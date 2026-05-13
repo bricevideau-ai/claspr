@@ -75,7 +75,7 @@ fn run() -> claspr::Result<bool> {
         }
     };
 
-    let kernels = compiled::Kernels::load(&ctx)?;
+    let kernels = gpu::kernels(&ctx)?;
 
     let inputs: Vec<u32> = (1..=N as u32).collect();
     let mut device_results = inputs.clone();

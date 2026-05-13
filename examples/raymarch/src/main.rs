@@ -246,7 +246,7 @@ fn run() -> claspr::Result<bool> {
         return Ok(false);
     }
 
-    let kernels = compiled::Kernels::load(&ctx)?;
+    let kernels = gpu::kernels(&ctx)?;
     let img = ctx.alloc_image_2d_rgba8(WIDTH, HEIGHT)?;
     kernels.raymarch(&ctx, [WIDTH as usize, HEIGHT as usize], &img, WIDTH, HEIGHT)?;
     let pixels = ctx.read_image_2d_rgba8(&img)?;

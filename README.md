@@ -38,7 +38,7 @@ mod gpu {
 
 fn main() -> claspr::Result<()> {
     let ctx = Context::new()?;
-    let kernels = compiled::Kernels::load(&ctx)?;
+    let kernels = gpu::kernels(&ctx)?;
 
     let mut data: Vec<u32> = (1..=1024).collect();
     let buf = ctx.upload(&data)?;
@@ -68,7 +68,7 @@ fn main() {
 }
 ```
 
-That's the whole thing. The kernel function lives once, in the `#[claspr::device] mod`. claspr-build extracts that module's body into a generated kernel sub-crate compiled by rust-gpu; `#[claspr::device]` synthesises a sibling `mod compiled { include!(...) }` block that pulls in the build-script-generated `Kernels` struct (so the user doesn't have to write the include themselves); the proc-macro emits a typed launch method on `compiled::Kernels` for each `#[claspr::kernel]` function (defaulting to that path when not specified). The host can also call `gpu::collatz(...)` for validation — same source, two consumers.
+That's the whole thing. The kernel function lives once, in the `#[claspr::device] mod`. claspr-build extracts that module's body into a generated kernel sub-crate compiled by rust-gpu; `#[claspr::device]` injects an `include!()` of the build-script-generated `Kernels` struct *inside* the device module (so it's scoped to `gpu::Kernels`) plus a `pub fn kernels(&ctx) -> Result<Kernels>` convenience wrapper; the proc-macro emits a typed launch method on `Kernels` for each `#[claspr::kernel]` function (resolving to the device module's local `Kernels` by default). The host can also call `gpu::collatz(...)` for validation — same source, two consumers. Multiple `#[claspr::device]` modules in the same file each get their own `Kernels` (no collisions).
 
 ## Workspace layout
 
