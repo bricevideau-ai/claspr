@@ -198,6 +198,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "claspr-build"
+version = "0.0.0"
+dependencies = [
+ "spirv-builder",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -212,6 +219,14 @@ version = "0.0.0"
 dependencies = [
  "glam",
  "spirv-std",
+]
+
+[[package]]
+name = "collatz-example"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+ "claspr-build",
 ]
 
 [[package]]
