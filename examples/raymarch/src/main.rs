@@ -251,32 +251,65 @@ fn run() -> claspr::Result<bool> {
         return Ok(false);
     }
 
-    // Host validation first — catches any cl::Float3 / opencl_std host-arm
-    // breakage cheaper than the full image launch. Sample a 9×9 grid of
-    // NDC coords; every pixel must be finite and within [-0.01, 1.01]
-    // (the kernel later clamps to [0, 1]).
-    for iy in 0..9 {
-        for ix in 0..9 {
-            let u = -1.0 + 0.25 * ix as f32;
-            let v = 1.0 - 0.25 * iy as f32;
-            let c = gpu::pixel_color(u, v).to_array();
-            for (i, x) in c.iter().enumerate() {
-                assert!(
-                    x.is_finite() && (-0.01..=1.01).contains(x),
-                    "host pixel_color({u}, {v}) component {i} out of range: {x}",
-                );
-            }
-        }
-    }
-
     let kernels = compiled::Kernels::load(&ctx)?;
     let img = ctx.alloc_image_2d_rgba8(WIDTH, HEIGHT)?;
     kernels.raymarch(&ctx, [WIDTH as usize, HEIGHT as usize], &img, WIDTH, HEIGHT)?;
     let pixels = ctx.read_image_2d_rgba8(&img)?;
 
+    // Host vs. device pixel comparison. Walking every pixel through
+    // `pixel_color` on the CPU is doable but slow — we stride by `STEP`
+    // so the binary stays snappy while still covering a few thousand
+    // pixels spread across the frame.
+    //
+    // Tolerance: OpenCL math intrinsics (sqrt/sin/cos/pow/exp) have
+    // implementation-defined precision per the spec, so we don't
+    // assume bit-for-bit matches between pocl's CPU JIT and host
+    // libm. ±2 per channel passes everywhere we've measured; bump
+    // if real divergence shows up on a different runtime.
+    const STEP: u32 = 20;
+    const TOL: u8 = 2;
+    let aspect = WIDTH as f32 / HEIGHT as f32;
+    let (mut compared, mut max_diff): (usize, u8) = (0, 0);
+    for py in (0..HEIGHT).step_by(STEP as usize) {
+        for px in (0..WIDTH).step_by(STEP as usize) {
+            let pixel_base = ((py * WIDTH + px) * 4) as usize;
+            let device = [
+                pixels[pixel_base],
+                pixels[pixel_base + 1],
+                pixels[pixel_base + 2],
+            ];
+
+            let u = (2.0 * (px as f32 + 0.5) / WIDTH as f32 - 1.0) * aspect;
+            let v = 1.0 - 2.0 * (py as f32 + 0.5) / HEIGHT as f32;
+            let host_color = gpu::pixel_color(u, v).to_array();
+            let host = [
+                (host_color[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (host_color[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (host_color[2].clamp(0.0, 1.0) * 255.0) as u8,
+            ];
+
+            for c in 0..3 {
+                let diff = device[c].abs_diff(host[c]);
+                assert!(
+                    diff <= TOL,
+                    "device/host mismatch at ({px},{py}) channel {c}: \
+                     device={} host={} diff={diff} > tol {TOL}",
+                    device[c],
+                    host[c],
+                );
+                if diff > max_diff {
+                    max_diff = diff;
+                }
+            }
+            compared += 1;
+        }
+    }
+
     let ppm_path = "raymarch.ppm";
     claspr::write_ppm_rgba8(ppm_path, WIDTH, HEIGHT, &pixels)?;
-    println!("raymarch: wrote {ppm_path} ({WIDTH}x{HEIGHT}, host validation passed at 81 pixels)",);
+    println!(
+        "raymarch: wrote {ppm_path} ({WIDTH}x{HEIGHT}, {compared} pixels host-validated, max channel delta {max_diff})",
+    );
 
     Ok(true)
 }
