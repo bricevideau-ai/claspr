@@ -1,42 +1,26 @@
-//! End-to-end smoke test driven by the build-time generated module
-//! plus a `#[claspr::kernel]` stub.
+//! Stage-3 single-source end-to-end test.
 //!
-//! What's new vs. the stage-2 form:
-//!
-//! - The build script no longer declares the kernel signature with
-//!   `.kernel(...)` — it just compiles the kernel crate.
-//! - A body-less stub function in this test file, marked with
-//!   `#[claspr::kernel]`, mirrors the kernel-crate signature exactly
-//!   (kernel-style `&mut [u32]`, builtin params with `#[spirv(...)]`).
-//!   The proc-macro turns it into a host launch wrapper that takes
-//!   `&claspr::Context`, `&claspr::Kernel`, an `impl IntoLaunchSpec`,
-//!   and the kernel-supplied buffers as `&claspr::DeviceSlice<T>`.
+//! No standalone kernel crate, no manual signature declarations — the
+//! kernel function lives in `examples/collatz/src/kernels.rs` and
+//! drives both the host wrapper (via `#[claspr::kernel]`) and the
+//! kernel-side compilation (via `claspr_build::compile_from_host`).
 //!
 //! Skips silently if no OpenCL device is reachable.
 
 use claspr::Context;
-use collatz_example::Kernels;
-
-/// Stub mirrors the collatz kernel signature. The body is discarded
-/// by the proc-macro; we leave it empty here to match the
-/// "documentation-only" style stage-3-v1 settles on.
-#[claspr::kernel]
-fn collatz_kernel(
-    #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
-    #[spirv(cross_workgroup)] data: &mut [u32],
-) {
-}
+use collatz_example::compiled::Kernels;
+use collatz_example::kernels::collatz_kernel;
 
 /// Well-known Collatz sequence lengths (1-indexed input → length to
 /// reach 1). OEIS A006577.
 const CHECKS: &[(u32, u32)] = &[(1, 0), (2, 1), (3, 7), (4, 2), (27, 111)];
 
 #[test]
-fn collatz_via_proc_macro_stub() {
+fn collatz_single_source() {
     let ctx = match Context::new() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("SKIP collatz_via_proc_macro_stub: no OpenCL device ({e})");
+            eprintln!("SKIP collatz_single_source: no OpenCL device ({e})");
             return;
         }
     };

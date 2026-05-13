@@ -53,6 +53,7 @@
 //! [`claspr::Context::launch`]: https://docs.rs/claspr
 //! [claspr]: https://github.com/bricevideau-ai/claspr
 
+use quote::ToTokens;
 use spirv_builder::{Capability, CompileResult, ShaderPanicStrategy, SpirvBuilder};
 use std::error::Error;
 use std::fmt::Write as _;
@@ -383,4 +384,227 @@ fn has_decl(kernels: &[KernelDecl], name: &str) -> bool {
 /// be slotted in without changing the call sites.
 fn sanitize_field_name(name: &str) -> String {
     name.to_string()
+}
+
+// ── compile_from_host: single-source kernel extraction ────────────────
+
+/// Build kernel SPIR-V from a *host-crate* source file containing
+/// `#[claspr::kernel]`-marked functions.
+///
+/// This is the "single source" mode — kernel function bodies live in
+/// the host crate (next to where they're called from), and `claspr-build`
+/// extracts them at build time into a generated kernel sub-crate that
+/// `spirv-builder` then compiles. The host crate's own compilation of
+/// the same file goes through the [`#[claspr::kernel]`][kernel-macro]
+/// proc-macro, which emits a host launch wrapper from the same source.
+///
+/// The whole source file is copied into the generated kernel crate
+/// (modulo translating `#[claspr::kernel]` → `#[spirv(kernel)]`), so
+/// device-side helper functions can sit alongside entry points without
+/// any extra annotation.
+///
+/// ```ignore
+/// // build.rs
+/// claspr_build::compile_from_host("src/kernels.rs")
+///     .opencl12()
+///     .write_to(format!("{}/kernels.rs", std::env::var("OUT_DIR").unwrap()))?;
+/// ```
+///
+/// [kernel-macro]: https://docs.rs/claspr_macros
+pub fn compile_from_host(src_file: impl AsRef<Path>) -> HostBuilder {
+    HostBuilder::new(src_file)
+}
+
+/// Builder for [`compile_from_host`].
+///
+/// The preset / capability / panic-strategy methods carry the same
+/// semantics as on [`CompileBuilder`]; the terminal call is
+/// [`write_to`] just like the explicit-kernel-crate flow.
+///
+/// [`write_to`]: Self::write_to
+pub struct HostBuilder {
+    src_file: PathBuf,
+    target_env: String,
+    capabilities: Vec<Capability>,
+    panic_strategy: Option<ShaderPanicStrategy>,
+}
+
+impl HostBuilder {
+    fn new(src_file: impl AsRef<Path>) -> Self {
+        Self {
+            src_file: src_file.as_ref().to_path_buf(),
+            target_env: "spirv-unknown-opencl1.2".to_string(),
+            capabilities: Vec::new(),
+            panic_strategy: None,
+        }
+    }
+
+    /// Set the SPIR-V target environment string.
+    pub fn target_env(mut self, target: impl Into<String>) -> Self {
+        self.target_env = target.into();
+        self
+    }
+
+    /// Add a SPIR-V capability the kernels need.
+    pub fn capability(mut self, cap: Capability) -> Self {
+        self.capabilities.push(cap);
+        self
+    }
+
+    /// Set the panic strategy.
+    pub fn panic_strategy(mut self, strategy: ShaderPanicStrategy) -> Self {
+        self.panic_strategy = Some(strategy);
+        self
+    }
+
+    /// Preset — OpenCL 1.2 with `panic!` lowered to printf-then-exit.
+    pub fn opencl12(self) -> Self {
+        self.target_env("spirv-unknown-opencl1.2").panic_strategy(
+            ShaderPanicStrategy::DebugPrintfThenExit {
+                print_inputs: true,
+                print_backtrace: true,
+            },
+        )
+    }
+
+    /// Preset — OpenCL 2.0 + `Groups` capability for subgroup / workgroup
+    /// collective kernels with barriers.
+    pub fn opencl20_groups(self) -> Self {
+        self.target_env("spirv-unknown-opencl2.0")
+            .capability(Capability::Groups)
+            .panic_strategy(ShaderPanicStrategy::UNSOUND_DO_NOT_USE_UndefinedBehaviorViaUnreachable)
+    }
+
+    /// Preset — image kernels: OpenCL 1.2 target, no panic strategy.
+    pub fn image(self) -> Self {
+        self.target_env("spirv-unknown-opencl1.2")
+    }
+
+    /// Convenience — add the `Float64` capability.
+    pub fn with_f64(self) -> Self {
+        self.capability(Capability::Float64)
+    }
+
+    /// Generate the kernel sub-crate from the host source, compile via
+    /// rust-gpu, and write the [`Kernels`-style module][module-shape]
+    /// to `out_path`.
+    ///
+    /// Emits `cargo:rerun-if-changed=` for the source file so changes
+    /// trigger a rebuild.
+    ///
+    /// [module-shape]: CompileBuilder::write_to
+    pub fn write_to(self, out_path: impl AsRef<Path>) -> Result<()> {
+        let out_path = out_path.as_ref();
+
+        println!("cargo:rerun-if-changed={}", self.src_file.display());
+
+        // Read + parse the host source.
+        let source = std::fs::read_to_string(&self.src_file)
+            .map_err(|e| format!("read {}: {}", self.src_file.display(), e))?;
+        let parsed: syn::File = syn::parse_str(&source)
+            .map_err(|e| format!("parse {}: {}", self.src_file.display(), e))?;
+
+        // Translate #[claspr::kernel] -> #[spirv(kernel)] in-place.
+        let translated = translate_for_kernel_crate(parsed);
+
+        // Materialize the generated kernel crate under OUT_DIR/claspr_kernel_crate.
+        let out_dir = std::env::var("OUT_DIR").map_err(|_| "OUT_DIR not set")?;
+        let crate_dir = PathBuf::from(&out_dir).join("claspr_kernel_crate");
+        std::fs::create_dir_all(crate_dir.join("src"))?;
+        write_generated_cargo_toml(&crate_dir)?;
+        write_generated_lib_rs(&crate_dir, &translated)?;
+
+        // Compile via spirv-builder.
+        let mut sb = SpirvBuilder::new(&crate_dir, &self.target_env);
+        for cap in &self.capabilities {
+            sb = sb.capability(*cap);
+        }
+        if let Some(ps) = self.panic_strategy {
+            sb = sb.shader_panic_strategy(ps);
+        }
+        let result: CompileResult = sb.build()?;
+        let spv_path = result.module.unwrap_single().to_path_buf();
+
+        // Emit the Kernels module — same shape as the explicit-kernel-crate
+        // flow, but without typed methods (those come from the
+        // proc-macro on the host stub).
+        let generated = generate_module_source(&spv_path, &result.entry_points, &[], &crate_dir)?;
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(out_path, generated)?;
+        Ok(())
+    }
+}
+
+/// Walk the host source and rewrite each `#[claspr::kernel]` (or
+/// `#[kernel]`, when re-exported into scope) attribute into
+/// `#[spirv(kernel)]`. Other items (helper functions, types, use
+/// statements) carry through unchanged.
+fn translate_for_kernel_crate(mut file: syn::File) -> syn::File {
+    for item in &mut file.items {
+        if let syn::Item::Fn(f) = item {
+            translate_fn_attrs(&mut f.attrs);
+        }
+    }
+    file
+}
+
+fn translate_fn_attrs(attrs: &mut [syn::Attribute]) {
+    for attr in attrs.iter_mut() {
+        if is_claspr_kernel_attr(attr) {
+            *attr = syn::parse_quote!(#[spirv(kernel)]);
+        }
+    }
+}
+
+fn is_claspr_kernel_attr(attr: &syn::Attribute) -> bool {
+    let path = attr.path();
+    let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    segs == ["claspr", "kernel"] || segs == ["kernel"]
+}
+
+fn write_generated_cargo_toml(crate_dir: &Path) -> Result<()> {
+    // Hardcoded for the bricevideau-ai/rust-gpu opencl-kernel-support
+    // branch used throughout this workspace. Future iterations should
+    // either inherit from the host workspace or take the dep specs as
+    // a builder parameter.
+    // Empty `[workspace]` table makes this a standalone workspace —
+    // it lives under the host's `target/` so cargo would otherwise
+    // try to associate it with the host workspace and fail.
+    let cargo_toml = r#"[package]
+name = "claspr_generated_kernels"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+spirv-std = { git = "https://github.com/bricevideau-ai/rust-gpu.git", branch = "opencl-kernel-support" }
+glam = { version = ">=0.30.8", default-features = false }
+"#;
+    std::fs::write(crate_dir.join("Cargo.toml"), cargo_toml)?;
+    Ok(())
+}
+
+fn write_generated_lib_rs(crate_dir: &Path, file: &syn::File) -> Result<()> {
+    // Hardcoded preamble matches the convention used by the
+    // hand-written collatz kernel crate. Anything more flexible (e.g.
+    // pulling user-side use statements through) is deferred until we
+    // see a sample that needs it.
+    let mut s = String::new();
+    s.push_str("#![cfg_attr(target_arch = \"spirv\", no_std)]\n\n");
+    s.push_str("#[allow(unused_imports)]\n");
+    s.push_str("use glam::USizeVec3;\n");
+    s.push_str("#[allow(unused_imports)]\n");
+    s.push_str("use spirv_std::{glam, spirv};\n\n");
+    for item in &file.items {
+        s.push_str(&item.to_token_stream().to_string());
+        s.push_str("\n\n");
+    }
+    std::fs::write(crate_dir.join("src/lib.rs"), s)?;
+    Ok(())
 }
