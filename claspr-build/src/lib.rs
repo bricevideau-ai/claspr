@@ -537,11 +537,25 @@ impl HostBuilder {
     }
 }
 
-/// Walk the host source and rewrite each `#[claspr::kernel]` (or
-/// `#[kernel]`, when re-exported into scope) attribute into
-/// `#[spirv(kernel)]`. Other items (helper functions, types, use
-/// statements) carry through unchanged.
+/// Walk the host source, **filter to kernel-side items**, and translate
+/// claspr attributes into their rust-gpu equivalents.
+///
+/// Kept items (everything else is dropped):
+///
+/// - `fn` items with `#[claspr::kernel(...)]` — translated to
+///   `#[spirv(kernel)]`. The `kernels = ...` argument from the host
+///   side is stripped (rust-gpu's `#[spirv(kernel)]` takes no args).
+/// - `fn` items with `#[claspr::device]` — kept as a regular fn,
+///   marker attribute removed.
+///
+/// This filter is the linchpin of single-file single-source mode:
+/// it lets `use claspr::Context`, `mod compiled { include!(...) }`,
+/// and `fn main()` sit alongside kernel definitions in `src/main.rs`
+/// without breaking the no-std SPIR-V build of the extracted kernel
+/// crate.
 fn translate_for_kernel_crate(mut file: syn::File) -> syn::File {
+    file.items
+        .retain(|item| matches!(item, syn::Item::Fn(f) if has_kernel_or_device_attr(&f.attrs)));
     for item in &mut file.items {
         if let syn::Item::Fn(f) = item {
             translate_fn_attrs(&mut f.attrs);
@@ -550,18 +564,46 @@ fn translate_for_kernel_crate(mut file: syn::File) -> syn::File {
     file
 }
 
-fn translate_fn_attrs(attrs: &mut [syn::Attribute]) {
-    for attr in attrs.iter_mut() {
-        if is_claspr_kernel_attr(attr) {
-            *attr = syn::parse_quote!(#[spirv(kernel)]);
+fn has_kernel_or_device_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|a| is_claspr_kernel_attr(a) || is_claspr_device_attr(a))
+}
+
+fn translate_fn_attrs(attrs: &mut Vec<syn::Attribute>) {
+    let mut out = Vec::with_capacity(attrs.len());
+    for attr in attrs.drain(..) {
+        if is_claspr_kernel_attr(&attr) {
+            out.push(syn::parse_quote!(#[spirv(kernel)]));
+        } else if is_claspr_device_attr(&attr) {
+            // Pure marker — drop with no replacement.
+        } else {
+            out.push(attr);
         }
     }
+    *attrs = out;
 }
 
 fn is_claspr_kernel_attr(attr: &syn::Attribute) -> bool {
-    let path = attr.path();
-    let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-    segs == ["claspr", "kernel"] || segs == ["kernel"]
+    attr_path_matches(attr, "kernel")
+}
+
+fn is_claspr_device_attr(attr: &syn::Attribute) -> bool {
+    attr_path_matches(attr, "device")
+}
+
+fn attr_path_matches(attr: &syn::Attribute, name: &str) -> bool {
+    let segs: Vec<String> = attr
+        .path()
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    match segs.as_slice() {
+        [single] => single == name,
+        [first, second] => first == "claspr" && second == name,
+        _ => false,
+    }
 }
 
 fn write_generated_cargo_toml(crate_dir: &Path) -> Result<()> {
