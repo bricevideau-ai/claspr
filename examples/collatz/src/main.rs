@@ -31,7 +31,12 @@ mod compiled {
 /// of steps to reach 1), or `None` on overflow / zero input.
 ///
 /// Marked `#[claspr::device]` so `claspr-build` pulls this into the
-/// kernel sub-crate alongside the entry point that calls it.
+/// kernel sub-crate alongside the entry point that calls it. The
+/// marker doesn't restrict host-side use — `run` below uses the same
+/// function to validate the kernel's output against an
+/// independently-computed reference, which is the stronger
+/// "single-source" claim: one definition serves both the device
+/// computation and the host validator.
 #[claspr::device]
 fn collatz(mut n: u32) -> Option<u32> {
     let mut i = 0;
@@ -61,10 +66,6 @@ pub fn collatz_kernel(
     data[index] = collatz(data[index]).unwrap_or(u32::MAX);
 }
 
-/// Well-known Collatz sequence lengths (1-indexed input → length to
-/// reach 1). OEIS A006577.
-const CHECKS: &[(u32, u32)] = &[(1, 0), (2, 1), (3, 7), (4, 2), (27, 111)];
-
 const N: usize = 1024;
 
 fn run() -> claspr::Result<bool> {
@@ -77,17 +78,20 @@ fn run() -> claspr::Result<bool> {
     };
 
     let kernels = compiled::Kernels::load(&ctx)?;
-    let mut data: Vec<u32> = (1..=N as u32).collect();
-    let buf = ctx.upload(&data)?;
-    kernels.collatz_kernel(&ctx, [N], &buf)?;
-    ctx.download(&buf, &mut data)?;
 
-    for &(input, expected) in CHECKS {
-        let idx = (input - 1) as usize;
+    let inputs: Vec<u32> = (1..=N as u32).collect();
+    let mut device_results = inputs.clone();
+    let buf = ctx.upload(&device_results)?;
+    kernels.collatz_kernel(&ctx, [N], &buf)?;
+    ctx.download(&buf, &mut device_results)?;
+
+    // Validate the kernel's output element-by-element against the
+    // host-side `collatz` implementation. Same function, two callers.
+    for (i, (&input, &device)) in inputs.iter().zip(&device_results).enumerate() {
+        let host = collatz(input).unwrap_or(u32::MAX);
         assert_eq!(
-            data[idx], expected,
-            "collatz({input}) = {} (expected {expected})",
-            data[idx],
+            device, host,
+            "device/host mismatch at index {i} (input {input}): device={device}, host={host}",
         );
     }
     Ok(true)
@@ -95,7 +99,7 @@ fn run() -> claspr::Result<bool> {
 
 fn main() -> claspr::Result<()> {
     if run()? {
-        println!("collatz: {N} elements, {} spot-checks OK", CHECKS.len());
+        println!("collatz: device/host agreement on {N} elements");
     }
     Ok(())
 }
