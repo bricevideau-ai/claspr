@@ -50,7 +50,7 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
-    Attribute, FnArg, ItemFn, Pat, PatType, Path, Type, TypeReference, TypeSlice,
+    Attribute, FnArg, ItemFn, Pat, PatType, Path, Type, TypeMacro, TypeReference, TypeSlice,
     parse_macro_input, spanned::Spanned,
 };
 
@@ -125,10 +125,14 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item: TokenStream2 = item.into();
-    // `#[allow(dead_code)]` on a `mod` propagates to its inner items,
-    // so this works for both function and module forms.
+    // `#[allow(...)]` on a `mod` propagates to its inner items, so
+    // this works for both function and module forms. `unused_imports`
+    // is in there because a device module's `use` statements typically
+    // look unused on the host (the kernel body that uses them is
+    // discarded by `#[claspr::kernel]`), but we still need them for
+    // the kernel-crate compilation.
     quote! {
-        #[allow(dead_code)]
+        #[allow(dead_code, unused_imports)]
         #item
     }
     .into()
@@ -258,6 +262,12 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
 
     let ty_translated = if matches!(kind, Some(SpirvKind::CrossWorkgroup)) {
         translate_cross_workgroup_ty(&pt.ty)?
+    } else if is_image_param(&pt.ty) {
+        // `&Image!(...)` / `&mut Image!(...)` — translate to claspr's
+        // host-side image type. Both mutability flavours map to
+        // `&Image2DRgba8` since the host-side handle isn't itself
+        // mutated by the launch (the GPU is what writes to it).
+        quote! { &::claspr::Image2DRgba8 }
     } else {
         // No spirv attribute (or an unrecognised one): pass type through.
         let ty = &pt.ty;
@@ -304,11 +314,31 @@ fn spirv_attr_kind(attr: &Attribute) -> SpirvKind {
     }
 }
 
+/// True if `ty` looks like `&Image!(...)` or `&mut Image!(...)` — the
+/// rust-gpu storage-image kernel-parameter type. We map this to
+/// `&::claspr::Image2DRgba8` in the host launch wrapper.
+///
+/// Detection is purely syntactic on the macro path being `Image` —
+/// we don't (yet) try to read out the dimensionality / format /
+/// sampled-ness arguments. Today claspr only ships
+/// `Image2DRgba8`, so any image kernel parameter maps there. When
+/// other formats arrive (`R32f`, `Rgba32f`, …), this branch will
+/// grow into a small dispatch.
+fn is_image_param(ty: &Type) -> bool {
+    let Type::Reference(TypeReference { elem, .. }) = ty else {
+        return false;
+    };
+    let Type::Macro(TypeMacro { mac }) = &**elem else {
+        return false;
+    };
+    mac.path.is_ident("Image")
+}
+
 /// Translate a `cross_workgroup` parameter type.
 ///
 /// `&mut [T]` and `&[T]` both become `&::claspr::DeviceSlice<T>`. Any
 /// other shape is a hard error — those paths haven't been wired up
-/// yet (image, sampler, workgroup-memory parameters will land as
+/// yet (sampler / workgroup-memory parameters will land as
 /// follow-ups).
 fn translate_cross_workgroup_ty(ty: &Type) -> syn::Result<TokenStream2> {
     let Type::Reference(TypeReference { elem, .. }) = ty else {

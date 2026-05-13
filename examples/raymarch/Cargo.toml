@@ -1,0 +1,25 @@
+[package]
+name = "raymarch-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Ray-marched SDF scene rendered through claspr — single-source kernel + invocation"
+
+[[bin]]
+name = "raymarch_example"
+path = "src/main.rs"
+
+[dependencies]
+claspr = { path = "../../claspr" }
+# spirv-std host arms provide the host-side implementations of cl::Float3
+# arithmetic + opencl_std::* math intrinsics, so the same `pixel_color`
+# function used by the kernel can also run on the CPU for validation.
+spirv-std.workspace = true
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true

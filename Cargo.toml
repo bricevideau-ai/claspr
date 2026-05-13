@@ -5,6 +5,7 @@ members = [
     "claspr-build",
     "claspr-macros",
     "examples/collatz",
+    "examples/raymarch",
 ]
 
 [workspace.package]
