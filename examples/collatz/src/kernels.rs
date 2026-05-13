@@ -45,7 +45,7 @@ pub fn collatz(mut n: u32) -> Option<u32> {
     Some(i)
 }
 
-#[claspr::kernel]
+#[claspr::kernel(kernels = crate::compiled::Kernels)]
 pub fn collatz_kernel(
     #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
     #[spirv(cross_workgroup)] data: &mut [u32],

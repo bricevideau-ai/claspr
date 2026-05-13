@@ -9,7 +9,6 @@
 
 use claspr::Context;
 use collatz_example::compiled::Kernels;
-use collatz_example::kernels::collatz_kernel;
 
 /// Well-known Collatz sequence lengths (1-indexed input → length to
 /// reach 1). OEIS A006577.
@@ -31,7 +30,9 @@ fn collatz_single_source() {
     let mut data: Vec<u32> = (1..=n as u32).collect();
 
     let buf = ctx.upload(&data).expect("upload");
-    collatz_kernel(&ctx, &kernels.collatz_kernel, [n], &buf).expect("launch collatz_kernel");
+    kernels
+        .collatz_kernel(&ctx, [n], &buf)
+        .expect("launch collatz_kernel");
     ctx.download(&buf, &mut data).expect("download");
 
     for &(input, expected) in CHECKS {

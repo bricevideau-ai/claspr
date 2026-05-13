@@ -50,8 +50,8 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
-    Attribute, FnArg, ItemFn, Pat, PatType, Type, TypeReference, TypeSlice, parse_macro_input,
-    spanned::Spanned,
+    Attribute, FnArg, ItemFn, Pat, PatType, Path, Type, TypeReference, TypeSlice,
+    parse_macro_input, spanned::Spanned,
 };
 
 /// Mark a function as a claspr kernel — generates a host-side launch
@@ -75,15 +75,48 @@ use syn::{
 /// memory, and user structs will arrive as we exercise more samples
 /// through the macro.
 #[proc_macro_attribute]
-pub fn kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
-    match expand_kernel(&func) {
+    let attr_args = match parse_attr_args(attr) {
+        Ok(a) => a,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    match expand_kernel(&func, &attr_args) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
 }
 
-fn expand_kernel(func: &ItemFn) -> syn::Result<TokenStream2> {
+struct AttrArgs {
+    /// Path to the build-script-generated `Kernels` struct that this
+    /// kernel's typed launch method will be added to.
+    kernels: Path,
+}
+
+fn parse_attr_args(attr: TokenStream) -> syn::Result<AttrArgs> {
+    let mut kernels: Option<Path> = None;
+    let parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("kernels") {
+            kernels = Some(meta.value()?.parse::<Path>()?);
+            Ok(())
+        } else {
+            Err(meta.error(
+                "unsupported claspr::kernel argument; expected `kernels = path::to::Kernels`",
+            ))
+        }
+    });
+    syn::parse::Parser::parse(parser, attr)?;
+    let kernels = kernels.ok_or_else(|| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "claspr::kernel requires `kernels = path::to::Kernels` to point at the build-script-\
+             generated Kernels struct",
+        )
+    })?;
+    Ok(AttrArgs { kernels })
+}
+
+fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     let vis = &func.vis;
     let name = &func.sig.ident;
 
@@ -117,14 +150,23 @@ fn expand_kernel(func: &ItemFn) -> syn::Result<TokenStream2> {
         quote! { ( #(#launch_args),* ) }
     };
 
+    let kernels_path = &args.kernels;
+
+    // Emit an `impl Kernels { fn <name>(...) }` block. The generated
+    // method shadows the field of the same name on `Kernels` (which
+    // claspr-build emits as `pub`) — at the call site, parens
+    // disambiguate method vs field, so `kernels.collatz_kernel(...)`
+    // dispatches to the typed launch method here.
     Ok(quote! {
-        #vis fn #name(
-            ctx: &::claspr::Context,
-            kernel: &::claspr::Kernel,
-            grid: impl ::claspr::IntoLaunchSpec,
-            #(#host_params),*
-        ) -> ::claspr::Result<::claspr::Event> {
-            ctx.launch(kernel, grid, #launch_tuple)
+        impl #kernels_path {
+            #vis fn #name(
+                &self,
+                ctx: &::claspr::Context,
+                grid: impl ::claspr::IntoLaunchSpec,
+                #(#host_params),*
+            ) -> ::claspr::Result<::claspr::Event> {
+                ctx.launch(&self.#name, grid, #launch_tuple)
+            }
         }
     })
 }
