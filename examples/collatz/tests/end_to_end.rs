@@ -32,8 +32,9 @@ fn collatz_via_generated_module() {
     let mut data: Vec<u32> = (1..=n as u32).collect();
 
     let buf = ctx.upload(&data).expect("upload");
-    ctx.launch(&kernels.collatz_kernel, [n], (&buf,))
-        .expect("launch");
+    kernels
+        .collatz_kernel(&ctx, [n], &buf)
+        .expect("launch collatz_kernel");
     ctx.download(&buf, &mut data).expect("download");
 
     for &(input, expected) in CHECKS {

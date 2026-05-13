@@ -16,6 +16,7 @@
 //!         .join("../../kernels/collatz");
 //!     claspr_build::compile(&kernel_crate)
 //!         .opencl12()
+//!         .kernel("collatz_kernel", &[("data", "&::claspr::DeviceSlice<u32>")])
 //!         .write_to(&out_path)
 //!         .unwrap();
 //! }
@@ -30,17 +31,26 @@
 //!
 //! let ctx = claspr::Context::new()?;
 //! let kernels = kernels::Kernels::load(&ctx)?;
-//! ctx.launch(&kernels.collatz_kernel, [n], (&buf,))?;
+//! kernels.collatz_kernel(&ctx, [n], &buf)?;
 //! ```
 //!
-//! ## Status
+//! ## Typed launch wrappers
 //!
-//! This is the **stage 2 sketch** — only SPIR-V bytes + kernel objects
-//! are generated; per-kernel typed launch wrappers (the headline
-//! feature of stage 2) come in a follow-up commit, after we have
-//! collatz running through this build-time path so we can iterate on
-//! reflection on real SPIR-V.
+//! For each kernel the build script declares via [`CompileBuilder::kernel`],
+//! the generated module emits a typed launch method on `Kernels` so the
+//! call site reads:
 //!
+//! ```ignore
+//! kernels.collatz_kernel(&ctx, [n], &buf)?;
+//! ```
+//!
+//! instead of the raw [`claspr::Context::launch`] form. We don't reflect
+//! the SPIR-V to discover signatures because the long-term plan
+//! (stage 3 proc-macro) will know them from the kernel function
+//! definition — explicit declaration here is the same shape the
+//! proc-macro will emit.
+//!
+//! [`claspr::Context::launch`]: https://docs.rs/claspr
 //! [claspr]: https://github.com/bricevideau-ai/claspr
 
 use spirv_builder::{Capability, CompileResult, ShaderPanicStrategy, SpirvBuilder};
@@ -65,6 +75,19 @@ pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync + 'stati
 pub struct CompileBuilder {
     inner: SpirvBuilder,
     crate_path: PathBuf,
+    kernels: Vec<KernelDecl>,
+}
+
+/// A declared kernel entry point + its host-side launch signature.
+///
+/// Built up via [`CompileBuilder::kernel`] — see that method for usage.
+struct KernelDecl {
+    name: String,
+    /// `(arg_name, arg_type)` pairs, in source declaration order. Both
+    /// fields are spliced verbatim into the generated wrapper, so they
+    /// must be valid Rust syntax in the position they're written
+    /// (paths can be absolute, e.g. `&::claspr::DeviceSlice<u32>`).
+    params: Vec<(String, String)>,
 }
 
 /// Start a [`CompileBuilder`] for the kernel crate at `path`.
@@ -79,7 +102,50 @@ impl CompileBuilder {
         Self {
             inner: SpirvBuilder::new(&crate_path, "spirv-unknown-opencl1.2"),
             crate_path,
+            kernels: Vec::new(),
         }
+    }
+
+    /// Declare a kernel entry point and its host-side launch signature.
+    ///
+    /// `name` must match the SPIR-V entry-point name (cross-checked
+    /// against `spirv-builder`'s reported entry points at [`write_to`]
+    /// time — a typo will fail the build with a clear error). `params`
+    /// is a list of `(arg_name, arg_type)` pairs as written in Rust
+    /// source.
+    ///
+    /// ```ignore
+    /// claspr_build::compile("kernels/collatz")
+    ///     .opencl12()
+    ///     .kernel("collatz_kernel", &[("data", "&::claspr::DeviceSlice<u32>")])
+    ///     .write_to(&out_path)?;
+    /// ```
+    ///
+    /// Both `arg_name` and `arg_type` are spliced into the generated
+    /// wrapper verbatim — `arg_name` becomes a parameter name and a
+    /// launch-tuple element, `arg_type` becomes the parameter type.
+    /// Use absolute paths (`::claspr::...`) so the wrapper compiles
+    /// regardless of what's in scope at the include site.
+    ///
+    /// Multiple `.kernel(...)` calls are supported for modules with
+    /// more than one entry point. Entry points compiled by
+    /// `spirv-builder` but **not** declared here still appear as
+    /// [`claspr::Kernel`] fields on the `Kernels` struct, just without
+    /// a typed launch method — call sites can still launch them via
+    /// [`claspr::Context::launch`] directly.
+    ///
+    /// [`write_to`]: Self::write_to
+    /// [`claspr::Kernel`]: https://docs.rs/claspr
+    /// [`claspr::Context::launch`]: https://docs.rs/claspr
+    pub fn kernel(mut self, name: &str, params: &[(&str, &str)]) -> Self {
+        self.kernels.push(KernelDecl {
+            name: name.to_string(),
+            params: params
+                .iter()
+                .map(|(n, t)| ((*n).to_string(), (*t).to_string()))
+                .collect(),
+        });
+        self
     }
 
     /// Set the SPIR-V target environment string passed to rust-gpu
@@ -145,12 +211,18 @@ impl CompileBuilder {
     /// - `SPV_BYTES: &[u8]` — the SPIR-V module, embedded via `include_bytes!`
     /// - `ENTRY_POINTS: &[&str]` — the entry-point names rust-gpu reported
     /// - `Kernels { ... }` — a struct holding one [`claspr::Kernel`] per
-    ///   entry point, constructed via `Kernels::load(&ctx)`
+    ///   entry point, constructed via `Kernels::load(&ctx)`. Entry
+    ///   points declared via [`kernel`] also get a typed launch method
+    ///   on the struct.
     ///
     /// Also emits `cargo:rerun-if-changed=` lines for the kernel
     /// crate's `Cargo.toml` and `src/` directory so cargo recompiles
     /// when the kernel changes. Call this from a `build.rs`.
     ///
+    /// Errors if any [`kernel`] declaration names an entry point that
+    /// isn't present in the compiled SPIR-V module — typo detection.
+    ///
+    /// [`kernel`]: Self::kernel
     /// [`claspr::Kernel`]: https://docs.rs/claspr
     pub fn write_to(self, out_path: impl AsRef<Path>) -> Result<()> {
         let out_path = out_path.as_ref();
@@ -160,10 +232,24 @@ impl CompileBuilder {
         emit_rerun_if_changed(&self.crate_path);
 
         let crate_path = self.crate_path.clone();
+        let kernels = self.kernels;
         let result: CompileResult = self.inner.build()?;
         let spv_path = result.module.unwrap_single().to_path_buf();
 
-        let generated = generate_module_source(&spv_path, &result.entry_points, &crate_path)?;
+        // Cross-check: every declared kernel must exist in the module.
+        for decl in &kernels {
+            if !result.entry_points.iter().any(|ep| ep == &decl.name) {
+                return Err(format!(
+                    "kernel declaration {:?} does not match any entry point in the compiled module \
+                     (entry points: {:?})",
+                    decl.name, result.entry_points,
+                )
+                .into());
+            }
+        }
+
+        let generated =
+            generate_module_source(&spv_path, &result.entry_points, &kernels, &crate_path)?;
 
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -182,6 +268,7 @@ fn emit_rerun_if_changed(crate_path: &Path) {
 fn generate_module_source(
     spv_path: &Path,
     entry_points: &[String],
+    kernels: &[KernelDecl],
     crate_path: &Path,
 ) -> Result<String> {
     let mut s = String::new();
@@ -214,7 +301,12 @@ fn generate_module_source(
     writeln!(s, "pub struct Kernels {{")?;
     for ep in entry_points {
         let field = sanitize_field_name(ep);
-        writeln!(s, "    pub {field}: ::claspr::Kernel,")?;
+        // Field is private when the kernel has a typed launch method
+        // (avoids `kernels.foo` field vs `kernels.foo(...)` confusion);
+        // public otherwise so callers can still launch via
+        // `ctx.launch(&kernels.foo, ...)`.
+        let vis = if has_decl(kernels, ep) { "" } else { "pub " };
+        writeln!(s, "    {vis}{field}: ::claspr::Kernel,")?;
     }
     writeln!(s, "}}\n")?;
 
@@ -235,9 +327,53 @@ fn generate_module_source(
     }
     writeln!(s, "        }})")?;
     writeln!(s, "    }}")?;
+
+    // Typed launch methods, one per declared kernel.
+    for decl in kernels {
+        let field = sanitize_field_name(&decl.name);
+        let params_sig: String = decl
+            .params
+            .iter()
+            .map(|(n, t)| format!(",\n        {n}: {t}"))
+            .collect();
+        let tuple_args: String = decl
+            .params
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Trailing comma needed for single-element tuples.
+        let tuple_lit = if decl.params.len() == 1 {
+            format!("({tuple_args},)")
+        } else {
+            format!("({tuple_args})")
+        };
+
+        writeln!(s)?;
+        writeln!(
+            s,
+            "    /// Launch the `{}` kernel with typed arguments.",
+            decl.name
+        )?;
+        writeln!(s, "    pub fn {field}(")?;
+        writeln!(s, "        &self,")?;
+        writeln!(s, "        ctx: &::claspr::Context,")?;
+        writeln!(
+            s,
+            "        grid: impl ::claspr::IntoLaunchSpec{params_sig},"
+        )?;
+        writeln!(s, "    ) -> ::claspr::Result<::claspr::Event> {{")?;
+        writeln!(s, "        ctx.launch(&self.{field}, grid, {tuple_lit})")?;
+        writeln!(s, "    }}")?;
+    }
+
     writeln!(s, "}}")?;
 
     Ok(s)
+}
+
+fn has_decl(kernels: &[KernelDecl], name: &str) -> bool {
+    kernels.iter().any(|k| k.name == name)
 }
 
 /// Convert an OpenCL entry-point name into a valid Rust field

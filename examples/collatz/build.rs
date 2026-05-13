@@ -7,6 +7,7 @@ fn main() {
 
     claspr_build::compile(&kernel_crate)
         .opencl12()
+        .kernel("collatz_kernel", &[("data", "&::claspr::DeviceSlice<u32>")])
         .write_to(&out_path)
         .expect("compile collatz kernel");
 }
