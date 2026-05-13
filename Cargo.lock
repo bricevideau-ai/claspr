@@ -193,6 +193,7 @@ dependencies = [
 name = "claspr"
 version = "0.0.0"
 dependencies = [
+ "claspr-macros",
  "opencl3",
  "spirv-builder",
 ]
@@ -202,6 +203,15 @@ name = "claspr-build"
 version = "0.0.0"
 dependencies = [
  "spirv-builder",
+]
+
+[[package]]
+name = "claspr-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

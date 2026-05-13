@@ -74,6 +74,9 @@ pub use ppm::write_ppm_rgba8;
 // add it as a separate dep.
 pub use spirv_builder::{Capability, ShaderPanicStrategy};
 
+// Stage-3 proc-macro frontend.
+pub use claspr_macros::kernel;
+
 // Re-exports from opencl3 — the types users actually touch through
 // claspr's API.
 pub use opencl3::event::Event;
