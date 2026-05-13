@@ -1,21 +1,18 @@
-//! End-to-end **single-file** claspr example.
+//! End-to-end **single-file** claspr example using a `#[claspr::device]`
+//! module.
 //!
-//! The kernel function, the device-side helper it calls, the
-//! `mod compiled` import of the build-script-generated SPIR-V, the
-//! host launch, and the test all live in this one file. The same
-//! source serves both:
+//! The whole device side — kernel entry point + helper function +
+//! whatever future state shows up (constants, static configs, etc.) —
+//! lives inside one `mod gpu { ... }` tagged with `#[claspr::device]`.
+//! The build script lifts everything inside that module into the
+//! generated kernel sub-crate; the host sees the module normally and
+//! can call into it (`gpu::collatz(...)`) for validation against the
+//! kernel output.
 //!
-//! - the **host** compilation, which expands `#[claspr::kernel]` into
-//!   a typed launch method on `compiled::Kernels`, treats
-//!   `#[claspr::device]` as a no-op marker, and ignores everything
-//!   else as ordinary host code; and
-//! - the **kernel** compilation, which is driven by `build.rs`'s
-//!   `claspr_build::compile_from_host("src/main.rs")` call —
-//!   `claspr-build` keeps only items marked `#[claspr::kernel]` or
-//!   `#[claspr::device]`, translates `#[claspr::kernel]` to
-//!   `#[spirv(kernel)]`, and strips the `#[claspr::device]` marker.
-//!   `use claspr::*`, `mod compiled`, `fn main`, etc. never reach
-//!   the kernel crate.
+//! Items at the top level of this file (use claspr::*, `mod compiled`,
+//! `fn main`, `#[cfg(test)] mod tests`) stay host-only — `claspr-build`
+//! drops anything that isn't a `#[claspr::kernel]` / `#[claspr::device]`
+//! item.
 //!
 //! Run with `cargo run -p collatz-example`. The `#[test]` at the
 //! bottom turns this into the project's smoke test.
@@ -27,43 +24,49 @@ mod compiled {
     include!(concat!(env!("OUT_DIR"), "/collatz_kernels.rs"));
 }
 
-/// Length of the Collatz sequence for `n` (1-indexed input → number
-/// of steps to reach 1), or `None` on overflow / zero input.
-///
-/// Marked `#[claspr::device]` so `claspr-build` pulls this into the
-/// kernel sub-crate alongside the entry point that calls it. The
-/// marker doesn't restrict host-side use — `run` below uses the same
-/// function to validate the kernel's output against an
-/// independently-computed reference, which is the stronger
-/// "single-source" claim: one definition serves both the device
-/// computation and the host validator.
 #[claspr::device]
-fn collatz(mut n: u32) -> Option<u32> {
-    let mut i = 0;
-    if n == 0 {
-        return None;
-    }
-    while n != 1 {
-        n = if n.is_multiple_of(2) {
-            n / 2
-        } else {
-            if n >= 0x5555_5555 {
-                return None;
-            }
-            3 * n + 1
-        };
-        i += 1;
-    }
-    Some(i)
-}
+mod gpu {
+    // `spirv` is the proc-macro that recognises `#[spirv(kernel)]` and
+    // `#[spirv(<builtin>)]` attributes on the kernel side. Cfg-gated
+    // because the host crate doesn't have spirv-std as a dep — and
+    // it doesn't need to: the host compilation never sees those
+    // attributes (the `#[claspr::kernel]` proc-macro discards the
+    // builtin params + replaces the function with its impl block
+    // before name resolution touches them).
+    #[cfg(target_arch = "spirv")]
+    use spirv_std::spirv;
 
-#[claspr::kernel(kernels = crate::compiled::Kernels)]
-pub fn collatz_kernel(
-    #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
-    #[spirv(cross_workgroup)] data: &mut [u32],
-) {
-    let index = _id.x;
-    data[index] = collatz(data[index]).unwrap_or(u32::MAX);
+    /// Length of the Collatz sequence for `n` (1-indexed input → number
+    /// of steps to reach 1), or `None` on overflow / zero input. Pure
+    /// Rust — both the kernel body (per-element step) and the host
+    /// validator below call into this.
+    pub fn collatz(mut n: u32) -> Option<u32> {
+        let mut i = 0;
+        if n == 0 {
+            return None;
+        }
+        while n != 1 {
+            n = if n.is_multiple_of(2) {
+                n / 2
+            } else {
+                if n >= 0x5555_5555 {
+                    return None;
+                }
+                3 * n + 1
+            };
+            i += 1;
+        }
+        Some(i)
+    }
+
+    #[claspr::kernel(kernels = crate::compiled::Kernels)]
+    pub fn collatz_kernel(
+        #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+        #[spirv(cross_workgroup)] data: &mut [u32],
+    ) {
+        let index = _id.x;
+        data[index] = collatz(data[index]).unwrap_or(u32::MAX);
+    }
 }
 
 const N: usize = 1024;
@@ -85,10 +88,11 @@ fn run() -> claspr::Result<bool> {
     kernels.collatz_kernel(&ctx, [N], &buf)?;
     ctx.download(&buf, &mut device_results)?;
 
-    // Validate the kernel's output element-by-element against the
-    // host-side `collatz` implementation. Same function, two callers.
+    // Validate every kernel output against the host-side `collatz`
+    // implementation lifted from inside the device module. Same
+    // function, two callers.
     for (i, (&input, &device)) in inputs.iter().zip(&device_results).enumerate() {
-        let host = collatz(input).unwrap_or(u32::MAX);
+        let host = gpu::collatz(input).unwrap_or(u32::MAX);
         assert_eq!(
             device, host,
             "device/host mismatch at index {i} (input {input}): device={device}, host={host}",
@@ -110,10 +114,6 @@ mod tests {
 
     #[test]
     fn collatz_single_source() {
-        // `run` returns false (without panicking) when there's no
-        // OpenCL device, which we want the test to treat as a skip
-        // rather than a failure. Errors during the run itself unwrap
-        // and fail the test loudly.
         let _ran = run().expect("run collatz");
     }
 }

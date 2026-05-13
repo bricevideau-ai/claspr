@@ -540,34 +540,77 @@ impl HostBuilder {
 /// Walk the host source, **filter to kernel-side items**, and translate
 /// claspr attributes into their rust-gpu equivalents.
 ///
-/// Kept items (everything else is dropped):
+/// Three flavours of opt-in are recognised at the top level
+/// (everything else is dropped):
 ///
 /// - `fn` items with `#[claspr::kernel(...)]` — translated to
 ///   `#[spirv(kernel)]`. The `kernels = ...` argument from the host
 ///   side is stripped (rust-gpu's `#[spirv(kernel)]` takes no args).
 /// - `fn` items with `#[claspr::device]` — kept as a regular fn,
 ///   marker attribute removed.
+/// - `mod` items with `#[claspr::device]` — the **whole module body**
+///   is lifted into the generated kernel crate (use statements,
+///   consts, statics, helper fns, type defs, even nested modules).
+///   Inside the lifted body, `#[claspr::kernel]` attrs still get
+///   translated to `#[spirv(kernel)]`. The module wrapper itself is
+///   discarded; its contents become top-level items in the kernel
+///   lib.rs. This is the right tool for non-trivial kernels with a
+///   lot of shared state — one marker covers all of it.
 ///
 /// This filter is the linchpin of single-file single-source mode:
 /// it lets `use claspr::Context`, `mod compiled { include!(...) }`,
 /// and `fn main()` sit alongside kernel definitions in `src/main.rs`
 /// without breaking the no-std SPIR-V build of the extracted kernel
 /// crate.
-fn translate_for_kernel_crate(mut file: syn::File) -> syn::File {
-    file.items
-        .retain(|item| matches!(item, syn::Item::Fn(f) if has_kernel_or_device_attr(&f.attrs)));
-    for item in &mut file.items {
-        if let syn::Item::Fn(f) = item {
-            translate_fn_attrs(&mut f.attrs);
+fn translate_for_kernel_crate(file: syn::File) -> syn::File {
+    let mut out_items: Vec<syn::Item> = Vec::new();
+    for item in file.items {
+        match item {
+            // `#[claspr::device] mod ...` — lift the whole module body.
+            syn::Item::Mod(m) if has_any_claspr_device_attr(&m.attrs) => {
+                if let Some((_brace, inner)) = m.content {
+                    for inner_item in inner {
+                        out_items.push(translate_lifted_item(inner_item));
+                    }
+                }
+                // module wrapper (and its #[claspr::device] / #[allow] attrs) discarded
+            }
+            // `#[claspr::kernel(...)]` or `#[claspr::device]` on a free fn
+            syn::Item::Fn(mut f) if has_any_claspr_marker(&f.attrs) => {
+                translate_fn_attrs(&mut f.attrs);
+                out_items.push(syn::Item::Fn(f));
+            }
+            _ => {} // dropped: host-only items
         }
     }
-    file
+    syn::File {
+        items: out_items,
+        ..file
+    }
 }
 
-fn has_kernel_or_device_attr(attrs: &[syn::Attribute]) -> bool {
+/// Translate an item that's been lifted out of a `#[claspr::device]`
+/// module. Functions get their `#[claspr::kernel]` attrs translated;
+/// other item kinds (use, const, static, struct, mod, …) pass
+/// through verbatim.
+fn translate_lifted_item(item: syn::Item) -> syn::Item {
+    match item {
+        syn::Item::Fn(mut f) => {
+            translate_fn_attrs(&mut f.attrs);
+            syn::Item::Fn(f)
+        }
+        other => other,
+    }
+}
+
+fn has_any_claspr_marker(attrs: &[syn::Attribute]) -> bool {
     attrs
         .iter()
         .any(|a| is_claspr_kernel_attr(a) || is_claspr_device_attr(a))
+}
+
+fn has_any_claspr_device_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(is_claspr_device_attr)
 }
 
 fn translate_fn_attrs(attrs: &mut Vec<syn::Attribute>) {
@@ -633,16 +676,15 @@ glam = { version = ">=0.30.8", default-features = false }
 }
 
 fn write_generated_lib_rs(crate_dir: &Path, file: &syn::File) -> Result<()> {
-    // Hardcoded preamble matches the convention used by the
-    // hand-written collatz kernel crate. Anything more flexible (e.g.
-    // pulling user-side use statements through) is deferred until we
-    // see a sample that needs it.
+    // Bare-minimum preamble — just the no_std attribute. The user's
+    // `#[claspr::device]` module is expected to bring its own `use`
+    // statements (`use spirv_std::{glam, spirv};` etc.), which carry
+    // through to the generated kernel crate verbatim. Per-fn
+    // `#[claspr::device]` callers without a wrapping module pay the
+    // price of declaring their own `use` statements at module level
+    // alongside the function — same source file, same scope.
     let mut s = String::new();
     s.push_str("#![cfg_attr(target_arch = \"spirv\", no_std)]\n\n");
-    s.push_str("#[allow(unused_imports)]\n");
-    s.push_str("use glam::USizeVec3;\n");
-    s.push_str("#[allow(unused_imports)]\n");
-    s.push_str("use spirv_std::{glam, spirv};\n\n");
     for item in &file.items {
         s.push_str(&item.to_token_stream().to_string());
         s.push_str("\n\n");
