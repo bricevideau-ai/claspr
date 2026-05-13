@@ -19,7 +19,6 @@
 
 use claspr::Context;
 
-#[allow(dead_code)] // SPV_BYTES + ENTRY_POINTS are exposed but not used in this demo.
 mod compiled {
     include!(concat!(env!("OUT_DIR"), "/collatz_kernels.rs"));
 }

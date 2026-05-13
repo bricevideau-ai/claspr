@@ -16,7 +16,7 @@ examples/raymarch/     larger demo (consts, helpers, image kernel)
 
 User writes one source file (e.g. `examples/collatz/src/main.rs`). It contains:
 
-- **Top-level host code**: `use claspr::*`, `mod compiled { include!(concat!(env!("OUT_DIR"), "/foo_kernels.rs")) }`, `fn main`, optional `#[cfg(test)] mod tests`.
+- **Top-level host code**: `use claspr::*`, `mod compiled { include!(concat!(env!("OUT_DIR"), "/foo_kernels.rs")) }` (the generated file tags `SPV_BYTES`/`ENTRY_POINTS` with per-item `#[allow(dead_code)]`, so the user doesn't need to suppress unused-const warnings — `include!()` doesn't accept inner attributes, hence per-item rather than `#![allow]` at the top), `fn main`, optional `#[cfg(test)] mod tests`.
 - **`#[claspr::device] mod gpu { ... }`** — the device side, in a single tagged module. Inside: kernel-only `use` statements (cfg-gated to `target_arch = "spirv"` if the host doesn't depend on those crates), `const`s, helper `fn`s, and one or more `#[claspr::kernel(kernels = crate::compiled::Kernels)]` entry points.
 
 Two compilation paths run on the same source:

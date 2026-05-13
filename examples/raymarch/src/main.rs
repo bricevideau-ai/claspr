@@ -18,7 +18,6 @@
 
 use claspr::Context;
 
-#[allow(dead_code)] // SPV_BYTES + ENTRY_POINTS are exposed but not used directly here.
 mod compiled {
     include!(concat!(env!("OUT_DIR"), "/raymarch_kernels.rs"));
 }
