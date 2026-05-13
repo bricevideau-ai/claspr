@@ -9,3 +9,4 @@ description = "Single-source OpenCL with rust-gpu — runtime helpers, build-tim
 
 [dependencies]
 opencl3.workspace = true
+spirv-builder.workspace = true

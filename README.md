@@ -2,7 +2,7 @@
 
 Single-source OpenCL with [rust-gpu](https://github.com/Rust-GPU/rust-gpu) — host and device code in one Rust project, with type-safe kernel launches.
 
-> **Status:** very early scaffolding. Nothing builds yet.
+> **Status:** stage 1 (runtime helper crate) lands the API surface — `Context`, `DeviceSlice<T>`, typed `KernelArgs` tuples, `compile()` builder with presets, `Image2DRgba8`. No runnable example yet (deferred); validated by `cargo build` + `cargo doc`.
 
 ## Why
 
