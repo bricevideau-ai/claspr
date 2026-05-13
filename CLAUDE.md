@@ -19,7 +19,7 @@ User writes one source file (e.g. `examples/collatz/src/main.rs`). It contains:
 - **Top-level host code**: `use claspr::*`, `fn main`, optional `#[cfg(test)] mod tests`. No `mod compiled` — that's owned by the device module now.
 - **`#[claspr::device] mod gpu { ... }`** — the device side, in a single tagged module. Inside (user-written): kernel-only `use` statements (cfg-gated to `target_arch = "spirv"` if the host doesn't depend on those crates), `const`s, helper `fn`s, and one or more `#[claspr::kernel]` entry points (defaults to `kernels = Kernels` — the relative-path `Kernels` resolves to the one the macro injects below). Inside (macro-injected, at the end of the module body): `include!(concat!(env!("OUT_DIR"), "/kernels.rs"));` (brings `Kernels` + `Kernels::load` + `SPV_BYTES` + `ENTRY_POINTS` in) and a `pub fn kernels(ctx) -> Result<Kernels>` convenience wrapper.
 - Calling code reads `let kernels = gpu::kernels(&ctx)?;` then `kernels.collatz_kernel(&ctx, ...)`. Multiple `#[claspr::device]` modules in the same file each scope their own `Kernels`/`kernels()` — no collisions.
-- The build script writes its output to `OUT_DIR/kernels.rs` (fixed name, by convention with the include the device macro injects).
+- The build script writes one `OUT_DIR/<modname>.rs` per device module it finds — the macro's injected include matches the module ident, so module name is the only piece of coupling between the build-script side and the host source. Top-level `#[claspr::kernel]` / `#[claspr::device]` items outside any module are rejected: organise kernel code into a module so the per-module file naming has something to key off.
 
 Two compilation paths run on the same source:
 
@@ -27,13 +27,12 @@ Two compilation paths run on the same source:
    - `#[claspr::device]` on a fn → `#[allow(dead_code, unused_imports)] <fn>` (no semantic change beyond the warning suppression).
    - `#[claspr::device]` on a mod → re-emits the user's module with two extra items appended *inside* the body: an `include!(concat!(env!("OUT_DIR"), "/kernels.rs"))` (brings `Kernels`/`Kernels::load` into the module's scope) and a `pub fn kernels(&ctx) -> Result<Kernels>` convenience wrapper. The whole module is wrapped in `#[allow(dead_code, unused_imports)]`.
    - `#[claspr::kernel(kernels = path)]` (path defaults to `Kernels` — relative; resolves to the device module's local `Kernels`) parses the kernel-style fn signature, drops `#[spirv(<builtin>)]` params, translates `#[spirv(cross_workgroup)] &mut [T]` → `&claspr::DeviceSlice<T>` and `&Image!(...)` → `&claspr::Image2DRgba8`, then emits `impl path { fn name(&self, ctx, grid, args...) }`. The impl ends up inside the same module, attached to the same `Kernels` struct the include brought in. The original kernel body is discarded on the host side.
-2. **Kernel build** (driven by `examples/<name>/build.rs` calling `claspr_build::compile_from_host(src)`):
-   - Reads the same source file, parses with syn.
-   - Filter at top level: keep only `Item::Mod` with `#[claspr::device]` (lift its body verbatim) or `Item::Fn` with `#[claspr::kernel]` / `#[claspr::device]` (keep at top level). Drop everything else (`use claspr::*`, `mod compiled`, `fn main`, …).
-   - Translate `#[claspr::kernel(...)]` → `#[spirv(kernel)]`, strip `#[claspr::device]`.
-   - Write the result to `OUT_DIR/claspr_kernel_crate/src/lib.rs` with a slim `#![cfg_attr(target_arch = "spirv", no_std)]` preamble — the user's `use spirv_std::*` lines come along.
-   - Generate `Cargo.toml` for the kernel crate (with `[workspace]` so cargo doesn't try to attach it to the host workspace; spirv-std + glam deps hardcoded at the rust-gpu branch we depend on).
-   - Run `SpirvBuilder` on it, then emit a `Kernels { ... }` struct (one `pub` field per entry point + `Kernels::load(&Context)`) to the user-supplied `out_path` (typically `OUT_DIR/foo_kernels.rs`).
+2. **Kernel build** (driven by `examples/<name>/build.rs` calling `claspr_build::compile_from_host(src).opencl12().write()`):
+   - Reads the source file, parses with syn.
+   - Discovers every top-level `Item::Mod` with `#[claspr::device]`. Top-level `Item::Fn` with `#[claspr::kernel]` / `#[claspr::device]` (no enclosing module) is an error — there's no module name to use for the output file.
+   - For each device module, lifts its body verbatim into a fresh kernel sub-crate at `OUT_DIR/claspr_kernel_<modname>/`. Inside the lifted body, translates `#[claspr::kernel(...)]` → `#[spirv(kernel)]` and strips `#[claspr::device]`. Wrapper preamble is just `#![cfg_attr(target_arch = "spirv", no_std)]` — user's `use` lines come along.
+   - Writes a `Cargo.toml` for the sub-crate (with `[workspace]` so cargo doesn't try to attach it to the host workspace; spirv-std + glam deps hardcoded at the rust-gpu branch we depend on).
+   - Runs `SpirvBuilder` on each sub-crate, then writes the `Kernels { ... }` struct (one `pub` field per entry point + `Kernels::load(&Context)`) to `OUT_DIR/<modname>.rs`. The matching `#[claspr::device]` on the host side `include!()`s this exact path.
 
 ## Key files
 

@@ -492,34 +492,97 @@ impl HostBuilder {
         self.capability(Capability::Float64)
     }
 
-    /// Generate the kernel sub-crate from the host source, compile via
-    /// rust-gpu, and write the [`Kernels`-style module][module-shape]
-    /// to `out_path`.
+    /// Discover every `#[claspr::device] mod <name>` in the host
+    /// source, generate one kernel sub-crate per module, compile each
+    /// via rust-gpu, and write the corresponding [`Kernels`-style
+    /// module][module-shape] to `OUT_DIR/<name>.rs`. The
+    /// `#[claspr::device]` proc-macro on each module includes from
+    /// the matching `<name>.rs`, so module name is the only piece of
+    /// coupling between this side and the host source.
+    ///
+    /// Multiple `#[claspr::device]` modules in one source file are
+    /// fine — each gets its own kernel sub-crate, SPV blob, and
+    /// generated `Kernels`. Top-level `#[claspr::kernel]` /
+    /// `#[claspr::device]` items outside any device module are
+    /// rejected as an error: organise kernel code into a module so
+    /// the per-module file naming has something to key off.
     ///
     /// Emits `cargo:rerun-if-changed=` for the source file so changes
     /// trigger a rebuild.
     ///
     /// [module-shape]: CompileBuilder::write_to
-    pub fn write_to(self, out_path: impl AsRef<Path>) -> Result<()> {
-        let out_path = out_path.as_ref();
-
+    pub fn write(self) -> Result<()> {
         println!("cargo:rerun-if-changed={}", self.src_file.display());
 
-        // Read + parse the host source.
         let source = std::fs::read_to_string(&self.src_file)
             .map_err(|e| format!("read {}: {}", self.src_file.display(), e))?;
         let parsed: syn::File = syn::parse_str(&source)
             .map_err(|e| format!("parse {}: {}", self.src_file.display(), e))?;
 
-        // Translate #[claspr::kernel] -> #[spirv(kernel)] in-place.
-        let translated = translate_for_kernel_crate(parsed);
+        // Reject top-level marked items — they have no module name to
+        // key the output filename against.
+        for item in &parsed.items {
+            if let syn::Item::Fn(f) = item
+                && (has_any_claspr_marker(&f.attrs))
+            {
+                return Err(format!(
+                    "claspr::kernel / claspr::device on top-level fn `{}` is unsupported by \
+                     compile_from_host — wrap kernel code in `#[claspr::device] mod <name> {{ ... }}` \
+                     so the generated file can be named after the module",
+                    f.sig.ident,
+                )
+                .into());
+            }
+        }
 
-        // Materialize the generated kernel crate under OUT_DIR/claspr_kernel_crate.
+        let device_mods: Vec<&syn::ItemMod> = parsed
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Mod(m) if has_any_claspr_device_attr(&m.attrs) => Some(m),
+                _ => None,
+            })
+            .collect();
+        if device_mods.is_empty() {
+            return Err(format!(
+                "no #[claspr::device] mod found in {} — at least one is required",
+                self.src_file.display(),
+            )
+            .into());
+        }
+
         let out_dir = std::env::var("OUT_DIR").map_err(|_| "OUT_DIR not set")?;
-        let crate_dir = PathBuf::from(&out_dir).join("claspr_kernel_crate");
+        let out_dir = PathBuf::from(&out_dir);
+
+        for device_mod in device_mods {
+            self.compile_one_module(device_mod, &out_dir)?;
+        }
+        Ok(())
+    }
+
+    /// Build one device module into its own kernel sub-crate.
+    fn compile_one_module(&self, device_mod: &syn::ItemMod, out_dir: &Path) -> Result<()> {
+        let mod_name = device_mod.ident.to_string();
+
+        // Lift the module body into a fresh syn::File representing
+        // the kernel sub-crate's lib.rs contents.
+        let lifted_items: Vec<syn::Item> = device_mod
+            .content
+            .as_ref()
+            .map(|(_, items)| items.iter().cloned().map(translate_lifted_item).collect())
+            .unwrap_or_default();
+        let lifted_file = syn::File {
+            shebang: None,
+            attrs: vec![],
+            items: lifted_items,
+        };
+
+        // Materialise per-module kernel sub-crate. Distinct dir per
+        // module so multiple modules don't clobber each other.
+        let crate_dir = out_dir.join(format!("claspr_kernel_{mod_name}"));
         std::fs::create_dir_all(crate_dir.join("src"))?;
         write_generated_cargo_toml(&crate_dir)?;
-        write_generated_lib_rs(&crate_dir, &translated)?;
+        write_generated_lib_rs(&crate_dir, &lifted_file)?;
 
         // Compile via spirv-builder.
         let mut sb = SpirvBuilder::new(&crate_dir, &self.target_env);
@@ -532,67 +595,12 @@ impl HostBuilder {
         let result: CompileResult = sb.build()?;
         let spv_path = result.module.unwrap_single().to_path_buf();
 
-        // Emit the Kernels module — same shape as the explicit-kernel-crate
-        // flow, but without typed methods (those come from the
-        // proc-macro on the host stub).
+        // Emit the Kernels module to OUT_DIR/<mod_name>.rs — this
+        // is what `#[claspr::device] mod <name>` includes!() from.
+        let module_out_path = out_dir.join(format!("{mod_name}.rs"));
         let generated = generate_module_source(&spv_path, &result.entry_points, &[], &crate_dir)?;
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(out_path, generated)?;
+        std::fs::write(&module_out_path, generated)?;
         Ok(())
-    }
-}
-
-/// Walk the host source, **filter to kernel-side items**, and translate
-/// claspr attributes into their rust-gpu equivalents.
-///
-/// Three flavours of opt-in are recognised at the top level
-/// (everything else is dropped):
-///
-/// - `fn` items with `#[claspr::kernel(...)]` — translated to
-///   `#[spirv(kernel)]`. The `kernels = ...` argument from the host
-///   side is stripped (rust-gpu's `#[spirv(kernel)]` takes no args).
-/// - `fn` items with `#[claspr::device]` — kept as a regular fn,
-///   marker attribute removed.
-/// - `mod` items with `#[claspr::device]` — the **whole module body**
-///   is lifted into the generated kernel crate (use statements,
-///   consts, statics, helper fns, type defs, even nested modules).
-///   Inside the lifted body, `#[claspr::kernel]` attrs still get
-///   translated to `#[spirv(kernel)]`. The module wrapper itself is
-///   discarded; its contents become top-level items in the kernel
-///   lib.rs. This is the right tool for non-trivial kernels with a
-///   lot of shared state — one marker covers all of it.
-///
-/// This filter is the linchpin of single-file single-source mode:
-/// it lets `use claspr::Context`, `mod compiled { include!(...) }`,
-/// and `fn main()` sit alongside kernel definitions in `src/main.rs`
-/// without breaking the no-std SPIR-V build of the extracted kernel
-/// crate.
-fn translate_for_kernel_crate(file: syn::File) -> syn::File {
-    let mut out_items: Vec<syn::Item> = Vec::new();
-    for item in file.items {
-        match item {
-            // `#[claspr::device] mod ...` — lift the whole module body.
-            syn::Item::Mod(m) if has_any_claspr_device_attr(&m.attrs) => {
-                if let Some((_brace, inner)) = m.content {
-                    for inner_item in inner {
-                        out_items.push(translate_lifted_item(inner_item));
-                    }
-                }
-                // module wrapper (and its #[claspr::device] / #[allow] attrs) discarded
-            }
-            // `#[claspr::kernel(...)]` or `#[claspr::device]` on a free fn
-            syn::Item::Fn(mut f) if has_any_claspr_marker(&f.attrs) => {
-                translate_fn_attrs(&mut f.attrs);
-                out_items.push(syn::Item::Fn(f));
-            }
-            _ => {} // dropped: host-only items
-        }
-    }
-    syn::File {
-        items: out_items,
-        ..file
     }
 }
 

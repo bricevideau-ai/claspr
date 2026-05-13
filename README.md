@@ -59,16 +59,12 @@ fn main() -> claspr::Result<()> {
 ```rust
 // build.rs
 fn main() {
-    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("kernels.rs");
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
-    claspr_build::compile_from_host(&src)
-        .opencl12()
-        .write_to(&out)
-        .unwrap();
+    claspr_build::compile_from_host(&src).opencl12().write().unwrap();
 }
 ```
 
-That's the whole thing. The kernel function lives once, in the `#[claspr::device] mod`. claspr-build extracts that module's body into a generated kernel sub-crate compiled by rust-gpu; `#[claspr::device]` injects an `include!()` of the build-script-generated `Kernels` struct *inside* the device module (so it's scoped to `gpu::Kernels`) plus a `pub fn kernels(&ctx) -> Result<Kernels>` convenience wrapper; the proc-macro emits a typed launch method on `Kernels` for each `#[claspr::kernel]` function (resolving to the device module's local `Kernels` by default). The host can also call `gpu::collatz(...)` for validation — same source, two consumers. Multiple `#[claspr::device]` modules in the same file each get their own `Kernels` (no collisions).
+That's the whole thing. The kernel function lives once, in the `#[claspr::device] mod`. claspr-build extracts the module's body into a generated kernel sub-crate compiled by rust-gpu; for each device module `<name>` it finds, output is written to `OUT_DIR/<name>.rs`. `#[claspr::device]` on the matching host module injects an `include!()` of that file *inside* the module (so `Kernels` ends up scoped to `gpu::Kernels`) plus a `pub fn kernels(&ctx) -> Result<Kernels>` convenience wrapper; the `#[claspr::kernel]` proc-macro emits a typed launch method on `Kernels` for each function (resolving to the local `Kernels` by default). The host can also call `gpu::collatz(...)` for validation — same source, two consumers. Multiple `#[claspr::device]` modules in the same file each map to their own `OUT_DIR/<name>.rs` and own `Kernels` — no collisions.
 
 ## Workspace layout
 

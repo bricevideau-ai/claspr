@@ -1,23 +1,16 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn main() {
-    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
-    // Convention: write to `OUT_DIR/kernels.rs`, which is what the
-    // `#[claspr::device]` proc-macro's auto-generated
-    // `mod compiled { include!(...) }` expects.
-    let out_path = PathBuf::from(out_dir).join("kernels.rs");
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
 
-    // Single-source mode: read kernel functions out of the host crate's
-    // own source file. `claspr-build` translates #[claspr::kernel] to
-    // #[spirv(kernel)], generates a kernel sub-crate under OUT_DIR, and
-    // compiles via rust-gpu. Whatever entry points it finds become
-    // public fields on the generated `Kernels` struct; the host launch
-    // wrappers are emitted by the `#[claspr::kernel]` proc-macro on
-    // the same source, so `.kernel(...)` declarations aren't needed
-    // here any more.
+    // Single-source mode: read kernel functions out of the host
+    // crate's own source file. `claspr-build` writes one
+    // `OUT_DIR/<modname>.rs` per `#[claspr::device]` module it finds
+    // — the matching `#[claspr::device]` proc-macro on the host side
+    // includes from the same path, so module name is the only
+    // coupling.
     claspr_build::compile_from_host(&src)
         .opencl12()
-        .write_to(&out_path)
+        .write()
         .expect("compile collatz kernel from host source");
 }

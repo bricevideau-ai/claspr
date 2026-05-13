@@ -149,13 +149,17 @@ pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
     if let Ok(syn::Item::Mod(mut item_mod)) = parsed {
         if let Some((_, items)) = &mut item_mod.content {
             // Append the include and the convenience `kernels()` fn
-            // *inside* the user's module body. Order doesn't matter
-            // for type/method resolution within a module — the impl
-            // blocks emitted by `#[claspr::kernel]` (also inside this
-            // module) find `Kernels` regardless of where the include
-            // lands.
+            // *inside* the user's module body. Filename matches the
+            // module name so multiple `#[claspr::device]` modules in
+            // the same file don't share output (build script writes
+            // `OUT_DIR/<modname>.rs` per device module). Order
+            // doesn't matter for type/method resolution within a
+            // module — the impl blocks emitted by `#[claspr::kernel]`
+            // (also inside this module) find `Kernels` regardless of
+            // where the include lands.
+            let mod_filename = format!("/{}.rs", item_mod.ident);
             let include_item: syn::Item = syn::parse_quote! {
-                include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
+                include!(concat!(env!("OUT_DIR"), #mod_filename));
             };
             let kernels_fn: syn::Item = syn::parse_quote! {
                 /// Build the program from the embedded SPIR-V and look up every entry point.
