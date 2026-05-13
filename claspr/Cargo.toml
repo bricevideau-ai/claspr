@@ -1,0 +1,11 @@
+[package]
+name = "claspr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Single-source OpenCL with rust-gpu — runtime helpers, build-time codegen, and a proc-macro frontend"
+
+[dependencies]
+opencl3.workspace = true

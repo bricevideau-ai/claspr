@@ -1,0 +1,8 @@
+[toolchain]
+channel = "nightly-2026-04-11"
+components = ["rust-src", "rustc-dev", "llvm-tools"]
+# commit_hash = 02c7f9bec0fd583160f8bcccb830216023b07bee
+
+# Pinned to match `bricevideau-ai/rust-gpu` opencl-kernel-support. When
+# bumping rust-gpu, sync this channel + commit hash with the rust-gpu
+# rust-toolchain.toml.

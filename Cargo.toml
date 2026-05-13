@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "claspr",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/bricevideau-ai/claspr"
+authors = ["Brice Videau <brice.ai.videau@gmail.com>"]
+
+[workspace.dependencies]
+opencl3 = "0.12"
+spirv-builder = { git = "https://github.com/bricevideau-ai/rust-gpu.git", branch = "opencl-kernel-support", default-features = false, features = ["use-compiled-tools"] }
+spirv-std = { git = "https://github.com/bricevideau-ai/rust-gpu.git", branch = "opencl-kernel-support" }
