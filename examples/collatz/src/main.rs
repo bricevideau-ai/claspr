@@ -19,10 +19,6 @@
 
 use claspr::Context;
 
-mod compiled {
-    include!(concat!(env!("OUT_DIR"), "/collatz_kernels.rs"));
-}
-
 #[claspr::device]
 mod gpu {
     // `spirv` is the proc-macro that recognises `#[spirv(kernel)]` and
@@ -58,7 +54,7 @@ mod gpu {
         Some(i)
     }
 
-    #[claspr::kernel(kernels = crate::compiled::Kernels)]
+    #[claspr::kernel]
     pub fn collatz_kernel(
         #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [u32],

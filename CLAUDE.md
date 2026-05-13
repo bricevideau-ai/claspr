@@ -16,14 +16,16 @@ examples/raymarch/     larger demo (consts, helpers, image kernel)
 
 User writes one source file (e.g. `examples/collatz/src/main.rs`). It contains:
 
-- **Top-level host code**: `use claspr::*`, `mod compiled { include!(concat!(env!("OUT_DIR"), "/foo_kernels.rs")) }` (the generated file tags `SPV_BYTES`/`ENTRY_POINTS` with per-item `#[allow(dead_code)]`, so the user doesn't need to suppress unused-const warnings — `include!()` doesn't accept inner attributes, hence per-item rather than `#![allow]` at the top), `fn main`, optional `#[cfg(test)] mod tests`.
-- **`#[claspr::device] mod gpu { ... }`** — the device side, in a single tagged module. Inside: kernel-only `use` statements (cfg-gated to `target_arch = "spirv"` if the host doesn't depend on those crates), `const`s, helper `fn`s, and one or more `#[claspr::kernel(kernels = crate::compiled::Kernels)]` entry points.
+- **Top-level host code**: `use claspr::*`, `fn main`, optional `#[cfg(test)] mod tests`. The `mod compiled { include!(...) }` block is **synthesised by `#[claspr::device]`** — the user doesn't write it.
+- **`#[claspr::device] mod gpu { ... }`** — the device side, in a single tagged module. Inside: kernel-only `use` statements (cfg-gated to `target_arch = "spirv"` if the host doesn't depend on those crates), `const`s, helper `fn`s, and one or more `#[claspr::kernel]` entry points (defaults to `kernels = crate::compiled::Kernels`).
+- The build script writes its output to `OUT_DIR/kernels.rs` (fixed name, by convention with the `#[claspr::device]` macro's auto-include).
 
 Two compilation paths run on the same source:
 
 1. **Host build** (cargo's normal flow). The proc-macros do the heavy lifting:
-   - `#[claspr::device]` → `#[allow(dead_code, unused_imports)] <item>` (no semantic change)
-   - `#[claspr::kernel(kernels = path)]` parses the kernel-style fn signature, drops `#[spirv(<builtin>)]` params, translates `#[spirv(cross_workgroup)] &mut [T]` → `&claspr::DeviceSlice<T>` and `&Image!(...)` → `&claspr::Image2DRgba8`, then emits `impl path { fn name(&self, ctx, grid, args...) }`. The original kernel body is discarded on the host side.
+   - `#[claspr::device]` on a fn → `#[allow(dead_code, unused_imports)] <fn>` (no semantic change beyond the warning suppression).
+   - `#[claspr::device]` on a mod → emits a sibling `mod compiled { include!(concat!(env!("OUT_DIR"), "/kernels.rs")); }` *plus* the user's module wrapped in the same `#[allow(...)]`. So at the host build, `crate::compiled::Kernels` resolves to whatever claspr-build wrote.
+   - `#[claspr::kernel(kernels = path)]` (path defaults to `crate::compiled::Kernels`) parses the kernel-style fn signature, drops `#[spirv(<builtin>)]` params, translates `#[spirv(cross_workgroup)] &mut [T]` → `&claspr::DeviceSlice<T>` and `&Image!(...)` → `&claspr::Image2DRgba8`, then emits `impl path { fn name(&self, ctx, grid, args...) }`. The original kernel body is discarded on the host side.
 2. **Kernel build** (driven by `examples/<name>/build.rs` calling `claspr_build::compile_from_host(src)`):
    - Reads the same source file, parses with syn.
    - Filter at top level: keep only `Item::Mod` with `#[claspr::device]` (lift its body verbatim) or `Item::Fn` with `#[claspr::kernel]` / `#[claspr::device]` (keep at top level). Drop everything else (`use claspr::*`, `mod compiled`, `fn main`, …).

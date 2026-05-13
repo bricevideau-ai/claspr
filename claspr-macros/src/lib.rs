@@ -97,12 +97,22 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// adds `#[allow(dead_code)]` so the host doesn't warn when only the
 /// kernel-side compilation actually uses the function.
 ///
-/// On a **module**, the *whole module body* gets lifted into the
-/// generated kernel crate — every `use`, `const`, `static`, helper
-/// `fn`, type definition, even nested modules. This is the right tool
-/// for non-trivial kernels with a lot of shared state (constants,
-/// helper functions). The host still sees the module normally and can
-/// call into it (`gpu::pixel_color(...)`) for validation.
+/// On a **module**, the macro does *two* things:
+///
+/// 1. Lifts the whole module body into the generated kernel crate at
+///    build time — every `use`, `const`, `static`, helper `fn`, type
+///    def, even nested modules.
+/// 2. Materialises a sibling `mod compiled { include!(concat!(env!("OUT_DIR"), "/kernels.rs")); }`
+///    block at the same scope (typically the host crate root). That
+///    module holds the build-script-generated `Kernels` struct +
+///    `Kernels::load(&Context)`, and `#[claspr::kernel]` defaults to
+///    targeting `crate::compiled::Kernels` when the path isn't
+///    specified — so kernel definitions inside the device module
+///    don't have to repeat the path.
+///
+/// The build script must write its output to `OUT_DIR/kernels.rs` for
+/// step 2 to find it. (`claspr_build::compile_from_host(...).write_to(...)`
+/// — set the path to `format!("{}/kernels.rs", env::var("OUT_DIR")?)`.)
 ///
 /// ```ignore
 /// #[claspr::device]
@@ -112,30 +122,47 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 ///     pub fn helper(p: Float3) -> f32 { /* shared host+device helper */ }
 ///
-///     #[claspr::kernel(kernels = crate::compiled::Kernels)]
+///     #[claspr::kernel] // defaults to `kernels = crate::compiled::Kernels`
 ///     pub fn raymarch(/* ... */) { /* uses RADIUS, helper, etc. */ }
 /// }
+///
+/// // host code can use `compiled::Kernels::load(&ctx)?` — the module
+/// // exists thanks to step 2 above, no manual `include!()` needed.
 /// ```
 ///
-/// Items without `#[claspr::kernel]` or `#[claspr::device]` are
-/// host-only — `claspr-build` skips them when generating the kernel
-/// crate, so things like `use claspr::*` and `fn main()` can sit
-/// alongside the device module without breaking the no-std SPIR-V
-/// build.
+/// Items at the same scope as the device module that aren't tagged
+/// `#[claspr::kernel]` or `#[claspr::device]` are host-only —
+/// `claspr-build` skips them when generating the kernel crate, so
+/// things like `use claspr::*` and `fn main()` work normally.
 #[proc_macro_attribute]
 pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let item: TokenStream2 = item.into();
+    let item_ts: TokenStream2 = item.into();
     // `#[allow(...)]` on a `mod` propagates to its inner items, so
     // this works for both function and module forms. `unused_imports`
     // is in there because a device module's `use` statements typically
     // look unused on the host (the kernel body that uses them is
     // discarded by `#[claspr::kernel]`), but we still need them for
     // the kernel-crate compilation.
-    quote! {
+    let tagged = quote! {
         #[allow(dead_code, unused_imports)]
-        #item
+        #item_ts
+    };
+    // For the module form, also synthesise the `mod compiled { ... }`
+    // sibling that holds the build-script-generated `Kernels` struct.
+    // Detect "is module" cheaply by re-parsing the item — costs a
+    // syn::parse2 per invocation, but `#[claspr::device]` shows up at
+    // most a handful of times per crate.
+    if let Ok(syn::Item::Mod(_)) = syn::parse2::<syn::Item>(item_ts) {
+        quote! {
+            mod compiled {
+                include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
+            }
+            #tagged
+        }
+        .into()
+    } else {
+        tagged.into()
     }
-    .into()
 }
 
 struct AttrArgs {
@@ -157,13 +184,13 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<AttrArgs> {
         }
     });
     syn::parse::Parser::parse(parser, attr)?;
-    let kernels = kernels.ok_or_else(|| {
-        syn::Error::new(
-            proc_macro2::Span::call_site(),
-            "claspr::kernel requires `kernels = path::to::Kernels` to point at the build-script-\
-             generated Kernels struct",
-        )
-    })?;
+    // Default to `crate::compiled::Kernels` — the path
+    // `#[claspr::device] mod ...` synthesises at the same scope as
+    // the device module (assumed to be the crate root). Override with
+    // the explicit `kernels = ...` argument when the build script
+    // writes to a non-default location or the kernels module lives
+    // somewhere else.
+    let kernels = kernels.unwrap_or_else(|| syn::parse_quote!(crate::compiled::Kernels));
     Ok(AttrArgs { kernels })
 }
 

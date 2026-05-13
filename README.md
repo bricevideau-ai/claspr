@@ -9,10 +9,6 @@ Single-source OpenCL with [rust-gpu](https://github.com/Rust-GPU/rust-gpu) — k
 ```rust
 use claspr::Context;
 
-mod compiled {
-    include!(concat!(env!("OUT_DIR"), "/collatz_kernels.rs"));
-}
-
 #[claspr::device]
 mod gpu {
     #[cfg(target_arch = "spirv")]
@@ -30,7 +26,7 @@ mod gpu {
         Some(i)
     }
 
-    #[claspr::kernel(kernels = crate::compiled::Kernels)]
+    #[claspr::kernel]
     pub fn collatz_kernel(
         #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [u32],
@@ -63,8 +59,7 @@ fn main() -> claspr::Result<()> {
 ```rust
 // build.rs
 fn main() {
-    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap())
-        .join("collatz_kernels.rs");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("kernels.rs");
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
     claspr_build::compile_from_host(&src)
         .opencl12()
@@ -73,7 +68,7 @@ fn main() {
 }
 ```
 
-That's the whole thing. The kernel function lives once, in the `#[claspr::device] mod`. claspr-build extracts that module's body into a generated kernel sub-crate compiled by rust-gpu; the proc-macro emits a typed launch method on `compiled::Kernels` for each `#[claspr::kernel]` function. The host can also call `gpu::collatz(...)` for validation — same source, two consumers.
+That's the whole thing. The kernel function lives once, in the `#[claspr::device] mod`. claspr-build extracts that module's body into a generated kernel sub-crate compiled by rust-gpu; `#[claspr::device]` synthesises a sibling `mod compiled { include!(...) }` block that pulls in the build-script-generated `Kernels` struct (so the user doesn't have to write the include themselves); the proc-macro emits a typed launch method on `compiled::Kernels` for each `#[claspr::kernel]` function (defaulting to that path when not specified). The host can also call `gpu::collatz(...)` for validation — same source, two consumers.
 
 ## Workspace layout
 

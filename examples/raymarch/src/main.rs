@@ -18,10 +18,6 @@
 
 use claspr::Context;
 
-mod compiled {
-    include!(concat!(env!("OUT_DIR"), "/raymarch_kernels.rs"));
-}
-
 #[claspr::device]
 mod gpu {
     use spirv_std::arch::opencl_std as ocl;
@@ -200,7 +196,7 @@ mod gpu {
         }
     }
 
-    #[claspr::kernel(kernels = crate::compiled::Kernels)]
+    #[claspr::kernel]
     pub fn raymarch(
         #[spirv(global_invocation_id)] id: USizeVec3,
         image: &mut Image!(2D, type=u32, sampled=false),
