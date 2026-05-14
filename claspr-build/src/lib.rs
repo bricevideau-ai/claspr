@@ -5,7 +5,57 @@
 //! embeds the SPIR-V bytes and pre-built kernels into a typed
 //! `Kernels` struct.
 //!
-//! Use from a downstream crate's `build.rs`:
+//! Two entry points, picked by where the kernel source lives:
+//!
+//! - [`compile_from_host`] — single-source mode. Kernel functions
+//!   live alongside host code in the host crate's own source file,
+//!   wrapped in `#[claspr::device] mod <name> { ... }`. The build
+//!   script extracts each device module into a generated kernel
+//!   sub-crate, compiles via rust-gpu, and writes
+//!   `OUT_DIR/<name>.rs`. The matching `#[claspr::device]` proc-macro
+//!   on the host side `include!()`s that file. This is what both
+//!   in-tree examples (collatz, raymarch) use.
+//! - [`compile`] — explicit mode. The kernel lives in a separate
+//!   crate; the build script names entry points and their typed
+//!   launch signatures by hand. Useful when the kernel sources are
+//!   shared between projects or maintained independently of any
+//!   single host crate.
+//!
+//! ## Single-source: `compile_from_host`
+//!
+//! ```ignore
+//! // build.rs
+//! fn main() {
+//!     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+//!     claspr_build::compile_from_host(&src).opencl12().write().unwrap();
+//! }
+//! ```
+//!
+//! ```ignore
+//! // src/main.rs
+//! use claspr::Context;
+//!
+//! #[claspr::device]
+//! mod gpu {
+//!     #[cfg(target_arch = "spirv")]
+//!     use spirv_std::spirv;
+//!
+//!     #[claspr::kernel]
+//!     pub fn collatz_kernel(
+//!         #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+//!         #[spirv(cross_workgroup)] data: &mut [u32],
+//!     ) { /* ... */ }
+//! }
+//!
+//! fn main() -> claspr::Result<()> {
+//!     let ctx = Context::new()?;
+//!     let kernels = gpu::kernels(&ctx)?;
+//!     // kernels.collatz_kernel(&ctx, [n], &buf)?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Explicit: `compile` + manual kernel declarations
 //!
 //! ```ignore
 //! // build.rs
@@ -22,8 +72,6 @@
 //! }
 //! ```
 //!
-//! Then in your library/binary:
-//!
 //! ```ignore
 //! mod kernels {
 //!     include!(concat!(env!("OUT_DIR"), "/collatz_kernels.rs"));
@@ -36,21 +84,21 @@
 //!
 //! ## Typed launch wrappers
 //!
-//! For each kernel the build script declares via [`CompileBuilder::kernel`],
-//! the generated module emits a typed launch method on `Kernels` so the
-//! call site reads:
+//! Both flows produce a `Kernels` struct with one field per entry
+//! point and a `Kernels::load(&ctx)` constructor. Single-source mode
+//! gets the typed launch methods from the [`#[claspr::kernel]`][kernel-macro]
+//! proc-macro (which sees the kernel's signature directly). Explicit
+//! mode gets them from each [`CompileBuilder::kernel`] call's
+//! `(name, type)` pairs. Either way the call site reads:
 //!
 //! ```ignore
 //! kernels.collatz_kernel(&ctx, [n], &buf)?;
 //! ```
 //!
-//! instead of the raw [`claspr::Context::launch`] form. We don't reflect
-//! the SPIR-V to discover signatures because the long-term plan
-//! (stage 3 proc-macro) will know them from the kernel function
-//! definition — explicit declaration here is the same shape the
-//! proc-macro will emit.
+//! instead of the raw [`claspr::Context::launch`] form.
 //!
 //! [`claspr::Context::launch`]: https://docs.rs/claspr
+//! [kernel-macro]: https://docs.rs/claspr_macros
 //! [claspr]: https://github.com/bricevideau-ai/claspr
 
 use quote::ToTokens;

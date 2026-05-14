@@ -116,9 +116,10 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// in the same file without colliding (they live in different
 /// module-namespaces).
 ///
-/// The build script must write to `OUT_DIR/kernels.rs` for step 2 to
-/// find the generated module — set
-/// `claspr_build::compile_from_host(...).write_to(...)` accordingly.
+/// The build script must write to `OUT_DIR/<modname>.rs` for step 2
+/// to find the generated module — `claspr_build::compile_from_host(...).write()`
+/// derives the filename from each `#[claspr::device] mod <name>` it
+/// discovers, so the coupling matches automatically.
 ///
 /// ```ignore
 /// #[claspr::device]
