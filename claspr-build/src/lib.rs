@@ -111,6 +111,47 @@ use std::path::{Path, PathBuf};
 /// Boxed-error result alias used by all [`claspr_build`] entry points.
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync + 'static>>;
 
+/// Deferred-construction settings for [`SpirvBuilder`].
+///
+/// Both [`CompileBuilder`] and [`HostBuilder`] embed one and apply it
+/// to a fresh [`SpirvBuilder`] at terminal-call time. Call order
+/// doesn't matter — `target_env` no longer rebuilds anything mid-chain.
+#[derive(Default)]
+struct SpirvBuilderSettings {
+    target_env: String,
+    capabilities: Vec<Capability>,
+    panic_strategy: Option<ShaderPanicStrategy>,
+    customizers: Vec<Box<dyn Fn(SpirvBuilder) -> SpirvBuilder>>,
+}
+
+impl SpirvBuilderSettings {
+    fn new() -> Self {
+        Self {
+            target_env: "spirv-unknown-opencl1.2".to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// Build a fresh [`SpirvBuilder`] for `crate_path` with these
+    /// settings + customizers applied.
+    ///
+    /// Takes `&self` so [`HostBuilder::write`] can call this once per
+    /// device module without consuming the settings.
+    fn apply_to(&self, crate_path: &Path) -> SpirvBuilder {
+        let mut sb = SpirvBuilder::new(crate_path, &self.target_env);
+        for cap in &self.capabilities {
+            sb = sb.capability(*cap);
+        }
+        if let Some(ps) = self.panic_strategy {
+            sb = sb.shader_panic_strategy(ps);
+        }
+        for f in &self.customizers {
+            sb = f(sb);
+        }
+        sb
+    }
+}
+
 /// Builder for compiling a kernel crate at build time and emitting
 /// generated Rust source.
 ///
@@ -122,7 +163,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync + 'stati
 ///
 /// [`write_to`]: Self::write_to
 pub struct CompileBuilder {
-    inner: SpirvBuilder,
+    settings: SpirvBuilderSettings,
     crate_path: PathBuf,
     kernels: Vec<KernelDecl>,
 }
@@ -147,10 +188,9 @@ pub fn compile(path: impl AsRef<Path>) -> CompileBuilder {
 impl CompileBuilder {
     /// Equivalent to the free function [`compile`].
     pub fn new(path: impl AsRef<Path>) -> Self {
-        let crate_path = path.as_ref().to_path_buf();
         Self {
-            inner: SpirvBuilder::new(&crate_path, "spirv-unknown-opencl1.2"),
-            crate_path,
+            settings: SpirvBuilderSettings::new(),
+            crate_path: path.as_ref().to_path_buf(),
             kernels: Vec::new(),
         }
     }
@@ -198,30 +238,31 @@ impl CompileBuilder {
     }
 
     /// Set the SPIR-V target environment string passed to rust-gpu
-    /// (e.g. `"spirv-unknown-opencl2.0"`).
-    ///
-    /// Switching target rebuilds the underlying [`SpirvBuilder`], so
-    /// call this **before** `capability` / `panic_strategy` / `with`.
+    /// (e.g. `"spirv-unknown-opencl2.0"`). Call order is irrelevant —
+    /// settings accumulate and apply when [`build`][Self::build] runs.
     pub fn target_env(mut self, target: impl Into<String>) -> Self {
-        self.inner = SpirvBuilder::new(&self.crate_path, target);
+        self.settings.target_env = target.into();
         self
     }
 
     /// Add a SPIR-V capability the kernel needs (e.g. `Capability::Float64`).
     pub fn capability(mut self, cap: Capability) -> Self {
-        self.inner = self.inner.capability(cap);
+        self.settings.capabilities.push(cap);
         self
     }
 
     /// Set the panic strategy used by SPIR-T to lower `panic!`/`abort`.
     pub fn panic_strategy(mut self, strategy: ShaderPanicStrategy) -> Self {
-        self.inner = self.inner.shader_panic_strategy(strategy);
+        self.settings.panic_strategy = Some(strategy);
         self
     }
 
-    /// Escape hatch for settings claspr-build doesn't wrap.
-    pub fn with(mut self, f: impl FnOnce(SpirvBuilder) -> SpirvBuilder) -> Self {
-        self.inner = f(self.inner);
+    /// Escape hatch for settings claspr-build doesn't wrap. Multiple
+    /// `with` calls accumulate; closures fire in call order at
+    /// terminal-call time, after the inherent setters and presets
+    /// have been applied.
+    pub fn with(mut self, f: impl Fn(SpirvBuilder) -> SpirvBuilder + 'static) -> Self {
+        self.settings.customizers.push(Box::new(f));
         self
     }
 
@@ -280,10 +321,9 @@ impl CompileBuilder {
         // re-runs when the kernel source changes.
         emit_rerun_if_changed(&self.crate_path);
 
-        let crate_path = self.crate_path.clone();
-        let kernels = self.kernels;
-        let result: CompileResult = self.inner.build()?;
+        let result: CompileResult = self.settings.apply_to(&self.crate_path).build()?;
         let spv_path = result.module.unwrap_single().to_path_buf();
+        let kernels = self.kernels;
 
         // Cross-check: every declared kernel must exist in the module.
         for decl in &kernels {
@@ -298,7 +338,7 @@ impl CompileBuilder {
         }
 
         let generated =
-            generate_module_source(&spv_path, &result.entry_points, &kernels, &crate_path)?;
+            generate_module_source(&spv_path, &result.entry_points, &kernels, &self.crate_path)?;
 
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -478,37 +518,43 @@ pub fn compile_from_host(src_file: impl AsRef<Path>) -> HostBuilder {
 ///
 /// [`write_to`]: Self::write_to
 pub struct HostBuilder {
+    settings: SpirvBuilderSettings,
     src_file: PathBuf,
-    target_env: String,
-    capabilities: Vec<Capability>,
-    panic_strategy: Option<ShaderPanicStrategy>,
 }
 
 impl HostBuilder {
     fn new(src_file: impl AsRef<Path>) -> Self {
         Self {
+            settings: SpirvBuilderSettings::new(),
             src_file: src_file.as_ref().to_path_buf(),
-            target_env: "spirv-unknown-opencl1.2".to_string(),
-            capabilities: Vec::new(),
-            panic_strategy: None,
         }
     }
 
     /// Set the SPIR-V target environment string.
     pub fn target_env(mut self, target: impl Into<String>) -> Self {
-        self.target_env = target.into();
+        self.settings.target_env = target.into();
         self
     }
 
     /// Add a SPIR-V capability the kernels need.
     pub fn capability(mut self, cap: Capability) -> Self {
-        self.capabilities.push(cap);
+        self.settings.capabilities.push(cap);
         self
     }
 
     /// Set the panic strategy.
     pub fn panic_strategy(mut self, strategy: ShaderPanicStrategy) -> Self {
-        self.panic_strategy = Some(strategy);
+        self.settings.panic_strategy = Some(strategy);
+        self
+    }
+
+    /// Escape hatch for settings claspr-build doesn't wrap. Multiple
+    /// `with` calls accumulate; closures fire in call order at build
+    /// time, after the inherent setters and presets have been
+    /// applied. Each device module's [`SpirvBuilder`] gets the
+    /// customizations independently.
+    pub fn with(mut self, f: impl Fn(SpirvBuilder) -> SpirvBuilder + 'static) -> Self {
+        self.settings.customizers.push(Box::new(f));
         self
     }
 
@@ -633,14 +679,7 @@ impl HostBuilder {
         write_generated_lib_rs(&crate_dir, &lifted_file)?;
 
         // Compile via spirv-builder.
-        let mut sb = SpirvBuilder::new(&crate_dir, &self.target_env);
-        for cap in &self.capabilities {
-            sb = sb.capability(*cap);
-        }
-        if let Some(ps) = self.panic_strategy {
-            sb = sb.shader_panic_strategy(ps);
-        }
-        let result: CompileResult = sb.build()?;
+        let result: CompileResult = self.settings.apply_to(&crate_dir).build()?;
         let spv_path = result.module.unwrap_single().to_path_buf();
 
         // Emit the Kernels module to OUT_DIR/<mod_name>.rs — this
