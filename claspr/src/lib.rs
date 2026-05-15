@@ -59,6 +59,7 @@
 
 pub mod buffer;
 pub mod context;
+pub mod device;
 pub mod error;
 pub mod image;
 pub mod launch;
@@ -68,6 +69,7 @@ pub mod ppm;
 
 pub use buffer::DeviceSlice;
 pub use context::Context;
+pub use device::{Device, DeviceType, Platform};
 pub use error::{Error, Result};
 pub use image::Image2DRgba8;
 pub use launch::{
