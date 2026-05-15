@@ -1,6 +1,17 @@
-//! Single-file claspr example: a ray-marched signed-distance-field
+//! Multi-file claspr example: a ray-marched signed-distance-field
 //! scene with sun lighting + soft shadows + distance fog. Writes the
-//! result to `raymarch.ppm`.
+//! result to `raymarch.ppm`. Demonstrates that a `#[claspr::device]`
+//! module can be split across files using ordinary `mod foo;`
+//! declarations — claspr-build follows them with rustc's normal
+//! file-resolution rules and inlines the bodies into the generated
+//! kernel sub-crate.
+//!
+//! `#![feature(proc_macro_hygiene)]` is required at crate level
+//! because `mod foo;` (file modules) inside a proc-macro's input is
+//! gated by that feature on nightly (rust-lang/rust#54727). Single-
+//! file kernel modules don't need it; only the multi-file form does.
+#![feature(proc_macro_hygiene)]
+
 //!
 //! Layout mirrors `examples/collatz`: top-level is host code (use
 //! statements, `mod compiled`, `fn main`), and the entire device side
@@ -20,151 +31,30 @@ use claspr::Context;
 
 #[claspr::device]
 mod gpu {
+    // Submodules — bodies live in src/gpu/scene.rs and src/gpu/shading.rs.
+    // claspr-build follows these `mod` declarations the same way rustc
+    // does, inlining each file into the generated kernel sub-crate.
+    pub mod scene;
+    pub mod shading;
+
     use spirv_std::Image;
-    use spirv_std::arch::opencl_std as ocl;
     use spirv_std::cl::{Float3, Int2};
     use spirv_std::glam::{USizeVec3, UVec4};
 
-    // `spirv` is in scope via claspr-build's preamble (it injects
-    // `use spirv_std::spirv;` into the generated kernel crate), so
-    // we don't need to import it here.
-
-    // f32::cos/sin/powf/exp on bare `f32` (no std) need
-    // `num_traits::Float` in scope on the kernel side — the libm
-    // intercept then rewrites them to `OpExtInst <OpenCL.std> {cos,
-    // sin, pow, exp, …}`. On host they come from std, so the import
-    // is unused there — cfg-gate to keep the host build clean.
+    // f32::exp on bare `f32` (no std) needs `num_traits::Float` in
+    // scope on the kernel side — the libm intercept rewrites it to
+    // `OpExtInst <OpenCL.std> exp`. On host it comes from std.
     #[cfg(target_arch = "spirv")]
     use spirv_std::num_traits::Float;
 
-    // ── Numeric tolerances ─────────────────────────────────────
-    pub const EPSILON: f32 = 0.001;
-
-    // ── Scene ──────────────────────────────────────────────────
-    pub const SPHERE_A: Float3 = Float3::new(-0.7, 0.0, 0.0);
-    pub const SPHERE_B: Float3 = Float3::new(0.6, -0.2, 0.0);
-    pub const RADIUS_A: f32 = 0.9;
-    pub const RADIUS_B: f32 = 0.7;
-    pub const GROUND_Y: f32 = -0.9;
-    pub const SMIN_K: f32 = 0.45;
-    pub const GROUND_BIAS: f32 = 0.01;
-
-    // ── Primary ray march ──────────────────────────────────────
-    pub const MAX_STEPS: u32 = 96;
-    pub const MAX_DIST: f32 = 30.0;
-
-    // ── Soft-shadow march ──────────────────────────────────────
-    pub const SHADOW_STEPS: u32 = 32;
-    pub const SHADOW_MAX_DIST: f32 = 12.0;
-    pub const SHADOW_T_START: f32 = 0.02;
-    pub const SHADOW_K: f32 = 8.0;
-    pub const SHADOW_STEP_MIN: f32 = 0.05;
-    pub const SHADOW_STEP_MAX: f32 = 0.5;
+    use scene::{GROUND_BIAS, GROUND_Y, march, ray_at, scene_normal};
+    use shading::{COLOR_BLOB, COLOR_GROUND, FOG_DENSITY, shade, sky, sun_dir};
 
     // ── Camera ─────────────────────────────────────────────────
     pub const CAM_RO: Float3 = Float3::new(3.0, 1.6, 4.0);
     pub const CAM_TARGET: Float3 = Float3::ZERO;
     pub const CAM_WORLD_UP: Float3 = Float3::Y;
     pub const FOV_SCALE: f32 = 0.7;
-
-    // ── Sun & shading ──────────────────────────────────────────
-    pub const SUN_AZ: f32 = 0.7;
-    pub const SUN_EL: f32 = 0.6;
-    pub const SUN_COLOR: Float3 = Float3::new(1.0, 0.95, 0.85);
-    pub const AMBIENT: f32 = 0.15;
-    pub const DIFFUSE: f32 = 0.7;
-    pub const SPECULAR_POWER: f32 = 32.0;
-    pub const FOG_DENSITY: f32 = 0.06;
-
-    // ── Sky gradient ───────────────────────────────────────────
-    pub const SKY_ZENITH: Float3 = Float3::new(0.30, 0.55, 0.85);
-    pub const SKY_BAND: Float3 = Float3::new(0.85, 0.78, 0.62);
-    pub const SKY_HORIZON_LO: f32 = -0.05;
-    pub const SKY_HORIZON_HI: f32 = 0.45;
-
-    // ── Surface palette ────────────────────────────────────────
-    pub const COLOR_GROUND: Float3 = Float3::new(0.55, 0.55, 0.60);
-    pub const COLOR_BLOB: Float3 = Float3::new(0.85, 0.55, 0.40);
-
-    pub fn ray_at(ro: Float3, rd: Float3, t: f32) -> Float3 {
-        rd.mul_add(Float3::splat(t), ro)
-    }
-
-    pub fn smin(a: f32, b: f32, k: f32) -> f32 {
-        let h = ocl::clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
-        ocl::mix(b, a, h) - k * h * (1.0 - h)
-    }
-
-    pub fn scene_sdf(p: Float3) -> f32 {
-        let d_a = p.distance(SPHERE_A) - RADIUS_A;
-        let d_b = p.distance(SPHERE_B) - RADIUS_B;
-        let blob = smin(d_a, d_b, SMIN_K);
-        let plane = p.y() - GROUND_Y;
-        blob.min(plane)
-    }
-
-    pub fn scene_normal(p: Float3) -> Float3 {
-        let ex = Float3::new(EPSILON, 0.0, 0.0);
-        let ey = Float3::new(0.0, EPSILON, 0.0);
-        let ez = Float3::new(0.0, 0.0, EPSILON);
-        let dx = scene_sdf(p + ex) - scene_sdf(p - ex);
-        let dy = scene_sdf(p + ey) - scene_sdf(p - ey);
-        let dz = scene_sdf(p + ez) - scene_sdf(p - ez);
-        Float3::new(dx, dy, dz).normalize()
-    }
-
-    pub fn march(ro: Float3, rd: Float3) -> (bool, f32) {
-        let mut t = 0.0f32;
-        let mut i = 0u32;
-        while i < MAX_STEPS {
-            let d = scene_sdf(ray_at(ro, rd, t));
-            if d < EPSILON {
-                return (true, t);
-            }
-            t += d;
-            if t > MAX_DIST {
-                break;
-            }
-            i += 1;
-        }
-        (false, t)
-    }
-
-    pub fn soft_shadow(ro: Float3, rd: Float3) -> f32 {
-        let mut t = SHADOW_T_START;
-        let mut res = 1.0f32;
-        let mut i = 0u32;
-        while i < SHADOW_STEPS {
-            let d = scene_sdf(ray_at(ro, rd, t));
-            if d < EPSILON {
-                return 0.0;
-            }
-            res = res.min(SHADOW_K * d / t);
-            t += ocl::clamp(d, SHADOW_STEP_MIN, SHADOW_STEP_MAX);
-            if t > SHADOW_MAX_DIST {
-                break;
-            }
-            i += 1;
-        }
-        ocl::clamp(res, 0.0, 1.0)
-    }
-
-    pub fn sky(rd: Float3) -> Float3 {
-        let h = ocl::smoothstep(SKY_HORIZON_LO, SKY_HORIZON_HI, rd.y());
-        SKY_BAND.lerp(SKY_ZENITH, h)
-    }
-
-    pub fn shade(p: Float3, n: Float3, ro: Float3, sun: Float3, base: Float3) -> Float3 {
-        let view = (ro - p).normalize();
-        let ndotl = ocl::clamp(n.dot(sun), 0.0, 1.0);
-        let shadow = soft_shadow(p, sun);
-
-        let refl = n * (2.0 * view.dot(n)) - view;
-        let spec = ocl::clamp(refl.dot(sun), 0.0, 1.0).powf(SPECULAR_POWER) * shadow;
-
-        let diff = DIFFUSE * ndotl * shadow;
-        base * (SUN_COLOR * diff + Float3::splat(AMBIENT)) + SUN_COLOR * spec
-    }
 
     /// Per-pixel colour at NDC `(u, v)`. Same code path runs on both
     /// the kernel (per work item) and the host (validation harness in
@@ -175,13 +65,7 @@ mod gpu {
         let cam_up = right.cross(forward);
         let rd = (forward + (right * (u * FOV_SCALE)) + (cam_up * (v * FOV_SCALE))).normalize();
 
-        let sun = Float3::new(
-            SUN_EL.cos() * SUN_AZ.sin(),
-            SUN_EL.sin(),
-            SUN_EL.cos() * SUN_AZ.cos(),
-        )
-        .normalize();
-
+        let sun = sun_dir();
         let (hit, t) = march(CAM_RO, rd);
 
         if hit {
