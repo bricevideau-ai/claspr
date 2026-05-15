@@ -1,7 +1,7 @@
 //! 2D RGBA8 image helpers.
 //!
-//! Collapses the `cl_image_format` + `cl_image_desc` + `Image::create`
-//! + `enqueue_read_image` boilerplate that the mandelbrot-image and
+//! Collapses the `cl_image_format` + `cl_image_desc` + `Image::create` +
+//! `enqueue_read_image` boilerplate that the mandelbrot-image and
 //! raymarch samples currently duplicate.
 //!
 //! Stage 2 will replace this format-hardcoded type with a generic

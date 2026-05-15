@@ -14,9 +14,7 @@
 use crate::context::Context;
 use crate::error::Result;
 use crate::launch::{IntoLaunchSpec, KernelArgs};
-use opencl3::command_queue::{
-    CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, CL_QUEUE_PROFILING_ENABLE, CommandQueue,
-};
+use opencl3::command_queue::{CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, CommandQueue};
 use opencl3::event::Event;
 use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::types::cl_command_queue_properties;
@@ -51,13 +49,15 @@ pub struct OutOfOrder;
 
 impl QueueOrder for InOrder {
     fn properties() -> cl_command_queue_properties {
-        CL_QUEUE_PROFILING_ENABLE
+        // Profiling is opt-in (SYCL `property::queue::enable_profiling`
+        // pattern). The eventual `Queue::builder()` will expose it.
+        0
     }
 }
 
 impl QueueOrder for OutOfOrder {
     fn properties() -> cl_command_queue_properties {
-        CL_QUEUE_PROFILING_ENABLE | CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE
+        CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE
     }
 }
 

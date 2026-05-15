@@ -1,8 +1,8 @@
 //! [`Context`] — the OpenCL context wrapper, Arc-shared internally
 //! so it's cheap to clone and `Send + Sync`.
 //!
-//! Each `Context` carries a bundled profiling-enabled in-order
-//! command queue used as the default launch path. Most user code
+//! Each `Context` carries a bundled in-order command queue used
+//! as the default launch path. Most user code
 //! never names a separate [`Queue`](crate::queue::Queue) — passing
 //! `&ctx` to a generated launch wrapper routes through the default
 //! queue. Advanced callers create explicit `Queue<InOrder>` /
@@ -12,7 +12,7 @@
 use crate::device::Device;
 use crate::error::Result;
 use crate::queue::Launcher;
-use opencl3::command_queue::{CL_QUEUE_PROFILING_ENABLE, CommandQueue};
+use opencl3::command_queue::CommandQueue;
 use opencl3::kernel::Kernel;
 use opencl3::program::Program;
 use std::sync::Arc;
@@ -32,8 +32,9 @@ pub struct Context {
 struct ContextInner {
     cl_context: opencl3::context::Context,
     device: Device,
-    /// Profiling-enabled in-order queue. Used by the [`Launcher`]
-    /// impl when the user hands `&ctx` to a kernel call.
+    /// In-order queue (no profiling — see `for_device`). Used by
+    /// the [`Launcher`] impl when the user hands `&ctx` to a
+    /// kernel call.
     default_cl_queue: CommandQueue,
     /// Sticky-error counter. `Drop` impls that discover an OpenCL
     /// release failure can't propagate it; they bump this instead so
@@ -48,15 +49,13 @@ unsafe impl Send for ContextInner {}
 unsafe impl Sync for ContextInner {}
 
 impl Context {
-    /// Build a context pinned to `device`, with a profiling-enabled
-    /// in-order default queue.
+    /// Build a context pinned to `device`, with an in-order default
+    /// queue. The queue has no extra properties enabled — profiling
+    /// is opt-in via the `Queue` builder (matches SYCL 2020's
+    /// `property::queue::enable_profiling` semantics).
     pub fn for_device(device: &Device) -> Result<Self> {
         let cl_context = opencl3::context::Context::from_device(&device.cl3())?;
-        let default_cl_queue = CommandQueue::create_default_with_properties(
-            &cl_context,
-            CL_QUEUE_PROFILING_ENABLE,
-            0,
-        )?;
+        let default_cl_queue = CommandQueue::create_default_with_properties(&cl_context, 0, 0)?;
         Ok(Context {
             inner: Arc::new(ContextInner {
                 cl_context,
@@ -93,8 +92,8 @@ impl Context {
         &self.inner.cl_context
     }
 
-    /// Borrow the default profiling-enabled in-order command queue.
-    /// The [`Launcher`] impl for `&Context` routes through this.
+    /// Borrow the default in-order command queue. The [`Launcher`]
+    /// impl for `&Context` routes through this.
     pub fn raw_default_queue(&self) -> &CommandQueue {
         &self.inner.default_cl_queue
     }
