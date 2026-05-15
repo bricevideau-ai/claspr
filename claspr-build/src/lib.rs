@@ -663,13 +663,26 @@ impl HostBuilder {
     fn compile_one_module(&self, device_mod: &syn::ItemMod, out_dir: &Path) -> Result<()> {
         let mod_name = device_mod.ident.to_string();
 
-        // Lift the module body into a fresh syn::File representing
-        // the kernel sub-crate's lib.rs contents.
-        let lifted_items: Vec<syn::Item> = device_mod
+        // Lift the module body into a fresh syn::File representing the
+        // kernel sub-crate's lib.rs contents. Submodules declared with
+        // `mod foo;` (no inline body) are followed using rustc's
+        // standard file-resolution rules, so the user can split a
+        // device module across files.
+        //
+        // The "module directory" for the device module's body is
+        // `<src_file_dir>/<mod_name>/` — same convention rustc uses
+        // for inline modules at the crate root.
+        let src_dir = self
+            .src_file
+            .parent()
+            .ok_or("source file has no parent directory")?;
+        let device_mod_dir = src_dir.join(&mod_name);
+        let raw_items = device_mod
             .content
             .as_ref()
-            .map(|(_, items)| items.iter().cloned().map(translate_lifted_item).collect())
+            .map(|(_, items)| items.clone())
             .unwrap_or_default();
+        let lifted_items = translate_and_inline(raw_items, &device_mod_dir)?;
         let lifted_file = syn::File {
             shebang: None,
             attrs: vec![],
@@ -696,17 +709,77 @@ impl HostBuilder {
     }
 }
 
-/// Translate an item that's been lifted out of a `#[claspr::device]`
-/// module. Functions get their `#[claspr::kernel]` attrs translated;
-/// other item kinds (use, const, static, struct, mod, …) pass
-/// through verbatim.
-fn translate_lifted_item(item: syn::Item) -> syn::Item {
-    match item {
-        syn::Item::Fn(mut f) => {
-            translate_fn_attrs(&mut f.attrs);
-            syn::Item::Fn(f)
+/// Translate items lifted out of a `#[claspr::device]` module body
+/// (or a submodule within), recursively inlining external module
+/// declarations (`mod foo;` whose body lives in a separate file).
+///
+/// `dir` is the directory the *current* scope's `mod foo;` declarations
+/// resolve against, following rustc's normal rules:
+/// - For an inline module nested inside the device module, push the
+///   inline module's name onto the parent dir.
+/// - For an external module loaded from `<dir>/<name>.rs`, the
+///   sub-modules of that file resolve against `<dir>/<name>/`.
+/// - For an external module loaded from `<dir>/<name>/mod.rs`, same
+///   resolution dir as the file.
+///
+/// Function items get their `#[claspr::kernel]` attrs translated to
+/// `#[spirv(kernel)]`; everything else (use, const, static, struct,
+/// type def, …) passes through verbatim.
+fn translate_and_inline(items: Vec<syn::Item>, dir: &Path) -> Result<Vec<syn::Item>> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            syn::Item::Fn(mut f) => {
+                translate_fn_attrs(&mut f.attrs);
+                out.push(syn::Item::Fn(f));
+            }
+            syn::Item::Mod(mut m) => {
+                if let Some((brace, inner)) = m.content {
+                    // Inline module — recurse into its body, with
+                    // the dir extended by the module's name.
+                    let sub_dir = dir.join(m.ident.to_string());
+                    let inlined = translate_and_inline(inner, &sub_dir)?;
+                    m.content = Some((brace, inlined));
+                    out.push(syn::Item::Mod(m));
+                } else {
+                    // External module declaration `mod foo;` — find
+                    // the file and recurse on its items.
+                    let name = m.ident.to_string();
+                    let (path, sub_dir) = resolve_module_file(dir, &name)?;
+                    println!("cargo:rerun-if-changed={}", path.display());
+                    let source = std::fs::read_to_string(&path)
+                        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+                    let parsed: syn::File = syn::parse_str(&source)
+                        .map_err(|e| format!("parse {}: {}", path.display(), e))?;
+                    let inlined = translate_and_inline(parsed.items, &sub_dir)?;
+                    m.content = Some((syn::token::Brace::default(), inlined));
+                    m.semi = None;
+                    out.push(syn::Item::Mod(m));
+                }
+            }
+            other => out.push(other),
         }
-        other => other,
+    }
+    Ok(out)
+}
+
+/// Resolve `mod <name>;` against `dir` using rustc's file-naming
+/// rules. Returns `(file_path, dir_for_that_module's_submodules)`.
+fn resolve_module_file(dir: &Path, name: &str) -> Result<(PathBuf, PathBuf)> {
+    let as_file = dir.join(format!("{name}.rs"));
+    let as_dir_mod = dir.join(name).join("mod.rs");
+    if as_file.exists() {
+        Ok((as_file, dir.join(name)))
+    } else if as_dir_mod.exists() {
+        Ok((as_dir_mod, dir.join(name)))
+    } else {
+        Err(format!(
+            "could not resolve `mod {name};` — looked for {} and {}. \
+             #[path = \"...\"] overrides aren't supported yet.",
+            as_file.display(),
+            as_dir_mod.display(),
+        )
+        .into())
     }
 }
 
