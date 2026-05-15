@@ -1,34 +1,40 @@
 //! claspr — single-source OpenCL with rust-gpu.
 //!
-//! This crate is the **runtime helper layer** (stage 1 of three):
-//! it wraps `opencl3` and `spirv-builder` so a host program can compile
-//! and launch a rust-gpu kernel crate without the per-project boilerplate
-//! that otherwise piles up around every sample. Stage 2 (build-time
-//! codegen) and stage 3 (`#[claspr::kernel]` proc-macro single-source)
-//! build on this layer.
+//! This crate is the **runtime helper layer**: typed `Context`,
+//! `DeviceSlice<T>`, kernel argument plumbing, image helpers, and the
+//! `#[claspr::kernel]` / `#[claspr::device]` proc-macro re-exports.
+//! The matching build-script library [`claspr-build`] handles
+//! compiling the rust-gpu kernel sub-crates into SPIR-V at build time.
 //!
 //! ## Quickstart
 //!
+//! Single-source mode (the recommended path — see the workspace
+//! `examples/`):
+//!
 //! ```ignore
-//! use claspr::{Context, compile, profiling_duration};
+//! use claspr::Context;
 //!
-//! // 1. Compile the kernel crate to SPIR-V.
-//! let module = compile("kernels/collatz").opencl12().build()?;
+//! #[claspr::device]
+//! mod gpu {
+//!     #[claspr::kernel]
+//!     pub fn collatz_kernel(
+//!         #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+//!         #[spirv(cross_workgroup)] data: &mut [u32],
+//!     ) { /* ... */ }
+//! }
 //!
-//! // 2. Pick an OpenCL device and create a context + queue.
-//! let ctx = Context::new()?;
-//!
-//! // 3. Load the kernel.
-//! let kernel = ctx.kernel_from_spv(&module.spv_bytes, "collatz_kernel")?;
-//!
-//! // 4. Upload data, launch with a typed argument tuple, read back.
-//! let mut data: Vec<u32> = (1..=1024).collect();
-//! let buf = ctx.upload(&data)?;
-//! let event = ctx.launch(&kernel, [data.len()], (&buf,))?;
-//! ctx.download(&buf, &mut data)?;
-//!
-//! println!("kernel ran in {:?}", profiling_duration(&event));
+//! fn main() -> claspr::Result<()> {
+//!     let ctx = Context::new()?;
+//!     let kernels = gpu::kernels(&ctx)?;
+//!     let mut data: Vec<u32> = (1..=1024).collect();
+//!     let buf = ctx.upload(&data)?;
+//!     kernels.collatz_kernel(&ctx, [data.len()], &buf)?;
+//!     ctx.download(&buf, &mut data)?;
+//!     Ok(())
+//! }
 //! ```
+//!
+//! Pair with a `build.rs` that calls `claspr_build::compile_from_host(...).write()`.
 //!
 //! ## Crate structure
 //!
@@ -38,10 +44,8 @@
 //!   rust-gpu's slice decomposition.
 //! - [`KernelArg`] / [`KernelArgs`] / [`ScalarArg`] — typed launch
 //!   surface. User structs opt in via the [`scalar_arg!`] macro.
-//! - [`compile()`] / [`CompileBuilder`] — thin builder around
-//!   [`spirv_builder::SpirvBuilder`] with named presets
-//!   (`opencl12`, `opencl20_groups`, `image`, `with_f64`).
 //! - [`Image2DRgba8`] + [`write_ppm_rgba8`] — render-to-image helpers.
+//! - [`device`] / [`kernel`] — proc-macros from `claspr-macros`.
 //!
 //! ## Error type
 //!
@@ -50,10 +54,10 @@
 //! This will likely become a `thiserror` enum once we have real
 //! patterns of error handling to enumerate.
 //!
+//! [claspr-build]: https://docs.rs/claspr-build
 //! [`Image2DRgba8`]: crate::image::Image2DRgba8
 
 pub mod buffer;
-pub mod compile;
 pub mod context;
 pub mod image;
 pub mod launch;
@@ -62,17 +66,12 @@ pub mod ppm;
 // ── Public surface ────────────────────────────────────────────────────
 
 pub use buffer::DeviceSlice;
-pub use compile::{CompileBuilder, CompiledModule, compile};
 pub use context::Context;
 pub use image::Image2DRgba8;
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
 };
 pub use ppm::write_ppm_rgba8;
-
-// Re-exports from spirv-builder so kernel-crate users don't need to
-// add it as a separate dep.
-pub use spirv_builder::{Capability, ShaderPanicStrategy};
 
 // Stage-3 proc-macro frontend.
 pub use claspr_macros::{device, kernel};

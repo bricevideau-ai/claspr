@@ -102,11 +102,16 @@
 //! [claspr]: https://github.com/bricevideau-ai/claspr
 
 use quote::ToTokens;
-use spirv_builder::{Capability, CompileResult, ShaderPanicStrategy, SpirvBuilder};
+use spirv_builder::{CompileResult, SpirvBuilder};
 use std::error::Error;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+
+// Re-exported so build scripts that need to pass extra
+// capabilities / a non-default panic strategy don't have to add
+// spirv-builder as a separate build-dependency.
+pub use spirv_builder::{Capability, ShaderPanicStrategy};
 
 /// Boxed-error result alias used by all [`claspr_build`] entry points.
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync + 'static>>;
