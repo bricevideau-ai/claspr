@@ -784,26 +784,24 @@ glam = { version = ">=0.30.8", default-features = false }
 
 fn write_generated_lib_rs(crate_dir: &Path, file: &syn::File) -> Result<()> {
     // Preamble injected by claspr-build. Beyond the no_std attribute,
-    // we bring two universally-needed device-side names into scope:
+    // we inject `use spirv_std::spirv;` because claspr-build's own
+    // translation emits `#[spirv(kernel)]` (rewritten from
+    // `#[claspr::kernel]`) — so `spirv` MUST be in scope for any
+    // claspr kernel module to compile, and the user never writes
+    // `spirv` directly. The crate-level `#[allow(unused_imports)]`
+    // covers degenerate cases (e.g. a device module with only
+    // helper fns and no kernel entry points).
     //
-    //   - `spirv` — the proc-macro that recognises `#[spirv(kernel)]`
-    //     and `#[spirv(<builtin>)]` attributes. Every translated
-    //     entry-point function ends up with `#[spirv(kernel)]`, so
-    //     this is non-optional for any claspr kernel module.
-    //
-    //   - `Image` — the `Image!(...)` macro used in image kernel
-    //     parameter types. Harmless if the user has no image kernels
-    //     (silenced by the crate-level `#[allow(unused_imports)]`).
-    //
-    // The user's own `#[claspr::device]` module body still carries
-    // its own `use` statements through verbatim — anything beyond
-    // these two (glam types, `cl::*` vectors, opencl_std math
-    // intrinsics, `num_traits::Float` for libm intercept, …) the
-    // user imports themselves alongside the kernel.
+    // Other spirv-std names users do reference directly — `Image` for
+    // image kernel param types, `cl::Float3` etc. for vector
+    // arithmetic, `opencl_std` for math intrinsics, `num_traits::Float`
+    // for the libm intercept on bare `f32` — are imported by the
+    // user alongside the kernel, since they're situational and the
+    // user's import makes the dep visible at the call site.
     let mut s = String::new();
     s.push_str("#![cfg_attr(target_arch = \"spirv\", no_std)]\n");
     s.push_str("#![allow(unused_imports)]\n\n");
-    s.push_str("use spirv_std::{spirv, Image};\n\n");
+    s.push_str("use spirv_std::spirv;\n\n");
     for item in &file.items {
         s.push_str(&item.to_token_stream().to_string());
         s.push_str("\n\n");

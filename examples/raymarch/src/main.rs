@@ -20,13 +20,14 @@ use claspr::Context;
 
 #[claspr::device]
 mod gpu {
+    use spirv_std::Image;
     use spirv_std::arch::opencl_std as ocl;
     use spirv_std::cl::{Float3, Int2};
     use spirv_std::glam::{USizeVec3, UVec4};
 
-    // `spirv` and `Image` come from claspr-build's preamble (it
-    // injects `use spirv_std::{spirv, Image};` into the generated
-    // kernel crate's lib.rs), so they don't need to be imported here.
+    // `spirv` is in scope via claspr-build's preamble (it injects
+    // `use spirv_std::spirv;` into the generated kernel crate), so
+    // we don't need to import it here.
 
     // f32::cos/sin/powf/exp on bare `f32` (no std) need
     // `num_traits::Float` in scope on the kernel side — the libm
