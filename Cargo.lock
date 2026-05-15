@@ -912,6 +912,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "repro-rusticl-bitwise"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+ "claspr-build",
+]
+
+[[package]]
+name = "repro-rusticl-raymarch"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+ "claspr-build",
+ "spirv-std",
+]
+
+[[package]]
 name = "rspirv"
 version = "0.12.0+sdk-1.3.268.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

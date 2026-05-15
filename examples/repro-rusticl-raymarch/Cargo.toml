@@ -1,0 +1,18 @@
+[package]
+name = "repro-rusticl-raymarch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Bisecting reproducer for the raymarch crash on rusticl. Strips the raymarch kernel down progressively to identify what triggers the segfault in rusticl's SPIR-V → NIR lowering."
+
+[dependencies]
+claspr = { path = "../../claspr" }
+spirv-std.workspace = true
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true

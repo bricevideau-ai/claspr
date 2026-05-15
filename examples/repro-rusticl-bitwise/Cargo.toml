@@ -1,0 +1,17 @@
+[package]
+name = "repro-rusticl-bitwise"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Bisecting reproducer for the bitwise_ops_opencl crash on rusticl. One device module per suspect op; the first one that fails to load identifies the bad SPIR-V instruction."
+
+[dependencies]
+claspr = { path = "../../claspr" }
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true

@@ -9,6 +9,8 @@ members = [
     "examples/mandelbrot-kernel",
     "examples/sobel-kernel",
     "examples/image-pipeline",
+    "examples/repro-rusticl-bitwise",
+    "examples/repro-rusticl-raymarch",
 ]
 
 [workspace.package]
