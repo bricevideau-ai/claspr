@@ -783,15 +783,27 @@ glam = { version = ">=0.30.8", default-features = false }
 }
 
 fn write_generated_lib_rs(crate_dir: &Path, file: &syn::File) -> Result<()> {
-    // Bare-minimum preamble — just the no_std attribute. The user's
-    // `#[claspr::device]` module is expected to bring its own `use`
-    // statements (`use spirv_std::{glam, spirv};` etc.), which carry
-    // through to the generated kernel crate verbatim. Per-fn
-    // `#[claspr::device]` callers without a wrapping module pay the
-    // price of declaring their own `use` statements at module level
-    // alongside the function — same source file, same scope.
+    // Preamble injected by claspr-build. Beyond the no_std attribute,
+    // we bring two universally-needed device-side names into scope:
+    //
+    //   - `spirv` — the proc-macro that recognises `#[spirv(kernel)]`
+    //     and `#[spirv(<builtin>)]` attributes. Every translated
+    //     entry-point function ends up with `#[spirv(kernel)]`, so
+    //     this is non-optional for any claspr kernel module.
+    //
+    //   - `Image` — the `Image!(...)` macro used in image kernel
+    //     parameter types. Harmless if the user has no image kernels
+    //     (silenced by the crate-level `#[allow(unused_imports)]`).
+    //
+    // The user's own `#[claspr::device]` module body still carries
+    // its own `use` statements through verbatim — anything beyond
+    // these two (glam types, `cl::*` vectors, opencl_std math
+    // intrinsics, `num_traits::Float` for libm intercept, …) the
+    // user imports themselves alongside the kernel.
     let mut s = String::new();
-    s.push_str("#![cfg_attr(target_arch = \"spirv\", no_std)]\n\n");
+    s.push_str("#![cfg_attr(target_arch = \"spirv\", no_std)]\n");
+    s.push_str("#![allow(unused_imports)]\n\n");
+    s.push_str("use spirv_std::{spirv, Image};\n\n");
     for item in &file.items {
         s.push_str(&item.to_token_stream().to_string());
         s.push_str("\n\n");

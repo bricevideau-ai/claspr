@@ -21,16 +21,6 @@ use claspr::Context;
 
 #[claspr::device]
 mod gpu {
-    // `spirv` is the proc-macro that recognises `#[spirv(kernel)]` and
-    // `#[spirv(<builtin>)]` attributes on the kernel side. Cfg-gated
-    // because the host crate doesn't have spirv-std as a dep — and
-    // it doesn't need to: the host compilation never sees those
-    // attributes (the `#[claspr::kernel]` proc-macro discards the
-    // builtin params + replaces the function with its impl block
-    // before name resolution touches them).
-    #[cfg(target_arch = "spirv")]
-    use spirv_std::spirv;
-
     /// Length of the Collatz sequence for `n` (1-indexed input → number
     /// of steps to reach 1), or `None` on overflow / zero input. Pure
     /// Rust — both the kernel body (per-element step) and the host
