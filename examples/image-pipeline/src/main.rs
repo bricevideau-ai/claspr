@@ -34,7 +34,7 @@ const HEIGHT: u32 = 720;
 const MAX_ITER: u32 = 256;
 
 fn run() -> claspr::Result<bool> {
-    let ctx = match Context::new() {
+    let ctx = match Context::any() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("SKIP: no OpenCL device ({e})");
@@ -42,7 +42,7 @@ fn run() -> claspr::Result<bool> {
         }
     };
 
-    if !ctx.device().image_support().unwrap_or(false) {
+    if !ctx.device().cl3().image_support().unwrap_or(false) {
         eprintln!("SKIP: device has no image support");
         return Ok(false);
     }
@@ -54,8 +54,8 @@ fn run() -> claspr::Result<bool> {
 
     // Two RGBA8 images: `fractal` is mandelbrot's destination + sobel's
     // input; `edges` is sobel's destination.
-    let fractal = ctx.alloc_image_2d_rgba8(WIDTH, HEIGHT)?;
-    let edges = ctx.alloc_image_2d_rgba8(WIDTH, HEIGHT)?;
+    let fractal = claspr::Image2DRgba8::alloc(&ctx, WIDTH, HEIGHT)?;
+    let edges = claspr::Image2DRgba8::alloc(&ctx, WIDTH, HEIGHT)?;
 
     // Stage 1: render the Mandelbrot set into `fractal`.
     mandelbrot.mandelbrot(
@@ -77,7 +77,7 @@ fn run() -> claspr::Result<bool> {
         HEIGHT,
     )?;
 
-    let pixels = ctx.read_image_2d_rgba8(&edges)?;
+    let pixels = &edges.download(&ctx)?;
     let ppm_path = "image-pipeline.ppm";
     write_ppm_rgba8(ppm_path, WIDTH, HEIGHT, &pixels)?;
     println!(

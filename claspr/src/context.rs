@@ -1,207 +1,163 @@
-//! OpenCL context, command queue, and the launch entry point.
+//! [`Context`] — the OpenCL context wrapper, Arc-shared internally
+//! so it's cheap to clone and `Send + Sync`.
+//!
+//! Each `Context` carries a bundled profiling-enabled in-order
+//! command queue used as the default launch path. Most user code
+//! never names a separate [`Queue`](crate::queue::Queue) — passing
+//! `&ctx` to a generated launch wrapper routes through the default
+//! queue. Advanced callers create explicit `Queue<InOrder>` /
+//! `Queue<OutOfOrder>` handles when they need separate command
+//! streams or out-of-order semantics.
 
-use crate::Result;
-use crate::buffer::DeviceSlice;
-use crate::launch::{IntoLaunchSpec, KernelArgs};
+use crate::device::Device;
+use crate::error::Result;
+use crate::queue::Launcher;
 use opencl3::command_queue::{CL_QUEUE_PROFILING_ENABLE, CommandQueue};
-use opencl3::device::{CL_DEVICE_TYPE_ALL, Device, get_all_devices};
-use opencl3::event::Event;
-use opencl3::kernel::{ExecuteKernel, Kernel};
-use opencl3::memory::{Buffer, CL_MEM_READ_WRITE};
+use opencl3::kernel::Kernel;
 use opencl3::program::Program;
-use opencl3::types::{CL_BLOCKING, cl_device_id};
-use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-/// OpenCL context, command queue, and selected device.
+/// OpenCL context, the device it's pinned to, and the default
+/// in-order command queue.
 ///
-/// Owns one device, one [`opencl3::context::Context`], and one
-/// profiling-enabled [`CommandQueue`]. Kernel launches go through
-/// [`Context::launch`].
+/// Cheap to clone (one `Arc` increment). `Send + Sync`. The OpenCL
+/// ICD does its own internal refcount under the hood; this Rust
+/// `Arc` is the only per-process refcount we add.
+#[derive(Clone)]
 pub struct Context {
-    device_id: cl_device_id,
-    context: opencl3::context::Context,
-    queue: CommandQueue,
+    inner: Arc<ContextInner>,
 }
 
+struct ContextInner {
+    cl_context: opencl3::context::Context,
+    device: Device,
+    /// Profiling-enabled in-order queue. Used by the [`Launcher`]
+    /// impl when the user hands `&ctx` to a kernel call.
+    default_cl_queue: CommandQueue,
+    /// Sticky-error counter. `Drop` impls that discover an OpenCL
+    /// release failure can't propagate it; they bump this instead so
+    /// callers who care can audit via [`Context::error_count`].
+    error_state: AtomicU32,
+}
+
+// SAFETY: cl_context, cl_command_queue, and cl_device_id are opaque
+// handles. OpenCL API calls on them are thread-safe per the spec
+// (CL §3.4.1).
+unsafe impl Send for ContextInner {}
+unsafe impl Sync for ContextInner {}
+
 impl Context {
-    /// Pick the first available OpenCL device of any type.
-    ///
-    /// Errors if no OpenCL device is reachable. For multi-device
-    /// systems where you want a specific vendor or device type, use
-    /// [`Context::select`].
-    pub fn new() -> Result<Self> {
-        Self::from_device_id(
-            *get_all_devices(CL_DEVICE_TYPE_ALL)?
-                .first()
-                .ok_or("no OpenCL devices found")?,
-        )
+    /// Build a context pinned to `device`, with a profiling-enabled
+    /// in-order default queue.
+    pub fn for_device(device: &Device) -> Result<Self> {
+        let cl_context = opencl3::context::Context::from_device(&device.cl3())?;
+        let default_cl_queue = CommandQueue::create_default_with_properties(
+            &cl_context,
+            CL_QUEUE_PROFILING_ENABLE,
+            0,
+        )?;
+        Ok(Context {
+            inner: Arc::new(ContextInner {
+                cl_context,
+                device: device.clone(),
+                default_cl_queue,
+                error_state: AtomicU32::new(0),
+            }),
+        })
     }
 
-    /// Pick the first device for which `pred` returns `true`.
-    ///
-    /// `pred` receives an [`opencl3::device::Device`] and can call any
-    /// of its query methods (`name`, `vendor`, `device_type`,
-    /// `extensions`, …) to make the decision.
-    ///
-    /// ```ignore
-    /// let ctx = claspr::Context::select(|d| {
-    ///     d.vendor().map(|v| v == "Intel(R) Corporation").unwrap_or(false)
-    /// })?;
-    /// ```
-    pub fn select<F>(mut pred: F) -> Result<Self>
+    /// Pick the first available device of any type and build a
+    /// context on it. Convenience for trivial single-device setups.
+    pub fn any() -> Result<Self> {
+        Self::for_device(&Device::any()?)
+    }
+
+    /// Pick a device with a SYCL-style scoring closure (highest
+    /// score wins, negative excludes) and build a context on it.
+    pub fn select<F>(score: F) -> Result<Self>
     where
-        F: FnMut(&Device) -> bool,
+        F: FnMut(&Device) -> i32,
     {
-        let device_id = get_all_devices(CL_DEVICE_TYPE_ALL)?
-            .into_iter()
-            .find(|id| pred(&Device::new(*id)))
-            .ok_or("no OpenCL device matched the predicate")?;
-        Self::from_device_id(device_id)
+        Self::for_device(&Device::find(score)?)
     }
 
-    fn from_device_id(device_id: cl_device_id) -> Result<Self> {
-        let device = Device::new(device_id);
-        let context = opencl3::context::Context::from_device(&device)?;
-        let queue =
-            CommandQueue::create_default_with_properties(&context, CL_QUEUE_PROFILING_ENABLE, 0)?;
-        Ok(Self {
-            device_id,
-            context,
-            queue,
-        })
+    /// The device this context is pinned to.
+    pub fn device(&self) -> &Device {
+        &self.inner.device
     }
 
-    /// Borrow the [`Device`] backing this context for capability queries.
-    pub fn device(&self) -> Device {
-        Device::new(self.device_id)
-    }
-
-    /// Borrow the underlying [`opencl3::context::Context`].
+    /// Borrow the underlying [`opencl3::context::Context`] for
+    /// operations claspr doesn't surface yet.
     pub fn raw_context(&self) -> &opencl3::context::Context {
-        &self.context
+        &self.inner.cl_context
     }
 
-    /// Borrow the profiling-enabled command queue.
-    pub fn queue(&self) -> &CommandQueue {
-        &self.queue
+    /// Borrow the default profiling-enabled in-order command queue.
+    /// The [`Launcher`] impl for `&Context` routes through this.
+    pub fn raw_default_queue(&self) -> &CommandQueue {
+        &self.inner.default_cl_queue
     }
 
-    // ── Buffer management ─────────────────────────────────────────────
-
-    /// Allocate a device buffer and write `data` into it (blocking).
-    pub fn upload<T>(&self, data: &[T]) -> Result<DeviceSlice<T>> {
-        let mut buffer = unsafe {
-            Buffer::<T>::create(
-                &self.context,
-                CL_MEM_READ_WRITE,
-                data.len(),
-                ptr::null_mut(),
-            )?
-        };
-        unsafe {
-            self.queue
-                .enqueue_write_buffer(&mut buffer, CL_BLOCKING, 0, data, &[])?
-                .wait()?;
-        }
-        Ok(DeviceSlice {
-            buffer,
-            len: data.len(),
-        })
+    /// How many sticky errors have been recorded by Drop impls.
+    /// Always zero unless an OpenCL release call failed during
+    /// teardown — fault accumulator pattern from cuda-oxide.
+    pub fn error_count(&self) -> u32 {
+        self.inner.error_state.load(Ordering::Relaxed)
     }
 
-    /// Allocate a device buffer of `len` `T`s without initialising it.
-    ///
-    /// Wraps `Buffer::create(.., null_mut())` — passing the null host
-    /// pointer makes OpenCL allocate fresh device memory and ignore the
-    /// host-pointer contract that makes `Buffer::create` generally
-    /// unsafe, so the wrapper here is sound.
-    pub fn alloc<T>(&self, len: usize) -> Result<DeviceSlice<T>> {
-        let buffer =
-            unsafe { Buffer::<T>::create(&self.context, CL_MEM_READ_WRITE, len, ptr::null_mut())? };
-        Ok(DeviceSlice { buffer, len })
-    }
-
-    /// Read a device buffer back into a host slice (blocking).
-    ///
-    /// `dst` must have the same length as `src`.
-    pub fn download<T>(&self, src: &DeviceSlice<T>, dst: &mut [T]) -> Result<()> {
-        if dst.len() != src.len() {
-            return Err(format!(
-                "download length mismatch: src has {} elements, dst has {}",
-                src.len(),
-                dst.len()
-            )
-            .into());
-        }
-        unsafe {
-            self.queue
-                .enqueue_read_buffer(&src.buffer, CL_BLOCKING, 0, dst, &[])?
-                .wait()?;
-        }
-        Ok(())
+    /// Bump the sticky-error counter. Called from `Drop` impls in
+    /// dependent types when a release fails and the error can't be
+    /// propagated. (Not yet wired — neither `QueueInner` nor
+    /// `DeviceSlice` have fallible drop today; this stays
+    /// `pub(crate)` for the buffer/queue Drop work in stage 2.)
+    #[allow(dead_code)]
+    pub(crate) fn record_err(&self) {
+        self.inner.error_state.fetch_add(1, Ordering::Relaxed);
     }
 
     // ── Program / kernel ─────────────────────────────────────────────
 
     /// Create + build an OpenCL program from raw SPIR-V bytes.
-    ///
     /// Returns the build log on failure.
     pub fn build_program(&self, spv_bytes: &[u8]) -> Result<Program> {
-        let mut program = Program::create_from_il(&self.context, spv_bytes)
-            .map_err(|e| format!("create_from_il: {e}"))?;
-        if let Err(e) = program.build(self.context.devices(), "") {
+        let mut program = Program::create_from_il(&self.inner.cl_context, spv_bytes)
+            .map_err(|e| crate::Error::Other(format!("create_from_il: {e}")))?;
+        if let Err(e) = program.build(self.inner.cl_context.devices(), "") {
             let log = program
-                .get_build_log(self.device_id)
+                .get_build_log(self.inner.device.raw_id())
                 .unwrap_or_else(|_| "no build log".into());
-            return Err(format!("program.build: {e}\nbuild log: {log}").into());
+            return Err(crate::Error::Build {
+                log: format!("{e}\n{log}"),
+            });
         }
         Ok(program)
     }
 
     /// Look up a kernel by entry-point name in a built program.
     pub fn kernel(&self, program: &Program, name: &str) -> Result<Kernel> {
-        Kernel::create(program, name).map_err(|e| format!("Kernel::create({name}): {e}").into())
+        Kernel::create(program, name)
+            .map_err(|e| crate::Error::Other(format!("Kernel::create({name}): {e}")))
     }
 
-    /// Convenience: [`build_program`] + [`kernel`] in one call. The
-    /// intermediate `Program` is dropped — OpenCL refcounts it
-    /// internally and the kernel keeps it alive.
-    ///
-    /// [`build_program`]: Self::build_program
-    /// [`kernel`]: Self::kernel
+    /// Convenience: [`build_program`](Self::build_program) +
+    /// [`kernel`](Self::kernel) in one call. The intermediate
+    /// `Program` is dropped — OpenCL refcounts it internally and
+    /// the kernel keeps it alive.
     pub fn kernel_from_spv(&self, spv_bytes: &[u8], name: &str) -> Result<Kernel> {
         let program = self.build_program(spv_bytes)?;
         self.kernel(&program, name)
     }
+}
 
-    // ── Launch ───────────────────────────────────────────────────────
+// ── Launcher impl ────────────────────────────────────────────────────
 
-    /// Launch a kernel, blocking until it finishes.
-    ///
-    /// `spec` is the work-item geometry — pass `[N]`, `[W, H]`, or
-    /// `[X, Y, Z]` for global-only, or `(global, local)` to control
-    /// the workgroup size as well. `args` is a tuple of [`KernelArg`]
-    /// values, set in declaration order.
-    ///
-    /// Returns the [`Event`] for profiling — feed it to
-    /// [`profiling_duration`] to get the kernel runtime.
-    ///
-    /// [`KernelArg`]: crate::launch::KernelArg
-    /// [`profiling_duration`]: crate::launch::profiling_duration
-    pub fn launch<S, A>(&self, kernel: &Kernel, spec: S, args: A) -> Result<Event>
-    where
-        S: IntoLaunchSpec,
-        A: KernelArgs,
-    {
-        let spec = spec.into_launch_spec();
-        let mut exec = ExecuteKernel::new(kernel);
-        args.set_all(&mut exec);
-        exec.set_global_work_sizes(spec.global());
-        if let Some(local) = spec.local() {
-            exec.set_local_work_sizes(local);
-        }
-        let event = unsafe { exec.enqueue_nd_range(&self.queue)? };
-        event.wait()?;
-        Ok(event)
+impl Launcher for Context {
+    fn cl_queue(&self) -> &CommandQueue {
+        &self.inner.default_cl_queue
+    }
+
+    fn context(&self) -> &Context {
+        self
     }
 }

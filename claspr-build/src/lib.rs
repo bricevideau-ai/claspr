@@ -458,13 +458,16 @@ fn generate_module_source(
         )?;
         writeln!(s, "    pub fn {field}(")?;
         writeln!(s, "        &self,")?;
-        writeln!(s, "        ctx: &::claspr::Context,")?;
+        writeln!(s, "        launcher: &impl ::claspr::Launcher,")?;
         writeln!(
             s,
             "        grid: impl ::claspr::IntoLaunchSpec{params_sig},"
         )?;
         writeln!(s, "    ) -> ::claspr::Result<::claspr::Event> {{")?;
-        writeln!(s, "        ctx.launch(&self.{field}, grid, {tuple_lit})")?;
+        writeln!(
+            s,
+            "        launcher.launch(&self.{field}, grid, {tuple_lit})"
+        )?;
         writeln!(s, "    }}")?;
     }
 

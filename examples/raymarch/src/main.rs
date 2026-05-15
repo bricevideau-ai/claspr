@@ -121,7 +121,7 @@ const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 
 fn run() -> claspr::Result<bool> {
-    let ctx = match Context::new() {
+    let ctx = match Context::any() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("SKIP: no OpenCL device ({e})");
@@ -129,15 +129,15 @@ fn run() -> claspr::Result<bool> {
         }
     };
 
-    if !ctx.device().image_support().unwrap_or(false) {
+    if !ctx.device().cl3().image_support().unwrap_or(false) {
         eprintln!("SKIP: device has no image support");
         return Ok(false);
     }
 
     let kernels = gpu::kernels(&ctx)?;
-    let img = ctx.alloc_image_2d_rgba8(WIDTH, HEIGHT)?;
+    let img = claspr::Image2DRgba8::alloc(&ctx, WIDTH, HEIGHT)?;
     kernels.raymarch(&ctx, [WIDTH as usize, HEIGHT as usize], &img, WIDTH, HEIGHT)?;
-    let pixels = ctx.read_image_2d_rgba8(&img)?;
+    let pixels = &img.download(&ctx)?;
 
     // Host vs. device pixel comparison. Walking every pixel through
     // `pixel_color` on the CPU is doable but slow — we stride by `STEP`

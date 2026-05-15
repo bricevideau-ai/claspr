@@ -261,15 +261,20 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // claspr-build emits as `pub`) — at the call site, parens
     // disambiguate method vs field, so `kernels.collatz_kernel(...)`
     // dispatches to the typed launch method here.
+    //
+    // The launcher is `&impl Launcher` so callers can pass `&ctx`
+    // (uses the bundled default in-order queue) or `&queue` (uses
+    // the queue directly) interchangeably. `Launcher::launch` is
+    // the unified entry point — see `claspr/src/queue.rs`.
     Ok(quote! {
         impl #kernels_path {
             #vis fn #name(
                 &self,
-                ctx: &::claspr::Context,
+                launcher: &impl ::claspr::Launcher,
                 grid: impl ::claspr::IntoLaunchSpec,
                 #(#host_params),*
             ) -> ::claspr::Result<::claspr::Event> {
-                ctx.launch(&self.#name, grid, #launch_tuple)
+                launcher.launch(&self.#name, grid, #launch_tuple)
             }
         }
     })

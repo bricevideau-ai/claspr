@@ -57,7 +57,7 @@ mod gpu {
 const N: usize = 1024;
 
 fn run() -> claspr::Result<bool> {
-    let ctx = match Context::new() {
+    let ctx = match Context::any() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("SKIP: no OpenCL device ({e})");
@@ -69,9 +69,9 @@ fn run() -> claspr::Result<bool> {
 
     let inputs: Vec<u32> = (1..=N as u32).collect();
     let mut device_results = inputs.clone();
-    let buf = ctx.upload(&device_results)?;
+    let buf = claspr::DeviceSlice::upload(&ctx, &device_results)?;
     kernels.collatz_kernel(&ctx, [N], &buf)?;
-    ctx.download(&buf, &mut device_results)?;
+    buf.download(&ctx, &mut device_results)?;
 
     // Validate every kernel output against the host-side `collatz`
     // implementation lifted from inside the device module. Same
