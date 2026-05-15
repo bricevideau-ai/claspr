@@ -1,0 +1,19 @@
+[package]
+name = "sobel-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Sobel edge-detection image kernel — a claspr kernel packaged as a reusable library crate"
+
+[lib]
+
+[dependencies]
+claspr = { path = "../../claspr" }
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true

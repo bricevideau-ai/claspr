@@ -74,7 +74,9 @@ That's the whole thing. The kernel function lives once, in the `#[claspr::device
 | `claspr-build/` | Build-script library — `compile_from_host(src_file)` reads a host source, lifts `#[claspr::kernel]` / `#[claspr::device]` items into a generated kernel sub-crate, compiles via rust-gpu, emits the `Kernels` struct. |
 | `claspr-macros/` | Proc-macros: `#[kernel(kernels = path::to::Kernels)]` (typed launch method on the `Kernels` struct, kernel-style param signature) and `#[device]` (module or fn marker — the build script copies these into the kernel crate). |
 | `examples/collatz/` | One-file demo: kernel + host validation in `src/main.rs`. |
-| `examples/raymarch/` | Larger demo: ~21 consts + 9 helpers + 1 image kernel; SDF ray-march with sun lighting + soft shadows. Writes `raymarch.ppm`. |
+| `examples/raymarch/` | Multi-file demo: SDF ray-march with sun lighting + soft shadows. Splits the device module across `src/main.rs` + `src/gpu/scene.rs` + `src/gpu/shading.rs`. Writes `raymarch.ppm`. |
+| `examples/mandelbrot-kernel/` + `examples/sobel-kernel/` | Two **library** crates each packaging one kernel — demonstrates publishing a claspr kernel as a reusable dependency. |
+| `examples/image-pipeline/` | Binary that depends on both kernel libraries above and runs them as a two-stage pipeline (mandelbrot → sobel edge detection). No `build.rs` of its own; each kernel library carries its own. |
 
 ## Running the examples
 
@@ -85,7 +87,11 @@ cargo run -p collatz-example
 
 # 1280×720 ray-marched SDF scene → raymarch.ppm
 cargo run -p raymarch-example
-# → "raymarch: wrote raymarch.ppm (1280x720, host validation passed at 81 pixels)"
+# → "raymarch: wrote raymarch.ppm (1280x720, ...)"
+
+# Two library crates composed from one binary → image-pipeline.ppm
+cargo run -p image-pipeline
+# → "image-pipeline: wrote image-pipeline.ppm (1280x720, mandelbrot → sobel via two library crates)"
 ```
 
 Both need an OpenCL runtime. With pocl installed under `~/.local`:

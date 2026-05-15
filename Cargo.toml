@@ -6,6 +6,9 @@ members = [
     "claspr-macros",
     "examples/collatz",
     "examples/raymarch",
+    "examples/mandelbrot-kernel",
+    "examples/sobel-kernel",
+    "examples/image-pipeline",
 ]
 
 [workspace.package]

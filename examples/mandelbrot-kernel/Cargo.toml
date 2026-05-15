@@ -1,0 +1,19 @@
+[package]
+name = "mandelbrot-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Mandelbrot set image kernel — an example of packaging a claspr kernel as a reusable library crate"
+
+[lib]
+
+[dependencies]
+claspr = { path = "../../claspr" }
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true
