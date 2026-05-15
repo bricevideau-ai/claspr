@@ -49,16 +49,17 @@
 //!
 //! ## Error type
 //!
-//! Every fallible function returns [`Result<T>`], which is just
-//! `std::result::Result<T, Box<dyn Error + Send + Sync + 'static>>`.
-//! This will likely become a `thiserror` enum once we have real
-//! patterns of error handling to enumerate.
+//! Every fallible function returns [`Result<T>`] from [`mod@error`] —
+//! a typed [`Error`] enum so callers can `match` on the failure mode
+//! (OpenCL status, build failure, missing capability) instead of
+//! string-sniffing a boxed trait object.
 //!
 //! [claspr-build]: https://docs.rs/claspr-build
 //! [`Image2DRgba8`]: crate::image::Image2DRgba8
 
 pub mod buffer;
 pub mod context;
+pub mod error;
 pub mod image;
 pub mod launch;
 pub mod ppm;
@@ -67,6 +68,7 @@ pub mod ppm;
 
 pub use buffer::DeviceSlice;
 pub use context::Context;
+pub use error::{Error, Result};
 pub use image::Image2DRgba8;
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
@@ -81,6 +83,3 @@ pub use claspr_macros::{device, kernel};
 pub use opencl3::event::Event;
 pub use opencl3::kernel::Kernel;
 pub use opencl3::program::Program;
-
-/// Boxed-error result alias. All claspr APIs return this.
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
