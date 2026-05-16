@@ -77,7 +77,7 @@ fn run() -> claspr::Result<bool> {
         HEIGHT,
     )?;
 
-    let pixels = edges.download(&ctx)?;
+    let pixels = edges.download_bytes(&ctx)?;
     let ppm_path = "image-pipeline.ppm";
     write_ppm_rgba8(ppm_path, WIDTH, HEIGHT, &pixels)?;
     println!(

@@ -75,7 +75,7 @@ pub use buffer::{Buffer, DeviceSlice, HostBuffer};
 pub use context::{Context, SvmLevel};
 pub use device::{Device, DeviceType, Platform};
 pub use error::{Error, Result};
-pub use image::Image2DRgba8;
+pub use image::{Image2D, Image2DRgba8, ImageAccess, ReadOnly, ReadWrite, WriteOnly, format};
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
 };
