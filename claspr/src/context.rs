@@ -13,6 +13,10 @@ use crate::device::Device;
 use crate::error::Result;
 use crate::queue::Launcher;
 use opencl3::command_queue::CommandQueue;
+use opencl3::device::{
+    CL_DEVICE_SVM_ATOMICS, CL_DEVICE_SVM_COARSE_GRAIN_BUFFER, CL_DEVICE_SVM_FINE_GRAIN_BUFFER,
+    CL_DEVICE_SVM_FINE_GRAIN_SYSTEM,
+};
 use opencl3::kernel::Kernel;
 use opencl3::program::Program;
 use std::sync::Arc;
@@ -98,6 +102,20 @@ impl Context {
         &self.inner.default_cl_queue
     }
 
+    /// What level of Shared Virtual Memory this context's device
+    /// supports — useful for gating [`crate::svm::SharedBuffer`]
+    /// construction or picking between SVM and host-mapped tiers.
+    ///
+    /// Returns the highest applicable level. A device may report
+    /// multiple capability bits; ordering is
+    /// `FineSystem > FineBuffer > CoarseBuffer > None`. The atomics
+    /// extension is independent — query via [`SvmLevel::has_atomics`]
+    /// on the returned value.
+    pub fn svm_capability(&self) -> SvmLevel {
+        let caps = self.inner.device.cl3().svm_mem_capability();
+        SvmLevel::from_caps(caps)
+    }
+
     /// How many sticky errors have been recorded by Drop impls.
     /// Always zero unless an OpenCL release call failed during
     /// teardown — fault accumulator pattern from cuda-oxide.
@@ -146,6 +164,62 @@ impl Context {
     pub fn kernel_from_spv(&self, spv_bytes: &[u8], name: &str) -> Result<Kernel> {
         let program = self.build_program(spv_bytes)?;
         self.kernel(&program, name)
+    }
+}
+
+// ── SvmLevel ─────────────────────────────────────────────────────────
+
+/// The highest level of Shared Virtual Memory the device supports.
+///
+/// SVM tiers in OpenCL 2.0+ form a strict hierarchy: a device that
+/// supports fine-grain system also supports fine-grain buffer and
+/// coarse-grain buffer. claspr surfaces only the top level reached;
+/// query [`has_atomics`](SvmLevel::has_atomics) separately for the
+/// orthogonal atomics extension.
+///
+/// Used to gate [`crate::svm::SharedBuffer`] construction —
+/// `SharedBuffer::alloc` returns [`crate::Error::SvmNotAvailable`]
+/// when the device reports [`SvmLevel::None`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum SvmLevel {
+    /// `CL_DEVICE_SVM_CAPABILITIES` is zero — SVM not supported.
+    None,
+    /// `CL_DEVICE_SVM_COARSE_GRAIN_BUFFER`: SVM allocations behave
+    /// like cl_mem buffers; host access requires map/unmap.
+    CoarseBuffer,
+    /// `CL_DEVICE_SVM_FINE_GRAIN_BUFFER`: host and device can access
+    /// the buffer concurrently at byte granularity, no map/unmap
+    /// needed.
+    FineBuffer,
+    /// `CL_DEVICE_SVM_FINE_GRAIN_SYSTEM`: any host pointer (`Vec`,
+    /// `Box`, arbitrary malloc) is shareable with the device — no
+    /// claspr-side allocator needed; just pass `&Vec<T>` directly.
+    FineSystem,
+}
+
+impl SvmLevel {
+    fn from_caps(caps: opencl3::types::cl_device_svm_capabilities) -> SvmLevel {
+        // Per the OpenCL spec the higher levels imply the lower
+        // ones, but devices may report any subset (e.g. fine-grain
+        // buffer without coarse-grain). Pick the highest set bit.
+        if caps & CL_DEVICE_SVM_FINE_GRAIN_SYSTEM != 0 {
+            SvmLevel::FineSystem
+        } else if caps & CL_DEVICE_SVM_FINE_GRAIN_BUFFER != 0 {
+            SvmLevel::FineBuffer
+        } else if caps & CL_DEVICE_SVM_COARSE_GRAIN_BUFFER != 0 {
+            SvmLevel::CoarseBuffer
+        } else {
+            SvmLevel::None
+        }
+    }
+
+    /// `true` if the SVM atomics extension is also available.
+    /// Orthogonal to the level — both queried from the same flags
+    /// word but reported separately because the level alone doesn't
+    /// imply atomics.
+    pub fn has_atomics(&self, ctx: &Context) -> bool {
+        let caps = ctx.inner.device.cl3().svm_mem_capability();
+        caps & CL_DEVICE_SVM_ATOMICS != 0
     }
 }
 

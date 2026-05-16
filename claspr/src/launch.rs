@@ -35,7 +35,7 @@
 //! Rust types). The stage-2 build-time codegen and stage-3 proc-macro
 //! will tighten this to compile-time checks.
 
-use crate::buffer::DeviceSlice;
+use crate::buffer::{DeviceSlice, HostBuffer};
 use opencl3::event::Event;
 use opencl3::kernel::ExecuteKernel;
 use std::time::Duration;
@@ -66,14 +66,24 @@ impl<T: KernelArg + ?Sized> KernelArg for &mut T {
     }
 }
 
-// `DeviceSlice` lives in `buffer`, but its `KernelArg` impl belongs
-// here with the rest of the launch surface so `set_arg` plumbing is
-// in one place.
+// `DeviceSlice` and `HostBuffer` live in `buffer`, but their
+// `KernelArg` impls belong here with the rest of the launch surface
+// so `set_arg` plumbing is in one place. Both decompose into the
+// same `(buffer, len)` pair that rust-gpu's slice param expects.
 impl<T> KernelArg for DeviceSlice<T> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         let len: usize = self.len;
         unsafe {
             exec.set_arg(&self.buffer).set_arg(&len);
+        }
+    }
+}
+
+impl<T> KernelArg for HostBuffer<T> {
+    fn set(&self, exec: &mut ExecuteKernel<'_>) {
+        let len: usize = crate::Buffer::len(self);
+        unsafe {
+            exec.set_arg(self.buffer()).set_arg(&len);
         }
     }
 }

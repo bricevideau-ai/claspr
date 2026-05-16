@@ -68,8 +68,8 @@ pub mod queue;
 
 // ── Public surface ────────────────────────────────────────────────────
 
-pub use buffer::DeviceSlice;
-pub use context::Context;
+pub use buffer::{Buffer, DeviceSlice, HostBuffer};
+pub use context::{Context, SvmLevel};
 pub use device::{Device, DeviceType, Platform};
 pub use error::{Error, Result};
 pub use image::Image2DRgba8;

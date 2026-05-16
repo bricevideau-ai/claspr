@@ -1,28 +1,91 @@
-//! Device-side typed buffers.
+//! Typed device-side buffers and the [`Buffer`] trait that abstracts
+//! over them.
+//!
+//! Two tiers live in this module:
+//!
+//! | Type | Backing | Host access | Use case |
+//! |------|---------|-------------|----------|
+//! | [`DeviceSlice<T>`] | `CL_MEM_READ_WRITE` | via [`upload`](DeviceSlice::upload) / [`download`](DeviceSlice::download) | classic device-side buffer, opaque host pointer |
+//! | [`HostBuffer<T>`] | `CL_MEM_ALLOC_HOST_PTR` + persistent map | direct via `Deref<Target=[T]>` + `DerefMut` | pinned, runtime-chosen-host-accessible memory; zero-copy where the device supports it |
+//!
+//! The third tier (SVM / [`SharedBuffer`](crate::svm::SharedBuffer))
+//! lives in [`crate::svm`].
+//!
+//! User code that doesn't care which tier parameterises over
+//! `B: Buffer<T>`.
 
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::queue::Launcher;
-use opencl3::memory::{Buffer, CL_MEM_READ_WRITE};
-use opencl3::types::CL_BLOCKING;
+use opencl3::command_queue::{
+    enqueue_map_buffer, enqueue_unmap_mem_object, release_command_queue, retain_command_queue,
+};
+use opencl3::memory::{
+    Buffer as ClBuffer, CL_MAP_READ, CL_MAP_WRITE, CL_MEM_ALLOC_HOST_PTR, CL_MEM_READ_WRITE, ClMem,
+};
+use opencl3::types::{CL_BLOCKING, cl_command_queue, cl_int, cl_mem};
+use std::ops::{Deref, DerefMut};
 use std::ptr;
+use std::slice;
+
+/// Raw cl3 functions return `Result<_, cl_int>`. Wrap into our
+/// typed `Error` via opencl3's `ClError` newtype.
+fn cl_to_err(code: cl_int) -> Error {
+    Error::OpenCl(opencl3::error_codes::ClError(code))
+}
+
+// ── Buffer trait ────────────────────────────────────────────────────
+
+/// Common surface for the buffer tiers — [`DeviceSlice`],
+/// [`HostBuffer`], and [`crate::svm::SharedBuffer`].
+///
+/// Mostly informational: `len`, `is_empty`, and the owning
+/// `Context`. Allocation, upload, download, map, and unmap stay on
+/// each concrete type because their signatures differ.
+///
+/// Use this when writing code generic over which tier the user
+/// supplies:
+///
+/// ```ignore
+/// fn print_size<T, B: claspr::Buffer<T>>(b: &B) {
+///     println!("{} elements", b.len());
+/// }
+/// ```
+pub trait Buffer<T> {
+    /// Number of `T` elements in the buffer.
+    fn len(&self) -> usize;
+
+    /// `true` when the buffer has zero elements.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The context this buffer was allocated on.
+    fn ctx(&self) -> &Context;
+}
+
+// ── DeviceSlice ─────────────────────────────────────────────────────
 
 /// A typed device-side buffer paired with its element count.
 ///
 /// Mirrors rust-gpu's slice decomposition for kernel parameters: a
 /// `&mut [T]` kernel arg becomes two `clSetKernelArg` calls (data
 /// pointer + `usize` length). When passed as a launch argument,
-/// claspr sets both — see the [`KernelArg`] impl in
-/// [`crate::launch`].
+/// claspr sets both — see the [`KernelArg`] impl in [`crate::launch`].
 ///
 /// Construct via [`DeviceSlice::alloc`] (uninitialised) or
 /// [`DeviceSlice::upload`] (with initial host data). Read back via
 /// [`DeviceSlice::download`].
 ///
+/// Host code never sees the bytes directly — for that, use
+/// [`HostBuffer<T>`] (pinned host memory) or
+/// [`crate::svm::SharedBuffer<T>`] (SVM).
+///
 /// [`KernelArg`]: crate::launch::KernelArg
 pub struct DeviceSlice<T> {
-    pub(crate) buffer: Buffer<T>,
+    pub(crate) buffer: ClBuffer<T>,
     pub(crate) len: usize,
+    pub(crate) ctx: Context,
 }
 
 impl<T> DeviceSlice<T> {
@@ -36,9 +99,13 @@ impl<T> DeviceSlice<T> {
         // fresh device memory and ignores the host-pointer contract
         // that makes `Buffer::create` generally unsafe.
         let buffer = unsafe {
-            Buffer::<T>::create(ctx.raw_context(), CL_MEM_READ_WRITE, len, ptr::null_mut())?
+            ClBuffer::<T>::create(ctx.raw_context(), CL_MEM_READ_WRITE, len, ptr::null_mut())?
         };
-        Ok(DeviceSlice { buffer, len })
+        Ok(DeviceSlice {
+            buffer,
+            len,
+            ctx: ctx.clone(),
+        })
     }
 
     /// Allocate a device buffer and write `data` into it (blocking).
@@ -79,19 +146,183 @@ impl<T> DeviceSlice<T> {
         Ok(())
     }
 
-    /// Number of `T` elements in the buffer.
-    pub fn len(&self) -> usize {
+    /// Borrow the underlying opencl3 [`ClBuffer`](opencl3::memory::Buffer)
+    /// for cases that need direct OpenCL access.
+    pub fn buffer(&self) -> &ClBuffer<T> {
+        &self.buffer
+    }
+}
+
+impl<T> Buffer<T> for DeviceSlice<T> {
+    fn len(&self) -> usize {
         self.len
     }
 
-    /// `true` when the buffer has zero elements.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
+    fn ctx(&self) -> &Context {
+        &self.ctx
+    }
+}
+
+// ── HostBuffer ──────────────────────────────────────────────────────
+
+/// A typed buffer allocated with `CL_MEM_ALLOC_HOST_PTR`: the OpenCL
+/// runtime keeps the storage in host-accessible memory (typically
+/// pinned), and on devices that share an address space with the host
+/// (CPU OpenCL, integrated GPUs) the same allocation is the device's
+/// memory too — kernel reads and writes are zero-copy.
+///
+/// Host access is direct via [`Deref<Target=[T]>`](std::ops::Deref)
+/// and [`DerefMut`]. No `upload` / `download` needed — write the
+/// slice in place, then launch the kernel; the runtime synchronises
+/// the view at launch / completion boundaries.
+///
+/// Use [`HostBuffer::alloc`] for an uninitialised buffer or
+/// [`HostBuffer::from_slice`] to copy from a host slice at construction.
+pub struct HostBuffer<T> {
+    buffer: ClBuffer<T>,
+    /// Mapped host pointer — valid for the entire lifetime of the
+    /// HostBuffer (mapped once at construction, unmapped on Drop).
+    host_ptr: *mut T,
+    len: usize,
+    ctx: Context,
+    /// Retained cl_command_queue handle used for the matching
+    /// unmap call in Drop. Retained in `alloc`, released in Drop
+    /// after the unmap is enqueued.
+    map_queue: cl_command_queue,
+}
+
+// SAFETY: cl_mem and cl_command_queue are opaque handles; OpenCL API
+// calls on them are thread-safe per the spec (CL §3.4.1). `host_ptr`
+// is a stable mapped pointer for the lifetime of the buffer;
+// aliasing guarantees come from the borrow checker via
+// Deref/DerefMut on `&self` / `&mut self`.
+unsafe impl<T: Send> Send for HostBuffer<T> {}
+unsafe impl<T: Sync> Sync for HostBuffer<T> {}
+
+impl<T> HostBuffer<T> {
+    /// Allocate a `len`-element host-accessible buffer. Contents
+    /// are uninitialised — write before reading.
+    pub fn alloc<L: Launcher>(launcher: &L, len: usize) -> Result<Self> {
+        let ctx = launcher.context();
+        let q_raw: cl_command_queue = launcher.cl_queue().get();
+        // SAFETY: null host pointer + CL_MEM_ALLOC_HOST_PTR tells
+        // OpenCL to allocate fresh host-accessible memory.
+        let buffer = unsafe {
+            ClBuffer::<T>::create(
+                ctx.raw_context(),
+                CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
+                len,
+                ptr::null_mut(),
+            )?
+        };
+        // Map once for the lifetime of this HostBuffer. cl3's raw
+        // `enqueue_map_buffer` writes the host-accessible pointer
+        // into an out-param (opencl3's wrapper has the same shape).
+        // We use the raw call so we don't have to thread an opencl3
+        // CommandQueue wrapper into the struct.
+        let mut mapped_ptr: cl_mem = ptr::null_mut();
+        let map_event = unsafe {
+            enqueue_map_buffer(
+                q_raw,
+                buffer.get(),
+                CL_BLOCKING,
+                CL_MAP_READ | CL_MAP_WRITE,
+                0,
+                len * std::mem::size_of::<T>(),
+                &mut mapped_ptr,
+                0,
+                ptr::null(),
+            )
+            .map_err(cl_to_err)?
+        };
+        // CL_BLOCKING ensures the map completes; release the event.
+        // SAFETY: map_event was returned by the call above; we own it.
+        unsafe { opencl3::event::release_event(map_event).map_err(cl_to_err)? };
+        let host_ptr = mapped_ptr.cast::<T>();
+        // Retain the queue so its raw handle is valid for the unmap
+        // we issue in Drop, even if the user's Launcher gets dropped
+        // earlier.
+        // SAFETY: q_raw was just obtained from a live CommandQueue.
+        unsafe { retain_command_queue(q_raw).map_err(cl_to_err)? };
+        Ok(HostBuffer {
+            buffer,
+            host_ptr,
+            len,
+            ctx: ctx.clone(),
+            map_queue: q_raw,
+        })
     }
 
-    /// Borrow the underlying opencl3 [`Buffer`] for cases that need
-    /// direct OpenCL access.
-    pub fn buffer(&self) -> &Buffer<T> {
+    /// Allocate and initialise from a host slice. Same as
+    /// [`alloc`](Self::alloc) followed by `copy_from_slice` on the
+    /// `DerefMut` view.
+    pub fn from_slice<L: Launcher>(launcher: &L, data: &[T]) -> Result<Self>
+    where
+        T: Copy,
+    {
+        let mut buf = Self::alloc(launcher, data.len())?;
+        buf.copy_from_slice(data);
+        Ok(buf)
+    }
+
+    /// Borrow the underlying opencl3 [`ClBuffer`](opencl3::memory::Buffer).
+    pub fn buffer(&self) -> &ClBuffer<T> {
         &self.buffer
+    }
+}
+
+impl<T> Buffer<T> for HostBuffer<T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn ctx(&self) -> &Context {
+        &self.ctx
+    }
+}
+
+impl<T> Deref for HostBuffer<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        // SAFETY: host_ptr is a stable mapped pointer for `len`
+        // elements of T; the OpenCL runtime guarantees it remains
+        // valid until we unmap (Drop only).
+        unsafe { slice::from_raw_parts(self.host_ptr, self.len) }
+    }
+}
+
+impl<T> DerefMut for HostBuffer<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: see Deref. `&mut self` upgrades the unique-access
+        // guarantee from the borrow checker into a mutable slice.
+        unsafe { slice::from_raw_parts_mut(self.host_ptr, self.len) }
+    }
+}
+
+impl<T> Drop for HostBuffer<T> {
+    fn drop(&mut self) {
+        // SAFETY: we mapped this pointer in `alloc` and held it for
+        // the whole lifetime; unmap once now. We don't wait on the
+        // returned event — clReleaseMemObject (in our Buffer's Drop)
+        // refcounts the cl_mem until queued commands complete, so
+        // the buffer stays alive long enough for the unmap to land.
+        // Errors here can't be propagated; bump the sticky counter.
+        let unmap_res = unsafe {
+            enqueue_unmap_mem_object(
+                self.map_queue,
+                self.buffer.get(),
+                self.host_ptr.cast(),
+                0,
+                ptr::null(),
+            )
+        };
+        if unmap_res.is_err() {
+            self.ctx.record_err();
+        }
+        // SAFETY: queue was retained in `alloc`; release exactly once.
+        let rel_res = unsafe { release_command_queue(self.map_queue) };
+        if rel_res.is_err() {
+            self.ctx.record_err();
+        }
     }
 }
