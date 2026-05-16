@@ -9,6 +9,7 @@ members = [
     "examples/mandelbrot-kernel",
     "examples/sobel-kernel",
     "examples/image-pipeline",
+    "examples/two-device",
 ]
 
 [workspace.package]
