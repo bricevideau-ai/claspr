@@ -65,6 +65,7 @@ pub mod image;
 pub mod launch;
 pub mod ppm;
 pub mod queue;
+pub mod svm;
 
 // ── Public surface ────────────────────────────────────────────────────
 
@@ -78,6 +79,7 @@ pub use launch::{
 };
 pub use ppm::write_ppm_rgba8;
 pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
+pub use svm::{SharedBuffer, SharedReadGuard, SharedWriteGuard};
 
 // Stage-3 proc-macro frontend.
 pub use claspr_macros::{device, kernel};
