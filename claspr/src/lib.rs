@@ -61,6 +61,8 @@ pub mod buffer;
 pub mod context;
 pub mod device;
 pub mod error;
+#[cfg(feature = "async-events")]
+pub mod future;
 pub mod image;
 pub mod launch;
 pub mod ppm;
@@ -79,6 +81,9 @@ pub use launch::{
 };
 pub use ppm::write_ppm_rgba8;
 pub use queue::{InOrder, IntoEventList, Launcher, OutOfOrder, Queue, QueueOrder};
+
+#[cfg(feature = "async-events")]
+pub use future::{EventFuture, EventFutureExt};
 pub use svm::{SharedBuffer, SharedReadGuard, SharedWriteGuard};
 
 // Stage-3 proc-macro frontend.
