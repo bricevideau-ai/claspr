@@ -94,20 +94,36 @@ impl<O: QueueOrder> Clone for Queue<O> {
 }
 
 impl Queue<InOrder> {
-    /// Create a profiling-enabled in-order queue on this context's
-    /// device. The OpenCL spec guarantees commands run in submission
-    /// order — no event juggling required.
+    /// Create an in-order queue on this context's default device
+    /// (`ctx.device()`). The OpenCL spec guarantees commands run
+    /// in submission order — no event juggling required.
     pub fn new(ctx: &Context) -> Result<Self> {
         Self::from_props(ctx)
+    }
+
+    /// Create an in-order queue pinned to a specific device. Use
+    /// this for multi-device contexts where you need queues on
+    /// devices other than the default. `device` must be one of the
+    /// devices the context was built with (see
+    /// [`Context::for_devices`](crate::Context::for_devices)).
+    pub fn on_device(ctx: &Context, device: &crate::Device) -> Result<Self> {
+        Self::from_props_on(ctx, device)
     }
 }
 
 impl Queue<OutOfOrder> {
-    /// Create a profiling-enabled out-of-order queue. Commands run
-    /// when their explicit event dependencies are satisfied; the
-    /// caller is responsible for the dependency graph.
+    /// Create an out-of-order queue on this context's default
+    /// device. Commands run when their explicit event dependencies
+    /// are satisfied; the caller is responsible for the dependency
+    /// graph.
     pub fn new(ctx: &Context) -> Result<Self> {
         Self::from_props(ctx)
+    }
+
+    /// Create an out-of-order queue pinned to a specific device.
+    /// See [`Queue::<InOrder>::on_device`].
+    pub fn on_device(ctx: &Context, device: &crate::Device) -> Result<Self> {
+        Self::from_props_on(ctx, device)
     }
 
     /// Out-of-order launch: enqueue the kernel after `deps` complete,
@@ -203,6 +219,27 @@ impl<O: QueueOrder> Queue<O> {
     fn from_props(ctx: &Context) -> Result<Self> {
         let cl_queue =
             CommandQueue::create_default_with_properties(ctx.raw_context(), O::properties(), 0)?;
+        Ok(Queue {
+            inner: Arc::new(QueueInner {
+                cl_queue,
+                ctx: ctx.clone(),
+            }),
+            _order: PhantomData,
+        })
+    }
+
+    fn from_props_on(ctx: &Context, device: &crate::Device) -> Result<Self> {
+        // SAFETY: `device` must belong to `ctx` (per the docs on
+        // `on_device`). opencl3 marks this unsafe because the
+        // contract is per-call; we rely on the caller respecting it.
+        let cl_queue = unsafe {
+            CommandQueue::create_with_properties(
+                ctx.raw_context(),
+                device.raw_id(),
+                O::properties(),
+                0,
+            )?
+        };
         Ok(Queue {
             inner: Arc::new(QueueInner {
                 cl_queue,

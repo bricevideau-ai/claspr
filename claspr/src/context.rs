@@ -35,10 +35,13 @@ pub struct Context {
 
 struct ContextInner {
     cl_context: opencl3::context::Context,
-    device: Device,
-    /// In-order queue (no profiling — see `for_device`). Used by
-    /// the [`Launcher`] impl when the user hands `&ctx` to a
-    /// kernel call.
+    /// All devices the context spans. `devices[0]` is the default
+    /// (returned by `device()`); multi-device contexts add more.
+    devices: Vec<Device>,
+    /// In-order queue (no profiling — see `for_device`). Bound to
+    /// `devices[0]`. Used by the [`Launcher`] impl when the user
+    /// hands `&ctx` to a kernel call. Multi-device users build
+    /// additional `Queue<O>` handles for the other devices.
     default_cl_queue: CommandQueue,
     /// Sticky-error counter. `Drop` impls that discover an OpenCL
     /// release failure can't propagate it; they bump this instead so
@@ -58,12 +61,31 @@ impl Context {
     /// is opt-in via the `Queue` builder (matches SYCL 2020's
     /// `property::queue::enable_profiling` semantics).
     pub fn for_device(device: &Device) -> Result<Self> {
-        let cl_context = opencl3::context::Context::from_device(&device.cl3())?;
+        Self::for_devices(std::slice::from_ref(device))
+    }
+
+    /// Build a multi-device context. All `devices` must come from
+    /// the same platform (OpenCL spec requirement). The first
+    /// element becomes the "default" device — its queue is the
+    /// `Launcher` route, and `ctx.device()` returns it.
+    ///
+    /// Returns [`crate::Error::Other`] if `devices` is empty, or
+    /// the OpenCL error from `clCreateContext` if the devices
+    /// don't share a platform.
+    pub fn for_devices(devices: &[Device]) -> Result<Self> {
+        if devices.is_empty() {
+            return Err(crate::Error::Other(
+                "Context::for_devices: empty device slice".into(),
+            ));
+        }
+        let ids: Vec<_> = devices.iter().map(|d| d.raw_id()).collect();
+        let cl_context =
+            opencl3::context::Context::from_devices(&ids, &[], None, std::ptr::null_mut())?;
         let default_cl_queue = CommandQueue::create_default_with_properties(&cl_context, 0, 0)?;
         Ok(Context {
             inner: Arc::new(ContextInner {
                 cl_context,
-                device: device.clone(),
+                devices: devices.to_vec(),
                 default_cl_queue,
                 error_state: AtomicU32::new(0),
             }),
@@ -85,9 +107,17 @@ impl Context {
         Self::for_device(&Device::find(score)?)
     }
 
-    /// The device this context is pinned to.
+    /// The default device for this context — `devices()[0]`.
+    /// For single-device contexts this is the only device.
     pub fn device(&self) -> &Device {
-        &self.inner.device
+        &self.inner.devices[0]
+    }
+
+    /// Every device the context spans. Length 1 for contexts built
+    /// via [`Context::for_device`], length N for multi-device
+    /// contexts via [`Context::for_devices`].
+    pub fn devices(&self) -> &[Device] {
+        &self.inner.devices
     }
 
     /// Borrow the underlying [`opencl3::context::Context`] for
@@ -112,7 +142,7 @@ impl Context {
     /// extension is independent — query via [`SvmLevel::has_atomics`]
     /// on the returned value.
     pub fn svm_capability(&self) -> SvmLevel {
-        let caps = self.inner.device.cl3().svm_mem_capability();
+        let caps = self.inner.devices[0].cl3().svm_mem_capability();
         SvmLevel::from_caps(caps)
     }
 
@@ -142,7 +172,7 @@ impl Context {
             .map_err(|e| crate::Error::Other(format!("create_from_il: {e}")))?;
         if let Err(e) = program.build(self.inner.cl_context.devices(), "") {
             let log = program
-                .get_build_log(self.inner.device.raw_id())
+                .get_build_log(self.inner.devices[0].raw_id())
                 .unwrap_or_else(|_| "no build log".into());
             return Err(crate::Error::Build {
                 log: format!("{e}\n{log}"),
@@ -218,7 +248,7 @@ impl SvmLevel {
     /// word but reported separately because the level alone doesn't
     /// imply atomics.
     pub fn has_atomics(&self, ctx: &Context) -> bool {
-        let caps = ctx.inner.device.cl3().svm_mem_capability();
+        let caps = ctx.inner.devices[0].cl3().svm_mem_capability();
         caps & CL_DEVICE_SVM_ATOMICS != 0
     }
 }
