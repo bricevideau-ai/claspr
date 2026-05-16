@@ -17,7 +17,7 @@ use crate::launch::{IntoLaunchSpec, KernelArgs};
 use opencl3::command_queue::{CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, CommandQueue};
 use opencl3::event::Event;
 use opencl3::kernel::{ExecuteKernel, Kernel};
-use opencl3::types::cl_command_queue_properties;
+use opencl3::types::{cl_command_queue_properties, cl_event};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -108,6 +108,94 @@ impl Queue<OutOfOrder> {
     /// caller is responsible for the dependency graph.
     pub fn new(ctx: &Context) -> Result<Self> {
         Self::from_props(ctx)
+    }
+
+    /// Out-of-order launch: enqueue the kernel after `deps` complete,
+    /// return the resulting [`Event`] *without blocking*. The caller
+    /// composes dependency graphs by feeding returned events into
+    /// later `launch_with_deps` calls.
+    ///
+    /// `deps` accepts any [`IntoEventList`]: `()`, `&Event`,
+    /// `[&Event; N]`, `&[Event]`, `Vec<Event>`, etc.
+    ///
+    /// For the synchronous fire-and-wait path (matching the
+    /// [`Launcher::launch`] default impl), call `launch` instead.
+    pub fn launch_with_deps<D, S, A>(
+        &self,
+        deps: D,
+        kernel: &Kernel,
+        spec: S,
+        args: A,
+    ) -> Result<Event>
+    where
+        D: IntoEventList,
+        S: IntoLaunchSpec,
+        A: KernelArgs,
+    {
+        let mut exec = ExecuteKernel::new(kernel);
+        args.set_all(&mut exec);
+        let spec = spec.into_launch_spec();
+        exec.set_global_work_sizes(spec.global());
+        if let Some(local) = spec.local() {
+            exec.set_local_work_sizes(local);
+        }
+        let wait = deps.into_event_list();
+        if !wait.is_empty() {
+            exec.set_event_wait_list(&wait);
+        }
+        // SAFETY: see Launcher::launch — claspr's typed wrappers
+        // are what make this call safe. Unlike Launcher::launch,
+        // we do not block on the returned event; the caller chains
+        // it explicitly.
+        let event = unsafe { exec.enqueue_nd_range(self.raw())? };
+        Ok(event)
+    }
+}
+
+// ── IntoEventList ──────────────────────────────────────────────────
+
+/// Convert a value into a `Vec<cl_event>` for OpenCL wait-list
+/// arguments. Used by [`Queue<OutOfOrder>::launch_with_deps`] so
+/// callers can pass dependencies in whatever shape fits the
+/// situation — a single event, an array, a borrowed slice, etc.
+///
+/// Standard impls:
+/// - `()` — no dependencies (empty list)
+/// - `&Event` — one event
+/// - `[&Event; N]` (any const N) — fixed-size array of borrowed events
+/// - `&[Event]` — borrowed slice
+/// - `Vec<Event>` — owned vector
+pub trait IntoEventList {
+    fn into_event_list(self) -> Vec<cl_event>;
+}
+
+impl IntoEventList for () {
+    fn into_event_list(self) -> Vec<cl_event> {
+        Vec::new()
+    }
+}
+
+impl IntoEventList for &Event {
+    fn into_event_list(self) -> Vec<cl_event> {
+        vec![self.get()]
+    }
+}
+
+impl<const N: usize> IntoEventList for [&Event; N] {
+    fn into_event_list(self) -> Vec<cl_event> {
+        self.iter().map(|e| e.get()).collect()
+    }
+}
+
+impl IntoEventList for &[Event] {
+    fn into_event_list(self) -> Vec<cl_event> {
+        self.iter().map(|e| e.get()).collect()
+    }
+}
+
+impl IntoEventList for Vec<Event> {
+    fn into_event_list(self) -> Vec<cl_event> {
+        self.iter().map(|e| e.get()).collect()
     }
 }
 

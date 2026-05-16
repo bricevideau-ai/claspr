@@ -78,7 +78,7 @@ pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
 };
 pub use ppm::write_ppm_rgba8;
-pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
+pub use queue::{InOrder, IntoEventList, Launcher, OutOfOrder, Queue, QueueOrder};
 pub use svm::{SharedBuffer, SharedReadGuard, SharedWriteGuard};
 
 // Stage-3 proc-macro frontend.
