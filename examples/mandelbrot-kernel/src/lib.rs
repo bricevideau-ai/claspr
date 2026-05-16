@@ -26,6 +26,48 @@ pub mod gpu {
         glam::{USizeVec3, UVec4},
     };
 
+    // Note on math style: the iteration loop uses hand-expanded
+    // f32 `zx`/`zy` pairs rather than `num_complex::Complex32`.
+    // `num_complex` works fine in rust-gpu kernels in general
+    // (see `rust-gpu-opencl-samples/kernels/mandelbrot`, which
+    // uses `Complex32` against a `&mut [u32]` slice output). The
+    // problem is specifically the combination of Complex32 with
+    // an image-output kernel — it triggers two distinct runtime
+    // failures, one per OpenCL implementation observed:
+    //
+    // 1. **pocl 7.2-pre (aarch64)**: a SPIR-V module that has
+    //    both `OpTypeStruct %float %float` (Complex32) and
+    //    `OpCapability ImageBasic` (image kernel) makes
+    //    clBuildProgram either hang (long-lived process, worker
+    //    pool parked on a futex) or abort with `std::bad_alloc`
+    //    (bare C client). Internal cause unknown — could be a
+    //    memory corruption from a segfault that doesn't crash
+    //    immediately, an unbounded allocation, or something
+    //    else. Observed only that the trigger is module-level:
+    //    `#[inline(never)]` on a helper doesn't help, and
+    //    `#[inline(always)]` doesn't help either.
+    //
+    // 2. **rusticl / Mesa**: clBuildProgram succeeds, but
+    //    clEnqueueNDRangeKernel segfaults when the kernel runs.
+    //    Triggered when rust-gpu's optimiser outlines the
+    //    iteration helper into a second `OpFunction` with no
+    //    `OpName` attached (probably the known older rusticl
+    //    bug around `LLVMAddFunction(..., NULL)` for anonymous
+    //    helpers). `#[inline(always)]` works around this case —
+    //    collapses everything into the single named entry
+    //    function — and the Complex32 form then runs cleanly on
+    //    rusticl. pocl is still unhappy in that configuration.
+    //
+    // Hand-expanded `zx`/`zy` pairs sidestep both: the kernel
+    // becomes a single inlined entry function (no anonymous
+    // helper for rusticl) with no `OpTypeStruct` of floats (no
+    // pocl trigger).
+    //
+    // Minimal C reproducer + SPV diff at
+    // `/tmp/pocl-image-complex-hang/`. See also
+    // [[reference_pocl_image_complex_hang]] and
+    // [[reference_opencl_intercept_layer]] in memory.
+
     /// Map iteration count to an `(R, G, B)` u32 triple. Pure integer
     /// math so the kernel doesn't need any transcendental imports —
     /// three different multiples of `t = iter * 255 / max_iter` mod
