@@ -11,8 +11,8 @@
 //! The third tier (SVM / [`SharedBuffer`](crate::svm::SharedBuffer))
 //! lives in [`crate::svm`].
 //!
-//! User code that doesn't care which tier parameterises over
-//! `B: Buffer<T>`.
+//! See the [`Buffer`] trait's own docs for what it does and does
+//! not abstract over.
 
 use crate::context::Context;
 use crate::error::{Error, Result};
@@ -38,21 +38,54 @@ fn cl_to_err(code: cl_int) -> Error {
 
 // ── Buffer trait ────────────────────────────────────────────────────
 
-/// Common surface for the buffer tiers — [`DeviceSlice`],
+/// Common accessors shared by the buffer tiers — [`DeviceSlice`],
 /// [`HostBuffer`], and [`crate::svm::SharedBuffer`].
 ///
-/// Mostly informational: `len`, `is_empty`, and the owning
-/// `Context`. Allocation, upload, download, map, and unmap stay on
-/// each concrete type because their signatures differ.
+/// **Scope: plumbing, not tier polymorphism.** This trait exposes
+/// only the inspect-the-buffer accessors that mean the same thing
+/// across every tier: element count and the owning [`Context`]. It
+/// is *not* an upload/download polymorphism point — those operations
+/// stay on each concrete type because their signatures and lifetimes
+/// genuinely differ:
 ///
-/// Use this when writing code generic over which tier the user
-/// supplies:
+/// - [`DeviceSlice::upload`] / [`DeviceSlice::download`] enqueue a
+///   `clEnqueueRead`/`WriteBuffer` against a [`Launcher`].
+/// - [`HostBuffer`] is permanently mapped — host writes/reads go
+///   through `Deref<Target=[T]>` + `DerefMut`. No "upload" step.
+/// - [`SharedBuffer`](crate::svm::SharedBuffer) maps lazily on demand
+///   via [`SharedBuffer::map_mut`](crate::svm::SharedBuffer::map_mut)
+///   and unmaps when the guard drops.
+///
+/// So code like `fn upload_and_run<B: Buffer<T>>(b: &mut B, data: &[T])`
+/// is intentionally not possible — there is no single "upload" verb
+/// that does the right thing on all three tiers, and pretending one
+/// exists would force the polymorphic body to pick a worst-case
+/// strategy (e.g. unconditional `clEnqueueWriteBuffer`) that pessimises
+/// the zero-copy tiers.
+///
+/// Use this trait when you want a [`len`]/[`is_empty`]/[`ctx`]
+/// accessor without committing to a tier:
 ///
 /// ```ignore
 /// fn print_size<T, B: claspr::Buffer<T>>(b: &B) {
-///     println!("{} elements", b.len());
+///     println!("{} elements on {}", b.len(), b.ctx().device().name().unwrap());
 /// }
 /// ```
+///
+/// ## Future direction
+///
+/// If a real tier-polymorphism need surfaces (e.g. a benchmark
+/// harness that wants `upload_then_run` over all three tiers), the
+/// likely shape is a separate `BufferUpload<T>: Buffer<T>` super-trait
+/// with a single `upload(&mut self, launcher, data)` method whose
+/// impls call `clEnqueueWriteBuffer` for `DeviceSlice` and become a
+/// memcpy through `DerefMut` / `map_mut` for the host-mapped tiers.
+/// That can be added later without breaking the present trait's
+/// callers.
+///
+/// [`len`]: Self::len
+/// [`is_empty`]: Self::is_empty
+/// [`ctx`]: Self::ctx
 pub trait Buffer<T> {
     /// Number of `T` elements in the buffer.
     fn len(&self) -> usize;
