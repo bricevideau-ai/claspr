@@ -255,19 +255,32 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     };
 
     let kernels_path = &args.kernels;
+    let async_name = quote::format_ident!("{}_async", name);
 
-    // Emit an `impl Kernels { fn <name>(...) }` block. The generated
-    // method shadows the field of the same name on `Kernels` (which
-    // claspr-build emits as `pub`) — at the call site, parens
-    // disambiguate method vs field, so `kernels.collatz_kernel(...)`
-    // dispatches to the typed launch method here.
+    // Emit an `impl Kernels { fn <name>(...) fn <name>_async(...) }` block.
+    // The generated methods shadow the field of the same name on
+    // `Kernels` (which claspr-build emits as `pub`) — at the call site,
+    // parens disambiguate method vs field, so
+    // `kernels.collatz_kernel(...)` dispatches to the typed launch
+    // method here.
     //
-    // The launcher is `&impl Launcher` so callers can pass `&ctx`
-    // (uses the bundled default in-order queue) or `&queue` (uses
-    // the queue directly) interchangeably. `Launcher::launch` is
-    // the unified entry point — see `claspr/src/queue.rs`.
+    // Sync wrapper: takes `&impl Launcher` so callers can pass `&ctx`
+    // (uses the bundled default in-order queue) or any `&queue`
+    // interchangeably. Blocks on completion.
+    //
+    // Async wrapper: takes `&impl LauncherAsync` (only `&Queue<OutOfOrder>`
+    // implements this today) plus a `deps: impl IntoEventList`.
+    // Returns the event without blocking — the user chains it into
+    // later `_async` launches to build a DAG.
+    // `#[allow(clippy::too_many_arguments)]` — the wrapper's arg
+    // count is determined by the kernel's signature, which the user
+    // can't refactor without changing the device-side function. The
+    // async sibling adds one more (the `deps` list), pushing kernels
+    // with 4+ host args over clippy's 7-arg threshold. Suppress here
+    // rather than burden every user with a per-call `#[allow]`.
     Ok(quote! {
         impl #kernels_path {
+            #[allow(clippy::too_many_arguments)]
             #vis fn #name(
                 &self,
                 launcher: &impl ::claspr::Launcher,
@@ -275,6 +288,17 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 #(#host_params),*
             ) -> ::claspr::Result<::claspr::Event> {
                 launcher.launch(&self.#name, grid, #launch_tuple)
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            #vis fn #async_name(
+                &self,
+                launcher: &impl ::claspr::LauncherAsync,
+                deps: impl ::claspr::IntoEventList,
+                grid: impl ::claspr::IntoLaunchSpec,
+                #(#host_params),*
+            ) -> ::claspr::Result<::claspr::Event> {
+                launcher.launch_with_deps(deps, &self.#name, grid, #launch_tuple)
             }
         }
     })

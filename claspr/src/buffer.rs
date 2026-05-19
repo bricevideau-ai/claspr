@@ -178,7 +178,7 @@ impl<T> DeviceSlice<T> {
     /// cross-context transfers, download to host then re-upload.
     /// Returns the completion [`Event`] from the queued copy
     /// (non-blocking — chain via `.wait()` or
-    /// `Queue<OutOfOrder>::launch_with_deps`).
+    /// `LauncherAsync::launch_with_deps`).
     pub fn copy_to<L: Launcher>(
         &self,
         dst: &mut DeviceSlice<T>,

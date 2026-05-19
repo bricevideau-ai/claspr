@@ -453,9 +453,14 @@ fn generate_module_source(
         writeln!(s)?;
         writeln!(
             s,
-            "    /// Launch the `{}` kernel with typed arguments.",
+            "    /// Launch the `{}` kernel with typed arguments (sync — blocks on completion).",
             decl.name
         )?;
+        // `clippy::too_many_arguments` — arg count is determined by
+        // the kernel's declared signature, not user choice. The
+        // async sibling below adds `deps`, which can push wrappers
+        // over clippy's 7-arg threshold.
+        writeln!(s, "    #[allow(clippy::too_many_arguments)]")?;
         writeln!(s, "    pub fn {field}(")?;
         writeln!(s, "        &self,")?;
         writeln!(s, "        launcher: &impl ::claspr::Launcher,")?;
@@ -467,6 +472,31 @@ fn generate_module_source(
         writeln!(
             s,
             "        launcher.launch(&self.{field}, grid, {tuple_lit})"
+        )?;
+        writeln!(s, "    }}")?;
+
+        // Async sibling — takes a `deps: impl IntoEventList` and a
+        // `&impl LauncherAsync` (only `&Queue<OutOfOrder>` implements
+        // it today), returns the event without blocking.
+        writeln!(s)?;
+        writeln!(
+            s,
+            "    /// Launch the `{}` kernel after `deps` complete; returns the event without blocking.",
+            decl.name
+        )?;
+        writeln!(s, "    #[allow(clippy::too_many_arguments)]")?;
+        writeln!(s, "    pub fn {field}_async(")?;
+        writeln!(s, "        &self,")?;
+        writeln!(s, "        launcher: &impl ::claspr::LauncherAsync,")?;
+        writeln!(s, "        deps: impl ::claspr::IntoEventList,")?;
+        writeln!(
+            s,
+            "        grid: impl ::claspr::IntoLaunchSpec{params_sig},"
+        )?;
+        writeln!(s, "    ) -> ::claspr::Result<::claspr::Event> {{")?;
+        writeln!(
+            s,
+            "        launcher.launch_with_deps(deps, &self.{field}, grid, {tuple_lit})"
         )?;
         writeln!(s, "    }}")?;
     }

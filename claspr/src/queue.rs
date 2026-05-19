@@ -142,47 +142,6 @@ impl Queue<OutOfOrder> {
     pub fn on_device(ctx: &Context, device: &crate::Device) -> Result<Self> {
         Self::from_props_on(ctx, device)
     }
-
-    /// Out-of-order launch: enqueue the kernel after `deps` complete,
-    /// return the resulting [`Event`] *without blocking*. The caller
-    /// composes dependency graphs by feeding returned events into
-    /// later `launch_with_deps` calls.
-    ///
-    /// `deps` accepts any [`IntoEventList`]: `()`, `&Event`,
-    /// `[&Event; N]`, `&[Event]`, `Vec<Event>`, etc.
-    ///
-    /// For the synchronous fire-and-wait path (matching the
-    /// [`Launcher::launch`] default impl), call `launch` instead.
-    pub fn launch_with_deps<D, S, A>(
-        &self,
-        deps: D,
-        kernel: &Kernel,
-        spec: S,
-        args: A,
-    ) -> Result<Event>
-    where
-        D: IntoEventList,
-        S: IntoLaunchSpec,
-        A: KernelArgs,
-    {
-        let mut exec = ExecuteKernel::new(kernel);
-        args.set_all(&mut exec);
-        let spec = spec.into_launch_spec();
-        exec.set_global_work_sizes(spec.global());
-        if let Some(local) = spec.local() {
-            exec.set_local_work_sizes(local);
-        }
-        let wait = deps.into_event_list();
-        if !wait.is_empty() {
-            exec.set_event_wait_list(&wait);
-        }
-        // SAFETY: see Launcher::launch — claspr's typed wrappers
-        // are what make this call safe. Unlike Launcher::launch,
-        // we do not block on the returned event; the caller chains
-        // it explicitly.
-        let event = unsafe { exec.enqueue_nd_range(self.raw())? };
-        Ok(event)
-    }
 }
 
 // ── IntoEventList ──────────────────────────────────────────────────
@@ -359,3 +318,61 @@ impl<L: Launcher + ?Sized> Launcher for &L {
         (**self).context()
     }
 }
+
+// ── LauncherAsync trait ──────────────────────────────────────────────
+
+/// What the proc-macro's `_async` launch wrappers key off.
+///
+/// Implemented only by [`Queue<OutOfOrder>`] (and references to it):
+/// in-order launchers don't expose an explicit dependency-list path
+/// because their `clEnqueue*` calls already serialise against the
+/// previous command on the same queue.
+///
+/// The proc-macro emits two methods per kernel — `kernels.foo(...)`
+/// (sync, takes `&impl Launcher`, blocks on the event) and
+/// `kernels.foo_async(launcher, deps, ...)` (async, takes
+/// `&impl LauncherAsync`, returns the event without waiting). The
+/// async path is what users compose into a DAG.
+pub trait LauncherAsync: Launcher {
+    /// Out-of-order launch: enqueue the kernel after `deps` complete,
+    /// return the resulting [`Event`] *without blocking*. The caller
+    /// composes dependency graphs by feeding returned events into
+    /// later `launch_with_deps` calls.
+    ///
+    /// `deps` accepts any [`IntoEventList`]: `()`, `&Event`,
+    /// `[&Event; N]`, `&[Event]`, `Vec<Event>`, etc.
+    ///
+    /// For the synchronous fire-and-wait path (matching the
+    /// [`Launcher::launch`] default impl), call [`Launcher::launch`]
+    /// instead — same launcher, no `deps` argument, blocks.
+    fn launch_with_deps<D, S, A>(&self, deps: D, kernel: &Kernel, spec: S, args: A) -> Result<Event>
+    where
+        D: IntoEventList,
+        S: IntoLaunchSpec,
+        A: KernelArgs,
+    {
+        let mut exec = ExecuteKernel::new(kernel);
+        args.set_all(&mut exec);
+        let spec = spec.into_launch_spec();
+        exec.set_global_work_sizes(spec.global());
+        if let Some(local) = spec.local() {
+            exec.set_local_work_sizes(local);
+        }
+        let wait = deps.into_event_list();
+        if !wait.is_empty() {
+            exec.set_event_wait_list(&wait);
+        }
+        // SAFETY: see Launcher::launch — claspr's typed wrappers
+        // are what make this call safe. Unlike Launcher::launch,
+        // we do not block on the returned event; the caller chains
+        // it explicitly.
+        let event = unsafe { exec.enqueue_nd_range(self.cl_queue())? };
+        Ok(event)
+    }
+}
+
+impl LauncherAsync for Queue<OutOfOrder> {}
+
+// Same blanket as for `Launcher` — accepting `&Queue<OutOfOrder>` in
+// `&impl LauncherAsync` parameters needs the reference-through impl.
+impl<L: LauncherAsync + ?Sized> LauncherAsync for &L {}

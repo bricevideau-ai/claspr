@@ -12,7 +12,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use claspr::{Queue, OutOfOrder, EventFutureExt};
+//! use claspr::{Queue, OutOfOrder, EventFutureExt, LauncherAsync};
 //!
 //! let q = Queue::<OutOfOrder>::new(&ctx)?;
 //! let event = q.launch_with_deps((), &kernel, [n], (&buf,))?;

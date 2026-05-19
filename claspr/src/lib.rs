@@ -80,7 +80,7 @@ pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
 };
 pub use ppm::write_ppm_rgba8;
-pub use queue::{InOrder, IntoEventList, Launcher, OutOfOrder, Queue, QueueOrder};
+pub use queue::{InOrder, IntoEventList, Launcher, LauncherAsync, OutOfOrder, Queue, QueueOrder};
 
 #[cfg(feature = "async-events")]
 pub use future::{EventFuture, EventFutureExt};
