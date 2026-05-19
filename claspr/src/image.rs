@@ -122,10 +122,10 @@ pub mod format {
     macro_rules! format_zst {
         ($name:ident, $order:ident, $ctype:ident, $pixel:ty) => {
             #[doc = concat!(
-                            "OpenCL image format: ",
-                            stringify!($order), " / ", stringify!($ctype),
-                            ". Pixel type: `", stringify!($pixel), "`."
-                        )]
+                                        "OpenCL image format: ",
+                                        stringify!($order), " / ", stringify!($ctype),
+                                        ". Pixel type: `", stringify!($pixel), "`."
+                                    )]
             #[derive(Clone, Copy, Debug)]
             pub struct $name;
             impl sealed::Sealed for $name {}

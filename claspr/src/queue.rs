@@ -74,7 +74,11 @@ pub struct Queue<O: QueueOrder> {
 }
 
 struct QueueInner {
-    cl_queue: CommandQueue,
+    /// `ManuallyDrop` so opencl3's `CommandQueue::drop` (which panics
+    /// on release failure) doesn't fire — our own [`Drop`] impl
+    /// below calls `release_command_queue` and records into the
+    /// context's sticky-error counter on failure instead.
+    cl_queue: std::mem::ManuallyDrop<CommandQueue>,
     ctx: Context,
 }
 
@@ -83,6 +87,19 @@ struct QueueInner {
 // is itself Send + Sync.
 unsafe impl Send for QueueInner {}
 unsafe impl Sync for QueueInner {}
+
+impl Drop for QueueInner {
+    fn drop(&mut self) {
+        // SAFETY: opencl3's `CommandQueue` holds the cl_command_queue
+        // we created in `from_props` / `from_props_on`; release
+        // exactly once now.
+        let raw = self.cl_queue.get();
+        let res = unsafe { opencl3::command_queue::release_command_queue(raw) };
+        if res.is_err() {
+            self.ctx.record_err();
+        }
+    }
+}
 
 impl<O: QueueOrder> Clone for Queue<O> {
     fn clone(&self) -> Self {
@@ -221,7 +238,7 @@ impl<O: QueueOrder> Queue<O> {
             CommandQueue::create_default_with_properties(ctx.raw_context(), O::properties(), 0)?;
         Ok(Queue {
             inner: Arc::new(QueueInner {
-                cl_queue,
+                cl_queue: std::mem::ManuallyDrop::new(cl_queue),
                 ctx: ctx.clone(),
             }),
             _order: PhantomData,
@@ -242,7 +259,7 @@ impl<O: QueueOrder> Queue<O> {
         };
         Ok(Queue {
             inner: Arc::new(QueueInner {
-                cl_queue,
+                cl_queue: std::mem::ManuallyDrop::new(cl_queue),
                 ctx: ctx.clone(),
             }),
             _order: PhantomData,

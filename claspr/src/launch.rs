@@ -74,7 +74,7 @@ impl<T> KernelArg for DeviceSlice<T> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         let len: usize = self.len;
         unsafe {
-            exec.set_arg(&self.buffer).set_arg(&len);
+            exec.set_arg(&*self.buffer).set_arg(&len);
         }
     }
 }

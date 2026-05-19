@@ -22,8 +22,10 @@ use opencl3::command_queue::{
 };
 use opencl3::memory::{
     Buffer as ClBuffer, CL_MAP_READ, CL_MAP_WRITE, CL_MEM_ALLOC_HOST_PTR, CL_MEM_READ_WRITE, ClMem,
+    release_mem_object,
 };
 use opencl3::types::{CL_BLOCKING, cl_command_queue, cl_int, cl_mem};
+use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::slice;
@@ -83,9 +85,26 @@ pub trait Buffer<T> {
 ///
 /// [`KernelArg`]: crate::launch::KernelArg
 pub struct DeviceSlice<T> {
-    pub(crate) buffer: ClBuffer<T>,
+    /// `ManuallyDrop` so opencl3's `Buffer::drop` (which panics on
+    /// release failure) doesn't fire — our own [`Drop`] impl below
+    /// calls `release_mem_object` and records into the context's
+    /// sticky-error counter on failure instead.
+    pub(crate) buffer: ManuallyDrop<ClBuffer<T>>,
     pub(crate) len: usize,
     pub(crate) ctx: Context,
+}
+
+impl<T> Drop for DeviceSlice<T> {
+    fn drop(&mut self) {
+        let mem = self.buffer.get();
+        // SAFETY: mem was returned by clCreateBuffer in `alloc` and
+        // we hold the only owner (ManuallyDrop suppressed opencl3's
+        // own release path). Release exactly once now.
+        let res = unsafe { release_mem_object(mem) };
+        if res.is_err() {
+            self.ctx.record_err();
+        }
+    }
 }
 
 impl<T> DeviceSlice<T> {
@@ -102,7 +121,7 @@ impl<T> DeviceSlice<T> {
             ClBuffer::<T>::create(ctx.raw_context(), CL_MEM_READ_WRITE, len, ptr::null_mut())?
         };
         Ok(DeviceSlice {
-            buffer,
+            buffer: ManuallyDrop::new(buffer),
             len,
             ctx: ctx.clone(),
         })
@@ -119,7 +138,7 @@ impl<T> DeviceSlice<T> {
         unsafe {
             launcher
                 .cl_queue()
-                .enqueue_write_buffer(&mut slice.buffer, CL_BLOCKING, 0, data, &[])?
+                .enqueue_write_buffer(&mut *slice.buffer, CL_BLOCKING, 0, data, &[])?
                 .wait()?;
         }
         Ok(slice)
@@ -140,7 +159,7 @@ impl<T> DeviceSlice<T> {
         unsafe {
             launcher
                 .cl_queue()
-                .enqueue_read_buffer(&self.buffer, CL_BLOCKING, 0, dst, &[])?
+                .enqueue_read_buffer(&*self.buffer, CL_BLOCKING, 0, dst, &[])?
                 .wait()?;
         }
         Ok(())
@@ -179,8 +198,8 @@ impl<T> DeviceSlice<T> {
         // silent miscopy).
         let event = unsafe {
             launcher.cl_queue().enqueue_copy_buffer(
-                &self.buffer,
-                &mut dst.buffer,
+                &*self.buffer,
+                &mut *dst.buffer,
                 0,
                 0,
                 bytes,
