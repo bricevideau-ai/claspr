@@ -344,12 +344,15 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
 
     let ty_translated = if matches!(kind, Some(SpirvKind::CrossWorkgroup)) {
         translate_cross_workgroup_ty(&pt.ty)?
-    } else if is_image_param(&pt.ty) {
+    } else if let Some(info) = classify_image_param(&pt.ty) {
         // `&Image!(...)` / `&mut Image!(...)` — translate to claspr's
-        // host-side image type. Both mutability flavours map to
-        // `&Image2DRgba8` since the host-side handle isn't itself
-        // mutated by the launch (the GPU is what writes to it).
-        quote! { &::claspr::Image2DRgba8 }
+        // host-side image type. The reference itself stays `&` (the
+        // GPU writes to the image, the host handle isn't mutated);
+        // the access mode is encoded in the type parameter `A`
+        // instead.
+        let access = info.access;
+        let format = info.format;
+        quote! { &::claspr::Image2D<#access, #format> }
     } else {
         // No spirv attribute (or an unrecognised one): pass type through.
         let ty = &pt.ty;
@@ -396,24 +399,110 @@ fn spirv_attr_kind(attr: &Attribute) -> SpirvKind {
     }
 }
 
-/// True if `ty` looks like `&Image!(...)` or `&mut Image!(...)` — the
-/// rust-gpu storage-image kernel-parameter type. We map this to
-/// `&::claspr::Image2DRgba8` in the host launch wrapper.
+/// Parsed `Image!(...)` parameter info: the access-mode and format
+/// type paths to splice into the generated `&Image2D<A, F>` arg.
+struct ImageInfo {
+    access: TokenStream2,
+    format: TokenStream2,
+}
+
+/// Recognise `&Image!(...)` / `&mut Image!(...)` and parse the
+/// macro's token list to pick the matching claspr `Image2D<A, F>`
+/// host-side type.
 ///
-/// Detection is purely syntactic on the macro path being `Image` —
-/// we don't (yet) try to read out the dimensionality / format /
-/// sampled-ness arguments. Today claspr only ships
-/// `Image2DRgba8`, so any image kernel parameter maps there. When
-/// other formats arrive (`R32f`, `Rgba32f`, …), this branch will
-/// grow into a small dispatch.
-fn is_image_param(ty: &Type) -> bool {
+/// Mapping:
+///
+/// - `access=` token (if present) wins: `read_only` → `ReadOnly`,
+///   `write_only` → `WriteOnly`, `read_write` → `ReadWrite`.
+/// - Otherwise the default is `ReadWrite` — matching rust-gpu's
+///   unspecified-access behaviour (OpenCL treats it as both
+///   readable and writable). The host-side reference mutability
+///   (`&` vs `&mut`) is intentionally NOT used to pick access, so
+///   that today's `&mut Image!(2D, type=u32, ...)` kernels keep
+///   accepting the existing `Image2DRgba8` allocator (which is
+///   `Image2D<ReadWrite, ...>`).
+/// - `format=<name>` token (if present) wins for format selection:
+///   the name is taken as a `::claspr::image::format::<name>` ZST.
+/// - Otherwise, `type=u32` / `type=f32` / `type=i32` pick sensible
+///   defaults: `R8G8B8A8Uint` / `R32G32B32A32Float` / `R8G8B8A8Sint`.
+/// - Otherwise (no `type=` either) the default is `R8G8B8A8Uint`
+///   — same as the legacy `Image2DRgba8` alias.
+///
+/// Returns `None` if `ty` doesn't look like an `Image!(...)` ref.
+fn classify_image_param(ty: &Type) -> Option<ImageInfo> {
     let Type::Reference(TypeReference { elem, .. }) = ty else {
-        return false;
+        return None;
     };
     let Type::Macro(TypeMacro { mac }) = &**elem else {
-        return false;
+        return None;
     };
-    mac.path.is_ident("Image")
+    if !mac.path.is_ident("Image") {
+        return None;
+    }
+    let (access_tok, format_tok, type_tok) = parse_image_tokens(mac.tokens.clone());
+
+    let access = match access_tok.as_deref() {
+        Some("read_only") => quote! { ::claspr::ReadOnly },
+        Some("write_only") => quote! { ::claspr::WriteOnly },
+        Some("read_write") | None => quote! { ::claspr::ReadWrite },
+        Some(other) => {
+            // Unknown access keyword — fall back to ReadWrite and
+            // let the runtime sort it out. We could span-error here
+            // but tolerating unknown tokens keeps the macro forward-
+            // compatible with future rust-gpu Image! grammar.
+            let _ = other;
+            quote! { ::claspr::ReadWrite }
+        }
+    };
+
+    let format = if let Some(fname) = format_tok {
+        let ident = quote::format_ident!("{}", fname);
+        quote! { ::claspr::image::format::#ident }
+    } else {
+        match type_tok.as_deref() {
+            Some("f32") => quote! { ::claspr::image::format::R32G32B32A32Float },
+            Some("i32") => quote! { ::claspr::image::format::R8G8B8A8Sint },
+            // `u32` and the catch-all both map to the RGBA8 uint
+            // format — same as the legacy `Image2DRgba8` alias.
+            _ => quote! { ::claspr::image::format::R8G8B8A8Uint },
+        }
+    };
+
+    Some(ImageInfo { access, format })
+}
+
+/// Scan an `Image!(...)` token list for `access=<ident>`,
+/// `format=<ident>`, and `type=<ident>` key/value pairs. Tokens are
+/// comma-separated; standalone idents (`2D`, `3D`, …) are ignored.
+fn parse_image_tokens(tokens: TokenStream2) -> (Option<String>, Option<String>, Option<String>) {
+    let mut access = None;
+    let mut format = None;
+    let mut type_ = None;
+    let tts: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
+    let mut i = 0;
+    while i < tts.len() {
+        // Look for `<ident> = <ident>` triples.
+        if let (
+            Some(proc_macro2::TokenTree::Ident(key)),
+            Some(proc_macro2::TokenTree::Punct(eq)),
+            Some(proc_macro2::TokenTree::Ident(val)),
+        ) = (tts.get(i), tts.get(i + 1), tts.get(i + 2))
+            && eq.as_char() == '='
+        {
+            let k = key.to_string();
+            let v = val.to_string();
+            match k.as_str() {
+                "access" => access = Some(v),
+                "format" => format = Some(v),
+                "type" => type_ = Some(v),
+                _ => {}
+            }
+            i += 3;
+            continue;
+        }
+        i += 1;
+    }
+    (access, format, type_)
 }
 
 /// Translate a `cross_workgroup` parameter type.

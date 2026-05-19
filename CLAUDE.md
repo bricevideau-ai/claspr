@@ -105,7 +105,6 @@ On macOS the system OpenCL framework picks up automatically; no `OCL_ICD_VENDORS
 - **`#[path = "..."]` attribute support in multi-file resolution** — currently errors with a clear message.
 - **`cargo:warning=` for missing `proc_macro_hygiene` feature gate** — claspr-build could detect file modules in device-module bodies and check if the crate's inner attrs include the gate; warn at build time before the rustc error fires.
 - **Inherit `spirv-std` / `glam` dep specs from the host workspace** rather than hardcoding the bricevideau-ai/rust-gpu branch in the generated `Cargo.toml`.
-- **Image format dispatch in the proc-macro** — today every `&Image!(...)` maps to `&Image2DRgba8`. Need to read the macro's tokens (`type=u32, sampled=false`) and dispatch when other formats land.
 - **More samples through single-source**: subgroup ops + workgroup memory (reduce sample), f64 (nbody), printf, sampler-based image reads. Each will likely surface a small claspr-build / proc-macro extension.
 - **`cargo claspr` subcommand** to eliminate build.rs entirely (NVlabs/cuda-oxide-style). Doesn't port cleanly because rust-gpu is a whole-crate codegen backend (no per-item dispatch); workflow friction (plain cargo stops working, IDE tooling breaks) likely makes it not worth it.
 
