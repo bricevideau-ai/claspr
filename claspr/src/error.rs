@@ -29,8 +29,21 @@ pub enum Error {
     SvmNotAvailable,
     /// I/O error (reading a SPIR-V file, writing a PPM, …).
     Io(io::Error),
-    /// Free-form message for cases the typed variants don't cover yet.
-    /// New strongly-typed variants should subsume these over time.
+    /// A function argument failed a validation check (empty slice,
+    /// usize overflow, malformed name, …). The string is a static
+    /// description — the offending value is the caller's, not part
+    /// of the error.
+    InvalidArgument(&'static str),
+    /// Free-form message for cases the typed variants don't cover.
+    ///
+    /// Reserved as a user-facing escape hatch (via the
+    /// [`From<String>`]/[`From<&str>`] impls below) for callers that
+    /// want to bubble up an ad-hoc error without defining their own
+    /// type. *claspr's own code does not use this variant* — every
+    /// internal failure path goes through a typed variant.
+    ///
+    /// [`From<String>`]: #impl-From%3CString%3E-for-Error
+    /// [`From<&str>`]: #impl-From%3C%26str%3E-for-Error
     Other(String),
 }
 
@@ -49,6 +62,7 @@ impl fmt::Display for Error {
                 f.write_str("SVM (shared virtual memory) not available on this device")
             }
             Error::Io(e) => write!(f, "I/O: {e}"),
+            Error::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
             Error::Other(msg) => f.write_str(msg),
         }
     }

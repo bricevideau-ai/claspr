@@ -220,7 +220,7 @@ impl Device {
         Self::all()?
             .into_iter()
             .next()
-            .ok_or_else(|| Error::Other("no OpenCL devices found".into()))
+            .ok_or(Error::NotSupported("no OpenCL devices found"))
     }
 
     /// First GPU device on any platform.

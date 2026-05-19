@@ -2,7 +2,7 @@
 //! writer. Just enough to round-trip an RGBA8 image read from a kernel
 //! to a file you can open in any image viewer.
 
-use crate::Result;
+use crate::{Error, Result};
 use std::path::Path;
 
 /// Write an `RGBA8` byte buffer to a PPM (P6) file at `path`.
@@ -18,16 +18,14 @@ pub fn write_ppm_rgba8(
     let expected = (width as usize)
         .checked_mul(height as usize)
         .and_then(|n| n.checked_mul(4))
-        .ok_or("image dimensions overflow usize")?;
+        .ok_or(Error::InvalidArgument(
+            "write_ppm_rgba8: image dimensions overflow usize",
+        ))?;
     if pixels.len() != expected {
-        return Err(format!(
-            "pixel buffer is {} bytes, expected {} ({}x{} RGBA8)",
-            pixels.len(),
-            expected,
-            width,
-            height
-        )
-        .into());
+        return Err(Error::LengthMismatch {
+            src: pixels.len(),
+            dst: expected,
+        });
     }
     let mut out = Vec::with_capacity(expected / 4 * 3 + 32);
     out.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());

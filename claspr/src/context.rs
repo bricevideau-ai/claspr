@@ -69,13 +69,13 @@ impl Context {
     /// element becomes the "default" device — its queue is the
     /// `Launcher` route, and `ctx.device()` returns it.
     ///
-    /// Returns [`crate::Error::Other`] if `devices` is empty, or
-    /// the OpenCL error from `clCreateContext` if the devices
-    /// don't share a platform.
+    /// Returns [`crate::Error::InvalidArgument`] if `devices` is
+    /// empty, or the OpenCL error from `clCreateContext` if the
+    /// devices don't share a platform.
     pub fn for_devices(devices: &[Device]) -> Result<Self> {
         if devices.is_empty() {
-            return Err(crate::Error::Other(
-                "Context::for_devices: empty device slice".into(),
+            return Err(crate::Error::InvalidArgument(
+                "Context::for_devices: empty device slice",
             ));
         }
         let ids: Vec<_> = devices.iter().map(|d| d.raw_id()).collect();
@@ -168,8 +168,7 @@ impl Context {
     /// Create + build an OpenCL program from raw SPIR-V bytes.
     /// Returns the build log on failure.
     pub fn build_program(&self, spv_bytes: &[u8]) -> Result<Program> {
-        let mut program = Program::create_from_il(&self.inner.cl_context, spv_bytes)
-            .map_err(|e| crate::Error::Other(format!("create_from_il: {e}")))?;
+        let mut program = Program::create_from_il(&self.inner.cl_context, spv_bytes)?;
         if let Err(e) = program.build(self.inner.cl_context.devices(), "") {
             let log = program
                 .get_build_log(self.inner.devices[0].raw_id())
@@ -183,8 +182,7 @@ impl Context {
 
     /// Look up a kernel by entry-point name in a built program.
     pub fn kernel(&self, program: &Program, name: &str) -> Result<Kernel> {
-        Kernel::create(program, name)
-            .map_err(|e| crate::Error::Other(format!("Kernel::create({name}): {e}")))
+        Ok(Kernel::create(program, name)?)
     }
 
     /// Convenience: [`build_program`](Self::build_program) +
