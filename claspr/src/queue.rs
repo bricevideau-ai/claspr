@@ -13,7 +13,9 @@
 
 use crate::context::Context;
 use crate::error::Result;
-use opencl3::command_queue::{CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, CommandQueue};
+use opencl3::command_queue::{
+    CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, CL_QUEUE_PROFILING_ENABLE, CommandQueue,
+};
 use opencl3::types::cl_command_queue_properties;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -46,8 +48,6 @@ pub struct OutOfOrder;
 
 impl QueueOrder for InOrder {
     fn properties() -> cl_command_queue_properties {
-        // Profiling is opt-in (SYCL `property::queue::enable_profiling`
-        // pattern). The eventual `Queue::builder()` will expose it.
         0
     }
 }
@@ -107,6 +107,15 @@ impl<O: QueueOrder> Clone for Queue<O> {
     }
 }
 
+impl<O: QueueOrder> std::fmt::Debug for Queue<O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Queue")
+            .field("order", &std::any::type_name::<O>())
+            .field("raw", &self.inner.cl_queue.get())
+            .finish()
+    }
+}
+
 impl Queue<InOrder> {
     /// Create an in-order queue on this context's default device
     /// (`ctx.device()`). The OpenCL spec guarantees commands run
@@ -142,9 +151,20 @@ impl Queue<OutOfOrder> {
 }
 
 impl<O: QueueOrder> Queue<O> {
+    /// Compose the per-order properties (ordering, ...) with the
+    /// per-context toggles (profiling) into the bitmask
+    /// `clCreateCommandQueueWithProperties` wants.
+    fn effective_properties(ctx: &Context) -> cl_command_queue_properties {
+        let mut props = O::properties();
+        if ctx.profiling() {
+            props |= CL_QUEUE_PROFILING_ENABLE;
+        }
+        props
+    }
+
     fn from_props(ctx: &Context) -> Result<Self> {
-        let cl_queue =
-            CommandQueue::create_default_with_properties(ctx.raw_context(), O::properties(), 0)?;
+        let props = Self::effective_properties(ctx);
+        let cl_queue = CommandQueue::create_default_with_properties(ctx.raw_context(), props, 0)?;
         Ok(Queue {
             inner: Arc::new(QueueInner {
                 cl_queue: std::mem::ManuallyDrop::new(cl_queue),
@@ -155,16 +175,12 @@ impl<O: QueueOrder> Queue<O> {
     }
 
     fn from_props_on(ctx: &Context, device: &crate::Device) -> Result<Self> {
+        let props = Self::effective_properties(ctx);
         // SAFETY: `device` must belong to `ctx` (per the docs on
         // `on_device`). opencl3 marks this unsafe because the
         // contract is per-call; we rely on the caller respecting it.
         let cl_queue = unsafe {
-            CommandQueue::create_with_properties(
-                ctx.raw_context(),
-                device.raw_id(),
-                O::properties(),
-                0,
-            )?
+            CommandQueue::create_with_properties(ctx.raw_context(), device.raw_id(), props, 0)?
         };
         Ok(Queue {
             inner: Arc::new(QueueInner {

@@ -1,17 +1,25 @@
 //! [`Context`] — the OpenCL context wrapper, Arc-shared internally
 //! so it's cheap to clone and `Send + Sync`.
 //!
-//! Each `Context` carries a bundled in-order command queue used
-//! as the default launch path. Most user code
-//! never names a separate [`Queue`](crate::queue::Queue) — passing
-//! `&ctx` to a generated launch wrapper routes through the default
-//! queue. Advanced callers create explicit `Queue<InOrder>` /
-//! `Queue<OutOfOrder>` handles when they need separate command
-//! streams or out-of-order semantics.
+//! Each `Context` carries a per-device pair of lazy default queues
+//! (in-order + out-of-order). Most user code never names a
+//! [`Queue`](crate::queue::Queue) explicitly — passing `&ctx` to a
+//! generated launch wrapper routes through the in-order default
+//! for [`ctx.device()`](Context::device). Advanced callers reach
+//! for [`Context::default_inorder_queue`] /
+//! [`Context::default_outoforder_queue`] (per device, lazy) or
+//! create explicit [`Queue<O>`](crate::queue::Queue) handles when
+//! they want their own command stream.
+//!
+//! Profiling is opt-in on the [`ContextBuilder`]; the per-device
+//! default queues — and any [`Queue::new`](crate::queue::Queue::new) /
+//! [`Queue::on_device`](crate::queue::Queue::on_device) built later —
+//! inherit it. Matches SYCL 2020's
+//! `property::queue::enable_profiling` semantics.
 
 use crate::device::Device;
-use crate::error::Result;
-use crate::queue::Launcher;
+use crate::error::{Error, Result};
+use crate::queue::{InOrder, Launcher, OutOfOrder, Queue};
 use opencl3::command_queue::CommandQueue;
 use opencl3::device::{
     CL_DEVICE_SVM_ATOMICS, CL_DEVICE_SVM_COARSE_GRAIN_BUFFER, CL_DEVICE_SVM_FINE_GRAIN_BUFFER,
@@ -20,10 +28,11 @@ use opencl3::device::{
 use opencl3::kernel::Kernel;
 use opencl3::program::Program;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// OpenCL context, the device it's pinned to, and the default
-/// in-order command queue.
+/// OpenCL context + the devices it spans + lazy per-device default
+/// queue pairs.
 ///
 /// Cheap to clone (one `Arc` increment). `Send + Sync`. The OpenCL
 /// ICD does its own internal refcount under the hood; this Rust
@@ -38,15 +47,53 @@ struct ContextInner {
     /// All devices the context spans. `devices[0]` is the default
     /// (returned by `device()`); multi-device contexts add more.
     devices: Vec<Device>,
-    /// In-order queue (no profiling — see `for_device`). Bound to
-    /// `devices[0]`. Used by the [`Launcher`] impl when the user
-    /// hands `&ctx` to a kernel call. Multi-device users build
-    /// additional `Queue<O>` handles for the other devices.
-    default_cl_queue: CommandQueue,
+    /// Whether queues built from this context — both the per-device
+    /// defaults below and any `Queue::new` / `Queue::on_device` the
+    /// user constructs later — enable `CL_QUEUE_PROFILING_ENABLE`.
+    profiling: bool,
+    /// Per-device default queue pair. `queues[i]` corresponds to
+    /// `devices[i]`. Lazily populated on first lookup except
+    /// `queues[0].in_order` which is created at build time so the
+    /// `Launcher::cl_queue` implementation for `&Context` can return
+    /// a `&CommandQueue` infallibly.
+    queues: Vec<DeviceQueues>,
     /// Sticky-error counter. `Drop` impls that discover an OpenCL
     /// release failure can't propagate it; they bump this instead so
     /// callers who care can audit via [`Context::error_count`].
     error_state: AtomicU32,
+}
+
+/// Lazy queue pair for one device in a [`Context`].
+struct DeviceQueues {
+    in_order: OnceLock<Queue<InOrder>>,
+    out_of_order: OnceLock<Queue<OutOfOrder>>,
+}
+
+impl DeviceQueues {
+    fn empty() -> Self {
+        DeviceQueues {
+            in_order: OnceLock::new(),
+            out_of_order: OnceLock::new(),
+        }
+    }
+}
+
+/// Stand-in for the unstable [`OnceLock::get_or_try_init`]. Cheap
+/// fast path on hit; race-safe on miss (if two threads call this
+/// simultaneously, both may run `f`, but only one value survives —
+/// callers see whichever one wins the `set` race).
+fn once_lock_get_or_try_init<T, E, F>(cell: &OnceLock<T>, f: F) -> std::result::Result<&T, E>
+where
+    F: FnOnce() -> std::result::Result<T, E>,
+{
+    if let Some(v) = cell.get() {
+        return Ok(v);
+    }
+    let v = f()?;
+    // Discard our value if another thread won the race; either way
+    // `cell.get()` then returns the stored value.
+    let _ = cell.set(v);
+    Ok(cell.get().expect("OnceLock just set"))
 }
 
 // SAFETY: cl_context, cl_command_queue, and cl_device_id are opaque
@@ -56,40 +103,26 @@ unsafe impl Send for ContextInner {}
 unsafe impl Sync for ContextInner {}
 
 impl Context {
-    /// Build a context pinned to `device`, with an in-order default
-    /// queue. The queue has no extra properties enabled — profiling
-    /// is opt-in via the `Queue` builder (matches SYCL 2020's
-    /// `property::queue::enable_profiling` semantics).
-    pub fn for_device(device: &Device) -> Result<Self> {
-        Self::for_devices(std::slice::from_ref(device))
+    // ── Builder + canned constructors ──────────────────────────────
+
+    /// Start a [`ContextBuilder`]. The general entry point for
+    /// constructing a context — accumulate devices, enable profiling
+    /// if desired, and `.build()`.
+    pub fn builder() -> ContextBuilder {
+        ContextBuilder::new()
     }
 
-    /// Build a multi-device context. All `devices` must come from
-    /// the same platform (OpenCL spec requirement). The first
-    /// element becomes the "default" device — its queue is the
-    /// `Launcher` route, and `ctx.device()` returns it.
-    ///
-    /// Returns [`crate::Error::InvalidArgument`] if `devices` is
-    /// empty, or the OpenCL error from `clCreateContext` if the
-    /// devices don't share a platform.
+    /// Build a context pinned to `device`, with profiling off.
+    /// Shortcut for `Context::builder().device(device).build()`.
+    pub fn for_device(device: &Device) -> Result<Self> {
+        Self::builder().device(device).build()
+    }
+
+    /// Build a multi-device context with profiling off. All `devices`
+    /// must come from the same platform (OpenCL spec requirement).
+    /// Shortcut for `Context::builder().devices(devices).build()`.
     pub fn for_devices(devices: &[Device]) -> Result<Self> {
-        if devices.is_empty() {
-            return Err(crate::Error::InvalidArgument(
-                "Context::for_devices: empty device slice",
-            ));
-        }
-        let ids: Vec<_> = devices.iter().map(|d| d.raw_id()).collect();
-        let cl_context =
-            opencl3::context::Context::from_devices(&ids, &[], None, std::ptr::null_mut())?;
-        let default_cl_queue = CommandQueue::create_default_with_properties(&cl_context, 0, 0)?;
-        Ok(Context {
-            inner: Arc::new(ContextInner {
-                cl_context,
-                devices: devices.to_vec(),
-                default_cl_queue,
-                error_state: AtomicU32::new(0),
-            }),
-        })
+        Self::builder().devices(devices).build()
     }
 
     /// Pick the first available device of any type and build a
@@ -107,6 +140,8 @@ impl Context {
         Self::for_device(&Device::find(score)?)
     }
 
+    // ── Devices ────────────────────────────────────────────────────
+
     /// The default device for this context — `devices()[0]`.
     /// For single-device contexts this is the only device.
     pub fn device(&self) -> &Device {
@@ -120,17 +155,77 @@ impl Context {
         &self.inner.devices
     }
 
+    // ── Default queues ─────────────────────────────────────────────
+
+    /// Per-device default in-order queue (the Tier 1 default).
+    /// Lazily created on first lookup; stable reference thereafter.
+    ///
+    /// `device` must be one of the devices the context was built
+    /// with — otherwise returns [`Error::InvalidArgument`]. Honors
+    /// the [`profiling`](Self::profiling) setting from the builder.
+    pub fn default_inorder_queue(&self, device: &Device) -> Result<&Queue<InOrder>> {
+        let idx = self.device_index(device)?;
+        once_lock_get_or_try_init(&self.inner.queues[idx].in_order, || {
+            Queue::<InOrder>::on_device(self, device)
+        })
+    }
+
+    /// Per-device default out-of-order queue (the Tier 2 default).
+    /// Lazily created on first lookup; stable reference thereafter.
+    ///
+    /// `device` must be one of the devices the context was built
+    /// with — otherwise returns [`Error::InvalidArgument`]. Honors
+    /// the [`profiling`](Self::profiling) setting from the builder.
+    pub fn default_outoforder_queue(&self, device: &Device) -> Result<&Queue<OutOfOrder>> {
+        let idx = self.device_index(device)?;
+        once_lock_get_or_try_init(&self.inner.queues[idx].out_of_order, || {
+            Queue::<OutOfOrder>::on_device(self, device)
+        })
+    }
+
+    /// `true` if the context was built with `.profiling(true)`.
+    /// Every default queue and every [`Queue::new`](crate::queue::Queue::new) /
+    /// [`Queue::on_device`](crate::queue::Queue::on_device) built off
+    /// this context inherits the flag.
+    pub fn profiling(&self) -> bool {
+        self.inner.profiling
+    }
+
+    /// Position of `device` in [`devices`](Self::devices) by handle
+    /// identity (raw `cl_device_id`). Used by the default-queue
+    /// accessors to index into the per-device queue pair.
+    fn device_index(&self, device: &Device) -> Result<usize> {
+        self.inner
+            .devices
+            .iter()
+            .position(|d| d.raw_id() == device.raw_id())
+            .ok_or(Error::InvalidArgument("device is not part of this Context"))
+    }
+
+    // ── Raw escape hatches ─────────────────────────────────────────
+
     /// Borrow the underlying [`opencl3::context::Context`] for
     /// operations claspr doesn't surface yet.
     pub fn raw_context(&self) -> &opencl3::context::Context {
         &self.inner.cl_context
     }
 
-    /// Borrow the default in-order command queue. The [`Launcher`]
-    /// impl for `&Context` routes through this.
+    /// Borrow the default in-order command queue for
+    /// [`device()`](Self::device). This is the queue the
+    /// [`Launcher`] impl for `&Context` routes through.
+    ///
+    /// Always succeeds — created eagerly at build time.
     pub fn raw_default_queue(&self) -> &CommandQueue {
-        &self.inner.default_cl_queue
+        // `queues[0].in_order` is populated at build time; unwrap is
+        // safe. See `ContextBuilder::build`.
+        self.inner.queues[0]
+            .in_order
+            .get()
+            .expect("devices[0] default in-order queue is populated at build time")
+            .raw()
     }
+
+    // ── SVM capability query ───────────────────────────────────────
 
     /// What level of Shared Virtual Memory this context's device
     /// supports — useful for gating [`crate::svm::SharedBuffer`]
@@ -146,6 +241,8 @@ impl Context {
         SvmLevel::from_caps(caps)
     }
 
+    // ── Sticky-error counter ───────────────────────────────────────
+
     /// How many sticky errors have been recorded by Drop impls.
     /// Always zero unless an OpenCL release call failed during
     /// teardown — fault accumulator pattern from cuda-oxide.
@@ -155,10 +252,7 @@ impl Context {
 
     /// Bump the sticky-error counter. Called from `Drop` impls in
     /// dependent types when a release fails and the error can't be
-    /// propagated. (Not yet wired — neither `QueueInner` nor
-    /// `DeviceSlice` have fallible drop today; this stays
-    /// `pub(crate)` for the buffer/queue Drop work in stage 2.)
-    #[allow(dead_code)]
+    /// propagated.
     pub(crate) fn record_err(&self) {
         self.inner.error_state.fetch_add(1, Ordering::Relaxed);
     }
@@ -192,6 +286,90 @@ impl Context {
     pub fn kernel_from_spv(&self, spv_bytes: &[u8], name: &str) -> Result<Kernel> {
         let program = self.build_program(spv_bytes)?;
         self.kernel(&program, name)
+    }
+}
+
+// ── ContextBuilder ──────────────────────────────────────────────────
+
+/// Builder for [`Context`]. Accumulate devices via [`device`](Self::device)
+/// / [`devices`](Self::devices), opt into profiling via
+/// [`profiling`](Self::profiling), then [`build`](Self::build).
+///
+/// Use the canned [`Context::for_device`] / [`Context::for_devices`]
+/// shortcuts for single-call construction with profiling off.
+pub struct ContextBuilder {
+    devices: Vec<Device>,
+    profiling: bool,
+}
+
+impl ContextBuilder {
+    fn new() -> Self {
+        ContextBuilder {
+            devices: Vec::new(),
+            profiling: false,
+        }
+    }
+
+    /// Add a device to the context. Chainable — call once per device,
+    /// or use [`devices`](Self::devices) to add a slice in one go.
+    pub fn device(mut self, dev: &Device) -> Self {
+        self.devices.push(dev.clone());
+        self
+    }
+
+    /// Add multiple devices. All devices must come from the same
+    /// platform (OpenCL spec requirement; the underlying
+    /// `clCreateContext` rejects mixed platforms).
+    pub fn devices(mut self, devs: &[Device]) -> Self {
+        self.devices.extend_from_slice(devs);
+        self
+    }
+
+    /// Enable `CL_QUEUE_PROFILING_ENABLE` on every default queue and
+    /// every [`Queue::new`](crate::queue::Queue::new) /
+    /// [`Queue::on_device`](crate::queue::Queue::on_device) built off
+    /// this context. Off by default.
+    ///
+    /// Required for [`LaunchOp::profiled`](crate::op::LaunchOp::profiled)
+    /// to return real timestamps.
+    pub fn profiling(mut self, enabled: bool) -> Self {
+        self.profiling = enabled;
+        self
+    }
+
+    /// Materialise the context. The default in-order queue for the
+    /// first device is created eagerly so `&Context` can be used as
+    /// a `Launcher` without an extra fallible step; every other
+    /// per-device queue is created on first lookup.
+    pub fn build(self) -> Result<Context> {
+        if self.devices.is_empty() {
+            return Err(Error::InvalidArgument(
+                "ContextBuilder::build: no devices selected",
+            ));
+        }
+        let ids: Vec<_> = self.devices.iter().map(|d| d.raw_id()).collect();
+        let cl_context =
+            opencl3::context::Context::from_devices(&ids, &[], None, std::ptr::null_mut())?;
+        let queues: Vec<DeviceQueues> = (0..self.devices.len())
+            .map(|_| DeviceQueues::empty())
+            .collect();
+        let ctx = Context {
+            inner: Arc::new(ContextInner {
+                cl_context,
+                devices: self.devices,
+                profiling: self.profiling,
+                queues,
+                error_state: AtomicU32::new(0),
+            }),
+        };
+        // Eagerly populate the in-order queue for devices[0] so
+        // `Launcher::cl_queue(&ctx)` never has to fail. The lazy
+        // initialiser inside `default_inorder_queue` is the same
+        // path; calling it once now stores the queue into the
+        // OnceLock.
+        let dev0 = ctx.inner.devices[0].clone();
+        ctx.default_inorder_queue(&dev0)?;
+        Ok(ctx)
     }
 }
 
@@ -255,7 +433,7 @@ impl SvmLevel {
 
 impl Launcher for Context {
     fn cl_queue(&self) -> &CommandQueue {
-        &self.inner.default_cl_queue
+        self.raw_default_queue()
     }
 
     fn context(&self) -> &Context {
