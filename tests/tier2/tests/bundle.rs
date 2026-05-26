@@ -62,7 +62,7 @@ fn bundle2_two_kernels_on_distinct_buffers() {
             let kernels = kernels::kernels(ec.context())?;
             kernels.fill_u32(ec, [N], &buf, 0xAA).wait()?;
             let mut out = vec![0u32; N];
-            buf.download(ec, &mut out).wait()?;
+            buf.read(ec, &mut out).wait()?;
             Ok::<_, claspr::Error>(out)
         })
     });
@@ -72,7 +72,7 @@ fn bundle2_two_kernels_on_distinct_buffers() {
             let kernels = kernels::kernels(ec.context())?;
             kernels.fill_u32(ec, [N], &buf, 0xBB).wait()?;
             let mut out = vec![0u32; N];
-            buf.download(ec, &mut out).wait()?;
+            buf.read(ec, &mut out).wait()?;
             Ok::<_, claspr::Error>(out)
         })
     });
@@ -96,7 +96,7 @@ fn fan_out_homogeneous_kernels() {
             let kernels = kernels::kernels(ec.context())?;
             kernels.fill_u32(ec, [N], &buf, v).wait()?;
             let mut out = vec![0u32; N];
-            buf.download(ec, &mut out).wait()?;
+            buf.read(ec, &mut out).wait()?;
             Ok::<_, claspr::Error>(out)
         })
     })

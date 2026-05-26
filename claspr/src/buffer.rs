@@ -209,7 +209,7 @@ impl<T> DeviceSlice<T> {
     ///
     /// `dst.len()` must equal `self.len()` (checked at terminal time —
     /// the terminals return [`Error::LengthMismatch`] otherwise).
-    pub fn download<'a, L: Launcher + ?Sized>(
+    pub fn read<'a, L: Launcher + ?Sized>(
         &'a self,
         launcher: &'a L,
         dst: &'a mut [T],
@@ -222,6 +222,24 @@ impl<T> DeviceSlice<T> {
             deps: Vec::new(),
             profile_cb: None,
         }
+    }
+
+    /// Allocate a host `Vec<T>` of length `self.len()` and synchronously
+    /// read the buffer into it. Returns the populated vector.
+    ///
+    /// This is the blocking convenience for the common "device buffer →
+    /// host vec" case, the symmetric counterpart of [`upload`](Self::upload).
+    /// Internally it does `vec![T::default(); self.len]` followed by
+    /// `self.read(launcher, &mut out).wait()?`. For async / non-blocking
+    /// reads (or to reuse an existing buffer), call [`read`](Self::read)
+    /// directly.
+    pub fn download<L: Launcher + ?Sized>(&self, launcher: &L) -> Result<Vec<T>>
+    where
+        T: Clone + Default,
+    {
+        let mut out = vec![T::default(); self.len];
+        self.read(launcher, &mut out).wait()?;
+        Ok(out)
     }
 
     /// Borrow the underlying opencl3 [`ClBuffer`](opencl3::memory::Buffer)

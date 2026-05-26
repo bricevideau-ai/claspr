@@ -24,7 +24,7 @@
 //!     }))
 //!     .and_then(|buf| with_context(move |c| {
 //!         let mut out = vec![0u32; buf.len()];
-//!         buf.download(c, &mut out)?;
+//!         Ok(buf.download(c)?)
 //!         Ok(out)
 //!     }))
 //!     .sync(&ctx)?;

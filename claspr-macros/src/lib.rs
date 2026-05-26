@@ -39,7 +39,7 @@
 //!     //       data: &'l claspr::DeviceSlice<u32>,
 //!     //   ) -> claspr::LaunchOp<'l, (&'l claspr::DeviceSlice<u32>,)>
 //!     kernels.collatz_kernel(&ctx, [data.len()], &buf).wait()?;
-//!     ctx.download(&buf, &mut data)?;
+//!     buf.read(&ctx, &mut data).wait()?;
 //!     Ok(())
 //! }
 //! ```

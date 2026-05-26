@@ -97,6 +97,6 @@ fn fill_then_download_round_trip() {
         .expect("fill_u32");
 
     let mut out = vec![0u32; N];
-    buf.download(&ctx, &mut out).wait().expect("download");
+    buf.read(&ctx, &mut out).wait().expect("download");
     assert!(out.iter().all(|&x| x == 99));
 }

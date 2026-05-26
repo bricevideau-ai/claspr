@@ -109,9 +109,9 @@ fn run() -> claspr::Result<bool> {
     let mut out0 = vec![0u32; half];
     let mut out1 = vec![0u32; N - half];
     let mut mirror_out = vec![0u32; half];
-    buf0.download(&q0, &mut out0).wait()?;
-    buf1.download(&q1, &mut out1).wait()?;
-    mirror.download(&q1, &mut mirror_out).wait()?;
+    buf0.read(&q0, &mut out0).wait()?;
+    buf1.read(&q1, &mut out1).wait()?;
+    mirror.read(&q1, &mut mirror_out).wait()?;
 
     assert_eq!(out0, inputs[..half], "buf0 round-trip mismatch");
     assert_eq!(out1, inputs[half..], "buf1 round-trip mismatch");
