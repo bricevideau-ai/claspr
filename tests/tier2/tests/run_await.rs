@@ -10,8 +10,8 @@
 //! Uses `futures::executor::block_on` so the test harness doesn't
 //! need a full async runtime.
 
-use claspr::{Context, DeviceSlice};
-use claspr_async::{DeviceOperation, value, with_context};
+use claspr::Context;
+use claspr_async::{DeviceOperation, upload, value, with_context};
 use claspr_test_kernels::kernels;
 use futures::executor::block_on;
 
@@ -25,7 +25,7 @@ fn await_simple_chain() {
     };
 
     let chain = value(vec![0u32; N])
-        .and_then(|host| with_context(move |ec| DeviceSlice::upload(ec, &host)))
+        .and_then(upload)
         .and_then(|buf| {
             with_context(move |ec| {
                 let kernels = kernels::kernels(ec.context())?;
@@ -72,7 +72,7 @@ fn await_propagates_chain_error() {
     // — DeviceSlice::download returns LengthMismatch if dst.len() !=
     // self.len().
     let chain = value(vec![0u32; 16])
-        .and_then(|host| with_context(move |ec| DeviceSlice::upload(ec, &host)))
+        .and_then(upload)
         .and_then(|buf| {
             with_context(move |ec| {
                 let mut wrong_size = vec![0u32; 8];

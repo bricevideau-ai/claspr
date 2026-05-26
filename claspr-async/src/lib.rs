@@ -55,6 +55,7 @@ pub mod fan_out;
 pub mod future;
 pub mod op;
 pub mod profile;
+pub mod transfer;
 
 pub use and_then_host::{AndThenHost, DeviceOperationHostExt};
 pub use arc::ArcSplit;
@@ -67,3 +68,4 @@ pub use fan_out::{FanOut, fan_out};
 pub use future::ChainFuture;
 pub use op::{AndThen, Arced, DeviceOperation, Value, WithContext, value, with_context};
 pub use profile::{DeviceOperationProfileExt, Profiled};
+pub use transfer::{Download, Upload, UploadSource, download, upload};

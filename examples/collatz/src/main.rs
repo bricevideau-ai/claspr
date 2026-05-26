@@ -69,7 +69,8 @@ fn run() -> claspr::Result<bool> {
 
     let inputs: Vec<u32> = (1..=N as u32).collect();
     let mut device_results = inputs.clone();
-    let buf = claspr::DeviceSlice::upload(&ctx, &device_results)?;
+    let mut buf = claspr::DeviceSlice::alloc(&ctx, device_results.len())?;
+    buf.write(&ctx, &device_results).wait()?;
     kernels.collatz_kernel(&ctx, [N], &buf).wait()?;
     buf.read(&ctx, &mut device_results).wait()?;
 

@@ -80,7 +80,9 @@ pub use image::{Image2D, Image2DRgba8, ImageAccess, ReadOnly, ReadWrite, WriteOn
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
 };
-pub use op::{LaunchOp, ProfileCb, ProfilingInfo, register_profiling_callback};
+pub use op::{
+    LaunchOp, ProfileCb, ProfilingInfo, register_drop_callback, register_profiling_callback,
+};
 pub use ppm::write_ppm_rgba8;
 pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 

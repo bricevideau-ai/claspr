@@ -1,9 +1,10 @@
 //! Sub-step-3.5 (and_then_host) + sub-step-3.7 (`.profiled`)
 //! coverage.
 
-use claspr::{Context, Device, DeviceSlice};
+use claspr::{Context, Device};
 use claspr_async::{
-    DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, value, with_context,
+    DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, upload, value,
+    with_context,
 };
 use claspr_test_kernels::kernels;
 
@@ -29,7 +30,7 @@ fn and_then_host_sum_between_device_stages() {
 
     // upload + fill + download + (host) sum + check
     let sum: u32 = value(vec![0u32; N])
-        .and_then(|host| with_context(move |ec| DeviceSlice::upload(ec, &host)))
+        .and_then(upload)
         .and_then(|buf| {
             with_context(move |ec| {
                 let kernels = kernels::kernels(ec.context())?;
@@ -75,7 +76,7 @@ fn profile_chain_fires_callback_when_profiling_on() {
 
     let (tx, rx) = std::sync::mpsc::channel();
     value(vec![0u32; N])
-        .and_then(|host| with_context(move |ec| DeviceSlice::upload(ec, &host)))
+        .and_then(upload)
         .and_then(|buf| {
             with_context(move |ec| {
                 let kernels = kernels::kernels(ec.context())?;

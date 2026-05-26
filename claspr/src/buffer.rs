@@ -163,25 +163,6 @@ impl<T> DeviceSlice<T> {
         })
     }
 
-    /// Allocate a buffer of `data.len()` elements and synchronously
-    /// write `data` into it. Returns the populated buffer.
-    ///
-    /// This is the blocking convenience for the common "host vector →
-    /// device buffer" case. Internally it does
-    /// `alloc(ctx, data.len())?` followed by `buf.write(launcher, data).wait()?`.
-    /// For async / non-blocking variants, allocate explicitly and use
-    /// [`write`](Self::write):
-    ///
-    /// ```ignore
-    /// let mut buf = DeviceSlice::alloc(&ctx, data.len())?;
-    /// buf.write(&q, &data).await?;
-    /// ```
-    pub fn upload<L: Launcher + ?Sized>(launcher: &L, data: &[T]) -> Result<Self> {
-        let mut buf = Self::alloc(launcher.context(), data.len())?;
-        buf.write(launcher, data).wait()?;
-        Ok(buf)
-    }
-
     /// Begin writing `data` into this buffer. Returns a lazy
     /// [`WriteOp`] builder — pick a terminal ([`wait`](WriteOp::wait),
     /// [`submit`](WriteOp::submit), `.await`) to actually run.
@@ -222,24 +203,6 @@ impl<T> DeviceSlice<T> {
             deps: Vec::new(),
             profile_cb: None,
         }
-    }
-
-    /// Allocate a host `Vec<T>` of length `self.len()` and synchronously
-    /// read the buffer into it. Returns the populated vector.
-    ///
-    /// This is the blocking convenience for the common "device buffer →
-    /// host vec" case, the symmetric counterpart of [`upload`](Self::upload).
-    /// Internally it does `vec![T::default(); self.len]` followed by
-    /// `self.read(launcher, &mut out).wait()?`. For async / non-blocking
-    /// reads (or to reuse an existing buffer), call [`read`](Self::read)
-    /// directly.
-    pub fn download<L: Launcher + ?Sized>(&self, launcher: &L) -> Result<Vec<T>>
-    where
-        T: Clone + Default,
-    {
-        let mut out = vec![T::default(); self.len];
-        self.read(launcher, &mut out).wait()?;
-        Ok(out)
     }
 
     /// Borrow the underlying opencl3 [`ClBuffer`](opencl3::memory::Buffer)

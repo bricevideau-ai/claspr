@@ -267,3 +267,76 @@ fn collect_profiling(event: &Event) -> Result<ProfilingInfo> {
         end: event.profiling_command_end()?,
     })
 }
+
+// ── Keep-alive callback FFI shim ────────────────────────────────────
+
+/// Register a `CL_COMPLETE` callback on `event` whose sole job is to
+/// drop `holder` when the event fires.
+///
+/// Use case: non-blocking host-to-device writes. `clEnqueueWriteBuffer(CL_FALSE)`
+/// requires the source host buffer to stay valid until the write event
+/// completes (CL §5.2.1). The caller hands us the heap holder of the
+/// source (a `Box<Vec<T>>`, a `Box<Arc<[T]>>`, etc.); we keep it alive
+/// by stashing the box pointer in OpenCL's `user_data`, and drop it
+/// from a `CL_COMPLETE` callback once the write is done.
+///
+/// `T` is monomorphised per holder type — the thunk reclaims the box
+/// via `Box::from_raw` with the same `T` it was allocated as.
+///
+/// Panics inside the drop are caught via `catch_unwind` (FFI safety).
+pub fn register_drop_callback<T>(event: &Event, holder: Box<T>) -> Result<()>
+where
+    T: Send + 'static,
+{
+    // Bump the cl_event refcount so the callback still fires even if
+    // every other Event handle for this cl_event has been released.
+    // SAFETY: `event.get()` is a live cl_event; retain matches the
+    // release in `drop_callback_thunk` when it reclaims the box.
+    unsafe {
+        opencl3::event::retain_event(event.get())
+            .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?
+    };
+    let owned_event = Event::new(event.get());
+    let data = Box::new(KeepAlive {
+        event: owned_event,
+        holder,
+    });
+    let user_data = Box::into_raw(data) as *mut c_void;
+    let res = set_event_callback(
+        event.get(),
+        CL_COMPLETE,
+        drop_callback_thunk::<T>,
+        user_data,
+    );
+    if let Err(code) = res {
+        // SAFETY: registration failed, OpenCL never took ownership;
+        // reclaim and drop.
+        unsafe {
+            drop(Box::from_raw(user_data as *mut KeepAlive<T>));
+        }
+        return Err(Error::OpenCl(opencl3::error_codes::ClError(code)));
+    }
+    Ok(())
+}
+
+/// `user_data` payload for [`register_drop_callback`]. Both fields
+/// drop when the thunk reclaims the box — the `event` releases the
+/// retained cl_event refcount we added, and `holder` releases
+/// whatever the caller wanted us to keep alive.
+#[allow(dead_code)] // fields are read only via their Drop impls
+struct KeepAlive<T> {
+    event: Event,
+    holder: Box<T>,
+}
+
+extern "C" fn drop_callback_thunk<T>(_event: cl_event, _status: cl_int, user_data: *mut c_void)
+where
+    T: Send + 'static,
+{
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: `user_data` was leaked from `register_drop_callback`
+        // with the same `T`. CL_COMPLETE fires at most once. Reclaim
+        // and drop the holder + event on scope exit.
+        let _ = unsafe { Box::from_raw(user_data as *mut KeepAlive<T>) };
+    }));
+}
