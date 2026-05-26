@@ -15,6 +15,12 @@ path = "src/lib.rs"
 # `.run().await` builds on. It's the whole point of this crate, so the
 # feature is on unconditionally.
 claspr = { path = "../claspr", features = ["async-events"] }
+# Direct opencl3 dep so the per-buffer HostAccessible impls in
+# host_view.rs can call enqueue_svm_map / enqueue_svm_unmap and the
+# command-queue retain/release helpers without re-exporting them
+# through claspr. opencl3 is already in our transitive dep graph
+# via claspr — this just makes the imports cleaner.
+opencl3.workspace = true
 
 [lints]
 workspace = true

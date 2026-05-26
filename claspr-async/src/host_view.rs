@@ -37,8 +37,20 @@
 
 use crate::exec_ctx::ExecutionContext;
 use crate::op::DeviceOperation;
-use claspr::{Buffer, DeviceSlice, Result};
+use claspr::{Buffer, DeviceSlice, Error, HostBuffer, Launcher, Result, SharedBuffer};
+use opencl3::command_queue::{
+    enqueue_svm_map, enqueue_svm_unmap, release_command_queue, retain_command_queue,
+};
+use opencl3::event::release_event;
+use opencl3::types::{CL_BLOCKING, cl_command_queue};
 use std::ops::{Deref, DerefMut};
+use std::ptr;
+use std::slice;
+
+/// Wrap a raw cl3 status code into our typed [`Error`].
+fn cl_to_err(code: opencl3::types::cl_int) -> Error {
+    Error::OpenCl(opencl3::error_codes::ClError(code))
+}
 
 // ── Extension trait for the user-facing entry point ─────────────────
 
@@ -165,6 +177,290 @@ where
         // callback trick (same as transfer::upload) for a non-blocking
         // release.
         buf.write(ctx, &data).wait()?;
+        Ok(buf)
+    }
+}
+
+// ── HostBuffer: zero-copy — acquire/release are no-ops ──────────────
+
+impl<T> HostAccessibleExt for HostBuffer<T>
+where
+    T: Send + 'static,
+{
+    type AcquireOp = AcquireHostBufferOp<T>;
+    fn acquire_host_view(self) -> AcquireHostBufferOp<T> {
+        AcquireHostBufferOp { buf: Some(self) }
+    }
+}
+
+/// Combinator returned by `HostBuffer::acquire_host_view`. No CL
+/// command — the buffer is permanently mapped already (`CL_MEM_ALLOC_HOST_PTR`
+/// + persistent map), so the view just wraps the buf and lets the
+/// host Deref-access the existing mapped pointer.
+pub struct AcquireHostBufferOp<T> {
+    buf: Option<HostBuffer<T>>,
+}
+
+impl<T> DeviceOperation for AcquireHostBufferOp<T>
+where
+    T: Send + 'static,
+{
+    type Output = HostBufferHostView<T>;
+
+    fn execute(mut self, _ctx: &ExecutionContext<'_>) -> Result<HostBufferHostView<T>> {
+        let buf = self
+            .buf
+            .take()
+            .expect("AcquireHostBufferOp::execute called twice");
+        Ok(HostBufferHostView { buf })
+    }
+}
+
+/// Host-side view of a [`HostBuffer<T>`]. Same shape as
+/// [`DeviceSliceHostView`] but DerefMut goes straight to the
+/// always-mapped host pointer — no extra scratch buffer.
+pub struct HostBufferHostView<T> {
+    buf: HostBuffer<T>,
+}
+
+impl<T> Deref for HostBufferHostView<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        // HostBuffer derefs to [T] via its persistent map.
+        &self.buf
+    }
+}
+
+impl<T> DerefMut for HostBufferHostView<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.buf
+    }
+}
+
+impl<T> HostBufferHostView<T>
+where
+    T: Send + 'static,
+{
+    /// Symmetric counterpart of [`HostAccessibleExt::acquire_host_view`].
+    /// Since [`HostBuffer`] is zero-copy, release is also a no-op —
+    /// just hand the buffer back.
+    pub fn release_to_device(self) -> ReleaseHostBufferOp<T> {
+        ReleaseHostBufferOp {
+            view: Some(self.buf),
+        }
+    }
+}
+
+/// Combinator returned by [`HostBufferHostView::release_to_device`].
+pub struct ReleaseHostBufferOp<T> {
+    view: Option<HostBuffer<T>>,
+}
+
+impl<T> DeviceOperation for ReleaseHostBufferOp<T>
+where
+    T: Send + 'static,
+{
+    type Output = HostBuffer<T>;
+    fn execute(mut self, _ctx: &ExecutionContext<'_>) -> Result<HostBuffer<T>> {
+        Ok(self
+            .view
+            .take()
+            .expect("ReleaseHostBufferOp::execute called twice"))
+    }
+}
+
+// ── SharedBuffer: clEnqueueSVMMap (blocking) + clEnqueueSVMUnmap ────
+
+impl<T> HostAccessibleExt for SharedBuffer<T>
+where
+    T: Send + 'static,
+{
+    type AcquireOp = AcquireSharedBufferOp<T>;
+    fn acquire_host_view(self) -> AcquireSharedBufferOp<T> {
+        AcquireSharedBufferOp { buf: Some(self) }
+    }
+}
+
+/// Combinator returned by `SharedBuffer::acquire_host_view`. Issues a
+/// blocking `clEnqueueSVMMap(CL_TRUE, CL_MAP_READ|WRITE)` so the host
+/// has coherent access to the SVM allocation, retains the queue handle
+/// so the matching unmap on release uses the same queue, then wraps
+/// everything in a [`SharedBufferHostView`].
+pub struct AcquireSharedBufferOp<T> {
+    buf: Option<SharedBuffer<T>>,
+}
+
+impl<T> DeviceOperation for AcquireSharedBufferOp<T>
+where
+    T: Send + 'static,
+{
+    type Output = SharedBufferHostView<T>;
+
+    fn execute(mut self, ctx: &ExecutionContext<'_>) -> Result<SharedBufferHostView<T>> {
+        let buf = self
+            .buf
+            .take()
+            .expect("AcquireSharedBufferOp::execute called twice");
+        let q_raw: cl_command_queue = ctx.cl_queue().get();
+        let size = buf.len() * std::mem::size_of::<T>();
+        let ptr = buf.ptr();
+        // SAFETY: blocking SVM map (CL_TRUE). `ptr` came from
+        // clSVMAlloc on the same context; `size` is the allocation's
+        // exact byte length. CL_MAP_READ | CL_MAP_WRITE gives full
+        // coherent host access. Map flags `3` = READ|WRITE per the CL
+        // spec (CL_MAP_READ=1, CL_MAP_WRITE=2).
+        let evt = unsafe {
+            enqueue_svm_map(
+                q_raw,
+                CL_BLOCKING,
+                opencl3::memory::CL_MAP_READ | opencl3::memory::CL_MAP_WRITE,
+                ptr.cast(),
+                size,
+                0,
+                ptr::null(),
+            )
+            .map_err(cl_to_err)?
+        };
+        // SAFETY: blocking-map returned an event — release it immediately
+        // (we don't need to track it; the map is already done).
+        unsafe { release_event(evt).map_err(cl_to_err)? };
+        // Retain the queue handle so it stays alive for the matching
+        // unmap on release. Mirrors what claspr's
+        // `SharedReadGuard::new` does for the same reason.
+        unsafe { retain_command_queue(q_raw).map_err(cl_to_err)? };
+        Ok(SharedBufferHostView {
+            buf: Some(buf),
+            queue: q_raw,
+        })
+    }
+}
+
+/// Host-side view of a [`SharedBuffer<T>`] — a live SVM map.
+///
+/// **Drop hazard**: the inner [`SharedBuffer`]'s own Drop fires a
+/// `clEnqueueSVMFree` on the Context's default in-order queue (per
+/// Phase 0 fix). The map we issued lives on a *different* queue
+/// (the chain's OOO queue), so there's no implicit ordering between
+/// the unmap and the free. We *must* unmap (and wait for the unmap
+/// event) before letting the inner SharedBuffer drop. Drop below
+/// does that; [`release_to_device`](Self::release_to_device) takes
+/// the same path, then yields the buffer back.
+///
+/// `buf` is wrapped in `Option<>` so `release_to_device` can take it
+/// out — Drop then becomes a no-op on the post-release path.
+pub struct SharedBufferHostView<T> {
+    buf: Option<SharedBuffer<T>>,
+    /// Retained `cl_command_queue` handle for the matching SVM unmap.
+    queue: cl_command_queue,
+}
+
+// SAFETY: cl_command_queue is an opaque handle; we hold a retained
+// reference. The SharedBuffer inside is itself Send (its impl above).
+unsafe impl<T: Send> Send for SharedBufferHostView<T> {}
+
+impl<T> SharedBufferHostView<T> {
+    /// Shared helper for the unmap-and-wait sequence used by both
+    /// the explicit release path and the implicit Drop path. Returns
+    /// the buffer back; the queue handle is released as a side
+    /// effect. Errors are returned (release) or sunk into the
+    /// sticky-error counter (Drop).
+    fn unmap(&mut self) -> Result<Option<SharedBuffer<T>>> {
+        let Some(buf) = self.buf.take() else {
+            return Ok(None);
+        };
+        // SAFETY: ptr was mapped in acquire; unmap exactly once.
+        let evt = unsafe { enqueue_svm_unmap(self.queue, buf.ptr().cast(), 0, ptr::null()) }
+            .map_err(cl_to_err)?;
+        // Wrap the event so its Drop releases it. We MUST wait on it
+        // before the SharedBuffer drops — its Drop's clEnqueueSVMFree
+        // runs on a different queue (the Context's default in-order)
+        // and there's no implicit ordering between the two queues.
+        let event = opencl3::event::Event::new(evt);
+        event.wait()?;
+        // SAFETY: the queue handle was retained in acquire; release
+        // exactly once here.
+        unsafe { release_command_queue(self.queue) }.map_err(cl_to_err)?;
+        Ok(Some(buf))
+    }
+}
+
+impl<T> Drop for SharedBufferHostView<T> {
+    fn drop(&mut self) {
+        // If the user already called release_to_device, `buf` is None
+        // and unmap is a no-op. Otherwise we're on the panic / early-
+        // exit path: do the unmap synchronously so the inner buf can
+        // safely drop afterwards.
+        match self.unmap() {
+            Ok(_) => {}
+            Err(_) => {
+                // Errors here are unrecoverable. The buf, if any, is
+                // still around (because unmap took it). Stash an
+                // error on its context before dropping it.
+                if let Some(buf) = self.buf.take() {
+                    buf.ctx().record_err();
+                }
+            }
+        }
+    }
+}
+
+impl<T> Deref for SharedBufferHostView<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        let buf = self
+            .buf
+            .as_ref()
+            .expect("SharedBufferHostView already released");
+        // SAFETY: the SVM pointer is valid and mapped for read+write
+        // for the lifetime of this view (between acquire's map and
+        // release's / Drop's unmap).
+        unsafe { slice::from_raw_parts(buf.ptr(), buf.len()) }
+    }
+}
+
+impl<T> DerefMut for SharedBufferHostView<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        let buf = self
+            .buf
+            .as_ref()
+            .expect("SharedBufferHostView already released");
+        // SAFETY: same as Deref — plus the SVM map was acquired with
+        // CL_MAP_WRITE so mutation is permitted.
+        unsafe { slice::from_raw_parts_mut(buf.ptr(), buf.len()) }
+    }
+}
+
+impl<T> SharedBufferHostView<T>
+where
+    T: Send + 'static,
+{
+    /// Symmetric counterpart of [`HostAccessibleExt::acquire_host_view`].
+    /// Issues the `clEnqueueSVMUnmap`, waits for it to complete (so
+    /// the buffer is safe to drop on a different queue afterwards),
+    /// and yields the [`SharedBuffer`] back.
+    pub fn release_to_device(self) -> ReleaseSharedBufferOp<T> {
+        ReleaseSharedBufferOp { view: Some(self) }
+    }
+}
+
+/// Combinator returned by [`SharedBufferHostView::release_to_device`].
+pub struct ReleaseSharedBufferOp<T> {
+    view: Option<SharedBufferHostView<T>>,
+}
+
+impl<T> DeviceOperation for ReleaseSharedBufferOp<T>
+where
+    T: Send + 'static,
+{
+    type Output = SharedBuffer<T>;
+
+    fn execute(mut self, _ctx: &ExecutionContext<'_>) -> Result<SharedBuffer<T>> {
+        let mut view = self
+            .view
+            .take()
+            .expect("ReleaseSharedBufferOp::execute called twice");
+        let buf = view.unmap()?.expect("view's buf was already released");
+        // view's Drop runs now — buf is None, no-op.
         Ok(buf)
     }
 }

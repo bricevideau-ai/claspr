@@ -253,7 +253,10 @@ impl Context {
     /// Bump the sticky-error counter. Called from `Drop` impls in
     /// dependent types when a release fails and the error can't be
     /// propagated.
-    pub(crate) fn record_err(&self) {
+    ///
+    /// Public so external claspr-async impls (e.g. the SVM view's
+    /// Drop in `host_view`) can record into the same counter.
+    pub fn record_err(&self) {
         self.inner.error_state.fetch_add(1, Ordering::Relaxed);
     }
 

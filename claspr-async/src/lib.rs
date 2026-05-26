@@ -68,7 +68,9 @@ pub use exec_ctx::ExecutionContext;
 pub use fan_out::{FanOut, fan_out};
 pub use future::ChainFuture;
 pub use host_view::{
-    AcquireDeviceSliceOp, DeviceSliceHostView, HostAccessibleExt, ReleaseDeviceSliceOp,
+    AcquireDeviceSliceOp, AcquireHostBufferOp, AcquireSharedBufferOp, DeviceSliceHostView,
+    HostAccessibleExt, HostBufferHostView, ReleaseDeviceSliceOp, ReleaseHostBufferOp,
+    ReleaseSharedBufferOp, SharedBufferHostView,
 };
 pub use op::{AndThen, Arced, DeviceOperation, Value, WithContext, value, with_context};
 pub use profile::{DeviceOperationProfileExt, Profiled};

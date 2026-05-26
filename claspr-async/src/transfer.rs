@@ -43,7 +43,7 @@
 
 use crate::exec_ctx::ExecutionContext;
 use crate::op::DeviceOperation;
-use claspr::{Buffer, DeviceSlice, Result, register_drop_callback};
+use claspr::{Buffer, DeviceSlice, Result};
 use std::sync::Arc;
 
 // ── UploadSource ────────────────────────────────────────────────────
@@ -101,15 +101,30 @@ impl<T> From<Arc<[T]>> for UploadSource<T> {
 
 // ── upload ──────────────────────────────────────────────────────────
 
-/// Allocate a [`DeviceSlice`] of `source.len()` elements and
-/// non-blocking-write `source` into it. The host buffer is kept
-/// alive by a `clSetEventCallback` that drops the holder when the
-/// write completes — execute returns the populated [`DeviceSlice`]
-/// immediately; the chain's terminator gates user visibility.
+/// Allocate a [`DeviceSlice`] of `source.len()` elements and write
+/// `source` into it.
+///
+/// **execute() currently blocks** on the write completing (CL_TRUE
+/// internally). Reason: claspr-async's chains run on a per-device
+/// out-of-order queue, and we don't yet auto-thread "last writer"
+/// events between dependent ops — so a non-blocking write here would
+/// race a downstream read on the same buffer (per CL §5.4 OOO commands
+/// may reorder without explicit event links). Until per-buffer event
+/// tracking lands, the safe choice is a blocking write inside execute.
+///
+/// The chain *as a whole* is still async-capable via [`run`](crate::DeviceOperation::run):
+/// the upload step blocks, but kernel pipelining + the async terminal
+/// stay intact. Multiple parallel uploads (e.g. inside [`fan_out`])
+/// pipeline at the host level — each upload's execute blocks but they
+/// can run concurrently when fan_out submits them on the OOO queue.
 ///
 /// See [`UploadSource`] for the sources accepted via `impl Into<...>`.
 pub fn upload<T, S>(source: S) -> Upload<T>
 where
+    // `T: Sync` is required only because `UploadSource::Arc(Arc<[T]>)`
+    // needs `Arc<T>: Send` for the chain's Send bound; Vec/Box paths
+    // don't need it. Cheap to keep here; common types (u32, f32, ...)
+    // satisfy it.
     T: Send + Sync + 'static,
     S: Into<UploadSource<T>>,
 {
@@ -118,9 +133,8 @@ where
     }
 }
 
-/// Combinator built by [`upload`]. Lazy — `execute` allocates,
-/// enqueues, and registers the keep-alive callback when the chain
-/// reaches it.
+/// Combinator built by [`upload`]. Lazy — `execute` allocates and
+/// enqueues the (blocking) write when the chain reaches it.
 pub struct Upload<T> {
     source: Option<UploadSource<T>>,
 }
@@ -137,16 +151,14 @@ where
             .take()
             .expect("Upload::execute called twice — internal claspr-async bug");
         let mut buf = DeviceSlice::alloc(ctx.context(), source.len())?;
-        // Non-blocking enqueue via the public WriteOp builder. The
-        // WriteOp captures `&source` for the duration of the enqueue
-        // call; `.submit()` consumes it and returns the event, at
-        // which point the borrow is released and we can move
-        // `source` into the keep-alive callback.
-        let event = buf.write(ctx, source.as_slice()).submit()?;
-        // Move `source` into a Box, hand to the OpenCL runtime via
-        // user_data. The thunk drops it when CL_COMPLETE fires —
-        // exactly when OpenCL is finished reading from the host heap.
-        register_drop_callback(&event, Box::new(source))?;
+        // Blocking enqueue (CL_TRUE). See the function-level docs for
+        // why: without per-buffer event tracking, a non-blocking
+        // write would race a downstream read on the same OOO queue.
+        buf.write(ctx, source.as_slice()).wait()?;
+        // `source` is dropped at end of scope. With CL_TRUE the
+        // runtime is done reading from the host heap by the time
+        // .wait() returns, so the drop is safe — no keep-alive
+        // callback needed.
         Ok(buf)
     }
 }
@@ -154,11 +166,15 @@ where
 // ── download ────────────────────────────────────────────────────────
 
 /// Consume `buf` and allocate a host `Vec<T>` of `buf.len()` elements,
-/// non-blocking-read the buffer into it. The `DeviceSlice` is dropped
-/// at the end of `execute` — but OpenCL keeps an internal refcount
-/// on the `cl_mem` so the read completes safely. The `Vec` moves up
-/// the chain (its heap address stays stable across Rust moves) and
-/// the chain's terminator waits before the user sees it.
+/// blocking-read the buffer into it.
+///
+/// **execute() blocks** on the read (CL_TRUE), same rationale as
+/// [`upload`]: without per-buffer event tracking, a non-blocking read
+/// would race subsequent ops (or post-terminator user code) that
+/// touch the Vec contents. The chain itself remains async-capable
+/// via [`run`](crate::DeviceOperation::run) — the download step
+/// blocks, but earlier pipelined work plus the async terminal stay
+/// intact.
 pub fn download<T>(buf: DeviceSlice<T>) -> Download<T>
 where
     T: Clone + Default + Send + 'static,
@@ -167,8 +183,8 @@ where
 }
 
 /// Combinator built by [`download`]. Lazy — `execute` allocs the
-/// destination Vec, enqueues a non-blocking read into it, and
-/// returns the Vec.
+/// destination Vec and enqueues the (blocking) read when the chain
+/// reaches it.
 pub struct Download<T> {
     buf: Option<DeviceSlice<T>>,
 }
@@ -185,13 +201,8 @@ where
             .take()
             .expect("Download::execute called twice — internal claspr-async bug");
         let mut out = vec![T::default(); buf.len()];
-        // .submit() gives non-blocking enqueue + Event. We don't keep
-        // the Event — the chain's terminator (queue.finish in .sync,
-        // marker in .run().await) is what waits. The `out` Vec moves
-        // through subsequent stages (Vec move = pointer move; the
-        // heap data stays put). The `buf` DeviceSlice drops at end of
-        // scope; OpenCL retains the cl_mem until the read completes.
-        let _event = buf.read(ctx, &mut out).submit()?;
+        // Blocking read (CL_TRUE). See function-level docs for why.
+        buf.read(ctx, &mut out).wait()?;
         Ok(out)
     }
 }
