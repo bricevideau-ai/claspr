@@ -1,0 +1,20 @@
+[package]
+name = "claspr-test-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Simple rust-gpu kernels for claspr's runtime integration tests"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+claspr = { path = "../../claspr" }
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true

@@ -27,6 +27,14 @@ pub enum Error {
     NotSupported(&'static str),
     /// SVM (shared virtual memory) was requested but not available on this device.
     SvmNotAvailable,
+    /// A [`LaunchOp::profiled`](crate::op::LaunchOp::profiled) closure was
+    /// registered, but the target queue lacks `CL_QUEUE_PROFILING_ENABLE`.
+    /// Build the context with [`ContextBuilder::profiling(true)`](crate::context::ContextBuilder::profiling)
+    /// so the per-device default queues — and any
+    /// [`Queue::new`](crate::queue::Queue::new) /
+    /// [`Queue::on_device`](crate::queue::Queue::on_device) built off it —
+    /// inherit profiling.
+    ProfilingDisabled,
     /// I/O error (reading a SPIR-V file, writing a PPM, …).
     Io(io::Error),
     /// A function argument failed a validation check (empty slice,
@@ -61,6 +69,10 @@ impl fmt::Display for Error {
             Error::SvmNotAvailable => {
                 f.write_str("SVM (shared virtual memory) not available on this device")
             }
+            Error::ProfilingDisabled => f.write_str(
+                "queue does not have CL_QUEUE_PROFILING_ENABLE \
+                 (build the Context with .profiling(true))",
+            ),
             Error::Io(e) => write!(f, "I/O: {e}"),
             Error::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
             Error::Other(msg) => f.write_str(msg),

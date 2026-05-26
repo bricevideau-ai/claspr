@@ -218,6 +218,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "claspr-test-kernels"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+ "claspr-build",
+]
+
+[[package]]
+name = "claspr-tier1-tests"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+ "claspr-test-kernels",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

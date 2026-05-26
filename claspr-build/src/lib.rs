@@ -745,6 +745,17 @@ impl HostBuilder {
         std::fs::create_dir_all(crate_dir.join("src"))?;
         write_generated_cargo_toml(&crate_dir)?;
         write_generated_lib_rs(&crate_dir, &lifted_file)?;
+        // Seed the sub-crate with the host workspace's Cargo.lock so
+        // shared transitive deps (notably `glam`) resolve to the same
+        // versions the host built against. Without this, the sub-crate
+        // is its own independent workspace and would re-resolve fresh
+        // against crates.io. That can pick up new releases that gate
+        // previously-always-available items behind features — e.g.
+        // glam 0.33 moved `UVec2/UVec3/UVec4/IVec*` behind the
+        // `integer-types` feature, which `spirv-std`'s
+        // `opencl-kernel-support` branch doesn't request, breaking
+        // its build.
+        seed_lockfile_from_host(src_dir, &crate_dir);
 
         // Compile via spirv-builder.
         let result: CompileResult = self.settings.apply_to(&crate_dir).build()?;
@@ -876,6 +887,25 @@ fn attr_path_matches(attr: &syn::Attribute, name: &str) -> bool {
         [single] => single == name,
         [first, second] => first == "claspr" && second == name,
         _ => false,
+    }
+}
+
+/// Best-effort: walk up from `src_dir` looking for a `Cargo.lock` (the
+/// host workspace's), and copy it into the generated kernel sub-crate
+/// so cargo reuses the host's version pins for transitive deps. Silent
+/// on failure — the build still works if the lock is missing, it just
+/// resolves fresh and may pick newer (potentially-incompatible) deps.
+fn seed_lockfile_from_host(src_dir: &Path, crate_dir: &Path) {
+    let mut probe = src_dir.to_path_buf();
+    for _ in 0..16 {
+        let candidate = probe.join("Cargo.lock");
+        if candidate.exists() {
+            let _ = std::fs::copy(&candidate, crate_dir.join("Cargo.lock"));
+            return;
+        }
+        if !probe.pop() {
+            return;
+        }
     }
 }
 

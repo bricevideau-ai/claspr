@@ -23,7 +23,7 @@
 use crate::error::{Error, Result};
 use crate::launch::{IntoLaunchSpec, KernelArgs, LaunchSpec};
 use crate::queue::Launcher;
-use opencl3::command_queue::CommandQueue;
+use opencl3::command_queue::{CL_QUEUE_PROFILING_ENABLE, CommandQueue};
 use opencl3::event::{CL_COMPLETE, Event, retain_event, set_event_callback};
 use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::types::{cl_event, cl_int};
@@ -110,12 +110,18 @@ impl<'l, A: KernelArgs> LaunchOp<'l, A> {
     /// avoid blocking calls.
     ///
     /// Panics inside the callback are caught and dropped (unwinding
-    /// across the FFI boundary is UB); the resulting `Result` reflects
-    /// only OpenCL-side failures querying the timestamps.
+    /// across the FFI boundary is UB); the `Result` the closure
+    /// receives reflects only OpenCL-side failures querying the
+    /// timestamps.
     ///
-    /// Requires the queue to have been built with profiling enabled —
-    /// otherwise the timestamp queries fail and the closure receives
-    /// `Err(...)`.
+    /// Requires the queue to have `CL_QUEUE_PROFILING_ENABLE` — build
+    /// the [`Context`](crate::Context) with
+    /// [`.profiling(true)`](crate::context::ContextBuilder::profiling)
+    /// to flip it on for the per-device defaults and every
+    /// [`Queue`](crate::queue::Queue) built afterwards. The check
+    /// fires at terminal time ([`wait`](Self::wait) /
+    /// [`submit`](Self::submit) / `.await`), surfacing as
+    /// [`Error::ProfilingDisabled`] before any enqueue happens.
     pub fn profiled<F>(mut self, cb: F) -> Self
     where
         F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
@@ -152,6 +158,15 @@ impl<'l, A: KernelArgs> LaunchOp<'l, A> {
             deps,
             profile_cb,
         } = self;
+        // If the caller asked for profiling, the target queue must
+        // have `CL_QUEUE_PROFILING_ENABLE`. Check before enqueueing so
+        // we surface a clean error instead of silently registering a
+        // callback whose timestamp queries would fail later.
+        // `CommandQueue::properties()` is `clGetCommandQueueInfo(...,
+        // CL_QUEUE_PROPERTIES)` — one syscall per profiled launch.
+        if profile_cb.is_some() && (queue.properties()? & CL_QUEUE_PROFILING_ENABLE) == 0 {
+            return Err(Error::ProfilingDisabled);
+        }
         let mut exec = ExecuteKernel::new(kernel);
         args.set_all(&mut exec);
         exec.set_global_work_sizes(spec.global());

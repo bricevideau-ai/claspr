@@ -1,0 +1,20 @@
+[package]
+name = "claspr-tier1-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Integration tests for claspr's Tier 1 runtime surface (LaunchOp, Context, Queue, …)"
+
+# Empty library shell so `tests/*.rs` files are discovered as
+# integration tests. No public API.
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+claspr = { path = "../../claspr" }
+claspr-test-kernels = { path = "../kernels" }
+
+[lints]
+workspace = true

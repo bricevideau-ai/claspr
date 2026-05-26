@@ -10,6 +10,8 @@ members = [
     "examples/sobel-kernel",
     "examples/image-pipeline",
     "examples/two-device",
+    "tests/kernels",
+    "tests/tier1",
 ]
 
 [workspace.package]
