@@ -93,6 +93,7 @@ pub use claspr_macros::{device, kernel};
 
 // Re-exports from opencl3 — the types users actually touch through
 // claspr's API.
+pub use opencl3::command_queue::CommandQueue;
 pub use opencl3::event::Event;
 pub use opencl3::kernel::Kernel;
 pub use opencl3::program::Program;

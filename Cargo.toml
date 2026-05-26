@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "claspr",
+    "claspr-async",
     "claspr-build",
     "claspr-macros",
     "examples/collatz",
@@ -12,6 +13,7 @@ members = [
     "examples/two-device",
     "tests/kernels",
     "tests/tier1",
+    "tests/tier2",
 ]
 
 [workspace.package]

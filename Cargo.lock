@@ -199,6 +199,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "claspr-async"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+]
+
+[[package]]
 name = "claspr-build"
 version = "0.0.0"
 dependencies = [
@@ -230,6 +237,15 @@ name = "claspr-tier1-tests"
 version = "0.0.0"
 dependencies = [
  "claspr",
+ "claspr-test-kernels",
+]
+
+[[package]]
+name = "claspr-tier2-tests"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+ "claspr-async",
  "claspr-test-kernels",
 ]
 

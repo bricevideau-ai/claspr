@@ -1,0 +1,17 @@
+[package]
+name = "claspr-async"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Tier 2 combinator API on top of claspr — DeviceOperation + and_then + bundle + fan_out, lazy-execution model with sync and async terminals"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+claspr = { path = "../claspr" }
+
+[lints]
+workspace = true

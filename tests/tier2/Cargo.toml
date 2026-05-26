@@ -1,0 +1,19 @@
+[package]
+name = "claspr-tier2-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Integration tests for claspr-async's Tier 2 combinator API"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+claspr = { path = "../../claspr" }
+claspr-async = { path = "../../claspr-async" }
+claspr-test-kernels = { path = "../kernels" }
+
+[lints]
+workspace = true
