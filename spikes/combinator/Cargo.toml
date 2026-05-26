@@ -1,0 +1,9 @@
+[package]
+name = "claspr-combinator-spike"
+version = "0.0.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+pollster = "0.4"
