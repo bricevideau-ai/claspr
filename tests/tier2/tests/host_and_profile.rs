@@ -3,8 +3,7 @@
 
 use claspr::{Context, Device};
 use claspr_async::{
-    DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, upload, value,
-    with_context,
+    DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, upload, value, with_context,
 };
 use claspr_test_kernels::kernels;
 

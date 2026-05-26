@@ -71,16 +71,14 @@ fn await_propagates_chain_error() {
     // Force the chain to fail by passing a bogus length to a download
     // — DeviceSlice::download returns LengthMismatch if dst.len() !=
     // self.len().
-    let chain = value(vec![0u32; 16])
-        .and_then(upload)
-        .and_then(|buf| {
-            with_context(move |ec| {
-                let mut wrong_size = vec![0u32; 8];
-                // This errors synchronously inside execute.
-                buf.read(ec, &mut wrong_size).wait()?;
-                Ok::<_, claspr::Error>(wrong_size)
-            })
-        });
+    let chain = value(vec![0u32; 16]).and_then(upload).and_then(|buf| {
+        with_context(move |ec| {
+            let mut wrong_size = vec![0u32; 8];
+            // This errors synchronously inside execute.
+            buf.read(ec, &mut wrong_size).wait()?;
+            Ok::<_, claspr::Error>(wrong_size)
+        })
+    });
 
     let err = block_on(chain.run(&ctx)).expect_err("chain should error");
     assert!(

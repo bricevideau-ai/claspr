@@ -53,6 +53,7 @@ pub mod bundle;
 pub mod exec_ctx;
 pub mod fan_out;
 pub mod future;
+pub mod host_view;
 pub mod op;
 pub mod profile;
 pub mod transfer;
@@ -66,6 +67,9 @@ pub use bundle::{
 pub use exec_ctx::ExecutionContext;
 pub use fan_out::{FanOut, fan_out};
 pub use future::ChainFuture;
+pub use host_view::{
+    AcquireDeviceSliceOp, DeviceSliceHostView, HostAccessibleExt, ReleaseDeviceSliceOp,
+};
 pub use op::{AndThen, Arced, DeviceOperation, Value, WithContext, value, with_context};
 pub use profile::{DeviceOperationProfileExt, Profiled};
 pub use transfer::{Download, Upload, UploadSource, download, upload};

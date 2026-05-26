@@ -105,6 +105,16 @@ where
         Ok(ev) => ev,
         Err(code) => return ChainFuture::Errored(Some(Error::OpenCl(code))),
     };
+    // 3a. clFlush — push the queue to the device without blocking.
+    //     The async terminal otherwise has no sync point: pocl
+    //     happens to push commands eagerly, but rusticl is spec-strict
+    //     and keeps the marker in `CL_QUEUED` forever without an
+    //     explicit flush, so the CL_COMPLETE callback never fires
+    //     and the future deadlocks. clFlush returns immediately;
+    //     completion still happens asynchronously via the callback.
+    if let Err(e) = queue.raw().flush() {
+        return ChainFuture::Errored(Some(Error::OpenCl(e)));
+    }
     // 4. Wrap in a Future that polls the marker via
     //    clSetEventCallback (the EventFuture machinery from claspr).
     ChainFuture::Running {
