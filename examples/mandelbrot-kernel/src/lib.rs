@@ -19,6 +19,7 @@ pub mod gpu {
     // `#[claspr::kernel]` proc-macro discards builtin params and the
     // kernel body before host name resolution touches them, so these
     // imports are only ever resolved on the spirv target.
+    use num_complex::Complex32;
     #[cfg(target_arch = "spirv")]
     use spirv_std::{
         Image,
@@ -26,47 +27,27 @@ pub mod gpu {
         glam::{USizeVec3, UVec4},
     };
 
-    // Note on math style: the iteration loop uses hand-expanded
-    // f32 `zx`/`zy` pairs rather than `num_complex::Complex32`.
-    // `num_complex` works fine in rust-gpu kernels in general
-    // (see `rust-gpu-opencl-samples/kernels/mandelbrot`, which
-    // uses `Complex32` against a `&mut [u32]` slice output). The
-    // problem is specifically the combination of Complex32 with
-    // an image-output kernel — it triggers two distinct runtime
-    // failures, one per OpenCL implementation observed:
-    //
-    // 1. **pocl 7.2-pre (aarch64)**: a SPIR-V module that has
-    //    both `OpTypeStruct %float %float` (Complex32) and
-    //    `OpCapability ImageBasic` (image kernel) makes
-    //    clBuildProgram either hang (long-lived process, worker
-    //    pool parked on a futex) or abort with `std::bad_alloc`
-    //    (bare C client). Internal cause unknown — could be a
-    //    memory corruption from a segfault that doesn't crash
-    //    immediately, an unbounded allocation, or something
-    //    else. Observed only that the trigger is module-level:
-    //    `#[inline(never)]` on a helper doesn't help, and
-    //    `#[inline(always)]` doesn't help either.
-    //
-    // 2. **rusticl / Mesa**: clBuildProgram succeeds, but
-    //    clEnqueueNDRangeKernel segfaults when the kernel runs.
-    //    Triggered when rust-gpu's optimiser outlines the
-    //    iteration helper into a second `OpFunction` with no
-    //    `OpName` attached (probably the known older rusticl
-    //    bug around `LLVMAddFunction(..., NULL)` for anonymous
-    //    helpers). `#[inline(always)]` works around this case —
-    //    collapses everything into the single named entry
-    //    function — and the Complex32 form then runs cleanly on
-    //    rusticl. pocl is still unhappy in that configuration.
-    //
-    // Hand-expanded `zx`/`zy` pairs sidestep both: the kernel
-    // becomes a single inlined entry function (no anonymous
-    // helper for rusticl) with no `OpTypeStruct` of floats (no
-    // pocl trigger).
-    //
-    // Minimal C reproducer + SPV diff at
-    // `/tmp/pocl-image-complex-hang/`. See also
-    // [[reference_pocl_image_complex_hang]] and
-    // [[reference_opencl_intercept_layer]] in memory.
+    /// Iterate the Mandelbrot recurrence `z = z² + c` from `z = 0`
+    /// until escape (|z|² > 4) or `max_iter`. Outlined into its own
+    /// function — rust-gpu's optimiser may keep this as a separate
+    /// `OpFunction` rather than inlining into the kernel, which used
+    /// to trip both pocl and rusticl on image kernels; see
+    /// `[[reference_pocl_image_complex_hang]]` for the history.
+    /// Both runtimes handle this shape cleanly now.
+    ///
+    /// Pure Rust + `num_complex` only — host-callable for validation.
+    pub fn mandelbrot_iter(c: Complex32, max_iter: u32) -> u32 {
+        let mut z = Complex32::new(0.0, 0.0);
+        let mut i = 0u32;
+        while i < max_iter {
+            if z.norm_sqr() > 4.0 {
+                break;
+            }
+            z = z * z + c;
+            i += 1;
+        }
+        i
+    }
 
     /// Map iteration count to an `(R, G, B)` u32 triple. Pure integer
     /// math so the kernel doesn't need any transcendental imports —
@@ -101,21 +82,7 @@ pub mod gpu {
         let cx = (px as f32 / width as f32) * 3.5 - 2.5;
         let cy = (py as f32 / height as f32) * 2.0 - 1.0;
 
-        let mut zx = 0.0f32;
-        let mut zy = 0.0f32;
-        let mut iter = 0u32;
-        while iter < max_iter {
-            let zx2 = zx * zx;
-            let zy2 = zy * zy;
-            if zx2 + zy2 > 4.0 {
-                break;
-            }
-            let new_zx = zx2 - zy2 + cx;
-            let new_zy = 2.0 * zx * zy + cy;
-            zx = new_zx;
-            zy = new_zy;
-            iter += 1;
-        }
+        let iter = mandelbrot_iter(Complex32::new(cx, cy), max_iter);
 
         let (r, g, b) = color(iter, max_iter);
         let coord = Int2::new(px as i32, py as i32);

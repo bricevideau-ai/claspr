@@ -11,6 +11,11 @@ description = "Mandelbrot set image kernel — an example of packaging a claspr 
 
 [dependencies]
 claspr = { path = "../../claspr" }
+# `num-complex` is also pulled into the generated kernel sub-crate by
+# claspr-build, but we list it here as a regular host dep too so the
+# `mandelbrot_iter` helper is callable from both sides without a cfg
+# gate (host validation, doctests, etc).
+num-complex = { version = "0.4", default-features = false }
 
 [build-dependencies]
 claspr-build = { path = "../../claspr-build" }

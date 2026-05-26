@@ -930,6 +930,11 @@ crate-type = ["dylib"]
 [dependencies]
 spirv-std = { git = "https://github.com/bricevideau-ai/rust-gpu.git", branch = "opencl-kernel-support" }
 glam = { version = ">=0.30.8", default-features = false }
+# Always-available extras for kernel code: `num-complex` for Complex
+# arithmetic. Tiny no_std crate; pulling it unconditionally beats
+# requiring every user to extend the generated Cargo.toml just to
+# `use num_complex::Complex32;`.
+num-complex = { version = "0.4", default-features = false }
 "#;
     std::fs::write(crate_dir.join("Cargo.toml"), cargo_toml)?;
     Ok(())
