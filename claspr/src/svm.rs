@@ -47,7 +47,7 @@ use opencl3::command_queue::{
 };
 use opencl3::event::release_event;
 use opencl3::kernel::ExecuteKernel;
-use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, CL_MEM_READ_WRITE, svm_alloc, svm_free};
+use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, CL_MEM_READ_WRITE, svm_alloc};
 use opencl3::types::{CL_BLOCKING, cl_command_queue, cl_int, cl_uint};
 use std::ops::{Deref, DerefMut};
 use std::ptr;
@@ -62,7 +62,10 @@ fn cl_to_err(code: cl_int) -> Error {
 /// A typed Shared Virtual Memory allocation.
 ///
 /// Construction allocates via `clSVMAlloc`; Drop releases via
-/// `clSVMFree`. Host access is RAII-guarded via [`map`](Self::map) and
+/// `clEnqueueSVMFree` on the context's default queue (queue-ordered,
+/// so it can't race in-flight commands using the pointer — the
+/// immediate `clSVMFree` would be UB in that case per the CL spec).
+/// Host access is RAII-guarded via [`map`](Self::map) and
 /// [`map_mut`](Self::map_mut): each returns a guard that issues
 /// `clEnqueueSVMMap` on construction and `clEnqueueSVMUnmap` on Drop.
 pub struct SharedBuffer<T> {
@@ -144,10 +147,28 @@ impl<T> Buffer<T> for SharedBuffer<T> {
 
 impl<T> Drop for SharedBuffer<T> {
     fn drop(&mut self) {
-        // SAFETY: ptr was returned by svm_alloc on this context;
-        // free exactly once. Errors here can't be propagated;
-        // record in the sticky counter.
-        let res = unsafe { svm_free(self.ctx.raw_context().get(), self.ptr.cast()) };
+        // Use `clEnqueueSVMFree` on the context's default queue, NOT
+        // the immediate `clSVMFree`. Per the CL spec, `clSVMFree` does
+        // NOT wait for in-flight commands using the pointer to finish
+        // before deallocation — using the pointer after `clSVMFree`
+        // is UB. `clEnqueueSVMFree` queues the free so it runs only
+        // after the queue's prior commands complete (and after any
+        // explicit wait-list events, which we don't use here).
+        //
+        // Limitation: this orders the free relative to commands on the
+        // default queue only. If the buffer was used on a different
+        // queue (multi-queue or multi-device SVM), the free isn't
+        // ordered against those commands. A proper fix (track source
+        // queue + last event on SharedBuffer) lands with Tier 2
+        // where buffers naturally carry their event provenance.
+        let queue = self.ctx.raw_default_queue();
+        // SAFETY: ptr was returned by svm_alloc on this context; we
+        // queue exactly one free for it. The event returned is
+        // dropped immediately (CL still tracks it on the queue, and
+        // clReleaseCommandQueue waits for it before the queue is
+        // deleted).
+        let svm_ptr = self.ptr as *const std::ffi::c_void;
+        let res = unsafe { queue.enqueue_svm_free(&[svm_ptr], None, std::ptr::null_mut(), &[]) };
         if res.is_err() {
             self.ctx.record_err();
         }
