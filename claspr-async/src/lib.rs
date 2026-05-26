@@ -47,12 +47,16 @@
 //! [claspr]: https://docs.rs/claspr
 //! [`LaunchOp`]: claspr::LaunchOp
 
+pub mod and_then_host;
 pub mod arc;
 pub mod bundle;
 pub mod exec_ctx;
 pub mod fan_out;
+pub mod future;
 pub mod op;
+pub mod profile;
 
+pub use and_then_host::{AndThenHost, DeviceOperationHostExt};
 pub use arc::ArcSplit;
 pub use bundle::{
     Bundle2, Bundle3, Bundle4, Bundle5, Bundle6, Bundle7, Bundle8, Bundle9, Bundle10, Bundle11,
@@ -60,4 +64,6 @@ pub use bundle::{
 };
 pub use exec_ctx::ExecutionContext;
 pub use fan_out::{FanOut, fan_out};
+pub use future::ChainFuture;
 pub use op::{AndThen, Arced, DeviceOperation, Value, WithContext, value, with_context};
+pub use profile::{DeviceOperationProfileExt, Profiled};

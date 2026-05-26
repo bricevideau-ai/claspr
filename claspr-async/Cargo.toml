@@ -11,7 +11,10 @@ description = "Tier 2 combinator API on top of claspr — DeviceOperation + and_
 path = "src/lib.rs"
 
 [dependencies]
-claspr = { path = "../claspr" }
+# `async-events` enables claspr::EventFuture, which claspr-async's
+# `.run().await` builds on. It's the whole point of this crate, so the
+# feature is on unconditionally.
+claspr = { path = "../claspr", features = ["async-events"] }
 
 [lints]
 workspace = true

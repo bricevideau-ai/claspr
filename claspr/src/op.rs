@@ -61,7 +61,10 @@ impl ProfilingInfo {
 
 // ── LaunchOp ─────────────────────────────────────────────────────────
 
-type ProfileCb = Box<dyn FnOnce(Result<ProfilingInfo>) + Send + 'static>;
+/// Type alias for the boxed profiling closure. Public so
+/// [`register_profiling_callback`] callers (e.g. claspr-async's Tier
+/// 2 profile combinator) can name the same shape.
+pub type ProfileCb = Box<dyn FnOnce(Result<ProfilingInfo>) + Send + 'static>;
 
 /// Lazy builder for one kernel launch. Constructed by the
 /// proc-macro-generated launch methods; consumed by [`wait`](Self::wait),
@@ -199,7 +202,17 @@ struct ProfileData {
     cb: ProfileCb,
 }
 
-fn register_profiling_callback(event: &Event, cb: ProfileCb) -> Result<()> {
+/// Register a profiling callback on `event`. Wraps the
+/// `clSetEventCallback(CL_COMPLETE, ...)` FFI dance — bumps the
+/// event refcount, boxes the closure + event into `user_data`, and
+/// hands it to OpenCL. The callback thunk (private to this module)
+/// reclaims the box on completion, queries the four CL profiling
+/// timestamps, and invokes `cb` with the result.
+///
+/// Shared by [`LaunchOp::profiled`] and by claspr-async's Tier 2
+/// `.profiled()` combinator (which registers the same shim on a
+/// marker event after a sub-chain completes).
+pub fn register_profiling_callback(event: &Event, cb: ProfileCb) -> Result<()> {
     // Bump the cl_event refcount so we own a second handle inside the
     // callback's user_data. The user's Event handle in `submit()` /
     // the internal handle used by `wait()` may be released before the

@@ -15,5 +15,10 @@ claspr = { path = "../../claspr" }
 claspr-async = { path = "../../claspr-async" }
 claspr-test-kernels = { path = "../kernels" }
 
+[dev-dependencies]
+# Just for `block_on` in the async-terminal tests — no need for tokio's
+# full machinery.
+futures = { version = "0.3", default-features = false, features = ["executor", "std"] }
+
 [lints]
 workspace = true

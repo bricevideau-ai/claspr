@@ -80,7 +80,7 @@ pub use image::{Image2D, Image2DRgba8, ImageAccess, ReadOnly, ReadWrite, WriteOn
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
 };
-pub use op::{LaunchOp, ProfilingInfo};
+pub use op::{LaunchOp, ProfileCb, ProfilingInfo, register_profiling_callback};
 pub use ppm::write_ppm_rgba8;
 pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 
@@ -93,7 +93,7 @@ pub use claspr_macros::{device, kernel};
 
 // Re-exports from opencl3 — the types users actually touch through
 // claspr's API.
-pub use opencl3::command_queue::CommandQueue;
+pub use opencl3::command_queue::{CL_QUEUE_PROFILING_ENABLE, CommandQueue};
 pub use opencl3::event::Event;
 pub use opencl3::kernel::Kernel;
 pub use opencl3::program::Program;

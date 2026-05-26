@@ -62,6 +62,19 @@ pub trait DeviceOperation: Send + Sized {
         Ok(out)
     }
 
+    /// Async terminal — submit the chain and return a [`ChainFuture`]
+    /// that resolves when the chain's commands have all completed on
+    /// the device. The chain's `Output` value is materialised eagerly
+    /// (handles, `Vec`s, etc.); the future just gates *when* the user
+    /// gets to see it on the queue's marker firing.
+    ///
+    /// ```ignore
+    /// let result = chain.run(&ctx).await?;
+    /// ```
+    fn run(self, context: &claspr::Context) -> crate::future::ChainFuture<Self::Output> {
+        crate::future::run_chain(self, context)
+    }
+
     /// Sequential dependency: when `self` produces its output, hand
     /// it to `f` to build the next op in the chain, then run that op
     /// against the same [`ExecutionContext`].
