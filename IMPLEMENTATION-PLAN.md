@@ -43,10 +43,15 @@ pub trait Launcher {
 
 Drop the `launch()` default method. Op builders consume `&impl Launcher` directly.
 
-**Each Tier 1 op gets two terminals only:**
+**Each Tier 1 op gets these terminals:**
 
 - `.wait() -> Result<()>` (sync, blocks)
 - Future impl for `.await` (async)
+- `.profiled(|info: ProfilingInfo| { ... }) -> Self` — modifier that
+  registers a `clSetEventCallback(CL_COMPLETE, ...)` so the user
+  closure receives timestamps when the kernel completes. Output of
+  the underlying op is unchanged (profiling is a side-effect).
+  Requires the queue to have been built with `.profiling(true)`.
 
 **Cross-queue sync escape hatch** (the one place explicit events live
 in Tier 1):
@@ -59,6 +64,18 @@ kernels.consume(&q_b, [N], &buf).after(&h).wait()?;
 
 `.submit()` returns a `claspr::Event` (re-export of `opencl3::Event`)
 — used only for `.after(...)` cross-queue waits.
+
+**Why `.profiled()` lands in Phase 1, not Phase 3:** the FFI shim for
+`clSetEventCallback` (extern "C" thunk with `catch_unwind`, panic
+safety, user-data boxing) is needed for the `.await` Future impl
+anyway. Once that wrapper exists, exposing it as `.profiled(|info|
+...)` is ~30 lines extra. Phase 3's Tier 2 combinator-level
+`.profiled()` then reuses the same wrapper.
+
+Tier 1 users who don't use `.profiled()` can also get timing
+manually via `.submit()` + `event.profiling_command_end()? -
+event.profiling_command_start()?`. Both paths work; `.profiled()`
+is the ergonomic one.
 
 **Update examples** to use simplified API:
 
@@ -136,10 +153,10 @@ claspr-async/
 1. `op.rs` + `exec_ctx.rs`: core trait + sync `.sync()` terminal
 2. `bundle.rs` + `fan_out.rs`: variadic structure combinators
 3. `arc.rs`: `Arc<T>` wrapping + `ArcSplit::split::<N>()`
-4. `future.rs`: `clSetEventCallback`-driven async — the biggest new chunk; wrap callback as `extern "C" fn` with `catch_unwind`
+4. `future.rs`: `clSetEventCallback`-driven async — **reuses the Tier 1 callback wrapper from Phase 1** (FFI thunk + `catch_unwind`); ties it to the chain's Future poll machinery (atomic flag + `AtomicWaker`)
 5. `and_then_host.rs`: trivial (just `and_then` returning a value)
 6. `host_view.rs`: `HostAccessible<T>` trait + impls for `DeviceSlice<T>` (d2h + h2d), `HostBuffer<T>` (no-op), `SharedBuffer<T>` (map + unmap)
-7. `profile.rs`: `clSetEventCallback` for completion, `clGetEventProfilingInfo` to read timestamps, user closure invoked via FFI thunk
+7. `profile.rs`: combinator-shape wrapper over the Tier 1 `.profiled()` for use inside lazy chains (where the underlying Event isn't user-visible); shares the callback wrapper
 
 **Critical CL integration points:**
 
@@ -241,7 +258,8 @@ tests/
 │   ├── cross_queue.rs      # .after() between queues
 │   ├── multi_device.rs     # gated on >= 2 devices
 │   ├── svm.rs              # SharedBuffer + map/unmap correctness
-│   └── drop_safety.rs      # "drop while in flight" tests
+│   ├── drop_safety.rs      # "drop while in flight" tests
+│   └── profile.rs          # .profiled(|info| ...) — callback fires, timestamps valid
 └── tier2/
     ├── chain.rs            # AndThen + Value
     ├── bundle.rs           # Bundle2/3/4 + bundle! macro
