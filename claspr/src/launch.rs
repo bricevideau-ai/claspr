@@ -25,8 +25,8 @@
 //! Pass kernel arguments as a typed tuple at the launch site:
 //!
 //! ```ignore
-//! ctx.launch(&kernel, [n], (&buf,))?;
-//! ctx.launch(&kernel, [w, h], (&buf, vp, max_iter))?;
+//! kernels.foo(&ctx, [n], &buf).wait()?;
+//! kernels.foo(&ctx, [w, h], &buf, vp, max_iter).wait()?;
 //! ```
 //!
 //! Wrong-arity launches are caught at `clEnqueueNDRangeKernel` time

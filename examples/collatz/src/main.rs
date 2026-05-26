@@ -70,7 +70,7 @@ fn run() -> claspr::Result<bool> {
     let inputs: Vec<u32> = (1..=N as u32).collect();
     let mut device_results = inputs.clone();
     let buf = claspr::DeviceSlice::upload(&ctx, &device_results)?;
-    kernels.collatz_kernel(&ctx, [N], &buf)?;
+    kernels.collatz_kernel(&ctx, [N], &buf).wait()?;
     buf.download(&ctx, &mut device_results)?;
 
     // Validate every kernel output against the host-side `collatz`

@@ -13,11 +13,8 @@
 
 use crate::context::Context;
 use crate::error::Result;
-use crate::launch::{IntoLaunchSpec, KernelArgs};
 use opencl3::command_queue::{CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, CommandQueue};
-use opencl3::event::Event;
-use opencl3::kernel::{ExecuteKernel, Kernel};
-use opencl3::types::{cl_command_queue_properties, cl_event};
+use opencl3::types::cl_command_queue_properties;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -144,53 +141,6 @@ impl Queue<OutOfOrder> {
     }
 }
 
-// ── IntoEventList ──────────────────────────────────────────────────
-
-/// Convert a value into a `Vec<cl_event>` for OpenCL wait-list
-/// arguments. Used by [`Queue<OutOfOrder>::launch_with_deps`] so
-/// callers can pass dependencies in whatever shape fits the
-/// situation — a single event, an array, a borrowed slice, etc.
-///
-/// Standard impls:
-/// - `()` — no dependencies (empty list)
-/// - `&Event` — one event
-/// - `[&Event; N]` (any const N) — fixed-size array of borrowed events
-/// - `&[Event]` — borrowed slice
-/// - `Vec<Event>` — owned vector
-pub trait IntoEventList {
-    fn into_event_list(self) -> Vec<cl_event>;
-}
-
-impl IntoEventList for () {
-    fn into_event_list(self) -> Vec<cl_event> {
-        Vec::new()
-    }
-}
-
-impl IntoEventList for &Event {
-    fn into_event_list(self) -> Vec<cl_event> {
-        vec![self.get()]
-    }
-}
-
-impl<const N: usize> IntoEventList for [&Event; N] {
-    fn into_event_list(self) -> Vec<cl_event> {
-        self.iter().map(|e| e.get()).collect()
-    }
-}
-
-impl IntoEventList for &[Event] {
-    fn into_event_list(self) -> Vec<cl_event> {
-        self.iter().map(|e| e.get()).collect()
-    }
-}
-
-impl IntoEventList for Vec<Event> {
-    fn into_event_list(self) -> Vec<cl_event> {
-        self.iter().map(|e| e.get()).collect()
-    }
-}
-
 impl<O: QueueOrder> Queue<O> {
     fn from_props(ctx: &Context) -> Result<Self> {
         let cl_queue =
@@ -249,14 +199,15 @@ impl<O: QueueOrder> Queue<O> {
 /// What the proc-macro-generated launch wrappers key off.
 ///
 /// Implemented for `Context` (uses the bundled default in-order
-/// queue) and `Queue<_>` (uses the queue directly). Most users
-/// only see this trait in the signature `&impl Launcher` of a
-/// generated `kernels.foo(...)` method — passing either `&ctx` or
-/// `&queue` works.
+/// queue) and `Queue<_>` (uses the queue directly). The signature
+/// users see at call sites is `&impl Launcher` — passing either
+/// `&ctx` or `&queue` works.
 ///
-/// Default-impl methods cover the synchronous path: launch a kernel
-/// and wait. Out-of-order users who want non-blocking event chaining
-/// call inherent `Queue<OutOfOrder>` methods directly.
+/// The two methods are the integration surface for
+/// [`LaunchOp`](crate::op::LaunchOp), which captures the command queue
+/// and context references at construction time and defers the actual
+/// `clEnqueueNDRangeKernel` until [`wait`](crate::op::LaunchOp::wait),
+/// [`submit`](crate::op::LaunchOp::submit), or `.await`.
 pub trait Launcher {
     /// The OpenCL command queue this launcher will enqueue on.
     fn cl_queue(&self) -> &CommandQueue;
@@ -265,35 +216,6 @@ pub trait Launcher {
     /// constructors that allocate on the context (e.g.
     /// `clCreateBuffer`).
     fn context(&self) -> &Context;
-
-    /// Launch a kernel synchronously and return its profiling event.
-    ///
-    /// `spec` accepts `[N]`, `[W, H]`, `[X, Y, Z]`, or
-    /// `(global, local)` tuples — anything implementing
-    /// [`IntoLaunchSpec`]. `args` is a typed tuple of
-    /// [`KernelArg`](crate::launch::KernelArg)s, set in declaration order.
-    fn launch<S, A>(&self, kernel: &Kernel, spec: S, args: A) -> Result<Event>
-    where
-        S: IntoLaunchSpec,
-        A: KernelArgs,
-    {
-        let mut exec = ExecuteKernel::new(kernel);
-        args.set_all(&mut exec);
-        let spec = spec.into_launch_spec();
-        exec.set_global_work_sizes(spec.global());
-        if let Some(local) = spec.local() {
-            exec.set_local_work_sizes(local);
-        }
-        // SAFETY: opencl3's `enqueue_nd_range` is `unsafe` because it
-        // doesn't validate that the argument types passed to the
-        // kernel match the kernel's actual signature. claspr's typed
-        // wrapper (the proc-macro emits matched `&DeviceSlice<T>`,
-        // `&Image2DRgba8`, etc.) is what makes this call safe in
-        // practice.
-        let event = unsafe { exec.enqueue_nd_range(self.cl_queue())? };
-        event.wait()?;
-        Ok(event)
-    }
 }
 
 impl<O: QueueOrder> Launcher for Queue<O> {
@@ -318,61 +240,3 @@ impl<L: Launcher + ?Sized> Launcher for &L {
         (**self).context()
     }
 }
-
-// ── LauncherAsync trait ──────────────────────────────────────────────
-
-/// What the proc-macro's `_async` launch wrappers key off.
-///
-/// Implemented only by [`Queue<OutOfOrder>`] (and references to it):
-/// in-order launchers don't expose an explicit dependency-list path
-/// because their `clEnqueue*` calls already serialise against the
-/// previous command on the same queue.
-///
-/// The proc-macro emits two methods per kernel — `kernels.foo(...)`
-/// (sync, takes `&impl Launcher`, blocks on the event) and
-/// `kernels.foo_async(launcher, deps, ...)` (async, takes
-/// `&impl LauncherAsync`, returns the event without waiting). The
-/// async path is what users compose into a DAG.
-pub trait LauncherAsync: Launcher {
-    /// Out-of-order launch: enqueue the kernel after `deps` complete,
-    /// return the resulting [`Event`] *without blocking*. The caller
-    /// composes dependency graphs by feeding returned events into
-    /// later `launch_with_deps` calls.
-    ///
-    /// `deps` accepts any [`IntoEventList`]: `()`, `&Event`,
-    /// `[&Event; N]`, `&[Event]`, `Vec<Event>`, etc.
-    ///
-    /// For the synchronous fire-and-wait path (matching the
-    /// [`Launcher::launch`] default impl), call [`Launcher::launch`]
-    /// instead — same launcher, no `deps` argument, blocks.
-    fn launch_with_deps<D, S, A>(&self, deps: D, kernel: &Kernel, spec: S, args: A) -> Result<Event>
-    where
-        D: IntoEventList,
-        S: IntoLaunchSpec,
-        A: KernelArgs,
-    {
-        let mut exec = ExecuteKernel::new(kernel);
-        args.set_all(&mut exec);
-        let spec = spec.into_launch_spec();
-        exec.set_global_work_sizes(spec.global());
-        if let Some(local) = spec.local() {
-            exec.set_local_work_sizes(local);
-        }
-        let wait = deps.into_event_list();
-        if !wait.is_empty() {
-            exec.set_event_wait_list(&wait);
-        }
-        // SAFETY: see Launcher::launch — claspr's typed wrappers
-        // are what make this call safe. Unlike Launcher::launch,
-        // we do not block on the returned event; the caller chains
-        // it explicitly.
-        let event = unsafe { exec.enqueue_nd_range(self.cl_queue())? };
-        Ok(event)
-    }
-}
-
-impl LauncherAsync for Queue<OutOfOrder> {}
-
-// Same blanket as for `Launcher` — accepting `&Queue<OutOfOrder>` in
-// `&impl LauncherAsync` parameters needs the reference-through impl.
-impl<L: LauncherAsync + ?Sized> LauncherAsync for &L {}

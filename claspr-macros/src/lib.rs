@@ -32,13 +32,13 @@
 //!     let mut data: Vec<u32> = (1..=1024).collect();
 //!     let buf = ctx.upload(&data)?;
 //!     // Generated wrapper:
-//!     //   fn collatz_kernel(
-//!     //       ctx: &claspr::Context,
-//!     //       kernel: &claspr::Kernel,
+//!     //   fn collatz_kernel<'l>(
+//!     //       &'l self,
+//!     //       launcher: &'l impl claspr::Launcher,
 //!     //       grid: impl claspr::IntoLaunchSpec,
-//!     //       data: &claspr::DeviceSlice<u32>,
-//!     //   ) -> claspr::Result<claspr::Event>
-//!     collatz_kernel(&ctx, &kernels.collatz_kernel, [data.len()], &buf)?;
+//!     //       data: &'l claspr::DeviceSlice<u32>,
+//!     //   ) -> claspr::LaunchOp<'l, (&'l claspr::DeviceSlice<u32>,)>
+//!     kernels.collatz_kernel(&ctx, [data.len()], &buf).wait()?;
 //!     ctx.download(&buf, &mut data)?;
 //!     Ok(())
 //! }
@@ -225,6 +225,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     let name = &func.sig.ident;
 
     let mut host_params: Vec<TokenStream2> = Vec::new();
+    let mut arg_types: Vec<TokenStream2> = Vec::new();
     let mut launch_args: Vec<TokenStream2> = Vec::new();
 
     for input in &func.sig.inputs {
@@ -241,6 +242,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 ty: pty,
             } => {
                 host_params.push(quote! { #pname: #pty });
+                arg_types.push(pty);
                 launch_args.push(quote! { #pname });
             }
         }
@@ -253,52 +255,41 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     } else {
         quote! { ( #(#launch_args),* ) }
     };
+    let arg_tuple_ty = if arg_types.len() == 1 {
+        let only = &arg_types[0];
+        quote! { ( #only, ) }
+    } else {
+        quote! { ( #(#arg_types),* ) }
+    };
 
     let kernels_path = &args.kernels;
-    let async_name = quote::format_ident!("{}_async", name);
 
-    // Emit an `impl Kernels { fn <name>(...) fn <name>_async(...) }` block.
-    // The generated methods shadow the field of the same name on
-    // `Kernels` (which claspr-build emits as `pub`) — at the call site,
-    // parens disambiguate method vs field, so
+    // Emit an `impl Kernels { fn <name>(...) }` block.
+    // The generated method shadows the field of the same name on
+    // `Kernels` (which claspr-build emits as `pub`) — at the call
+    // site, parens disambiguate method vs field, so
     // `kernels.collatz_kernel(...)` dispatches to the typed launch
     // method here.
     //
-    // Sync wrapper: takes `&impl Launcher` so callers can pass `&ctx`
+    // The wrapper takes `&impl Launcher` so callers can pass `&ctx`
     // (uses the bundled default in-order queue) or any `&queue`
-    // interchangeably. Blocks on completion.
+    // interchangeably, and returns a `LaunchOp` builder. The actual
+    // enqueue is deferred until a terminal: `.wait()`, `.submit()`,
+    // or `.await`.
     //
-    // Async wrapper: takes `&impl LauncherAsync` (only `&Queue<OutOfOrder>`
-    // implements this today) plus a `deps: impl IntoEventList`.
-    // Returns the event without blocking — the user chains it into
-    // later `_async` launches to build a DAG.
     // `#[allow(clippy::too_many_arguments)]` — the wrapper's arg
-    // count is determined by the kernel's signature, which the user
-    // can't refactor without changing the device-side function. The
-    // async sibling adds one more (the `deps` list), pushing kernels
-    // with 4+ host args over clippy's 7-arg threshold. Suppress here
-    // rather than burden every user with a per-call `#[allow]`.
+    // count is determined by the kernel's declared signature, not
+    // user choice, so a per-call `#[allow]` would burden every user.
     Ok(quote! {
         impl #kernels_path {
             #[allow(clippy::too_many_arguments)]
-            #vis fn #name(
-                &self,
-                launcher: &impl ::claspr::Launcher,
+            #vis fn #name<'claspr_l>(
+                &'claspr_l self,
+                launcher: &'claspr_l impl ::claspr::Launcher,
                 grid: impl ::claspr::IntoLaunchSpec,
                 #(#host_params),*
-            ) -> ::claspr::Result<::claspr::Event> {
-                launcher.launch(&self.#name, grid, #launch_tuple)
-            }
-
-            #[allow(clippy::too_many_arguments)]
-            #vis fn #async_name(
-                &self,
-                launcher: &impl ::claspr::LauncherAsync,
-                deps: impl ::claspr::IntoEventList,
-                grid: impl ::claspr::IntoLaunchSpec,
-                #(#host_params),*
-            ) -> ::claspr::Result<::claspr::Event> {
-                launcher.launch_with_deps(deps, &self.#name, grid, #launch_tuple)
+            ) -> ::claspr::LaunchOp<'claspr_l, #arg_tuple_ty> {
+                ::claspr::LaunchOp::new(launcher, &self.#name, grid, #launch_tuple)
             }
         }
     })
@@ -349,10 +340,11 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
         // host-side image type. The reference itself stays `&` (the
         // GPU writes to the image, the host handle isn't mutated);
         // the access mode is encoded in the type parameter `A`
-        // instead.
+        // instead. Tagged with the wrapper's `'claspr_l` lifetime so
+        // the resulting LaunchOp can capture it.
         let access = info.access;
         let format = info.format;
-        quote! { &::claspr::Image2D<#access, #format> }
+        quote! { &'claspr_l ::claspr::Image2D<#access, #format> }
     } else {
         // No spirv attribute (or an unrecognised one): pass type through.
         let ty = &pt.ty;
@@ -507,10 +499,15 @@ fn parse_image_tokens(tokens: TokenStream2) -> (Option<String>, Option<String>, 
 
 /// Translate a `cross_workgroup` parameter type.
 ///
-/// `&mut [T]` and `&[T]` both become `&::claspr::DeviceSlice<T>`. Any
-/// other shape is a hard error — those paths haven't been wired up
-/// yet (sampler / workgroup-memory parameters will land as
-/// follow-ups).
+/// `&mut [T]` and `&[T]` both become `&'claspr_l ::claspr::DeviceSlice<T>`.
+/// The `'claspr_l` lifetime is the wrapper function's lifetime parameter
+/// (see [`expand_kernel`]) and ties the resulting [`LaunchOp`] to the
+/// borrow of every host slice argument.
+///
+/// Any other shape is a hard error — those paths haven't been wired up
+/// yet (sampler / workgroup-memory parameters will land as follow-ups).
+///
+/// [`LaunchOp`]: claspr::op::LaunchOp
 fn translate_cross_workgroup_ty(ty: &Type) -> syn::Result<TokenStream2> {
     let Type::Reference(TypeReference { elem, .. }) = ty else {
         return Err(syn::Error::new(
@@ -526,5 +523,5 @@ fn translate_cross_workgroup_ty(ty: &Type) -> syn::Result<TokenStream2> {
              by claspr::kernel",
         ));
     };
-    Ok(quote! { &::claspr::DeviceSlice<#inner> })
+    Ok(quote! { &'claspr_l ::claspr::DeviceSlice<#inner> })
 }

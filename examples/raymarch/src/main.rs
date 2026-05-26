@@ -136,7 +136,9 @@ fn run() -> claspr::Result<bool> {
 
     let kernels = gpu::kernels(&ctx)?;
     let img = claspr::Image2DRgba8::alloc(&ctx, WIDTH, HEIGHT)?;
-    kernels.raymarch(&ctx, [WIDTH as usize, HEIGHT as usize], &img, WIDTH, HEIGHT)?;
+    kernels
+        .raymarch(&ctx, [WIDTH as usize, HEIGHT as usize], &img, WIDTH, HEIGHT)
+        .wait()?;
     let pixels = img.download_bytes(&ctx)?;
 
     // Host vs. device pixel comparison. Walking every pixel through

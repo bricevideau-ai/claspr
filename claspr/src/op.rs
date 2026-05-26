@@ -1,0 +1,241 @@
+//! Tier 1 launch builder — [`LaunchOp`] and its terminals.
+//!
+//! Returned by the proc-macro / build-script-emitted launch methods
+//! per `#[claspr::kernel]`. Captures everything needed to enqueue the
+//! kernel; defers the actual `clEnqueueNDRangeKernel` until the user
+//! picks a terminal:
+//!
+//! - [`LaunchOp::wait`] — sync, blocks on completion.
+//! - [`LaunchOp::submit`] — non-blocking; returns the [`Event`] so the
+//!   user can chain across queues via [`LaunchOp::after`].
+//! - `.await` (via [`IntoFuture`]) — async, completes via the OpenCL
+//!   `CL_COMPLETE` event callback. Requires the `async-events` cargo
+//!   feature.
+//!
+//! Modifiers (chain before the terminal):
+//!
+//! - [`LaunchOp::after`] — wait for a previously [`submit`](LaunchOp::submit)ted
+//!   event on a different queue before this kernel starts.
+//! - [`LaunchOp::profiled`] — register a completion callback that
+//!   receives the kernel's timestamp set. Requires the queue to have
+//!   been built with profiling enabled.
+
+use crate::error::{Error, Result};
+use crate::launch::{IntoLaunchSpec, KernelArgs, LaunchSpec};
+use crate::queue::Launcher;
+use opencl3::command_queue::CommandQueue;
+use opencl3::event::{CL_COMPLETE, Event, retain_event, set_event_callback};
+use opencl3::kernel::{ExecuteKernel, Kernel};
+use opencl3::types::{cl_event, cl_int};
+use std::ffi::c_void;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+// ── ProfilingInfo ────────────────────────────────────────────────────
+
+/// The four OpenCL command-event timestamps, in device nanoseconds.
+///
+/// The reference epoch is implementation-defined per CL §5.14, so only
+/// deltas are meaningful. The four points correspond to
+/// `CL_PROFILING_COMMAND_QUEUED`, `_SUBMIT`, `_START`, `_END`.
+///
+/// Pass a closure to [`LaunchOp::profiled`] to receive this when the
+/// kernel completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfilingInfo {
+    /// Device timestamp when the command was queued on the host.
+    pub queued: u64,
+    /// Device timestamp when the runtime submitted the command to the device.
+    pub submit: u64,
+    /// Device timestamp when the device began executing the command.
+    pub start: u64,
+    /// Device timestamp when the device finished executing the command.
+    pub end: u64,
+}
+
+impl ProfilingInfo {
+    /// Wall-clock kernel runtime — `end - start` as a [`Duration`].
+    pub fn duration(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.end.saturating_sub(self.start))
+    }
+}
+
+// ── LaunchOp ─────────────────────────────────────────────────────────
+
+type ProfileCb = Box<dyn FnOnce(Result<ProfilingInfo>) + Send + 'static>;
+
+/// Lazy builder for one kernel launch. Constructed by the
+/// proc-macro-generated launch methods; consumed by [`wait`](Self::wait),
+/// [`submit`](Self::submit), or `.await`.
+///
+/// Modifiers — [`after`](Self::after), [`profiled`](Self::profiled) —
+/// chain by-value; combine them in any order before the terminal.
+pub struct LaunchOp<'l, A: KernelArgs> {
+    queue: &'l CommandQueue,
+    kernel: &'l Kernel,
+    spec: LaunchSpec,
+    args: A,
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
+}
+
+impl<'l, A: KernelArgs> LaunchOp<'l, A> {
+    /// Construct a launch builder. Called by proc-macro-generated
+    /// wrappers; user code uses `kernels.foo(...)` directly.
+    pub fn new<L, S>(launcher: &'l L, kernel: &'l Kernel, spec: S, args: A) -> Self
+    where
+        L: Launcher + ?Sized,
+        S: IntoLaunchSpec,
+    {
+        LaunchOp {
+            queue: launcher.cl_queue(),
+            kernel,
+            spec: spec.into_launch_spec(),
+            args,
+            deps: Vec::new(),
+            profile_cb: None,
+        }
+    }
+
+    /// Add a cross-queue dependency: this kernel won't start until
+    /// `event` (typically from another queue's [`submit`](Self::submit))
+    /// completes. Chainable.
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
+    }
+
+    /// Register a completion callback that receives the kernel's
+    /// [`ProfilingInfo`] when execution finishes. The callback runs
+    /// on the OpenCL runtime's callback thread — keep it short and
+    /// avoid blocking calls.
+    ///
+    /// Panics inside the callback are caught and dropped (unwinding
+    /// across the FFI boundary is UB); the resulting `Result` reflects
+    /// only OpenCL-side failures querying the timestamps.
+    ///
+    /// Requires the queue to have been built with profiling enabled —
+    /// otherwise the timestamp queries fail and the closure receives
+    /// `Err(...)`.
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    /// Sync terminal — enqueue the kernel and block on its completion.
+    pub fn wait(self) -> Result<()> {
+        let event = self.into_event()?;
+        event.wait()?;
+        Ok(())
+    }
+
+    /// Non-blocking terminal — enqueue the kernel and return its
+    /// [`Event`]. The intended use is cross-queue chaining: pass the
+    /// returned event to a later [`after`](Self::after) call on a
+    /// different queue.
+    ///
+    /// For single-queue use, prefer [`wait`](Self::wait) or `.await`.
+    pub fn submit(self) -> Result<Event> {
+        self.into_event()
+    }
+
+    /// Crate-internal enqueue used by both [`submit`](Self::submit)
+    /// and the `IntoFuture` impl in [`crate::future`].
+    pub(crate) fn into_event(self) -> Result<Event> {
+        let LaunchOp {
+            queue,
+            kernel,
+            spec,
+            args,
+            deps,
+            profile_cb,
+        } = self;
+        let mut exec = ExecuteKernel::new(kernel);
+        args.set_all(&mut exec);
+        exec.set_global_work_sizes(spec.global());
+        if let Some(local) = spec.local() {
+            exec.set_local_work_sizes(local);
+        }
+        if !deps.is_empty() {
+            exec.set_event_wait_list(&deps);
+        }
+        // SAFETY: opencl3's `enqueue_nd_range` is `unsafe` because it
+        // doesn't validate argument types against the kernel signature.
+        // claspr's typed wrappers (the proc-macro emits matched
+        // `&DeviceSlice<T>` / `&Image2D<...>` arg types) are what make
+        // this call safe in practice.
+        let event = unsafe { exec.enqueue_nd_range(queue)? };
+        if let Some(cb) = profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
+        Ok(event)
+    }
+}
+
+// ── Profiling callback FFI shim ─────────────────────────────────────
+
+/// Box passed to OpenCL via `user_data`. The retained event keeps
+/// the cl_event alive long enough for the callback to query its
+/// timestamps even if the user's `Event` handle has been dropped.
+struct ProfileData {
+    event: Event,
+    cb: ProfileCb,
+}
+
+fn register_profiling_callback(event: &Event, cb: ProfileCb) -> Result<()> {
+    // Bump the cl_event refcount so we own a second handle inside the
+    // callback's user_data. The user's Event handle in `submit()` /
+    // the internal handle used by `wait()` may be released before the
+    // callback fires; we need a dedicated reference.
+    //
+    // SAFETY: `event.get()` returns a live cl_event; `retain_event`
+    // matches with the `Event::drop` inside `ProfileData` when the
+    // callback reclaims the box.
+    unsafe {
+        retain_event(event.get())
+            .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?
+    };
+    let owned_event = Event::new(event.get());
+    let data = Box::new(ProfileData {
+        event: owned_event,
+        cb,
+    });
+    let user_data = Box::into_raw(data) as *mut c_void;
+    let res = set_event_callback(event.get(), CL_COMPLETE, profile_callback_thunk, user_data);
+    if let Err(code) = res {
+        // Reclaim the leaked box so the retained event drops.
+        // SAFETY: registration failed, so OpenCL never took ownership
+        // of `user_data` — it's still uniquely ours.
+        unsafe {
+            drop(Box::from_raw(user_data as *mut ProfileData));
+        }
+        return Err(Error::OpenCl(opencl3::error_codes::ClError(code)));
+    }
+    Ok(())
+}
+
+extern "C" fn profile_callback_thunk(_event: cl_event, _status: cl_int, user_data: *mut c_void) {
+    // Unwinding across the FFI boundary is UB; `catch_unwind` here is
+    // load-bearing. The user closure runs inside it — if it panics,
+    // we drop the panic and let the OpenCL runtime continue.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: `user_data` is exactly the box we leaked in
+        // `register_profiling_callback`. The OpenCL spec guarantees the
+        // CL_COMPLETE callback fires at most once per registration; we
+        // reclaim ownership here and drop on scope exit.
+        let data = unsafe { Box::from_raw(user_data as *mut ProfileData) };
+        let info = collect_profiling(&data.event);
+        (data.cb)(info);
+    }));
+}
+
+fn collect_profiling(event: &Event) -> Result<ProfilingInfo> {
+    Ok(ProfilingInfo {
+        queued: event.profiling_command_queued()?,
+        submit: event.profiling_command_submit()?,
+        start: event.profiling_command_start()?,
+        end: event.profiling_command_end()?,
+    })
+}

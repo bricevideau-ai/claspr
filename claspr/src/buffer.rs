@@ -209,9 +209,10 @@ impl<T> DeviceSlice<T> {
     /// Both buffers must be on the same `Context` — OpenCL's
     /// `clEnqueueCopyBuffer` only works within one context. For
     /// cross-context transfers, download to host then re-upload.
-    /// Returns the completion [`Event`] from the queued copy
-    /// (non-blocking — chain via `.wait()` or
-    /// `LauncherAsync::launch_with_deps`).
+    /// Returns the completion [`Event`](opencl3::event::Event) from
+    /// the queued copy (non-blocking — call `.wait()?` on it, or feed
+    /// it into a downstream [`LaunchOp::after`](crate::op::LaunchOp::after)
+    /// for cross-queue chaining).
     pub fn copy_to<L: Launcher>(
         &self,
         dst: &mut DeviceSlice<T>,

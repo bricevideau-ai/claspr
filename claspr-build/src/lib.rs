@@ -50,7 +50,7 @@
 //! fn main() -> claspr::Result<()> {
 //!     let ctx = Context::new()?;
 //!     let kernels = gpu::kernels(&ctx)?;
-//!     // kernels.collatz_kernel(&ctx, [n], &buf)?;
+//!     // kernels.collatz_kernel(&ctx, [n], &buf).wait()?;
 //!     Ok(())
 //! }
 //! ```
@@ -79,7 +79,7 @@
 //!
 //! let ctx = claspr::Context::new()?;
 //! let kernels = kernels::Kernels::load(&ctx)?;
-//! kernels.collatz_kernel(&ctx, [n], &buf)?;
+//! kernels.collatz_kernel(&ctx, [n], &buf).wait()?;
 //! ```
 //!
 //! ## Typed launch wrappers
@@ -92,12 +92,13 @@
 //! `(name, type)` pairs. Either way the call site reads:
 //!
 //! ```ignore
-//! kernels.collatz_kernel(&ctx, [n], &buf)?;
+//! kernels.collatz_kernel(&ctx, [n], &buf).wait()?;
 //! ```
 //!
-//! instead of the raw [`claspr::Context::launch`] form.
+//! and the returned [`LaunchOp`] supports `.wait()`, `.submit()`,
+//! `.await`, plus `.profiled(...)` / `.after(...)` modifiers.
 //!
-//! [`claspr::Context::launch`]: https://docs.rs/claspr
+//! [`LaunchOp`]: https://docs.rs/claspr
 //! [kernel-macro]: https://docs.rs/claspr_macros
 //! [claspr]: https://github.com/bricevideau-ai/claspr
 
@@ -432,11 +433,23 @@ fn generate_module_source(
     // Typed launch methods, one per declared kernel.
     for decl in kernels {
         let field = sanitize_field_name(&decl.name);
+        // Inject `'claspr_l` after every leading `&` so the resulting
+        // LaunchOp's lifetime parameter ties to the borrows of the
+        // host args. The build script's user supplies type strings
+        // like `&::claspr::DeviceSlice<u32>` (no lifetime); we
+        // rewrite to `&'claspr_l ::claspr::DeviceSlice<u32>` here.
+        // Value-type params (`u32`, `Viewport`) pass through unchanged.
         let params_sig: String = decl
             .params
             .iter()
-            .map(|(n, t)| format!(",\n        {n}: {t}"))
+            .map(|(n, t)| format!(",\n        {n}: {}", inject_lifetime(t)))
             .collect();
+        let arg_types: String = decl
+            .params
+            .iter()
+            .map(|(_, t)| inject_lifetime(t))
+            .collect::<Vec<_>>()
+            .join(", ");
         let tuple_args: String = decl
             .params
             .iter()
@@ -444,59 +457,41 @@ fn generate_module_source(
             .collect::<Vec<_>>()
             .join(", ");
         // Trailing comma needed for single-element tuples.
-        let tuple_lit = if decl.params.len() == 1 {
-            format!("({tuple_args},)")
+        let (tuple_lit, arg_tuple_ty) = if decl.params.len() == 1 {
+            (format!("({tuple_args},)"), format!("({arg_types},)"))
         } else {
-            format!("({tuple_args})")
+            (format!("({tuple_args})"), format!("({arg_types})"))
         };
 
         writeln!(s)?;
         writeln!(
             s,
-            "    /// Launch the `{}` kernel with typed arguments (sync — blocks on completion).",
+            "    /// Build a typed [`LaunchOp`][lo] for the `{}` kernel — call",
             decl.name
         )?;
+        writeln!(
+            s,
+            "    /// `.wait()`, `.submit()`, or `.await` on the result to enqueue."
+        )?;
+        writeln!(s, "    ///")?;
+        writeln!(s, "    /// [lo]: ::claspr::LaunchOp")?;
         // `clippy::too_many_arguments` — arg count is determined by
-        // the kernel's declared signature, not user choice. The
-        // async sibling below adds `deps`, which can push wrappers
-        // over clippy's 7-arg threshold.
+        // the kernel's declared signature, not user choice.
         writeln!(s, "    #[allow(clippy::too_many_arguments)]")?;
-        writeln!(s, "    pub fn {field}(")?;
-        writeln!(s, "        &self,")?;
-        writeln!(s, "        launcher: &impl ::claspr::Launcher,")?;
+        writeln!(s, "    pub fn {field}<'claspr_l>(")?;
+        writeln!(s, "        &'claspr_l self,")?;
+        writeln!(s, "        launcher: &'claspr_l impl ::claspr::Launcher,")?;
         writeln!(
             s,
             "        grid: impl ::claspr::IntoLaunchSpec{params_sig},"
         )?;
-        writeln!(s, "    ) -> ::claspr::Result<::claspr::Event> {{")?;
         writeln!(
             s,
-            "        launcher.launch(&self.{field}, grid, {tuple_lit})"
+            "    ) -> ::claspr::LaunchOp<'claspr_l, {arg_tuple_ty}> {{"
         )?;
-        writeln!(s, "    }}")?;
-
-        // Async sibling — takes a `deps: impl IntoEventList` and a
-        // `&impl LauncherAsync` (only `&Queue<OutOfOrder>` implements
-        // it today), returns the event without blocking.
-        writeln!(s)?;
         writeln!(
             s,
-            "    /// Launch the `{}` kernel after `deps` complete; returns the event without blocking.",
-            decl.name
-        )?;
-        writeln!(s, "    #[allow(clippy::too_many_arguments)]")?;
-        writeln!(s, "    pub fn {field}_async(")?;
-        writeln!(s, "        &self,")?;
-        writeln!(s, "        launcher: &impl ::claspr::LauncherAsync,")?;
-        writeln!(s, "        deps: impl ::claspr::IntoEventList,")?;
-        writeln!(
-            s,
-            "        grid: impl ::claspr::IntoLaunchSpec{params_sig},"
-        )?;
-        writeln!(s, "    ) -> ::claspr::Result<::claspr::Event> {{")?;
-        writeln!(
-            s,
-            "        launcher.launch_with_deps(deps, &self.{field}, grid, {tuple_lit})"
+            "        ::claspr::LaunchOp::new(launcher, &self.{field}, grid, {tuple_lit})"
         )?;
         writeln!(s, "    }}")?;
     }
@@ -504,6 +499,28 @@ fn generate_module_source(
     writeln!(s, "}}")?;
 
     Ok(s)
+}
+
+/// Inject a `'claspr_l` lifetime after the leading `&` of a reference
+/// type string. Used to tie host-arg borrows to the LaunchOp's
+/// lifetime parameter. Pass-through for non-reference types.
+fn inject_lifetime(ty: &str) -> String {
+    let trimmed = ty.trim_start();
+    let prefix_len = ty.len() - trimmed.len();
+    let prefix = &ty[..prefix_len];
+    if let Some(after_amp) = trimmed.strip_prefix('&') {
+        // Skip `mut ` if present so `&mut T` becomes `&'claspr_l mut T`.
+        let after = after_amp.trim_start();
+        let trimmed_amp_len = after_amp.len() - after.len();
+        let between = &after_amp[..trimmed_amp_len];
+        if let Some(rest) = after.strip_prefix("mut ") {
+            format!("{prefix}&'claspr_l{between}mut {rest}")
+        } else {
+            format!("{prefix}&'claspr_l {after}")
+        }
+    } else {
+        ty.to_string()
+    }
 }
 
 fn has_decl(kernels: &[KernelDecl], name: &str) -> bool {

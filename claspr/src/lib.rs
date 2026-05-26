@@ -28,7 +28,7 @@
 //!     let kernels = gpu::kernels(&ctx)?;
 //!     let mut data: Vec<u32> = (1..=1024).collect();
 //!     let buf = ctx.upload(&data)?;
-//!     kernels.collatz_kernel(&ctx, [data.len()], &buf)?;
+//!     kernels.collatz_kernel(&ctx, [data.len()], &buf).wait()?;
 //!     ctx.download(&buf, &mut data)?;
 //!     Ok(())
 //! }
@@ -65,6 +65,7 @@ pub mod error;
 pub mod future;
 pub mod image;
 pub mod launch;
+pub mod op;
 pub mod ppm;
 pub mod queue;
 pub mod svm;
@@ -79,11 +80,12 @@ pub use image::{Image2D, Image2DRgba8, ImageAccess, ReadOnly, ReadWrite, WriteOn
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
 };
+pub use op::{LaunchOp, ProfilingInfo};
 pub use ppm::write_ppm_rgba8;
-pub use queue::{InOrder, IntoEventList, Launcher, LauncherAsync, OutOfOrder, Queue, QueueOrder};
+pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 
 #[cfg(feature = "async-events")]
-pub use future::{EventFuture, EventFutureExt};
+pub use future::{EventFuture, EventFutureExt, LaunchFuture};
 pub use svm::{SharedBuffer, SharedReadGuard, SharedWriteGuard};
 
 // Stage-3 proc-macro frontend.
