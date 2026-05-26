@@ -36,7 +36,7 @@ fn await_simple_chain() {
         .and_then(|buf| {
             with_context(move |ec| {
                 let mut out = vec![0u32; N];
-                buf.download(ec, &mut out)?;
+                buf.download(ec, &mut out).wait()?;
                 Ok::<_, claspr::Error>(out)
             })
         });
@@ -77,7 +77,7 @@ fn await_propagates_chain_error() {
             with_context(move |ec| {
                 let mut wrong_size = vec![0u32; 8];
                 // This errors synchronously inside execute.
-                buf.download(ec, &mut wrong_size)?;
+                buf.download(ec, &mut wrong_size).wait()?;
                 Ok::<_, claspr::Error>(wrong_size)
             })
         });

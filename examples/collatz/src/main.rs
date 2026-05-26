@@ -71,7 +71,7 @@ fn run() -> claspr::Result<bool> {
     let mut device_results = inputs.clone();
     let buf = claspr::DeviceSlice::upload(&ctx, &device_results)?;
     kernels.collatz_kernel(&ctx, [N], &buf).wait()?;
-    buf.download(&ctx, &mut device_results)?;
+    buf.download(&ctx, &mut device_results).wait()?;
 
     // Validate every kernel output against the host-side `collatz`
     // implementation lifted from inside the device module. Same

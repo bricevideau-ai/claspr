@@ -40,7 +40,7 @@ fn and_then_host_sum_between_device_stages() {
         .and_then(|buf| {
             with_context(move |ec| {
                 let mut out = vec![0u32; N];
-                buf.download(ec, &mut out)?;
+                buf.download(ec, &mut out).wait()?;
                 Ok::<_, claspr::Error>(out)
             })
         })

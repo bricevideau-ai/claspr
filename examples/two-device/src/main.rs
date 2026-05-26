@@ -103,15 +103,15 @@ fn run() -> claspr::Result<bool> {
     // `DeviceSlice::copy_to` path within a possibly-multi-device
     // context.
     let mut mirror = DeviceSlice::alloc(&ctx, half)?;
-    buf0.copy_to(&mut mirror, &q1)?.wait()?;
+    buf0.copy_to(&mut mirror, &q1).wait()?;
 
     // Stage 3: download back via the respective queues and verify.
     let mut out0 = vec![0u32; half];
     let mut out1 = vec![0u32; N - half];
     let mut mirror_out = vec![0u32; half];
-    buf0.download(&q0, &mut out0)?;
-    buf1.download(&q1, &mut out1)?;
-    mirror.download(&q1, &mut mirror_out)?;
+    buf0.download(&q0, &mut out0).wait()?;
+    buf1.download(&q1, &mut out1).wait()?;
+    mirror.download(&q1, &mut mirror_out).wait()?;
 
     assert_eq!(out0, inputs[..half], "buf0 round-trip mismatch");
     assert_eq!(out1, inputs[half..], "buf1 round-trip mismatch");

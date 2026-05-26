@@ -16,15 +16,18 @@
 
 use crate::context::Context;
 use crate::error::{Error, Result};
+use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
 use crate::queue::Launcher;
 use opencl3::command_queue::{
-    enqueue_map_buffer, enqueue_unmap_mem_object, release_command_queue, retain_command_queue,
+    CommandQueue, enqueue_map_buffer, enqueue_unmap_mem_object, release_command_queue,
+    retain_command_queue,
 };
+use opencl3::event::Event;
 use opencl3::memory::{
     Buffer as ClBuffer, CL_MAP_READ, CL_MAP_WRITE, CL_MEM_ALLOC_HOST_PTR, CL_MEM_READ_WRITE, ClMem,
     release_mem_object,
 };
-use opencl3::types::{CL_BLOCKING, cl_command_queue, cl_int, cl_mem};
+use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_command_queue, cl_event, cl_int, cl_mem};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
@@ -160,42 +163,65 @@ impl<T> DeviceSlice<T> {
         })
     }
 
-    /// Allocate a device buffer and write `data` into it (blocking).
+    /// Allocate a buffer of `data.len()` elements and synchronously
+    /// write `data` into it. Returns the populated buffer.
     ///
-    /// Needs a [`Launcher`] for the queue side. Pass `&ctx` for the
-    /// default queue or `&queue` for an explicit one.
-    pub fn upload<L: Launcher>(launcher: &L, data: &[T]) -> Result<Self> {
-        let mut slice = Self::alloc(launcher.context(), data.len())?;
-        // SAFETY: blocking write into the buffer we just allocated;
-        // no aliasing, no concurrent device access.
-        unsafe {
-            launcher
-                .cl_queue()
-                .enqueue_write_buffer(&mut *slice.buffer, CL_BLOCKING, 0, data, &[])?
-                .wait()?;
-        }
-        Ok(slice)
+    /// This is the blocking convenience for the common "host vector →
+    /// device buffer" case. Internally it does
+    /// `alloc(ctx, data.len())?` followed by `buf.write(launcher, data).wait()?`.
+    /// For async / non-blocking variants, allocate explicitly and use
+    /// [`write`](Self::write):
+    ///
+    /// ```ignore
+    /// let mut buf = DeviceSlice::alloc(&ctx, data.len())?;
+    /// buf.write(&q, &data).await?;
+    /// ```
+    pub fn upload<L: Launcher + ?Sized>(launcher: &L, data: &[T]) -> Result<Self> {
+        let mut buf = Self::alloc(launcher.context(), data.len())?;
+        buf.write(launcher, data).wait()?;
+        Ok(buf)
     }
 
-    /// Read the buffer back into a host slice (blocking).
+    /// Begin writing `data` into this buffer. Returns a lazy
+    /// [`WriteOp`] builder — pick a terminal ([`wait`](WriteOp::wait),
+    /// [`submit`](WriteOp::submit), `.await`) to actually run.
     ///
-    /// `dst` must have the same length as `self`. Returns
-    /// [`Error::LengthMismatch`] otherwise.
-    pub fn download<L: Launcher>(&self, launcher: &L, dst: &mut [T]) -> Result<()> {
-        if dst.len() != self.len {
-            return Err(Error::LengthMismatch {
-                src: self.len,
-                dst: dst.len(),
-            });
+    /// `data.len()` must equal `self.len()` (checked at terminal time —
+    /// the terminals return [`Error::LengthMismatch`] otherwise).
+    pub fn write<'a, L: Launcher + ?Sized>(
+        &'a mut self,
+        launcher: &'a L,
+        data: &'a [T],
+    ) -> WriteOp<'a, T> {
+        WriteOp {
+            queue: launcher.cl_queue(),
+            buffer: &mut self.buffer,
+            dst_len: self.len,
+            data,
+            deps: Vec::new(),
+            profile_cb: None,
         }
-        // SAFETY: blocking read; no aliasing of `dst`.
-        unsafe {
-            launcher
-                .cl_queue()
-                .enqueue_read_buffer(&*self.buffer, CL_BLOCKING, 0, dst, &[])?
-                .wait()?;
+    }
+
+    /// Begin reading the buffer into `dst`. Returns a lazy [`ReadOp`]
+    /// builder — call [`wait`](ReadOp::wait), [`submit`](ReadOp::submit),
+    /// or `.await` on it to actually run.
+    ///
+    /// `dst.len()` must equal `self.len()` (checked at terminal time —
+    /// the terminals return [`Error::LengthMismatch`] otherwise).
+    pub fn download<'a, L: Launcher + ?Sized>(
+        &'a self,
+        launcher: &'a L,
+        dst: &'a mut [T],
+    ) -> ReadOp<'a, T> {
+        ReadOp {
+            queue: launcher.cl_queue(),
+            buffer: &self.buffer,
+            src_len: self.len,
+            dst,
+            deps: Vec::new(),
+            profile_cb: None,
         }
-        Ok(())
     }
 
     /// Borrow the underlying opencl3 [`ClBuffer`](opencl3::memory::Buffer)
@@ -204,42 +230,255 @@ impl<T> DeviceSlice<T> {
         &self.buffer
     }
 
-    /// Copy this buffer into `dst` on the given launcher's queue.
+    /// Begin a device-to-device copy from `self` into `dst`. Returns
+    /// a lazy [`CopyOp`] builder — call [`wait`](CopyOp::wait),
+    /// [`submit`](CopyOp::submit), or `.await` on it to actually run.
     ///
     /// Both buffers must be on the same `Context` — OpenCL's
     /// `clEnqueueCopyBuffer` only works within one context. For
     /// cross-context transfers, download to host then re-upload.
-    /// Returns the completion [`Event`](opencl3::event::Event) from
-    /// the queued copy (non-blocking — call `.wait()?` on it, or feed
-    /// it into a downstream [`LaunchOp::after`](crate::op::LaunchOp::after)
-    /// for cross-queue chaining).
-    pub fn copy_to<L: Launcher>(
-        &self,
-        dst: &mut DeviceSlice<T>,
-        launcher: &L,
-    ) -> Result<opencl3::event::Event> {
-        if self.len != dst.len {
+    pub fn copy_to<'a, L: Launcher + ?Sized>(
+        &'a self,
+        dst: &'a mut DeviceSlice<T>,
+        launcher: &'a L,
+    ) -> CopyOp<'a, T> {
+        CopyOp {
+            queue: launcher.cl_queue(),
+            src: &self.buffer,
+            dst: &mut dst.buffer,
+            src_len: self.len,
+            dst_len: dst.len,
+            deps: Vec::new(),
+            profile_cb: None,
+        }
+    }
+}
+
+// ── UploadOp / ReadOp / CopyOp builders ─────────────────────────────
+//
+// Same terminal-menu pattern as [`crate::op::LaunchOp`]: lazy builder
+// captures everything the enqueue needs; the user picks `.wait()`
+// (blocking), `.submit()` (returns Event, non-blocking), `.await`
+// (registers a CL_COMPLETE callback, non-blocking), plus modifiers
+// `.after(&Event)` (queue-side wait dependency) and `.profiled(|info|
+// ...)` (timestamp callback). The terminal-decides-blocking trick:
+// `.wait()` passes `CL_TRUE` straight to the enqueue — the driver
+// blocks internally, no extra `event.wait()` roundtrip — whereas
+// `.submit()` / `.await` pass `CL_FALSE` and return / register on
+// the resulting event.
+
+/// Lazy builder for `clEnqueueWriteBuffer`. Returned by
+/// [`DeviceSlice::write`]. Writes into an existing buffer; for the
+/// "alloc + write in one shot" convenience, see [`DeviceSlice::upload`].
+pub struct WriteOp<'a, T> {
+    queue: &'a CommandQueue,
+    buffer: &'a mut ManuallyDrop<ClBuffer<T>>,
+    dst_len: usize,
+    data: &'a [T],
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
+}
+
+impl<'a, T> WriteOp<'a, T> {
+    /// Add a queue-side wait dependency. Chainable.
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
+    }
+
+    /// Register a completion callback that receives the write's
+    /// [`ProfilingInfo`]. Same FFI shim as
+    /// [`LaunchOp::profiled`](crate::op::LaunchOp::profiled);
+    /// requires the queue to have `CL_QUEUE_PROFILING_ENABLE`.
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    /// Sync terminal — enqueue the write with `CL_TRUE`; the driver
+    /// blocks until the buffer has been written.
+    pub fn wait(self) -> Result<()> {
+        if self.data.len() != self.dst_len {
             return Err(Error::LengthMismatch {
-                src: self.len,
-                dst: dst.len,
+                src: self.data.len(),
+                dst: self.dst_len,
             });
         }
-        let bytes = self.len * std::mem::size_of::<T>();
-        // SAFETY: enqueue_copy_buffer is unsafe only because the
-        // caller must ensure src/dst belong to the queue's context.
-        // We check len equality above; context cross-checking is on
-        // the caller (pocl panics if mismatched — preferable to a
-        // silent miscopy).
+        // SAFETY: CL_TRUE — the driver waits for the write to complete
+        // before returning.
         let event = unsafe {
-            launcher.cl_queue().enqueue_copy_buffer(
-                &*self.buffer,
-                &mut *dst.buffer,
+            self.queue.enqueue_write_buffer(
+                &mut **self.buffer,
+                CL_BLOCKING,
                 0,
-                0,
-                bytes,
-                &[],
+                self.data,
+                &self.deps,
             )?
         };
+        if let Some(cb) = self.profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
+        Ok(())
+    }
+
+    /// Non-blocking terminal — enqueue the write with `CL_FALSE`,
+    /// return the completion event. `data` must outlive the event.
+    pub fn submit(self) -> Result<Event> {
+        if self.data.len() != self.dst_len {
+            return Err(Error::LengthMismatch {
+                src: self.data.len(),
+                dst: self.dst_len,
+            });
+        }
+        // SAFETY: CL_FALSE; the write may complete after this call
+        // returns. `data` must stay alive until the event fires.
+        let event = unsafe {
+            self.queue.enqueue_write_buffer(
+                &mut **self.buffer,
+                CL_NON_BLOCKING,
+                0,
+                self.data,
+                &self.deps,
+            )?
+        };
+        if let Some(cb) = self.profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
+        Ok(event)
+    }
+}
+
+/// Lazy builder for `clEnqueueReadBuffer`. Returned by
+/// [`DeviceSlice::download`].
+pub struct ReadOp<'a, T> {
+    queue: &'a CommandQueue,
+    buffer: &'a ClBuffer<T>,
+    src_len: usize,
+    dst: &'a mut [T],
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
+}
+
+impl<'a, T> ReadOp<'a, T> {
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
+    }
+
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    /// Sync terminal — enqueue the read with `CL_TRUE`; the driver
+    /// blocks until `dst` has been filled.
+    pub fn wait(self) -> Result<()> {
+        if self.dst.len() != self.src_len {
+            return Err(Error::LengthMismatch {
+                src: self.src_len,
+                dst: self.dst.len(),
+            });
+        }
+        // SAFETY: CL_TRUE — the driver waits for the read to complete
+        // before returning, so `dst` is fully populated on return.
+        let event = unsafe {
+            self.queue
+                .enqueue_read_buffer(self.buffer, CL_BLOCKING, 0, self.dst, &self.deps)?
+        };
+        if let Some(cb) = self.profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
+        Ok(())
+    }
+
+    /// Non-blocking terminal — enqueue the read with `CL_FALSE`,
+    /// return the completion event. `dst` is only valid after the
+    /// event fires; the caller must keep `dst` alive until then.
+    pub fn submit(self) -> Result<Event> {
+        if self.dst.len() != self.src_len {
+            return Err(Error::LengthMismatch {
+                src: self.src_len,
+                dst: self.dst.len(),
+            });
+        }
+        // SAFETY: CL_FALSE; the driver enqueues the read and returns
+        // immediately. `dst` must outlive the returned event.
+        let event = unsafe {
+            self.queue
+                .enqueue_read_buffer(self.buffer, CL_NON_BLOCKING, 0, self.dst, &self.deps)?
+        };
+        if let Some(cb) = self.profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
+        Ok(event)
+    }
+}
+
+/// Lazy builder for `clEnqueueCopyBuffer`. Returned by
+/// [`DeviceSlice::copy_to`]. There's no `CL_BLOCKING` flag on
+/// `clEnqueueCopyBuffer`, so `.wait()` is non-blocking enqueue +
+/// `event.wait()` (same as [`LaunchOp`](crate::op::LaunchOp)).
+pub struct CopyOp<'a, T> {
+    queue: &'a CommandQueue,
+    src: &'a ClBuffer<T>,
+    dst: &'a mut ClBuffer<T>,
+    src_len: usize,
+    dst_len: usize,
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
+}
+
+impl<'a, T> CopyOp<'a, T> {
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
+    }
+
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    /// Sync terminal — enqueue + wait on the resulting event.
+    pub fn wait(self) -> Result<()> {
+        let event = self.into_event()?;
+        event.wait()?;
+        Ok(())
+    }
+
+    /// Non-blocking terminal — enqueue and return the completion event.
+    pub fn submit(self) -> Result<Event> {
+        self.into_event()
+    }
+
+    pub(crate) fn into_event(self) -> Result<Event> {
+        if self.src_len != self.dst_len {
+            return Err(Error::LengthMismatch {
+                src: self.src_len,
+                dst: self.dst_len,
+            });
+        }
+        let bytes = self.src_len * std::mem::size_of::<T>();
+        // SAFETY: `enqueue_copy_buffer` is `unsafe` because src/dst
+        // must belong to the queue's context. Length equality checked
+        // above; context cross-checking is on the caller (pocl panics
+        // on mismatch — preferable to a silent miscopy).
+        let event = unsafe {
+            self.queue
+                .enqueue_copy_buffer(self.src, self.dst, 0, 0, bytes, &self.deps)?
+        };
+        if let Some(cb) = self.profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
         Ok(event)
     }
 }

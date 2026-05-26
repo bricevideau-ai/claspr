@@ -35,7 +35,7 @@ fn linear_chain_fill_and_download() {
         .and_then(|buf| {
             with_context(move |ec| {
                 let mut out = vec![0u32; N];
-                buf.download(ec, &mut out)?;
+                buf.download(ec, &mut out).wait()?;
                 Ok::<_, claspr::Error>(out)
             })
         })

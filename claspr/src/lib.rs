@@ -29,7 +29,7 @@
 //!     let mut data: Vec<u32> = (1..=1024).collect();
 //!     let buf = ctx.upload(&data)?;
 //!     kernels.collatz_kernel(&ctx, [data.len()], &buf).wait()?;
-//!     ctx.download(&buf, &mut data)?;
+//!     buf.download(&ctx, &mut data).wait()?;
 //!     Ok(())
 //! }
 //! ```
@@ -72,7 +72,7 @@ pub mod svm;
 
 // ── Public surface ────────────────────────────────────────────────────
 
-pub use buffer::{Buffer, DeviceSlice, HostBuffer};
+pub use buffer::{Buffer, CopyOp, DeviceSlice, HostBuffer, ReadOp, WriteOp};
 pub use context::{Context, SvmLevel};
 pub use device::{Device, DeviceType, Platform};
 pub use error::{Error, Result};
@@ -85,7 +85,7 @@ pub use ppm::write_ppm_rgba8;
 pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 
 #[cfg(feature = "async-events")]
-pub use future::{EventFuture, EventFutureExt, LaunchFuture};
+pub use future::{CopyFuture, EventFuture, EventFutureExt, LaunchFuture, ReadFuture, WriteFuture};
 pub use svm::{SharedBuffer, SharedReadGuard, SharedWriteGuard};
 
 // Stage-3 proc-macro frontend.
