@@ -893,7 +893,16 @@ crate-type = ["dylib"]
 
 [dependencies]
 spirv-std = { git = "https://github.com/bricevideau-ai/rust-gpu.git", branch = "opencl-kernel-support" }
-glam = { version = ">=0.30.8", default-features = false }
+# `<0.33` matches the rust-gpu fork's workspace pin (0.33 hides the
+# vector type families behind opt-in features that spirv-std doesn't
+# request). `libm` is the math backend — glam 0.33+ refuses to
+# compile without one of `std`/`libm`/`nostd-libm`, and the spirv
+# target is no_std, so libm is the choice. We request it here at the
+# kernel-sub-crate level so the resolution succeeds even when the
+# host's lockfile doesn't already pin a libm-featured glam (which is
+# exactly the case for standalone consumers like the combinator
+# spike that don't touch glam from the host side themselves).
+glam = { version = ">=0.30.8, <0.33", default-features = false, features = ["libm"] }
 # Always-available extras for kernel code: `num-complex` for Complex
 # arithmetic. Tiny no_std crate; pulling it unconditionally beats
 # requiring every user to extend the generated Cargo.toml just to

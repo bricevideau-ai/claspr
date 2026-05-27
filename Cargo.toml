@@ -29,7 +29,11 @@ authors = ["Brice Videau <brice.ai.videau@gmail.com>"]
 opencl3 = "0.12"
 spirv-builder = { git = "https://github.com/bricevideau-ai/rust-gpu.git", branch = "opencl-kernel-support", default-features = false, features = ["use-compiled-tools"] }
 spirv-std = { git = "https://github.com/bricevideau-ai/rust-gpu.git", branch = "opencl-kernel-support" }
-glam = { version = ">=0.30.8", default-features = false }
+# <0.33 to match the upstream rust-gpu fork's workspace pin —
+# glam 0.33 gates the integer/size/float vector type families behind
+# opt-in features that spirv-std doesn't request. Bump the upper
+# bound here together with rust-gpu's workspace bound.
+glam = { version = ">=0.30.8, <0.33", default-features = false }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(target_arch, values("spirv"))'] }
