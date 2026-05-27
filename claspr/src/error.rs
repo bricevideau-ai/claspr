@@ -1,8 +1,14 @@
 //! claspr's [`Error`] type and [`Result`] alias.
 //!
 //! Single typed enum so callers can `match` on the failure mode
-//! (compile failure, OpenCL status, missing capability) instead of
+//! (compile failure, OpenCL status, missing capability, …) instead of
 //! string-sniffing a boxed trait object.
+//!
+//! Variants are added on demand — `#[non_exhaustive]` so a future
+//! addition doesn't break `match` arms in downstream code. The audit
+//! pass that removed `Error::Other`, `Error::KernelArg`, and
+//! `Error::InvalidWorkSize` confirmed every variant below is
+//! constructed at at least one in-tree call site.
 
 use std::fmt;
 use std::io;
@@ -16,11 +22,6 @@ pub enum Error {
     OpenCl(opencl3::error_codes::ClError),
     /// Program build failed; carries the build log from `clGetProgramBuildInfo`.
     Build { log: String },
-    /// A kernel argument couldn't be set (wrong type, wrong index, etc).
-    KernelArg(String),
-    /// Work-size geometry is invalid (zero dims, mismatched lengths,
-    /// exceeds device max, …).
-    InvalidWorkSize(String),
     /// A buffer download / upload had mismatched lengths.
     LengthMismatch { src: usize, dst: usize },
     /// The selected device or runtime doesn't support a requested feature.
@@ -35,24 +36,17 @@ pub enum Error {
     /// [`Queue::on_device`](crate::queue::Queue::on_device) built off it —
     /// inherit profiling.
     ProfilingDisabled,
-    /// I/O error (reading a SPIR-V file, writing a PPM, …).
+    /// I/O error (reading a SPIR-V file, writing a PPM, …). Constructed
+    /// via the [`From<io::Error>`] impl below — any `?` on a fallible
+    /// I/O call inside claspr lands here automatically.
+    ///
+    /// [`From<io::Error>`]: #impl-From%3CError%3E-for-Error
     Io(io::Error),
     /// A function argument failed a validation check (empty slice,
     /// usize overflow, malformed name, …). The string is a static
     /// description — the offending value is the caller's, not part
     /// of the error.
     InvalidArgument(&'static str),
-    /// Free-form message for cases the typed variants don't cover.
-    ///
-    /// Reserved as a user-facing escape hatch (via the
-    /// [`From<String>`]/[`From<&str>`] impls below) for callers that
-    /// want to bubble up an ad-hoc error without defining their own
-    /// type. *claspr's own code does not use this variant* — every
-    /// internal failure path goes through a typed variant.
-    ///
-    /// [`From<String>`]: #impl-From%3CString%3E-for-Error
-    /// [`From<&str>`]: #impl-From%3C%26str%3E-for-Error
-    Other(String),
 }
 
 impl fmt::Display for Error {
@@ -60,8 +54,6 @@ impl fmt::Display for Error {
         match self {
             Error::OpenCl(e) => write!(f, "OpenCL error: {e}"),
             Error::Build { log } => write!(f, "program build failed:\n{log}"),
-            Error::KernelArg(msg) => write!(f, "kernel argument: {msg}"),
-            Error::InvalidWorkSize(msg) => write!(f, "invalid work size: {msg}"),
             Error::LengthMismatch { src, dst } => {
                 write!(f, "length mismatch: src has {src} elements, dst has {dst}")
             }
@@ -75,7 +67,6 @@ impl fmt::Display for Error {
             ),
             Error::Io(e) => write!(f, "I/O: {e}"),
             Error::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
-            Error::Other(msg) => f.write_str(msg),
         }
     }
 }
@@ -99,21 +90,5 @@ impl From<opencl3::error_codes::ClError> for Error {
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
         Error::Io(e)
-    }
-}
-
-// String / &str conversions cover the existing `format!(...).into()`
-// and `"...".into()` patterns. New code should prefer the typed
-// variants — these shims exist so the migration doesn't require
-// touching every fallible call site at once.
-impl From<String> for Error {
-    fn from(s: String) -> Self {
-        Error::Other(s)
-    }
-}
-
-impl From<&str> for Error {
-    fn from(s: &str) -> Self {
-        Error::Other(s.to_owned())
     }
 }
