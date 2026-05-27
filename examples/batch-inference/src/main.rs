@@ -27,7 +27,7 @@
 //! [fo]: claspr_async::fan_out
 
 use claspr::Context;
-use claspr_async::{DeviceOperation, DeviceOperationHostExt, bundle, download, fan_out, upload};
+use claspr_async::{DeviceOperation, bundle, download, fan_out, upload};
 use std::sync::Arc;
 
 const N: usize = 64;
@@ -88,7 +88,12 @@ fn run(ctx: Context) -> claspr::Result<()> {
     // The full fan_out chain: each branch is its own independent
     // upload + bundle(weights, input) + kernel + bias + download + sum.
     // BATCHES branches run concurrently on the OOO queue.
-    let outputs: Vec<u32> = fan_out(inputs.clone(), move |input| {
+    // Each branch downloads to a Vec<u32>; final reduction is a
+    // host-side sum after the chain has finished. (Pre-async
+    // `and_then_host` could fold this into the chain, but the new
+    // signature only does in-place mutation — for pure reductions,
+    // host sum after `.sync()` is the natural shape.)
+    let downloaded: Vec<Vec<u32>> = fan_out(inputs.clone(), move |input| {
         // `Arc::clone(&weights)` is cheap; both clones share the same
         // host allocation. The keep-alive callback on the write event
         // drops each clone once OpenCL is done copying from it.
@@ -103,9 +108,9 @@ fn run(ctx: Context) -> claspr::Result<()> {
                 )
             })
             .and_then(download)
-            .and_then_host(|v| Ok(v.iter().sum::<u32>()))
     })
     .sync(&ctx)?;
+    let outputs: Vec<u32> = downloaded.iter().map(|v| v.iter().sum()).collect();
 
     for (i, (got, want)) in outputs.iter().zip(expected.iter()).enumerate() {
         if got != want {

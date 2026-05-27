@@ -36,10 +36,10 @@
 //! `transfer_to_device`), the scenario uses the closest production-
 //! API equivalent and notes the gap in a comment.
 
-use claspr::{Context, Device, DeviceSlice, InOrder, Queue};
+use claspr::{Context, Device, InOrder, Queue};
 use claspr_async::{
-    DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, DynOp, HostAccessibleExt,
-    bundle, download, fan_out, upload, value, with_context,
+    DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, DynOp, bundle, download,
+    fan_out, upload, value, with_context,
 };
 use std::sync::Arc;
 
@@ -336,20 +336,25 @@ fn scenario_10_error_propagation(ctx: &Context) -> claspr::Result<()> {
     println!("\n=== Scenario 10: error propagation through and_then ===");
     let kernels = gpu::kernels(ctx)?;
     let kernels_ref = &kernels;
+    // Under the new async and_then_host, closure error → user event
+    // set to negative status → downstream device commands fail with
+    // the same negative code. The specific Error::InvalidArgument
+    // variant doesn't survive the user-event boundary; the chain
+    // surfaces an Error::OpenCl(ClError(neg)) instead. The "should
+    // not run" closure technically still runs (it produces an op
+    // eagerly during execute()), but the produced kernel command
+    // never actually fires — its wait-list events are failed.
     let result = upload(vec![1.0f32; N])
         .and_then(|buf| kernels_ref.scale([N], buf, 2.0))
-        .and_then_host(|_buf| -> claspr::Result<DeviceSlice<f32>> {
+        .and_then_host(|_slice: &mut [f32]| -> claspr::Result<()> {
             Err(claspr::Error::InvalidArgument("simulated stage failure"))
         })
-        .and_then(|buf| {
-            println!("  this stage SHOULD NOT RUN");
-            kernels_ref.scale([N], buf, 2.0)
-        })
+        .and_then(|buf| kernels_ref.scale([N], buf, 2.0))
         .and_then(download)
         .sync(ctx);
     match result {
         Ok(_) => panic!("should have errored"),
-        Err(e) => println!("  got expected error: {e}"),
+        Err(e) => println!("  got expected error (negative cl status): {e}"),
     }
     Ok(())
 }
@@ -470,15 +475,27 @@ fn scenario_15_and_then_host(ctx: &Context) -> claspr::Result<()> {
     println!("\n=== Scenario 15: .and_then_host(|x| ...) — in-queue host work ===");
     let kernels = gpu::kernels(ctx)?;
     let kernels_ref = &kernels;
+    // Under the async and_then_host: the closure runs on a worker
+    // thread, in queue order between two device stages. The mapped
+    // view (`&mut [f32]`) is the buffer's mapped memory — writes
+    // commit back via the queued unmap. The next kernel sees them.
+    //
+    // Note: feeding a host-computed value to a *scalar argument* of
+    // the next kernel doesn't work, because the next `.and_then`
+    // closure runs at execute() time (before the worker fires).
+    // Pass host-computed state through device memory instead — i.e.
+    // write it into the buffer itself, here just by tripling every
+    // element in place.
     let result: Vec<f32> = upload(vec![1.0f32; N])
-        .and_then(|buf| kernels_ref.scale([N], buf, 2.0))
-        .and_then(download)
-        .and_then_host(|v| {
-            let factor = if v[0] > 1.5 { 3.0 } else { 1.0 };
-            eprintln!("  host computed factor = {factor}");
-            Ok((v, factor))
+        .and_then(|buf| kernels_ref.scale([N], buf, 2.0)) // [2; N]
+        .and_then_host(|slice: &mut [f32]| {
+            // In-queue host work: triple every element in place.
+            for x in slice.iter_mut() {
+                *x *= 3.0;
+            }
+            eprintln!("  host modified slice[0] = {}", slice[0]);
+            Ok(())
         })
-        .and_then(|(v, factor)| upload(v).and_then(move |buf| kernels_ref.scale([N], buf, factor)))
         .and_then(download)
         .sync(ctx)?;
     println!("  result[0..4] = {:?}", &result[..4]);
@@ -487,18 +504,21 @@ fn scenario_15_and_then_host(ctx: &Context) -> claspr::Result<()> {
 }
 
 fn scenario_16_host_accessible(ctx: &Context) -> claspr::Result<()> {
-    println!("\n=== Scenario 16: HostAccessible — three-stage acquire/host/release ===");
+    println!("\n=== Scenario 16: HostAccessible — direct map via and_then_host ===");
     let kernels = gpu::kernels(ctx)?;
     let kernels_ref = &kernels;
+    // The old "acquire_host_view → and_then_host(view) → release"
+    // three-stage pattern is now subsumed by `.and_then_host` directly
+    // on the `DeviceSlice` — the closure receives a mapped `&mut [T]`,
+    // mutations are committed back on the next stage via the unmap
+    // command that's already queued.
     let result: Vec<f32> = upload(vec![1.0f32; N])
         .and_then(|buf| kernels_ref.scale([N], buf, 2.0)) // [2; N]
-        .and_then(|buf| buf.acquire_host_view())
-        .and_then_host(|mut view| {
-            view[0] += 100.0;
-            eprintln!("  host modified view[0] = {}", view[0]);
-            Ok(view)
+        .and_then_host(|slice: &mut [f32]| {
+            slice[0] += 100.0;
+            eprintln!("  host modified slice[0] = {}", slice[0]);
+            Ok(())
         })
-        .and_then(|view| view.release_to_device())
         .and_then(|buf| kernels_ref.scale([N], buf, 0.5)) // GPU again
         .and_then(download)
         .sync(ctx)?;

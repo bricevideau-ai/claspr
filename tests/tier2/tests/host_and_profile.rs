@@ -3,9 +3,10 @@
 
 use claspr::{Context, Device};
 use claspr_async::{
-    DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, download, upload, value,
+    DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, upload, value,
 };
 use claspr_test_kernels::kernels;
+use std::sync::{Arc, Mutex};
 
 const N: usize = 128;
 
@@ -28,14 +29,22 @@ fn and_then_host_sum_between_device_stages() {
     };
 
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    // upload + fill + download + (host) sum + check
-    let sum: u32 = value(vec![0u32; N])
+    // upload + fill + (host) sum-in-place via mapped view. The new
+    // and_then_host is side-effects-only — the closure mutates / reads
+    // the mapped buffer in place and returns Result<()>. To surface a
+    // reduction value, capture into an Arc<Mutex<_>>.
+    let sum_cell = Arc::new(Mutex::new(0u32));
+    let cell = Arc::clone(&sum_cell);
+    let _final_buf = value(vec![0u32; N])
         .and_then(upload)
         .and_then(|buf| kernels.fill_u32([N], buf, 3))
-        .and_then(download)
-        .and_then_host(|out| Ok(out.iter().sum::<u32>()))
+        .and_then_host(move |slice: &mut [u32]| {
+            *cell.lock().unwrap() = slice.iter().sum();
+            Ok(())
+        })
         .sync(&ctx)
         .expect("and_then_host chain");
+    let sum = *sum_cell.lock().unwrap();
     assert_eq!(sum, 3 * N as u32);
 }
 
@@ -45,11 +54,15 @@ fn and_then_host_error_propagates() {
         eprintln!("SKIP: no OpenCL device");
         return;
     };
+    // Closure returns Err → user event set to negative status → chain
+    // surfaces an Error::OpenCl with the negative code. The original
+    // Error::SvmNotAvailable doesn't survive the user-event boundary;
+    // we just check the chain errored.
     let err = value(())
-        .and_then_host(|_| -> claspr::Result<u32> { Err(claspr::Error::SvmNotAvailable) })
+        .and_then_host(|()| -> claspr::Result<()> { Err(claspr::Error::SvmNotAvailable) })
         .sync(&ctx)
         .expect_err("expected error");
-    assert!(matches!(err, claspr::Error::SvmNotAvailable));
+    assert!(matches!(err, claspr::Error::OpenCl(_)), "got {err:?}");
 }
 
 // ── profile ──────────────────────────────────────────────────────────

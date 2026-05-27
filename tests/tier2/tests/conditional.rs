@@ -8,6 +8,7 @@
 use claspr::Context;
 use claspr_async::{DeviceOperation, DeviceOperationHostExt, DynOp, download, upload, value};
 use claspr_test_kernels::kernels;
+use std::sync::{Arc, Mutex};
 
 const N: usize = 32;
 
@@ -63,16 +64,22 @@ fn dyn_op_wraps_upload_download() {
 
 #[test]
 fn baseline_kernel_chain_without_dynop() {
-    // Sanity baseline: the exact same chain shape outside DynOp.
+    // Sanity baseline: the exact same chain shape outside DynOp. The
+    // new async and_then_host can't return a value — capture the sum
+    // via Arc<Mutex<_>> instead.
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let a = upload(vec![3u32; N])
+    let sum_cell = Arc::new(Mutex::new(0u32));
+    let cell = Arc::clone(&sum_cell);
+    let _final_buf = upload(vec![3u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 9))
-        .and_then(download)
-        .and_then_host(|v| Ok(v.iter().sum::<u32>()))
+        .and_then_host(move |slice: &mut [u32]| {
+            *cell.lock().unwrap() = slice.iter().sum();
+            Ok(())
+        })
         .sync(&ctx)
         .expect("baseline");
-    assert_eq!(a, 9 * N as u32);
+    assert_eq!(*sum_cell.lock().unwrap(), 9 * N as u32);
 }
 
 #[test]
@@ -93,42 +100,54 @@ fn dyn_op_wraps_bare_kernel_op() {
 
 #[test]
 fn dyn_op_minimal_kernel_chain() {
-    // Single DynOp wrapping a chain that touches a kernel.
+    // Single DynOp wrapping a chain that touches a kernel. The sum
+    // is captured via Arc<Mutex<_>>; the chain's Output is the buffer.
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
+    let sum_cell = Arc::new(Mutex::new(0u32));
+    let cell = Arc::clone(&sum_cell);
 
-    let chain: DynOp<u32> = DynOp::new(
+    let chain: DynOp<claspr::DeviceSlice<u32>> = DynOp::new(
         upload(vec![3u32; N])
             .and_then(|buf| kernels.fill_u32([N], buf, 9))
-            .and_then(download)
-            .and_then_host(|v| Ok(v.iter().sum::<u32>())),
+            .and_then_host(move |slice: &mut [u32]| {
+                *cell.lock().unwrap() = slice.iter().sum();
+                Ok(())
+            }),
     );
-    let a = chain.sync(&ctx).expect("a");
-    assert_eq!(a, 9 * N as u32);
+    let _buf = chain.sync(&ctx).expect("a");
+    assert_eq!(*sum_cell.lock().unwrap(), 9 * N as u32);
 }
 
 #[test]
 fn dyn_op_picks_branch_with_or_without_kernel() {
     // The actual conditional shape: two arms produce different
-    // concrete chain types — one runs the kernel, the other lifts a
-    // literal — and DynOp erases them so a single `let chain = ...`
-    // can hold either.
+    // concrete chain types — one runs the kernel and captures sum
+    // via cell, the other lifts a literal 0 — and DynOp erases them.
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
+    let sum_cell = Arc::new(Mutex::new(0u32));
 
     let make = |use_kernel: bool| -> DynOp<u32> {
         if use_kernel {
+            let cell = Arc::clone(&sum_cell);
             DynOp::new(
                 upload(vec![3u32; N])
                     .and_then(move |buf| kernels_ref.fill_u32([N], buf, 9))
-                    .and_then(download)
-                    .and_then_host(|v| Ok(v.iter().sum::<u32>())),
+                    .and_then_host(move |slice: &mut [u32]| {
+                        *cell.lock().unwrap() = slice.iter().sum();
+                        Ok(())
+                    })
+                    .and_then(|_buf| value(0u32)),
             )
         } else {
             DynOp::new(value(0u32))
         }
     };
-    assert_eq!(make(true).sync(&ctx).expect("a"), 9 * N as u32);
+    assert_eq!(make(true).sync(&ctx).expect("a"), 0);
+    assert_eq!(*sum_cell.lock().unwrap(), 9 * N as u32);
+    *sum_cell.lock().unwrap() = 0;
     assert_eq!(make(false).sync(&ctx).expect("b"), 0);
+    assert_eq!(*sum_cell.lock().unwrap(), 0);
 }

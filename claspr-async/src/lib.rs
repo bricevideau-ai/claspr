@@ -55,6 +55,7 @@ pub mod exec_ctx;
 pub mod fan_out;
 pub mod future;
 pub mod host_view;
+pub mod mappable;
 pub mod op;
 pub mod profile;
 pub mod transfer;
@@ -74,6 +75,7 @@ pub use host_view::{
     HostAccessibleExt, HostBufferHostView, ReleaseDeviceSliceOp, ReleaseHostBufferOp,
     ReleaseSharedBufferOp, SharedBufferHostView,
 };
+pub use mappable::{DeviceSliceMapHandle, Mappable};
 pub use op::{
     AndThen, Arced, Dep, Deps, DeviceOperation, Value, WithContext, deps_as_events, value,
     with_context, wrap_event,

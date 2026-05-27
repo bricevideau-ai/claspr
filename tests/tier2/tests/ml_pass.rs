@@ -13,6 +13,7 @@
 use claspr::Context;
 use claspr_async::{DeviceOperation, DeviceOperationHostExt, bundle, download, upload, value};
 use claspr_test_kernels::kernels;
+use std::sync::{Arc, Mutex};
 
 const N: usize = 64;
 
@@ -35,13 +36,18 @@ fn forward_pass_threads_buffer_through_three_stages() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let loss: u32 = upload(vec![1u32; N])
+    let loss_cell = Arc::new(Mutex::new(0u32));
+    let cell = Arc::clone(&loss_cell);
+    let _final_buf = upload(vec![1u32; N])
         .and_then(|buf| kernels.scale_u32([N], buf, 2)) // layer1
         .and_then(|buf| kernels.scale_u32([N], buf, 3)) // layer2
-        .and_then(download)
-        .and_then_host(|out| Ok(out.iter().sum::<u32>())) // loss
+        .and_then_host(move |slice: &mut [u32]| {
+            *cell.lock().unwrap() = slice.iter().sum(); // loss
+            Ok(())
+        })
         .sync(&ctx)
         .expect("forward pass");
+    let loss = *loss_cell.lock().unwrap();
     assert_eq!(loss, 6 * N as u32);
 }
 
@@ -53,7 +59,9 @@ fn forward_pass_carries_scalar_state_via_value_tuple_repack() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let (final_sum, step) = upload(vec![10u32; N])
+    let sum_cell = Arc::new(Mutex::new(0u32));
+    let cell = Arc::clone(&sum_cell);
+    let (_final_buf, step) = upload(vec![10u32; N])
         .and_then(|buf| {
             // Pack: device op output + an external scalar travel
             // together as a tuple. Tuple-repack at every stage is the
@@ -67,11 +75,16 @@ fn forward_pass_carries_scalar_state_via_value_tuple_repack() {
                 .scale_u32([N], buf, 3)
                 .and_then(move |buf| value((buf, step + 1)))
         })
-        .and_then(|(buf, step)| {
-            download(buf).and_then_host(move |v| Ok((v.iter().sum::<u32>(), step)))
+        // Map the buffer in place to sum it (side-effect via cell);
+        // the scalar step rides along as part of the tuple Mappable's
+        // View. Output is the same (buf, step) tuple, passed through.
+        .and_then_host(move |(slice, _step): (&mut [u32], u32)| {
+            *cell.lock().unwrap() = slice.iter().sum();
+            Ok(())
         })
         .sync(&ctx)
         .expect("stateful forward pass");
+    let final_sum = *sum_cell.lock().unwrap();
     assert_eq!(final_sum, 60 * N as u32);
     assert_eq!(step, 2);
 }

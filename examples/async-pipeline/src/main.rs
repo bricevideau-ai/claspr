@@ -22,7 +22,7 @@
 //! [ath]: claspr_async::DeviceOperationHostExt::and_then_host
 
 use claspr::Context;
-use claspr_async::{DeviceOperation, DeviceOperationHostExt, download, upload};
+use claspr_async::{DeviceOperation, download, upload};
 
 const N: usize = 256;
 // Layer 1
@@ -93,15 +93,17 @@ fn run(ctx: Context) -> claspr::Result<()> {
     // per-device default OOO queue; switch to `.run(&ctx).await` to
     // do the same work asynchronously.
     //
-    // `and_then_host` on the final reduction is load-bearing — see
-    // its rustdoc. Plain `and_then` would drop the Vec mid-write.
-    let loss: u32 = upload(input)
+    // The reduction is a host sum on the downloaded Vec — under the
+    // async `and_then_host`, in-chain reductions go via Arc<Mutex<_>>
+    // capture, but for "reduce after pipeline" the cleanest shape is
+    // just `.sync()` then sum on the host.
+    let downloaded: Vec<u32> = upload(input)
         .and_then(|buf| kernels.linear([N], buf, W1, B1))
         .and_then(|buf| kernels.relu_threshold([N], buf, THRESHOLD))
         .and_then(|buf| kernels.linear([N], buf, W2, B2))
         .and_then(download)
-        .and_then_host(|v| Ok(v.iter().sum::<u32>()))
         .sync(&ctx)?;
+    let loss: u32 = downloaded.iter().sum();
 
     println!("async-pipeline: loss = {loss} (host: {expected})");
     assert_eq!(loss, expected, "device/host mismatch");
