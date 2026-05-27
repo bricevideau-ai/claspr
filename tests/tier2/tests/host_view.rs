@@ -195,3 +195,57 @@ fn shared_buffer_acquire_release_round_trip() {
     );
     drop(guard);
 }
+
+#[test]
+fn shared_buffer_acquire_release_read_only() {
+    // Read-only SVM map: clEnqueueSVMMap with CL_MAP_READ only.
+    // Closure sees `&[u32]` (no DerefMut, no &mut access). Unmap is
+    // cheaper since the runtime knows no writes to commit.
+    let Ok(ctx) = Context::any() else {
+        eprintln!("SKIP: no OpenCL device");
+        return;
+    };
+    if ctx.svm_capability() == SvmLevel::None {
+        eprintln!("SKIP: no SVM support on this device");
+        return;
+    }
+
+    // Seed the SharedBuffer via Tier 1 first.
+    let mut buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("SharedBuffer alloc");
+    {
+        let mut guard = buf.map_mut(&ctx).expect("seed map");
+        for (i, x) in guard.iter_mut().enumerate() {
+            *x = 100 + i as u32;
+        }
+    }
+
+    let first_cell = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+    let cell = std::sync::Arc::clone(&first_cell);
+    let sum_cell = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+    let scell = std::sync::Arc::clone(&sum_cell);
+
+    let buf = value(buf)
+        .and_then(|b| b.acquire_host_view_read())
+        .and_then_host(move |slice: &[u32]| {
+            // Type is &[u32] — no mutation possible.
+            *cell.lock().unwrap() = slice[0];
+            *scell.lock().unwrap() = slice.iter().sum();
+            Ok(())
+        })
+        .and_then(|view| view.release_to_device())
+        .sync(&ctx)
+        .expect("SharedBuffer read-only chain");
+
+    assert_eq!(*first_cell.lock().unwrap(), 100);
+    let expected_sum: u32 = (0..N as u32).map(|i| 100 + i).sum();
+    assert_eq!(*sum_cell.lock().unwrap(), expected_sum);
+
+    // Buffer is unchanged — re-map and verify the original seed
+    // values survived (read-only map doesn't write back).
+    let mut buf = buf;
+    let guard = buf.map_mut(&ctx).expect("verify map");
+    for (i, &v) in guard.iter().enumerate() {
+        assert_eq!(v, 100 + i as u32, "read-only map must not modify data");
+    }
+    drop(guard);
+}
