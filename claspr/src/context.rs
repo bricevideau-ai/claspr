@@ -28,6 +28,7 @@ use opencl3::device::{
 use opencl3::kernel::Kernel;
 use opencl3::program::Program;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -64,16 +65,26 @@ struct ContextInner {
 }
 
 /// Lazy queue pair for one device in a [`Context`].
+///
+/// `in_order` is `OnceLock` — stable reference for the lifetime of
+/// the context, never rebuilt. `out_of_order` is `Mutex<Option<Arc>>`
+/// so it can be invalidated and rebuilt after a chain failure leaves
+/// the underlying `cl_command_queue` in a poisoned state (observed
+/// on rusticl after a `clSetUserEventStatus(_, -1)` call terminates
+/// a queued command). The mutex is touched at most once per
+/// `DeviceOperation::sync` / `DeviceOperation::run` — both grab an
+/// `Arc<Queue>` once and pass the raw `cl_command_queue` through to
+/// every enqueue call.
 struct DeviceQueues {
     in_order: OnceLock<Queue<InOrder>>,
-    out_of_order: OnceLock<Queue<OutOfOrder>>,
+    out_of_order: Mutex<Option<Arc<Queue<OutOfOrder>>>>,
 }
 
 impl DeviceQueues {
     fn empty() -> Self {
         DeviceQueues {
             in_order: OnceLock::new(),
-            out_of_order: OnceLock::new(),
+            out_of_order: Mutex::new(None),
         }
     }
 }
@@ -171,16 +182,61 @@ impl Context {
     }
 
     /// Per-device default out-of-order queue (the Tier 2 default).
-    /// Lazily created on first lookup; stable reference thereafter.
+    /// Lazily created on first lookup; subsequent calls return the
+    /// same `Arc` clone — until
+    /// [`invalidate_default_outoforder_queue`](Self::invalidate_default_outoforder_queue)
+    /// is called (e.g. by a failed chain's `sync()`), after which the
+    /// next call rebuilds the queue.
+    ///
+    /// Returns an owned `Arc<Queue>` rather than a borrow so the
+    /// caller can hold it across the chain's execution without
+    /// pinning the context's internal mutex. The mutex is acquired
+    /// once per call.
     ///
     /// `device` must be one of the devices the context was built
     /// with — otherwise returns [`Error::InvalidArgument`]. Honors
     /// the [`profiling`](Self::profiling) setting from the builder.
-    pub fn default_outoforder_queue(&self, device: &Device) -> Result<&Queue<OutOfOrder>> {
+    pub fn default_outoforder_queue(&self, device: &Device) -> Result<Arc<Queue<OutOfOrder>>> {
         let idx = self.device_index(device)?;
-        once_lock_get_or_try_init(&self.inner.queues[idx].out_of_order, || {
-            Queue::<OutOfOrder>::on_device(self, device)
-        })
+        let mut slot = self.inner.queues[idx]
+            .out_of_order
+            .lock()
+            .expect("DeviceQueues out_of_order mutex poisoned");
+        if let Some(q) = slot.as_ref() {
+            return Ok(Arc::clone(q));
+        }
+        let q = Arc::new(Queue::<OutOfOrder>::on_device(self, device)?);
+        *slot = Some(Arc::clone(&q));
+        Ok(q)
+    }
+
+    /// Drop the cached default out-of-order queue for `device`, if
+    /// any. The next call to
+    /// [`default_outoforder_queue`](Self::default_outoforder_queue)
+    /// will build a fresh one.
+    ///
+    /// Used by Tier 2 terminals (`DeviceOperation::sync` /
+    /// `DeviceOperation::run`) on the error path: some OpenCL
+    /// implementations (rusticl) keep a sticky negative
+    /// `CL_EVENT_COMMAND_EXECUTION_STATUS` on the queue after a
+    /// `clSetUserEventStatus(_, -1)` command termination, which
+    /// then propagates to subsequent unrelated commands on the
+    /// same queue. Dropping the queue (which `clReleaseCommandQueue`s
+    /// it once the last `Arc` ref drops) and rebuilding on the next
+    /// terminal clears that state.
+    ///
+    /// `device` not being part of this context is silently ignored —
+    /// the public guarantee is "next default_outoforder_queue rebuilds
+    /// if applicable," not strict validation.
+    pub fn invalidate_default_outoforder_queue(&self, device: &Device) {
+        let Ok(idx) = self.device_index(device) else {
+            return;
+        };
+        let mut slot = self.inner.queues[idx]
+            .out_of_order
+            .lock()
+            .expect("DeviceQueues out_of_order mutex poisoned");
+        *slot = None;
     }
 
     /// `true` if the context was built with `.profiling(true)`.

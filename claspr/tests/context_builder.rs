@@ -93,10 +93,30 @@ fn default_outoforder_queue_is_lazy_and_stable() -> TestResult {
         return Ok(());
     };
     let ctx = Context::builder().device(&dev).build()?;
-    // First call creates; subsequent calls return the same handle.
-    let a = ctx.default_outoforder_queue(&dev)? as *const _;
-    let b = ctx.default_outoforder_queue(&dev)? as *const _;
+    // First call creates; subsequent calls return Arc clones of the
+    // same underlying Queue (until an invalidate is triggered).
+    let a = std::sync::Arc::as_ptr(&ctx.default_outoforder_queue(&dev)?);
+    let b = std::sync::Arc::as_ptr(&ctx.default_outoforder_queue(&dev)?);
     assert_eq!(a, b);
+    Ok(())
+}
+
+#[test]
+fn default_outoforder_queue_rebuilds_after_invalidate() -> TestResult {
+    let Ok(dev) = Device::any() else {
+        eprintln!("SKIP: no OpenCL device");
+        return Ok(());
+    };
+    let ctx = Context::builder().device(&dev).build()?;
+    // Hold a clone of the first Arc so the underlying Queue can't be
+    // freed by the invalidate (which would let the allocator reuse
+    // the address and obscure the test).
+    let first = ctx.default_outoforder_queue(&dev)?;
+    let a = std::sync::Arc::as_ptr(&first);
+    ctx.invalidate_default_outoforder_queue(&dev);
+    let second = ctx.default_outoforder_queue(&dev)?;
+    let b = std::sync::Arc::as_ptr(&second);
+    assert_ne!(a, b, "invalidate should force a fresh Queue allocation");
     Ok(())
 }
 

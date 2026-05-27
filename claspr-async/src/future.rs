@@ -76,6 +76,16 @@ impl<T: Unpin> Future for ChainFuture<T> {
 
 /// Crate-internal worker: build a [`ChainFuture`] from a chain and a
 /// context. Called by [`DeviceOperation::run`] (added in `op.rs`).
+///
+/// Synchronous-error paths (everything that returns
+/// `ChainFuture::Errored` from this function) invalidate the
+/// context's cached out-of-order queue, mirroring the sync
+/// terminal's contract.
+///
+/// TODO: poll-time errors (the awaited marker completes with a
+/// negative status) don't yet invalidate. That requires plumbing
+/// the `Context` + `Device` handles into [`ChainFuture::Running`]
+/// so the future can call the invalidator on its own error branch.
 pub(crate) fn run_chain<Op>(chain: Op, context: &Context) -> ChainFuture<Op::Output>
 where
     Op: DeviceOperation,
@@ -89,10 +99,14 @@ where
     // 2. Build the ExecutionContext and submit the chain. `execute`
     //    may enqueue many CL commands; it returns the host-side output
     //    value immediately along with the events the chain produced.
-    let ec = ExecutionContext::new(context, device, queue.raw());
+    let ec = ExecutionContext::new(context, device.clone(), queue.raw());
     let (output, chain_evts) = match chain.execute(&ec, Vec::new()) {
         Ok(p) => p,
-        Err(e) => return ChainFuture::Errored(Some(e)),
+        Err(e) => {
+            drop(queue);
+            context.invalidate_default_outoforder_queue(&device);
+            return ChainFuture::Errored(Some(e));
+        }
     };
     // 3. Enqueue a marker that completes after every event the chain
     //    produced. Precise wait-list — we don't penalise other work
@@ -105,7 +119,12 @@ where
         chain_evts.iter().map(|d| d.as_ref().get()).collect();
     let marker = match unsafe { queue.raw().enqueue_marker_with_wait_list(&wait_list) } {
         Ok(ev) => ev,
-        Err(code) => return ChainFuture::Errored(Some(Error::OpenCl(code))),
+        Err(code) => {
+            drop(chain_evts);
+            drop(queue);
+            context.invalidate_default_outoforder_queue(&device);
+            return ChainFuture::Errored(Some(Error::OpenCl(code)));
+        }
     };
     drop(chain_evts);
     // 3a. clFlush — push the queue to the device without blocking.
@@ -116,6 +135,8 @@ where
     //     and the future deadlocks. clFlush returns immediately;
     //     completion still happens asynchronously via the callback.
     if let Err(e) = queue.raw().flush() {
+        drop(queue);
+        context.invalidate_default_outoforder_queue(&device);
         return ChainFuture::Errored(Some(Error::OpenCl(e)));
     }
     // 4. Wrap in a Future that polls the marker via

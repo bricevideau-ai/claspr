@@ -83,27 +83,33 @@ pub trait DeviceOperation: Send + Sized {
     /// Synchronous terminal — execute the chain on `context`'s default
     /// device using its out-of-order default queue, wait for every
     /// event the chain produced, return the output.
+    ///
+    /// On any `Err` from this call, the context's cached out-of-order
+    /// queue for the device is invalidated and rebuilt on the next
+    /// terminal. This recovers from drivers that leave the queue in
+    /// a poisoned state after a chain-error path (notably rusticl
+    /// after a `clSetUserEventStatus(_, -1)` propagates a sticky
+    /// negative status to subsequent unrelated commands on the same
+    /// queue). The mutex is touched only at this terminal boundary —
+    /// not on the per-enqueue hot path inside `execute`.
     fn sync(self, context: &claspr::Context) -> Result<Self::Output> {
         let device = context.device().clone();
         let queue = context.default_outoforder_queue(&device)?;
-        let ctx = ExecutionContext::new(context, device, queue.raw());
-        let (out, events) = self.execute(&ctx, Vec::new())?;
-        // Wait on every final event. Most chains have at most one
-        // (after a join marker); fan-outs may have several.
-        for ev in &events {
-            ev.wait()?;
+        let result = run_chain_sync(self, context, &device, &queue);
+        if result.is_err() {
+            // Drop our Arc clone before invalidating so the cache's
+            // ref drop is the one that triggers `clReleaseCommandQueue`
+            // (after any in-flight commands settle per CL spec).
+            drop(queue);
+            context.invalidate_default_outoforder_queue(&device);
         }
-        // Defensive: also drain the queue in case any commands were
-        // enqueued without being tracked in the events list (e.g.
-        // a `with_context` closure that called `.submit()` and
-        // discarded the event — bad style, but we don't want to
-        // strand commands).
-        queue.finish()?;
-        Ok(out)
+        result
     }
 
     /// Async terminal — submit the chain and return a [`ChainFuture`](crate::ChainFuture)
     /// that resolves when the chain's events fire.
+    ///
+    /// Same queue-invalidation-on-error contract as [`sync`](Self::sync).
     fn run(self, context: &claspr::Context) -> crate::future::ChainFuture<Self::Output> {
         crate::future::run_chain(self, context)
     }
@@ -146,6 +152,44 @@ pub trait DeviceOperation: Send + Sized {
     {
         Arced { source: self }
     }
+}
+
+/// Shared body of [`DeviceOperation::sync`]: build the
+/// [`ExecutionContext`], execute, wait on the final events, drain
+/// the queue. Factored out so the terminal can wrap its result in
+/// the "invalidate-on-error" guard cheaply.
+fn run_chain_sync<S>(
+    chain: S,
+    context: &claspr::Context,
+    device: &claspr::Device,
+    queue: &claspr::Queue<claspr::OutOfOrder>,
+) -> Result<S::Output>
+where
+    S: DeviceOperation,
+{
+    let ctx = ExecutionContext::new(context, device.clone(), queue.raw());
+    let (out, events) = chain.execute(&ctx, Vec::new())?;
+    // Wait on every final event. Most chains have at most one (after
+    // a join marker); fan-outs may have several. Record the first
+    // error but keep waiting on the rest so we don't strand
+    // terminated commands.
+    let mut wait_err: Option<claspr::Error> = None;
+    for ev in &events {
+        if let Err(e) = ev.wait()
+            && wait_err.is_none()
+        {
+            wait_err = Some(claspr::Error::OpenCl(e));
+        }
+    }
+    // Always drain the queue — covers commands enqueued without
+    // being tracked in the events list (e.g. a `with_context`
+    // closure that called `.submit()` and discarded the event).
+    let finish_res = queue.finish();
+    if let Some(e) = wait_err {
+        return Err(e);
+    }
+    finish_res?;
+    Ok(out)
 }
 
 // ── Value: lift a host value into the chain ─────────────────────────
