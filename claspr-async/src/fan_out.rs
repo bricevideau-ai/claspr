@@ -22,8 +22,8 @@
 //! ```
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::DeviceOperation;
-use claspr::Result;
+use crate::op::{Deps, DeviceOperation, wrap_event};
+use claspr::{Error, Launcher, Result};
 
 /// N-ary homogeneous parallel composition. Construct with [`fan_out`].
 pub struct FanOut<I, F> {
@@ -50,16 +50,29 @@ where
 {
     type Output = Vec<U::Output>;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>) -> Result<Vec<U::Output>> {
+    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Vec<U::Output>, Deps)> {
         let mut f = self
             .f
             .take()
             .expect("FanOut::execute called twice — internal claspr-async bug");
         let mut outputs = Vec::with_capacity(self.inputs.len());
+        // Hold every child's events until after the marker enqueue.
+        // See `bundle.rs` for the same rationale.
+        let mut child_evts: Vec<Deps> = Vec::with_capacity(self.inputs.len());
         for input in self.inputs {
             let op = f(input);
-            outputs.push(op.execute(ctx)?);
+            let (out, evts) = op.execute(ctx, deps.clone())?;
+            outputs.push(out);
+            child_evts.push(evts);
         }
-        Ok(outputs)
+        let all_events: Vec<opencl3::types::cl_event> = child_evts
+            .iter()
+            .flat_map(|evts| evts.iter().map(|d| d.as_ref().get()))
+            .collect();
+        // SAFETY: cl_event handles valid for the duration of the call.
+        let marker = unsafe { ctx.cl_queue().enqueue_marker_with_wait_list(&all_events) }
+            .map_err(Error::OpenCl)?;
+        drop(child_evts);
+        Ok((outputs, vec![wrap_event(marker)]))
     }
 }

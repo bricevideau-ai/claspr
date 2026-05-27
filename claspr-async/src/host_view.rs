@@ -36,7 +36,7 @@
 //! release's write is queue-ordered before subsequent kernels.
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::DeviceOperation;
+use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
 use claspr::{Buffer, DeviceSlice, Error, HostBuffer, Launcher, Result, SharedBuffer};
 use opencl3::command_queue::{
     enqueue_svm_map, enqueue_svm_unmap, release_command_queue, retain_command_queue,
@@ -98,17 +98,29 @@ where
 {
     type Output = DeviceSliceHostView<T>;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>) -> Result<DeviceSliceHostView<T>> {
+    fn execute(
+        mut self,
+        ctx: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> Result<(DeviceSliceHostView<T>, Deps)> {
         let buf = self
             .buf
             .take()
             .expect("AcquireDeviceSliceOp::execute called twice");
         let mut data = vec![T::default(); buf.len()];
-        // .wait() here is correctness-required: the host can't deref
-        // a stale Vec. The underlying ReadOp uses CL_TRUE so the
-        // driver blocks internally rather than enqueue + event.wait().
-        buf.read(ctx, &mut data).wait()?;
-        Ok(DeviceSliceHostView { buf, data })
+        // .wait() is correctness-required: the host can't deref a
+        // stale Vec when `and_then_host` next runs the closure. CL_TRUE
+        // inside the driver makes this efficient. Deps are passed in
+        // as wait-list so the read is queue-ordered after prior
+        // commands (e.g. an upload or kernel that produced `buf`'s
+        // data).
+        buf.read(ctx, &mut data)
+            .after_all(deps_as_events(&deps))
+            .wait()?;
+        // Blocking read means no new outbound event — the data is
+        // already in `data` by the time we return. The `and_then_host`
+        // that follows runs synchronously on the host.
+        Ok((DeviceSliceHostView { buf, data }, Vec::new()))
     }
 }
 
@@ -165,19 +177,21 @@ where
 {
     type Output = DeviceSlice<T>;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>) -> Result<DeviceSlice<T>> {
+    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(DeviceSlice<T>, Deps)> {
         let view = self
             .view
             .take()
             .expect("ReleaseDeviceSliceOp::execute called twice");
         let DeviceSliceHostView { mut buf, data } = view;
-        // .wait() here is correctness-required: the host `data` Vec
-        // drops at end of scope; we can't release it until OpenCL is
-        // done reading. Future optimisation: use the keep-alive
-        // callback trick (same as transfer::upload) for a non-blocking
-        // release.
-        buf.write(ctx, &data).wait()?;
-        Ok(buf)
+        // Non-blocking write — the keep-alive on `data` is provided
+        // by `register_drop_callback` so the Vec lives until OpenCL
+        // is done reading.
+        let event = buf
+            .write(ctx, &data)
+            .after_all(deps_as_events(&deps))
+            .submit()?;
+        claspr::register_drop_callback(&event, Box::new(data))?;
+        Ok((buf, vec![wrap_event(event)]))
     }
 }
 
@@ -194,9 +208,9 @@ where
 }
 
 /// Combinator returned by `HostBuffer::acquire_host_view`. No CL
-/// command — the buffer is permanently mapped already (`CL_MEM_ALLOC_HOST_PTR`
-/// + persistent map), so the view just wraps the buf and lets the
-/// host Deref-access the existing mapped pointer.
+/// command — the buffer is permanently mapped already
+/// (`CL_MEM_ALLOC_HOST_PTR` + persistent map), so the view just wraps
+/// the buf and lets the host Deref-access the existing mapped pointer.
 pub struct AcquireHostBufferOp<T> {
     buf: Option<HostBuffer<T>>,
 }
@@ -207,12 +221,22 @@ where
 {
     type Output = HostBufferHostView<T>;
 
-    fn execute(mut self, _ctx: &ExecutionContext<'_>) -> Result<HostBufferHostView<T>> {
+    fn execute(
+        mut self,
+        _ctx: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> Result<(HostBufferHostView<T>, Deps)> {
         let buf = self
             .buf
             .take()
             .expect("AcquireHostBufferOp::execute called twice");
-        Ok(HostBufferHostView { buf })
+        // No CL command (zero-copy persistent map), but we still need
+        // to wait on pending device writes before the host derefs the
+        // map. Drain deps synchronously and forward an empty list.
+        for ev in &deps {
+            ev.wait()?;
+        }
+        Ok((HostBufferHostView { buf }, Vec::new()))
     }
 }
 
@@ -261,11 +285,15 @@ where
     T: Send + 'static,
 {
     type Output = HostBuffer<T>;
-    fn execute(mut self, _ctx: &ExecutionContext<'_>) -> Result<HostBuffer<T>> {
-        Ok(self
-            .view
-            .take()
-            .expect("ReleaseHostBufferOp::execute called twice"))
+    fn execute(mut self, _ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(HostBuffer<T>, Deps)> {
+        // No CL command. Forward deps unchanged so downstream device
+        // ops still wait on anything pending elsewhere in the chain.
+        Ok((
+            self.view
+                .take()
+                .expect("ReleaseHostBufferOp::execute called twice"),
+            deps,
+        ))
     }
 }
 
@@ -296,7 +324,11 @@ where
 {
     type Output = SharedBufferHostView<T>;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>) -> Result<SharedBufferHostView<T>> {
+    fn execute(
+        mut self,
+        ctx: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> Result<(SharedBufferHostView<T>, Deps)> {
         let buf = self
             .buf
             .take()
@@ -304,6 +336,15 @@ where
         let q_raw: cl_command_queue = ctx.cl_queue().get();
         let size = buf.len() * std::mem::size_of::<T>();
         let ptr = buf.ptr();
+        // Pass deps as the map's wait-list — the blocking map then
+        // returns only after prior device work is done.
+        let wait_list: Vec<opencl3::types::cl_event> =
+            deps.iter().map(|d| d.as_ref().get()).collect();
+        let (wait_count, wait_ptr) = if wait_list.is_empty() {
+            (0, ptr::null())
+        } else {
+            (wait_list.len() as u32, wait_list.as_ptr())
+        };
         // SAFETY: blocking SVM map (CL_TRUE). `ptr` came from
         // clSVMAlloc on the same context; `size` is the allocation's
         // exact byte length. CL_MAP_READ | CL_MAP_WRITE gives full
@@ -316,11 +357,13 @@ where
                 opencl3::memory::CL_MAP_READ | opencl3::memory::CL_MAP_WRITE,
                 ptr.cast(),
                 size,
-                0,
-                ptr::null(),
+                wait_count,
+                wait_ptr,
             )
             .map_err(cl_to_err)?
         };
+        // Keep deps alive across the enqueue.
+        drop(deps);
         // SAFETY: blocking-map returned an event — release it immediately
         // (we don't need to track it; the map is already done).
         unsafe { release_event(evt).map_err(cl_to_err)? };
@@ -328,10 +371,14 @@ where
         // unmap on release. Mirrors what claspr's
         // `SharedReadGuard::new` does for the same reason.
         unsafe { retain_command_queue(q_raw).map_err(cl_to_err)? };
-        Ok(SharedBufferHostView {
-            buf: Some(buf),
-            queue: q_raw,
-        })
+        // Map was blocking, so no outbound event — host work next.
+        Ok((
+            SharedBufferHostView {
+                buf: Some(buf),
+                queue: q_raw,
+            },
+            Vec::new(),
+        ))
     }
 }
 
@@ -359,11 +406,15 @@ pub struct SharedBufferHostView<T> {
 unsafe impl<T: Send> Send for SharedBufferHostView<T> {}
 
 impl<T> SharedBufferHostView<T> {
-    /// Shared helper for the unmap-and-wait sequence used by both
-    /// the explicit release path and the implicit Drop path. Returns
-    /// the buffer back; the queue handle is released as a side
-    /// effect. Errors are returned (release) or sunk into the
-    /// sticky-error counter (Drop).
+    /// Shared helper for the unmap sequence used by both the explicit
+    /// release path and the implicit Drop path. Returns the buffer
+    /// back; the queue handle is released as a side effect. Errors are
+    /// returned (release) or sunk into the sticky-error counter (Drop).
+    ///
+    /// Records the unmap event as the buffer's `last_use` so its own
+    /// Drop's `clEnqueueSVMFree` queue-orders after the unmap. No
+    /// host-side wait — the cross-queue dependency is expressed
+    /// device-side via the free's wait-list.
     fn unmap(&mut self) -> Result<Option<SharedBuffer<T>>> {
         let Some(buf) = self.buf.take() else {
             return Ok(None);
@@ -371,12 +422,12 @@ impl<T> SharedBufferHostView<T> {
         // SAFETY: ptr was mapped in acquire; unmap exactly once.
         let evt = unsafe { enqueue_svm_unmap(self.queue, buf.ptr().cast(), 0, ptr::null()) }
             .map_err(cl_to_err)?;
-        // Wrap the event so its Drop releases it. We MUST wait on it
-        // before the SharedBuffer drops — its Drop's clEnqueueSVMFree
-        // runs on a different queue (the Context's default in-order)
-        // and there's no implicit ordering between the two queues.
-        let event = opencl3::event::Event::new(evt);
-        event.wait()?;
+        // Wrap the raw cl_event so its Drop releases the reference we
+        // got back from enqueue. Push an Arc<Event> onto the SharedBuffer's
+        // in-flight-use list so its `clEnqueueSVMFree` waits on the
+        // unmap before freeing.
+        let event = std::sync::Arc::new(opencl3::event::Event::new(evt));
+        buf.register_use(event);
         // SAFETY: the queue handle was retained in acquire; release
         // exactly once here.
         unsafe { release_command_queue(self.queue) }.map_err(cl_to_err)?;
@@ -454,13 +505,23 @@ where
 {
     type Output = SharedBuffer<T>;
 
-    fn execute(mut self, _ctx: &ExecutionContext<'_>) -> Result<SharedBuffer<T>> {
+    fn execute(
+        mut self,
+        _ctx: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> Result<(SharedBuffer<T>, Deps)> {
         let mut view = self
             .view
             .take()
             .expect("ReleaseSharedBufferOp::execute called twice");
+        // Drain any deps from parallel branches before unmapping —
+        // unmap is queue-local and won't otherwise see them.
+        for ev in &deps {
+            ev.wait()?;
+        }
         let buf = view.unmap()?.expect("view's buf was already released");
-        // view's Drop runs now — buf is None, no-op.
-        Ok(buf)
+        // view's Drop runs now — buf is None, no-op. unmap already
+        // waited internally, so we return no outbound events.
+        Ok((buf, Vec::new()))
     }
 }

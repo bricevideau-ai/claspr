@@ -7,8 +7,8 @@
 //! be flaky. The goal is correctness: each child runs once, outputs
 //! arrive in declaration order, the chain finishes.
 
-use claspr::{Context, DeviceSlice};
-use claspr_async::{DeviceOperation, bundle, fan_out, value, with_context};
+use claspr::Context;
+use claspr_async::{DeviceOperation, bundle, download, fan_out, upload, value};
 use claspr_test_kernels::kernels;
 
 const N: usize = 128;
@@ -55,27 +55,14 @@ fn bundle2_two_kernels_on_distinct_buffers() {
     let Some(ctx) = ctx() else {
         return;
     };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let left = value(0u32).and_then(|_| {
-        with_context(move |ec| {
-            let buf = DeviceSlice::alloc(ec.context(), N)?;
-            let kernels = kernels::kernels(ec.context())?;
-            kernels.fill_u32(ec, [N], &buf, 0xAA).wait()?;
-            let mut out = vec![0u32; N];
-            buf.read(ec, &mut out).wait()?;
-            Ok::<_, claspr::Error>(out)
-        })
-    });
-    let right = value(0u32).and_then(|_| {
-        with_context(move |ec| {
-            let buf = DeviceSlice::alloc(ec.context(), N)?;
-            let kernels = kernels::kernels(ec.context())?;
-            kernels.fill_u32(ec, [N], &buf, 0xBB).wait()?;
-            let mut out = vec![0u32; N];
-            buf.read(ec, &mut out).wait()?;
-            Ok::<_, claspr::Error>(out)
-        })
-    });
+    let left = upload(vec![0u32; N])
+        .and_then(|buf| kernels.fill_u32([N], buf, 0xAA))
+        .and_then(download);
+    let right = upload(vec![0u32; N])
+        .and_then(|buf| kernels.fill_u32([N], buf, 0xBB))
+        .and_then(download);
 
     let (l, r) = bundle!(left, right).sync(&ctx).expect("bundle2 kernels");
     assert!(l.iter().all(|&v| v == 0xAA), "left branch");
@@ -88,17 +75,14 @@ fn fan_out_homogeneous_kernels() {
     let Some(ctx) = ctx() else {
         return;
     };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+    let kernels_ref = &kernels;
 
     let values: Vec<u32> = (0..4).collect();
-    let outs: Vec<Vec<u32>> = fan_out(values.clone(), |v| {
-        with_context(move |ec| {
-            let buf = DeviceSlice::alloc(ec.context(), N)?;
-            let kernels = kernels::kernels(ec.context())?;
-            kernels.fill_u32(ec, [N], &buf, v).wait()?;
-            let mut out = vec![0u32; N];
-            buf.read(ec, &mut out).wait()?;
-            Ok::<_, claspr::Error>(out)
-        })
+    let outs: Vec<Vec<u32>> = fan_out(values.clone(), move |v| {
+        upload(vec![0u32; N])
+            .and_then(move |buf| kernels_ref.fill_u32([N], buf, v))
+            .and_then(download)
     })
     .sync(&ctx)
     .expect("fan_out");

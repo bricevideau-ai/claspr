@@ -52,17 +52,35 @@ pub trait KernelArg {
     /// Set this argument on `exec`. Most impls call `exec.set_arg(...)`
     /// once; [`DeviceSlice`] sets twice (pointer + length).
     fn set(&self, exec: &mut ExecuteKernel<'_>);
+
+    /// Called by `LaunchOp::into_event` *after* the enqueue returns,
+    /// once per arg, with the kernel's completion event. Default
+    /// no-op; argument types that need to track in-flight use of
+    /// their underlying resource (today: [`crate::SharedBuffer`],
+    /// whose Drop needs the wait-list for `clEnqueueSVMFree`)
+    /// override this to retain the event and store it on the arg.
+    ///
+    /// The reference is borrowed; impls that want to keep it past the
+    /// call must call `opencl3::event::retain_event(event.get())` and
+    /// wrap the raw handle in their own `Event` (or `Arc<Event>`).
+    fn register_completion(&self, _event: &::opencl3::event::Event) {}
 }
 
 impl<T: KernelArg + ?Sized> KernelArg for &T {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         (**self).set(exec)
     }
+    fn register_completion(&self, event: &::opencl3::event::Event) {
+        (**self).register_completion(event)
+    }
 }
 
 impl<T: KernelArg + ?Sized> KernelArg for &mut T {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         (**self).set(exec)
+    }
+    fn register_completion(&self, event: &::opencl3::event::Event) {
+        (**self).register_completion(event)
     }
 }
 
@@ -77,6 +95,10 @@ impl<T> KernelArg for DeviceSlice<T> {
             exec.set_arg(&*self.buffer).set_arg(&len);
         }
     }
+    // No `register_completion` override: `cl_mem` Drop is lazy /
+    // refcount-based, so the runtime defers actual deletion until
+    // in-flight commands using the buffer finish. No host-side
+    // bookkeeping needed.
 }
 
 impl<T> KernelArg for HostBuffer<T> {
@@ -86,6 +108,7 @@ impl<T> KernelArg for HostBuffer<T> {
             exec.set_arg(self.buffer()).set_arg(&len);
         }
     }
+    // Same as `DeviceSlice`: `cl_mem` lazy release.
 }
 
 // ── ScalarArg + scalar_arg! macro ─────────────────────────────────────
@@ -199,10 +222,17 @@ impl KernelArg for LocalBuffer {
 pub trait KernelArgs {
     /// Set every element of the tuple in order.
     fn set_all(&self, exec: &mut ExecuteKernel<'_>);
+
+    /// Call [`KernelArg::register_completion`] on every element with
+    /// the just-enqueued completion `event`. `LaunchOp::into_event`
+    /// invokes this after enqueue so args like `SharedBuffer<T>` can
+    /// record the event for their Drop's `clEnqueueSVMFree` wait-list.
+    fn register_all(&self, event: &::opencl3::event::Event);
 }
 
 impl KernelArgs for () {
     fn set_all(&self, _: &mut ExecuteKernel<'_>) {}
+    fn register_all(&self, _: &::opencl3::event::Event) {}
 }
 
 macro_rules! impl_kernel_args_tuple {
@@ -212,6 +242,11 @@ macro_rules! impl_kernel_args_tuple {
             fn set_all(&self, exec: &mut ExecuteKernel<'_>) {
                 let ($($name,)+) = self;
                 $( $name.set(exec); )+
+            }
+            #[allow(non_snake_case)]
+            fn register_all(&self, event: &::opencl3::event::Event) {
+                let ($($name,)+) = self;
+                $( $name.register_completion(event); )+
             }
         }
     };
@@ -274,6 +309,12 @@ impl LaunchSpec {
 pub trait IntoLaunchSpec {
     /// Build the launch spec.
     fn into_launch_spec(self) -> LaunchSpec;
+}
+
+impl IntoLaunchSpec for LaunchSpec {
+    fn into_launch_spec(self) -> LaunchSpec {
+        self
+    }
 }
 
 impl IntoLaunchSpec for [usize; 1] {

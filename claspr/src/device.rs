@@ -325,11 +325,32 @@ impl Device {
 
     // ── Sub-devices ──────────────────────────────────────────────────
 
-    /// Partition this device into `n` equally-sized sub-devices.
-    /// Each sub-device gets `max_compute_units / n` compute units.
-    pub fn partition_equally(&self, n: u32) -> Result<Vec<Device>> {
-        // CL_DEVICE_PARTITION_EQUALLY, n, 0
-        let props = [CL_DEVICE_PARTITION_EQUALLY, n as isize, 0];
+    /// Maximum number of sub-devices this device can be partitioned
+    /// into (`CL_DEVICE_PARTITION_MAX_SUB_DEVICES`). Returns 0 / 1
+    /// when partitioning isn't supported; otherwise the upper bound
+    /// for [`partition_equally`](Self::partition_equally) /
+    /// [`partition_by_counts`](Self::partition_by_counts).
+    pub fn partition_max_sub_devices(&self) -> Result<u32> {
+        Ok(self.cl3().partition_max_sub_devices()?)
+    }
+
+    /// Partition this device via `CL_DEVICE_PARTITION_EQUALLY` —
+    /// each sub-device gets `compute_units_per_sub_device` compute
+    /// units, and the returned `Vec<Device>` has
+    /// `max_compute_units / compute_units_per_sub_device` entries.
+    ///
+    /// **Note the parameter is per-sub-device, not number of
+    /// sub-devices** — matches the CL spec's
+    /// `CL_DEVICE_PARTITION_EQUALLY` property word. To produce
+    /// exactly 2 sub-devices from an N-CU parent, pass `N / 2` (see
+    /// the [`max_compute_units`](Self::max_compute_units) query).
+    pub fn partition_equally(&self, compute_units_per_sub_device: u32) -> Result<Vec<Device>> {
+        // CL_DEVICE_PARTITION_EQUALLY, <cu-per-sub>, 0
+        let props = [
+            CL_DEVICE_PARTITION_EQUALLY,
+            compute_units_per_sub_device as isize,
+            0,
+        ];
         self.partition(&props)
     }
 

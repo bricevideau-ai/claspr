@@ -41,11 +41,14 @@ fn errors_when_queue_lacks_profiling() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
 
-    let err = kernels
-        .fill_u32(&ctx, [N], &buf, 7)
+    let result = kernels
+        .fill_u32([N], buf, 7)
         .profiled(|_info| panic!("callback must not fire when profiling is off"))
-        .wait()
-        .expect_err("expected ProfilingDisabled");
+        .wait(&ctx);
+    let err = match result {
+        Ok(_) => panic!("expected ProfilingDisabled error"),
+        Err(e) => e,
+    };
     assert!(
         matches!(err, claspr::Error::ProfilingDisabled),
         "got {err:?}"
@@ -63,12 +66,12 @@ fn delivers_monotonic_timestamps_when_enabled() {
     let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
 
     let (tx, rx) = std::sync::mpsc::channel();
-    kernels
-        .fill_u32(&ctx, [N], &buf, 42)
+    let _buf = kernels
+        .fill_u32([N], buf, 42)
         .profiled(move |info| {
             tx.send(info).expect("send profiling info");
         })
-        .wait()
+        .wait(&ctx)
         .expect("wait");
 
     let info = rx
@@ -91,10 +94,7 @@ fn fill_then_download_round_trip() {
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
-    kernels
-        .fill_u32(&ctx, [N], &buf, 99)
-        .wait()
-        .expect("fill_u32");
+    let buf = kernels.fill_u32([N], buf, 99).wait(&ctx).expect("fill_u32");
 
     let mut out = vec![0u32; N];
     buf.read(&ctx, &mut out).wait().expect("download");

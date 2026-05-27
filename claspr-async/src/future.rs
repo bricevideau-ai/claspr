@@ -88,23 +88,26 @@ where
     };
     // 2. Build the ExecutionContext and submit the chain. `execute`
     //    may enqueue many CL commands; it returns the host-side output
-    //    value immediately.
+    //    value immediately along with the events the chain produced.
     let ec = ExecutionContext::new(context, device, queue.raw());
-    let output = match chain.execute(&ec) {
-        Ok(o) => o,
+    let (output, chain_evts) = match chain.execute(&ec, Vec::new()) {
+        Ok(p) => p,
         Err(e) => return ChainFuture::Errored(Some(e)),
     };
-    // 3. Enqueue a marker that completes after everything submitted
-    //    above. Empty wait-list means "wait for all prior commands on
-    //    this queue" (CL §5.13).
+    // 3. Enqueue a marker that completes after every event the chain
+    //    produced. Precise wait-list — we don't penalise other work
+    //    that may be sharing this OOO queue.
     //
-    // SAFETY: `enqueue_marker_with_wait_list` is unsafe only because
-    // it takes raw `cl_event` slices; we pass an empty slice, so no
-    // validation is needed on our side.
-    let marker = match unsafe { queue.raw().enqueue_marker_with_wait_list(&[]) } {
+    // SAFETY: each `cl_event` in `chain_evts` is held alive by the
+    // `Arc<Event>` wrappers for the duration of this call; the marker
+    // enqueue retains them internally before we drop the wrappers.
+    let wait_list: Vec<opencl3::types::cl_event> =
+        chain_evts.iter().map(|d| d.as_ref().get()).collect();
+    let marker = match unsafe { queue.raw().enqueue_marker_with_wait_list(&wait_list) } {
         Ok(ev) => ev,
         Err(code) => return ChainFuture::Errored(Some(Error::OpenCl(code))),
     };
+    drop(chain_evts);
     // 3a. clFlush — push the queue to the device without blocking.
     //     The async terminal otherwise has no sync point: pocl
     //     happens to push commands eagerly, but rusticl is spec-strict

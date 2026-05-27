@@ -45,13 +45,14 @@ use crate::queue::Launcher;
 use opencl3::command_queue::{
     enqueue_svm_map, enqueue_svm_unmap, release_command_queue, retain_command_queue,
 };
-use opencl3::event::release_event;
+use opencl3::event::{Event, release_event};
 use opencl3::kernel::ExecuteKernel;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, CL_MEM_READ_WRITE, svm_alloc};
-use opencl3::types::{CL_BLOCKING, cl_command_queue, cl_int, cl_uint};
+use opencl3::types::{CL_BLOCKING, cl_command_queue, cl_event, cl_int, cl_uint};
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::slice;
+use std::sync::{Arc, Mutex};
 
 fn cl_to_err(code: cl_int) -> Error {
     Error::OpenCl(opencl3::error_codes::ClError(code))
@@ -68,10 +69,54 @@ fn cl_to_err(code: cl_int) -> Error {
 /// Host access is RAII-guarded via [`map`](Self::map) and
 /// [`map_mut`](Self::map_mut): each returns a guard that issues
 /// `clEnqueueSVMMap` on construction and `clEnqueueSVMUnmap` on Drop.
+///
+/// ## Cross-queue ordering on Drop
+///
+/// Drop's `clEnqueueSVMFree` runs on the context's default in-order
+/// queue, with every recorded use as its wait-list. Uses are
+/// recorded automatically:
+///
+/// - **Kernel launches** that take `SharedBuffer<T>` as a `KernelArg`:
+///   [`LaunchOp::into_event`][lo] calls [`KernelArg::register_completion`][ka]
+///   after enqueue, which retains the completion event and pushes it
+///   onto this buffer's in-flight-use list.
+/// - **Host-view release** path: `SharedBufferHostView::Drop` /
+///   `ReleaseSharedBufferOp` push the unmap event via [`register_use`](Self::register_use).
+///
+/// The accumulation is correct under out-of-order scheduling: every
+/// in-flight use is in the wait-list, not just the most recently
+/// enqueued one. The cross-queue case (chain's OOO queue vs the
+/// context's default in-order queue) is handled by `clEnqueueSVMFree`'s
+/// wait-list semantics — events from any queue in the context can
+/// gate it.
+///
+/// Hand-rolled SVM use (`ctx.launch(&shared_buf, ...)`, manual
+/// `clSetKernelArgSVMPointer`) that doesn't go through `LaunchOp`
+/// must call [`register_use`](Self::register_use) explicitly to
+/// stay Drop-safe.
+///
+/// [lo]: crate::LaunchOp
+/// [ka]: crate::KernelArg::register_completion
 pub struct SharedBuffer<T> {
     ptr: *mut T,
     len: usize,
     ctx: Context,
+    /// Every event that touched this SVM pointer and is still in
+    /// flight. Drop passes all of them as the `clEnqueueSVMFree`
+    /// wait-list, so the free queue-orders after every prior use no
+    /// matter which queue produced it.
+    ///
+    /// Vec, not Option, because on an out-of-order queue "most
+    /// recent enqueue" ≠ "last to finish" — every in-flight use must
+    /// be in the wait-list, not just the most recent one. Auto-fed
+    /// by [`KernelArg::register_completion`] for kernel launches
+    /// that take `SharedBuffer<T>` as an arg, and by the host-view
+    /// release path's unmap event.
+    ///
+    /// Mutex-protected because the buffer is commonly shared via
+    /// `Arc<SharedBuffer<T>>` (e.g. through `.arc()` in claspr-async
+    /// chains) and multiple threads may register concurrently.
+    last_use: Mutex<Vec<Arc<Event>>>,
 }
 
 // SAFETY: the SVM pointer is a runtime-owned allocation in
@@ -108,7 +153,27 @@ impl<T> SharedBuffer<T> {
             ptr: raw.cast::<T>(),
             len,
             ctx: ctx.clone(),
+            last_use: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Append `event` to this buffer's in-flight-use list. Drop passes
+    /// every accumulated event to `clEnqueueSVMFree`'s wait-list, so
+    /// the free is queue-ordered after every recorded use — including
+    /// concurrent ones on an out-of-order queue, where "most recent
+    /// enqueue" is not the same as "last to finish".
+    ///
+    /// Most users never call this directly: [`KernelArg::register_completion`]
+    /// invokes it automatically for every kernel launch whose args
+    /// include a `SharedBuffer<T>`. The host-view release path also
+    /// records its unmap event. The public entry-point is exposed so
+    /// hand-rolled SVM use (raw `ctx.launch`, manual `clSetKernelArgSVMPointer`)
+    /// can keep Drop safe.
+    pub fn register_use(&self, event: Arc<Event>) {
+        self.last_use
+            .lock()
+            .expect("last_use mutex poisoned")
+            .push(event);
     }
 
     /// Map this buffer for host read access. Returns a RAII guard
@@ -152,23 +217,29 @@ impl<T> Drop for SharedBuffer<T> {
         // NOT wait for in-flight commands using the pointer to finish
         // before deallocation — using the pointer after `clSVMFree`
         // is UB. `clEnqueueSVMFree` queues the free so it runs only
-        // after the queue's prior commands complete (and after any
-        // explicit wait-list events, which we don't use here).
+        // after the queue's prior commands complete and after any
+        // explicit wait-list events.
         //
-        // Limitation: this orders the free relative to commands on the
-        // default queue only. If the buffer was used on a different
-        // queue (multi-queue or multi-device SVM), the free isn't
-        // ordered against those commands. A proper fix (track source
-        // queue + last event on SharedBuffer) lands with Tier 2
-        // where buffers naturally carry their event provenance.
+        // Cross-queue ordering: every recorded use is in the wait-list,
+        // so the free is queue-side-ordered after every in-flight
+        // touch of the SVM pointer, including OOO-concurrent uses on
+        // queues other than the default in-order one. Registrations
+        // come from `KernelArg::register_completion` (automatic for
+        // every kernel launch) and the host-view release path's unmap.
         let queue = self.ctx.raw_default_queue();
-        // SAFETY: ptr was returned by svm_alloc on this context; we
-        // queue exactly one free for it. The event returned is
-        // dropped immediately (CL still tracks it on the queue, and
-        // clReleaseCommandQueue waits for it before the queue is
-        // deleted).
         let svm_ptr = self.ptr as *const std::ffi::c_void;
-        let res = unsafe { queue.enqueue_svm_free(&[svm_ptr], None, std::ptr::null_mut(), &[]) };
+        let events: Vec<Arc<Event>> =
+            std::mem::take(&mut *self.last_use.lock().expect("last_use mutex poisoned"));
+        let wait_list: Vec<cl_event> = events.iter().map(|e| e.get()).collect();
+        // SAFETY: ptr was returned by svm_alloc on this context; we
+        // queue exactly one free for it. Every wait-list event is
+        // held alive via its Arc until after the enqueue returns —
+        // OpenCL retains them internally for the wait-list once
+        // enqueued.
+        let res =
+            unsafe { queue.enqueue_svm_free(&[svm_ptr], None, std::ptr::null_mut(), &wait_list) };
+        // Hold the Arcs until after the enqueue call.
+        drop(events);
         if res.is_err() {
             self.ctx.record_err();
         }
@@ -188,6 +259,25 @@ impl<T> KernelArg for SharedBuffer<T> {
         unsafe {
             exec.set_arg_svm(self.ptr).set_arg(&len);
         }
+    }
+
+    /// Retain the kernel's completion event and push it onto our
+    /// `last_use` list, so Drop's `clEnqueueSVMFree` queue-orders
+    /// after this launch. Without this, dropping a SharedBuffer
+    /// while a kernel using its SVM pointer is still in flight
+    /// would be UB.
+    fn register_completion(&self, event: &Event) {
+        let raw = event.get();
+        // SAFETY: retain bumps cl_event's refcount; we construct a
+        // second owning `Event` from the raw handle that will release
+        // on Drop. Pair: retain here, release when the Arc<Event>
+        // (held in `last_use`) drops after the Drop's enqueue.
+        if unsafe { opencl3::event::retain_event(raw) }.is_err() {
+            self.ctx.record_err();
+            return;
+        }
+        let owned = Event::from(raw);
+        self.register_use(Arc::new(owned));
     }
 }
 

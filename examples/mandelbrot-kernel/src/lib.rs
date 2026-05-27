@@ -6,7 +6,7 @@
 //!
 //! ```ignore
 //! let mandelbrot = mandelbrot_kernel::kernels(&ctx)?;
-//! mandelbrot.mandelbrot(&ctx, [w, h], &image, w, h, max_iter).wait()?;
+//! let image = mandelbrot.mandelbrot([w, h], image, w, h, max_iter).wait(&ctx)?;
 //! ```
 //!
 //! No build.rs in the consuming crate is needed — this library carries

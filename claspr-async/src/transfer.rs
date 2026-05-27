@@ -42,8 +42,8 @@
 //! ```
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::DeviceOperation;
-use claspr::{Buffer, DeviceSlice, Result};
+use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use claspr::{Buffer, DeviceSlice, Result, register_drop_callback};
 use std::sync::Arc;
 
 // ── UploadSource ────────────────────────────────────────────────────
@@ -104,19 +104,12 @@ impl<T> From<Arc<[T]>> for UploadSource<T> {
 /// Allocate a [`DeviceSlice`] of `source.len()` elements and write
 /// `source` into it.
 ///
-/// **execute() currently blocks** on the write completing (CL_TRUE
-/// internally). Reason: claspr-async's chains run on a per-device
-/// out-of-order queue, and we don't yet auto-thread "last writer"
-/// events between dependent ops — so a non-blocking write here would
-/// race a downstream read on the same buffer (per CL §5.4 OOO commands
-/// may reorder without explicit event links). Until per-buffer event
-/// tracking lands, the safe choice is a blocking write inside execute.
-///
-/// The chain *as a whole* is still async-capable via [`run`](crate::DeviceOperation::run):
-/// the upload step blocks, but kernel pipelining + the async terminal
-/// stay intact. Multiple parallel uploads (e.g. inside [`fan_out`])
-/// pipeline at the host level — each upload's execute blocks but they
-/// can run concurrently when fan_out submits them on the OOO queue.
+/// Non-blocking: `clEnqueueWriteBuffer(CL_FALSE)` runs on the chain's
+/// OOO queue with `deps` as wait-list. The host buffer is kept alive
+/// by a `clSetEventCallback(CL_COMPLETE)` that drops the holder when
+/// the write finishes. The returned event becomes the next op's `deps`,
+/// so a downstream read of this buffer waits for the write to complete
+/// via queue-side event ordering — no host-side block.
 ///
 /// See [`UploadSource`] for the sources accepted via `impl Into<...>`.
 pub fn upload<T, S>(source: S) -> Upload<T>
@@ -133,8 +126,9 @@ where
     }
 }
 
-/// Combinator built by [`upload`]. Lazy — `execute` allocates and
-/// enqueues the (blocking) write when the chain reaches it.
+/// Combinator built by [`upload`]. Lazy — `execute` allocates, enqueues
+/// the non-blocking write, and registers a keep-alive callback on the
+/// resulting event.
 pub struct Upload<T> {
     source: Option<UploadSource<T>>,
 }
@@ -145,36 +139,41 @@ where
 {
     type Output = DeviceSlice<T>;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>) -> Result<DeviceSlice<T>> {
+    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(DeviceSlice<T>, Deps)> {
         let source = self
             .source
             .take()
             .expect("Upload::execute called twice — internal claspr-async bug");
         let mut buf = DeviceSlice::alloc(ctx.context(), source.len())?;
-        // Blocking enqueue (CL_TRUE). See the function-level docs for
-        // why: without per-buffer event tracking, a non-blocking
-        // write would race a downstream read on the same OOO queue.
-        buf.write(ctx, source.as_slice()).wait()?;
-        // `source` is dropped at end of scope. With CL_TRUE the
-        // runtime is done reading from the host heap by the time
-        // .wait() returns, so the drop is safe — no keep-alive
-        // callback needed.
-        Ok(buf)
+        // Non-blocking write with `deps` as the queue wait-list. The
+        // event from .submit() goes into the keep-alive callback +
+        // becomes the next op's dep.
+        let event = buf
+            .write(ctx, source.as_slice())
+            .after_all(deps_as_events(&deps))
+            .submit()?;
+        // Move `source` into a Box, hand to OpenCL's user_data. The
+        // thunk drops it when CL_COMPLETE fires — exactly when the
+        // runtime is done reading from the host heap.
+        register_drop_callback(&event, Box::new(source))?;
+        Ok((buf, vec![wrap_event(event)]))
     }
 }
 
 // ── download ────────────────────────────────────────────────────────
 
-/// Consume `buf` and allocate a host `Vec<T>` of `buf.len()` elements,
-/// blocking-read the buffer into it.
+/// Consume `buf`, allocate a host `Vec<T>` of `buf.len()` elements,
+/// and non-blocking-read the buffer into it.
 ///
-/// **execute() blocks** on the read (CL_TRUE), same rationale as
-/// [`upload`]: without per-buffer event tracking, a non-blocking read
-/// would race subsequent ops (or post-terminator user code) that
-/// touch the Vec contents. The chain itself remains async-capable
-/// via [`run`](crate::DeviceOperation::run) — the download step
-/// blocks, but earlier pipelined work plus the async terminal stay
-/// intact.
+/// `clEnqueueReadBuffer(CL_FALSE)` runs on the chain's OOO queue with
+/// `deps` as wait-list. The Vec moves up the chain (Vec moves don't
+/// reallocate; the heap address the runtime is writing to stays
+/// stable). The `DeviceSlice` drops at end of `execute`, but OpenCL
+/// retains the `cl_mem` internally until the read completes.
+///
+/// The returned event becomes the next op's `deps` — and the chain's
+/// terminator (`.sync` / `.run().await`) waits for it before handing
+/// the Vec to the user, so the data is valid when read.
 pub fn download<T>(buf: DeviceSlice<T>) -> Download<T>
 where
     T: Clone + Default + Send + 'static,
@@ -183,7 +182,7 @@ where
 }
 
 /// Combinator built by [`download`]. Lazy — `execute` allocs the
-/// destination Vec and enqueues the (blocking) read when the chain
+/// destination Vec and enqueues the non-blocking read when the chain
 /// reaches it.
 pub struct Download<T> {
     buf: Option<DeviceSlice<T>>,
@@ -195,14 +194,16 @@ where
 {
     type Output = Vec<T>;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>) -> Result<Vec<T>> {
+    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Vec<T>, Deps)> {
         let buf = self
             .buf
             .take()
             .expect("Download::execute called twice — internal claspr-async bug");
         let mut out = vec![T::default(); buf.len()];
-        // Blocking read (CL_TRUE). See function-level docs for why.
-        buf.read(ctx, &mut out).wait()?;
-        Ok(out)
+        let event = buf
+            .read(ctx, &mut out)
+            .after_all(deps_as_events(&deps))
+            .submit()?;
+        Ok((out, vec![wrap_event(event)]))
     }
 }

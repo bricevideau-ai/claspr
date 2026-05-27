@@ -23,8 +23,8 @@
 //! ```
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::DeviceOperation;
-use claspr::Result;
+use crate::op::{Deps, DeviceOperation, wrap_event};
+use claspr::{Error, Launcher, Result};
 
 /// Implementation detail — generates `BundleN` + a constructor function
 /// + a `DeviceOperation` impl for each arity.
@@ -56,13 +56,43 @@ macro_rules! impl_bundle {
         {
             type Output = ($(<$ty as DeviceOperation>::Output),+,);
 
-            fn execute(self, ctx: &ExecutionContext<'_>) -> Result<Self::Output> {
-                // Submit children to the OOO queue in declaration
-                // order; the runtime overlaps execution on the device
-                // based on event dependencies (which independent ops
-                // don't have, so they can run concurrently).
-                $(let $field = self.$field.execute(ctx)?;)+
-                Ok(($($field),+,))
+            fn execute(
+                self,
+                ctx: &ExecutionContext<'_>,
+                deps: Deps,
+            ) -> Result<(Self::Output, Deps)> {
+                // Each child gets a clone of the input deps — no
+                // inter-child ordering — so the OOO runtime can
+                // overlap them on the device.
+                //
+                // Hold every child's events in `child_evts` until after
+                // the marker enqueue: the marker uses raw cl_event
+                // handles, and dropping the Arcs before the enqueue
+                // could (in principle) release the underlying events
+                // out from under it. The runtime keeps its own retain
+                // on in-flight events but the spec doesn't strictly
+                // guarantee it — keep our refs alive to be safe.
+                let mut child_evts: Vec<Deps> = Vec::new();
+                let outputs = (
+                    $({
+                        let (out, evts) =
+                            self.$field.execute(ctx, deps.clone())?;
+                        child_evts.push(evts);
+                        out
+                    }),+,
+                );
+                let all_events: Vec<opencl3::types::cl_event> = child_evts
+                    .iter()
+                    .flat_map(|evts| evts.iter().map(|d| d.as_ref().get()))
+                    .collect();
+                // SAFETY: empty or non-empty wait-list; cl_event handles
+                // are valid (held by `child_evts` Arcs).
+                let marker = unsafe {
+                    ctx.cl_queue().enqueue_marker_with_wait_list(&all_events)
+                }.map_err(Error::OpenCl)?;
+                // `child_evts` drops here — safe, the marker is enqueued.
+                drop(child_evts);
+                Ok((outputs, vec![wrap_event(marker)]))
             }
         }
     };

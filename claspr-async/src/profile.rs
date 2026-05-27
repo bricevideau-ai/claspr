@@ -38,7 +38,7 @@
 //! [`LaunchOp::profiled`]: claspr::LaunchOp::profiled
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::DeviceOperation;
+use crate::op::{Deps, DeviceOperation, wrap_event};
 use claspr::{
     CL_QUEUE_PROFILING_ENABLE, Error, Launcher, ProfilingInfo, Result, register_profiling_callback,
 };
@@ -79,16 +79,23 @@ where
     // unchanged.
     type Output = S::Output;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>) -> Result<S::Output> {
-        let out = self.source.execute(ctx)?;
+    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(S::Output, Deps)> {
+        let (out, source_evts) = self.source.execute(ctx, deps)?;
         // Same up-front check as Tier 1: the queue needs profiling
         // enabled before we waste a marker + callback registration.
         if (ctx.cl_queue().properties()? & CL_QUEUE_PROFILING_ENABLE) == 0 {
             return Err(Error::ProfilingDisabled);
         }
-        // SAFETY: empty wait-list — see `crate::future::run_chain`.
-        let marker =
-            unsafe { ctx.cl_queue().enqueue_marker_with_wait_list(&[]) }.map_err(Error::OpenCl)?;
+        // The marker waits for the source op's events, so the
+        // timestamps reflect the source op's wall-clock duration
+        // (start of first command to end of last).
+        let wait_list: Vec<opencl3::types::cl_event> =
+            source_evts.iter().map(|d| d.as_ref().get()).collect();
+        let marker = unsafe { ctx.cl_queue().enqueue_marker_with_wait_list(&wait_list) }
+            .map_err(Error::OpenCl)?;
+        // source_evts keeps the underlying cl_events alive across the
+        // enqueue; safe to drop after.
+        drop(source_evts);
         register_profiling_callback(
             &marker,
             Box::new(
@@ -97,6 +104,9 @@ where
                     .expect("Profiled::execute called twice — internal claspr-async bug"),
             ),
         )?;
-        Ok(out)
+        // The marker also becomes the source op's "completion event"
+        // for downstream chaining — anything after the .profiled()
+        // waits on the marker (which subsumes source's events).
+        Ok((out, vec![wrap_event(marker)]))
     }
 }

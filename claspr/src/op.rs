@@ -30,6 +30,34 @@ use opencl3::types::{cl_event, cl_int};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+// ── Cross-context event check ───────────────────────────────────────
+
+/// Panic if `event` was produced on a different `cl_context` than
+/// `queue`'s. OpenCL rejects cross-context event deps with
+/// `CL_INVALID_CONTEXT` at enqueue time; checking up-front turns that
+/// cryptic CL error into a clear Rust panic at the call site that
+/// passed the foreign event.
+///
+/// `call_site` is included in the panic message (e.g. `"LaunchOp::after"`
+/// or `"FillU32Op::submit"`) so users can find the offending
+/// `.after(event)` call quickly.
+///
+/// Cheap — two `clGet*Info` calls (one per side) plus a pointer
+/// compare. The check skips silently when either query returns an
+/// error (e.g. event already released); the CL runtime then surfaces
+/// the underlying error.
+pub fn assert_same_context(event: &Event, queue: &CommandQueue, call_site: &str) {
+    if let (Ok(event_ctx), Ok(queue_ctx)) = (event.context(), queue.context())
+        && event_ctx != queue_ctx
+    {
+        panic!(
+            "{call_site}: event was produced on a different Context than the launcher's queue — \
+             OpenCL rejects cross-context event deps (CL_INVALID_CONTEXT). \
+             Both sides must use the same Context.",
+        );
+    }
+}
+
 // ── ProfilingInfo ────────────────────────────────────────────────────
 
 /// The four OpenCL command-event timestamps, in device nanoseconds.
@@ -102,8 +130,47 @@ impl<'l, A: KernelArgs> LaunchOp<'l, A> {
     /// Add a cross-queue dependency: this kernel won't start until
     /// `event` (typically from another queue's [`submit`](Self::submit))
     /// completes. Chainable.
+    ///
+    /// **Panics** if `event` was produced on a different `Context`
+    /// than `self`'s launcher's queue. OpenCL rejects cross-context
+    /// event deps with `CL_INVALID_CONTEXT`; we surface the mismatch
+    /// at `.after()` time with a clear message instead of as a
+    /// cryptic CL error at enqueue.
     pub fn after(mut self, event: &Event) -> Self {
+        assert_same_context(event, self.queue, "LaunchOp::after");
         self.deps.push(event.get());
+        self
+    }
+
+    /// Add multiple wait-list events at once. Equivalent to calling
+    /// [`after`](Self::after) for each in turn. Used by claspr-async
+    /// Tier 2 to thread per-op dependency chains.
+    ///
+    /// Same cross-context panic as [`after`](Self::after).
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        for event in events {
+            assert_same_context(event, self.queue, "LaunchOp::after_all");
+            self.deps.push(event.get());
+        }
+        self
+    }
+
+    /// Merge pre-collected dependency events and a pre-boxed profile
+    /// callback into the builder. Used by proc-macro-generated typed
+    /// `Op` types that hold their own builder state (so the user can
+    /// call `.after(&ev)` / `.profiled(cb)` on the typed Op before
+    /// it eventually delegates to LaunchOp at terminal time).
+    ///
+    /// Append-only for deps; replace for `profile_cb` only when one
+    /// is supplied (None leaves the existing callback alone).
+    pub fn with_state(mut self, deps: Vec<cl_event>, profile_cb: Option<ProfileCb>) -> Self {
+        self.deps.extend(deps);
+        if let Some(cb) = profile_cb {
+            self.profile_cb = Some(cb);
+        }
         self
     }
 
@@ -185,6 +252,12 @@ impl<'l, A: KernelArgs> LaunchOp<'l, A> {
         // `&DeviceSlice<T>` / `&Image2D<...>` arg types) are what make
         // this call safe in practice.
         let event = unsafe { exec.enqueue_nd_range(queue)? };
+        // Let arg types that need post-enqueue bookkeeping (e.g.
+        // `SharedBuffer<T>` recording the event for its Drop's
+        // `clEnqueueSVMFree` wait-list) see the completion event.
+        // Default impl on `KernelArg` is a no-op, so this is free for
+        // every other arg type.
+        args.register_all(&event);
         if let Some(cb) = profile_cb {
             register_profiling_callback(&event, cb)?;
         }

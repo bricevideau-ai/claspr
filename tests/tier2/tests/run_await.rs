@@ -11,7 +11,7 @@
 //! need a full async runtime.
 
 use claspr::Context;
-use claspr_async::{DeviceOperation, upload, value, with_context};
+use claspr_async::{DeviceOperation, download, upload, value, with_context};
 use claspr_test_kernels::kernels;
 use futures::executor::block_on;
 
@@ -23,23 +23,12 @@ fn await_simple_chain() {
         eprintln!("SKIP: no OpenCL device");
         return;
     };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let chain = value(vec![0u32; N])
         .and_then(upload)
-        .and_then(|buf| {
-            with_context(move |ec| {
-                let kernels = kernels::kernels(ec.context())?;
-                kernels.fill_u32(ec, [N], &buf, 0x1234_5678).wait()?;
-                Ok::<_, claspr::Error>(buf)
-            })
-        })
-        .and_then(|buf| {
-            with_context(move |ec| {
-                let mut out = vec![0u32; N];
-                buf.read(ec, &mut out).wait()?;
-                Ok::<_, claspr::Error>(out)
-            })
-        });
+        .and_then(|buf| kernels.fill_u32([N], buf, 0x1234_5678))
+        .and_then(download);
 
     let result: Vec<u32> = block_on(chain.run(&ctx)).expect("await chain");
     assert_eq!(result.len(), N);

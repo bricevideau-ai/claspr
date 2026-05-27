@@ -2,13 +2,21 @@
 //! with kernel-style attributes and signature, get a host-side launch
 //! wrapper for free.
 //!
-//! ## Status
+//! ## Generated shape
 //!
-//! This is the **stage 3 first sketch**. The macro generates the
-//! host-side launch wrapper from the stub's signature; the kernel
-//! source still lives in a separate kernel crate that the user
-//! maintains and that `claspr-build` compiles. Auto-generation of the
-//! kernel sub-crate from the stub function comes in a follow-up.
+//! For each `#[claspr::kernel] fn foo(...)`, the macro emits a single
+//! method `Kernels::foo(grid, slice_by_value, scalar)` that returns a
+//! per-kernel `Op` struct. The Op works in two modes:
+//!
+//! - **Tier 1 (sync, explicit launcher):** `.wait(launcher) -> Output`
+//!   or `.submit(launcher) -> (Output, Event)`. Modifiers: `.after(ev)`,
+//!   `.after_all(events)`, `.profiled(cb)`.
+//! - **Tier 2 (async chain):** the Op implements `DeviceOperation`,
+//!   so it composes into `.and_then` / `bundle!` / `fan_out` chains.
+//!
+//! `Output` is the slice arg(s) the kernel touches — bare for one
+//! slice, tuple for many, `()` for none. Scalars are dropped from
+//! `Output`. The same single method serves both contexts.
 //!
 //! ## Example
 //!
@@ -17,8 +25,8 @@
 //!     include!(concat!(env!("OUT_DIR"), "/collatz_kernels.rs"));
 //! }
 //!
-//! // Stub mirrors the kernel signature exactly. Body is discarded by
-//! // the proc-macro; leave it empty or copy-paste the real kernel
+//! // Stub mirrors the kernel signature exactly. Body is discarded
+//! // by the proc-macro; leave it empty or copy-paste the real kernel
 //! // body for documentation / future single-source extraction.
 //! #[claspr::kernel]
 //! fn collatz_kernel(
@@ -27,21 +35,28 @@
 //! ) {}
 //!
 //! fn main() -> claspr::Result<()> {
-//!     let ctx = claspr::Context::new()?;
+//!     let ctx = claspr::Context::any()?;
 //!     let kernels = kernels::Kernels::load(&ctx)?;
 //!     let mut data: Vec<u32> = (1..=1024).collect();
-//!     let buf = ctx.upload(&data)?;
-//!     // Generated wrapper:
-//!     //   fn collatz_kernel<'l>(
-//!     //       &'l self,
-//!     //       launcher: &'l impl claspr::Launcher,
-//!     //       grid: impl claspr::IntoLaunchSpec,
-//!     //       data: &'l claspr::DeviceSlice<u32>,
-//!     //   ) -> claspr::LaunchOp<'l, (&'l claspr::DeviceSlice<u32>,)>
-//!     kernels.collatz_kernel(&ctx, [data.len()], &buf).wait()?;
+//!     let mut buf = claspr::DeviceSlice::alloc(&ctx, data.len())?;
+//!     buf.write(&ctx, &data).wait()?;
+//!     // Tier 1: slices move in, come back out of `.wait()`.
+//!     let buf = kernels.collatz_kernel([data.len()], buf).wait(&ctx)?;
 //!     buf.read(&ctx, &mut data).wait()?;
 //!     Ok(())
 //! }
+//! ```
+//!
+//! ## In an async chain
+//!
+//! ```ignore
+//! use claspr_async::{DeviceOperation, download, upload};
+//!
+//! let result: Vec<u32> = upload(initial_data)
+//!     .and_then(|buf| kernels.fill_u32([N], buf, 5))
+//!     .and_then(|buf| kernels.scale_u32([N], buf, 3))
+//!     .and_then(download)
+//!     .sync(&ctx)?;
 //! ```
 //!
 //! [claspr]: https://github.com/bricevideau-ai/claspr
@@ -65,15 +80,13 @@ use syn::{
 ///   SPIR-V built-in inputs filled in by the OpenCL runtime, not
 ///   host-side arguments.
 /// - A parameter `#[spirv(cross_workgroup)] name: &mut [T]` or `&[T]`
-///   is **translated** to `name: &::claspr::DeviceSlice<T>`.
+///   is **translated** to `name: ::claspr::DeviceSlice<T>` (owned by
+///   the emitted Op; flows through `Output`).
+/// - A parameter `&Image!(...)` is translated to `::claspr::Image2D<A, F>`
+///   (also owned and threaded through `Output`).
 /// - Any other parameter is passed through verbatim — used for scalar
-///   `T` arguments, which work directly via the
-///   `claspr::scalar_arg!`-emitted `KernelArg` impl.
-///
-/// The macro supports *only* the subset of stub signatures collatz
-/// uses today (slices + scalars). Image params, samplers, workgroup
-/// memory, and user structs will arrive as we exercise more samples
-/// through the macro.
+///   `T` arguments via the `claspr::scalar_arg!`-emitted `KernelArg`
+///   impl. Scalars do *not* flow through `Output`.
 #[proc_macro_attribute]
 pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
@@ -224,9 +237,17 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     let vis = &func.vis;
     let name = &func.sig.ident;
 
-    let mut host_params: Vec<TokenStream2> = Vec::new();
+    // Per-host-param accumulators. The single emitted method takes
+    // slices by value (so they can flow through Tier 2 chains and so
+    // Tier 1 terminals can return them back). Scalars are by-value.
+    // `op_arg_pass` is what we hand to LaunchOp::new from inside the
+    // terminal / execute: `&name` for slices, `name` for scalars.
+    let mut host_names: Vec<TokenStream2> = Vec::new();
+    let mut method_params: Vec<TokenStream2> = Vec::new();
     let mut arg_types: Vec<TokenStream2> = Vec::new();
-    let mut launch_args: Vec<TokenStream2> = Vec::new();
+    let mut op_arg_pass: Vec<TokenStream2> = Vec::new();
+    let mut output_names: Vec<TokenStream2> = Vec::new();
+    let mut output_types: Vec<TokenStream2> = Vec::new();
 
     for input in &func.sig.inputs {
         let FnArg::Typed(pt) = input else {
@@ -239,60 +260,278 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
             ParamRole::Builtin => continue,
             ParamRole::Host {
                 name: pname,
-                ty: pty,
+                ty,
+                is_slice,
             } => {
-                host_params.push(quote! { #pname: #pty });
-                arg_types.push(pty);
-                launch_args.push(quote! { #pname });
+                host_names.push(pname.clone());
+                method_params.push(quote! { #pname: #ty });
+                arg_types.push(ty.clone());
+                if is_slice {
+                    op_arg_pass.push(quote! { &#pname });
+                    output_names.push(pname.clone());
+                    output_types.push(ty);
+                } else {
+                    op_arg_pass.push(quote! { #pname });
+                }
             }
         }
     }
 
     // Single-element tuples need a trailing comma.
-    let launch_tuple = if launch_args.len() == 1 {
-        let only = &launch_args[0];
-        quote! { ( #only, ) }
-    } else {
-        quote! { ( #(#launch_args),* ) }
-    };
-    let arg_tuple_ty = if arg_types.len() == 1 {
-        let only = &arg_types[0];
-        quote! { ( #only, ) }
-    } else {
-        quote! { ( #(#arg_types),* ) }
+    let op_args_tuple_ty = single_or_tuple(&arg_types);
+    let op_args_tuple_init = single_or_tuple(&host_names);
+    let op_launch_args_tuple = single_or_tuple(&op_arg_pass);
+
+    // Output type / expression — bare for a single slice, tuple for
+    // many, `()` for none. Same convention on both terminals
+    // (`wait`/`submit`) and the `DeviceOperation::Output`.
+    let (output_ty, output_expr) = match output_names.len() {
+        0 => (quote! { () }, quote! { () }),
+        1 => {
+            let n = &output_names[0];
+            let t = &output_types[0];
+            (quote! { #t }, quote! { #n })
+        }
+        _ => (
+            quote! { ( #(#output_types),* ) },
+            quote! { ( #(#output_names),* ) },
+        ),
     };
 
     let kernels_path = &args.kernels;
 
-    // Emit an `impl Kernels { fn <name>(...) }` block.
-    // The generated method shadows the field of the same name on
-    // `Kernels` (which claspr-build emits as `pub`) — at the call
-    // site, parens disambiguate method vs field, so
-    // `kernels.collatz_kernel(...)` dispatches to the typed launch
-    // method here.
+    // Hidden submodule per kernel: holds the Op struct + impls. The
+    // module name keeps the legacy `_op` suffix purely to namespace
+    // emissions; users only see `kernels.<name>(...)` and the Op type
+    // is doc-hidden.
+    let op_mod_ident = quote::format_ident!("__claspr_{}_op", name);
+    let kernel_name_lit = name.to_string();
+
+    // Emit ONE method on `Kernels`, named after the kernel. It returns
+    // a per-kernel `Op` struct that:
     //
-    // The wrapper takes `&impl Launcher` so callers can pass `&ctx`
-    // (uses the bundled default in-order queue) or any `&queue`
-    // interchangeably, and returns a `LaunchOp` builder. The actual
-    // enqueue is deferred until a terminal: `.wait()`, `.submit()`,
-    // or `.await`.
+    //   - implements Tier 1 terminals (`.wait(launcher) -> Output`,
+    //     `.submit(launcher) -> (Output, Event)`)
+    //   - implements builder modifiers (`.after(event)`,
+    //     `.after_all(events)`, `.profiled(cb)`)
+    //   - implements `DeviceOperation` (Tier 2 chain use)
     //
-    // `#[allow(clippy::too_many_arguments)]` — the wrapper's arg
-    // count is determined by the kernel's declared signature, not
-    // user choice, so a per-call `#[allow]` would burden every user.
+    // The method calls `kernels.kernel("<name>")` to mint a fresh
+    // `cl_kernel` handle owned by the resulting Op. Per-launch
+    // `clCreateKernel` keeps `clSetKernelArg` state private to each Op
+    // — no possible race even when two chains target the same kernel.
+    // Panics on the (extremely rare) `clCreateKernel` OOM because
+    // `Kernels::load` already validated every entry point.
+    //
+    // Because the Op owns its `Kernel` and no longer borrows `&Kernels`,
+    // it has **no lifetime parameter** — moving Ops into `tokio::spawn`
+    // / threads / `'static` futures is straightforward.
+    //
+    // Tier 2 use requires `claspr-async` in the user's dep graph (the
+    // DeviceOperation impl references it unconditionally). For purely
+    // Tier 1 use, the dep is still required to type-check the impl —
+    // a price paid once per kernel-crate.
+    //
+    // `#[allow(clippy::too_many_arguments)]` — the wrapper's arg count
+    // is determined by the kernel's declared signature, not user
+    // choice, so a per-call `#[allow]` would burden every user.
     Ok(quote! {
         impl #kernels_path {
             #[allow(clippy::too_many_arguments)]
-            #vis fn #name<'claspr_l>(
-                &'claspr_l self,
-                launcher: &'claspr_l impl ::claspr::Launcher,
+            #vis fn #name(
+                &self,
                 grid: impl ::claspr::IntoLaunchSpec,
-                #(#host_params),*
-            ) -> ::claspr::LaunchOp<'claspr_l, #arg_tuple_ty> {
-                ::claspr::LaunchOp::new(launcher, &self.#name, grid, #launch_tuple)
+                #(#method_params),*
+            ) -> #op_mod_ident::Op {
+                #op_mod_ident::Op {
+                    kernel: self.kernel(#kernel_name_lit),
+                    spec: ::claspr::IntoLaunchSpec::into_launch_spec(grid),
+                    args: #op_args_tuple_init,
+                    deps: ::std::vec::Vec::new(),
+                    profile_cb: ::core::option::Option::None,
+                }
+            }
+        }
+
+        #[doc(hidden)]
+        #[allow(non_snake_case, non_camel_case_types, unused_imports)]
+        pub mod #op_mod_ident {
+            use super::*;
+
+            pub struct Op {
+                /// Per-launch `cl_kernel` minted by `clCreateKernel`.
+                /// Owned and never aliased, so `clSetKernelArg` on it
+                /// can't race with any other launch.
+                pub kernel: ::claspr::Kernel,
+                pub spec: ::claspr::LaunchSpec,
+                pub args: #op_args_tuple_ty,
+                /// Caller-added wait-list events. Owned so the Op is
+                /// `Send` across executor threads — raw `cl_event`
+                /// handles aren't, and a borrowed `&Event` can't outlive
+                /// its source binding once the Op is moved.
+                pub deps: ::std::vec::Vec<::claspr::Event>,
+                pub profile_cb: ::core::option::Option<::claspr::ProfileCb>,
+            }
+
+            // Op is `Send` automatically — every field is Send. No
+            // unsafe impl, no lifetime, no `&Kernels` borrow.
+
+            impl Op {
+                /// Add a cross-queue dependency. Takes the event by
+                /// value because the Op may be moved into an executor
+                /// thread; a borrowed `&Event` could outlive the
+                /// caller's binding. Chainable.
+                pub fn after(mut self, event: ::claspr::Event) -> Self {
+                    self.deps.push(event);
+                    self
+                }
+
+                /// Add multiple wait-list events at once. Chainable.
+                pub fn after_all<I>(mut self, events: I) -> Self
+                where
+                    I: ::core::iter::IntoIterator<Item = ::claspr::Event>,
+                {
+                    self.deps.extend(events);
+                    self
+                }
+
+                /// Register a completion callback for profiling info.
+                /// Chainable.
+                pub fn profiled<F>(mut self, cb: F) -> Self
+                where
+                    F: ::core::ops::FnOnce(::claspr::Result<::claspr::ProfilingInfo>)
+                        + ::core::marker::Send
+                        + 'static,
+                {
+                    self.profile_cb = ::core::option::Option::Some(
+                        ::std::boxed::Box::new(cb),
+                    );
+                    self
+                }
+
+                /// Tier 1 non-blocking terminal — enqueue on `launcher`'s
+                /// queue and return `(Output, Event)` so the caller can
+                /// keep using the buffers and chain via `.after(event)`.
+                ///
+                /// Panics if any caller-added dep event (from `.after()`
+                /// / `.after_all()`) was produced on a different
+                /// `Context` than `launcher`'s queue.
+                pub fn submit<L>(
+                    self,
+                    launcher: &L,
+                ) -> ::claspr::Result<(#output_ty, ::claspr::Event)>
+                where
+                    L: ::claspr::Launcher,
+                {
+                    let Op { kernel, spec, args, deps, profile_cb } = self;
+                    // Validate cross-context match for every caller-added
+                    // dep. The launcher's context is known here; the
+                    // check is two CL info queries + a pointer compare
+                    // per dep (cheap), and surfaces mismatches as a
+                    // clear panic instead of a cryptic CL_INVALID_CONTEXT
+                    // at enqueue time.
+                    for ev in &deps {
+                        ::claspr::assert_same_context(
+                            ev,
+                            launcher.cl_queue(),
+                            concat!("kernel `", stringify!(#name), "` Op::submit"),
+                        );
+                    }
+                    let #op_args_tuple_init = args;
+                    // Hand LaunchOp raw cl_event handles; `deps` (owned
+                    // events) stays alive until after the enqueue returns,
+                    // at which point OpenCL has retained them internally
+                    // for the wait list.
+                    let raw_deps: ::std::vec::Vec<::claspr::cl_event> =
+                        deps.iter().map(|e| e.get()).collect();
+                    let event = ::claspr::LaunchOp::new(
+                        launcher,
+                        &kernel,
+                        spec,
+                        #op_launch_args_tuple,
+                    )
+                    .with_state(raw_deps, profile_cb)
+                    .submit()?;
+                    ::core::mem::drop(deps);
+                    ::core::mem::drop(kernel);
+                    ::core::result::Result::Ok((#output_expr, event))
+                }
+
+                /// Tier 1 blocking terminal — `submit` then `event.wait`.
+                /// Returns the slice arg(s) so the caller can keep using
+                /// them.
+                pub fn wait<L>(self, launcher: &L) -> ::claspr::Result<#output_ty>
+                where
+                    L: ::claspr::Launcher,
+                {
+                    let (out, event) = self.submit(launcher)?;
+                    event.wait()?;
+                    ::core::result::Result::Ok(out)
+                }
+            }
+
+            impl ::claspr_async::DeviceOperation for Op {
+                type Output = #output_ty;
+
+                fn execute(
+                    self,
+                    ctx: &::claspr_async::ExecutionContext<'_>,
+                    chain_deps: ::claspr_async::Deps,
+                ) -> ::claspr::Result<(Self::Output, ::claspr_async::Deps)> {
+                    let Op { kernel, spec, args, deps, profile_cb } = self;
+                    // Validate cross-context match for caller-added deps.
+                    // Chain-supplied deps are produced by upstream ops on
+                    // the same chain's ExecutionContext, so they're always
+                    // from the same Context — no check needed there.
+                    for ev in &deps {
+                        ::claspr::assert_same_context(
+                            ev,
+                            ::claspr::Launcher::cl_queue(ctx),
+                            concat!("kernel `", stringify!(#name), "` Op::execute"),
+                        );
+                    }
+                    // Merge caller-added (owned Events) with chain-supplied
+                    // deps (Arc<Event>) into a single Vec<cl_event>. Both
+                    // sources stay alive until after the enqueue.
+                    let mut raw_deps: ::std::vec::Vec<::claspr::cl_event> =
+                        deps.iter().map(|e| e.get()).collect();
+                    for d in &chain_deps {
+                        raw_deps.push(d.as_ref().get());
+                    }
+                    let #op_args_tuple_init = args;
+                    let event = ::claspr::LaunchOp::new(
+                        ctx,
+                        &kernel,
+                        spec,
+                        #op_launch_args_tuple,
+                    )
+                    .with_state(raw_deps, profile_cb)
+                    .submit()?;
+                    ::core::mem::drop(deps);
+                    ::core::mem::drop(chain_deps);
+                    ::core::mem::drop(kernel);
+                    ::core::result::Result::Ok((
+                        #output_expr,
+                        ::std::vec![::claspr_async::wrap_event(event)],
+                    ))
+                }
             }
         }
     })
+}
+
+/// Tuples with a single element need a trailing comma in Rust. Helper
+/// to emit either `(only,)` or `(a, b, c)` based on element count.
+/// Returns `()` for an empty list.
+fn single_or_tuple(elems: &[TokenStream2]) -> TokenStream2 {
+    match elems.len() {
+        0 => quote! { () },
+        1 => {
+            let only = &elems[0];
+            quote! { ( #only, ) }
+        }
+        _ => quote! { ( #(#elems),* ) },
+    }
 }
 
 enum ParamRole {
@@ -300,8 +539,21 @@ enum ParamRole {
     Builtin,
     /// Keep: host-side argument with translated type and original name.
     Host {
+        /// Plain identifier for the parameter (used as a pattern in the
+        /// destructure inside the Op's terminal / execute, and as the
+        /// field name in the args tuple).
         name: TokenStream2,
+        /// Owned form for the unified method's signature and the Op's
+        /// args tuple. Slices/images here are `::claspr::DeviceSlice<T>`
+        /// / `::claspr::Image2D<...>` (no reference) — the Op holds
+        /// them by value and returns them as its `Output`. Scalars pass
+        /// through unchanged.
         ty: TokenStream2,
+        /// Whether this param threads through the chain (slice / image).
+        /// Slices are referenced when passed to LaunchOp and re-emitted
+        /// as the Op's `Output`. Scalars are passed by value and dropped
+        /// from the output.
+        is_slice: bool,
     },
 }
 
@@ -333,28 +585,49 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
         }
     };
 
-    let ty_translated = if matches!(kind, Some(SpirvKind::CrossWorkgroup)) {
-        translate_cross_workgroup_ty(&pt.ty)?
+    let (ty, is_slice) = if matches!(kind, Some(SpirvKind::CrossWorkgroup)) {
+        let elem = slice_element_ty(&pt.ty)?;
+        // The Op holds the slice by value (so it can return it via
+        // `Output` for downstream chaining or Tier 1 callers).
+        (quote! { ::claspr::DeviceSlice<#elem> }, true)
     } else if let Some(info) = classify_image_param(&pt.ty) {
-        // `&Image!(...)` / `&mut Image!(...)` — translate to claspr's
-        // host-side image type. The reference itself stays `&` (the
-        // GPU writes to the image, the host handle isn't mutated);
-        // the access mode is encoded in the type parameter `A`
-        // instead. Tagged with the wrapper's `'claspr_l` lifetime so
-        // the resulting LaunchOp can capture it.
+        // `&Image!(...)` / `&mut Image!(...)` — owned `Image2D` so the
+        // Op can return it.
         let access = info.access;
         let format = info.format;
-        quote! { &'claspr_l ::claspr::Image2D<#access, #format> }
+        (quote! { ::claspr::Image2D<#access, #format> }, true)
     } else {
-        // No spirv attribute (or an unrecognised one): pass type through.
-        let ty = &pt.ty;
-        quote! { #ty }
+        // No spirv attribute (or an unrecognised one): pass type
+        // through unchanged. Scalars are by-value.
+        let t = &pt.ty;
+        (quote! { #t }, false)
     };
 
     Ok(ParamRole::Host {
         name: pname,
-        ty: ty_translated,
+        ty,
+        is_slice,
     })
+}
+
+/// Pull the element type out of `&[T]` / `&mut [T]`. Reused by both
+/// the Tier 1 wrapper translation and Tier 2's owned-arg type.
+fn slice_element_ty(ty: &Type) -> syn::Result<TokenStream2> {
+    let Type::Reference(TypeReference { elem, .. }) = ty else {
+        return Err(syn::Error::new(
+            ty.span(),
+            "expected a reference type (`&[T]` or `&mut [T]`) for a #[spirv(cross_workgroup)] \
+             parameter; other shapes are not yet supported by claspr::kernel",
+        ));
+    };
+    let Type::Slice(TypeSlice { elem: inner, .. }) = &**elem else {
+        return Err(syn::Error::new(
+            elem.span(),
+            "expected a slice type `[T]` after the reference; other shapes are not yet supported \
+             by claspr::kernel",
+        ));
+    };
+    Ok(quote! { #inner })
 }
 
 fn find_spirv_attr(attrs: &[Attribute]) -> Option<Attribute> {
@@ -495,33 +768,4 @@ fn parse_image_tokens(tokens: TokenStream2) -> (Option<String>, Option<String>, 
         i += 1;
     }
     (access, format, type_)
-}
-
-/// Translate a `cross_workgroup` parameter type.
-///
-/// `&mut [T]` and `&[T]` both become `&'claspr_l ::claspr::DeviceSlice<T>`.
-/// The `'claspr_l` lifetime is the wrapper function's lifetime parameter
-/// (see [`expand_kernel`]) and ties the resulting [`LaunchOp`] to the
-/// borrow of every host slice argument.
-///
-/// Any other shape is a hard error — those paths haven't been wired up
-/// yet (sampler / workgroup-memory parameters will land as follow-ups).
-///
-/// [`LaunchOp`]: claspr::op::LaunchOp
-fn translate_cross_workgroup_ty(ty: &Type) -> syn::Result<TokenStream2> {
-    let Type::Reference(TypeReference { elem, .. }) = ty else {
-        return Err(syn::Error::new(
-            ty.span(),
-            "expected a reference type (`&[T]` or `&mut [T]`) for a #[spirv(cross_workgroup)] \
-             parameter; other shapes are not yet supported by claspr::kernel",
-        ));
-    };
-    let Type::Slice(TypeSlice { elem: inner, .. }) = &**elem else {
-        return Err(syn::Error::new(
-            elem.span(),
-            "expected a slice type `[T]` after the reference; other shapes are not yet supported \
-             by claspr::kernel",
-        ));
-    };
-    Ok(quote! { &'claspr_l ::claspr::DeviceSlice<#inner> })
 }

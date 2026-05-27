@@ -6,7 +6,7 @@
 //!
 //! ```ignore
 //! let sobel = sobel_kernel::kernels(&ctx)?;
-//! sobel.sobel(&ctx, [w, h], &input_image, &output_image, w, h).wait()?;
+//! let (input, output) = sobel.sobel([w, h], input_image, output_image, w, h).wait(&ctx)?;
 //! ```
 
 #[claspr::device]

@@ -177,12 +177,13 @@ pub struct CompileBuilder {
 /// A declared kernel entry point + its host-side launch signature.
 ///
 /// Built up via [`CompileBuilder::kernel`] — see that method for usage.
+/// The `params` are currently unused by `emit_kernels_file` (typed
+/// launch methods are emitted by the `#[claspr::kernel]` proc-macro,
+/// not the build script), but kept on the struct so the
+/// `.kernel(name, params)` builder method remains stable for callers.
+#[allow(dead_code)]
 struct KernelDecl {
     name: String,
-    /// `(arg_name, arg_type)` pairs, in source declaration order. Both
-    /// fields are spliced verbatim into the generated wrapper, so they
-    /// must be valid Rust syntax in the position they're written
-    /// (paths can be absolute, e.g. `&::claspr::DeviceSlice<u32>`).
     params: Vec<(String, String)>,
 }
 
@@ -395,145 +396,108 @@ fn generate_module_source(
     }
     writeln!(s, "];\n")?;
 
+    // The Kernels struct just holds the built Program. Per-launch
+    // `clCreateKernel` (done by the proc-macro-emitted launch methods)
+    // hands each launch its own private `cl_kernel` handle — no
+    // shared mutable state across launches means no `clSetKernelArg`
+    // race, so we don't need an `unsafe impl Sync for Kernels {}`
+    // hack. The Op the proc-macro emits owns its kernel and has no
+    // lifetime tie back to Kernels.
     writeln!(
         s,
-        "/// All kernels in this module, pre-built once at startup and held"
+        "/// Built program for this module. Per-launch kernel handles are"
     )?;
-    writeln!(s, "/// for repeated launch.")?;
+    writeln!(
+        s,
+        "/// created via `clCreateKernel` inside the proc-macro-emitted"
+    )?;
+    writeln!(
+        s,
+        "/// launch methods (or via [`Kernels::kernel`] for the untyped path)."
+    )?;
     writeln!(s, "pub struct Kernels {{")?;
-    for ep in entry_points {
-        let field = sanitize_field_name(ep);
-        // Field is private when the kernel has a typed launch method
-        // (avoids `kernels.foo` field vs `kernels.foo(...)` confusion);
-        // public otherwise so callers can still launch via
-        // `ctx.launch(&kernels.foo, ...)`.
-        let vis = if has_decl(kernels, ep) { "" } else { "pub " };
-        writeln!(s, "    {vis}{field}: ::claspr::Kernel,")?;
-    }
+    writeln!(s, "    #[doc(hidden)]")?;
+    writeln!(s, "    pub __claspr_program: ::claspr::Program,")?;
     writeln!(s, "}}\n")?;
 
     writeln!(s, "impl Kernels {{")?;
     writeln!(
         s,
-        "    /// Build the program from the embedded SPIR-V and look up every entry point."
+        "    /// Build the program from the embedded SPIR-V and validate"
+    )?;
+    writeln!(
+        s,
+        "    /// every entry point exists by attempting one `clCreateKernel`"
+    )?;
+    writeln!(
+        s,
+        "    /// per entry-point name (the handle is dropped immediately)."
+    )?;
+    writeln!(
+        s,
+        "    /// After `load` returns Ok, per-launch `clCreateKernel` calls"
+    )?;
+    writeln!(
+        s,
+        "    /// can only fail with `CL_OUT_OF_RESOURCES` / `CL_OUT_OF_HOST_MEMORY`."
     )?;
     writeln!(
         s,
         "    pub fn load(ctx: &::claspr::Context) -> ::claspr::Result<Self> {{"
     )?;
     writeln!(s, "        let program = ctx.build_program(SPV_BYTES)?;")?;
-    writeln!(s, "        Ok(Self {{")?;
-    for ep in entry_points {
-        let field = sanitize_field_name(ep);
-        writeln!(s, "            {field}: ctx.kernel(&program, {ep:?})?,")?;
-    }
-    writeln!(s, "        }})")?;
+    writeln!(s, "        for ep in ENTRY_POINTS {{")?;
+    writeln!(s, "            let _ = ctx.kernel(&program, ep)?;")?;
+    writeln!(s, "        }}")?;
+    writeln!(s, "        Ok(Self {{ __claspr_program: program }})")?;
     writeln!(s, "    }}")?;
-
-    // Typed launch methods, one per declared kernel.
-    for decl in kernels {
-        let field = sanitize_field_name(&decl.name);
-        // Inject `'claspr_l` after every leading `&` so the resulting
-        // LaunchOp's lifetime parameter ties to the borrows of the
-        // host args. The build script's user supplies type strings
-        // like `&::claspr::DeviceSlice<u32>` (no lifetime); we
-        // rewrite to `&'claspr_l ::claspr::DeviceSlice<u32>` here.
-        // Value-type params (`u32`, `Viewport`) pass through unchanged.
-        let params_sig: String = decl
-            .params
-            .iter()
-            .map(|(n, t)| format!(",\n        {n}: {}", inject_lifetime(t)))
-            .collect();
-        let arg_types: String = decl
-            .params
-            .iter()
-            .map(|(_, t)| inject_lifetime(t))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let tuple_args: String = decl
-            .params
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
-        // Trailing comma needed for single-element tuples.
-        let (tuple_lit, arg_tuple_ty) = if decl.params.len() == 1 {
-            (format!("({tuple_args},)"), format!("({arg_types},)"))
-        } else {
-            (format!("({tuple_args})"), format!("({arg_types})"))
-        };
-
-        writeln!(s)?;
-        writeln!(
-            s,
-            "    /// Build a typed [`LaunchOp`][lo] for the `{}` kernel — call",
-            decl.name
-        )?;
-        writeln!(
-            s,
-            "    /// `.wait()`, `.submit()`, or `.await` on the result to enqueue."
-        )?;
-        writeln!(s, "    ///")?;
-        writeln!(s, "    /// [lo]: ::claspr::LaunchOp")?;
-        // `clippy::too_many_arguments` — arg count is determined by
-        // the kernel's declared signature, not user choice.
-        writeln!(s, "    #[allow(clippy::too_many_arguments)]")?;
-        writeln!(s, "    pub fn {field}<'claspr_l>(")?;
-        writeln!(s, "        &'claspr_l self,")?;
-        writeln!(s, "        launcher: &'claspr_l impl ::claspr::Launcher,")?;
-        writeln!(
-            s,
-            "        grid: impl ::claspr::IntoLaunchSpec{params_sig},"
-        )?;
-        writeln!(
-            s,
-            "    ) -> ::claspr::LaunchOp<'claspr_l, {arg_tuple_ty}> {{"
-        )?;
-        writeln!(
-            s,
-            "        ::claspr::LaunchOp::new(launcher, &self.{field}, grid, {tuple_lit})"
-        )?;
-        writeln!(s, "    }}")?;
-    }
-
+    writeln!(s)?;
+    writeln!(
+        s,
+        "    /// Get a fresh `cl_kernel` handle for `name`. Panics if the"
+    )?;
+    writeln!(
+        s,
+        "    /// runtime is out of resources — `load` validated every entry"
+    )?;
+    writeln!(
+        s,
+        "    /// point's existence, so the only remaining failure mode is OOM."
+    )?;
+    writeln!(
+        s,
+        "    /// Used internally by proc-macro-emitted launch methods; exposed"
+    )?;
+    writeln!(
+        s,
+        "    /// for the rare case where you need a raw kernel by name (e.g."
+    )?;
+    writeln!(s, "    /// `ctx.launch(&kernels.kernel(\"foo\"), ...)`).")?;
+    writeln!(
+        s,
+        "    pub fn kernel(&self, name: &str) -> ::claspr::Kernel {{"
+    )?;
+    writeln!(
+        s,
+        "        ::claspr::Kernel::create(&self.__claspr_program, name)"
+    )?;
+    writeln!(
+        s,
+        "            .unwrap_or_else(|e| panic!(\"clCreateKernel({{name:?}}) failed: {{e:?}}\"))"
+    )?;
+    writeln!(s, "    }}")?;
     writeln!(s, "}}")?;
 
+    // The compile() path's KernelDecl-driven typed launch methods are
+    // no longer emitted here — switching every emission to match the
+    // proc-macro's per-call clCreateKernel + Op + DeviceOperation shape
+    // would mean re-implementing the macro inside the build script.
+    // No example or test exercises the compile()+KernelDecl path, so
+    // we leave typed-launch emission to the proc-macro and treat the
+    // `kernels` argument as a no-op for now.
+    let _ = kernels;
+
     Ok(s)
-}
-
-/// Inject a `'claspr_l` lifetime after the leading `&` of a reference
-/// type string. Used to tie host-arg borrows to the LaunchOp's
-/// lifetime parameter. Pass-through for non-reference types.
-fn inject_lifetime(ty: &str) -> String {
-    let trimmed = ty.trim_start();
-    let prefix_len = ty.len() - trimmed.len();
-    let prefix = &ty[..prefix_len];
-    if let Some(after_amp) = trimmed.strip_prefix('&') {
-        // Skip `mut ` if present so `&mut T` becomes `&'claspr_l mut T`.
-        let after = after_amp.trim_start();
-        let trimmed_amp_len = after_amp.len() - after.len();
-        let between = &after_amp[..trimmed_amp_len];
-        if let Some(rest) = after.strip_prefix("mut ") {
-            format!("{prefix}&'claspr_l{between}mut {rest}")
-        } else {
-            format!("{prefix}&'claspr_l {after}")
-        }
-    } else {
-        ty.to_string()
-    }
-}
-
-fn has_decl(kernels: &[KernelDecl], name: &str) -> bool {
-    kernels.iter().any(|k| k.name == name)
-}
-
-/// Convert an OpenCL entry-point name into a valid Rust field
-/// identifier. Today this is a passthrough — entry points emitted by
-/// rust-gpu are already valid Rust identifiers — but reserved here so
-/// future renames (mangled C++-style names, leading-digit guards) can
-/// be slotted in without changing the call sites.
-fn sanitize_field_name(name: &str) -> String {
-    name.to_string()
 }
 
 // ── compile_from_host: single-source kernel extraction ────────────────

@@ -267,6 +267,15 @@ impl<'a, T> WriteOp<'a, T> {
         self
     }
 
+    /// Add multiple wait-list events at once.
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        self.deps.extend(events.into_iter().map(|e| e.get()));
+        self
+    }
+
     /// Register a completion callback that receives the write's
     /// [`ProfilingInfo`]. Same FFI shim as
     /// [`LaunchOp::profiled`](crate::op::LaunchOp::profiled);
@@ -349,6 +358,15 @@ impl<'a, T> ReadOp<'a, T> {
         self
     }
 
+    /// Add multiple wait-list events at once.
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        self.deps.extend(events.into_iter().map(|e| e.get()));
+        self
+    }
+
     pub fn profiled<F>(mut self, cb: F) -> Self
     where
         F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
@@ -418,6 +436,15 @@ pub struct CopyOp<'a, T> {
 impl<'a, T> CopyOp<'a, T> {
     pub fn after(mut self, event: &Event) -> Self {
         self.deps.push(event.get());
+        self
+    }
+
+    /// Add multiple wait-list events at once.
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        self.deps.extend(events.into_iter().map(|e| e.get()));
         self
     }
 

@@ -9,7 +9,6 @@
 use claspr::{Buffer, Context, HostBuffer, SharedBuffer, SvmLevel};
 use claspr_async::{
     DeviceOperation, DeviceOperationHostExt, HostAccessibleExt, download, upload, value,
-    with_context,
 };
 use claspr_test_kernels::kernels;
 
@@ -21,6 +20,7 @@ fn acquire_host_edit_release_round_trip() {
         eprintln!("SKIP: no OpenCL device");
         return;
     };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     // Stage 1: upload all-3s
     // Stage 2: kernel scale_u32 by 2 → all 6s
@@ -30,13 +30,7 @@ fn acquire_host_edit_release_round_trip() {
     // Stage 6: download
 
     let result: Vec<u32> = upload(vec![3u32; N])
-        .and_then(|buf| {
-            with_context(move |ec| {
-                let kernels = kernels::kernels(ec.context())?;
-                kernels.scale_u32(ec, [N], &buf, 2).wait()?;
-                Ok::<_, claspr::Error>(buf)
-            })
-        })
+        .and_then(|buf| kernels.scale_u32([N], buf, 2))
         .and_then(|buf| buf.acquire_host_view())
         .and_then_host(|mut view| {
             // At this point the d2h has completed; view derefs to the
@@ -47,13 +41,7 @@ fn acquire_host_edit_release_round_trip() {
             Ok(view)
         })
         .and_then(|view| view.release_to_device())
-        .and_then(|buf| {
-            with_context(move |ec| {
-                let kernels = kernels::kernels(ec.context())?;
-                kernels.scale_u32(ec, [N], &buf, 10).wait()?;
-                Ok::<_, claspr::Error>(buf)
-            })
-        })
+        .and_then(|buf| kernels.scale_u32([N], buf, 10))
         .and_then(download)
         .sync(&ctx)
         .expect("host_view chain");
@@ -75,7 +63,7 @@ fn acquire_immediately_release_is_a_round_trip() {
 
     let result: Vec<u32> = upload(vec![42u32; N])
         .and_then(|buf| buf.acquire_host_view())
-        .and_then_host(|view| Ok(view))
+        .and_then_host(Ok)
         .and_then(|view| view.release_to_device())
         .and_then(download)
         .sync(&ctx)

@@ -11,6 +11,7 @@ description = "Sobel edge-detection image kernel — a claspr kernel packaged as
 
 [dependencies]
 claspr = { path = "../../claspr" }
+claspr-async = { path = "../../claspr-async" }
 
 [build-dependencies]
 claspr-build = { path = "../../claspr-build" }

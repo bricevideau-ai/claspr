@@ -58,28 +58,26 @@ fn run() -> claspr::Result<bool> {
     let edges = claspr::Image2DRgba8::alloc(&ctx, WIDTH, HEIGHT)?;
 
     // Stage 1: render the Mandelbrot set into `fractal`.
-    mandelbrot
+    let fractal = mandelbrot
         .mandelbrot(
-            &ctx,
             [WIDTH as usize, HEIGHT as usize],
-            &fractal,
+            fractal,
             WIDTH,
             HEIGHT,
             MAX_ITER,
         )
-        .wait()?;
+        .wait(&ctx)?;
 
     // Stage 2: edge-detect `fractal` into `edges`.
-    sobel
+    let (_fractal, edges) = sobel
         .sobel(
-            &ctx,
             [WIDTH as usize, HEIGHT as usize],
-            &fractal,
-            &edges,
+            fractal,
+            edges,
             WIDTH,
             HEIGHT,
         )
-        .wait()?;
+        .wait(&ctx)?;
 
     let pixels = edges.download_bytes(&ctx)?;
     let ppm_path = "image-pipeline.ppm";

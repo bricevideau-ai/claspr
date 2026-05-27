@@ -28,7 +28,7 @@
 //! without bloating the core trait.
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::DeviceOperation;
+use crate::op::{Deps, DeviceOperation};
 use claspr::Result;
 
 /// Combinator built by [`DeviceOperationHostExt::and_then_host`].
@@ -69,11 +69,23 @@ where
 {
     type Output = U;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>) -> Result<U> {
-        let prior = self.source.execute(ctx)?;
-        (self
+    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(U, Deps)> {
+        let (prior, source_evts) = self.source.execute(ctx, deps)?;
+        // Drain source's events before running the host closure —
+        // the closure may read device-produced state (e.g. via
+        // `acquire_host_view`'s preceding read), and that has to be
+        // consistent. The closure runs synchronously on the host.
+        for ev in &source_evts {
+            ev.wait()?;
+        }
+        let out = (self
             .f
             .take()
-            .expect("AndThenHost::execute called twice — internal claspr-async bug"))(prior)
+            .expect("AndThenHost::execute called twice — internal claspr-async bug"))(
+            prior
+        )?;
+        // Closure produced no events (host work). Return empty deps
+        // so downstream device ops don't try to wait on stale events.
+        Ok((out, Vec::new()))
     }
 }

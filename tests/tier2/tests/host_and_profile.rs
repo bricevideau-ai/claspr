@@ -3,7 +3,7 @@
 
 use claspr::{Context, Device};
 use claspr_async::{
-    DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, upload, value, with_context,
+    DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, download, upload, value,
 };
 use claspr_test_kernels::kernels;
 
@@ -27,23 +27,12 @@ fn and_then_host_sum_between_device_stages() {
         return;
     };
 
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
     // upload + fill + download + (host) sum + check
     let sum: u32 = value(vec![0u32; N])
         .and_then(upload)
-        .and_then(|buf| {
-            with_context(move |ec| {
-                let kernels = kernels::kernels(ec.context())?;
-                kernels.fill_u32(ec, [N], &buf, 3).wait()?;
-                Ok::<_, claspr::Error>(buf)
-            })
-        })
-        .and_then(|buf| {
-            with_context(move |ec| {
-                let mut out = vec![0u32; N];
-                buf.read(ec, &mut out).wait()?;
-                Ok::<_, claspr::Error>(out)
-            })
-        })
+        .and_then(|buf| kernels.fill_u32([N], buf, 3))
+        .and_then(download)
         .and_then_host(|out| Ok(out.iter().sum::<u32>()))
         .sync(&ctx)
         .expect("and_then_host chain");
@@ -73,16 +62,11 @@ fn profile_chain_fires_callback_when_profiling_on() {
     };
     assert!(ctx.profiling());
 
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
     let (tx, rx) = std::sync::mpsc::channel();
     value(vec![0u32; N])
         .and_then(upload)
-        .and_then(|buf| {
-            with_context(move |ec| {
-                let kernels = kernels::kernels(ec.context())?;
-                kernels.fill_u32(ec, [N], &buf, 7).wait()?;
-                Ok::<_, claspr::Error>(buf)
-            })
-        })
+        .and_then(|buf| kernels.fill_u32([N], buf, 7))
         .profiled(move |info| {
             tx.send(info).expect("send profiling info");
         })
