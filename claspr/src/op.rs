@@ -341,6 +341,43 @@ fn collect_profiling(event: &Event) -> Result<ProfilingInfo> {
     })
 }
 
+// ── User events ─────────────────────────────────────────────────────
+
+/// Create a `cl_event` of execution status `CL_SUBMITTED` whose
+/// completion is signalled from the host via
+/// [`complete_user_event`]. Wraps `clCreateUserEvent`.
+///
+/// Building block for emulating `clEnqueueNativeKernel` on devices
+/// that don't expose `CL_EXEC_NATIVE_KERNEL`: stage an async host
+/// computation, hand its completion to the queue via a user event,
+/// chain other commands on it as if it were a normal queue command.
+///
+/// The returned [`Event`] owns its reference (refcount 1 from
+/// `clCreateUserEvent`); its `Drop` calls `clReleaseEvent` per the
+/// usual opencl3 invariant. Status defaults to `CL_SUBMITTED` until
+/// the first call to [`complete_user_event`].
+pub fn create_user_event(ctx: &crate::Context) -> Result<Event> {
+    let cl_ctx = ctx.raw_context().get();
+    let raw = opencl3::event::create_user_event(cl_ctx)
+        .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
+    Ok(Event::new(raw))
+}
+
+/// Set a user event's execution status. Wraps `clSetUserEventStatus`.
+///
+/// `status` must be `CL_COMPLETE` (0) or a negative value (treated
+/// as an error code). Per the CL spec, may be called at most once
+/// per user event — a second call returns `CL_INVALID_OPERATION`.
+///
+/// A negative status causes every command waiting on this user
+/// event (and transitively, anything waiting on those commands) to
+/// fail with the same negative code, propagating the abort through
+/// the in-queue dependency graph.
+pub fn complete_user_event(event: &Event, status: cl_int) -> Result<()> {
+    opencl3::event::set_user_event_status(event.get(), status)
+        .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))
+}
+
 // ── Keep-alive callback FFI shim ────────────────────────────────────
 
 /// Register a `CL_COMPLETE` callback on `event` whose sole job is to
@@ -412,4 +449,36 @@ where
         // and drop the holder + event on scope exit.
         let _ = unsafe { Box::from_raw(user_data as *mut KeepAlive<T>) };
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opencl3::event::CL_COMPLETE;
+    use std::sync::Arc;
+
+    /// Host thread signals a user event; another host thread blocked on
+    /// `event.wait()` returns. Exercises both [`create_user_event`] and
+    /// [`complete_user_event`] end-to-end.
+    #[test]
+    fn user_event_signals_across_threads() {
+        let Ok(ctx) = crate::Context::any() else {
+            eprintln!("skipping: no OpenCL device");
+            return;
+        };
+        let ev = Arc::new(create_user_event(&ctx).expect("create"));
+        let ev2 = Arc::clone(&ev);
+        let t0 = std::time::Instant::now();
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            complete_user_event(&ev2, CL_COMPLETE as cl_int).expect("signal");
+        });
+        ev.wait().expect("wait");
+        signal.join().expect("signal thread");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(40),
+            "wait returned too early: {elapsed:?}"
+        );
+    }
 }

@@ -81,8 +81,8 @@ pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
 };
 pub use op::{
-    LaunchOp, ProfileCb, ProfilingInfo, assert_same_context, register_drop_callback,
-    register_profiling_callback,
+    LaunchOp, ProfileCb, ProfilingInfo, assert_same_context, complete_user_event,
+    create_user_event, register_drop_callback, register_profiling_callback,
 };
 pub use ppm::write_ppm_rgba8;
 pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
