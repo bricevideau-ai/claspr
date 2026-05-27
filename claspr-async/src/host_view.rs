@@ -1,48 +1,62 @@
-//! `HostAccessible` — three-stage acquire / host-work / release for
-//! host code that needs to look at device data.
+//! `HostAccessible` — make a buffer's bytes host-visible in queue
+//! order so a host closure (typically inside
+//! [`AndThenHost`](crate::AndThenHost)) can read or mutate them
+//! in place, then hand the buffer back to subsequent device stages.
 //!
-//! Spike scenario 16. The pattern:
-//!
-//! ```ignore
-//! upload(host_vec)
-//!     .and_then(|buf| /* GPU work */)
-//!     .and_then(|buf| buf.acquire_host_view())     // d2h into a scratch Vec
-//!     .and_then_host(|mut view| {                   // DerefMut on the scratch
-//!         view[0] += 100.0;
-//!         Ok(view)
-//!     })
-//!     .and_then(|view| view.release_to_device())   // h2d the scratch back
-//!     .and_then(|buf| /* more GPU work */)
-//!     .and_then(download)
-//!     .sync(&ctx)?
-//! ```
-//!
-//! Per buffer type, acquire/release map to different CL primitives:
+//! Per buffer kind, acquire/release map to different CL primitives:
 //!
 //! | Buffer | Acquire | Release |
 //! |---|---|---|
-//! | `DeviceSlice<T>` | `clEnqueueReadBuffer` into a host `Vec<T>` | `clEnqueueWriteBuffer` from the Vec back into the buffer |
-//! | `HostBuffer<T>` (planned) | no-op — already host-mapped | no-op |
-//! | `SharedBuffer<T>` (planned) | `clEnqueueSVMMap` | `clEnqueueSVMUnmap` |
+//! | [`DeviceSlice<T>`] | non-blocking `clEnqueueMapBuffer` (READ \| WRITE or READ only) | `clEnqueueUnmapMemObject` |
+//! | [`HostBuffer<T>`] | no-op — buffer is permanently mapped | no-op |
+//! | [`SharedBuffer<T>`] | blocking `clEnqueueSVMMap` | `clEnqueueSVMUnmap` |
 //!
-//! **Correctness**: the read inside `acquire`'s `execute` must complete
-//! before the host gets to deref the view — otherwise `and_then_host`
-//! sees stale data. Similarly, `release`'s `execute` must complete the
-//! write before the view (and its `Vec`) drops. Both stages use
-//! `.wait()` on the underlying [`ReadOp`](claspr::ReadOp) /
-//! [`WriteOp`](claspr::WriteOp) builders for that. The chain still
-//! gets queue-ordered pipelining at the boundaries with neighbouring
-//! ops — the acquire's read is queue-ordered after prior kernels, the
-//! release's write is queue-ordered before subsequent kernels.
+//! All three view types implement [`crate::mappable::Mappable`] so
+//! the closure inside `and_then_host` receives the underlying slice
+//! directly — `&mut [T]` for the read/write variants, `&[T]` for the
+//! read-only variant. The closure does not need to call any method
+//! on the view; passing it through is enough.
+//!
+//! ## Two patterns, one closure shape
+//!
+//! Direct (one stage of host work, framework auto-maps + auto-unmaps):
+//!
+//! ```ignore
+//! .and_then(|buf| kernels.foo(buf))
+//! .and_then_host(|slice: &mut [u32]| { slice[0] = 99; Ok(()) })
+//! .and_then(|buf| kernels.bar(buf))
+//! ```
+//!
+//! Explicit (the view persists across multiple stages — useful when
+//! the host computation is split into pieces, or when caller wants
+//! the map lifecycle to be visible in the chain):
+//!
+//! ```ignore
+//! .and_then(|buf| kernels.foo(buf))
+//! .and_then(|buf| buf.acquire_host_view())       // -> DeviceSliceHostView
+//! .and_then_host(|slice: &mut [u32]| { slice[0] = 99; Ok(()) })
+//! .and_then(|view| view.release_to_device())     // -> DeviceSlice
+//! .and_then(|buf| kernels.bar(buf))
+//! ```
+//!
+//! For pure host inspection without writing back, use
+//! [`DeviceSlice::acquire_host_view_read`] (alias
+//! [`HostAccessibleExt::acquire_host_view_read`]): the view passes
+//! `&[T]` to the closure, the underlying map uses `CL_MAP_READ` only
+//! (no writeback on unmap).
 
 use crate::exec_ctx::ExecutionContext;
+use crate::mappable::Mappable;
 use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
-use claspr::{Buffer, DeviceSlice, Error, HostBuffer, Launcher, Result, SharedBuffer};
+use claspr::{Buffer, DeviceSlice, Error, Event, HostBuffer, Launcher, Result, SharedBuffer};
 use opencl3::command_queue::{
-    enqueue_svm_map, enqueue_svm_unmap, release_command_queue, retain_command_queue,
+    CommandQueue, enqueue_map_buffer, enqueue_svm_map, enqueue_svm_unmap,
+    enqueue_unmap_mem_object, release_command_queue, retain_command_queue,
 };
 use opencl3::event::release_event;
-use opencl3::types::{CL_BLOCKING, cl_command_queue};
+use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, ClMem};
+use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_command_queue, cl_event, cl_map_flags};
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::slice;
@@ -52,147 +66,395 @@ fn cl_to_err(code: opencl3::types::cl_int) -> Error {
     Error::OpenCl(opencl3::error_codes::ClError(code))
 }
 
-// ── Extension trait for the user-facing entry point ─────────────────
+// ── Access mode markers ─────────────────────────────────────────────
+
+/// Marker types selecting which `cl_map_flags` an acquire uses and
+/// whether the resulting view's `Mappable::View` is `&[T]` or
+/// `&mut [T]`. Implementors of [`MapAccess`] are zero-sized.
+mod access {
+    use super::*;
+
+    /// Read-only access: `clEnqueueMapBuffer(CL_MAP_READ)`; closure
+    /// sees `&[T]`. No writeback on unmap, so a read-only view is
+    /// the cheapest way to look at device data from the host inside
+    /// a chain.
+    pub struct ReadOnly;
+    /// Read/write access: `clEnqueueMapBuffer(CL_MAP_READ | CL_MAP_WRITE)`;
+    /// closure sees `&mut [T]`. Unmap commits writes back.
+    pub struct ReadWrite;
+
+    /// Trait abstracting [`ReadOnly`] / [`ReadWrite`] into a
+    /// `cl_map_flags` constant.
+    pub trait MapAccess: Send + Sync + 'static {
+        const MAP_FLAGS: cl_map_flags;
+    }
+    impl MapAccess for ReadOnly {
+        const MAP_FLAGS: cl_map_flags = CL_MAP_READ;
+    }
+    impl MapAccess for ReadWrite {
+        const MAP_FLAGS: cl_map_flags = CL_MAP_READ | CL_MAP_WRITE;
+    }
+}
+
+pub use access::{MapAccess, ReadOnly, ReadWrite};
+
+// ── HostAccessibleExt ───────────────────────────────────────────────
 
 /// Adds [`acquire_host_view`](Self::acquire_host_view) to types that
-/// can yield a host-side scratch view of their data. Only
-/// [`DeviceSlice`] today; `HostBuffer` and `SharedBuffer` will impl
-/// this trait in a follow-up.
+/// can yield a host-side view of their data.
 ///
 /// Bring into scope with `use claspr_async::HostAccessibleExt;` (or
 /// via a future prelude).
 pub trait HostAccessibleExt: Sized {
-    /// The acquire op type for this buffer kind.
+    /// The acquire op type for this buffer kind (read/write).
     type AcquireOp: DeviceOperation;
+    /// The acquire op type for the read-only variant. Same kind for
+    /// types where read/write is a no-op (e.g. [`HostBuffer`]).
+    type AcquireReadOp: DeviceOperation;
 
-    /// Build a [`DeviceOperation`] whose `Output` is a host-side view
-    /// into the buffer. The view DerefMut-s to `[T]` so the user can
-    /// read or write through it. Compose with
-    /// [`DeviceOperationHostExt::and_then_host`](crate::DeviceOperationHostExt::and_then_host).
+    /// Acquire a read/write host view. Closure inside
+    /// `and_then_host` receives `&mut [T]`.
     fn acquire_host_view(self) -> Self::AcquireOp;
+
+    /// Acquire a read-only host view. Closure inside `and_then_host`
+    /// receives `&[T]`. Cheaper for inspection-only patterns since
+    /// the unmap doesn't commit writes back to the device.
+    fn acquire_host_view_read(self) -> Self::AcquireReadOp;
 }
+
+// ── DeviceSlice: real map/unmap ─────────────────────────────────────
 
 impl<T> HostAccessibleExt for DeviceSlice<T>
 where
-    T: Clone + Default + Send + 'static,
+    T: Send + 'static,
 {
-    type AcquireOp = AcquireDeviceSliceOp<T>;
-    fn acquire_host_view(self) -> AcquireDeviceSliceOp<T> {
-        AcquireDeviceSliceOp { buf: Some(self) }
+    type AcquireOp = AcquireDeviceSliceOp<T, ReadWrite>;
+    type AcquireReadOp = AcquireDeviceSliceOp<T, ReadOnly>;
+    fn acquire_host_view(self) -> Self::AcquireOp {
+        AcquireDeviceSliceOp {
+            buf: Some(self),
+            _access: PhantomData,
+        }
+    }
+    fn acquire_host_view_read(self) -> Self::AcquireReadOp {
+        AcquireDeviceSliceOp {
+            buf: Some(self),
+            _access: PhantomData,
+        }
     }
 }
 
-// ── DeviceSlice acquire ──────────────────────────────────────────────
-
-/// Combinator returned by `DeviceSlice::acquire_host_view`. Allocates
-/// a host scratch `Vec<T>`, enqueues a blocking read into it, hands
-/// back a [`DeviceSliceHostView`] holding both the device buffer and
-/// the populated scratch.
-pub struct AcquireDeviceSliceOp<T> {
+/// Combinator returned by [`DeviceSlice::acquire_host_view`] /
+/// [`DeviceSlice::acquire_host_view_read`]. Enqueues a non-blocking
+/// `clEnqueueMapBuffer` with `deps` as the wait-list and produces a
+/// [`DeviceSliceHostView`].
+pub struct AcquireDeviceSliceOp<T, A: MapAccess> {
     buf: Option<DeviceSlice<T>>,
+    _access: PhantomData<A>,
 }
 
-impl<T> DeviceOperation for AcquireDeviceSliceOp<T>
+impl<T, A> DeviceOperation for AcquireDeviceSliceOp<T, A>
 where
-    T: Clone + Default + Send + 'static,
+    T: Send + 'static,
+    A: MapAccess,
 {
-    type Output = DeviceSliceHostView<T>;
+    type Output = DeviceSliceHostView<T, A>;
 
     fn execute(
         mut self,
         ctx: &ExecutionContext<'_>,
         deps: Deps,
-    ) -> Result<(DeviceSliceHostView<T>, Deps)> {
+    ) -> Result<(Self::Output, Deps)> {
         let buf = self
             .buf
             .take()
             .expect("AcquireDeviceSliceOp::execute called twice");
-        let mut data = vec![T::default(); buf.len()];
-        // .wait() is correctness-required: the host can't deref a
-        // stale Vec when `and_then_host` next runs the closure. CL_TRUE
-        // inside the driver makes this efficient. Deps are passed in
-        // as wait-list so the read is queue-ordered after prior
-        // commands (e.g. an upload or kernel that produced `buf`'s
-        // data).
-        buf.read(ctx, &mut data)
-            .after_all(deps_as_events(&deps))
-            .wait()?;
-        // Blocking read means no new outbound event — the data is
-        // already in `data` by the time we return. The `and_then_host`
-        // that follows runs synchronously on the host.
-        Ok((DeviceSliceHostView { buf, data }, Vec::new()))
+        let queue: &CommandQueue = ctx.cl_queue();
+        let q_raw = queue.get();
+        // Retain the queue for the view's defensive Drop-time unmap
+        // (it might outlive ctx if downstream stages don't release
+        // explicitly).
+        // SAFETY: q_raw was just queried from a live CommandQueue.
+        unsafe { retain_command_queue(q_raw).map_err(cl_to_err)? };
+        let cl_mem = buf.buffer().get();
+        let len = Buffer::len(&buf);
+        let size = len * std::mem::size_of::<T>();
+        let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let (wait_count, wait_ptr) = if wait_list.is_empty() {
+            (0, ptr::null())
+        } else {
+            (wait_list.len() as u32, wait_list.as_ptr())
+        };
+        let mut host_ptr_raw: opencl3::types::cl_mem = ptr::null_mut();
+        // SAFETY: cl_mem is live (we hold the DeviceSlice); the
+        // map size matches the allocation's byte length; deps stays
+        // alive for the call.
+        let map_event = unsafe {
+            enqueue_map_buffer(
+                q_raw,
+                cl_mem,
+                CL_NON_BLOCKING,
+                A::MAP_FLAGS,
+                0,
+                size,
+                &mut host_ptr_raw,
+                wait_count,
+                wait_ptr,
+            )
+            .map_err(cl_to_err)?
+        };
+        let view = DeviceSliceHostView {
+            buf: Some(buf),
+            host_ptr: host_ptr_raw.cast::<T>(),
+            len,
+            map_queue: q_raw,
+            unmap_done: false,
+            _access: PhantomData,
+        };
+        Ok((view, vec![wrap_event(Event::new(map_event))]))
     }
 }
 
 // ── DeviceSliceHostView ─────────────────────────────────────────────
 
-/// Host-side view of a [`DeviceSlice<T>`]. Carries the (now-populated)
-/// host scratch alongside the source device buffer so
-/// [`release_to_device`](Self::release_to_device) can write the scratch
-/// back without re-allocating the buffer.
+/// Host view of a [`DeviceSlice<T>`] — the buffer is mapped into
+/// host memory until `release_to_device` (or `Drop`) unmaps it.
 ///
-/// `Deref<Target = [T]>` + `DerefMut` for in-place host work via
-/// [`DeviceOperationHostExt::and_then_host`](crate::DeviceOperationHostExt::and_then_host).
-pub struct DeviceSliceHostView<T> {
-    buf: DeviceSlice<T>,
-    data: Vec<T>,
+/// `Deref<Target = [T]>` for both access modes;
+/// `DerefMut` only for [`ReadWrite`]. When used as the input to
+/// [`AndThenHost`](crate::AndThenHost), the closure receives
+/// `&'_ [T]` ([`ReadOnly`]) or `&'_ mut [T]` ([`ReadWrite`])
+/// directly — no extra method call on the view needed.
+///
+/// Carries a retained `cl_command_queue` so the defensive
+/// `Drop`-time unmap (fired if `release_to_device` was never called
+/// and the inner [`DeviceSlice`] is about to drop) has a valid
+/// queue handle even if the original Launcher is long gone.
+pub struct DeviceSliceHostView<T, A: MapAccess> {
+    buf: Option<DeviceSlice<T>>,
+    host_ptr: *mut T,
+    len: usize,
+    map_queue: cl_command_queue,
+    unmap_done: bool,
+    _access: PhantomData<A>,
 }
 
-impl<T> Deref for DeviceSliceHostView<T> {
+// SAFETY: cl_command_queue is an opaque handle (retained) and
+// `*mut T` is a mapped pointer the worker accesses serially. See
+// the comment on `DeviceSliceMapHandle` in mappable.rs for the full
+// safety argument; same shape applies here.
+unsafe impl<T: Send, A: MapAccess> Send for DeviceSliceHostView<T, A> {}
+
+impl<T, A: MapAccess> Deref for DeviceSliceHostView<T, A> {
     type Target = [T];
     fn deref(&self) -> &[T] {
-        &self.data
+        // SAFETY: host_ptr is the mapped pointer; remains valid
+        // between map (in acquire) and unmap (in release/Drop). The
+        // OpenCL map gives at least CL_MAP_READ access, so reads are
+        // permitted in both ReadOnly and ReadWrite.
+        unsafe { slice::from_raw_parts(self.host_ptr, self.len) }
     }
 }
 
-impl<T> DerefMut for DeviceSliceHostView<T> {
+impl<T> DerefMut for DeviceSliceHostView<T, ReadWrite> {
     fn deref_mut(&mut self) -> &mut [T] {
-        &mut self.data
+        // SAFETY: same as Deref; the map was acquired with
+        // CL_MAP_WRITE so mutation is permitted. `&mut self` upgrades
+        // the shared-ref guarantee to unique.
+        unsafe { slice::from_raw_parts_mut(self.host_ptr, self.len) }
     }
 }
 
-impl<T> DeviceSliceHostView<T>
+impl<T, A: MapAccess> Drop for DeviceSliceHostView<T, A> {
+    fn drop(&mut self) {
+        if !self.unmap_done
+            && let Some(buf) = self.buf.as_ref()
+        {
+            // Defensive sync unmap: release_to_device was never
+            // called, but we still need to unmap before the inner
+            // DeviceSlice's clReleaseMemObject (in its own Drop)
+            // fires, or the cl_mem is in a "still mapped" state on
+            // release which strict implementations reject.
+            //
+            // SAFETY: host_ptr came from our own acquire; map_queue
+            // and cl_mem are live (we hold the DeviceSlice).
+            unsafe {
+                let res = enqueue_unmap_mem_object(
+                    self.map_queue,
+                    buf.buffer().get(),
+                    self.host_ptr.cast(),
+                    0,
+                    ptr::null(),
+                );
+                if let Ok(ev) = res {
+                    let _ = opencl3::event::wait_for_events(&[ev]);
+                    let _ = release_event(ev);
+                }
+            }
+        }
+        // SAFETY: queue was retained in acquire; release exactly once.
+        unsafe { let _ = release_command_queue(self.map_queue); }
+    }
+}
+
+impl<T, A> DeviceSliceHostView<T, A>
 where
     T: Send + 'static,
+    A: MapAccess,
 {
-    /// Yield a [`DeviceOperation`] that writes the host scratch back
-    /// into the device buffer and returns the buffer.
-    pub fn release_to_device(self) -> ReleaseDeviceSliceOp<T> {
+    /// Enqueue the matching `clEnqueueUnmapMemObject` and yield the
+    /// underlying [`DeviceSlice`] back so subsequent device stages
+    /// can use it.
+    pub fn release_to_device(self) -> ReleaseDeviceSliceOp<T, A> {
         ReleaseDeviceSliceOp { view: Some(self) }
     }
 }
 
-// ── DeviceSlice release ─────────────────────────────────────────────
-
-/// Combinator returned by [`DeviceSliceHostView::release_to_device`].
-/// Enqueues a blocking write from the host scratch back into the
-/// device buffer, then yields the buffer.
-pub struct ReleaseDeviceSliceOp<T> {
-    view: Option<DeviceSliceHostView<T>>,
+/// Combinator returned by
+/// [`DeviceSliceHostView::release_to_device`]. Enqueues
+/// `clEnqueueUnmapMemObject` waiting on `deps`, returns the
+/// [`DeviceSlice`] and the unmap event.
+pub struct ReleaseDeviceSliceOp<T, A: MapAccess> {
+    view: Option<DeviceSliceHostView<T, A>>,
 }
 
-impl<T> DeviceOperation for ReleaseDeviceSliceOp<T>
+impl<T, A> DeviceOperation for ReleaseDeviceSliceOp<T, A>
 where
     T: Send + 'static,
+    A: MapAccess,
 {
     type Output = DeviceSlice<T>;
 
     fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(DeviceSlice<T>, Deps)> {
-        let view = self
+        let mut view = self
             .view
             .take()
             .expect("ReleaseDeviceSliceOp::execute called twice");
-        let DeviceSliceHostView { mut buf, data } = view;
-        // Non-blocking write — the keep-alive on `data` is provided
-        // by `register_drop_callback` so the Vec lives until OpenCL
-        // is done reading.
-        let event = buf
-            .write(ctx, &data)
-            .after_all(deps_as_events(&deps))
-            .submit()?;
-        claspr::register_drop_callback(&event, Box::new(data))?;
-        Ok((buf, vec![wrap_event(event)]))
+        let buf = view
+            .buf
+            .take()
+            .expect("DeviceSliceHostView already released");
+        let q_raw = ctx.cl_queue().get();
+        let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let (wait_count, wait_ptr) = if wait_list.is_empty() {
+            (0, ptr::null())
+        } else {
+            (wait_list.len() as u32, wait_list.as_ptr())
+        };
+        // SAFETY: host_ptr is the mapped pointer from acquire;
+        // cl_mem is the buffer it was mapped from.
+        let unmap_event = unsafe {
+            enqueue_unmap_mem_object(
+                q_raw,
+                buf.buffer().get(),
+                view.host_ptr.cast(),
+                wait_count,
+                wait_ptr,
+            )
+            .map_err(cl_to_err)?
+        };
+        view.unmap_done = true; // suppress Drop's defensive unmap
+        // view drops here — only the retained queue release fires.
+        Ok((buf, vec![wrap_event(Event::new(unmap_event))]))
     }
+}
+
+// ── Mappable for DeviceSliceHostView (closure-direct integration) ───
+
+/// `MapHandle` for the host-view Mappable impls. The view is already
+/// mapped; this just carries the pointer + len into the worker
+/// thread so the closure can construct a slice.
+pub struct HostViewHandle<T> {
+    ptr: *mut T,
+    len: usize,
+    _t: PhantomData<T>,
+}
+
+unsafe impl<T: Send> Send for HostViewHandle<T> {}
+
+impl<T> Mappable for DeviceSliceHostView<T, ReadWrite>
+where
+    T: Send + 'static,
+{
+    type View<'a>
+        = &'a mut [T]
+    where
+        Self: 'a;
+    type MapHandle = HostViewHandle<T>;
+
+    fn map(
+        &self,
+        _queue: &CommandQueue,
+        _deps: &[cl_event],
+    ) -> Result<(Self::MapHandle, Vec<Event>)> {
+        // Already mapped via acquire — no CL command. The map event
+        // that gated coherence is in source_evts (the worker waits
+        // on it before calling view()).
+        Ok((
+            HostViewHandle {
+                ptr: self.host_ptr,
+                len: self.len,
+                _t: PhantomData,
+            },
+            Vec::new(),
+        ))
+    }
+    fn enqueue_unmap(
+        _handle: &mut Self::MapHandle,
+        _queue: &CommandQueue,
+        _wait_for: &[cl_event],
+    ) -> Result<Vec<Event>> {
+        // View stays mapped past the and_then_host closure; the user
+        // calls release_to_device when ready.
+        Ok(Vec::new())
+    }
+    fn view<'a>(handle: &'a mut Self::MapHandle) -> Self::View<'a> {
+        // SAFETY: see DeviceSliceHostView::deref_mut. The MapHandle
+        // borrow is unique on the worker thread.
+        unsafe { slice::from_raw_parts_mut(handle.ptr, handle.len) }
+    }
+    fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {
+        // No unmap was enqueued by us — nothing to do on error path.
+    }
+}
+
+impl<T> Mappable for DeviceSliceHostView<T, ReadOnly>
+where
+    T: Send + Sync + 'static,
+{
+    type View<'a>
+        = &'a [T]
+    where
+        Self: 'a;
+    type MapHandle = HostViewHandle<T>;
+
+    fn map(
+        &self,
+        _queue: &CommandQueue,
+        _deps: &[cl_event],
+    ) -> Result<(Self::MapHandle, Vec<Event>)> {
+        Ok((
+            HostViewHandle {
+                ptr: self.host_ptr,
+                len: self.len,
+                _t: PhantomData,
+            },
+            Vec::new(),
+        ))
+    }
+    fn enqueue_unmap(
+        _handle: &mut Self::MapHandle,
+        _queue: &CommandQueue,
+        _wait_for: &[cl_event],
+    ) -> Result<Vec<Event>> {
+        Ok(Vec::new())
+    }
+    fn view<'a>(handle: &'a mut Self::MapHandle) -> Self::View<'a> {
+        // SAFETY: see DeviceSliceHostView::deref. The buffer was
+        // mapped with CL_MAP_READ; we hand out an immutable slice.
+        unsafe { slice::from_raw_parts(handle.ptr, handle.len) }
+    }
+    fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
 }
 
 // ── HostBuffer: zero-copy — acquire/release are no-ops ──────────────
@@ -202,15 +464,19 @@ where
     T: Send + 'static,
 {
     type AcquireOp = AcquireHostBufferOp<T>;
+    type AcquireReadOp = AcquireHostBufferOp<T>;
     fn acquire_host_view(self) -> AcquireHostBufferOp<T> {
+        AcquireHostBufferOp { buf: Some(self) }
+    }
+    fn acquire_host_view_read(self) -> AcquireHostBufferOp<T> {
         AcquireHostBufferOp { buf: Some(self) }
     }
 }
 
-/// Combinator returned by `HostBuffer::acquire_host_view`. No CL
-/// command — the buffer is permanently mapped already
+/// Combinator returned by `HostBuffer::acquire_host_view{,_read}`. No
+/// CL command — the buffer is permanently mapped already
 /// (`CL_MEM_ALLOC_HOST_PTR` + persistent map), so the view just wraps
-/// the buf and lets the host Deref-access the existing mapped pointer.
+/// the buf.
 pub struct AcquireHostBufferOp<T> {
     buf: Option<HostBuffer<T>>,
 }
@@ -234,15 +500,15 @@ where
         // to wait on pending device writes before the host derefs the
         // map. Drain deps synchronously and forward an empty list.
         for ev in &deps {
-            ev.wait()?;
+            ev.as_ref().wait()?;
         }
         Ok((HostBufferHostView { buf }, Vec::new()))
     }
 }
 
-/// Host-side view of a [`HostBuffer<T>`]. Same shape as
-/// [`DeviceSliceHostView`] but DerefMut goes straight to the
-/// always-mapped host pointer — no extra scratch buffer.
+/// Host view of a [`HostBuffer<T>`]. Same shape as
+/// [`DeviceSliceHostView`] but the underlying pointer is the
+/// HostBuffer's always-mapped one.
 pub struct HostBufferHostView<T> {
     buf: HostBuffer<T>,
 }
@@ -297,6 +563,46 @@ where
     }
 }
 
+/// Mappable impl so a `HostBufferHostView` can pass its inner
+/// slice straight into an [`AndThenHost`](crate::AndThenHost) closure.
+impl<T> Mappable for HostBufferHostView<T>
+where
+    T: Send + 'static,
+{
+    type View<'a>
+        = &'a mut [T]
+    where
+        Self: 'a;
+    type MapHandle = HostViewHandle<T>;
+
+    fn map(
+        &self,
+        _queue: &CommandQueue,
+        _deps: &[cl_event],
+    ) -> Result<(Self::MapHandle, Vec<Event>)> {
+        let ptr = self.buf.as_ptr() as *mut T;
+        Ok((
+            HostViewHandle {
+                ptr,
+                len: self.buf.len(),
+                _t: PhantomData,
+            },
+            Vec::new(),
+        ))
+    }
+    fn enqueue_unmap(
+        _handle: &mut Self::MapHandle,
+        _queue: &CommandQueue,
+        _wait_for: &[cl_event],
+    ) -> Result<Vec<Event>> {
+        Ok(Vec::new())
+    }
+    fn view<'a>(handle: &'a mut Self::MapHandle) -> Self::View<'a> {
+        unsafe { slice::from_raw_parts_mut(handle.ptr, handle.len) }
+    }
+    fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
+}
+
 // ── SharedBuffer: clEnqueueSVMMap (blocking) + clEnqueueSVMUnmap ────
 
 impl<T> HostAccessibleExt for SharedBuffer<T>
@@ -304,7 +610,11 @@ where
     T: Send + 'static,
 {
     type AcquireOp = AcquireSharedBufferOp<T>;
+    type AcquireReadOp = AcquireSharedBufferOp<T>;
     fn acquire_host_view(self) -> AcquireSharedBufferOp<T> {
+        AcquireSharedBufferOp { buf: Some(self) }
+    }
+    fn acquire_host_view_read(self) -> AcquireSharedBufferOp<T> {
         AcquireSharedBufferOp { buf: Some(self) }
     }
 }
@@ -336,10 +646,7 @@ where
         let q_raw: cl_command_queue = ctx.cl_queue().get();
         let size = buf.len() * std::mem::size_of::<T>();
         let ptr = buf.ptr();
-        // Pass deps as the map's wait-list — the blocking map then
-        // returns only after prior device work is done.
-        let wait_list: Vec<opencl3::types::cl_event> =
-            deps.iter().map(|d| d.as_ref().get()).collect();
+        let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let (wait_count, wait_ptr) = if wait_list.is_empty() {
             (0, ptr::null())
         } else {
@@ -347,14 +654,12 @@ where
         };
         // SAFETY: blocking SVM map (CL_TRUE). `ptr` came from
         // clSVMAlloc on the same context; `size` is the allocation's
-        // exact byte length. CL_MAP_READ | CL_MAP_WRITE gives full
-        // coherent host access. Map flags `3` = READ|WRITE per the CL
-        // spec (CL_MAP_READ=1, CL_MAP_WRITE=2).
+        // exact byte length.
         let evt = unsafe {
             enqueue_svm_map(
                 q_raw,
                 CL_BLOCKING,
-                opencl3::memory::CL_MAP_READ | opencl3::memory::CL_MAP_WRITE,
+                CL_MAP_READ | CL_MAP_WRITE,
                 ptr.cast(),
                 size,
                 wait_count,
@@ -362,16 +667,9 @@ where
             )
             .map_err(cl_to_err)?
         };
-        // Keep deps alive across the enqueue.
         drop(deps);
-        // SAFETY: blocking-map returned an event — release it immediately
-        // (we don't need to track it; the map is already done).
         unsafe { release_event(evt).map_err(cl_to_err)? };
-        // Retain the queue handle so it stays alive for the matching
-        // unmap on release. Mirrors what claspr's
-        // `SharedReadGuard::new` does for the same reason.
         unsafe { retain_command_queue(q_raw).map_err(cl_to_err)? };
-        // Map was blocking, so no outbound event — host work next.
         Ok((
             SharedBufferHostView {
                 buf: Some(buf),
@@ -382,19 +680,7 @@ where
     }
 }
 
-/// Host-side view of a [`SharedBuffer<T>`] — a live SVM map.
-///
-/// **Drop hazard**: the inner [`SharedBuffer`]'s own Drop fires a
-/// `clEnqueueSVMFree` on the Context's default in-order queue (per
-/// Phase 0 fix). The map we issued lives on a *different* queue
-/// (the chain's OOO queue), so there's no implicit ordering between
-/// the unmap and the free. We *must* unmap (and wait for the unmap
-/// event) before letting the inner SharedBuffer drop. Drop below
-/// does that; [`release_to_device`](Self::release_to_device) takes
-/// the same path, then yields the buffer back.
-///
-/// `buf` is wrapped in `Option<>` so `release_to_device` can take it
-/// out — Drop then becomes a no-op on the post-release path.
+/// Host view of a [`SharedBuffer<T>`] — a live SVM map.
 pub struct SharedBufferHostView<T> {
     buf: Option<SharedBuffer<T>>,
     /// Retained `cl_command_queue` handle for the matching SVM unmap.
@@ -407,14 +693,7 @@ unsafe impl<T: Send> Send for SharedBufferHostView<T> {}
 
 impl<T> SharedBufferHostView<T> {
     /// Shared helper for the unmap sequence used by both the explicit
-    /// release path and the implicit Drop path. Returns the buffer
-    /// back; the queue handle is released as a side effect. Errors are
-    /// returned (release) or sunk into the sticky-error counter (Drop).
-    ///
-    /// Records the unmap event as the buffer's `last_use` so its own
-    /// Drop's `clEnqueueSVMFree` queue-orders after the unmap. No
-    /// host-side wait — the cross-queue dependency is expressed
-    /// device-side via the free's wait-list.
+    /// release path and the implicit Drop path.
     fn unmap(&mut self) -> Result<Option<SharedBuffer<T>>> {
         let Some(buf) = self.buf.take() else {
             return Ok(None);
@@ -422,11 +701,7 @@ impl<T> SharedBufferHostView<T> {
         // SAFETY: ptr was mapped in acquire; unmap exactly once.
         let evt = unsafe { enqueue_svm_unmap(self.queue, buf.ptr().cast(), 0, ptr::null()) }
             .map_err(cl_to_err)?;
-        // Wrap the raw cl_event so its Drop releases the reference we
-        // got back from enqueue. Push an Arc<Event> onto the SharedBuffer's
-        // in-flight-use list so its `clEnqueueSVMFree` waits on the
-        // unmap before freeing.
-        let event = std::sync::Arc::new(opencl3::event::Event::new(evt));
+        let event = std::sync::Arc::new(Event::new(evt));
         buf.register_use(event);
         // SAFETY: the queue handle was retained in acquire; release
         // exactly once here.
@@ -437,16 +712,9 @@ impl<T> SharedBufferHostView<T> {
 
 impl<T> Drop for SharedBufferHostView<T> {
     fn drop(&mut self) {
-        // If the user already called release_to_device, `buf` is None
-        // and unmap is a no-op. Otherwise we're on the panic / early-
-        // exit path: do the unmap synchronously so the inner buf can
-        // safely drop afterwards.
         match self.unmap() {
             Ok(_) => {}
             Err(_) => {
-                // Errors here are unrecoverable. The buf, if any, is
-                // still around (because unmap took it). Stash an
-                // error on its context before dropping it.
                 if let Some(buf) = self.buf.take() {
                     buf.ctx().record_err();
                 }
@@ -486,9 +754,6 @@ where
     T: Send + 'static,
 {
     /// Symmetric counterpart of [`HostAccessibleExt::acquire_host_view`].
-    /// Issues the `clEnqueueSVMUnmap`, waits for it to complete (so
-    /// the buffer is safe to drop on a different queue afterwards),
-    /// and yields the [`SharedBuffer`] back.
     pub fn release_to_device(self) -> ReleaseSharedBufferOp<T> {
         ReleaseSharedBufferOp { view: Some(self) }
     }
@@ -514,14 +779,60 @@ where
             .view
             .take()
             .expect("ReleaseSharedBufferOp::execute called twice");
-        // Drain any deps from parallel branches before unmapping —
-        // unmap is queue-local and won't otherwise see them.
         for ev in &deps {
-            ev.wait()?;
+            ev.as_ref().wait()?;
         }
         let buf = view.unmap()?.expect("view's buf was already released");
-        // view's Drop runs now — buf is None, no-op. unmap already
-        // waited internally, so we return no outbound events.
         Ok((buf, Vec::new()))
     }
+}
+
+/// Mappable impl so a `SharedBufferHostView` can pass its inner
+/// slice straight into an [`AndThenHost`](crate::AndThenHost) closure.
+impl<T> Mappable for SharedBufferHostView<T>
+where
+    T: Send + 'static,
+{
+    type View<'a>
+        = &'a mut [T]
+    where
+        Self: 'a;
+    type MapHandle = HostViewHandle<T>;
+
+    fn map(
+        &self,
+        _queue: &CommandQueue,
+        _deps: &[cl_event],
+    ) -> Result<(Self::MapHandle, Vec<Event>)> {
+        let buf = self
+            .buf
+            .as_ref()
+            .expect("SharedBufferHostView already released");
+        Ok((
+            HostViewHandle {
+                ptr: buf.ptr(),
+                len: buf.len(),
+                _t: PhantomData,
+            },
+            Vec::new(),
+        ))
+    }
+    fn enqueue_unmap(
+        _handle: &mut Self::MapHandle,
+        _queue: &CommandQueue,
+        _wait_for: &[cl_event],
+    ) -> Result<Vec<Event>> {
+        Ok(Vec::new())
+    }
+    fn view<'a>(handle: &'a mut Self::MapHandle) -> Self::View<'a> {
+        unsafe { slice::from_raw_parts_mut(handle.ptr, handle.len) }
+    }
+    fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
+}
+
+// Suppress the unused import warning for `deps_as_events` — kept
+// available for future variants that need it.
+#[allow(dead_code)]
+fn _unused_deps_as_events_keepalive(d: &Deps) -> impl Iterator<Item = &Event> {
+    deps_as_events(d)
 }
