@@ -11,6 +11,8 @@ members = [
     "examples/sobel-kernel",
     "examples/image-pipeline",
     "examples/two-device",
+    "examples/async-pipeline",
+    "examples/batch-inference",
     "tests/kernels",
     "tests/tier1",
     "tests/tier2",

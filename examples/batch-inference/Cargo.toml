@@ -1,0 +1,22 @@
+[package]
+name = "batch-inference-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "fan_out over N independent batches sharing an Arc<[T]> weight buffer"
+
+[[bin]]
+name = "batch_inference_example"
+path = "src/main.rs"
+
+[dependencies]
+claspr = { path = "../../claspr" }
+claspr-async = { path = "../../claspr-async" }
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true

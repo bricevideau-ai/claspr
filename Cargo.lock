@@ -49,10 +49,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "async-pipeline-example"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+ "claspr-async",
+ "claspr-build",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+
+[[package]]
+name = "batch-inference-example"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+ "claspr-async",
+ "claspr-build",
+]
 
 [[package]]
 name = "bit-set"
@@ -230,6 +248,7 @@ name = "claspr-test-kernels"
 version = "0.0.0"
 dependencies = [
  "claspr",
+ "claspr-async",
  "claspr-build",
 ]
 
@@ -265,6 +284,7 @@ name = "collatz-example"
 version = "0.0.0"
 dependencies = [
  "claspr",
+ "claspr-async",
  "claspr-build",
 ]
 
@@ -789,6 +809,7 @@ name = "mandelbrot-kernel"
 version = "0.0.0"
 dependencies = [
  "claspr",
+ "claspr-async",
  "claspr-build",
  "num-complex",
 ]
@@ -999,6 +1020,7 @@ name = "raymarch-example"
 version = "0.0.0"
 dependencies = [
  "claspr",
+ "claspr-async",
  "claspr-build",
  "spirv-std",
 ]
@@ -1265,6 +1287,7 @@ name = "sobel-kernel"
 version = "0.0.0"
 dependencies = [
  "claspr",
+ "claspr-async",
  "claspr-build",
 ]
 
