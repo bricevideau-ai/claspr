@@ -49,17 +49,16 @@ use crate::exec_ctx::ExecutionContext;
 use crate::mappable::Mappable;
 use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
 use claspr::{Buffer, DeviceSlice, Error, Event, HostBuffer, Launcher, Result, SharedBuffer};
+use claspr::util::{RetainedQueue, mapped_slice, mapped_slice_mut};
 use opencl3::command_queue::{
     CommandQueue, enqueue_map_buffer, enqueue_svm_map, enqueue_svm_unmap,
-    enqueue_unmap_mem_object, release_command_queue, retain_command_queue,
+    enqueue_unmap_mem_object,
 };
-use opencl3::event::release_event;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, ClMem};
-use opencl3::types::{CL_NON_BLOCKING, cl_command_queue, cl_event, cl_map_flags};
+use opencl3::types::{CL_NON_BLOCKING, cl_event, cl_map_flags};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
-use std::slice;
 
 /// Wrap a raw cl3 status code into our typed [`Error`].
 fn cl_to_err(code: opencl3::types::cl_int) -> Error {
@@ -170,12 +169,10 @@ where
             .take()
             .expect("AcquireDeviceSliceOp::execute called twice");
         let queue: &CommandQueue = ctx.cl_queue();
-        let q_raw = queue.get();
         // Retain the queue for the view's defensive Drop-time unmap
         // (it might outlive ctx if downstream stages don't release
         // explicitly).
-        // SAFETY: q_raw was just queried from a live CommandQueue.
-        unsafe { retain_command_queue(q_raw).map_err(cl_to_err)? };
+        let map_queue = RetainedQueue::from_queue(queue)?;
         let cl_mem = buf.buffer().get();
         let len = Buffer::len(&buf);
         let size = len * std::mem::size_of::<T>();
@@ -191,7 +188,7 @@ where
         // alive for the call.
         let map_event = unsafe {
             enqueue_map_buffer(
-                q_raw,
+                map_queue.raw(),
                 cl_mem,
                 CL_NON_BLOCKING,
                 A::MAP_FLAGS,
@@ -207,7 +204,7 @@ where
             buf: Some(buf),
             host_ptr: host_ptr_raw.cast::<T>(),
             len,
-            map_queue: q_raw,
+            map_queue,
             unmap_done: false,
             _access: PhantomData,
         };
@@ -226,23 +223,24 @@ where
 /// `&'_ [T]` ([`ReadOnly`]) or `&'_ mut [T]` ([`ReadWrite`])
 /// directly — no extra method call on the view needed.
 ///
-/// Carries a retained `cl_command_queue` so the defensive
-/// `Drop`-time unmap (fired if `release_to_device` was never called
-/// and the inner [`DeviceSlice`] is about to drop) has a valid
-/// queue handle even if the original Launcher is long gone.
+/// Carries a [`RetainedQueue`] so the defensive `Drop`-time unmap
+/// (fired if `release_to_device` was never called and the inner
+/// [`DeviceSlice`] is about to drop) has a valid queue handle even
+/// if the original Launcher is long gone. The retain pair is owned
+/// by the field's `Drop` — see the impl below.
 pub struct DeviceSliceHostView<T, A: MapAccess> {
     buf: Option<DeviceSlice<T>>,
     host_ptr: *mut T,
     len: usize,
-    map_queue: cl_command_queue,
+    map_queue: RetainedQueue,
     unmap_done: bool,
     _access: PhantomData<A>,
 }
 
-// SAFETY: cl_command_queue is an opaque handle (retained) and
-// `*mut T` is a mapped pointer the worker accesses serially. See
-// the comment on `DeviceSliceMapHandle` in mappable.rs for the full
-// safety argument; same shape applies here.
+// SAFETY: `*mut T` is a mapped pointer that worker code accesses
+// serially under unique borrow rules (see the doc on
+// `DeviceSliceMapHandle` in mappable.rs). `RetainedQueue` is Send
+// on its own.
 unsafe impl<T: Send, A: MapAccess> Send for DeviceSliceHostView<T, A> {}
 
 impl<T, A: MapAccess> Deref for DeviceSliceHostView<T, A> {
@@ -252,7 +250,7 @@ impl<T, A: MapAccess> Deref for DeviceSliceHostView<T, A> {
         // between map (in acquire) and unmap (in release/Drop). The
         // OpenCL map gives at least CL_MAP_READ access, so reads are
         // permitted in both ReadOnly and ReadWrite.
-        unsafe { slice::from_raw_parts(self.host_ptr, self.len) }
+        unsafe { mapped_slice(self.host_ptr, self.len) }
     }
 }
 
@@ -261,7 +259,7 @@ impl<T> DerefMut for DeviceSliceHostView<T, ReadWrite> {
         // SAFETY: same as Deref; the map was acquired with
         // CL_MAP_WRITE so mutation is permitted. `&mut self` upgrades
         // the shared-ref guarantee to unique.
-        unsafe { slice::from_raw_parts_mut(self.host_ptr, self.len) }
+        unsafe { mapped_slice_mut(self.host_ptr, self.len) }
     }
 }
 
@@ -277,23 +275,25 @@ impl<T, A: MapAccess> Drop for DeviceSliceHostView<T, A> {
             // release which strict implementations reject.
             //
             // SAFETY: host_ptr came from our own acquire; map_queue
-            // and cl_mem are live (we hold the DeviceSlice).
-            unsafe {
-                let res = enqueue_unmap_mem_object(
-                    self.map_queue,
+            // and cl_mem are live (we hold the DeviceSlice). Wrap
+            // the resulting cl_event in claspr::Event so its Drop
+            // releases it without an explicit release_event call.
+            let res = unsafe {
+                enqueue_unmap_mem_object(
+                    self.map_queue.raw(),
                     buf.buffer().get(),
                     self.host_ptr.cast(),
                     0,
                     ptr::null(),
-                );
-                if let Ok(ev) = res {
-                    let _ = opencl3::event::wait_for_events(&[ev]);
-                    let _ = release_event(ev);
-                }
+                )
+            };
+            if let Ok(ev) = res {
+                let _ = opencl3::event::wait_for_events(&[ev]);
+                let _ = Event::new(ev); // drops, releases the event
             }
         }
-        // SAFETY: queue was retained in acquire; release exactly once.
-        unsafe { let _ = release_command_queue(self.map_queue); }
+        // The `map_queue: RetainedQueue` field drops after this body
+        // returns and releases the queue handle.
     }
 }
 
@@ -354,7 +354,7 @@ where
             .map_err(cl_to_err)?
         };
         view.unmap_done = true; // suppress Drop's defensive unmap
-        // view drops here — only the retained queue release fires.
+        // view drops here — only the RetainedQueue release fires.
         Ok((buf, vec![wrap_event(Event::new(unmap_event))]))
     }
 }
@@ -411,7 +411,7 @@ where
     fn view<'a>(handle: &'a mut Self::MapHandle) -> Self::View<'a> {
         // SAFETY: see DeviceSliceHostView::deref_mut. The MapHandle
         // borrow is unique on the worker thread.
-        unsafe { slice::from_raw_parts_mut(handle.ptr, handle.len) }
+        unsafe { mapped_slice_mut(handle.ptr, handle.len) }
     }
     fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {
         // No unmap was enqueued by us — nothing to do on error path.
@@ -452,7 +452,7 @@ where
     fn view<'a>(handle: &'a mut Self::MapHandle) -> Self::View<'a> {
         // SAFETY: see DeviceSliceHostView::deref. The buffer was
         // mapped with CL_MAP_READ; we hand out an immutable slice.
-        unsafe { slice::from_raw_parts(handle.ptr, handle.len) }
+        unsafe { mapped_slice(handle.ptr, handle.len) }
     }
     fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
 }
@@ -598,7 +598,7 @@ where
         Ok(Vec::new())
     }
     fn view<'a>(handle: &'a mut Self::MapHandle) -> Self::View<'a> {
-        unsafe { slice::from_raw_parts_mut(handle.ptr, handle.len) }
+        unsafe { mapped_slice_mut(handle.ptr, handle.len) }
     }
     fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
 }
@@ -652,12 +652,10 @@ where
             .buf
             .take()
             .expect("AcquireSharedBufferOp::execute called twice");
-        let q_raw: cl_command_queue = ctx.cl_queue().get();
         let size = buf.len() * std::mem::size_of::<T>();
         let ptr = buf.ptr();
         // Retain the queue for the view's defensive Drop-time unmap.
-        // SAFETY: q_raw was just queried from a live CommandQueue.
-        unsafe { retain_command_queue(q_raw).map_err(cl_to_err)? };
+        let queue = RetainedQueue::from_queue(ctx.cl_queue())?;
         let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let (wait_count, wait_ptr) = if wait_list.is_empty() {
             (0, ptr::null())
@@ -670,7 +668,7 @@ where
         // `deps` Vec.
         let map_event = unsafe {
             enqueue_svm_map(
-                q_raw,
+                queue.raw(),
                 CL_NON_BLOCKING,
                 A::MAP_FLAGS,
                 ptr.cast(),
@@ -682,7 +680,7 @@ where
         };
         let view = SharedBufferHostView {
             buf: Some(buf),
-            queue: q_raw,
+            queue,
             unmap_done: false,
             _access: PhantomData,
         };
@@ -698,16 +696,15 @@ where
 pub struct SharedBufferHostView<T, A: MapAccess> {
     buf: Option<SharedBuffer<T>>,
     /// Retained `cl_command_queue` handle for the matching SVM unmap.
-    queue: cl_command_queue,
+    queue: RetainedQueue,
     /// Set to `true` once `release_to_device` enqueued the unmap, so
     /// the view's `Drop` skips the defensive synchronous unmap.
     unmap_done: bool,
     _access: PhantomData<A>,
 }
 
-// SAFETY: cl_command_queue is an opaque handle; we hold a retained
-// reference. The SharedBuffer inside is itself Send (per its own
-// impl).
+// SAFETY: SharedBuffer is itself Send (per its own impl). The
+// queue is wrapped in RetainedQueue which is independently Send.
 unsafe impl<T: Send, A: MapAccess> Send for SharedBufferHostView<T, A> {}
 
 impl<T, A: MapAccess> Drop for SharedBufferHostView<T, A> {
@@ -723,7 +720,9 @@ impl<T, A: MapAccess> Drop for SharedBufferHostView<T, A> {
             //
             // SAFETY: ptr was mapped in acquire; unmap exactly once
             // per acquire (we never reach this branch if unmap_done).
-            let res = unsafe { enqueue_svm_unmap(self.queue, buf.ptr().cast(), 0, ptr::null()) };
+            let res = unsafe {
+                enqueue_svm_unmap(self.queue.raw(), buf.ptr().cast(), 0, ptr::null())
+            };
             match res {
                 Ok(evt) => {
                     let _ = opencl3::event::wait_for_events(&[evt]);
@@ -734,10 +733,8 @@ impl<T, A: MapAccess> Drop for SharedBufferHostView<T, A> {
                 }
             }
         }
-        // SAFETY: queue was retained in acquire; release exactly once.
-        unsafe {
-            let _ = release_command_queue(self.queue);
-        }
+        // The `queue: RetainedQueue` field drops after this body
+        // returns and releases the queue handle.
     }
 }
 
@@ -751,7 +748,7 @@ impl<T, A: MapAccess> Deref for SharedBufferHostView<T, A> {
         // SAFETY: the SVM pointer is valid and mapped between
         // acquire's clEnqueueSVMMap and release's / Drop's unmap.
         // CL_MAP_READ is always granted (both access modes set it).
-        unsafe { slice::from_raw_parts(buf.ptr(), buf.len()) }
+        unsafe { mapped_slice(buf.ptr(), buf.len()) }
     }
 }
 
@@ -764,7 +761,7 @@ impl<T> DerefMut for SharedBufferHostView<T, ReadWrite> {
         // SAFETY: same as Deref — plus the SVM map was acquired with
         // CL_MAP_WRITE (ReadWrite::MAP_FLAGS includes it) so mutation
         // is permitted by the OpenCL runtime.
-        unsafe { slice::from_raw_parts_mut(buf.ptr(), buf.len()) }
+        unsafe { mapped_slice_mut(buf.ptr(), buf.len()) }
     }
 }
 
@@ -873,7 +870,7 @@ where
         Ok(Vec::new())
     }
     fn view<'a>(handle: &'a mut Self::MapHandle) -> Self::View<'a> {
-        unsafe { slice::from_raw_parts_mut(handle.ptr, handle.len) }
+        unsafe { mapped_slice_mut(handle.ptr, handle.len) }
     }
     fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
 }
@@ -914,7 +911,7 @@ where
         Ok(Vec::new())
     }
     fn view<'a>(handle: &'a mut Self::MapHandle) -> Self::View<'a> {
-        unsafe { slice::from_raw_parts(handle.ptr, handle.len) }
+        unsafe { mapped_slice(handle.ptr, handle.len) }
     }
     fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
 }

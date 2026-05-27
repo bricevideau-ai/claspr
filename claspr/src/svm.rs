@@ -42,16 +42,13 @@ use crate::context::{Context, SvmLevel};
 use crate::error::{Error, Result};
 use crate::launch::KernelArg;
 use crate::queue::Launcher;
-use opencl3::command_queue::{
-    enqueue_svm_map, enqueue_svm_unmap, release_command_queue, retain_command_queue,
-};
+use opencl3::command_queue::{enqueue_svm_map, enqueue_svm_unmap};
 use opencl3::event::{Event, release_event};
 use opencl3::kernel::ExecuteKernel;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, CL_MEM_READ_WRITE, svm_alloc};
-use opencl3::types::{CL_BLOCKING, cl_command_queue, cl_event, cl_int, cl_uint};
+use opencl3::types::{CL_BLOCKING, cl_event, cl_int, cl_uint};
 use std::ops::{Deref, DerefMut};
 use std::ptr;
-use std::slice;
 use std::sync::{Arc, Mutex};
 
 fn cl_to_err(code: cl_int) -> Error {
@@ -284,19 +281,19 @@ impl<T> KernelArg for SharedBuffer<T> {
 // ── Map guards ──────────────────────────────────────────────────────
 
 /// RAII guard for a SVM read map. Drop issues `clEnqueueSVMUnmap`
-/// and releases the retained queue handle.
+/// and the inner `RetainedQueue` releases the queue handle.
 pub struct SharedReadGuard<'a, T> {
     buf: &'a SharedBuffer<T>,
-    queue: cl_command_queue,
+    queue: crate::util::RetainedQueue,
 }
 
 impl<'a, T> SharedReadGuard<'a, T> {
     fn new<L: Launcher>(buf: &'a SharedBuffer<T>, launcher: &L) -> Result<Self> {
-        let q_raw: cl_command_queue = launcher.cl_queue().get();
-        // SAFETY: blocking map for read; queue is alive (we hold &launcher).
+        let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
+        // SAFETY: blocking map for read; queue is alive (RetainedQueue).
         let evt = unsafe {
             enqueue_svm_map(
-                q_raw,
+                queue.raw(),
                 CL_BLOCKING,
                 CL_MAP_READ,
                 buf.ptr.cast(),
@@ -307,9 +304,7 @@ impl<'a, T> SharedReadGuard<'a, T> {
             .map_err(cl_to_err)?
         };
         unsafe { release_event(evt).map_err(cl_to_err)? };
-        // Retain the queue so its handle stays valid for unmap on Drop.
-        unsafe { retain_command_queue(q_raw).map_err(cl_to_err)? };
-        Ok(SharedReadGuard { buf, queue: q_raw })
+        Ok(SharedReadGuard { buf, queue })
     }
 }
 
@@ -318,42 +313,42 @@ impl<T> Deref for SharedReadGuard<'_, T> {
     fn deref(&self) -> &[T] {
         // SAFETY: the SVM pointer is valid + mapped for read for
         // this guard's lifetime.
-        unsafe { slice::from_raw_parts(self.buf.ptr, self.buf.len) }
+        unsafe { crate::util::mapped_slice(self.buf.ptr, self.buf.len) }
     }
 }
 
 impl<T> Drop for SharedReadGuard<'_, T> {
     fn drop(&mut self) {
         // SAFETY: ptr was mapped in `new`; unmap exactly once now.
-        let unmap = unsafe { enqueue_svm_unmap(self.queue, self.buf.ptr.cast(), 0, ptr::null()) };
+        // The `queue: RetainedQueue` field drops after this body
+        // returns, releasing the queue handle.
+        let unmap = unsafe {
+            enqueue_svm_unmap(self.queue.raw(), self.buf.ptr.cast(), 0, ptr::null())
+        };
         if let Ok(evt) = unmap {
             let _ = unsafe { release_event(evt) };
         } else {
-            self.buf.ctx.record_err();
-        }
-        let rel = unsafe { release_command_queue(self.queue) };
-        if rel.is_err() {
             self.buf.ctx.record_err();
         }
     }
 }
 
 /// RAII guard for a SVM write map. Drop issues `clEnqueueSVMUnmap`
-/// and releases the retained queue handle.
+/// and the inner `RetainedQueue` releases the queue handle.
 pub struct SharedWriteGuard<'a, T> {
     buf: &'a mut SharedBuffer<T>,
-    queue: cl_command_queue,
+    queue: crate::util::RetainedQueue,
 }
 
 impl<'a, T> SharedWriteGuard<'a, T> {
     fn new<L: Launcher>(buf: &'a mut SharedBuffer<T>, launcher: &L) -> Result<Self> {
-        let q_raw: cl_command_queue = launcher.cl_queue().get();
+        let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
         let ptr = buf.ptr;
         let len = buf.len;
         // SAFETY: blocking map for read+write.
         let evt = unsafe {
             enqueue_svm_map(
-                q_raw,
+                queue.raw(),
                 CL_BLOCKING,
                 CL_MAP_READ | CL_MAP_WRITE,
                 ptr.cast(),
@@ -364,8 +359,7 @@ impl<'a, T> SharedWriteGuard<'a, T> {
             .map_err(cl_to_err)?
         };
         unsafe { release_event(evt).map_err(cl_to_err)? };
-        unsafe { retain_command_queue(q_raw).map_err(cl_to_err)? };
-        Ok(SharedWriteGuard { buf, queue: q_raw })
+        Ok(SharedWriteGuard { buf, queue })
     }
 }
 
@@ -373,7 +367,7 @@ impl<T> Deref for SharedWriteGuard<'_, T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         // SAFETY: see SharedReadGuard.
-        unsafe { slice::from_raw_parts(self.buf.ptr, self.buf.len) }
+        unsafe { crate::util::mapped_slice(self.buf.ptr, self.buf.len) }
     }
 }
 
@@ -381,20 +375,18 @@ impl<T> DerefMut for SharedWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut [T] {
         // SAFETY: `&mut self` upgrades to a unique mutable slice;
         // mapped read+write for the guard's lifetime.
-        unsafe { slice::from_raw_parts_mut(self.buf.ptr, self.buf.len) }
+        unsafe { crate::util::mapped_slice_mut(self.buf.ptr, self.buf.len) }
     }
 }
 
 impl<T> Drop for SharedWriteGuard<'_, T> {
     fn drop(&mut self) {
-        let unmap = unsafe { enqueue_svm_unmap(self.queue, self.buf.ptr.cast(), 0, ptr::null()) };
+        let unmap = unsafe {
+            enqueue_svm_unmap(self.queue.raw(), self.buf.ptr.cast(), 0, ptr::null())
+        };
         if let Ok(evt) = unmap {
             let _ = unsafe { release_event(evt) };
         } else {
-            self.buf.ctx.record_err();
-        }
-        let rel = unsafe { release_command_queue(self.queue) };
-        if rel.is_err() {
             self.buf.ctx.record_err();
         }
     }

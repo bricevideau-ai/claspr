@@ -35,13 +35,13 @@
 //! leak its mapped state. This is the only blocking call in the
 //! whole module, and only fires on the error path.
 
+use claspr::util::{RetainedQueue, mapped_slice_mut};
 use claspr::{Buffer, DeviceSlice, Event, Result};
 use opencl3::command_queue::{CommandQueue, enqueue_map_buffer, enqueue_unmap_mem_object};
 use opencl3::error_codes::ClError;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, ClMem};
-use opencl3::types::{CL_NON_BLOCKING, cl_command_queue, cl_event, cl_mem};
+use opencl3::types::{CL_NON_BLOCKING, cl_event, cl_mem};
 use std::ptr;
-use std::slice;
 
 fn cl_to_err(code: opencl3::types::cl_int) -> claspr::Error {
     claspr::Error::OpenCl(ClError(code))
@@ -114,18 +114,19 @@ pub trait Mappable: Send + 'static {
 
 /// Per-element map state for [`DeviceSlice<T>`].
 ///
-/// `unsafe impl Send` is needed because the raw cl_mem / cl_command_queue
-/// handles are bare pointers. They're opaque OpenCL handles whose
-/// thread-safety is documented (CL §3.4.1: command queues, except for
-/// `clSetCommandQueueProperty`, are thread-safe), and we never call any
-/// of the non-thread-safe APIs on them.
+/// `unsafe impl Send` is needed because the raw `cl_mem` handle is a
+/// bare pointer. It's an opaque OpenCL handle whose thread-safety is
+/// documented (CL §3.4.1: command queues, except for
+/// `clSetCommandQueueProperty`, are thread-safe), and we never call
+/// any of the non-thread-safe APIs on it. The queue handle is owned
+/// by `RetainedQueue` (already Send).
 pub struct DeviceSliceMapHandle<T> {
     host_ptr: *mut T,
     cl_mem: cl_mem,
-    /// Retained command-queue handle. Released on `Drop`. Held so
-    /// the defensive blocking unmap path can use it even if the
-    /// original `CommandQueue` was dropped by the caller.
-    map_queue: cl_command_queue,
+    /// Retained queue. Released on `Drop`. Held so the defensive
+    /// blocking unmap path can use it even if the original
+    /// `CommandQueue` was dropped by the caller.
+    map_queue: RetainedQueue,
     len: usize,
     /// `true` once `enqueue_unmap` ran. If the handle drops with
     /// this still `false`, `Drop` issues a blocking unmap to keep
@@ -141,27 +142,24 @@ impl<T> Drop for DeviceSliceMapHandle<T> {
         if !self.unmap_enqueued && !self.host_ptr.is_null() {
             // Defensive blocking unmap on the error path between
             // `map` returning Ok and `enqueue_unmap` being called.
-            // Issue the unmap, wait for it, release the event.
             // SAFETY: host_ptr came from a successful map call on
             // self.cl_mem via self.map_queue. We unmap exactly once.
-            unsafe {
-                let res = enqueue_unmap_mem_object(
-                    self.map_queue,
+            let res = unsafe {
+                enqueue_unmap_mem_object(
+                    self.map_queue.raw(),
                     self.cl_mem,
                     self.host_ptr.cast(),
                     0,
                     ptr::null(),
-                );
-                if let Ok(ev) = res {
-                    let _ = opencl3::event::wait_for_events(&[ev]);
-                    let _ = opencl3::event::release_event(ev);
-                }
+                )
             };
+            if let Ok(ev) = res {
+                let _ = opencl3::event::wait_for_events(&[ev]);
+                let _ = Event::new(ev); // drops -> releases the event
+            }
         }
-        // SAFETY: queue was retained in `map`. Release exactly once.
-        unsafe {
-            let _ = opencl3::command_queue::release_command_queue(self.map_queue);
-        }
+        // The `map_queue: RetainedQueue` field drops after this body
+        // returns and releases the queue handle.
     }
 }
 
@@ -177,15 +175,13 @@ where
         queue: &CommandQueue,
         deps: &[cl_event],
     ) -> Result<(Self::MapHandle, Vec<Event>)> {
-        let q_raw = queue.get();
         let cl_mem = self.buffer().get();
         let len = Buffer::len(self);
         let size = len * std::mem::size_of::<T>();
         // Retain the queue so its handle stays valid for the
         // defensive Drop-time unmap if anything between this map
         // and `enqueue_unmap` errors out.
-        // SAFETY: q_raw was just queried from a live CommandQueue.
-        unsafe { opencl3::command_queue::retain_command_queue(q_raw).map_err(cl_to_err)? };
+        let map_queue = RetainedQueue::from_queue(queue)?;
         let (wait_count, wait_ptr) = if deps.is_empty() {
             (0, ptr::null())
         } else {
@@ -198,7 +194,7 @@ where
         // this call; host_ptr_raw is a stable out-param.
         let map_event = unsafe {
             enqueue_map_buffer(
-                q_raw,
+                map_queue.raw(),
                 cl_mem,
                 CL_NON_BLOCKING,
                 CL_MAP_READ | CL_MAP_WRITE,
@@ -213,7 +209,7 @@ where
         let handle = DeviceSliceMapHandle {
             host_ptr: host_ptr_raw.cast::<T>(),
             cl_mem,
-            map_queue: q_raw,
+            map_queue,
             len,
             unmap_enqueued: false,
         };
@@ -254,7 +250,7 @@ where
         // calls this only after waiting on the map event, so the
         // memory is coherent. `&'a mut self` on the handle is the
         // borrow-checker proof that no other view aliases this.
-        unsafe { slice::from_raw_parts_mut(handle.host_ptr, handle.len) }
+        unsafe { mapped_slice_mut(handle.host_ptr, handle.len) }
     }
 
     fn mark_unmap_not_done(handle: &mut Self::MapHandle) {

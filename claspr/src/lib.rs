@@ -69,6 +69,8 @@ pub mod op;
 pub mod ppm;
 pub mod queue;
 pub mod svm;
+#[doc(hidden)]
+pub mod util;
 
 // ── Public surface ────────────────────────────────────────────────────
 

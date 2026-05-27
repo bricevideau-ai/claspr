@@ -19,19 +19,17 @@ use crate::error::{Error, Result};
 use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
 use crate::queue::Launcher;
 use opencl3::command_queue::{
-    CommandQueue, enqueue_map_buffer, enqueue_unmap_mem_object, release_command_queue,
-    retain_command_queue,
+    CommandQueue, enqueue_map_buffer, enqueue_unmap_mem_object,
 };
 use opencl3::event::Event;
 use opencl3::memory::{
     Buffer as ClBuffer, CL_MAP_READ, CL_MAP_WRITE, CL_MEM_ALLOC_HOST_PTR, CL_MEM_READ_WRITE, ClMem,
     release_mem_object,
 };
-use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_command_queue, cl_event, cl_int, cl_mem};
+use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_event, cl_int, cl_mem};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
-use std::slice;
 
 /// Raw cl3 functions return `Result<_, cl_int>`. Wrap into our
 /// typed `Error` via opencl3's `ClError` newtype.
@@ -523,10 +521,11 @@ pub struct HostBuffer<T> {
     host_ptr: *mut T,
     len: usize,
     ctx: Context,
-    /// Retained cl_command_queue handle used for the matching
-    /// unmap call in Drop. Retained in `alloc`, released in Drop
-    /// after the unmap is enqueued.
-    map_queue: cl_command_queue,
+    /// Retained `cl_command_queue` so the matching unmap in Drop
+    /// has a valid handle even if the user's Launcher dropped. The
+    /// `RetainedQueue` Drop runs after our own — see comment on
+    /// `Drop for HostBuffer`.
+    map_queue: crate::util::RetainedQueue,
 }
 
 // SAFETY: cl_mem and cl_command_queue are opaque handles; OpenCL API
@@ -542,7 +541,7 @@ impl<T> HostBuffer<T> {
     /// are uninitialised — write before reading.
     pub fn alloc<L: Launcher>(launcher: &L, len: usize) -> Result<Self> {
         let ctx = launcher.context();
-        let q_raw: cl_command_queue = launcher.cl_queue().get();
+        let queue = launcher.cl_queue();
         // SAFETY: null host pointer + CL_MEM_ALLOC_HOST_PTR tells
         // OpenCL to allocate fresh host-accessible memory.
         let buffer = unsafe {
@@ -553,15 +552,15 @@ impl<T> HostBuffer<T> {
                 ptr::null_mut(),
             )?
         };
-        // Map once for the lifetime of this HostBuffer. cl3's raw
-        // `enqueue_map_buffer` writes the host-accessible pointer
-        // into an out-param (opencl3's wrapper has the same shape).
-        // We use the raw call so we don't have to thread an opencl3
-        // CommandQueue wrapper into the struct.
+        // Retain the queue for the lifetime of this HostBuffer so
+        // its raw handle stays valid for the unmap in Drop, even if
+        // the user's Launcher gets dropped earlier.
+        let map_queue = crate::util::RetainedQueue::from_queue(queue)?;
+        // Map once for the lifetime of this HostBuffer.
         let mut mapped_ptr: cl_mem = ptr::null_mut();
         let map_event = unsafe {
             enqueue_map_buffer(
-                q_raw,
+                map_queue.raw(),
                 buffer.get(),
                 CL_BLOCKING,
                 CL_MAP_READ | CL_MAP_WRITE,
@@ -577,17 +576,12 @@ impl<T> HostBuffer<T> {
         // SAFETY: map_event was returned by the call above; we own it.
         unsafe { opencl3::event::release_event(map_event).map_err(cl_to_err)? };
         let host_ptr = mapped_ptr.cast::<T>();
-        // Retain the queue so its raw handle is valid for the unmap
-        // we issue in Drop, even if the user's Launcher gets dropped
-        // earlier.
-        // SAFETY: q_raw was just obtained from a live CommandQueue.
-        unsafe { retain_command_queue(q_raw).map_err(cl_to_err)? };
         Ok(HostBuffer {
             buffer,
             host_ptr,
             len,
             ctx: ctx.clone(),
-            map_queue: q_raw,
+            map_queue,
         })
     }
 
@@ -623,9 +617,9 @@ impl<T> Deref for HostBuffer<T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         // SAFETY: host_ptr is a stable mapped pointer for `len`
-        // elements of T; the OpenCL runtime guarantees it remains
-        // valid until we unmap (Drop only).
-        unsafe { slice::from_raw_parts(self.host_ptr, self.len) }
+        // elements of T, valid for the whole HostBuffer lifetime
+        // (mapped in alloc, unmapped in Drop).
+        unsafe { crate::util::mapped_slice(self.host_ptr, self.len) }
     }
 }
 
@@ -633,7 +627,7 @@ impl<T> DerefMut for HostBuffer<T> {
     fn deref_mut(&mut self) -> &mut [T] {
         // SAFETY: see Deref. `&mut self` upgrades the unique-access
         // guarantee from the borrow checker into a mutable slice.
-        unsafe { slice::from_raw_parts_mut(self.host_ptr, self.len) }
+        unsafe { crate::util::mapped_slice_mut(self.host_ptr, self.len) }
     }
 }
 
@@ -645,9 +639,12 @@ impl<T> Drop for HostBuffer<T> {
         // refcounts the cl_mem until queued commands complete, so
         // the buffer stays alive long enough for the unmap to land.
         // Errors here can't be propagated; bump the sticky counter.
+        //
+        // The `map_queue: RetainedQueue` field drops after this body
+        // returns, releasing the queue handle exactly once.
         let unmap_res = unsafe {
             enqueue_unmap_mem_object(
-                self.map_queue,
+                self.map_queue.raw(),
                 self.buffer.get(),
                 self.host_ptr.cast(),
                 0,
@@ -655,11 +652,6 @@ impl<T> Drop for HostBuffer<T> {
             )
         };
         if unmap_res.is_err() {
-            self.ctx.record_err();
-        }
-        // SAFETY: queue was retained in `alloc`; release exactly once.
-        let rel_res = unsafe { release_command_queue(self.map_queue) };
-        if rel_res.is_err() {
             self.ctx.record_err();
         }
     }
