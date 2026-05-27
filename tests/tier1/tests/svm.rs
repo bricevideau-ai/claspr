@@ -153,3 +153,71 @@ fn kernel_launches_on_ooo_queue_register_themselves_for_drop() {
     ctx.cl_queue().finish().expect("finish ctx default");
     assert_eq!(ctx.error_count(), 0);
 }
+
+#[test]
+fn alloc_then_immediate_drop_uses_empty_wait_list() {
+    // The simplest case: nothing in flight when Drop fires →
+    // `clEnqueueSVMFree` runs with an empty wait_list. Exercises the
+    // None/empty arm of the Vec-drain path.
+    let Some(ctx) = ctx_with_svm() else { return };
+    {
+        let _buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    } // immediate drop, no use registered
+    ctx.cl_queue().finish().expect("finish");
+    assert_eq!(ctx.error_count(), 0);
+}
+
+#[test]
+fn read_only_map_via_map_guard() {
+    // Existing tests use map_mut. This exercises the read-only path
+    // (`map(launcher)` → SharedReadGuard derefs to &[T]).
+    let Some(ctx) = ctx_with_svm() else { return };
+    let mut buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    {
+        // Populate via map_mut...
+        let mut g = buf.map_mut(&ctx).expect("map_mut");
+        for (i, slot) in g.iter_mut().enumerate() {
+            *slot = (i as u32).wrapping_mul(7);
+        }
+    } // unmap
+
+    // ...then read back via read-only map.
+    let g = buf.map(&ctx).expect("map");
+    for (i, &v) in g.iter().enumerate() {
+        assert_eq!(v, (i as u32).wrapping_mul(7));
+    }
+}
+
+#[test]
+fn multi_kernel_svm_pipeline_via_lower_level_launch() {
+    // Two-stage compute pipeline operating entirely on a SharedBuffer:
+    // fill → scale → read back via map. Both kernels run on an OOO
+    // queue and take the SVM as a `KernelArg`; the auto-registration
+    // path (KernelArg::register_completion) records each launch's
+    // event on `buf`, so the buffer's eventual Drop can wait on every
+    // in-flight use.
+    let Some(ctx) = ctx_with_svm() else { return };
+    let device: Device = ctx.device().clone();
+    let ooo = Queue::<OutOfOrder>::on_device(&ctx, &device).expect("ooo queue");
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+
+    // Stage 1: fill_u32 with 4.
+    use claspr::{IntoLaunchSpec, LaunchOp};
+    let fill_kernel = kernels.kernel("fill_u32");
+    let fill_event = LaunchOp::new(&ooo, &fill_kernel, [N].into_launch_spec(), (&buf, 4u32))
+        .submit()
+        .expect("submit fill");
+
+    // Stage 2: scale_u32 by 5, ordered after fill via `.after`.
+    let scale_kernel = kernels.kernel("scale_u32");
+    LaunchOp::new(&ooo, &scale_kernel, [N].into_launch_spec(), (&buf, 5u32))
+        .after(&fill_event)
+        .wait()
+        .expect("scale after fill");
+
+    // Read result via map: every slot is 4 * 5 = 20.
+    let g = buf.map(&ctx).expect("map");
+    assert!(g.iter().all(|&v| v == 20));
+}
