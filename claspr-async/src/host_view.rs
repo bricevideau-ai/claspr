@@ -48,11 +48,10 @@
 use crate::exec_ctx::ExecutionContext;
 use crate::mappable::Mappable;
 use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
-use claspr::{Buffer, DeviceSlice, Error, Event, HostBuffer, Launcher, Result, SharedBuffer};
 use claspr::util::{RetainedQueue, mapped_slice, mapped_slice_mut};
+use claspr::{Buffer, DeviceSlice, Error, Event, HostBuffer, Launcher, Result, SharedBuffer};
 use opencl3::command_queue::{
-    CommandQueue, enqueue_map_buffer, enqueue_svm_map, enqueue_svm_unmap,
-    enqueue_unmap_mem_object,
+    CommandQueue, enqueue_map_buffer, enqueue_svm_map, enqueue_svm_unmap, enqueue_unmap_mem_object,
 };
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, ClMem};
 use opencl3::types::{CL_NON_BLOCKING, cl_event, cl_map_flags};
@@ -159,11 +158,7 @@ where
 {
     type Output = DeviceSliceHostView<T, A>;
 
-    fn execute(
-        mut self,
-        ctx: &ExecutionContext<'_>,
-        deps: Deps,
-    ) -> Result<(Self::Output, Deps)> {
+    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let buf = self
             .buf
             .take()
@@ -643,11 +638,7 @@ where
 {
     type Output = SharedBufferHostView<T, A>;
 
-    fn execute(
-        mut self,
-        ctx: &ExecutionContext<'_>,
-        deps: Deps,
-    ) -> Result<(Self::Output, Deps)> {
+    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let buf = self
             .buf
             .take()
@@ -720,9 +711,8 @@ impl<T, A: MapAccess> Drop for SharedBufferHostView<T, A> {
             //
             // SAFETY: ptr was mapped in acquire; unmap exactly once
             // per acquire (we never reach this branch if unmap_done).
-            let res = unsafe {
-                enqueue_svm_unmap(self.queue.raw(), buf.ptr().cast(), 0, ptr::null())
-            };
+            let res =
+                unsafe { enqueue_svm_unmap(self.queue.raw(), buf.ptr().cast(), 0, ptr::null()) };
             match res {
                 Ok(evt) => {
                     let _ = opencl3::event::wait_for_events(&[evt]);

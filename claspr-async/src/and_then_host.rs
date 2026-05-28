@@ -121,11 +121,7 @@ where
 {
     type Output = S::Output;
 
-    fn execute(
-        mut self,
-        ctx: &ExecutionContext<'_>,
-        deps: Deps,
-    ) -> Result<(Self::Output, Deps)> {
+    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (input, source_evts) = self.source.execute(ctx, deps)?;
         let q = ctx.cl_queue();
 
@@ -148,22 +144,19 @@ where
         // user event). The defensive Drop on `handle` doesn't cover
         // that. Mitigation: from this point on we MUST signal the
         // user event before returning Err.
-        let unmap_events = match <S::Output as Mappable>::enqueue_unmap(
-            &mut handle,
-            q,
-            &[user_event.get()],
-        ) {
-            Ok(evs) => evs,
-            Err(e) => {
-                // Map succeeded, unmap-enqueue failed. The user
-                // event is unsignalled, but there's nothing waiting
-                // on it yet (unmaps weren't enqueued). Set it to a
-                // negative status anyway in case future code in this
-                // execute() body added a waiter.
-                let _ = complete_user_event(&user_event, -1);
-                return Err(e);
-            }
-        };
+        let unmap_events =
+            match <S::Output as Mappable>::enqueue_unmap(&mut handle, q, &[user_event.get()]) {
+                Ok(evs) => evs,
+                Err(e) => {
+                    // Map succeeded, unmap-enqueue failed. The user
+                    // event is unsignalled, but there's nothing waiting
+                    // on it yet (unmaps weren't enqueued). Set it to a
+                    // negative status anyway in case future code in this
+                    // execute() body added a waiter.
+                    let _ = complete_user_event(&user_event, -1);
+                    return Err(e);
+                }
+            };
 
         let f = self
             .f

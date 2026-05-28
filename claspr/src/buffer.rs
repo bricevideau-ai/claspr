@@ -18,9 +18,7 @@ use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
 use crate::queue::Launcher;
-use opencl3::command_queue::{
-    CommandQueue, enqueue_map_buffer, enqueue_unmap_mem_object,
-};
+use opencl3::command_queue::{CommandQueue, enqueue_map_buffer, enqueue_unmap_mem_object};
 use opencl3::event::Event;
 use opencl3::memory::{
     Buffer as ClBuffer, CL_MAP_READ, CL_MAP_WRITE, CL_MEM_ALLOC_HOST_PTR, CL_MEM_READ_WRITE, ClMem,

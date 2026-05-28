@@ -74,11 +74,8 @@ pub trait Mappable: Send + 'static {
     ///
     /// Borrows `&self` — the value continues to flow through the
     /// chain as the combinator's output unchanged.
-    fn map(
-        &self,
-        queue: &CommandQueue,
-        deps: &[cl_event],
-    ) -> Result<(Self::MapHandle, Vec<Event>)>;
+    fn map(&self, queue: &CommandQueue, deps: &[cl_event])
+    -> Result<(Self::MapHandle, Vec<Event>)>;
 
     /// Enqueue the matching unmap(s) for `handle`, with `wait_for`
     /// (the [`crate::AndThenHost`]'s user event) as the wait-list.
@@ -291,7 +288,9 @@ macro_rules! impl_mappable_scalar {
     )*};
 }
 
-impl_mappable_scalar!(u8, u16, u32, u64, i8, i16, i32, i64, usize, isize, f32, f64, bool);
+impl_mappable_scalar!(
+    u8, u16, u32, u64, i8, i16, i32, i64, usize, isize, f32, f64, bool
+);
 
 // `()` pass-through — chains that produce no output can still go
 // through and_then_host (e.g. for side-effect-only host work after
@@ -385,9 +384,7 @@ mod tests {
             return;
         };
         let device = ctx.device().clone();
-        let queue = ctx
-            .default_outoforder_queue(&device)
-            .expect("oo queue");
+        let queue = ctx.default_outoforder_queue(&device).expect("oo queue");
         let q = queue.raw();
 
         // Allocate + seed via Tier 1 write.
@@ -436,9 +433,7 @@ mod tests {
             return;
         };
         let device = ctx.device().clone();
-        let queue = ctx
-            .default_outoforder_queue(&device)
-            .expect("oo queue");
+        let queue = ctx.default_outoforder_queue(&device).expect("oo queue");
         let q = queue.raw();
 
         let mut buf = DeviceSlice::<u32>::alloc(&ctx, 4).expect("alloc");

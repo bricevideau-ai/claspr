@@ -322,9 +322,8 @@ impl<T> Drop for SharedReadGuard<'_, T> {
         // SAFETY: ptr was mapped in `new`; unmap exactly once now.
         // The `queue: RetainedQueue` field drops after this body
         // returns, releasing the queue handle.
-        let unmap = unsafe {
-            enqueue_svm_unmap(self.queue.raw(), self.buf.ptr.cast(), 0, ptr::null())
-        };
+        let unmap =
+            unsafe { enqueue_svm_unmap(self.queue.raw(), self.buf.ptr.cast(), 0, ptr::null()) };
         if let Ok(evt) = unmap {
             let _ = unsafe { release_event(evt) };
         } else {
@@ -381,9 +380,8 @@ impl<T> DerefMut for SharedWriteGuard<'_, T> {
 
 impl<T> Drop for SharedWriteGuard<'_, T> {
     fn drop(&mut self) {
-        let unmap = unsafe {
-            enqueue_svm_unmap(self.queue.raw(), self.buf.ptr.cast(), 0, ptr::null())
-        };
+        let unmap =
+            unsafe { enqueue_svm_unmap(self.queue.raw(), self.buf.ptr.cast(), 0, ptr::null()) };
         if let Ok(evt) = unmap {
             let _ = unsafe { release_event(evt) };
         } else {
