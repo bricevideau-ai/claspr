@@ -68,13 +68,24 @@ struct ContextInner {
 ///
 /// `in_order` is `OnceLock` — stable reference for the lifetime of
 /// the context, never rebuilt. `out_of_order` is `Mutex<Option<Arc>>`
-/// so it can be invalidated and rebuilt after a chain failure leaves
-/// the underlying `cl_command_queue` in a poisoned state (observed
-/// on rusticl after a `clSetUserEventStatus(_, -1)` call terminates
-/// a queued command). The mutex is touched at most once per
-/// `DeviceOperation::sync` / `DeviceOperation::run` — both grab an
-/// `Arc<Queue>` once and pass the raw `cl_command_queue` through to
-/// every enqueue call.
+/// so it can be invalidated and rebuilt after a terminated command
+/// renders the queue unusable. Per the OpenCL spec on command
+/// execution status: "If the execution of a command is terminated,
+/// the command-queue associated with this terminated command, and
+/// the associated context (and all other command-queues in this
+/// context) may no longer be available. The behavior of OpenCL API
+/// calls that use this context (and command-queues associated with
+/// this context) are now considered to be implementation-defined."
+/// We hit this path whenever a host closure errors and
+/// `claspr_async::AndThenHost` signals the user event with a
+/// negative status. Some drivers (e.g. rusticl) make the queue
+/// permanently propagate the negative status to subsequent
+/// commands; others (e.g. pocl) keep it usable. Rebuilding the
+/// queue on the next sync covers either case.
+///
+/// The mutex is touched at most once per `DeviceOperation::sync` /
+/// `DeviceOperation::run` — both grab an `Arc<Queue>` once and pass
+/// the raw `cl_command_queue` through to every enqueue call.
 struct DeviceQueues {
     in_order: OnceLock<Queue<InOrder>>,
     out_of_order: Mutex<Option<Arc<Queue<OutOfOrder>>>>,
@@ -216,14 +227,16 @@ impl Context {
     /// will build a fresh one.
     ///
     /// Used by Tier 2 terminals (`DeviceOperation::sync` /
-    /// `DeviceOperation::run`) on the error path: some OpenCL
-    /// implementations (rusticl) keep a sticky negative
-    /// `CL_EVENT_COMMAND_EXECUTION_STATUS` on the queue after a
-    /// `clSetUserEventStatus(_, -1)` command termination, which
-    /// then propagates to subsequent unrelated commands on the
-    /// same queue. Dropping the queue (which `clReleaseCommandQueue`s
-    /// it once the last `Arc` ref drops) and rebuilding on the next
-    /// terminal clears that state.
+    /// `DeviceOperation::run`) on the error path. Per the OpenCL
+    /// spec on command execution status, once a command is
+    /// terminated (e.g. via `clSetUserEventStatus(_, -1)` from our
+    /// `and_then_host` error path), the queue and context "may no
+    /// longer be available" and the behavior of subsequent API
+    /// calls on them is implementation-defined. Observed in
+    /// practice: rusticl propagates the negative status to
+    /// subsequent unrelated commands on the same queue; pocl keeps
+    /// the queue usable. Rebuilding the queue cache on the next
+    /// terminal is the defensive choice that works across both.
     ///
     /// `device` not being part of this context is silently ignored —
     /// the public guarantee is "next default_outoforder_queue rebuilds

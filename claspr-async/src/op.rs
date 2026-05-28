@@ -86,12 +86,15 @@ pub trait DeviceOperation: Send + Sized {
     ///
     /// On any `Err` from this call, the context's cached out-of-order
     /// queue for the device is invalidated and rebuilt on the next
-    /// terminal. This recovers from drivers that leave the queue in
-    /// a poisoned state after a chain-error path (notably rusticl
-    /// after a `clSetUserEventStatus(_, -1)` propagates a sticky
-    /// negative status to subsequent unrelated commands on the same
-    /// queue). The mutex is touched only at this terminal boundary —
-    /// not on the per-enqueue hot path inside `execute`.
+    /// terminal. The OpenCL spec on command execution status declares
+    /// behavior of API calls on a queue / context after one of its
+    /// commands has been terminated to be implementation-defined —
+    /// observed in practice: rusticl renders the queue unusable
+    /// (negative status carries to subsequent commands); pocl keeps
+    /// it usable. The cache invalidation is the defensive choice
+    /// that works across both. The mutex is touched only at this
+    /// terminal boundary — not on the per-enqueue hot path inside
+    /// `execute`.
     fn sync(self, context: &claspr::Context) -> Result<Self::Output> {
         let device = context.device().clone();
         let queue = context.default_outoforder_queue(&device)?;

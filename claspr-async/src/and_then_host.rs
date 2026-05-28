@@ -185,15 +185,18 @@ where
                 run_worker::<S::Output, F>(handle, worker_map_events, worker_source_evts, f);
             if status < 0 {
                 // On the error path the queued unmap (which waits on
-                // the user event) is "terminated" by the OpenCL runtime
-                // when we signal a negative status (CL spec §5.11) —
-                // it never actually unmaps the buffer. Force the
-                // defensive sync unmap NOW, before signalling failure,
-                // so that by the time the chain's `.sync()` observes
-                // the error and returns, the buffer is in a clean
-                // (unmapped) state. Otherwise subsequent commands on
-                // the same context can see a still-mapped buffer
-                // that confuses strict implementations like rusticl.
+                // the user event) is "terminated" by the OpenCL
+                // runtime when we signal a negative status — it
+                // never actually unmaps the buffer. Per the spec,
+                // queue / context state after such a termination is
+                // implementation-defined, so we can't rely on the
+                // unmap "eventually completing" or on the runtime
+                // gracefully recovering. Force the defensive sync
+                // unmap NOW, before signalling failure, so that by
+                // the time the chain's `.sync()` observes the error
+                // and returns, the buffer is in a clean (unmapped)
+                // state regardless of how the implementation handles
+                // the rest of the queue.
                 <S::Output as Mappable>::mark_unmap_not_done(&mut handle);
                 drop(handle);
             }
