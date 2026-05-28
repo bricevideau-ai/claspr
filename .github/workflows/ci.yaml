@@ -1,0 +1,59 @@
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+name: CI
+
+jobs:
+  build:
+    name: Build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Enable the llvmpipe back-end of rusticl, installed below via
+      # `mesa-opencl-icd`. Required for the workspace tests + the
+      # combinator spike to find a SPIR-V-capable OpenCL device;
+      # `fp64` enables the f64-using tests (e.g. nbody-style chains,
+      # SVM tests with f64 buffers). The fmt / clippy / build steps
+      # don't need the runtime, but setting the env job-wide keeps
+      # the surface uniform.
+      RUSTICL_ENABLE: llvmpipe
+      RUSTICL_FEATURES: fp64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust-toolchain
+        run: rustup component add rustfmt clippy
+
+      - name: Install rusticl OpenCL ICD
+        run: |
+          sudo apt-get update -y -qq
+          # `kisak-mesa` ships the rusticl OpenCL ICD via
+          # `mesa-opencl-icd`; older Ubuntu archives do not.
+          sudo add-apt-repository ppa:kisak/kisak-mesa -y
+          sudo apt-get update
+          sudo apt install -y mesa-opencl-icd
+
+      - name: cargo fetch --locked
+        run: cargo fetch --locked
+
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo test --workspace
+        # Workspace covers claspr unit tests, the tier1 / tier2
+        # integration test suites, and the small async-pipeline /
+        # batch-inference examples' inline tests. Tests that need an
+        # OpenCL device skip gracefully if none is present, but with
+        # rusticl installed above they actually execute.
+        run: cargo test --workspace --release
