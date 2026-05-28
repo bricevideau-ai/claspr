@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install rust-toolchain
+      - name: Install rustfmt + clippy
         run: rustup component add rustfmt clippy
 
       - name: Install rusticl OpenCL ICD
@@ -38,17 +38,29 @@ jobs:
           sudo apt-get update
           sudo apt install -y mesa-opencl-icd
 
+      # Compute the host triple and pass it as `--target $TARGET` to
+      # every build/clippy/test step. Cargo issue #6313: when host ==
+      # target *implicitly*, the host build-dep dylib
+      # `librustc_codegen_spirv.so` (pulled by `claspr-build` as a
+      # build-dep of multiple workspace members) ends up scheduled
+      # twice in the same output dir and cargo warns about a
+      # collision. Specifying `--target` explicitly — even with the
+      # host triple — opts cargo into a separate host build-dep dep
+      # graph that resolves to a distinct output path.
+      - name: install rust-toolchain
+        run: echo "TARGET=$(rustc --print host-tuple)" >> "$GITHUB_ENV"
+
       - name: cargo fetch --locked
-        run: cargo fetch --locked
+        run: cargo fetch --locked --target $TARGET
 
       - name: Rustfmt
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --target $TARGET -- -D warnings
 
       - name: cargo build --workspace
-        run: cargo build --workspace
+        run: cargo build --workspace --target $TARGET
 
       - name: cargo test --workspace
         # Workspace covers claspr unit tests, the tier1 / tier2
@@ -56,4 +68,4 @@ jobs:
         # batch-inference examples' inline tests. Tests that need an
         # OpenCL device skip gracefully if none is present, but with
         # rusticl installed above they actually execute.
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --target $TARGET
