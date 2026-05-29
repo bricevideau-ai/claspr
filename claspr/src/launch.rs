@@ -120,8 +120,11 @@ pub trait KernelSliceArg<T>: KernelArg + Send + 'static + kernel_slice_arg_seale
     fn element_count(&self) -> usize;
 }
 
-impl<T: Send + 'static> kernel_slice_arg_sealed::Sealed for DeviceSlice<T> {}
-impl<T: Send + 'static> KernelSliceArg<T> for DeviceSlice<T> {
+impl<T: Send + 'static, M: crate::access::MemMode> kernel_slice_arg_sealed::Sealed
+    for DeviceSlice<T, M>
+{
+}
+impl<T: Send + 'static, M: crate::access::MemMode> KernelSliceArg<T> for DeviceSlice<T, M> {
     fn element_count(&self) -> usize {
         crate::Buffer::len(self)
     }
@@ -151,8 +154,13 @@ impl<T: Send + 'static> KernelSliceArg<T> for crate::USMSlice<T> {
 //
 // `T: Sync` is needed because `Arc<DeviceSlice<T>>: Send` requires
 // `DeviceSlice<T>: Send + Sync` which propagates `T: Sync`.
-impl<T: Send + Sync + 'static> kernel_slice_arg_sealed::Sealed for Arc<DeviceSlice<T>> {}
-impl<T: Send + Sync + 'static> KernelSliceArg<T> for Arc<DeviceSlice<T>> {
+impl<T: Send + Sync + 'static, M: crate::access::MemMode> kernel_slice_arg_sealed::Sealed
+    for Arc<DeviceSlice<T, M>>
+{
+}
+impl<T: Send + Sync + 'static, M: crate::access::MemMode> KernelSliceArg<T>
+    for Arc<DeviceSlice<T, M>>
+{
     fn element_count(&self) -> usize {
         crate::Buffer::len(&**self)
     }
@@ -162,7 +170,7 @@ impl<T: Send + Sync + 'static> KernelSliceArg<T> for Arc<DeviceSlice<T>> {
 // here with the rest of the launch surface so `set_arg` plumbing is
 // in one place. Decomposes into the `(buffer, len)` pair that
 // rust-gpu's slice param expects.
-impl<T> KernelArg for DeviceSlice<T> {
+impl<T, M: crate::access::MemMode> KernelArg for DeviceSlice<T, M> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         let len: usize = self.len;
         unsafe {
@@ -179,7 +187,7 @@ impl<T> KernelArg for DeviceSlice<T> {
 // blanket `impl<T: KernelArg> KernelArg for &T` then makes
 // `&Arc<DeviceSlice<T>>` (which is what the proc-macro-emitted
 // launcher hands to LaunchOp) a `KernelArg` too.
-impl<T> KernelArg for Arc<DeviceSlice<T>> {
+impl<T, M: crate::access::MemMode> KernelArg for Arc<DeviceSlice<T, M>> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         (**self).set(exec);
     }

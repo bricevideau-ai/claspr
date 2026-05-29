@@ -10,15 +10,17 @@
 //! See the [`Buffer`] trait's own docs for what it does and does
 //! not abstract over.
 
+use crate::access::{MemMode, ReadWrite};
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
 use crate::queue::Launcher;
 use opencl3::command_queue::CommandQueue;
 use opencl3::event::Event;
-use opencl3::memory::{Buffer as ClBuffer, CL_MEM_READ_WRITE, ClMem, release_mem_object};
+use opencl3::memory::{Buffer as ClBuffer, ClMem, release_mem_object};
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_event, cl_mem};
 use std::fmt;
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr;
 
@@ -106,7 +108,7 @@ pub trait Buffer<T> {
 /// `Vec<T>`).
 ///
 /// [`KernelArg`]: crate::launch::KernelArg
-pub struct DeviceSlice<T> {
+pub struct DeviceSlice<T, M: MemMode = ReadWrite> {
     /// `ManuallyDrop` so opencl3's `Buffer::drop` (which panics on
     /// release failure) doesn't fire — our own [`Drop`] impl below
     /// calls `release_mem_object` and records into the context's
@@ -114,9 +116,14 @@ pub struct DeviceSlice<T> {
     pub(crate) buffer: ManuallyDrop<ClBuffer<T>>,
     pub(crate) len: usize,
     pub(crate) ctx: Context,
+    /// Type-level access mode tag (`ReadWrite` / `ReadOnly` /
+    /// `Frozen` / etc.). Zero-sized; encoded only at the type level
+    /// to gate method availability and the `clCreateBuffer` flags
+    /// chosen at alloc time. See [`crate::access`].
+    pub(crate) _mode: PhantomData<fn() -> M>,
 }
 
-impl<T> Drop for DeviceSlice<T> {
+impl<T, M: MemMode> Drop for DeviceSlice<T, M> {
     fn drop(&mut self) {
         let mem = self.buffer.get();
         // SAFETY: mem was returned by clCreateBuffer in `alloc` and
@@ -129,7 +136,7 @@ impl<T> Drop for DeviceSlice<T> {
     }
 }
 
-impl<T: Default + Copy> DeviceSlice<T> {
+impl<T: Default + Copy> DeviceSlice<T, ReadWrite> {
     /// Allocate a device buffer of `len` elements, zero-initialised
     /// via `clEnqueueFillBuffer(T::default())` on the context's
     /// default queue. Blocks until the fill completes.
@@ -154,7 +161,7 @@ impl<T: Default + Copy> DeviceSlice<T> {
     }
 }
 
-impl<T> DeviceSlice<T> {
+impl<T> DeviceSlice<T, ReadWrite> {
     /// Allocate a device buffer of `len` elements, leaving the bytes
     /// uninitialised. Cheaper than [`alloc`](Self::alloc) when the
     /// caller writes the whole buffer before any read.
@@ -185,12 +192,13 @@ impl<T> DeviceSlice<T> {
         // fresh device memory and ignores the host-pointer contract
         // that makes `Buffer::create` generally unsafe.
         let buffer = unsafe {
-            ClBuffer::<T>::create(ctx.raw_context(), CL_MEM_READ_WRITE, len, ptr::null_mut())?
+            ClBuffer::<T>::create(ctx.raw_context(), ReadWrite::FLAGS, len, ptr::null_mut())?
         };
         Ok(DeviceSlice {
             buffer: ManuallyDrop::new(buffer),
             len,
             ctx: ctx.clone(),
+            _mode: PhantomData,
         })
     }
 
@@ -655,7 +663,7 @@ impl<'a, T> MigrateOp<'a, T> {
 /// fault) and doesn't require `T: Debug` (the element type doesn't
 /// flow through). Useful for `Result<DeviceSlice<T>, _>::expect_err`
 /// / `.unwrap` and generic `{:?}` chain-output debugging.
-impl<T> fmt::Debug for DeviceSlice<T> {
+impl<T, M: MemMode> fmt::Debug for DeviceSlice<T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeviceSlice")
             .field("len", &self.len)
@@ -730,7 +738,7 @@ impl<'a, T: Copy> FillOp<'a, T> {
     }
 }
 
-impl<T> Buffer<T> for DeviceSlice<T> {
+impl<T, M: MemMode> Buffer<T> for DeviceSlice<T, M> {
     fn len(&self) -> usize {
         self.len
     }
