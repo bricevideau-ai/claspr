@@ -9,7 +9,8 @@
 
 use claspr::{Context, MappedSlice, SvmLevel};
 use claspr_async::{
-    DeviceOperation, DeviceOperationHostExt, HostAccessibleExt, download, upload, value,
+    DeviceOperation, DeviceOperationHostExt, HostReadableExt, HostWritableExt, download, upload,
+    value,
 };
 use claspr_test_kernels::kernels;
 

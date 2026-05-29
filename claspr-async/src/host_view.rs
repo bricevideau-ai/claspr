@@ -63,56 +63,60 @@ fn cl_to_err(code: opencl3::types::cl_int) -> Error {
     Error::OpenCl(opencl3::error_codes::ClError(code))
 }
 
-// ── Access mode markers ─────────────────────────────────────────────
+// ── Map-flag markers (host-side map access mode) ───────────────────
+//
+// These are `cl_map_flags` markers for `clEnqueueMapBuffer` — distinct
+// from the `cl_mem_flags` markers in `claspr::access` (which describe
+// the buffer's creation-time kernel/host access). `MapReadOnly` says
+// "the map call uses CL_MAP_READ only"; `MapReadWrite` says "CL_MAP_READ |
+// CL_MAP_WRITE." The two layers compose: a `DeviceSlice<T, claspr::ReadOnly>`
+// (buffer-level kernel-RO) can be acquired with a `MapReadOnly` view
+// (host-level read), but never with a `MapReadWrite` view (host can't
+// write a buffer-level-kernel-RO buffer through the typed surface;
+// the buffer-marker scheme will gate that statically).
 
-/// Marker types selecting which `cl_map_flags` an acquire uses and
-/// whether the resulting view's `Mappable::View` is `&[T]` or
-/// `&mut [T]`. Implementors of [`MapAccess`] are zero-sized.
-mod access {
+mod map_access {
     use super::*;
 
-    /// Read-only access: `clEnqueueMapBuffer(CL_MAP_READ)`; closure
-    /// sees `&[T]`. No writeback on unmap, so a read-only view is
-    /// the cheapest way to look at device data from the host inside
+    /// Read-only host map: `clEnqueueMapBuffer(CL_MAP_READ)`. Closure
+    /// inside `and_then_host` sees `&[T]`. No writeback on unmap, so
+    /// the cheapest way to inspect device data from the host inside
     /// a chain.
-    pub struct ReadOnly;
-    /// Read/write access: `clEnqueueMapBuffer(CL_MAP_READ | CL_MAP_WRITE)`;
-    /// closure sees `&mut [T]`. Unmap commits writes back.
-    pub struct ReadWrite;
+    pub struct MapReadOnly;
+    /// Read/write host map: `clEnqueueMapBuffer(CL_MAP_READ | CL_MAP_WRITE)`.
+    /// Closure inside `and_then_host` sees `&mut [T]`. Unmap commits
+    /// writes back to the device.
+    pub struct MapReadWrite;
 
-    /// Trait abstracting [`ReadOnly`] / [`ReadWrite`] into a
+    /// Trait abstracting [`MapReadOnly`] / [`MapReadWrite`] into a
     /// `cl_map_flags` constant.
     pub trait MapAccess: Send + Sync + 'static {
         const MAP_FLAGS: cl_map_flags;
     }
-    impl MapAccess for ReadOnly {
+    impl MapAccess for MapReadOnly {
         const MAP_FLAGS: cl_map_flags = CL_MAP_READ;
     }
-    impl MapAccess for ReadWrite {
+    impl MapAccess for MapReadWrite {
         const MAP_FLAGS: cl_map_flags = CL_MAP_READ | CL_MAP_WRITE;
     }
 }
 
-pub use access::{MapAccess, ReadOnly, ReadWrite};
+pub use map_access::{MapAccess, MapReadOnly, MapReadWrite};
 
-// ── HostAccessibleExt ───────────────────────────────────────────────
+// ── HostReadableExt / HostWritableExt ──────────────────────────────
+//
+// Two traits, split per host-access direction. Used to be one trait
+// (`HostAccessibleExt`) with both methods on it, but that prevented
+// per-marker gating — `Frozen` should expose `acquire_host_view_read`
+// but not `acquire_host_view` (the mut version), which is unrepresent-
+// able with a single trait that requires both methods.
 
-/// Adds [`acquire_host_view`](Self::acquire_host_view) to types that
-/// can yield a host-side view of their data.
-///
-/// Bring into scope with `use claspr_async::HostAccessibleExt;` (or
-/// via a future prelude).
-pub trait HostAccessibleExt: Sized {
-    /// The acquire op type for this buffer kind (read/write).
-    type AcquireOp: DeviceOperation;
-    /// The acquire op type for the read-only variant. May be the
-    /// same kind as the read/write op when the only difference is
-    /// the `cl_map_flags` constant.
+/// Adds [`acquire_host_view_read`](Self::acquire_host_view_read) to
+/// buffer types whose marker permits host reads
+/// ([`claspr::access::HostReadable`]).
+pub trait HostReadableExt: Sized {
+    /// The acquire op type for the read-only variant.
     type AcquireReadOp: DeviceOperation;
-
-    /// Acquire a read/write host view. Closure inside
-    /// `and_then_host` receives `&mut [T]`.
-    fn acquire_host_view(self) -> Self::AcquireOp;
 
     /// Acquire a read-only host view. Closure inside `and_then_host`
     /// receives `&[T]`. Cheaper for inspection-only patterns since
@@ -120,21 +124,46 @@ pub trait HostAccessibleExt: Sized {
     fn acquire_host_view_read(self) -> Self::AcquireReadOp;
 }
 
+/// Adds [`acquire_host_view`](Self::acquire_host_view) (the mutating
+/// variant) to buffer types whose marker permits host writes
+/// ([`claspr::access::HostWritable`]).
+pub trait HostWritableExt: Sized {
+    /// The acquire op type for the read/write variant.
+    type AcquireOp: DeviceOperation;
+
+    /// Acquire a read/write host view. Closure inside
+    /// `and_then_host` receives `&mut [T]`.
+    fn acquire_host_view(self) -> Self::AcquireOp;
+}
+
+/// Legacy compound trait — kept as an alias for callers that want
+/// both directions at once. Users should prefer the split traits
+/// going forward; this convenience trait is satisfied automatically
+/// whenever both halves are.
+pub trait HostAccessibleExt: HostReadableExt + HostWritableExt {}
+impl<X: HostReadableExt + HostWritableExt> HostAccessibleExt for X {}
+
 // ── DeviceSlice: real map/unmap ─────────────────────────────────────
 
-impl<T> HostAccessibleExt for DeviceSlice<T>
+impl<T> HostReadableExt for DeviceSlice<T>
 where
     T: Send + 'static,
 {
-    type AcquireOp = AcquireDeviceSliceOp<T, ReadWrite>;
-    type AcquireReadOp = AcquireDeviceSliceOp<T, ReadOnly>;
-    fn acquire_host_view(self) -> Self::AcquireOp {
+    type AcquireReadOp = AcquireDeviceSliceOp<T, MapReadOnly>;
+    fn acquire_host_view_read(self) -> Self::AcquireReadOp {
         AcquireDeviceSliceOp {
             buf: Some(self),
             _access: PhantomData,
         }
     }
-    fn acquire_host_view_read(self) -> Self::AcquireReadOp {
+}
+
+impl<T> HostWritableExt for DeviceSlice<T>
+where
+    T: Send + 'static,
+{
+    type AcquireOp = AcquireDeviceSliceOp<T, MapReadWrite>;
+    fn acquire_host_view(self) -> Self::AcquireOp {
         AcquireDeviceSliceOp {
             buf: Some(self),
             _access: PhantomData,
@@ -213,9 +242,9 @@ where
 /// host memory until `release_to_device` (or `Drop`) unmaps it.
 ///
 /// `Deref<Target = [T]>` for both access modes;
-/// `DerefMut` only for [`ReadWrite`]. When used as the input to
+/// `DerefMut` only for [`MapReadWrite`]. When used as the input to
 /// [`AndThenHost`](crate::AndThenHost), the closure receives
-/// `&'_ [T]` ([`ReadOnly`]) or `&'_ mut [T]` ([`ReadWrite`])
+/// `&'_ [T]` ([`MapReadOnly`]) or `&'_ mut [T]` ([`MapReadWrite`])
 /// directly — no extra method call on the view needed.
 ///
 /// Carries a [`RetainedQueue`] so the defensive `Drop`-time unmap
@@ -244,12 +273,12 @@ impl<T, A: MapAccess> Deref for DeviceSliceHostView<T, A> {
         // SAFETY: host_ptr is the mapped pointer; remains valid
         // between map (in acquire) and unmap (in release/Drop). The
         // OpenCL map gives at least CL_MAP_READ access, so reads are
-        // permitted in both ReadOnly and ReadWrite.
+        // permitted in both MapReadOnly and MapReadWrite.
         unsafe { mapped_slice(self.host_ptr, self.len) }
     }
 }
 
-impl<T> DerefMut for DeviceSliceHostView<T, ReadWrite> {
+impl<T> DerefMut for DeviceSliceHostView<T, MapReadWrite> {
     fn deref_mut(&mut self) -> &mut [T] {
         // SAFETY: same as Deref; the map was acquired with
         // CL_MAP_WRITE so mutation is permitted. `&mut self` upgrades
@@ -367,7 +396,7 @@ pub struct HostViewHandle<T> {
 
 unsafe impl<T: Send> Send for HostViewHandle<T> {}
 
-impl<T> Mappable for DeviceSliceHostView<T, ReadWrite>
+impl<T> Mappable for DeviceSliceHostView<T, MapReadWrite>
 where
     T: Send + 'static,
 {
@@ -413,7 +442,7 @@ where
     }
 }
 
-impl<T> Mappable for DeviceSliceHostView<T, ReadOnly>
+impl<T> Mappable for DeviceSliceHostView<T, MapReadOnly>
 where
     T: Send + Sync + 'static,
 {
@@ -454,19 +483,25 @@ where
 
 // ── MappedSlice: non-blocking SVM map/unmap ────────────────────────
 
-impl<T> HostAccessibleExt for MappedSlice<T>
+impl<T> HostReadableExt for MappedSlice<T>
 where
     T: Send + Sync + 'static,
 {
-    type AcquireOp = AcquireMappedSliceOp<T, ReadWrite>;
-    type AcquireReadOp = AcquireMappedSliceOp<T, ReadOnly>;
-    fn acquire_host_view(self) -> Self::AcquireOp {
+    type AcquireReadOp = AcquireMappedSliceOp<T, MapReadOnly>;
+    fn acquire_host_view_read(self) -> Self::AcquireReadOp {
         AcquireMappedSliceOp {
             buf: Some(self),
             _access: PhantomData,
         }
     }
-    fn acquire_host_view_read(self) -> Self::AcquireReadOp {
+}
+
+impl<T> HostWritableExt for MappedSlice<T>
+where
+    T: Send + Sync + 'static,
+{
+    type AcquireOp = AcquireMappedSliceOp<T, MapReadWrite>;
+    fn acquire_host_view(self) -> Self::AcquireOp {
         AcquireMappedSliceOp {
             buf: Some(self),
             _access: PhantomData,
@@ -536,7 +571,7 @@ where
 /// Host view of a [`MappedSlice<T>`] — a live SVM map.
 ///
 /// Deref behaviour mirrors [`DeviceSliceHostView`]: `&[T]` always;
-/// `&mut [T]` only for the [`ReadWrite`] access mode (type-system
+/// `&mut [T]` only for the [`MapReadWrite`] access mode (type-system
 /// enforcement against accidental writes through a read-only map).
 pub struct MappedSliceHostView<T, A: MapAccess> {
     buf: Option<MappedSlice<T>>,
@@ -596,14 +631,14 @@ impl<T, A: MapAccess> Deref for MappedSliceHostView<T, A> {
     }
 }
 
-impl<T> DerefMut for MappedSliceHostView<T, ReadWrite> {
+impl<T> DerefMut for MappedSliceHostView<T, MapReadWrite> {
     fn deref_mut(&mut self) -> &mut [T] {
         let buf = self
             .buf
             .as_ref()
             .expect("MappedSliceHostView already released");
         // SAFETY: same as Deref — plus the SVM map was acquired with
-        // CL_MAP_WRITE (ReadWrite::MAP_FLAGS includes it) so mutation
+        // CL_MAP_WRITE (MapReadWrite::MAP_FLAGS includes it) so mutation
         // is permitted by the OpenCL runtime.
         unsafe { mapped_slice_mut(buf.ptr(), buf.len()) }
     }
@@ -674,7 +709,7 @@ where
 /// The SVM map is already in place from acquire; `map`/`unmap` are
 /// no-ops here, and the map event reaches the worker via
 /// `source_evts` (the `Deps` carried through the chain).
-impl<T> Mappable for MappedSliceHostView<T, ReadWrite>
+impl<T> Mappable for MappedSliceHostView<T, MapReadWrite>
 where
     T: Send + 'static,
 {
@@ -715,7 +750,7 @@ where
     fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
 }
 
-impl<T> Mappable for MappedSliceHostView<T, ReadOnly>
+impl<T> Mappable for MappedSliceHostView<T, MapReadOnly>
 where
     T: Send + Sync + 'static,
 {
