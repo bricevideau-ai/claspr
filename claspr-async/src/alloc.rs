@@ -170,6 +170,85 @@ where
     }
 }
 
+// ── HostBuffer fill / upload (alloc + DerefMut write) ──────────────
+//
+// HostBuffer storage is host-accessible (CL_MEM_ALLOC_HOST_PTR +
+// persistent map), so fill / upload are pure host writes through
+// DerefMut. No clEnqueue, no event tracking — deps pass through.
+// The OpenCL runtime handles host↔device coherency at the next
+// kernel-launch boundary that consumes the buffer.
+
+/// Lazy alloc + slice-fill for [`HostBuffer<T>`]. Built by
+/// [`host_buffer_filled`]. SVM/host analog of [`DeviceSliceFilled`]
+/// — different mechanism (host memcpy through `DerefMut`), same
+/// shape at the chain level.
+pub struct HostBufferFilled<T: Copy> {
+    value: T,
+    len: usize,
+}
+
+/// Allocate a [`HostBuffer<T>`] of `len` elements all set to
+/// `value`. Argument order mirrors [`vec!`](std::vec)'s
+/// `[value; count]`. Pure host write through the persistent map
+/// — no clEnqueue.
+pub fn host_buffer_filled<T>(value: T, len: usize) -> HostBufferFilled<T>
+where
+    T: Copy + Send + Sync + 'static,
+{
+    HostBufferFilled { value, len }
+}
+
+impl<T> DeviceOperation for HostBufferFilled<T>
+where
+    T: Copy + Send + Sync + 'static,
+{
+    type Output = HostBuffer<T>;
+
+    fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(HostBuffer<T>, Deps)> {
+        let mut buf = HostBuffer::<T>::alloc(ec, self.len)?;
+        buf.fill(self.value);
+        Ok((buf, deps))
+    }
+}
+
+/// Lazy alloc + memcpy from a host source into a fresh
+/// [`HostBuffer<T>`]. Built by [`host_buffer_upload`]. Wraps
+/// [`HostBuffer::from_slice`] under the hood — host-side memcpy
+/// through the persistent map, no clEnqueue.
+pub struct HostBufferUpload<T> {
+    source: Option<UploadSource<T>>,
+}
+
+/// Allocate a [`HostBuffer<T>`] of `source.len()` elements and copy
+/// `source` into it through the persistent host map. Mirrors
+/// [`upload`](crate::upload) on the host-pinned side.
+pub fn host_buffer_upload<T, S>(source: S) -> HostBufferUpload<T>
+where
+    T: Copy + Send + Sync + 'static,
+    S: Into<UploadSource<T>>,
+{
+    HostBufferUpload {
+        source: Some(source.into()),
+    }
+}
+
+impl<T> DeviceOperation for HostBufferUpload<T>
+where
+    T: Copy + Send + Sync + 'static,
+{
+    type Output = HostBuffer<T>;
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(HostBuffer<T>, Deps)> {
+        let source = self
+            .source
+            .take()
+            .expect("HostBufferUpload::execute called twice — internal claspr-async bug");
+        // from_slice does alloc + DerefMut copy_from_slice in one shot.
+        let buf = HostBuffer::<T>::from_slice(ec, source.as_slice())?;
+        Ok((buf, deps))
+    }
+}
+
 // ── SharedBuffer fill (alloc + clEnqueueSVMMemFill) ────────────────
 
 /// Lazy alloc + fill for SVM — produces a [`SharedBuffer<T>`] of
