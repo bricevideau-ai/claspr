@@ -166,6 +166,48 @@ where
     }
 }
 
+// ── SharedBuffer fill (alloc + clEnqueueSVMMemFill) ────────────────
+
+/// Lazy alloc + fill for SVM — produces a [`SharedBuffer<T>`] of
+/// `len` elements all set to `value`, via `clEnqueueSVMMemFill`
+/// (no host allocation, no host→device transfer). Built by
+/// [`shared_buffer_filled`]. SVM analog of [`DeviceSliceFilled`].
+pub struct SharedBufferFilled<T: Copy> {
+    value: T,
+    len: usize,
+}
+
+/// Allocate a [`SharedBuffer<T>`] of `len` elements all set to
+/// `value`. Argument order mirrors [`vec!`](std::vec)'s
+/// `[value; count]` shape — same as
+/// [`device_slice_filled`](crate::device_slice_filled), just SVM.
+///
+/// Surfaces [`Error::SvmNotAvailable`](claspr::Error::SvmNotAvailable)
+/// at execute time on devices without SVM (same gate as
+/// [`SharedBuffer::alloc`]).
+pub fn shared_buffer_filled<T>(value: T, len: usize) -> SharedBufferFilled<T>
+where
+    T: Copy + Send + 'static,
+{
+    SharedBufferFilled { value, len }
+}
+
+impl<T> DeviceOperation for SharedBufferFilled<T>
+where
+    T: Copy + Send + 'static,
+{
+    type Output = SharedBuffer<T>;
+
+    fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(SharedBuffer<T>, Deps)> {
+        let buf = SharedBuffer::<T>::alloc(ec.context(), self.len)?;
+        let event = buf
+            .fill(ec, self.value)
+            .after_all(deps_as_events(&deps))
+            .submit()?;
+        Ok((buf, vec![wrap_event(event)]))
+    }
+}
+
 // ── SharedBuffer ────────────────────────────────────────────────────
 
 /// Lazy [`SharedBuffer<T>`] (SVM) alloc. Built by [`shared_buffer_alloc`].

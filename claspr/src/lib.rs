@@ -92,7 +92,7 @@ pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 
 #[cfg(feature = "async-events")]
 pub use future::{CopyFuture, EventFuture, EventFutureExt, LaunchFuture, ReadFuture, WriteFuture};
-pub use svm::{SharedBuffer, SharedReadGuard, SharedWriteGuard};
+pub use svm::{SharedBuffer, SharedReadGuard, SharedWriteGuard, SvmCopyOp, SvmFillOp};
 
 // Stage-3 proc-macro frontend.
 pub use claspr_macros::{device, kernel};

@@ -54,8 +54,9 @@ pub mod transfer;
 pub mod transfer_to_device;
 
 pub use alloc::{
-    DeviceSliceAlloc, DeviceSliceFilled, HostBufferAlloc, SharedBufferAlloc, device_slice_alloc,
-    device_slice_filled, host_buffer_alloc, shared_buffer_alloc,
+    DeviceSliceAlloc, DeviceSliceFilled, HostBufferAlloc, SharedBufferAlloc, SharedBufferFilled,
+    device_slice_alloc, device_slice_filled, host_buffer_alloc, shared_buffer_alloc,
+    shared_buffer_filled,
 };
 pub use and_then_host::{AndThenHost, AndThenHostWithContext, DeviceOperationHostExt};
 pub use arc::ArcSplit;

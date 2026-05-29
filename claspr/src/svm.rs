@@ -41,12 +41,14 @@ use crate::buffer::Buffer;
 use crate::context::{Context, SvmLevel};
 use crate::error::{Error, Result};
 use crate::launch::KernelArg;
+use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
 use crate::queue::Launcher;
-use opencl3::command_queue::{enqueue_svm_map, enqueue_svm_unmap};
-use opencl3::event::{Event, release_event};
+use opencl3::command_queue::{CommandQueue, enqueue_svm_map, enqueue_svm_unmap};
+use opencl3::event::{Event, release_event, retain_event};
 use opencl3::kernel::ExecuteKernel;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, CL_MEM_READ_WRITE, svm_alloc};
-use opencl3::types::{CL_BLOCKING, cl_event, cl_int, cl_uint};
+use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_event, cl_int, cl_uint};
+use std::ffi::c_void;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
@@ -196,6 +198,51 @@ impl<T> SharedBuffer<T> {
     pub fn ptr(&self) -> *mut T {
         self.ptr
     }
+
+    /// Begin filling this SVM buffer's contents with `value` repeated
+    /// for every element — wraps `clEnqueueSVMMemFill` (CL 2.0+).
+    /// SVM analog of [`crate::DeviceSlice::fill`].
+    ///
+    /// Takes `&self` because the underlying SVM pointer is intentionally
+    /// aliased (host map guards govern exclusivity separately). The
+    /// resulting event is auto-registered on this buffer's
+    /// last-use list, so Drop's `clEnqueueSVMFree` waits for the
+    /// fill to finish.
+    pub fn fill<'a, L: Launcher + ?Sized>(&'a self, launcher: &'a L, value: T) -> SvmFillOp<'a, T>
+    where
+        T: Copy,
+    {
+        SvmFillOp {
+            queue: launcher.cl_queue(),
+            owner: self,
+            pattern: value,
+            deps: Vec::new(),
+            profile_cb: None,
+        }
+    }
+
+    /// Begin a SVM→SVM copy from `self` into `dst` — wraps
+    /// `clEnqueueSVMMemcpy` (CL 2.0+). SVM analog of
+    /// [`crate::DeviceSlice::copy_to`].
+    ///
+    /// Both buffers must be on the same `Context` (the runtime
+    /// enforces this; mismatch surfaces as a CL error at terminal
+    /// time). The resulting event is registered on **both** buffers'
+    /// last-use lists so Drop on either side is ordered after the
+    /// copy.
+    pub fn copy_to<'a, L: Launcher + ?Sized>(
+        &'a self,
+        dst: &'a SharedBuffer<T>,
+        launcher: &'a L,
+    ) -> SvmCopyOp<'a, T> {
+        SvmCopyOp {
+            queue: launcher.cl_queue(),
+            src: self,
+            dst,
+            deps: Vec::new(),
+            profile_cb: None,
+        }
+    }
 }
 
 /// Metadata-only `Debug` — does not read through the SVM pointer
@@ -217,6 +264,175 @@ impl<T> Buffer<T> for SharedBuffer<T> {
 
     fn ctx(&self) -> &Context {
         &self.ctx
+    }
+}
+
+// ── SvmFillOp / SvmCopyOp builders ─────────────────────────────────
+//
+// Same terminal / modifier shape as `DeviceSlice`'s FillOp / CopyOp.
+// Take `&SharedBuffer<T>` rather than a raw `cl_mem` reference because
+// the terminal needs to call `register_use` on the buffer(s) so Drop's
+// `clEnqueueSVMFree` waits for the fill/copy event.
+
+/// Lazy builder for `clEnqueueSVMMemFill`. Returned by
+/// [`SharedBuffer::fill`].
+pub struct SvmFillOp<'a, T: Copy> {
+    queue: &'a CommandQueue,
+    owner: &'a SharedBuffer<T>,
+    pattern: T,
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
+}
+
+impl<'a, T: Copy> SvmFillOp<'a, T> {
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
+    }
+
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        self.deps.extend(events.into_iter().map(|e| e.get()));
+        self
+    }
+
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    pub fn wait(self) -> Result<()> {
+        let event = self.into_event()?;
+        event.wait()?;
+        Ok(())
+    }
+
+    pub fn submit(self) -> Result<Event> {
+        self.into_event()
+    }
+
+    pub(crate) fn into_event(self) -> Result<Event> {
+        let size = self.owner.len * std::mem::size_of::<T>();
+        // SAFETY: svm_ptr is a valid SVM allocation in the queue's
+        // context (caller's responsibility — same as
+        // `DeviceSlice::fill`). Pattern is a single T byte-copied
+        // across the buffer.
+        let event = unsafe {
+            self.queue.enqueue_svm_mem_fill(
+                self.owner.ptr as *mut c_void,
+                std::slice::from_ref(&self.pattern),
+                size,
+                &self.deps,
+            )?
+        };
+        if let Some(cb) = self.profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
+        // Auto-register on the source buffer's last-use list so
+        // Drop's free waits for this fill. clRetainEvent bumps the
+        // cl_event refcount so the returned `event` and the
+        // registered Arc<Event> each hold an independent reference;
+        // both `Event::drop`s call `clReleaseEvent` to balance.
+        // SAFETY: event.get() is live; retain is paired with the
+        // Event::drop inside the Arc.
+        unsafe {
+            retain_event(event.get())
+                .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
+        }
+        self.owner
+            .register_use(std::sync::Arc::new(Event::new(event.get())));
+        Ok(event)
+    }
+}
+
+/// Lazy builder for `clEnqueueSVMMemcpy`. Returned by
+/// [`SharedBuffer::copy_to`].
+pub struct SvmCopyOp<'a, T> {
+    queue: &'a CommandQueue,
+    src: &'a SharedBuffer<T>,
+    dst: &'a SharedBuffer<T>,
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
+}
+
+impl<'a, T> SvmCopyOp<'a, T> {
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
+    }
+
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        self.deps.extend(events.into_iter().map(|e| e.get()));
+        self
+    }
+
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    pub fn wait(self) -> Result<()> {
+        let event = self.into_event()?;
+        event.wait()?;
+        Ok(())
+    }
+
+    pub fn submit(self) -> Result<Event> {
+        self.into_event()
+    }
+
+    pub(crate) fn into_event(self) -> Result<Event> {
+        if self.src.len != self.dst.len {
+            return Err(Error::LengthMismatch {
+                src: self.src.len,
+                dst: self.dst.len,
+            });
+        }
+        let size = self.src.len * std::mem::size_of::<T>();
+        // SAFETY: both SVM pointers are valid allocations in the
+        // queue's context (caller's responsibility — runtime gives
+        // CL_INVALID_CONTEXT on mismatch). CL_NON_BLOCKING so the
+        // event encodes completion; .wait()/.submit() pick how to
+        // observe it.
+        let event = unsafe {
+            self.queue.enqueue_svm_mem_cpy(
+                CL_NON_BLOCKING,
+                self.dst.ptr as *mut c_void,
+                self.src.ptr as *const c_void,
+                size,
+                &self.deps,
+            )?
+        };
+        if let Some(cb) = self.profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
+        // Two extra refcounts (one per buffer's last_use). The
+        // returned `event` keeps its original refcount. Three
+        // independent Event::drop → clReleaseEvent, balanced.
+        // SAFETY: event.get() is live; each retain is paired with
+        // a matching Event::drop in the registered Arc.
+        unsafe {
+            retain_event(event.get())
+                .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
+            retain_event(event.get())
+                .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
+        }
+        let src_arc = std::sync::Arc::new(Event::new(event.get()));
+        let dst_arc = std::sync::Arc::new(Event::new(event.get()));
+        self.src.register_use(src_arc);
+        self.dst.register_use(dst_arc);
+        Ok(event)
     }
 }
 
