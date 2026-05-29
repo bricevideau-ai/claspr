@@ -42,6 +42,29 @@ where
     FanOut { inputs, f: Some(f) }
 }
 
+/// Method-call form of [`fan_out`]: `vec![a, b].fan_out(op)`.
+///
+/// Reads as data → operation and composes cleanly with downstream
+/// `.and_then`, mirroring how tokio / rayon let you chain
+/// parallel-map shapes. The free-fn form stays available — use
+/// whichever fits the call site.
+pub trait FanOutExt<I>: Sized {
+    fn fan_out<F, U>(self, f: F) -> FanOut<I, F>
+    where
+        F: FnMut(I) -> U + Send,
+        U: DeviceOperation;
+}
+
+impl<I: Send> FanOutExt<I> for Vec<I> {
+    fn fan_out<F, U>(self, f: F) -> FanOut<I, F>
+    where
+        F: FnMut(I) -> U + Send,
+        U: DeviceOperation,
+    {
+        fan_out(self, f)
+    }
+}
+
 impl<I, F, U> DeviceOperation for FanOut<I, F>
 where
     I: Send,

@@ -68,7 +68,7 @@ pub use bundle::{
 };
 pub use dyn_op::DynOp;
 pub use exec_ctx::ExecutionContext;
-pub use fan_out::{FanOut, fan_out};
+pub use fan_out::{FanOut, FanOutExt, fan_out};
 pub use future::ChainFuture;
 pub use host_view::{
     AcquireDeviceSliceOp, AcquireHostBufferOp, AcquireSharedBufferOp, DeviceSliceHostView,

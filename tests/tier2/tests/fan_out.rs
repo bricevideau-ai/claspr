@@ -6,7 +6,7 @@
 //! transform to each tile, collect results in order.
 
 use claspr::Context;
-use claspr_async::{DeviceOperation, download, fan_out, upload, value};
+use claspr_async::{DeviceOperation, FanOutExt, download, fan_out, upload, value};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;
@@ -62,6 +62,24 @@ fn fan_out_of_kernel_ops_runs_each_branch() {
     for (out, expected) in outputs.iter().zip(fill_values.iter()) {
         assert!(out.iter().all(|&v| v == *expected));
     }
+}
+
+#[test]
+fn vec_method_form_matches_free_fn() {
+    // The `Vec::fan_out(op)` method form should produce the same chain
+    // as `fan_out(vec, op)`. Run both, assert outputs match.
+    let Some(ctx) = ctx() else { return };
+    let inputs: Vec<u32> = (0..6).collect();
+    let via_free: Vec<u32> = fan_out(inputs.clone(), |n| value(n.wrapping_add(1)))
+        .sync(&ctx)
+        .expect("fan_out free");
+    let via_method: Vec<u32> = inputs
+        .clone()
+        .fan_out(|n| value(n.wrapping_add(1)))
+        .sync(&ctx)
+        .expect("fan_out method");
+    assert_eq!(via_free, via_method);
+    assert_eq!(via_method, vec![1, 2, 3, 4, 5, 6]);
 }
 
 #[test]
