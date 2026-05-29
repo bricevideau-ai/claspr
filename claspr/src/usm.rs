@@ -124,6 +124,24 @@ impl<T> USMSlice<T> {
     }
 }
 
+impl<T: Default + Copy + Send + 'static> USMSlice<T> {
+    /// Allocate a USMSlice of `len` elements initialised to
+    /// `T::default()`. Convenience wrapper over
+    /// [`new(ctx, vec![T::default(); len])`](Self::new), symmetric
+    /// with [`DeviceSlice::alloc`](crate::DeviceSlice::alloc) and
+    /// [`MappedSlice::alloc`](crate::MappedSlice::alloc).
+    ///
+    /// No perf win over the explicit `new` form — the Vec still needs
+    /// to be initialised before construction (`USMSlice` derefs to
+    /// `&[T]` so uninit bytes would be unsound to expose). The benefit
+    /// is API symmetry across tiers and a shorter call site for the
+    /// common "I just want N zeroed elements the kernel will fill"
+    /// pattern.
+    pub fn alloc(ctx: &Context, len: usize) -> Result<Self> {
+        Self::new(ctx, vec![T::default(); len])
+    }
+}
+
 impl<T> Buffer<T> for USMSlice<T> {
     fn len(&self) -> usize {
         self.data.len()

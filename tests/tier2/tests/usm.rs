@@ -10,7 +10,7 @@
 //! saw 0"); it must pass here.
 
 use claspr::{Buffer, Context, SvmLevel};
-use claspr_async::{DeviceOperation, usm_slice};
+use claspr_async::{DeviceOperation, usm_slice, usm_slice_alloc};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;
@@ -97,6 +97,20 @@ fn usm_slice_drop_waits_for_in_flight_kernel() {
     // completes (which the Drop's wait loop ensures).
     drop(buf);
     assert_eq!(ctx.error_count(), 0);
+}
+
+#[test]
+fn usm_slice_alloc_produces_zero_initialised_buffer() {
+    // Symmetric with device_slice_alloc / mapped_slice_alloc:
+    // `usm_slice_alloc::<T>(N)` allocates a host Vec of length N
+    // initialised to T::default(). Before any kernel runs, every
+    // element is T::default() (zero for u32).
+    let Some(ctx) = ctx_with_fine_system() else {
+        return;
+    };
+    let buf = usm_slice_alloc::<u32>(N).sync(&ctx).expect("alloc");
+    assert_eq!(buf.len(), N);
+    assert!(buf.iter().all(|&v| v == 0), "alloc should zero-init");
 }
 
 #[test]

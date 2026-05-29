@@ -82,7 +82,7 @@ pub use op::{
 pub use profile::{DeviceOperationProfileExt, Profiled};
 pub use transfer::{Download, Upload, UploadSource, download, upload};
 pub use transfer_to_device::{TransferToDevice, transfer_to_device};
-pub use usm::{UsmSliceOp, usm_slice};
+pub use usm::{UsmSliceAlloc, UsmSliceOp, usm_slice, usm_slice_alloc};
 
 /// `vec!`-shaped sugar for producing a [`DeviceSlice<T>`] op.
 ///

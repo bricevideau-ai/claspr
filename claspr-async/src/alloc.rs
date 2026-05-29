@@ -61,11 +61,15 @@ pub struct DeviceSliceAlloc<T> {
     _phantom: PhantomData<fn() -> T>,
 }
 
-/// Allocate a [`DeviceSlice<T>`] of `len` uninitialised elements when
-/// the chain reaches this op. See module docs for the rationale.
+/// Allocate a [`DeviceSlice<T>`] of `len` zero-initialised elements
+/// when the chain reaches this op. See module docs for the rationale.
+///
+/// The bound matches [`DeviceSlice::alloc`](claspr::DeviceSlice::alloc) —
+/// `T: Default + Copy` so the underlying `clEnqueueFillBuffer(T::default())`
+/// is well-typed.
 pub fn device_slice_alloc<T>(len: usize) -> DeviceSliceAlloc<T>
 where
-    T: Send + 'static,
+    T: Default + Copy + Send + 'static,
 {
     DeviceSliceAlloc {
         len,
@@ -75,11 +79,14 @@ where
 
 impl<T> DeviceOperation for DeviceSliceAlloc<T>
 where
-    T: Send + 'static,
+    T: Default + Copy + Send + 'static,
 {
     type Output = DeviceSlice<T>;
 
     fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(DeviceSlice<T>, Deps)> {
+        // DeviceSlice::alloc zero-fills synchronously on the context's
+        // default queue and blocks until done, so the bytes are valid
+        // when this returns. No new chain-queue event needed.
         let buf = DeviceSlice::<T>::alloc(ec.context(), self.len)?;
         Ok((buf, deps))
     }
@@ -119,7 +126,9 @@ where
     type Output = DeviceSlice<T>;
 
     fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(DeviceSlice<T>, Deps)> {
-        let mut buf = DeviceSlice::<T>::alloc(ec.context(), self.len)?;
+        // alloc_uninit: the fill below overwrites every byte, so
+        // skip alloc's redundant zero-fill.
+        let mut buf = DeviceSlice::<T>::alloc_uninit(ec.context(), self.len)?;
         // Fill on the chain's queue with upstream deps as wait-list.
         // Same shape as Upload: downstream waits on the fill event,
         // which transitively gates on upstream.
@@ -164,7 +173,8 @@ where
     type Output = MappedSlice<T>;
 
     fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(MappedSlice<T>, Deps)> {
-        let buf = MappedSlice::<T>::alloc(ec.context(), self.len)?;
+        // alloc_uninit: the fill below overwrites every byte.
+        let buf = MappedSlice::<T>::alloc_uninit(ec.context(), self.len)?;
         let event = buf
             .fill(ec, self.value)
             .after_all(deps_as_events(&deps))
@@ -213,7 +223,8 @@ where
             .take()
             .expect("MappedSliceUpload::execute called twice — internal claspr-async bug");
         let len = source.len();
-        let buf = MappedSlice::<T>::alloc(ec.context(), len)?;
+        // alloc_uninit: the memcpy below overwrites every byte.
+        let buf = MappedSlice::<T>::alloc_uninit(ec.context(), len)?;
 
         let raw_deps: Vec<opencl3::types::cl_event> =
             deps.iter().map(|d| d.as_ref().get()).collect();
@@ -259,7 +270,11 @@ pub struct MappedSliceAlloc<T> {
 }
 
 /// Allocate a [`MappedSlice<T>`] (SVM coarse-grain) of `len`
-/// elements when the chain reaches this op.
+/// zero-initialised elements when the chain reaches this op.
+///
+/// The bound matches [`MappedSlice::alloc`](claspr::MappedSlice::alloc) —
+/// `T: Default + Copy` so the underlying `clEnqueueSVMMemFill(T::default())`
+/// is well-typed.
 ///
 /// Surfaces [`Error::SvmNotAvailable`] at execute time if the running
 /// device doesn't support SVM. Same gate as the synchronous
@@ -268,7 +283,7 @@ pub struct MappedSliceAlloc<T> {
 /// [`Error::SvmNotAvailable`]: claspr::Error::SvmNotAvailable
 pub fn mapped_slice_alloc<T>(len: usize) -> MappedSliceAlloc<T>
 where
-    T: Send + 'static,
+    T: Default + Copy + Send + 'static,
 {
     MappedSliceAlloc {
         len,
@@ -278,11 +293,13 @@ where
 
 impl<T> DeviceOperation for MappedSliceAlloc<T>
 where
-    T: Send + 'static,
+    T: Default + Copy + Send + 'static,
 {
     type Output = MappedSlice<T>;
 
     fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(MappedSlice<T>, Deps)> {
+        // MappedSlice::alloc zero-fills synchronously on the context's
+        // default queue and blocks until done.
         let buf = MappedSlice::<T>::alloc(ec.context(), self.len)?;
         Ok((buf, deps))
     }

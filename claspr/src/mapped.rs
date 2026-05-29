@@ -126,12 +126,40 @@ pub struct MappedSlice<T> {
 unsafe impl<T: Send> Send for MappedSlice<T> {}
 unsafe impl<T: Sync> Sync for MappedSlice<T> {}
 
-impl<T> MappedSlice<T> {
-    /// Allocate `len` elements of T in SVM memory, uninitialised.
+impl<T: Default + Copy> MappedSlice<T> {
+    /// Allocate `len` elements of T in SVM memory, zero-initialised
+    /// via `clEnqueueSVMMemFill(T::default())` on the context's
+    /// default queue. Blocks until the fill completes.
     ///
     /// Returns [`Error::SvmNotAvailable`] if the context's device
     /// reports [`SvmLevel::None`] for `CL_DEVICE_SVM_CAPABILITIES`.
+    ///
+    /// The `T: Default + Copy` bound makes the buffer's contents a
+    /// valid `T` value before any read; matches
+    /// [`DeviceSlice::alloc`](crate::DeviceSlice::alloc) and
+    /// [`USMSlice::alloc`](crate::USMSlice::alloc).
+    ///
+    /// Code paths that write the entire buffer immediately afterward
+    /// (e.g. `mapped_slice_filled`, `mapped_slice_upload`) should use
+    /// [`alloc_uninit`](Self::alloc_uninit) instead to skip the
+    /// redundant zero-fill.
     pub fn alloc(ctx: &Context, len: usize) -> Result<Self> {
+        let slice = Self::alloc_uninit(ctx, len)?;
+        slice.fill(ctx, T::default()).wait()?;
+        Ok(slice)
+    }
+}
+
+impl<T> MappedSlice<T> {
+    /// Allocate `len` elements of T in SVM memory, leaving the bytes
+    /// uninitialised. Cheaper than [`alloc`](Self::alloc) when the
+    /// caller writes the whole buffer before any read.
+    ///
+    /// Reading uninitialised bytes is unspecified at the OpenCL level
+    /// and UB at the Rust level if interpreted as a non-trivial `T`.
+    /// Prefer [`alloc`](Self::alloc) unless you know the buffer is
+    /// fully written before any read.
+    pub fn alloc_uninit(ctx: &Context, len: usize) -> Result<Self> {
         if ctx.svm_capability() == SvmLevel::None {
             return Err(Error::SvmNotAvailable);
         }

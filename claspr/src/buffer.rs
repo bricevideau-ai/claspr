@@ -93,8 +93,10 @@ pub trait Buffer<T> {
 /// pointer + `usize` length). When passed as a launch argument,
 /// claspr sets both — see the [`KernelArg`] impl in [`crate::launch`].
 ///
-/// Construct via [`DeviceSlice::alloc`] (uninitialised) or
-/// [`DeviceSlice::upload`] (with initial host data). Read back via
+/// Construct via [`DeviceSlice::alloc`] (zero-initialised) or
+/// [`DeviceSlice::upload`] (with initial host data). For output-only
+/// buffers where the zero-fill would be wasted work, use
+/// [`alloc_uninit`](DeviceSlice::alloc_uninit). Read back via
 /// [`DeviceSlice::download`].
 ///
 /// Host code never sees the bytes directly — for that, use
@@ -126,13 +128,42 @@ impl<T> Drop for DeviceSlice<T> {
     }
 }
 
-impl<T> DeviceSlice<T> {
-    /// Allocate a device buffer of `len` elements, uninitialised.
+impl<T: Default + Copy> DeviceSlice<T> {
+    /// Allocate a device buffer of `len` elements, zero-initialised
+    /// via `clEnqueueFillBuffer(T::default())` on the context's
+    /// default queue. Blocks until the fill completes.
     ///
-    /// Pure context op — no command queue needed (`clCreateBuffer`
-    /// doesn't enqueue anything). Pass any `Context` (e.g. from
-    /// `Context::any()` or as borrowed from a `Launcher`).
+    /// The `T: Default + Copy` bound makes the buffer's contents a
+    /// valid `T` value before any read, so a host download (or kernel
+    /// read-before-write) sees `T::default()` rather than uninit
+    /// bytes. Matches [`MappedSlice::alloc`](crate::MappedSlice::alloc)
+    /// and [`USMSlice::alloc`](crate::USMSlice::alloc).
+    ///
+    /// Internally a `clCreateBuffer` + a synchronous fill. Code paths
+    /// that write the entire buffer immediately afterward (e.g.
+    /// `upload`, `device_slice_filled`) should use
+    /// [`alloc_uninit`](Self::alloc_uninit) instead to skip the
+    /// redundant zero-fill.
     pub fn alloc(ctx: &Context, len: usize) -> Result<Self> {
+        let mut slice = Self::alloc_uninit(ctx, len)?;
+        slice.fill(ctx, T::default()).wait()?;
+        Ok(slice)
+    }
+}
+
+impl<T> DeviceSlice<T> {
+    /// Allocate a device buffer of `len` elements, leaving the bytes
+    /// uninitialised. Cheaper than [`alloc`](Self::alloc) when the
+    /// caller writes the whole buffer before any read (kernel output,
+    /// explicit `write`/`fill`, etc.).
+    ///
+    /// Reading from an unwritten buffer (via `read` / `map` /
+    /// `download`) is unspecified behaviour at the OpenCL level and
+    /// undefined behaviour at the Rust level if the bytes are
+    /// interpreted as a non-trivial `T`. Prefer
+    /// [`alloc`](Self::alloc) unless you know the buffer is fully
+    /// written before any read.
+    pub fn alloc_uninit(ctx: &Context, len: usize) -> Result<Self> {
         // SAFETY: passing a null host pointer means OpenCL allocates
         // fresh device memory and ignores the host-pointer contract
         // that makes `Buffer::create` generally unsafe.

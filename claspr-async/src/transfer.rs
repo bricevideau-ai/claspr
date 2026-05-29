@@ -144,7 +144,8 @@ where
             .source
             .take()
             .expect("Upload::execute called twice — internal claspr-async bug");
-        let mut buf = DeviceSlice::alloc(ctx.context(), source.len())?;
+        // alloc_uninit: the write below overwrites every byte.
+        let mut buf = DeviceSlice::alloc_uninit(ctx.context(), source.len())?;
         // Non-blocking write with `deps` as the queue wait-list. The
         // event from .submit() goes into the keep-alive callback +
         // becomes the next op's dep.
