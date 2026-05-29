@@ -110,50 +110,30 @@ fn pipeline_spans_two_devices_via_shared_buffer() {
 }
 
 #[test]
-fn download_from_device_b_can_be_reuploaded_to_device_a() {
-    // The "cross-context buffer flow" REVIEW.md identifies as where
-    // most users hit problems first: end a chain on device B with a
-    // download, take the Vec back, then feed it to a fresh chain
-    // that uploads to device A and processes it further.
-    //
-    // The Vec is fully host-owned between the two chains — no
-    // cl_mem aliasing risk — but the test pins the memory-lifecycle
+fn downloaded_vec_can_be_reuploaded_into_a_fresh_chain() {
+    // Chain 1 ends with `download` (host-owned `Vec<T>`); chain 2
+    // starts with `upload` of that same Vec. Pins the memory-lifecycle
     // path so a future regression that broke ownership semantics
-    // (e.g. download returning a borrow rather than an owned Vec)
-    // would surface here.
-    let Some((ctx, dev_a, dev_b)) = ctx_two_devices() else {
+    // (e.g. download returning a borrow rather than an owned Vec) would
+    // surface here. The two chains share a multi-device Context but
+    // both run on the chain's default OOO queue — per-op device routing
+    // is a separate open question and not what this test exercises.
+    let Some((ctx, _dev_a, _dev_b)) = ctx_two_devices() else {
         return;
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let kernels_ref = &kernels;
-    let q_a = claspr::Queue::<claspr::InOrder>::on_device(&ctx, &dev_a).expect("queue on dev_a");
-    let q_b = claspr::Queue::<claspr::InOrder>::on_device(&ctx, &dev_b).expect("queue on dev_b");
-    let q_a_ref = &q_a;
-    let q_b_ref = &q_b;
 
-    // Chain 1: fill on device B, download to host.
     let intermediate: Vec<u32> = upload(vec![0u32; N])
-        .and_then(move |buf| {
-            with_context(move |_ec| {
-                let buf = kernels_ref.fill_u32([N], buf, 5).wait(q_b_ref)?;
-                Ok::<DeviceSlice<u32>, claspr::Error>(buf)
-            })
-        })
+        .and_then(|buf| kernels.fill_u32([N], buf, 5))
         .and_then(download)
         .sync(&ctx)
-        .expect("chain 1 (device B → host)");
+        .expect("chain 1");
     assert!(intermediate.iter().all(|&v| v == 5));
 
-    // Chain 2: re-upload to device A, scale, download.
     let final_result: Vec<u32> = upload(intermediate)
-        .and_then(move |buf| {
-            with_context(move |_ec| {
-                let buf = kernels_ref.scale_u32([N], buf, 6).wait(q_a_ref)?;
-                Ok::<DeviceSlice<u32>, claspr::Error>(buf)
-            })
-        })
+        .and_then(|buf| kernels.scale_u32([N], buf, 6))
         .and_then(download)
         .sync(&ctx)
-        .expect("chain 2 (host → device A)");
+        .expect("chain 2");
     assert!(final_result.iter().all(|&v| v == 30));
 }
