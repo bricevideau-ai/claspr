@@ -250,10 +250,16 @@ where
             wait_err = Some(claspr::Error::OpenCl(e));
         }
     }
-    // Always drain the queue — covers commands enqueued without
-    // being tracked in the events list (e.g. a `with_context`
-    // closure that called `.submit()` and discarded the event).
-    let finish_res = queue.finish();
+    // Drain every per-device OOO queue the chain touched — covers
+    // commands enqueued without being tracked in the events list
+    // (e.g. a `with_context` closure that called `.submit()` and
+    // discarded the event). `queue.finish()` on the primary queue
+    // alone misses orphan commands on secondary queues that
+    // `.on_device(&dev_b)` / `transfer_to_device(buf, &dev_b)` may
+    // have populated. The chain-tracked events were already waited
+    // on above; this is purely the defensive untracked-commands
+    // sweep, parallel across queues.
+    let finish_res = context.finish_all_outoforder_queues();
     // Prefer a stashed host error (from an `and_then_host` worker)
     // over the CL cascade — that's the whole point of the slot. The
     // CL `-N` we'd otherwise surface is just the user-event-set-neg

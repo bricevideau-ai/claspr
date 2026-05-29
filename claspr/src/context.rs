@@ -283,6 +283,37 @@ impl Context {
         Ok(())
     }
 
+    /// Finish (`clFinish`: flush + wait-for-completion) every
+    /// per-device out-of-order queue this context has lazily
+    /// instantiated. No-op for slots that are still empty.
+    ///
+    /// Sync terminal in `claspr-async` calls this as a defensive
+    /// final drain — covers commands enqueued without being tracked
+    /// in the chain's deps (e.g. a `with_context` closure that
+    /// called `.submit()` and discarded the event). Without it, a
+    /// multi-device chain whose `with_context`-orphaned commands
+    /// land on a secondary queue (`.on_device(&dev_b)`-resolved)
+    /// would let `sync()` return while those commands are still in
+    /// flight — `.finish()` on the chain's primary queue alone
+    /// doesn't reach them.
+    ///
+    /// Synchronous: blocks until every cached OOO queue has drained.
+    /// Order across queues is unimportant for correctness — chain-
+    /// tracked events were already waited on; this is purely the
+    /// "catch untracked commands" pass.
+    pub fn finish_all_outoforder_queues(&self) -> Result<()> {
+        for slot in &self.inner.queues {
+            let guard = slot
+                .out_of_order
+                .lock()
+                .expect("DeviceQueues out_of_order mutex poisoned");
+            if let Some(q) = guard.as_ref() {
+                q.raw().finish()?;
+            }
+        }
+        Ok(())
+    }
+
     /// `true` if the context was built with `.profiling(true)`.
     /// Every default queue and every [`Queue::new`](crate::queue::Queue::new) /
     /// [`Queue::on_device`](crate::queue::Queue::on_device) built off
