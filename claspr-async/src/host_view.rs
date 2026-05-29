@@ -47,6 +47,7 @@
 use crate::exec_ctx::ExecutionContext;
 use crate::mappable::Mappable;
 use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use claspr::access::{HostReadable, HostWritable, MemMode};
 use claspr::util::{RetainedQueue, mapped_slice, mapped_slice_mut};
 use claspr::{Buffer, DeviceSlice, Error, Event, Launcher, MappedSlice, Result};
 use opencl3::command_queue::{
@@ -145,11 +146,11 @@ impl<X: HostReadableExt + HostWritableExt> HostAccessibleExt for X {}
 
 // ── DeviceSlice: real map/unmap ─────────────────────────────────────
 
-impl<T> HostReadableExt for DeviceSlice<T>
+impl<T, M: MemMode + HostReadable> HostReadableExt for DeviceSlice<T, M>
 where
     T: Send + 'static,
 {
-    type AcquireReadOp = AcquireDeviceSliceOp<T, MapReadOnly>;
+    type AcquireReadOp = AcquireDeviceSliceOp<T, M, MapReadOnly>;
     fn acquire_host_view_read(self) -> Self::AcquireReadOp {
         AcquireDeviceSliceOp {
             buf: Some(self),
@@ -158,11 +159,16 @@ where
     }
 }
 
-impl<T> HostWritableExt for DeviceSlice<T>
+impl<T, M: MemMode + HostWritable + HostReadable> HostWritableExt for DeviceSlice<T, M>
 where
     T: Send + 'static,
 {
-    type AcquireOp = AcquireDeviceSliceOp<T, MapReadWrite>;
+    // HostWritable + HostReadable: the mut acquire issues
+    // CL_MAP_READ | CL_MAP_WRITE, so the marker must permit both.
+    // A buffer that's host-write-only (CL_MEM_HOST_WRITE_ONLY) isn't
+    // expressible in our marker set, so HostWritable always implies
+    // HostReadable for the markers we have today.
+    type AcquireOp = AcquireDeviceSliceOp<T, M, MapReadWrite>;
     fn acquire_host_view(self) -> Self::AcquireOp {
         AcquireDeviceSliceOp {
             buf: Some(self),
@@ -175,17 +181,18 @@ where
 /// [`DeviceSlice::acquire_host_view_read`]. Enqueues a non-blocking
 /// `clEnqueueMapBuffer` with `deps` as the wait-list and produces a
 /// [`DeviceSliceHostView`].
-pub struct AcquireDeviceSliceOp<T, A: MapAccess> {
-    buf: Option<DeviceSlice<T>>,
+pub struct AcquireDeviceSliceOp<T, M: MemMode, A: MapAccess> {
+    buf: Option<DeviceSlice<T, M>>,
     _access: PhantomData<A>,
 }
 
-impl<T, A> DeviceOperation for AcquireDeviceSliceOp<T, A>
+impl<T, M, A> DeviceOperation for AcquireDeviceSliceOp<T, M, A>
 where
     T: Send + 'static,
+    M: MemMode,
     A: MapAccess,
 {
-    type Output = DeviceSliceHostView<T, A>;
+    type Output = DeviceSliceHostView<T, M, A>;
 
     fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let buf = self
@@ -252,8 +259,8 @@ where
 /// [`DeviceSlice`] is about to drop) has a valid queue handle even
 /// if the original Launcher is long gone. The retain pair is owned
 /// by the field's `Drop` — see the impl below.
-pub struct DeviceSliceHostView<T, A: MapAccess> {
-    buf: Option<DeviceSlice<T>>,
+pub struct DeviceSliceHostView<T, M: MemMode, A: MapAccess> {
+    buf: Option<DeviceSlice<T, M>>,
     host_ptr: *mut T,
     len: usize,
     map_queue: RetainedQueue,
@@ -265,9 +272,9 @@ pub struct DeviceSliceHostView<T, A: MapAccess> {
 // serially under unique borrow rules (see the doc on
 // `DeviceSliceMapHandle` in mappable.rs). `RetainedQueue` is Send
 // on its own.
-unsafe impl<T: Send, A: MapAccess> Send for DeviceSliceHostView<T, A> {}
+unsafe impl<T: Send, M: MemMode, A: MapAccess> Send for DeviceSliceHostView<T, M, A> {}
 
-impl<T, A: MapAccess> Deref for DeviceSliceHostView<T, A> {
+impl<T, M: MemMode, A: MapAccess> Deref for DeviceSliceHostView<T, M, A> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         // SAFETY: host_ptr is the mapped pointer; remains valid
@@ -278,7 +285,7 @@ impl<T, A: MapAccess> Deref for DeviceSliceHostView<T, A> {
     }
 }
 
-impl<T> DerefMut for DeviceSliceHostView<T, MapReadWrite> {
+impl<T, M: MemMode> DerefMut for DeviceSliceHostView<T, M, MapReadWrite> {
     fn deref_mut(&mut self) -> &mut [T] {
         // SAFETY: same as Deref; the map was acquired with
         // CL_MAP_WRITE so mutation is permitted. `&mut self` upgrades
@@ -287,7 +294,7 @@ impl<T> DerefMut for DeviceSliceHostView<T, MapReadWrite> {
     }
 }
 
-impl<T, A: MapAccess> Drop for DeviceSliceHostView<T, A> {
+impl<T, M: MemMode, A: MapAccess> Drop for DeviceSliceHostView<T, M, A> {
     fn drop(&mut self) {
         if !self.unmap_done
             && let Some(buf) = self.buf.as_ref()
@@ -321,15 +328,16 @@ impl<T, A: MapAccess> Drop for DeviceSliceHostView<T, A> {
     }
 }
 
-impl<T, A> DeviceSliceHostView<T, A>
+impl<T, M, A> DeviceSliceHostView<T, M, A>
 where
     T: Send + 'static,
+    M: MemMode,
     A: MapAccess,
 {
     /// Enqueue the matching `clEnqueueUnmapMemObject` and yield the
     /// underlying [`DeviceSlice`] back so subsequent device stages
     /// can use it.
-    pub fn release_to_device(self) -> ReleaseDeviceSliceOp<T, A> {
+    pub fn release_to_device(self) -> ReleaseDeviceSliceOp<T, M, A> {
         ReleaseDeviceSliceOp { view: Some(self) }
     }
 }
@@ -338,18 +346,23 @@ where
 /// [`DeviceSliceHostView::release_to_device`]. Enqueues
 /// `clEnqueueUnmapMemObject` waiting on `deps`, returns the
 /// [`DeviceSlice`] and the unmap event.
-pub struct ReleaseDeviceSliceOp<T, A: MapAccess> {
-    view: Option<DeviceSliceHostView<T, A>>,
+pub struct ReleaseDeviceSliceOp<T, M: MemMode, A: MapAccess> {
+    view: Option<DeviceSliceHostView<T, M, A>>,
 }
 
-impl<T, A> DeviceOperation for ReleaseDeviceSliceOp<T, A>
+impl<T, M, A> DeviceOperation for ReleaseDeviceSliceOp<T, M, A>
 where
     T: Send + 'static,
+    M: MemMode,
     A: MapAccess,
 {
-    type Output = DeviceSlice<T>;
+    type Output = DeviceSlice<T, M>;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(DeviceSlice<T>, Deps)> {
+    fn execute(
+        mut self,
+        ctx: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> Result<(DeviceSlice<T, M>, Deps)> {
         let mut view = self
             .view
             .take()
@@ -396,7 +409,7 @@ pub struct HostViewHandle<T> {
 
 unsafe impl<T: Send> Send for HostViewHandle<T> {}
 
-impl<T> Mappable for DeviceSliceHostView<T, MapReadWrite>
+impl<T, M: MemMode> Mappable for DeviceSliceHostView<T, M, MapReadWrite>
 where
     T: Send + 'static,
 {
@@ -442,7 +455,7 @@ where
     }
 }
 
-impl<T> Mappable for DeviceSliceHostView<T, MapReadOnly>
+impl<T, M: MemMode> Mappable for DeviceSliceHostView<T, M, MapReadOnly>
 where
     T: Send + Sync + 'static,
 {

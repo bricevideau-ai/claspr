@@ -84,6 +84,30 @@
 //! let _ = frozen.fill(&ctx, 9u32);  // ← KernelWritable: ERROR
 //! ```
 //!
+//! Frozen → `.acquire_host_view()` (mut variant): rejected because
+//! Frozen doesn't impl [`HostWritable`] (only Read).
+//!
+//! ```compile_fail
+//! use claspr::{Context, DeviceSlice, Frozen};
+//! use claspr_async::HostWritableExt;
+//! let ctx = Context::any().unwrap();
+//! let frozen: DeviceSlice<u32, Frozen> =
+//!     DeviceSlice::from_slice(&ctx, &[0u32; 16]).unwrap();
+//! let _ = frozen.acquire_host_view();  // ← HostWritable: ERROR
+//! ```
+//!
+//! Frozen → `.acquire_host_view_read()`: ALLOWED (Frozen impls
+//! [`HostReadable`]).
+//!
+//! ```ignore
+//! use claspr::{Context, DeviceSlice, Frozen};
+//! use claspr_async::HostReadableExt;
+//! let ctx = Context::any()?;
+//! let frozen: DeviceSlice<u32, Frozen> =
+//!     DeviceSlice::from_slice(&ctx, &[0u32; 16])?;
+//! let _read_op = frozen.acquire_host_view_read();  // ✓ compiles
+//! ```
+//!
 //! [`DeviceSlice`]: crate::DeviceSlice
 //! [`Image2D`]: crate::Image2D
 
