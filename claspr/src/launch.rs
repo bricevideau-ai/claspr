@@ -94,76 +94,119 @@ mod kernel_slice_arg_sealed {
 }
 
 /// Marker + capability trait identifying a value usable as the
-/// host-side counterpart of a `#[spirv(cross_workgroup)] &mut [T]`
-/// kernel parameter.
+/// host-side counterpart of a `#[spirv(cross_workgroup)] &[T]`
+/// kernel parameter (read-only slice).
 ///
-/// Proc-macro–emitted kernel methods (e.g. `kernels.fill_u32(...)`)
-/// are generic over `D: KernelSliceArg<T>` for each slice parameter,
-/// so any buffer kind that ships data and a length to a SPIR-V
-/// slice-decomposed kernel arg is usable interchangeably:
+/// Implemented by every buffer kind whose marker impls
+/// [`crate::KernelReadable`] — currently every buffer marker
+/// (`ReadWrite`, `ReadOnly`, `HostReadOnly`, `Frozen`,
+/// `DeviceScratch`). Plus the wrapper types `Arc<DeviceSlice<T, M>>`
+/// where `M: KernelReadable`.
 ///
-/// - [`crate::DeviceSlice<T>`] — `clCreateBuffer`-backed device
-///   memory, the default.
-/// - [`crate::MappedSlice<T>`] — coarse-grain SVM, when the device
-///   supports it.
-/// - [`crate::USMSlice<T>`] — fine-grain-system SVM wrapping a host
-///   `Vec<T>`, when the device supports it.
+/// Stronger sibling [`KernelSliceReadWriteArg<T>`] is the bound used
+/// for `&mut [T]` kernel params — only markers that also impl
+/// [`crate::KernelWritable`] satisfy it.
 ///
 /// The trait extends [`KernelArg`] (so the underlying
 /// `clSetKernelArg` plumbing is reused) and is sealed — claspr owns
 /// every impl. Users wanting a custom buffer-shaped argument should
 /// open an issue rather than try to add an impl out-of-tree.
-pub trait KernelSliceArg<T>: KernelArg + Send + 'static + kernel_slice_arg_sealed::Sealed {
+pub trait KernelSliceReadArg<T>:
+    KernelArg + Send + 'static + kernel_slice_arg_sealed::Sealed
+{
     /// Number of elements in the underlying buffer. Reused by some
     /// chain combinators that need to size a downstream allocation
     /// from the upstream slice without re-fetching from OpenCL.
     fn element_count(&self) -> usize;
 }
 
+/// The kernel may both read and write through this slice arg — the
+/// bound for `&mut [T]` kernel parameters.
+///
+/// Implemented for buffer kinds whose marker impls
+/// [`crate::KernelWritable`] (`ReadWrite`, `HostReadOnly`,
+/// `DeviceScratch`). Markers without write capability (`ReadOnly`,
+/// `Frozen`) intentionally do not impl this — passing them to a
+/// `&mut [T]` kernel param is a compile error.
+///
+/// Extends [`KernelSliceReadArg<T>`] (read access is a prerequisite
+/// for read/write access) so users with one bound can rely on the
+/// other.
+pub trait KernelSliceReadWriteArg<T>: KernelSliceReadArg<T> {}
+
+/// Legacy alias for [`KernelSliceReadWriteArg<T>`] — preserved so
+/// proc-macro-emitted bounds keep compiling while we migrate the
+/// macro to pick Read vs ReadWrite based on slice mutability.
+pub trait KernelSliceArg<T>: KernelSliceReadWriteArg<T> {}
+impl<T, X: KernelSliceReadWriteArg<T>> KernelSliceArg<T> for X {}
+
+// ── DeviceSlice<T, M> impls ────────────────────────────────────────
+
 impl<T: Send + 'static, M: crate::access::MemMode> kernel_slice_arg_sealed::Sealed
     for DeviceSlice<T, M>
 {
 }
-impl<T: Send + 'static, M: crate::access::MemMode> KernelSliceArg<T> for DeviceSlice<T, M> {
+impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadable>
+    KernelSliceReadArg<T> for DeviceSlice<T, M>
+{
     fn element_count(&self) -> usize {
         crate::Buffer::len(self)
     }
 }
+impl<
+    T: Send + 'static,
+    M: crate::access::MemMode + crate::access::KernelReadable + crate::access::KernelWritable,
+> KernelSliceReadWriteArg<T> for DeviceSlice<T, M>
+{
+}
+
+// ── MappedSlice (only ReadWrite for now — marker-parameterisation
+// is a follow-up) ──
 
 impl<T: Send + 'static> kernel_slice_arg_sealed::Sealed for crate::MappedSlice<T> {}
-impl<T: Send + 'static> KernelSliceArg<T> for crate::MappedSlice<T> {
+impl<T: Send + 'static> KernelSliceReadArg<T> for crate::MappedSlice<T> {
     fn element_count(&self) -> usize {
         crate::Buffer::len(self)
     }
 }
+impl<T: Send + 'static> KernelSliceReadWriteArg<T> for crate::MappedSlice<T> {}
+
+// ── USMSlice (same — marker-parameterisation is a follow-up) ──
 
 impl<T: Send + 'static> kernel_slice_arg_sealed::Sealed for crate::USMSlice<T> {}
-impl<T: Send + 'static> KernelSliceArg<T> for crate::USMSlice<T> {
+impl<T: Send + 'static> KernelSliceReadArg<T> for crate::USMSlice<T> {
     fn element_count(&self) -> usize {
         crate::Buffer::len(self)
     }
 }
+impl<T: Send + 'static> KernelSliceReadWriteArg<T> for crate::USMSlice<T> {}
 
-// `Arc<DeviceSlice<T>>` — share one cl_mem across N parallel chain
+// `Arc<DeviceSlice<T, M>>` — share one cl_mem across N parallel chain
 // branches without re-uploading. Pair with [`claspr_async::Arced`]
 // (built by `.arc()` on a `DeviceOperation` whose Output is
-// `DeviceSlice<T>`): the chain produces `Arc<DeviceSlice<T>>`, each
-// branch gets an `Arc::clone`, the kernel launcher accepts the Arc
-// directly, the underlying `cl_mem` lives until the last clone drops
-// (refcounted by `Arc` + lazy by OpenCL on top).
+// `DeviceSlice<T, M>`): the chain produces `Arc<DeviceSlice<T, M>>`,
+// each branch gets an `Arc::clone`, the kernel launcher accepts the
+// Arc directly, the underlying `cl_mem` lives until the last clone
+// drops (refcounted by `Arc` + lazy by OpenCL on top).
 //
-// `T: Sync` is needed because `Arc<DeviceSlice<T>>: Send` requires
-// `DeviceSlice<T>: Send + Sync` which propagates `T: Sync`.
+// `T: Sync` is needed because `Arc<DeviceSlice<T, M>>: Send` requires
+// `DeviceSlice<T, M>: Send + Sync` which propagates `T: Sync`.
 impl<T: Send + Sync + 'static, M: crate::access::MemMode> kernel_slice_arg_sealed::Sealed
     for Arc<DeviceSlice<T, M>>
 {
 }
-impl<T: Send + Sync + 'static, M: crate::access::MemMode> KernelSliceArg<T>
-    for Arc<DeviceSlice<T, M>>
+impl<T: Send + Sync + 'static, M: crate::access::MemMode + crate::access::KernelReadable>
+    KernelSliceReadArg<T> for Arc<DeviceSlice<T, M>>
 {
     fn element_count(&self) -> usize {
         crate::Buffer::len(&**self)
     }
+}
+impl<
+    T: Send + Sync + 'static,
+    M: crate::access::MemMode + crate::access::KernelReadable + crate::access::KernelWritable,
+> KernelSliceReadWriteArg<T> for Arc<DeviceSlice<T, M>>
+{
 }
 
 // `DeviceSlice` lives in `buffer`, but its `KernelArg` impl belongs

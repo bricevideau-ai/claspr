@@ -77,8 +77,8 @@ pub mod util;
 // ── Public surface ────────────────────────────────────────────────────
 
 pub use access::{
-    DeviceScratch, Frozen, HostAccess, HostReadOnly, KernelAccess, MemMode, ReadOnly, ReadWrite,
-    WriteOnly,
+    DeviceScratch, Frozen, HostAccess, HostReadOnly, KernelAccess, KernelReadable, KernelWritable,
+    MemMode, ReadOnly, ReadWrite, WriteOnly,
 };
 pub use buffer::{Buffer, CopyOp, DeviceSlice, FillOp, MigrateOp, ReadOp, WriteOp};
 pub use context::{Context, SvmLevel};
@@ -86,8 +86,8 @@ pub use device::{Device, DeviceType, Platform};
 pub use error::{Error, Result};
 pub use image::{Image2D, Image2DRgba8, ImageAccess, format};
 pub use launch::{
-    IntoLaunchSpec, KernelArg, KernelArgs, KernelSliceArg, LaunchSpec, LocalBuffer, ScalarArg,
-    profiling_duration,
+    IntoLaunchSpec, KernelArg, KernelArgs, KernelSliceArg, KernelSliceReadArg,
+    KernelSliceReadWriteArg, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
 };
 pub use op::{
     LaunchOp, ProfileCb, ProfilingInfo, assert_same_context, complete_user_event,

@@ -81,6 +81,54 @@ pub trait MemMode: KernelAccess + HostAccess {
 
 impl<T: KernelAccess + HostAccess> MemMode for T {}
 
+// ── Kernel-side classification traits ──────────────────────────────
+//
+// These split the [`KernelAccess`] trait by *what kernels can do* with
+// a buffer/image carrying this marker:
+//
+// - [`KernelReadable`] — kernel may issue read operations through this
+//   slice / image. True for every marker except `WriteOnly` (image-
+//   only marker where kernel reads are UB per spec).
+// - [`KernelWritable`] — kernel may issue write operations. False for
+//   `ReadOnly` and `Frozen` (kernel-side `CL_MEM_READ_ONLY`).
+//
+// The pair drives the [`KernelSliceReadArg`] /
+// [`KernelSliceReadWriteArg`] trait split in `crate::launch`: a buffer
+// can be passed to a kernel `&[T]` slice arg iff its marker impls
+// `KernelReadable`; a kernel `&mut [T]` slice arg iff its marker impls
+// `KernelReadable + KernelWritable` (rust-gpu's `&mut [T]` permits
+// reading, so write-only-only isn't expressible at the slice level).
+//
+// [`KernelSliceReadArg`]: crate::KernelSliceReadArg
+// [`KernelSliceReadWriteArg`]: crate::KernelSliceReadWriteArg
+
+/// The kernel may read through this access mode.
+pub trait KernelReadable: KernelAccess {}
+
+/// The kernel may write through this access mode.
+pub trait KernelWritable: KernelAccess {}
+
+// ReadWrite: read AND write
+impl KernelReadable for ReadWrite {}
+impl KernelWritable for ReadWrite {}
+
+// ReadOnly: read only
+impl KernelReadable for ReadOnly {}
+
+// WriteOnly (image-only): write only — explicitly NOT readable
+impl KernelWritable for WriteOnly {}
+
+// HostReadOnly: kernel side is RW
+impl KernelReadable for HostReadOnly {}
+impl KernelWritable for HostReadOnly {}
+
+// Frozen: kernel side is read-only
+impl KernelReadable for Frozen {}
+
+// DeviceScratch: kernel side is RW (host side is what's restricted)
+impl KernelReadable for DeviceScratch {}
+impl KernelWritable for DeviceScratch {}
+
 // ── Kernel-side variants × Host RW (the "no host restriction" row) ──
 
 /// Default — kernel reads/writes, host reads/writes.
