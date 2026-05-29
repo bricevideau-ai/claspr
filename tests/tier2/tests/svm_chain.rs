@@ -15,7 +15,7 @@
 //!
 //! Skips on devices without SVM (e.g. some configurations of rusticl).
 
-use claspr::{Context, IntoLaunchSpec, LaunchOp, SharedBuffer, SvmLevel};
+use claspr::{Context, SharedBuffer, SvmLevel};
 use claspr_async::{DeviceOperation, with_context};
 use claspr_test_kernels::kernels;
 
@@ -39,22 +39,17 @@ fn shared_buffer_threads_through_async_chain() {
 
     let result_sum: u32 = with_context(|ec| {
         // Allocate SVM inside the chain so the buffer's ownership
-        // belongs to this chain's scope. fill_u32 + scale_u32 launches
-        // both go through the typed Tier 1 API (which only accepts
-        // DeviceSlice for the slice arg), so we drop to LaunchOp for
-        // the SVM arg path.
+        // belongs to this chain's scope. Now the typed launchers
+        // accept `SharedBuffer<T>` directly (via `KernelSliceArg<T>`)
+        // so the chain stays on the high-level path end to end.
         let buf = SharedBuffer::<u32>::alloc(ec.context(), N)?;
         let kernels = kernels::kernels(ec.context())?;
-        let fill_kernel = kernels.kernel("fill_u32");
-        let scale_kernel = kernels.kernel("scale_u32");
 
-        // Stage 1: fill.
-        let fill_evt =
-            LaunchOp::new(ec, &fill_kernel, [N].into_launch_spec(), (&buf, 6u32)).submit()?;
+        // Stage 1: fill — returns (buf, event) so downstream stages
+        // can re-take ownership and chain on the event.
+        let (buf, fill_evt) = kernels.fill_u32([N], buf, 6u32).submit(ec)?;
         // Stage 2: scale, ordered after fill, blocking.
-        LaunchOp::new(ec, &scale_kernel, [N].into_launch_spec(), (&buf, 7u32))
-            .after(&fill_evt)
-            .wait()?;
+        let buf = kernels.scale_u32([N], buf, 7u32).after(fill_evt).wait(ec)?;
 
         // Read back via map.
         let g = buf.map(ec)?;
@@ -77,13 +72,14 @@ fn many_in_flight_svm_launches_drop_safely() {
     let Some(ctx) = ctx_with_svm() else { return };
 
     with_context(|ec| {
-        let buf = SharedBuffer::<u32>::alloc(ec.context(), N)?;
+        let mut buf = SharedBuffer::<u32>::alloc(ec.context(), N)?;
         let kernels = kernels::kernels(ec.context())?;
         // 8 successive scales on the same SVM. Each .submit() doesn't
-        // block, each launch auto-registers via `KernelArg::register_completion`.
+        // block; each launch auto-registers via `KernelArg::register_completion`.
+        // The typed launcher consumes + returns `buf` per call.
         for _ in 0..8 {
-            let k = kernels.kernel("scale_u32");
-            let _evt = LaunchOp::new(ec, &k, [N].into_launch_spec(), (&buf, 1u32)).submit()?;
+            let (returned, _evt) = kernels.scale_u32([N], buf, 1u32).submit(ec)?;
+            buf = returned;
         }
         // Drop the SVM here — Drop drains the in-flight events Vec
         // into the free's wait-list.

@@ -125,23 +125,21 @@ fn kernel_launches_on_ooo_queue_register_themselves_for_drop() {
     let ooo = Queue::<OutOfOrder>::on_device(&ctx, &device).expect("ooo queue");
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
-    // Issue several launches on the OOO queue, all consuming `&buf`.
+    let mut buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    // Issue several launches on the OOO queue, all consuming `&buf`
+    // via the typed launcher (now generic over KernelSliceArg, so
+    // `SharedBuffer<u32>` flows through `kernels.fill_u32` directly).
     // On an OOO queue, the events may finish in any order — without
     // Vec accumulation, only the most recently registered would gate
     // the free, which would race the others.
-    //
-    // We can't pass `&SharedBuffer` to the typed `kernels.fill_u32`
-    // (which is typed against `DeviceSlice<u32>`), so we drop to the
-    // lower-level path: build the LaunchOp manually via a kernel
-    // handle and the `KernelArgs` tuple.
-    use claspr::{IntoLaunchSpec, LaunchOp};
     for value in 0..4u32 {
-        let kernel = kernels.kernel("fill_u32");
-        let event = LaunchOp::new(&ooo, &kernel, [N].into_launch_spec(), (&buf, value))
-            .submit()
+        let (returned, event) = kernels
+            .fill_u32([N], buf, value)
+            .submit(&ooo)
             .expect("submit");
-        // Hold each Event briefly; auto-register has already happened.
+        buf = returned;
+        // Hold each Event briefly; auto-register has already happened
+        // via the SharedBuffer KernelArg impl.
         drop(event);
     }
     // Drop the buffer WITHOUT explicit sync. The Vec inside `buf` has
@@ -189,13 +187,17 @@ fn read_only_map_via_map_guard() {
 }
 
 #[test]
-fn multi_kernel_svm_pipeline_via_lower_level_launch() {
+fn multi_kernel_svm_pipeline_via_typed_launchers() {
     // Two-stage compute pipeline operating entirely on a SharedBuffer:
     // fill → scale → read back via map. Both kernels run on an OOO
     // queue and take the SVM as a `KernelArg`; the auto-registration
     // path (KernelArg::register_completion) records each launch's
     // event on `buf`, so the buffer's eventual Drop can wait on every
     // in-flight use.
+    //
+    // SharedBuffer flows through `kernels.fill_u32` / `kernels.scale_u32`
+    // directly thanks to the `KernelSliceArg<T>` widening on the
+    // emitted typed launchers — same surface as DeviceSlice.
     let Some(ctx) = ctx_with_svm() else { return };
     let device: Device = ctx.device().clone();
     let ooo = Queue::<OutOfOrder>::on_device(&ctx, &device).expect("ooo queue");
@@ -204,17 +206,16 @@ fn multi_kernel_svm_pipeline_via_lower_level_launch() {
     let buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
 
     // Stage 1: fill_u32 with 4.
-    use claspr::{IntoLaunchSpec, LaunchOp};
-    let fill_kernel = kernels.kernel("fill_u32");
-    let fill_event = LaunchOp::new(&ooo, &fill_kernel, [N].into_launch_spec(), (&buf, 4u32))
-        .submit()
+    let (buf, fill_event) = kernels
+        .fill_u32([N], buf, 4u32)
+        .submit(&ooo)
         .expect("submit fill");
 
     // Stage 2: scale_u32 by 5, ordered after fill via `.after`.
-    let scale_kernel = kernels.kernel("scale_u32");
-    LaunchOp::new(&ooo, &scale_kernel, [N].into_launch_spec(), (&buf, 5u32))
-        .after(&fill_event)
-        .wait()
+    let buf = kernels
+        .scale_u32([N], buf, 5u32)
+        .after(fill_event)
+        .wait(&ooo)
         .expect("scale after fill");
 
     // Read result via map: every slot is 4 * 5 = 20.

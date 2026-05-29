@@ -80,7 +80,8 @@ pub use device::{Device, DeviceType, Platform};
 pub use error::{Error, Result};
 pub use image::{Image2D, Image2DRgba8, ImageAccess, ReadOnly, ReadWrite, WriteOnly, format};
 pub use launch::{
-    IntoLaunchSpec, KernelArg, KernelArgs, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
+    IntoLaunchSpec, KernelArg, KernelArgs, KernelSliceArg, LaunchSpec, LocalBuffer, ScalarArg,
+    profiling_duration,
 };
 pub use op::{
     LaunchOp, ProfileCb, ProfilingInfo, assert_same_context, complete_user_event,

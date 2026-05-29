@@ -242,12 +242,22 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // Tier 1 terminals can return them back). Scalars are by-value.
     // `op_arg_pass` is what we hand to LaunchOp::new from inside the
     // terminal / execute: `&name` for slices, `name` for scalars.
+    //
+    // Slices get a fresh generic type parameter each (e.g. `__D0`,
+    // `__D1`, ...) bounded `: ::claspr::KernelSliceArg<elem>`. This
+    // lets the same emitted method accept `DeviceSlice<T>`,
+    // `HostBuffer<T>`, or `SharedBuffer<T>` interchangeably while
+    // keeping the flow-through Output typed precisely.
     let mut host_names: Vec<TokenStream2> = Vec::new();
     let mut method_params: Vec<TokenStream2> = Vec::new();
     let mut arg_types: Vec<TokenStream2> = Vec::new();
     let mut op_arg_pass: Vec<TokenStream2> = Vec::new();
     let mut output_names: Vec<TokenStream2> = Vec::new();
     let mut output_types: Vec<TokenStream2> = Vec::new();
+    // `(generic_ident, bound_token_stream)` — populated once per
+    // slice param, in source order. Drives the `<__D0, __D1, ...>` +
+    // `where`-equivalent inline bounds on every emitted impl block.
+    let mut slice_generics: Vec<(TokenStream2, TokenStream2)> = Vec::new();
 
     for input in &func.sig.inputs {
         let FnArg::Typed(pt) = input else {
@@ -258,24 +268,56 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         };
         match classify_param(pt)? {
             ParamRole::Builtin => continue,
-            ParamRole::Host {
-                name: pname,
-                ty,
-                is_slice,
-            } => {
+            ParamRole::Slice { name: pname, elem } => {
+                // Allocate a fresh generic per slice.
+                let gid = quote::format_ident!("__claspr_D{}", slice_generics.len());
+                let gid_tt: TokenStream2 = quote! { #gid };
+                let bound: TokenStream2 = quote! { #gid: ::claspr::KernelSliceArg<#elem> };
+                slice_generics.push((gid_tt.clone(), bound));
+
+                host_names.push(pname.clone());
+                method_params.push(quote! { #pname: #gid_tt });
+                arg_types.push(gid_tt.clone());
+                op_arg_pass.push(quote! { &#pname });
+                output_names.push(pname.clone());
+                output_types.push(gid_tt);
+            }
+            ParamRole::Image { name: pname, ty } => {
                 host_names.push(pname.clone());
                 method_params.push(quote! { #pname: #ty });
                 arg_types.push(ty.clone());
-                if is_slice {
-                    op_arg_pass.push(quote! { &#pname });
-                    output_names.push(pname.clone());
-                    output_types.push(ty);
-                } else {
-                    op_arg_pass.push(quote! { #pname });
-                }
+                op_arg_pass.push(quote! { &#pname });
+                output_names.push(pname.clone());
+                output_types.push(ty);
+            }
+            ParamRole::Scalar { name: pname, ty } => {
+                host_names.push(pname.clone());
+                method_params.push(quote! { #pname: #ty });
+                arg_types.push(ty);
+                op_arg_pass.push(quote! { #pname });
             }
         }
     }
+
+    // Generic parameter forms used in `impl<...>` / `Op<...>` / fn
+    // signature positions. Three flavours:
+    //   `<__D0, __D1>`              — for use sites where the generics
+    //                                  are already-bound (Op<__D0, __D1>).
+    //   `<__D0: K..., __D1: K...>`  — for declarator positions (impl
+    //                                  blocks, method generic lists).
+    //   `(empty)`                   — when there are no slice params.
+    let slice_gen_decl: TokenStream2 = if slice_generics.is_empty() {
+        quote! {}
+    } else {
+        let bounds = slice_generics.iter().map(|(_, b)| b);
+        quote! { < #( #bounds ),* > }
+    };
+    let slice_gen_use: TokenStream2 = if slice_generics.is_empty() {
+        quote! {}
+    } else {
+        let ids = slice_generics.iter().map(|(id, _)| id);
+        quote! { < #( #ids ),* > }
+    };
 
     // Single-element tuples need a trailing comma.
     let op_args_tuple_ty = single_or_tuple(&arg_types);
@@ -338,11 +380,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     Ok(quote! {
         impl #kernels_path {
             #[allow(clippy::too_many_arguments)]
-            #vis fn #name(
+            #vis fn #name #slice_gen_decl (
                 &self,
                 grid: impl ::claspr::IntoLaunchSpec,
                 #(#method_params),*
-            ) -> #op_mod_ident::Op {
+            ) -> #op_mod_ident::Op #slice_gen_use {
                 #op_mod_ident::Op {
                     kernel: self.kernel(#kernel_name_lit),
                     spec: ::claspr::IntoLaunchSpec::into_launch_spec(grid),
@@ -358,7 +400,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         pub mod #op_mod_ident {
             use super::*;
 
-            pub struct Op {
+            pub struct Op #slice_gen_decl {
                 /// Per-launch `cl_kernel` minted by `clCreateKernel`.
                 /// Owned and never aliased, so `clSetKernelArg` on it
                 /// can't race with any other launch.
@@ -376,7 +418,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
             // Op is `Send` automatically — every field is Send. No
             // unsafe impl, no lifetime, no `&Kernels` borrow.
 
-            impl Op {
+            impl #slice_gen_decl Op #slice_gen_use {
                 /// Add a cross-queue dependency. Takes the event by
                 /// value because the Op may be moved into an executor
                 /// thread; a borrowed `&Event` could outlive the
@@ -470,7 +512,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 }
             }
 
-            impl ::claspr_async::DeviceOperation for Op {
+            impl #slice_gen_decl ::claspr_async::DeviceOperation for Op #slice_gen_use {
                 type Output = #output_ty;
 
                 fn execute(
@@ -537,23 +579,27 @@ fn single_or_tuple(elems: &[TokenStream2]) -> TokenStream2 {
 enum ParamRole {
     /// Drop: SPIR-V builtin filled in by the runtime.
     Builtin,
-    /// Keep: host-side argument with translated type and original name.
-    Host {
-        /// Plain identifier for the parameter (used as a pattern in the
-        /// destructure inside the Op's terminal / execute, and as the
-        /// field name in the args tuple).
+    /// Slice param (`#[spirv(cross_workgroup)] &mut [T]`). Becomes a
+    /// generic type parameter `D: KernelSliceArg<T>` on the emitted
+    /// method + Op, so any of `DeviceSlice<T>` / `HostBuffer<T>` /
+    /// `SharedBuffer<T>` can flow through.
+    Slice {
         name: TokenStream2,
-        /// Owned form for the unified method's signature and the Op's
-        /// args tuple. Slices/images here are `::claspr::DeviceSlice<T>`
-        /// / `::claspr::Image2D<...>` (no reference) — the Op holds
-        /// them by value and returns them as its `Output`. Scalars pass
-        /// through unchanged.
+        /// The `T` from `&mut [T]` — used to constrain the generic.
+        elem: TokenStream2,
+    },
+    /// Image param (`&Image!(...)` / `&mut Image!(...)`). Stays
+    /// concrete (no generic widening yet — only one image type per
+    /// access+format combo).
+    Image {
+        name: TokenStream2,
         ty: TokenStream2,
-        /// Whether this param threads through the chain (slice / image).
-        /// Slices are referenced when passed to LaunchOp and re-emitted
-        /// as the Op's `Output`. Scalars are passed by value and dropped
-        /// from the output.
-        is_slice: bool,
+    },
+    /// Scalar param (no spirv attribute). Passed by value, doesn't
+    /// thread through Output.
+    Scalar {
+        name: TokenStream2,
+        ty: TokenStream2,
     },
 }
 
@@ -585,28 +631,22 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
         }
     };
 
-    let (ty, is_slice) = if matches!(kind, Some(SpirvKind::CrossWorkgroup)) {
+    if matches!(kind, Some(SpirvKind::CrossWorkgroup)) {
         let elem = slice_element_ty(&pt.ty)?;
-        // The Op holds the slice by value (so it can return it via
-        // `Output` for downstream chaining or Tier 1 callers).
-        (quote! { ::claspr::DeviceSlice<#elem> }, true)
-    } else if let Some(info) = classify_image_param(&pt.ty) {
-        // `&Image!(...)` / `&mut Image!(...)` — owned `Image2D` so the
-        // Op can return it.
+        return Ok(ParamRole::Slice { name: pname, elem });
+    }
+    if let Some(info) = classify_image_param(&pt.ty) {
         let access = info.access;
         let format = info.format;
-        (quote! { ::claspr::Image2D<#access, #format> }, true)
-    } else {
-        // No spirv attribute (or an unrecognised one): pass type
-        // through unchanged. Scalars are by-value.
-        let t = &pt.ty;
-        (quote! { #t }, false)
-    };
-
-    Ok(ParamRole::Host {
+        return Ok(ParamRole::Image {
+            name: pname,
+            ty: quote! { ::claspr::Image2D<#access, #format> },
+        });
+    }
+    let t = &pt.ty;
+    Ok(ParamRole::Scalar {
         name: pname,
-        ty,
-        is_slice,
+        ty: quote! { #t },
     })
 }
 

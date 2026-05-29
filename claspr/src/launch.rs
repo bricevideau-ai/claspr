@@ -84,6 +84,62 @@ impl<T: KernelArg + ?Sized> KernelArg for &mut T {
     }
 }
 
+// ── KernelSliceArg ────────────────────────────────────────────────────
+
+/// Sealing module — keeps `KernelSliceArg` impls in-crate so we can
+/// change the trait or its bounds without breaking external callers.
+mod kernel_slice_arg_sealed {
+    pub trait Sealed {}
+}
+
+/// Marker + capability trait identifying a value usable as the
+/// host-side counterpart of a `#[spirv(cross_workgroup)] &mut [T]`
+/// kernel parameter.
+///
+/// Proc-macro–emitted kernel methods (e.g. `kernels.fill_u32(...)`)
+/// are generic over `D: KernelSliceArg<T>` for each slice parameter,
+/// so any buffer kind that ships data and a length to a SPIR-V
+/// slice-decomposed kernel arg is usable interchangeably:
+///
+/// - [`crate::DeviceSlice<T>`] — `clCreateBuffer`-backed device
+///   memory, the default.
+/// - [`crate::HostBuffer<T>`] — `CL_MEM_ALLOC_HOST_PTR` zero-copy
+///   host-mapped memory.
+/// - [`crate::SharedBuffer<T>`] — coarse-grain SVM, when the device
+///   supports it.
+///
+/// The trait extends [`KernelArg`] (so the underlying
+/// `clSetKernelArg` plumbing is reused) and is sealed — claspr owns
+/// every impl. Users wanting a custom buffer-shaped argument should
+/// open an issue rather than try to add an impl out-of-tree.
+pub trait KernelSliceArg<T>: KernelArg + Send + 'static + kernel_slice_arg_sealed::Sealed {
+    /// Number of elements in the underlying buffer. Reused by some
+    /// chain combinators that need to size a downstream allocation
+    /// from the upstream slice without re-fetching from OpenCL.
+    fn element_count(&self) -> usize;
+}
+
+impl<T: Send + 'static> kernel_slice_arg_sealed::Sealed for DeviceSlice<T> {}
+impl<T: Send + 'static> KernelSliceArg<T> for DeviceSlice<T> {
+    fn element_count(&self) -> usize {
+        crate::Buffer::len(self)
+    }
+}
+
+impl<T: Send + Sync + 'static> kernel_slice_arg_sealed::Sealed for HostBuffer<T> {}
+impl<T: Send + Sync + 'static> KernelSliceArg<T> for HostBuffer<T> {
+    fn element_count(&self) -> usize {
+        crate::Buffer::len(self)
+    }
+}
+
+impl<T: Send + 'static> kernel_slice_arg_sealed::Sealed for crate::SharedBuffer<T> {}
+impl<T: Send + 'static> KernelSliceArg<T> for crate::SharedBuffer<T> {
+    fn element_count(&self) -> usize {
+        crate::Buffer::len(self)
+    }
+}
+
 // `DeviceSlice` and `HostBuffer` live in `buffer`, but their
 // `KernelArg` impls belong here with the rest of the launch surface
 // so `set_arg` plumbing is in one place. Both decompose into the
