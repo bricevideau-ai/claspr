@@ -90,9 +90,9 @@ fn fan_out_propagates_child_error() {
     let Some(ctx) = ctx() else { return };
     let err = fan_out(vec![1u32, 2, 3], |n| {
         value(n).and_then_host(|_n: u32| {
-            // Closure error surfaces as Error::OpenCl(ClError(neg))
-            // through the user-event signal — the specific variant
-            // is lost in the async boundary in v1.
+            // Closure error survives the user-event boundary via
+            // the host-error slot on ExecutionContext — the
+            // terminal surfaces the original Rust variant.
             Err::<(), _>(Error::Build {
                 log: "injected failure".to_string(),
             })
@@ -100,5 +100,8 @@ fn fan_out_propagates_child_error() {
     })
     .sync(&ctx)
     .expect_err("fan_out should surface child error");
-    assert!(matches!(err, Error::OpenCl(_)), "got {err:?}");
+    assert!(
+        matches!(&err, Error::Build { log } if log == "injected failure"),
+        "got {err:?}",
+    );
 }

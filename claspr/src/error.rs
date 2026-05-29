@@ -47,6 +47,11 @@ pub enum Error {
     /// description — the offending value is the caller's, not part
     /// of the error.
     InvalidArgument(&'static str),
+    /// A host closure inside `claspr_async::and_then_host` panicked.
+    /// The string is the panic payload extracted via `catch_unwind`
+    /// then downcast to `&str` / `String`. The backtrace is lost, as
+    /// is usual when a panic crosses a `catch_unwind` boundary.
+    HostPanic(String),
 }
 
 impl fmt::Display for Error {
@@ -67,6 +72,7 @@ impl fmt::Display for Error {
             ),
             Error::Io(e) => write!(f, "I/O: {e}"),
             Error::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
+            Error::HostPanic(msg) => write!(f, "host closure panicked: {msg}"),
         }
     }
 }

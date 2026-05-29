@@ -20,7 +20,8 @@
 //! [`CommandQueue`]: opencl3::command_queue::CommandQueue
 //! [`Launcher`]: claspr::Launcher
 
-use claspr::{CommandQueue, Context, Device, Launcher};
+use claspr::{CommandQueue, Context, Device, Error, Launcher};
+use std::sync::{Arc, Mutex};
 
 /// Execution-time environment for a [`DeviceOperation`].
 ///
@@ -35,6 +36,14 @@ pub struct ExecutionContext<'ctx> {
     context: &'ctx Context,
     device: Device,
     cl_queue: &'ctx CommandQueue,
+    /// Slot that `and_then_host` workers stash their failing
+    /// [`Error`] into before signalling `clSetUserEventStatus(_, -1)`.
+    /// Terminals read it after the marker event resolves with Err
+    /// and prefer the rich variant over the CL cascade. `Arc<Mutex<_>>`
+    /// because workers run on per-call threads. First-writer-wins
+    /// when multiple `and_then_host`s in a bundle/fan-out fail
+    /// concurrently — subsequent writers leave the slot alone.
+    host_error: Arc<Mutex<Option<Error>>>,
 }
 
 impl<'ctx> ExecutionContext<'ctx> {
@@ -50,7 +59,24 @@ impl<'ctx> ExecutionContext<'ctx> {
             context,
             device,
             cl_queue,
+            host_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Cheap `Arc` clone of the host-error slot for an `and_then_host`
+    /// worker to carry across `thread::spawn`. Workers populate it
+    /// (first-writer-wins) before signalling negative user-event
+    /// status; terminals drain it via [`take_host_error`](Self::take_host_error).
+    pub(crate) fn host_error_slot(&self) -> Arc<Mutex<Option<Error>>> {
+        Arc::clone(&self.host_error)
+    }
+
+    /// Take the stashed host error (if any). Crate-internal — called
+    /// by terminals (`sync` / `run`'s poll) after the chain's events
+    /// resolve with Err, so the original Rust variant surfaces instead
+    /// of the `Error::OpenCl(-1)` cascade from the user-event signal.
+    pub(crate) fn take_host_error(&self) -> Option<Error> {
+        self.host_error.lock().unwrap().take()
     }
 
     /// The [`Context`] this op-chain is running against.

@@ -22,11 +22,10 @@ fn ctx() -> Option<Context> {
     }
 }
 
-// Note: under the new async `and_then_host`, the original closure
-// error type doesn't survive the user-event signal — what propagates
-// is a negative `cl_event` status that surfaces as
-// `Error::OpenCl(ClError(negative))`. These tests now assert "chain
-// errored" rather than matching the specific Rust error variant.
+// The host-error slot on `ExecutionContext` carries the original
+// Rust `Error` variant across the `and_then_host` user-event
+// boundary, so terminals surface the closure's exact variant rather
+// than the `Error::OpenCl(-1)` cascade.
 
 #[test]
 fn and_then_host_error_stops_chain_immediately() {
@@ -48,7 +47,10 @@ fn and_then_host_error_stops_chain_immediately() {
         })
         .sync(&ctx);
 
-    assert!(matches!(result, Err(Error::OpenCl(_))), "got {result:?}");
+    assert!(
+        matches!(&result, Err(Error::Build { log }) if log == "abort"),
+        "got {result:?}",
+    );
     assert_eq!(
         counter.load(Ordering::SeqCst),
         0,
@@ -72,7 +74,10 @@ fn error_after_some_device_work_still_propagates() {
         })
         .sync(&ctx);
     let err = result.err().expect("expected error");
-    assert!(matches!(err, Error::OpenCl(_)), "got {err:?}");
+    assert!(
+        matches!(&err, Error::Build { log } if log == "post-kernel abort"),
+        "got {err:?}",
+    );
 }
 
 #[test]
@@ -89,5 +94,8 @@ fn nested_chain_error_does_not_skip_outer_terminator() {
             })
         })
         .sync(&ctx);
-    assert!(matches!(result, Err(Error::OpenCl(_))), "got {result:?}");
+    assert!(
+        matches!(&result, Err(Error::Build { log }) if log == "nested"),
+        "got {result:?}",
+    );
 }

@@ -171,7 +171,19 @@ where
     S: DeviceOperation,
 {
     let ctx = ExecutionContext::new(context, device.clone(), queue.raw());
-    let (out, events) = chain.execute(&ctx, Vec::new())?;
+    let (out, events) = match chain.execute(&ctx, Vec::new()) {
+        Ok(p) => p,
+        Err(e) => {
+            // A previously-spawned `and_then_host` worker may have
+            // stashed its rich error before this execute returned —
+            // e.g. in a fan_out/bundle where child 1's worker raced
+            // ahead and signalled user_event(-1), tripping the spec's
+            // implementation-defined post-termination behaviour on
+            // child 2's enqueue (rusticl: CL error; pocl: not
+            // observed). Prefer the rich variant if present.
+            return Err(ctx.take_host_error().unwrap_or(e));
+        }
+    };
     // Wait on every final event. Most chains have at most one (after
     // a join marker); fan-outs may have several. Record the first
     // error but keep waiting on the rest so we don't strand
@@ -188,6 +200,13 @@ where
     // being tracked in the events list (e.g. a `with_context`
     // closure that called `.submit()` and discarded the event).
     let finish_res = queue.finish();
+    // Prefer a stashed host error (from an `and_then_host` worker)
+    // over the CL cascade — that's the whole point of the slot. The
+    // CL `-N` we'd otherwise surface is just the user-event-set-neg
+    // ripple from whoever populated the slot.
+    if let Some(host_err) = ctx.take_host_error() {
+        return Err(host_err);
+    }
     if let Some(e) = wait_err {
         return Err(e);
     }

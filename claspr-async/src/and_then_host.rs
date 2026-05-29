@@ -51,19 +51,33 @@
 //!
 //! ## Error model
 //!
-//! v1 propagates "something went wrong" — no detailed error info
-//! survives the user-event boundary. Closure `Err` / panic / map
-//! failure / unmap failure all produce a negative user-event status.
-//! Downstream's `event.wait()` returns that status as an [`Error`].
-//! Capturing detailed errors into the chain via side-effects is the
-//! caller's responsibility for now.
+//! Workers stash the original Rust [`Error`] into a per-chain slot on
+//! the [`ExecutionContext`] before signalling the user event with
+//! negative status. Terminals (`sync` / `run`) check the slot after
+//! the marker event resolves with Err and prefer the stashed rich
+//! variant — so `Err(Error::Build { log })` from the closure surfaces
+//! at the terminal as `Error::Build { log }` rather than collapsing to
+//! `Error::OpenCl(-1)`. Cases:
+//!
+//! - **Closure returns `Err(rust_err)`** → `rust_err` stashed.
+//! - **Closure panics** → `Error::HostPanic(msg)` stashed (`msg` is
+//!   the panic payload extracted via `downcast_ref`).
+//! - **Map-event `wait()` fails** → `Error::OpenCl(cl_err)` stashed
+//!   (genuine CL-side cause).
+//! - **Upstream source-event `wait()` fails** → no stash; the upstream
+//!   worker has already populated the slot (or there's no host-side
+//!   cause, just a CL cascade).
+//!
+//! Multiple concurrent failures in `bundle!` / `fan_out`: first-writer-
+//! wins. Acceptable — the others are typically cascades of the first.
 //!
 //! [`Error`]: claspr::Error
+//! [`ExecutionContext`]: crate::ExecutionContext
 
 use crate::exec_ctx::ExecutionContext;
 use crate::mappable::Mappable;
 use crate::op::{Deps, DeviceOperation, wrap_event};
-use claspr::{Launcher, Result, complete_user_event, create_user_event};
+use claspr::{Error, Launcher, Result, complete_user_event, create_user_event};
 use opencl3::event::CL_COMPLETE;
 use opencl3::types::{cl_event, cl_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -165,7 +179,7 @@ where
 
         // Spawn the worker. It owns the handle, the map events, the
         // upstream events (for error short-circuiting), the user-event
-        // Arc clone, and the closure.
+        // Arc clone, the host-error slot, and the closure.
         //
         // Why source_evts in addition to map_events: when the upstream
         // user event resolves to a negative status (chain error), the
@@ -177,12 +191,24 @@ where
         let worker_user_event = Arc::clone(&user_event);
         let worker_map_events = map_events;
         let worker_source_evts = source_evts;
+        let worker_host_error = ctx.host_error_slot();
         std::thread::spawn(move || {
             // Worker is the only thread allowed to touch `handle`
             // and to call `complete_user_event`. Any path through
             // this body must signal the user event exactly once.
-            let (status, mut handle) =
+            let (status, mut handle, rust_err) =
                 run_worker::<S::Output, F>(handle, worker_map_events, worker_source_evts, f);
+            // Stash the original Rust error variant before signalling
+            // negative status, so the terminal can prefer it over the
+            // cascade. First-writer-wins — leave the slot alone if
+            // someone else already populated it (a concurrent failing
+            // host worker in the same bundle/fan-out).
+            if let Some(err) = rust_err {
+                let mut slot = worker_host_error.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(err);
+                }
+            }
             if status < 0 {
                 // On the error path the queued unmap (which waits on
                 // the user event) is "terminated" by the OpenCL
@@ -220,20 +246,27 @@ where
 }
 
 /// Worker body. Wait on upstream + map events, then run the closure
-/// inside `catch_unwind`. Returns the (status, handle) so the caller
-/// can decide whether to trigger the defensive sync unmap.
+/// inside `catch_unwind`. Returns the (status, handle, optional rich
+/// error) so the caller can stash the rich error before signalling
+/// and decide whether to trigger the defensive sync unmap.
 ///
 /// Why we return the handle: in the error path the queued unmap (with
 /// the user event in its wait-list) gets terminated by the OpenCL
 /// runtime instead of executing, which would leave the buffer mapped
 /// forever. The caller uses [`crate::mappable::Mappable`]'s defensive
 /// Drop path to issue a synchronous unmap when status is negative.
+///
+/// The third return slot is `Some(err)` when this worker has a
+/// host-side cause for the failure (closure `Err`, closure panic,
+/// or map-event wait failure). It's `None` for upstream-cascade
+/// short-circuits — the upstream worker (or a CL command without a
+/// host cause) is responsible for that signal.
 fn run_worker<O, F>(
     handle: O::MapHandle,
     map_events: Vec<claspr::Event>,
     source_evts: Deps,
     f: F,
-) -> (cl_int, O::MapHandle)
+) -> (cl_int, O::MapHandle, Option<Error>)
 where
     O: Mappable,
     F: for<'a> FnOnce(<O as Mappable>::View<'a>) -> Result<()> + Send + 'static,
@@ -241,23 +274,39 @@ where
     let mut handle = handle;
     // Short-circuit on upstream chain error (negative source-event
     // status, e.g. from a previous and_then_host whose closure failed).
+    // Do NOT stash — the upstream worker already populated the slot
+    // (or there was no host-side cause).
     for ev in &source_evts {
         if ev.as_ref().wait().is_err() {
-            return (-1, handle);
+            return (-1, handle, None);
         }
     }
+    // Map-event failure is a host-observable CL error — stash so the
+    // terminal sees the actual ClError rather than the cascade.
     for ev in &map_events {
-        if ev.wait().is_err() {
-            return (-1, handle);
+        if let Err(e) = ev.wait() {
+            return (-1, handle, Some(Error::OpenCl(e)));
         }
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
         let view = <O as Mappable>::view(&mut handle);
         f(view)
     }));
-    let status = match result {
-        Ok(Ok(())) => CL_COMPLETE as cl_int,
-        Ok(Err(_)) | Err(_) => -1,
-    };
-    (status, handle)
+    match result {
+        Ok(Ok(())) => (CL_COMPLETE as cl_int, handle, None),
+        Ok(Err(rust_err)) => (-1, handle, Some(rust_err)),
+        Err(panic) => {
+            // `catch_unwind` returns `Box<dyn Any + Send>`. The
+            // payload is typically `&'static str` (from `panic!("lit")`)
+            // or `String` (from `panic!("{}", x)`). Anything else
+            // gets a generic placeholder — the panic stack isn't
+            // available anyway once it's crossed the boundary.
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            (-1, handle, Some(Error::HostPanic(msg)))
+        }
+    }
 }

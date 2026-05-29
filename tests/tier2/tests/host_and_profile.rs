@@ -54,15 +54,15 @@ fn and_then_host_error_propagates() {
         eprintln!("SKIP: no OpenCL device");
         return;
     };
-    // Closure returns Err → user event set to negative status → chain
-    // surfaces an Error::OpenCl with the negative code. The original
-    // Error::SvmNotAvailable doesn't survive the user-event boundary;
-    // we just check the chain errored.
+    // Closure returns Err → user event set to negative status. The
+    // host-error slot on ExecutionContext preserves the original
+    // Rust variant across the user-event boundary, so the chain
+    // surfaces `Error::SvmNotAvailable` rather than the cascade.
     let err = value(())
         .and_then_host(|()| -> claspr::Result<()> { Err(claspr::Error::SvmNotAvailable) })
         .sync(&ctx)
         .expect_err("expected error");
-    assert!(matches!(err, claspr::Error::OpenCl(_)), "got {err:?}");
+    assert!(matches!(err, claspr::Error::SvmNotAvailable), "got {err:?}",);
 }
 
 // ── profile ──────────────────────────────────────────────────────────
