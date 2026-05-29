@@ -94,10 +94,11 @@ pub trait Buffer<T> {
 /// claspr sets both — see the [`KernelArg`] impl in [`crate::launch`].
 ///
 /// Construct via [`DeviceSlice::alloc`] (zero-initialised) or
-/// [`DeviceSlice::upload`] (with initial host data). For output-only
-/// buffers where the zero-fill would be wasted work, use
-/// [`alloc_uninit`](DeviceSlice::alloc_uninit). Read back via
-/// [`DeviceSlice::download`].
+/// [`DeviceSlice::upload`] (with initial host data). Read back via
+/// [`DeviceSlice::download`]. The `unsafe`
+/// [`alloc_uninit`](DeviceSlice::alloc_uninit) escape hatch exists
+/// for internal claspr ops that immediately write the whole buffer
+/// before exposing it — see its doc-comment for the safety contract.
 ///
 /// Host code never sees the bytes directly — for that, use
 /// [`crate::mapped::MappedSlice<T>`] (coarse-grain SVM) or
@@ -139,13 +140,15 @@ impl<T: Default + Copy> DeviceSlice<T> {
     /// bytes. Matches [`MappedSlice::alloc`](crate::MappedSlice::alloc)
     /// and [`USMSlice::alloc`](crate::USMSlice::alloc).
     ///
-    /// Internally a `clCreateBuffer` + a synchronous fill. Code paths
-    /// that write the entire buffer immediately afterward (e.g.
-    /// `upload`, `device_slice_filled`) should use
-    /// [`alloc_uninit`](Self::alloc_uninit) instead to skip the
-    /// redundant zero-fill.
+    /// Internally a `clCreateBuffer` + a synchronous fill. The
+    /// `unsafe` [`alloc_uninit`](Self::alloc_uninit) escape hatch
+    /// skips the fill, but is unsound unless every byte is written
+    /// before any read (kernel or host) — see its safety contract.
     pub fn alloc(ctx: &Context, len: usize) -> Result<Self> {
-        let mut slice = Self::alloc_uninit(ctx, len)?;
+        // SAFETY: we immediately overwrite every byte via the
+        // synchronous `fill` below before returning. No path from
+        // here can observe the uninit bytes.
+        let mut slice = unsafe { Self::alloc_uninit(ctx, len)? };
         slice.fill(ctx, T::default()).wait()?;
         Ok(slice)
     }
@@ -154,16 +157,30 @@ impl<T: Default + Copy> DeviceSlice<T> {
 impl<T> DeviceSlice<T> {
     /// Allocate a device buffer of `len` elements, leaving the bytes
     /// uninitialised. Cheaper than [`alloc`](Self::alloc) when the
-    /// caller writes the whole buffer before any read (kernel output,
-    /// explicit `write`/`fill`, etc.).
+    /// caller writes the whole buffer before any read.
     ///
-    /// Reading from an unwritten buffer (via `read` / `map` /
-    /// `download`) is unspecified behaviour at the OpenCL level and
-    /// undefined behaviour at the Rust level if the bytes are
-    /// interpreted as a non-trivial `T`. Prefer
-    /// [`alloc`](Self::alloc) unless you know the buffer is fully
-    /// written before any read.
-    pub fn alloc_uninit(ctx: &Context, len: usize) -> Result<Self> {
+    /// # Safety
+    ///
+    /// Every byte of the returned buffer must be written before any
+    /// read (host `read` / `download`, or a kernel that *reads* the
+    /// slice — including via a `&mut [T]` kernel arg whose body
+    /// happens to read before it writes). claspr's typed launcher
+    /// signature is `&mut [T]` regardless of whether the kernel reads
+    /// or only writes, so there is no static check that a given
+    /// kernel is write-only.
+    ///
+    /// rust-gpu has no `MaybeUninit` story, so a kernel that reads
+    /// uninit bytes interprets them as a `T` value at the SPIR-V
+    /// level. For numeric `T` this is arbitrary garbage (likely wrong
+    /// answer, not technically UB); for any `T` with invalid bit
+    /// patterns (e.g. `bool`, `NonZeroU32`, niche-optimised enums)
+    /// it is undefined behaviour.
+    ///
+    /// Use this only when you control both sides — e.g. wrapping the
+    /// alloc in a safe higher-level op that immediately enqueues a
+    /// full-buffer write (`Upload`, `DeviceSliceFilled`). Prefer
+    /// [`alloc`](Self::alloc) for user-facing code.
+    pub unsafe fn alloc_uninit(ctx: &Context, len: usize) -> Result<Self> {
         // SAFETY: passing a null host pointer means OpenCL allocates
         // fresh device memory and ignores the host-pointer contract
         // that makes `Buffer::create` generally unsafe.

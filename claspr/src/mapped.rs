@@ -139,12 +139,13 @@ impl<T: Default + Copy> MappedSlice<T> {
     /// [`DeviceSlice::alloc`](crate::DeviceSlice::alloc) and
     /// [`USMSlice::alloc`](crate::USMSlice::alloc).
     ///
-    /// Code paths that write the entire buffer immediately afterward
-    /// (e.g. `mapped_slice_filled`, `mapped_slice_upload`) should use
-    /// [`alloc_uninit`](Self::alloc_uninit) instead to skip the
-    /// redundant zero-fill.
+    /// The `unsafe` [`alloc_uninit`](Self::alloc_uninit) escape
+    /// hatch skips the fill but requires the caller to overwrite
+    /// every byte before any read — see its safety contract.
     pub fn alloc(ctx: &Context, len: usize) -> Result<Self> {
-        let slice = Self::alloc_uninit(ctx, len)?;
+        // SAFETY: synchronous fill below overwrites every byte
+        // before returning, so no path can observe uninit data.
+        let slice = unsafe { Self::alloc_uninit(ctx, len)? };
         slice.fill(ctx, T::default()).wait()?;
         Ok(slice)
     }
@@ -155,11 +156,15 @@ impl<T> MappedSlice<T> {
     /// uninitialised. Cheaper than [`alloc`](Self::alloc) when the
     /// caller writes the whole buffer before any read.
     ///
-    /// Reading uninitialised bytes is unspecified at the OpenCL level
-    /// and UB at the Rust level if interpreted as a non-trivial `T`.
-    /// Prefer [`alloc`](Self::alloc) unless you know the buffer is
-    /// fully written before any read.
-    pub fn alloc_uninit(ctx: &Context, len: usize) -> Result<Self> {
+    /// # Safety
+    ///
+    /// Same contract as [`DeviceSlice::alloc_uninit`](crate::DeviceSlice::alloc_uninit):
+    /// every byte must be written before any read (host map / SVM
+    /// copy / kernel that reads). rust-gpu has no `MaybeUninit` story,
+    /// so a kernel that reads uninit bytes interprets them as `T` at
+    /// the SPIR-V level — arbitrary garbage for numeric `T`, UB for
+    /// types with invalid bit patterns.
+    pub unsafe fn alloc_uninit(ctx: &Context, len: usize) -> Result<Self> {
         if ctx.svm_capability() == SvmLevel::None {
             return Err(Error::SvmNotAvailable);
         }

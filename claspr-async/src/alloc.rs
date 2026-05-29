@@ -126,12 +126,12 @@ where
     type Output = DeviceSlice<T>;
 
     fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(DeviceSlice<T>, Deps)> {
-        // alloc_uninit: the fill below overwrites every byte, so
-        // skip alloc's redundant zero-fill.
-        let mut buf = DeviceSlice::<T>::alloc_uninit(ec.context(), self.len)?;
-        // Fill on the chain's queue with upstream deps as wait-list.
-        // Same shape as Upload: downstream waits on the fill event,
-        // which transitively gates on upstream.
+        // SAFETY: alloc_uninit returns uninit bytes; the immediate
+        // fill on the chain's queue overwrites the whole buffer.
+        // Downstream stages gate on the fill event (returned in
+        // deps), so no read — host or kernel — can observe uninit.
+        // Skips the redundant zero-fill alloc would otherwise do.
+        let mut buf = unsafe { DeviceSlice::<T>::alloc_uninit(ec.context(), self.len)? };
         let event = buf
             .fill(ec, self.value)
             .after_all(deps_as_events(&deps))
@@ -173,8 +173,10 @@ where
     type Output = MappedSlice<T>;
 
     fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(MappedSlice<T>, Deps)> {
-        // alloc_uninit: the fill below overwrites every byte.
-        let buf = MappedSlice::<T>::alloc_uninit(ec.context(), self.len)?;
+        // SAFETY: alloc_uninit returns uninit SVM bytes; the
+        // immediate fill below overwrites the whole buffer, and
+        // downstream stages gate on the returned fill event.
+        let buf = unsafe { MappedSlice::<T>::alloc_uninit(ec.context(), self.len)? };
         let event = buf
             .fill(ec, self.value)
             .after_all(deps_as_events(&deps))
@@ -223,8 +225,11 @@ where
             .take()
             .expect("MappedSliceUpload::execute called twice — internal claspr-async bug");
         let len = source.len();
-        // alloc_uninit: the memcpy below overwrites every byte.
-        let buf = MappedSlice::<T>::alloc_uninit(ec.context(), len)?;
+        // SAFETY: alloc_uninit returns uninit SVM bytes; the
+        // clEnqueueSVMMemcpy below overwrites every byte from
+        // `source`. Downstream stages gate on the returned memcpy
+        // event so no read can observe uninit data.
+        let buf = unsafe { MappedSlice::<T>::alloc_uninit(ec.context(), len)? };
 
         let raw_deps: Vec<opencl3::types::cl_event> =
             deps.iter().map(|d| d.as_ref().get()).collect();
