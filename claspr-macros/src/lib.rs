@@ -268,11 +268,25 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         };
         match classify_param(pt)? {
             ParamRole::Builtin => continue,
-            ParamRole::Slice { name: pname, elem } => {
+            ParamRole::Slice {
+                name: pname,
+                elem,
+                mutable,
+            } => {
                 // Allocate a fresh generic per slice.
                 let gid = quote::format_ident!("__claspr_D{}", slice_generics.len());
                 let gid_tt: TokenStream2 = quote! { #gid };
-                let bound: TokenStream2 = quote! { #gid: ::claspr::KernelSliceArg<#elem> };
+                // Pick the appropriate bound based on slice mutability.
+                // Kernel `&[T]` → KernelSliceReadArg<T> (any buffer whose
+                // marker impls KernelReadable). Kernel `&mut [T]` →
+                // KernelSliceReadWriteArg<T> (additionally requires
+                // KernelWritable — excludes ReadOnly / Frozen at the
+                // type level rather than the runtime).
+                let bound: TokenStream2 = if mutable {
+                    quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> }
+                } else {
+                    quote! { #gid: ::claspr::KernelSliceReadArg<#elem> }
+                };
                 slice_generics.push((gid_tt.clone(), bound));
 
                 host_names.push(pname.clone());
@@ -579,14 +593,20 @@ fn single_or_tuple(elems: &[TokenStream2]) -> TokenStream2 {
 enum ParamRole {
     /// Drop: SPIR-V builtin filled in by the runtime.
     Builtin,
-    /// Slice param (`#[spirv(cross_workgroup)] &mut [T]`). Becomes a
-    /// generic type parameter `D: KernelSliceArg<T>` on the emitted
-    /// method + Op, so any of `DeviceSlice<T>` / `MappedSlice<T>` /
-    /// `USMSlice<T>` can flow through.
+    /// Slice param (`#[spirv(cross_workgroup)] &mut [T]` or `&[T]`).
+    /// Becomes a generic type parameter `D: KernelSliceReadArg<T>`
+    /// (for `&[T]`) or `D: KernelSliceReadWriteArg<T>` (for `&mut [T]`)
+    /// on the emitted method + Op, so any of `DeviceSlice<T, M>` /
+    /// `MappedSlice<T>` / `USMSlice<T>` can flow through — subject to
+    /// the marker's `KernelReadable` / `KernelWritable` constraints.
     Slice {
         name: TokenStream2,
-        /// The `T` from `&mut [T]` — used to constrain the generic.
+        /// The `T` from `&[T]` / `&mut [T]` — used to constrain the generic.
         elem: TokenStream2,
+        /// `true` when the kernel param is `&mut [T]` (emits the
+        /// stricter `KernelSliceReadWriteArg<T>` bound); `false` for
+        /// `&[T]` (emits `KernelSliceReadArg<T>`).
+        mutable: bool,
     },
     /// Image param (`&Image!(...)` / `&mut Image!(...)`). Stays
     /// concrete (no generic widening yet — only one image type per
@@ -632,8 +652,12 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
     };
 
     if matches!(kind, Some(SpirvKind::CrossWorkgroup)) {
-        let elem = slice_element_ty(&pt.ty)?;
-        return Ok(ParamRole::Slice { name: pname, elem });
+        let (elem, mutable) = slice_element_ty(&pt.ty)?;
+        return Ok(ParamRole::Slice {
+            name: pname,
+            elem,
+            mutable,
+        });
     }
     if let Some(info) = classify_image_param(&pt.ty) {
         let access = info.access;
@@ -650,10 +674,15 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
     })
 }
 
-/// Pull the element type out of `&[T]` / `&mut [T]`. Reused by both
-/// the Tier 1 wrapper translation and Tier 2's owned-arg type.
-fn slice_element_ty(ty: &Type) -> syn::Result<TokenStream2> {
-    let Type::Reference(TypeReference { elem, .. }) = ty else {
+/// Pull `(element type, is-mutable)` out of `&[T]` / `&mut [T]`.
+/// The mutability bit drives the choice between
+/// `KernelSliceReadArg<T>` (`&[T]`) and `KernelSliceReadWriteArg<T>`
+/// (`&mut [T]`) bounds on the emitted host method.
+fn slice_element_ty(ty: &Type) -> syn::Result<(TokenStream2, bool)> {
+    let Type::Reference(TypeReference {
+        elem, mutability, ..
+    }) = ty
+    else {
         return Err(syn::Error::new(
             ty.span(),
             "expected a reference type (`&[T]` or `&mut [T]`) for a #[spirv(cross_workgroup)] \
@@ -667,7 +696,7 @@ fn slice_element_ty(ty: &Type) -> syn::Result<TokenStream2> {
              by claspr::kernel",
         ));
     };
-    Ok(quote! { #inner })
+    Ok((quote! { #inner }, mutability.is_some()))
 }
 
 fn find_spirv_attr(attrs: &[Attribute]) -> Option<Attribute> {

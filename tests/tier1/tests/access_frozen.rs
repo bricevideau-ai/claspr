@@ -36,26 +36,29 @@ fn frozen_from_slice_round_trip_via_read() {
 
 #[test]
 fn frozen_threads_into_kernel_as_read_only_input() {
-    // Pass the Frozen buffer to a kernel that reads its slice arg.
-    // Kernel signature is `&mut [T]` today (rust-gpu doesn't yet
-    // distinguish read-only at the slice level), but the runtime
-    // enforces CL_MEM_READ_ONLY — the kernel reading is fine.
-    // Once step 6 lands (proc-macro preserves &/&mut), a kernel
-    // declared `&mut [T]` would fail to accept a Frozen buffer at
-    // the type level; today it goes through.
+    // Pass two Frozen buffers as the `&[u32]` (read-only) inputs of
+    // `add_u32`; the output goes to a ReadWrite DeviceSlice. The
+    // proc-macro (after step 6) emits `KernelSliceReadArg<u32>` for
+    // the `&[u32]` params, which Frozen satisfies (Frozen impls
+    // KernelReadable). This compiles AND executes; the kernel reads
+    // the bytes we baked in via CL_MEM_COPY_HOST_PTR.
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    // Use scale_u32 as a stand-in: kernel reads + writes to its
-    // slice. With Frozen the kernel WRITE would be a runtime error
-    // — so we just exercise the kernel-arg plumbing without actually
-    // launching for now. The full read-only-input scenario lands
-    // in step 6 with the proc-macro changes.
-    let _ = kernels;
-    let input_data: Vec<u32> = (0..N as u32).collect();
-    let frozen: DeviceSlice<u32, Frozen> =
-        DeviceSlice::from_slice(&ctx, &input_data).expect("Frozen alloc");
-    assert_eq!(claspr::Buffer::len(&frozen), N);
+    let a: DeviceSlice<u32, Frozen> =
+        DeviceSlice::from_slice(&ctx, &[3u32; N]).expect("Frozen a");
+    let b: DeviceSlice<u32, Frozen> =
+        DeviceSlice::from_slice(&ctx, &[5u32; N]).expect("Frozen b");
+    let out = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc out");
+
+    let (_a, _b, out) = kernels
+        .add_u32([N], a, b, out)
+        .wait(&ctx)
+        .expect("kernel launch with Frozen inputs");
+
+    let mut host = vec![0u32; N];
+    out.read(&ctx, &mut host).wait().expect("read");
+    assert!(host.iter().all(|&v| v == 8), "Frozen a + Frozen b = 8 each");
 }
 
 #[test]
