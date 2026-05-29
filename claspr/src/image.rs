@@ -28,60 +28,29 @@
 //! `R8G8B8A8Uint` for rust-gpu's `type=u32` kernel default.
 
 use crate::Result;
+use crate::access::KernelAccess;
 use crate::context::Context;
 use crate::launch::KernelArg;
 use crate::queue::Launcher;
 use opencl3::kernel::ExecuteKernel;
-use opencl3::memory::{
-    CL_MEM_OBJECT_IMAGE2D, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_WRITE_ONLY, ClMem, Image,
-};
-use opencl3::types::{CL_BLOCKING, cl_image_desc, cl_image_format, cl_mem_flags};
+use opencl3::memory::{CL_MEM_OBJECT_IMAGE2D, ClMem, Image};
+use opencl3::types::{CL_BLOCKING, cl_image_desc, cl_image_format};
 use std::marker::PhantomData;
 use std::ptr;
 
-// ── ImageAccess markers ─────────────────────────────────────────────
+// ── Access markers (re-exported from the shared access module) ─────
+//
+// Image2D used to define its own sealed `ImageAccess` trait + a private
+// `ReadOnly` / `WriteOnly` / `ReadWrite` set of markers. Those are now
+// the cross-cutting [`crate::access`] markers; this re-export keeps the
+// existing `claspr::image::*` import paths and proc-macro-emitted
+// `::claspr::ReadOnly` references working.
 
-mod access_sealed {
-    pub trait Sealed {}
-    impl Sealed for super::ReadOnly {}
-    impl Sealed for super::WriteOnly {}
-    impl Sealed for super::ReadWrite {}
-}
+pub use crate::access::{ReadOnly, ReadWrite, WriteOnly};
 
-/// Sealed marker for image access mode. Implementors are
-/// [`ReadOnly`], [`WriteOnly`], and [`ReadWrite`].
-///
-/// Corresponds to OpenCL's `CL_MEM_{READ_ONLY, WRITE_ONLY,
-/// READ_WRITE}` and SPIR-V's image-AccessQualifier
-/// (`ReadOnly`/`WriteOnly`/`ReadWrite`). Pick the strictest mode
-/// the kernel uses; for an image written by one kernel and read by
-/// another, use `ReadWrite` (requires OpenCL 2.0+).
-pub trait ImageAccess: access_sealed::Sealed {
-    #[doc(hidden)]
-    const CL_FLAGS: cl_mem_flags;
-}
-
-/// Image readable by kernels (`CL_MEM_READ_ONLY`).
-#[derive(Clone, Copy, Debug)]
-pub struct ReadOnly;
-impl ImageAccess for ReadOnly {
-    const CL_FLAGS: cl_mem_flags = CL_MEM_READ_ONLY;
-}
-
-/// Image writable by kernels (`CL_MEM_WRITE_ONLY`).
-#[derive(Clone, Copy, Debug)]
-pub struct WriteOnly;
-impl ImageAccess for WriteOnly {
-    const CL_FLAGS: cl_mem_flags = CL_MEM_WRITE_ONLY;
-}
-
-/// Image both readable and writable by kernels
-/// (`CL_MEM_READ_WRITE`). Requires OpenCL 2.0+ for storage images.
-#[derive(Clone, Copy, Debug)]
-pub struct ReadWrite;
-impl ImageAccess for ReadWrite {
-    const CL_FLAGS: cl_mem_flags = CL_MEM_READ_WRITE;
-}
+/// Backward-compat alias for [`KernelAccess`](crate::access::KernelAccess).
+/// Image2D's marker bound is now `A: KernelAccess` directly.
+pub use crate::access::KernelAccess as ImageAccess;
 
 // ── Format trait + ZST types ────────────────────────────────────────
 
@@ -186,7 +155,7 @@ pub mod format {
 /// [`Image2D::download_bytes`] (raw bytes for byte-oriented sinks
 /// like the PPM helper). Kernel arguments accept `&Image2D<A, F>`
 /// directly.
-pub struct Image2D<A: ImageAccess, F: format::Format> {
+pub struct Image2D<A: KernelAccess, F: format::Format> {
     image: Image,
     width: u32,
     height: u32,
@@ -196,7 +165,7 @@ pub struct Image2D<A: ImageAccess, F: format::Format> {
     _format: PhantomData<F>,
 }
 
-impl<A: ImageAccess, F: format::Format> Image2D<A, F> {
+impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
     /// Allocate a `width × height` image. Pure context op — no
     /// command queue needed (`clCreateImage` doesn't enqueue
     /// anything).
@@ -228,7 +197,7 @@ impl<A: ImageAccess, F: format::Format> Image2D<A, F> {
         let image = unsafe {
             Image::create(
                 ctx.raw_context(),
-                A::CL_FLAGS,
+                A::KERNEL_FLAGS,
                 &format,
                 &desc,
                 ptr::null_mut(),
@@ -320,7 +289,7 @@ impl<A: ImageAccess, F: format::Format> Image2D<A, F> {
     }
 }
 
-impl<A: ImageAccess, F: format::Format> KernelArg for Image2D<A, F> {
+impl<A: KernelAccess, F: format::Format> KernelArg for Image2D<A, F> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         let cl_mem_handle = self.image.get();
         unsafe {

@@ -57,6 +57,7 @@
 //! [claspr-build]: https://docs.rs/claspr-build
 //! [`Image2DRgba8`]: crate::image::Image2DRgba8
 
+pub mod access;
 pub mod buffer;
 pub mod context;
 pub mod device;
@@ -75,11 +76,15 @@ pub mod util;
 
 // ── Public surface ────────────────────────────────────────────────────
 
+pub use access::{
+    DeviceScratch, Frozen, HostAccess, HostReadOnly, KernelAccess, MemMode, ReadOnly, ReadWrite,
+    WriteOnly,
+};
 pub use buffer::{Buffer, CopyOp, DeviceSlice, FillOp, MigrateOp, ReadOp, WriteOp};
 pub use context::{Context, SvmLevel};
 pub use device::{Device, DeviceType, Platform};
 pub use error::{Error, Result};
-pub use image::{Image2D, Image2DRgba8, ImageAccess, ReadOnly, ReadWrite, WriteOnly, format};
+pub use image::{Image2D, Image2DRgba8, ImageAccess, format};
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, KernelSliceArg, LaunchSpec, LocalBuffer, ScalarArg,
     profiling_duration,
