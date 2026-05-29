@@ -151,3 +151,29 @@ fn dyn_op_picks_branch_with_or_without_kernel() {
     assert_eq!(make(false).sync(&ctx).expect("b"), 0);
     assert_eq!(*sum_cell.lock().unwrap(), 0);
 }
+
+#[test]
+fn non_taken_branch_closure_does_not_fire() {
+    // Pin the laziness guarantee: an `if`/`else` that builds one of
+    // two `DynOp<T>`s never constructs the not-taken arm. That arm
+    // here contains a closure that would panic; if branch selection
+    // were eager (e.g. some future refactor pre-built both arms), the
+    // test would panic. Picks the safe arm; assertion is "sync
+    // returns the safe arm's value, no panic." Belt-and-suspenders
+    // for the basic Rust short-circuit on top of DynOp's wrapper.
+    let Some(ctx) = ctx() else { return };
+    let make = |take_safe: bool| -> DynOp<u32> {
+        if take_safe {
+            DynOp::new(value(7u32))
+        } else {
+            DynOp::new(
+                value(())
+                    .and_then_host(|()| -> claspr::Result<()> {
+                        panic!("non-taken branch fired — DynOp construction must be lazy");
+                    })
+                    .and_then(|()| value(0u32)),
+            )
+        }
+    };
+    assert_eq!(make(true).sync(&ctx).expect("safe arm"), 7);
+}
