@@ -10,14 +10,14 @@
 //! See the [`Buffer`] trait's own docs for what it does and does
 //! not abstract over.
 
-use crate::access::{MemMode, ReadWrite};
+use crate::access::{Frozen, MemMode, ReadWrite};
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
 use crate::queue::Launcher;
 use opencl3::command_queue::CommandQueue;
 use opencl3::event::Event;
-use opencl3::memory::{Buffer as ClBuffer, ClMem, release_mem_object};
+use opencl3::memory::{Buffer as ClBuffer, CL_MEM_COPY_HOST_PTR, ClMem, release_mem_object};
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_event, cl_mem};
 use std::fmt;
 use std::marker::PhantomData;
@@ -201,7 +201,9 @@ impl<T> DeviceSlice<T, ReadWrite> {
             _mode: PhantomData,
         })
     }
+}
 
+impl<T, M: MemMode> DeviceSlice<T, M> {
     /// Begin writing `data` into this buffer. Returns a lazy
     /// [`WriteOp`] builder — pick a terminal ([`wait`](WriteOp::wait),
     /// [`submit`](WriteOp::submit), `.await`) to actually run.
@@ -257,9 +259,9 @@ impl<T> DeviceSlice<T, ReadWrite> {
     /// Both buffers must be on the same `Context` — OpenCL's
     /// `clEnqueueCopyBuffer` only works within one context. For
     /// cross-context transfers, download to host then re-upload.
-    pub fn copy_to<'a, L: Launcher + ?Sized>(
+    pub fn copy_to<'a, L: Launcher + ?Sized, M2: MemMode>(
         &'a self,
-        dst: &'a mut DeviceSlice<T>,
+        dst: &'a mut DeviceSlice<T, M2>,
         launcher: &'a L,
     ) -> CopyOp<'a, T> {
         CopyOp {
@@ -326,6 +328,48 @@ impl<T> DeviceSlice<T, ReadWrite> {
             deps: Vec::new(),
             profile_cb: None,
         }
+    }
+}
+
+// ── DeviceSlice<T, Frozen> — set-at-construction, never modified ──
+
+impl<T: Copy> DeviceSlice<T, Frozen> {
+    /// Create a [`Frozen`] device buffer whose contents are copied
+    /// from `data` at construction time via `CL_MEM_COPY_HOST_PTR`,
+    /// and locked thereafter (`CL_MEM_READ_ONLY | CL_MEM_HOST_READ_ONLY`).
+    ///
+    /// `Frozen` is the only marker without a default `alloc`: both
+    /// kernel and host are read-only, so the bytes must be set at
+    /// create time. After this call neither path can modify the
+    /// buffer — kernels see it as a `&[T]` slice, host code can
+    /// only inspect via map.
+    pub fn from_slice(ctx: &Context, data: &[T]) -> Result<Self> {
+        // SAFETY: `data.as_ptr()` is valid for `data.len() * size_of::<T>()`
+        // bytes; `CL_MEM_COPY_HOST_PTR` means the runtime copies the
+        // bytes into the new allocation immediately and does NOT
+        // retain the pointer. So `data` doesn't need to outlive the
+        // returned DeviceSlice.
+        let buffer = unsafe {
+            ClBuffer::<T>::create(
+                ctx.raw_context(),
+                Frozen::FLAGS | CL_MEM_COPY_HOST_PTR,
+                data.len(),
+                data.as_ptr() as *mut std::ffi::c_void,
+            )?
+        };
+        Ok(DeviceSlice {
+            buffer: ManuallyDrop::new(buffer),
+            len: data.len(),
+            ctx: ctx.clone(),
+            _mode: PhantomData,
+        })
+    }
+
+    /// Convenience for `from_slice(ctx, &data)` that takes the Vec
+    /// by value — symmetric with the `from_*` constructors on the
+    /// other tiers.
+    pub fn from_vec(ctx: &Context, data: Vec<T>) -> Result<Self> {
+        Self::from_slice(ctx, &data)
     }
 }
 
