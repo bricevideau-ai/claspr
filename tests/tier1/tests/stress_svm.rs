@@ -19,9 +19,10 @@ use claspr::{Context, OutOfOrder, Queue, SharedBuffer, SvmLevel};
 use claspr_test_kernels::kernels;
 
 const N: usize = 256;
-/// > 1000 per REVIEW.md item #5. `fill_u32` is one accumulator op
-/// per work-item; 1024 iterations on llvmpipe complete in well under
-/// a second, but the Vec accumulation surface is fully exercised.
+/// At least 1000 per REVIEW.md item #5. `fill_u32` is one
+/// accumulator op per work-item; 1024 iterations on llvmpipe complete
+/// in well under a second while still fully exercising the Vec
+/// accumulation surface.
 const LAUNCHES: u32 = 1024;
 
 fn ctx_with_svm() -> Option<Context> {
