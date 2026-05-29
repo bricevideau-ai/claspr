@@ -46,7 +46,7 @@
 //! [`SharedBuffer::alloc`]: claspr::SharedBuffer::alloc
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation};
+use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
 use claspr::{DeviceSlice, HostBuffer, Result, SharedBuffer};
 use std::marker::PhantomData;
 
@@ -79,6 +79,52 @@ where
     fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(DeviceSlice<T>, Deps)> {
         let buf = DeviceSlice::<T>::alloc(ec.context(), self.len)?;
         Ok((buf, deps))
+    }
+}
+
+// ── DeviceSlice fill (alloc + clEnqueueFillBuffer) ─────────────────
+
+/// Lazy alloc + fill — produces a [`DeviceSlice<T>`] of `len`
+/// elements all set to `value`, via `clEnqueueFillBuffer` (no host
+/// allocation, no host→device transfer). Built by
+/// [`device_slice_filled`] and by the [`device_slice!`](crate::device_slice!)
+/// macro's `[value; count]` arm.
+pub struct DeviceSliceFilled<T: Copy> {
+    value: T,
+    len: usize,
+}
+
+/// Allocate a [`DeviceSlice<T>`] of `len` elements all set to
+/// `value`. Argument order mirrors [`vec!`](std::vec)'s `[value; count]`
+/// shape.
+///
+/// Compared to `upload(vec![value; len])`: no host allocation of `len`
+/// elements, no host→device transfer — just `clEnqueueFillBuffer` on
+/// the chain's queue with the single-element pattern repeated across
+/// the buffer.
+pub fn device_slice_filled<T>(value: T, len: usize) -> DeviceSliceFilled<T>
+where
+    T: Copy + Send + 'static,
+{
+    DeviceSliceFilled { value, len }
+}
+
+impl<T> DeviceOperation for DeviceSliceFilled<T>
+where
+    T: Copy + Send + 'static,
+{
+    type Output = DeviceSlice<T>;
+
+    fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(DeviceSlice<T>, Deps)> {
+        let mut buf = DeviceSlice::<T>::alloc(ec.context(), self.len)?;
+        // Fill on the chain's queue with upstream deps as wait-list.
+        // Same shape as Upload: downstream waits on the fill event,
+        // which transitively gates on upstream.
+        let event = buf
+            .fill(ec, self.value)
+            .after_all(deps_as_events(&deps))
+            .submit()?;
+        Ok((buf, vec![wrap_event(event)]))
     }
 }
 

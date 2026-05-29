@@ -54,8 +54,8 @@ pub mod transfer;
 pub mod transfer_to_device;
 
 pub use alloc::{
-    DeviceSliceAlloc, HostBufferAlloc, SharedBufferAlloc, device_slice_alloc, host_buffer_alloc,
-    shared_buffer_alloc,
+    DeviceSliceAlloc, DeviceSliceFilled, HostBufferAlloc, SharedBufferAlloc, device_slice_alloc,
+    device_slice_filled, host_buffer_alloc, shared_buffer_alloc,
 };
 pub use and_then_host::{AndThenHost, AndThenHostWithContext, DeviceOperationHostExt};
 pub use arc::ArcSplit;
@@ -81,3 +81,38 @@ pub use op::{
 pub use profile::{DeviceOperationProfileExt, Profiled};
 pub use transfer::{Download, Upload, UploadSource, download, upload};
 pub use transfer_to_device::{TransferToDevice, transfer_to_device};
+
+/// `vec!`-shaped sugar for producing a [`DeviceSlice<T>`] op.
+///
+/// Two arms mirror [`vec!`](std::vec):
+///
+/// - `device_slice![value; count]` — alloc + `clEnqueueFillBuffer`
+///   on the chain's queue. No host allocation, no host→device
+///   transfer; just the pattern repeated across the new buffer.
+///   Expands to [`device_slice_filled(value, count)`](crate::device_slice_filled).
+/// - `device_slice![a, b, c]` — upload a host literal. Allocates
+///   a host `Vec<T>` and a fresh `cl_mem`, runs a non-blocking
+///   `clEnqueueWriteBuffer`. Expands to [`upload(vec![a, b, c])`](crate::upload).
+///
+/// Choose intentionally: the two arms have radically different
+/// bandwidth profiles even though they look almost identical. For
+/// the explicit form prefer [`device_slice_alloc`](crate::device_slice_alloc)
+/// and [`DeviceSlice::fill`](claspr::DeviceSlice::fill) directly
+/// when the alloc + fill decomposition matters in the chain shape.
+///
+/// ```ignore
+/// // Allocates one cl_mem, fills with 0u32 on-device.
+/// let buf_op = device_slice![0u32; N];
+///
+/// // Allocates a Vec on the host, uploads it.
+/// let buf_op = device_slice![1u32, 2, 3, 4];
+/// ```
+#[macro_export]
+macro_rules! device_slice {
+    [$value:expr; $count:expr] => {
+        $crate::device_slice_filled($value, $count)
+    };
+    [$($v:expr),* $(,)?] => {
+        $crate::upload(::std::vec![$($v),*])
+    };
+}

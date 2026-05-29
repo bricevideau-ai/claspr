@@ -258,6 +258,33 @@ impl<T> DeviceSlice<T> {
             profile_cb: None,
         }
     }
+
+    /// Begin filling this buffer's contents with `value` repeated for
+    /// every element — wraps `clEnqueueFillBuffer` on `launcher`'s
+    /// queue. Useful for "zero out" / "reset to constant" patterns
+    /// without uploading a host vector of N copies.
+    ///
+    /// Returns a lazy [`FillOp`] builder; pick a terminal
+    /// ([`wait`](FillOp::wait), [`submit`](FillOp::submit), `.await`)
+    /// to actually run.
+    ///
+    /// Takes `&mut self` because opencl3's `enqueue_fill_buffer`
+    /// requires `&mut Buffer<T>` even though the cl_mem handle
+    /// itself is shared / opaque at the OpenCL level — same shape
+    /// as [`write`](Self::write).
+    pub fn fill<'a, L: Launcher + ?Sized>(&'a mut self, launcher: &'a L, value: T) -> FillOp<'a, T>
+    where
+        T: Copy,
+    {
+        FillOp {
+            queue: launcher.cl_queue(),
+            buffer: &mut self.buffer,
+            len: self.len,
+            pattern: value,
+            deps: Vec::new(),
+            profile_cb: None,
+        }
+    }
 }
 
 // ── UploadOp / ReadOp / CopyOp builders ─────────────────────────────
@@ -600,6 +627,72 @@ impl<T> fmt::Debug for DeviceSlice<T> {
             .field("len", &self.len)
             .field("element_size", &std::mem::size_of::<T>())
             .finish_non_exhaustive()
+    }
+}
+
+/// Lazy builder for `clEnqueueFillBuffer`. Returned by
+/// [`DeviceSlice::fill`]. The pattern is a single `T` value; the
+/// fill spans the whole buffer (`len * size_of::<T>()` bytes).
+pub struct FillOp<'a, T: Copy> {
+    queue: &'a CommandQueue,
+    buffer: &'a mut ManuallyDrop<ClBuffer<T>>,
+    len: usize,
+    pattern: T,
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
+}
+
+impl<'a, T: Copy> FillOp<'a, T> {
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
+    }
+
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        self.deps.extend(events.into_iter().map(|e| e.get()));
+        self
+    }
+
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    pub fn wait(self) -> Result<()> {
+        let event = self.into_event()?;
+        event.wait()?;
+        Ok(())
+    }
+
+    pub fn submit(self) -> Result<Event> {
+        self.into_event()
+    }
+
+    pub(crate) fn into_event(self) -> Result<Event> {
+        // SAFETY: `enqueue_fill_buffer` is unsafe because the buffer
+        // must belong to the queue's context. Same constraint as
+        // `enqueue_copy_buffer` / `enqueue_migrate_mem_object`. The
+        // pattern is byte-copied (via opencl3's slice-of-pattern
+        // shape) across the whole buffer.
+        let event = unsafe {
+            self.queue.enqueue_fill_buffer(
+                &mut **self.buffer,
+                std::slice::from_ref(&self.pattern),
+                0,
+                self.len * std::mem::size_of::<T>(),
+                &self.deps,
+            )?
+        };
+        if let Some(cb) = self.profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
+        Ok(event)
     }
 }
 

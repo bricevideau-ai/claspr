@@ -74,7 +74,7 @@ pub mod util;
 
 // ── Public surface ────────────────────────────────────────────────────
 
-pub use buffer::{Buffer, CopyOp, DeviceSlice, HostBuffer, MigrateOp, ReadOp, WriteOp};
+pub use buffer::{Buffer, CopyOp, DeviceSlice, FillOp, HostBuffer, MigrateOp, ReadOp, WriteOp};
 pub use context::{Context, SvmLevel};
 pub use device::{Device, DeviceType, Platform};
 pub use error::{Error, Result};
