@@ -10,7 +10,7 @@
 //! See the [`Buffer`] trait's own docs for what it does and does
 //! not abstract over.
 
-use crate::access::{Frozen, HostReadable, HostWritable, KernelWritable, MemMode, ReadWrite};
+use crate::access::{HostReadable, HostWritable, KernelWritable, MemMode, ReadWrite};
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
@@ -136,16 +136,20 @@ impl<T, M: MemMode> Drop for DeviceSlice<T, M> {
     }
 }
 
-impl<T: Default + Copy> DeviceSlice<T, ReadWrite> {
+impl<T: Default + Copy, M: MemMode + KernelWritable> DeviceSlice<T, M> {
     /// Allocate a device buffer of `len` elements, zero-initialised
     /// via `clEnqueueFillBuffer(T::default())` on the context's
     /// default queue. Blocks until the fill completes.
     ///
     /// The `T: Default + Copy` bound makes the buffer's contents a
-    /// valid `T` value before any read, so a host download (or kernel
-    /// read-before-write) sees `T::default()` rather than uninit
-    /// bytes. Matches [`MappedSlice::alloc`](crate::MappedSlice::alloc)
-    /// and [`USMSlice::alloc`](crate::USMSlice::alloc).
+    /// valid `T` value before any read; the `M: KernelWritable` bound
+    /// limits this constructor to markers whose kernel-side flag
+    /// permits a runtime fill (excludes [`crate::ReadOnly`] and
+    /// [`crate::Frozen`] — those use [`from_slice`](Self::from_slice)
+    /// to bake in the initial data at create time instead).
+    ///
+    /// Matches [`MappedSlice::alloc`](crate::MappedSlice::alloc) and
+    /// [`USMSlice::alloc`](crate::USMSlice::alloc).
     ///
     /// Internally a `clCreateBuffer` + a synchronous fill. The
     /// `unsafe` [`alloc_uninit`](Self::alloc_uninit) escape hatch
@@ -161,7 +165,7 @@ impl<T: Default + Copy> DeviceSlice<T, ReadWrite> {
     }
 }
 
-impl<T> DeviceSlice<T, ReadWrite> {
+impl<T, M: MemMode + KernelWritable> DeviceSlice<T, M> {
     /// Allocate a device buffer of `len` elements, leaving the bytes
     /// uninitialised. Cheaper than [`alloc`](Self::alloc) when the
     /// caller writes the whole buffer before any read.
@@ -191,9 +195,8 @@ impl<T> DeviceSlice<T, ReadWrite> {
         // SAFETY: passing a null host pointer means OpenCL allocates
         // fresh device memory and ignores the host-pointer contract
         // that makes `Buffer::create` generally unsafe.
-        let buffer = unsafe {
-            ClBuffer::<T>::create(ctx.raw_context(), ReadWrite::FLAGS, len, ptr::null_mut())?
-        };
+        let buffer =
+            unsafe { ClBuffer::<T>::create(ctx.raw_context(), M::FLAGS, len, ptr::null_mut())? };
         Ok(DeviceSlice {
             buffer: ManuallyDrop::new(buffer),
             len,
@@ -349,18 +352,25 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
     }
 }
 
-// ── DeviceSlice<T, Frozen> — set-at-construction, never modified ──
+// ── from_slice / from_vec — bake in initial data at create time ────
 
-impl<T: Copy> DeviceSlice<T, Frozen> {
-    /// Create a [`Frozen`] device buffer whose contents are copied
-    /// from `data` at construction time via `CL_MEM_COPY_HOST_PTR`,
-    /// and locked thereafter (`CL_MEM_READ_ONLY | CL_MEM_HOST_READ_ONLY`).
+impl<T: Copy, M: MemMode> DeviceSlice<T, M> {
+    /// Create a device buffer whose contents are copied from `data`
+    /// at construction time via `CL_MEM_COPY_HOST_PTR`, with the
+    /// marker's access flags applied (`M::FLAGS`).
     ///
-    /// `Frozen` is the only marker without a default `alloc`: both
-    /// kernel and host are read-only, so the bytes must be set at
-    /// create time. After this call neither path can modify the
-    /// buffer — kernels see it as a `&[T]` slice, host code can
-    /// only inspect via map.
+    /// Works for any marker — `CL_MEM_COPY_HOST_PTR` is a one-shot
+    /// creation-time copy that doesn't interact with the host-access
+    /// or kernel-access flags applied to subsequent operations. So
+    /// `DeviceSlice::<u32, Frozen>::from_slice` bakes in immutable
+    /// initial data; `DeviceSlice::<u32, DeviceConstant>::from_slice`
+    /// bakes in initial data the host can update later via `.write()`;
+    /// `DeviceSlice::<u32>::from_slice` (default `ReadWrite`) is just
+    /// alloc+write in one call.
+    ///
+    /// For [`crate::Frozen`] this is the ONLY constructor (both axes
+    /// are read-only — no alloc-and-fill path). For other markers
+    /// it's a convenience over `alloc + write`.
     pub fn from_slice(ctx: &Context, data: &[T]) -> Result<Self> {
         // SAFETY: `data.as_ptr()` is valid for `data.len() * size_of::<T>()`
         // bytes; `CL_MEM_COPY_HOST_PTR` means the runtime copies the
@@ -370,7 +380,7 @@ impl<T: Copy> DeviceSlice<T, Frozen> {
         let buffer = unsafe {
             ClBuffer::<T>::create(
                 ctx.raw_context(),
-                Frozen::FLAGS | CL_MEM_COPY_HOST_PTR,
+                M::FLAGS | CL_MEM_COPY_HOST_PTR,
                 data.len(),
                 data.as_ptr() as *mut std::ffi::c_void,
             )?
