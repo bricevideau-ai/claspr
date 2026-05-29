@@ -287,20 +287,15 @@ impl Context {
     /// per-device out-of-order queue this context has lazily
     /// instantiated. No-op for slots that are still empty.
     ///
-    /// Sync terminal in `claspr-async` calls this as a defensive
-    /// final drain — covers commands enqueued without being tracked
-    /// in the chain's deps (e.g. a `with_context` closure that
-    /// called `.submit()` and discarded the event). Without it, a
-    /// multi-device chain whose `with_context`-orphaned commands
-    /// land on a secondary queue (`.on_device(&dev_b)`-resolved)
-    /// would let `sync()` return while those commands are still in
-    /// flight — `.finish()` on the chain's primary queue alone
-    /// doesn't reach them.
+    /// **Not called by `claspr-async`'s terminals** — those would
+    /// over-block on other users' work since the OOO queues are
+    /// shared (cached per-device on the Context). Provided here as
+    /// an explicit "drain everything on this context" primitive
+    /// for shutdown / synchronisation points where the caller
+    /// genuinely wants all in-flight commands done before
+    /// proceeding.
     ///
     /// Synchronous: blocks until every cached OOO queue has drained.
-    /// Order across queues is unimportant for correctness — chain-
-    /// tracked events were already waited on; this is purely the
-    /// "catch untracked commands" pass.
     pub fn finish_all_outoforder_queues(&self) -> Result<()> {
         for slot in &self.inner.queues {
             let guard = slot

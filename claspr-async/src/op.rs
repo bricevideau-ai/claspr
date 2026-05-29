@@ -250,16 +250,19 @@ where
             wait_err = Some(claspr::Error::OpenCl(e));
         }
     }
-    // Drain every per-device OOO queue the chain touched — covers
-    // commands enqueued without being tracked in the events list
-    // (e.g. a `with_context` closure that called `.submit()` and
-    // discarded the event). `queue.finish()` on the primary queue
-    // alone misses orphan commands on secondary queues that
-    // `.on_device(&dev_b)` / `transfer_to_device(buf, &dev_b)` may
-    // have populated. The chain-tracked events were already waited
-    // on above; this is purely the defensive untracked-commands
-    // sweep, parallel across queues.
-    let finish_res = context.finish_all_outoforder_queues();
+    // No defensive `finish` on the OOO queues here — the OOO queues
+    // are shared (cached per-device on the Context), so blocking on
+    // *all* their work would also block on other users / other
+    // chains using the same context. The chain's own commands are
+    // already covered: `events` contains the chain's final events,
+    // which transitively gate every upstream chain command via
+    // OpenCL's event semantics. Orphan commands from a
+    // `with_context` closure that called `.submit()` and discarded
+    // the event are the caller's responsibility (see
+    // `with_context`'s rustdoc) — they must either chain those
+    // events back into the chain's deps, or use `.wait()` terminals
+    // inside the closure.
+    //
     // Prefer a stashed host error (from an `and_then_host` worker)
     // over the CL cascade — that's the whole point of the slot. The
     // CL `-N` we'd otherwise surface is just the user-event-set-neg
@@ -270,7 +273,6 @@ where
     if let Some(e) = wait_err {
         return Err(e);
     }
-    finish_res?;
     Ok(out)
 }
 
