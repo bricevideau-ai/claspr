@@ -64,9 +64,10 @@ fn dyn_op_wraps_upload_download() {
 
 #[test]
 fn baseline_kernel_chain_without_dynop() {
-    // Sanity baseline: the exact same chain shape outside DynOp. The
-    // new async and_then_host can't return a value — capture the sum
-    // via Arc<Mutex<_>> instead.
+    // Sanity baseline: the exact same chain shape outside DynOp.
+    // and_then_host's closure returns Result<()> by design (async
+    // submit-vs-completion gap — see module docs); the reduction
+    // value flows out via Arc<Mutex<_>> as usual.
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let sum_cell = Arc::new(Mutex::new(0u32));
@@ -100,8 +101,10 @@ fn dyn_op_wraps_bare_kernel_op() {
 
 #[test]
 fn dyn_op_minimal_kernel_chain() {
-    // Single DynOp wrapping a chain that touches a kernel. The sum
-    // is captured via Arc<Mutex<_>>; the chain's Output is the buffer.
+    // Single DynOp wrapping a chain that touches a kernel. The
+    // chain's Output is the buffer; the sum is captured via
+    // Arc<Mutex<_>> (the canonical side-effect channel for
+    // host-closure-computed values).
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let sum_cell = Arc::new(Mutex::new(0u32));

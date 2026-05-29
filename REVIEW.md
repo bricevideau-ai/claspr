@@ -1,5 +1,32 @@
 # claspr — review of current state
 
+**Update 2026-05-29:** audit pass against the 2026-05-28 review below. Status of every "Real concerns" item:
+
+| # | Item | Status |
+|---|---|---|
+| 1 | Tier 2 error fidelity across async chain boundaries | **Done** — `tests/tier2/tests/error_fidelity.rs` added; error-erasure comment removed from prior tests. Rust error variants now survive the user-event boundary via a per-chain `Mutex<Option<Error>>` slot; see `and_then_host.rs` module docs § "Error model". |
+| 2 | `and_then_host` value-returning variant | **Won't Fix** — the async submit-vs-completion gap forbids it; see `and_then_host.rs` module docs § "Why no value-returning closure?". `Arc<Mutex<Option<T>>>` is the idiomatic shape, not a workaround. Test comments updated to reflect this. |
+| 3 | `MappedSlice` falls out of typed kernel wrappers | **Done** — `tier1/svm.rs` uses typed `kernels.fill_u32(&ctx, [N], buf, ...)` directly; the proc-macro's `KernelSliceArg<T>` widening accepts `DeviceSlice` / `MappedSlice` / `USMSlice` interchangeably. |
+| 4 | fp64 / vector test kernels absent | **Done** — `tier1/fp64.rs` + `tier2/fp64_chain.rs` exercise f64 paths through the runtime + chain. |
+| 5 | No stress tests | **Done** — `tier1/stress_svm.rs` validates the Vec-accumulation pattern at scale. |
+| 6 | README significantly stale | **Done** — current text reflects two-tier API, `Context::any` / `Context::builder`, `MappedSlice` / `USMSlice`, typed `Error` enum, CI on rusticl-on-llvmpipe. |
+| 7a | `cross_device` light coverage | Marginal — 1 → 2 tests. Still thin for the load-bearing case. |
+| 7b | `arc_split` low assertion density | Marginal — 2 → 3 tests. |
+| 7c | `conditional.rs` non-taken branch | **Done** — explicit `panic!("non-taken branch fired …")` in the skipped arm at line 172. |
+| 7d | `MappedSlice` not in `drop_safety.rs` | Acknowledged — coverage exists in `tier1/svm.rs` cross-queue tests; cross-reference added to `drop_safety.rs`. |
+
+**Beyond the REVIEW** (work landed since 2026-05-28):
+
+- **USMSlice tier** — new fine-grain-system SVM primitive (`usm_slice` / `usm_slice_alloc` / `usm_slice!` macro + 7 tests).
+- **HostBuffer removed** — was UB per spec on rusticl (`CL_MEM_ALLOC_HOST_PTR` + persistent map). USMSlice is the spec-correct replacement.
+- **SharedBuffer → MappedSlice rename** — naming family now lines up as `DeviceSlice` / `MappedSlice` / `USMSlice` with the suffix describing host-access mechanism.
+- **Zero-init by default** for every `alloc`; `pub unsafe fn alloc_uninit` as opt-in escape hatch for internal write-everything-first paths. Closes the "kernel reads uninit memory at the SPIR-V level" hole.
+- **`Buffer<T>` polymorphic test** restored to include USMSlice arm.
+
+Items 7a / 7b remain as incremental hardening opportunities.
+
+---
+
 Written from the linux box on 2026-05-28 after a deep read of the public surface (`claspr/src/{buffer,context,device,queue,op,svm,future,image,launch}.rs`, `claspr-async/src/*.rs`), every `tests/tier1/tests/*.rs` and `tests/tier2/tests/*.rs`, and the new examples (`async-pipeline`, `batch-inference`, `two-device`, plus the unchanged `collatz`/`raymarch`/`mandelbrot-kernel`/`sobel-kernel`/`image-pipeline`).
 
 The previous version of this doc was a pre-merge review of `runtime-redesign`. Most of its items have since landed:

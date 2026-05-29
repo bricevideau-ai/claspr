@@ -49,6 +49,36 @@
 //! in-place mutation of the borrowed view, or side-effects (e.g.
 //! `Arc<Mutex<_>>`).
 //!
+//! ## Why no value-returning closure?
+//!
+//! The chain's downstream output type is fixed at *submit time* — the
+//! moment [`execute`](DeviceOperation::execute) returns
+//! `Ok((output, deps))`. The worker thread hasn't run the closure yet;
+//! it might not run for milliseconds. For a closure return value to
+//! flow into a downstream `.and_then(|t| ...)` stage, one of these
+//! would have to give:
+//!
+//! 1. **`Self::Output = Promise<T>`** — downstream closures take the
+//!    output by value (`|buf| kernels.foo(buf)`), so promise-typing
+//!    forces every downstream stage to know how to await it. Wrecks
+//!    the type chain.
+//! 2. **Block the submit thread on the worker** — defeats the entire
+//!    reason this combinator exists. The previous synchronous shape
+//!    (`F: FnOnce(Output) -> Result<U>`, drain upstream events with
+//!    `ev.wait()`, run closure inline) collapsed pipelined device
+//!    work back into "host code with extra type machinery." That is
+//!    what we moved away from.
+//! 3. **Run the closure on the submit thread itself** — same as #2.
+//!
+//! So the closure returning `Result<()>` is **the only shape that
+//! respects the async contract.** Any value the closure computes must
+//! flow out via a side-effect channel readable *after* the chain
+//! terminates — the canonical pattern is `Arc<Mutex<Option<T>>>`
+//! captured by the closure, read by the caller after `.sync()` /
+//! `.run().await`. That is not a workaround; it is the idiomatic
+//! shape, and the only one that survives the submit-vs-completion
+//! gap.
+//!
 //! ## Error model
 //!
 //! Workers stash the original Rust [`Error`] into a per-chain slot on
@@ -112,10 +142,12 @@ where
     /// returns. See module docs for the full sequencing.
     ///
     /// The closure may mutate the view in place; the mutations are
-    /// committed back to the device via the matching unmap (gated
-    /// on the user event). Anything else the closure wants to
-    /// communicate goes through side-effects (`Arc<Mutex<_>>`, etc.)
-    /// — the closure itself returns only a status.
+    /// committed back to the device via the matching unmap (gated on
+    /// the user event). Values the closure computes flow out via a
+    /// side-effect channel (typically `Arc<Mutex<Option<T>>>`
+    /// captured by the closure, read by the caller after `.sync()` /
+    /// `.run().await`). See module docs for why the closure returns
+    /// `Result<()>` and not `Result<U>`.
     ///
     /// Errors from the closure (and panics, and map/unmap failures)
     /// propagate downstream as a negative `cl_event` status.

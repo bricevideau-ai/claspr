@@ -29,10 +29,10 @@ fn and_then_host_sum_between_device_stages() {
     };
 
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    // upload + fill + (host) sum-in-place via mapped view. The new
-    // and_then_host is side-effects-only — the closure mutates / reads
-    // the mapped buffer in place and returns Result<()>. To surface a
-    // reduction value, capture into an Arc<Mutex<_>>.
+    // upload + fill + (host) sum-in-place via mapped view. The
+    // closure returns Result<()> by design (see and_then_host module
+    // docs); a reduction value flows out via the canonical
+    // Arc<Mutex<Option<T>>> side-effect channel captured below.
     let sum_cell = Arc::new(Mutex::new(0u32));
     let cell = Arc::clone(&sum_cell);
     let _final_buf = value(vec![0u32; N])
