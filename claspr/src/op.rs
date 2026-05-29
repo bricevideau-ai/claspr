@@ -253,7 +253,7 @@ impl<'l, A: KernelArgs> LaunchOp<'l, A> {
         // this call safe in practice.
         let event = unsafe { exec.enqueue_nd_range(queue)? };
         // Let arg types that need post-enqueue bookkeeping (e.g.
-        // `SharedBuffer<T>` recording the event for its Drop's
+        // `MappedSlice<T>` recording the event for its Drop's
         // `clEnqueueSVMFree` wait-list) see the completion event.
         // Default impl on `KernelArg` is a no-op, so this is free for
         // every other arg type.

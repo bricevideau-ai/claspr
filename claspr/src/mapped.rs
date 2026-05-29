@@ -1,14 +1,14 @@
-//! Shared Virtual Memory ([`SharedBuffer`]) — OpenCL 2.0+ coarse-grain
+//! Shared Virtual Memory ([`MappedSlice`]) — OpenCL 2.0+ coarse-grain
 //! SVM buffers.
 //!
 //! SVM gives kernel and host the *same pointer* into a single
 //! allocation. claspr exposes coarse-grain SVM today: host access
-//! requires [`map`](SharedBuffer::map) / [`map_mut`](SharedBuffer::map_mut)
+//! requires [`map`](MappedSlice::map) / [`map_mut`](MappedSlice::map_mut)
 //! around the bytes you want to read or write, with the runtime
 //! ensuring the device-side view is coherent at the boundaries.
 //!
 //! Construction is gated on [`crate::SvmLevel`]:
-//! `SharedBuffer::alloc` returns [`crate::Error::SvmNotAvailable`]
+//! `MappedSlice::alloc` returns [`crate::Error::SvmNotAvailable`]
 //! when the device reports [`crate::SvmLevel::None`]. Check
 //! `ctx.svm_capability()` if you want to fall back to a
 //! [`crate::DeviceSlice`] gracefully.
@@ -16,14 +16,14 @@
 //! # Example
 //!
 //! ```ignore
-//! use claspr::{Context, SharedBuffer, SvmLevel};
+//! use claspr::{Context, MappedSlice, SvmLevel};
 //!
 //! let ctx = Context::any()?;
 //! if ctx.svm_capability() == SvmLevel::None {
 //!     return skip("device has no SVM");
 //! }
 //!
-//! let mut buf = SharedBuffer::<u32>::alloc(&ctx, 1024)?;
+//! let mut buf = MappedSlice::<u32>::alloc(&ctx, 1024)?;
 //! {
 //!     let mut view = buf.map_mut(&ctx)?;
 //!     for (i, slot) in view.iter_mut().enumerate() {
@@ -58,7 +58,7 @@ fn cl_to_err(code: cl_int) -> Error {
     Error::OpenCl(opencl3::error_codes::ClError(code))
 }
 
-// ── SharedBuffer ────────────────────────────────────────────────────
+// ── MappedSlice ────────────────────────────────────────────────────
 
 /// A typed Shared Virtual Memory allocation.
 ///
@@ -76,12 +76,12 @@ fn cl_to_err(code: cl_int) -> Error {
 /// queue, with every recorded use as its wait-list. Uses are
 /// recorded automatically:
 ///
-/// - **Kernel launches** that take `SharedBuffer<T>` as a `KernelArg`:
+/// - **Kernel launches** that take `MappedSlice<T>` as a `KernelArg`:
 ///   [`LaunchOp::into_event`][lo] calls [`KernelArg::register_completion`][ka]
 ///   after enqueue, which retains the completion event and pushes it
 ///   onto this buffer's in-flight-use list.
-/// - **Host-view release** path: `SharedBufferHostView::Drop` /
-///   `ReleaseSharedBufferOp` push the unmap event via [`register_use`](Self::register_use).
+/// - **Host-view release** path: `MappedSliceHostView::Drop` /
+///   `ReleaseMappedSliceOp` push the unmap event via [`register_use`](Self::register_use).
 ///
 /// The accumulation is correct under out-of-order scheduling: every
 /// in-flight use is in the wait-list, not just the most recently
@@ -97,7 +97,7 @@ fn cl_to_err(code: cl_int) -> Error {
 ///
 /// [lo]: crate::LaunchOp
 /// [ka]: crate::KernelArg::register_completion
-pub struct SharedBuffer<T> {
+pub struct MappedSlice<T> {
     ptr: *mut T,
     len: usize,
     ctx: Context,
@@ -110,11 +110,11 @@ pub struct SharedBuffer<T> {
     /// recent enqueue" ≠ "last to finish" — every in-flight use must
     /// be in the wait-list, not just the most recent one. Auto-fed
     /// by [`KernelArg::register_completion`] for kernel launches
-    /// that take `SharedBuffer<T>` as an arg, and by the host-view
+    /// that take `MappedSlice<T>` as an arg, and by the host-view
     /// release path's unmap event.
     ///
     /// Mutex-protected because the buffer is commonly shared via
-    /// `Arc<SharedBuffer<T>>` (e.g. through `.arc()` in claspr-async
+    /// `Arc<MappedSlice<T>>` (e.g. through `.arc()` in claspr-async
     /// chains) and multiple threads may register concurrently.
     last_use: Mutex<Vec<Arc<Event>>>,
 }
@@ -123,10 +123,10 @@ pub struct SharedBuffer<T> {
 // host-accessible memory; OpenCL guarantees thread-safety for API
 // calls on it (CL §3.4.1). Aliasing is governed by the map guards,
 // which use the borrow checker to enforce exclusivity for `map_mut`.
-unsafe impl<T: Send> Send for SharedBuffer<T> {}
-unsafe impl<T: Sync> Sync for SharedBuffer<T> {}
+unsafe impl<T: Send> Send for MappedSlice<T> {}
+unsafe impl<T: Sync> Sync for MappedSlice<T> {}
 
-impl<T> SharedBuffer<T> {
+impl<T> MappedSlice<T> {
     /// Allocate `len` elements of T in SVM memory, uninitialised.
     ///
     /// Returns [`Error::SvmNotAvailable`] if the context's device
@@ -149,7 +149,7 @@ impl<T> SharedBuffer<T> {
             )
             .map_err(cl_to_err)?
         };
-        Ok(SharedBuffer {
+        Ok(MappedSlice {
             ptr: raw.cast::<T>(),
             len,
             ctx: ctx.clone(),
@@ -165,7 +165,7 @@ impl<T> SharedBuffer<T> {
     ///
     /// Most users never call this directly: [`KernelArg::register_completion`]
     /// invokes it automatically for every kernel launch whose args
-    /// include a `SharedBuffer<T>`. The host-view release path also
+    /// include a `MappedSlice<T>`. The host-view release path also
     /// records its unmap event. The public entry-point is exposed so
     /// hand-rolled SVM use (raw `ctx.launch`, manual `clSetKernelArgSVMPointer`)
     /// can keep Drop safe.
@@ -181,16 +181,16 @@ impl<T> SharedBuffer<T> {
     ///
     /// The map is blocking — `clEnqueueSVMMap` with `CL_TRUE` for
     /// the blocking flag and `CL_MAP_READ`.
-    pub fn map<'a, L: Launcher>(&'a self, launcher: &L) -> Result<SharedReadGuard<'a, T>> {
-        SharedReadGuard::new(self, launcher)
+    pub fn map<'a, L: Launcher>(&'a self, launcher: &L) -> Result<MappedReadGuard<'a, T>> {
+        MappedReadGuard::new(self, launcher)
     }
 
     /// Map this buffer for host read+write access. Returns a RAII
     /// guard that derefs to `&mut [T]` and unmaps on Drop. The
     /// `&mut self` receiver gives the borrow checker the
     /// exclusivity guarantee needed for `DerefMut`.
-    pub fn map_mut<'a, L: Launcher>(&'a mut self, launcher: &L) -> Result<SharedWriteGuard<'a, T>> {
-        SharedWriteGuard::new(self, launcher)
+    pub fn map_mut<'a, L: Launcher>(&'a mut self, launcher: &L) -> Result<MappedWriteGuard<'a, T>> {
+        MappedWriteGuard::new(self, launcher)
     }
 
     /// Raw SVM pointer for direct use (e.g. passing to a kernel arg
@@ -232,7 +232,7 @@ impl<T> SharedBuffer<T> {
     /// copy.
     pub fn copy_to<'a, L: Launcher + ?Sized>(
         &'a self,
-        dst: &'a SharedBuffer<T>,
+        dst: &'a MappedSlice<T>,
         launcher: &'a L,
     ) -> SvmCopyOp<'a, T> {
         SvmCopyOp {
@@ -248,16 +248,16 @@ impl<T> SharedBuffer<T> {
 /// Metadata-only `Debug` — does not read through the SVM pointer
 /// (would race with in-flight kernel work and require holding a map
 /// guard) and doesn't require `T: Debug`.
-impl<T> fmt::Debug for SharedBuffer<T> {
+impl<T> fmt::Debug for MappedSlice<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SharedBuffer")
+        f.debug_struct("MappedSlice")
             .field("len", &self.len)
             .field("element_size", &std::mem::size_of::<T>())
             .finish_non_exhaustive()
     }
 }
 
-impl<T> Buffer<T> for SharedBuffer<T> {
+impl<T> Buffer<T> for MappedSlice<T> {
     fn len(&self) -> usize {
         self.len
     }
@@ -270,15 +270,15 @@ impl<T> Buffer<T> for SharedBuffer<T> {
 // ── SvmFillOp / SvmCopyOp builders ─────────────────────────────────
 //
 // Same terminal / modifier shape as `DeviceSlice`'s FillOp / CopyOp.
-// Take `&SharedBuffer<T>` rather than a raw `cl_mem` reference because
+// Take `&MappedSlice<T>` rather than a raw `cl_mem` reference because
 // the terminal needs to call `register_use` on the buffer(s) so Drop's
 // `clEnqueueSVMFree` waits for the fill/copy event.
 
 /// Lazy builder for `clEnqueueSVMMemFill`. Returned by
-/// [`SharedBuffer::fill`].
+/// [`MappedSlice::fill`].
 pub struct SvmFillOp<'a, T: Copy> {
     queue: &'a CommandQueue,
-    owner: &'a SharedBuffer<T>,
+    owner: &'a MappedSlice<T>,
     pattern: T,
     deps: Vec<cl_event>,
     profile_cb: Option<ProfileCb>,
@@ -351,11 +351,11 @@ impl<'a, T: Copy> SvmFillOp<'a, T> {
 }
 
 /// Lazy builder for `clEnqueueSVMMemcpy`. Returned by
-/// [`SharedBuffer::copy_to`].
+/// [`MappedSlice::copy_to`].
 pub struct SvmCopyOp<'a, T> {
     queue: &'a CommandQueue,
-    src: &'a SharedBuffer<T>,
-    dst: &'a SharedBuffer<T>,
+    src: &'a MappedSlice<T>,
+    dst: &'a MappedSlice<T>,
     deps: Vec<cl_event>,
     profile_cb: Option<ProfileCb>,
 }
@@ -436,7 +436,7 @@ impl<'a, T> SvmCopyOp<'a, T> {
     }
 }
 
-impl<T> Drop for SharedBuffer<T> {
+impl<T> Drop for MappedSlice<T> {
     fn drop(&mut self) {
         // Use `clEnqueueSVMFree` on the context's default queue, NOT
         // the immediate `clSVMFree`. Per the CL spec, `clSVMFree` does
@@ -472,7 +472,7 @@ impl<T> Drop for SharedBuffer<T> {
     }
 }
 
-impl<T> KernelArg for SharedBuffer<T> {
+impl<T> KernelArg for MappedSlice<T> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         // Slice decomposition matches rust-gpu's
         // `#[spirv(cross_workgroup)] &mut [T]` lowering: SVM
@@ -489,7 +489,7 @@ impl<T> KernelArg for SharedBuffer<T> {
 
     /// Retain the kernel's completion event and push it onto our
     /// `last_use` list, so Drop's `clEnqueueSVMFree` queue-orders
-    /// after this launch. Without this, dropping a SharedBuffer
+    /// after this launch. Without this, dropping a MappedSlice
     /// while a kernel using its SVM pointer is still in flight
     /// would be UB.
     fn register_completion(&self, event: &Event) {
@@ -511,13 +511,13 @@ impl<T> KernelArg for SharedBuffer<T> {
 
 /// RAII guard for a SVM read map. Drop issues `clEnqueueSVMUnmap`
 /// and the inner `RetainedQueue` releases the queue handle.
-pub struct SharedReadGuard<'a, T> {
-    buf: &'a SharedBuffer<T>,
+pub struct MappedReadGuard<'a, T> {
+    buf: &'a MappedSlice<T>,
     queue: crate::util::RetainedQueue,
 }
 
-impl<'a, T> SharedReadGuard<'a, T> {
-    fn new<L: Launcher>(buf: &'a SharedBuffer<T>, launcher: &L) -> Result<Self> {
+impl<'a, T> MappedReadGuard<'a, T> {
+    fn new<L: Launcher>(buf: &'a MappedSlice<T>, launcher: &L) -> Result<Self> {
         let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
         // SAFETY: blocking map for read; queue is alive (RetainedQueue).
         let evt = unsafe {
@@ -533,11 +533,11 @@ impl<'a, T> SharedReadGuard<'a, T> {
             .map_err(cl_to_err)?
         };
         unsafe { release_event(evt).map_err(cl_to_err)? };
-        Ok(SharedReadGuard { buf, queue })
+        Ok(MappedReadGuard { buf, queue })
     }
 }
 
-impl<T> Deref for SharedReadGuard<'_, T> {
+impl<T> Deref for MappedReadGuard<'_, T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         // SAFETY: the SVM pointer is valid + mapped for read for
@@ -546,7 +546,7 @@ impl<T> Deref for SharedReadGuard<'_, T> {
     }
 }
 
-impl<T> Drop for SharedReadGuard<'_, T> {
+impl<T> Drop for MappedReadGuard<'_, T> {
     fn drop(&mut self) {
         // SAFETY: ptr was mapped in `new`; unmap exactly once now.
         // The `queue: RetainedQueue` field drops after this body
@@ -563,13 +563,13 @@ impl<T> Drop for SharedReadGuard<'_, T> {
 
 /// RAII guard for a SVM write map. Drop issues `clEnqueueSVMUnmap`
 /// and the inner `RetainedQueue` releases the queue handle.
-pub struct SharedWriteGuard<'a, T> {
-    buf: &'a mut SharedBuffer<T>,
+pub struct MappedWriteGuard<'a, T> {
+    buf: &'a mut MappedSlice<T>,
     queue: crate::util::RetainedQueue,
 }
 
-impl<'a, T> SharedWriteGuard<'a, T> {
-    fn new<L: Launcher>(buf: &'a mut SharedBuffer<T>, launcher: &L) -> Result<Self> {
+impl<'a, T> MappedWriteGuard<'a, T> {
+    fn new<L: Launcher>(buf: &'a mut MappedSlice<T>, launcher: &L) -> Result<Self> {
         let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
         let ptr = buf.ptr;
         let len = buf.len;
@@ -587,19 +587,19 @@ impl<'a, T> SharedWriteGuard<'a, T> {
             .map_err(cl_to_err)?
         };
         unsafe { release_event(evt).map_err(cl_to_err)? };
-        Ok(SharedWriteGuard { buf, queue })
+        Ok(MappedWriteGuard { buf, queue })
     }
 }
 
-impl<T> Deref for SharedWriteGuard<'_, T> {
+impl<T> Deref for MappedWriteGuard<'_, T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
-        // SAFETY: see SharedReadGuard.
+        // SAFETY: see MappedReadGuard.
         unsafe { crate::util::mapped_slice(self.buf.ptr, self.buf.len) }
     }
 }
 
-impl<T> DerefMut for SharedWriteGuard<'_, T> {
+impl<T> DerefMut for MappedWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut [T] {
         // SAFETY: `&mut self` upgrades to a unique mutable slice;
         // mapped read+write for the guard's lifetime.
@@ -607,7 +607,7 @@ impl<T> DerefMut for SharedWriteGuard<'_, T> {
     }
 }
 
-impl<T> Drop for SharedWriteGuard<'_, T> {
+impl<T> Drop for MappedWriteGuard<'_, T> {
     fn drop(&mut self) {
         let unmap =
             unsafe { enqueue_svm_unmap(self.queue.raw(), self.buf.ptr.cast(), 0, ptr::null()) };

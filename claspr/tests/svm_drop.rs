@@ -1,6 +1,6 @@
-//! Integration tests for `SharedBuffer::Drop` correctness.
+//! Integration tests for `MappedSlice::Drop` correctness.
 //!
-//! Validates the Phase 0 fix: `SharedBuffer::Drop` now uses
+//! Validates the Phase 0 fix: `MappedSlice::Drop` now uses
 //! `clEnqueueSVMFree` (queue-ordered) instead of the immediate
 //! `clSVMFree` (UB if commands in flight per the CL spec).
 //!
@@ -8,7 +8,7 @@
 //! host has no OpenCL device or no SVM support, so CI without GPUs
 //! still passes.
 
-use claspr::{Context, SharedBuffer, SvmLevel};
+use claspr::{Context, MappedSlice, SvmLevel};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -30,7 +30,7 @@ fn alloc_and_drop_basic() -> Result<()> {
         return Ok(());
     };
 
-    let buf = SharedBuffer::<u32>::alloc(&ctx, 1024)?;
+    let buf = MappedSlice::<u32>::alloc(&ctx, 1024)?;
     drop(buf);
 
     // The drop enqueues an SVM free. The context's default queue
@@ -50,7 +50,7 @@ fn alloc_drop_many_in_sequence() -> Result<()> {
     };
 
     for _ in 0..32 {
-        let buf = SharedBuffer::<u32>::alloc(&ctx, 256)?;
+        let buf = MappedSlice::<u32>::alloc(&ctx, 256)?;
         drop(buf);
     }
 
@@ -70,7 +70,7 @@ fn alloc_drop_with_map_in_between() -> Result<()> {
     };
 
     {
-        let mut buf = SharedBuffer::<u32>::alloc(&ctx, 16)?;
+        let mut buf = MappedSlice::<u32>::alloc(&ctx, 16)?;
         {
             let mut guard = buf.map_mut(&ctx)?;
             for (i, x) in guard.iter_mut().enumerate() {

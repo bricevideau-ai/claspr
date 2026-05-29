@@ -11,10 +11,10 @@ Bugs in current code that should be fixed regardless of the rewrite.
 
 | Item | What | Where |
 |---|---|---|
-| SVM Drop UB | `SharedBuffer::Drop` calls direct `clSVMFree` (UB if commands in flight) — switch to `clEnqueueSVMFree` on source queue | `claspr/src/svm.rs` |
+| SVM Drop UB | `MappedSlice::Drop` calls direct `clSVMFree` (UB if commands in flight) — switch to `clEnqueueSVMFree` on source queue | `claspr/src/svm.rs` |
 | Audit cl_mem Drop | Confirm `DeviceSlice` / `HostBuffer` Drop go through `clReleaseMemObject` (lazy / refcount — already safe) | `claspr/src/buffer.rs` |
 
-**Test:** add a test that drops a `SharedBuffer` while a kernel is
+**Test:** add a test that drops a `MappedSlice` while a kernel is
 "using" it (enqueue a kernel, drop without explicit sync, run
 `q.finish()`, verify no UB via `cargo test`).
 
@@ -155,14 +155,14 @@ claspr-async/
 3. `arc.rs`: `Arc<T>` wrapping + `ArcSplit::split::<N>()`
 4. `future.rs`: `clSetEventCallback`-driven async — **reuses the Tier 1 callback wrapper from Phase 1** (FFI thunk + `catch_unwind`); ties it to the chain's Future poll machinery (atomic flag + `AtomicWaker`)
 5. `and_then_host.rs`: trivial (just `and_then` returning a value)
-6. `host_view.rs`: `HostAccessible<T>` trait + impls for `DeviceSlice<T>` (d2h + h2d), `HostBuffer<T>` (no-op), `SharedBuffer<T>` (map + unmap)
+6. `host_view.rs`: `HostAccessible<T>` trait + impls for `DeviceSlice<T>` (d2h + h2d), `HostBuffer<T>` (no-op), `MappedSlice<T>` (map + unmap)
 7. `profile.rs`: combinator-shape wrapper over the Tier 1 `.profiled()` for use inside lazy chains (where the underlying Event isn't user-visible); shares the callback wrapper
 
 **Critical CL integration points:**
 
 - `clSetEventCallback(event, CL_COMPLETE, thunk, user_data)` — Future poll machinery + profiling callbacks
 - `clEnqueueMarkerWithWaitList(queue, n_wait, wait_list, &marker)` — `FanOut`'s implicit marker join
-- `clEnqueueSVMMap` / `clEnqueueSVMUnmap` — `HostAccessible` for `SharedBuffer`
+- `clEnqueueSVMMap` / `clEnqueueSVMUnmap` — `HostAccessible` for `MappedSlice`
 - `clEnqueueReadBuffer` / `clEnqueueWriteBuffer` (CL_FALSE for async) — `HostAccessible` for `DeviceSlice`
 
 ---
@@ -257,7 +257,7 @@ tests/
 │   ├── basic.rs            # h2d → kernel → d2h
 │   ├── cross_queue.rs      # .after() between queues
 │   ├── multi_device.rs     # gated on >= 2 devices
-│   ├── svm.rs              # SharedBuffer + map/unmap correctness
+│   ├── svm.rs              # MappedSlice + map/unmap correctness
 │   ├── drop_safety.rs      # "drop while in flight" tests
 │   └── profile.rs          # .profiled(|info| ...) — callback fires, timestamps valid
 └── tier2/

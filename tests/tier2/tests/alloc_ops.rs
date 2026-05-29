@@ -2,7 +2,7 @@
 //!
 //! Two ergonomic primitives added together:
 //!
-//! - `device_slice_alloc` / `shared_buffer_alloc`:
+//! - `device_slice_alloc` / `mapped_slice_alloc`:
 //!   lazy `DeviceOperation` versions of the synchronous constructors,
 //!   making bundle-hoisted-alloc and `and_then_with_context`-of-an-op
 //!   chains express cleanly.
@@ -15,9 +15,9 @@
 //! shape (hoisted bundle + chained `and_then_with_context`) work
 //! end-to-end on a real device.
 
-use claspr::{Buffer, Context, Error, SharedBuffer, SvmLevel};
+use claspr::{Buffer, Context, Error, MappedSlice, SvmLevel};
 use claspr_async::{
-    DeviceOperation, bundle, device_slice_alloc, download, shared_buffer_alloc, upload, value,
+    DeviceOperation, bundle, device_slice_alloc, download, mapped_slice_alloc, upload, value,
 };
 use claspr_test_kernels::kernels;
 
@@ -51,11 +51,11 @@ fn device_slice_alloc_produces_buffer_usable_in_kernel() {
 }
 
 #[test]
-fn shared_buffer_alloc_succeeds_or_surfaces_svm_not_available() {
+fn mapped_slice_alloc_succeeds_or_surfaces_svm_not_available() {
     let Some(ctx) = ctx() else { return };
-    let result = shared_buffer_alloc::<u32>(N).sync(&ctx);
+    let result = mapped_slice_alloc::<u32>(N).sync(&ctx);
     if ctx.svm_capability() == SvmLevel::None {
-        // The synchronous SharedBuffer::alloc gates on SVM; the
+        // The synchronous MappedSlice::alloc gates on SVM; the
         // lazy op should surface the same Err at execute time.
         let err = result.expect_err("expected SvmNotAvailable");
         assert!(
@@ -63,7 +63,7 @@ fn shared_buffer_alloc_succeeds_or_surfaces_svm_not_available() {
             "expected SvmNotAvailable on no-SVM device, got {err:?}",
         );
     } else {
-        let buf: SharedBuffer<u32> = result.expect("alloc");
+        let buf: MappedSlice<u32> = result.expect("alloc");
         assert_eq!(buf.len(), N);
     }
 }

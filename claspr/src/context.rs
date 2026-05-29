@@ -354,7 +354,7 @@ impl Context {
     // ── SVM capability query ───────────────────────────────────────
 
     /// What level of Shared Virtual Memory this context's device
-    /// supports — useful for gating [`crate::svm::SharedBuffer`]
+    /// supports — useful for gating [`crate::mapped::MappedSlice`]
     /// construction or picking between SVM and host-mapped tiers.
     ///
     /// Returns the highest applicable level. A device may report
@@ -512,8 +512,8 @@ impl ContextBuilder {
 /// query [`has_atomics`](SvmLevel::has_atomics) separately for the
 /// orthogonal atomics extension.
 ///
-/// Used to gate [`crate::svm::SharedBuffer`] construction —
-/// `SharedBuffer::alloc` returns [`crate::Error::SvmNotAvailable`]
+/// Used to gate [`crate::mapped::MappedSlice`] construction —
+/// `MappedSlice::alloc` returns [`crate::Error::SvmNotAvailable`]
 /// when the device reports [`SvmLevel::None`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum SvmLevel {

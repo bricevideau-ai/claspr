@@ -55,9 +55,9 @@ pub mod transfer_to_device;
 pub mod usm;
 
 pub use alloc::{
-    DeviceSliceAlloc, DeviceSliceFilled, SharedBufferAlloc, SharedBufferFilled, SharedBufferUpload,
-    device_slice_alloc, device_slice_filled, shared_buffer_alloc, shared_buffer_filled,
-    shared_buffer_upload,
+    DeviceSliceAlloc, DeviceSliceFilled, MappedSliceAlloc, MappedSliceFilled, MappedSliceUpload,
+    device_slice_alloc, device_slice_filled, mapped_slice_alloc, mapped_slice_filled,
+    mapped_slice_upload,
 };
 pub use and_then_host::{AndThenHost, AndThenHostWithContext, DeviceOperationHostExt};
 pub use arc::ArcSplit;
@@ -70,8 +70,8 @@ pub use exec_ctx::ExecutionContext;
 pub use fan_out::{FanOut, FanOutExt, fan_out};
 pub use future::ChainFuture;
 pub use host_view::{
-    AcquireDeviceSliceOp, AcquireSharedBufferOp, DeviceSliceHostView, HostAccessibleExt,
-    ReleaseDeviceSliceOp, ReleaseSharedBufferOp, SharedBufferHostView,
+    AcquireDeviceSliceOp, AcquireMappedSliceOp, DeviceSliceHostView, HostAccessibleExt,
+    MappedSliceHostView, ReleaseDeviceSliceOp, ReleaseMappedSliceOp,
 };
 pub use mappable::{DeviceSliceMapHandle, Mappable};
 pub use on_device::OnDevice;
@@ -119,15 +119,15 @@ macro_rules! device_slice {
     };
 }
 
-/// `vec!`-shaped sugar for producing a [`SharedBuffer<T>`] op — SVM
+/// `vec!`-shaped sugar for producing a [`MappedSlice<T>`] op — SVM
 /// analog of [`device_slice!`](crate::device_slice!).
 ///
 /// Two arms mirror [`vec!`](std::vec):
 ///
-/// - `shared_buffer![value; count]` — alloc + `clEnqueueSVMMemFill`.
-///   Expands to [`shared_buffer_filled(value, count)`](crate::shared_buffer_filled).
-/// - `shared_buffer![a, b, c]` — alloc + `clEnqueueSVMMemcpy` from a
-///   host literal. Expands to [`shared_buffer_upload(vec![a, b, c])`](crate::shared_buffer_upload).
+/// - `mapped_slice![value; count]` — alloc + `clEnqueueSVMMemFill`.
+///   Expands to [`mapped_slice_filled(value, count)`](crate::mapped_slice_filled).
+/// - `mapped_slice![a, b, c]` — alloc + `clEnqueueSVMMemcpy` from a
+///   host literal. Expands to [`mapped_slice_upload(vec![a, b, c])`](crate::mapped_slice_upload).
 ///
 /// Both arms gate on SVM availability and surface
 /// [`Error::SvmNotAvailable`](claspr::Error::SvmNotAvailable) at
@@ -135,21 +135,17 @@ macro_rules! device_slice {
 ///
 /// ```ignore
 /// // SVM alloc + on-device fill with 0u32.
-/// let buf_op = shared_buffer![0u32; N];
+/// let buf_op = mapped_slice![0u32; N];
 ///
 /// // SVM alloc + SVM memcpy from a host literal.
-/// let buf_op = shared_buffer![1u32, 2, 3, 4];
+/// let buf_op = mapped_slice![1u32, 2, 3, 4];
 /// ```
 #[macro_export]
-macro_rules! shared_buffer {
+macro_rules! mapped_slice {
     [$value:expr; $count:expr] => {
-        $crate::shared_buffer_filled($value, $count)
+        $crate::mapped_slice_filled($value, $count)
     };
     [$($v:expr),* $(,)?] => {
-        $crate::shared_buffer_upload(::std::vec![$($v),*])
+        $crate::mapped_slice_upload(::std::vec![$($v),*])
     };
 }
-
-// `host_buffer!` macro removed 2026-05-29 when HostBuffer was
-// deleted (see commit log). Use `device_slice!` or `shared_buffer!`
-// instead; for fine-grain-system SVM use `usm_slice(vec)`.

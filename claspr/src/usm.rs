@@ -15,12 +15,12 @@
 //! Shared-USM backend without renaming. At the host-facing level
 //! both look the same: a host pointer the kernel just reads.
 //!
-//! # Compared to [`crate::DeviceSlice`] and [`crate::SharedBuffer`]
+//! # Compared to [`crate::DeviceSlice`] and [`crate::MappedSlice`]
 //!
 //! | type | host access | kernel access | needs |
 //! |------|-------------|---------------|-------|
 //! | [`DeviceSlice<T>`](crate::DeviceSlice) | via `upload` / `download` | direct (cl_mem arg) | OpenCL 1.0+ |
-//! | [`SharedBuffer<T>`](crate::SharedBuffer) | via `.map()` / `.map_mut()` guard | direct (SVM ptr arg) | SVM coarse-grain |
+//! | [`MappedSlice<T>`](crate::MappedSlice) | via `.map()` / `.map_mut()` guard | direct (SVM ptr arg) | SVM coarse-grain |
 //! | [`USMSlice<T>`] | direct (`Deref<Target=[T]>` / `DerefMut`) | direct (SVM ptr arg) | SVM fine-grain system |
 //!
 //! `USMSlice` is the only one of the three where host code can read
@@ -57,7 +57,7 @@ use std::sync::{Arc, Mutex};
 /// recorded via [`register_use`](Self::register_use) before letting
 /// the Vec drop. The kernel may still be reading from the Vec's
 /// bytes; without the wait, freeing the host allocation would race
-/// the kernel. Unlike `SharedBuffer`'s `clEnqueueSVMFree` (which can
+/// the kernel. Unlike `MappedSlice`'s `clEnqueueSVMFree` (which can
 /// queue-order behind in-flight events), the host `Vec` drop is
 /// synchronous — so the wait must be too.
 pub struct USMSlice<T> {
@@ -118,7 +118,7 @@ impl<T> USMSlice<T> {
     }
 
     /// Raw SVM pointer (the wrapped Vec's allocation). Same escape
-    /// hatch as [`SharedBuffer::ptr`](crate::SharedBuffer::ptr).
+    /// hatch as [`MappedSlice::ptr`](crate::MappedSlice::ptr).
     pub fn ptr(&self) -> *mut T {
         self.data.as_ptr() as *mut T
     }
@@ -160,7 +160,7 @@ impl<T> fmt::Debug for USMSlice<T> {
 
 impl<T> KernelArg for USMSlice<T> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
-        // Same slice-decomposition as SharedBuffer: SVM pointer
+        // Same slice-decomposition as MappedSlice: SVM pointer
         // first (via clSetKernelArgSVMPointer), then length as a
         // regular scalar arg.
         let len: usize = self.data.len();
@@ -196,7 +196,7 @@ impl<T> KernelArg for USMSlice<T> {
 impl<T> Drop for USMSlice<T> {
     fn drop(&mut self) {
         // Block host-side on every in-flight event before the Vec
-        // drops. Unlike SharedBuffer (where clEnqueueSVMFree can
+        // drops. Unlike MappedSlice (where clEnqueueSVMFree can
         // queue-order behind the in-flight events) we have no
         // OpenCL command to enqueue — Rust's Vec free runs
         // immediately and unconditionally on the host. The only way

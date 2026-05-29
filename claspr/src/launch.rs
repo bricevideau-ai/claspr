@@ -57,7 +57,7 @@ pub trait KernelArg {
     /// Called by `LaunchOp::into_event` *after* the enqueue returns,
     /// once per arg, with the kernel's completion event. Default
     /// no-op; argument types that need to track in-flight use of
-    /// their underlying resource (today: [`crate::SharedBuffer`],
+    /// their underlying resource (today: [`crate::MappedSlice`],
     /// whose Drop needs the wait-list for `clEnqueueSVMFree`)
     /// override this to retain the event and store it on the arg.
     ///
@@ -104,7 +104,7 @@ mod kernel_slice_arg_sealed {
 ///
 /// - [`crate::DeviceSlice<T>`] — `clCreateBuffer`-backed device
 ///   memory, the default.
-/// - [`crate::SharedBuffer<T>`] — coarse-grain SVM, when the device
+/// - [`crate::MappedSlice<T>`] — coarse-grain SVM, when the device
 ///   supports it.
 /// - [`crate::USMSlice<T>`] — fine-grain-system SVM wrapping a host
 ///   `Vec<T>`, when the device supports it.
@@ -127,8 +127,8 @@ impl<T: Send + 'static> KernelSliceArg<T> for DeviceSlice<T> {
     }
 }
 
-impl<T: Send + 'static> kernel_slice_arg_sealed::Sealed for crate::SharedBuffer<T> {}
-impl<T: Send + 'static> KernelSliceArg<T> for crate::SharedBuffer<T> {
+impl<T: Send + 'static> kernel_slice_arg_sealed::Sealed for crate::MappedSlice<T> {}
+impl<T: Send + 'static> KernelSliceArg<T> for crate::MappedSlice<T> {
     fn element_count(&self) -> usize {
         crate::Buffer::len(self)
     }
@@ -301,7 +301,7 @@ pub trait KernelArgs {
 
     /// Call [`KernelArg::register_completion`] on every element with
     /// the just-enqueued completion `event`. `LaunchOp::into_event`
-    /// invokes this after enqueue so args like `SharedBuffer<T>` can
+    /// invokes this after enqueue so args like `MappedSlice<T>` can
     /// record the event for their Drop's `clEnqueueSVMFree` wait-list.
     fn register_all(&self, event: &::opencl3::event::Event);
 }

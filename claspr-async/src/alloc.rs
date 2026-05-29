@@ -1,8 +1,8 @@
 //! Lazy buffer allocs as [`DeviceOperation`]s — `device_slice_alloc`
-//! and `shared_buffer_alloc`.
+//! and `mapped_slice_alloc`.
 //!
 //! Where the Tier 1 constructors [`DeviceSlice::alloc`] /
-//! [`SharedBuffer::alloc`] are synchronous
+//! [`MappedSlice::alloc`] are synchronous
 //! fallible host calls that need a `Context` (or `Launcher`) in scope,
 //! these defer the alloc until execute time. Two ergonomic wins:
 //!
@@ -42,12 +42,12 @@
 //! stages still see whatever event chain led into this point.
 //!
 //! [`DeviceSlice::alloc`]: claspr::DeviceSlice::alloc
-//! [`SharedBuffer::alloc`]: claspr::SharedBuffer::alloc
+//! [`MappedSlice::alloc`]: claspr::MappedSlice::alloc
 
 use crate::exec_ctx::ExecutionContext;
 use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
 use crate::transfer::UploadSource;
-use claspr::{DeviceSlice, Launcher, Result, SharedBuffer, register_drop_callback};
+use claspr::{DeviceSlice, Launcher, MappedSlice, Result, register_drop_callback};
 use opencl3::event::{Event, retain_event};
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -131,43 +131,40 @@ where
     }
 }
 
-// HostBuffer Tier 2 (alloc / filled / upload) removed 2026-05-29
-// when HostBuffer itself was deleted — see commit log.
+// ── MappedSlice fill (alloc + clEnqueueSVMMemFill) ────────────────
 
-// ── SharedBuffer fill (alloc + clEnqueueSVMMemFill) ────────────────
-
-/// Lazy alloc + fill for SVM — produces a [`SharedBuffer<T>`] of
+/// Lazy alloc + fill for SVM — produces a [`MappedSlice<T>`] of
 /// `len` elements all set to `value`, via `clEnqueueSVMMemFill`
 /// (no host allocation, no host→device transfer). Built by
-/// [`shared_buffer_filled`]. SVM analog of [`DeviceSliceFilled`].
-pub struct SharedBufferFilled<T: Copy> {
+/// [`mapped_slice_filled`]. SVM analog of [`DeviceSliceFilled`].
+pub struct MappedSliceFilled<T: Copy> {
     value: T,
     len: usize,
 }
 
-/// Allocate a [`SharedBuffer<T>`] of `len` elements all set to
+/// Allocate a [`MappedSlice<T>`] of `len` elements all set to
 /// `value`. Argument order mirrors [`vec!`](std::vec)'s
 /// `[value; count]` shape — same as
 /// [`device_slice_filled`](crate::device_slice_filled), just SVM.
 ///
 /// Surfaces [`Error::SvmNotAvailable`](claspr::Error::SvmNotAvailable)
 /// at execute time on devices without SVM (same gate as
-/// [`SharedBuffer::alloc`]).
-pub fn shared_buffer_filled<T>(value: T, len: usize) -> SharedBufferFilled<T>
+/// [`MappedSlice::alloc`]).
+pub fn mapped_slice_filled<T>(value: T, len: usize) -> MappedSliceFilled<T>
 where
     T: Copy + Send + 'static,
 {
-    SharedBufferFilled { value, len }
+    MappedSliceFilled { value, len }
 }
 
-impl<T> DeviceOperation for SharedBufferFilled<T>
+impl<T> DeviceOperation for MappedSliceFilled<T>
 where
     T: Copy + Send + 'static,
 {
-    type Output = SharedBuffer<T>;
+    type Output = MappedSlice<T>;
 
-    fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(SharedBuffer<T>, Deps)> {
-        let buf = SharedBuffer::<T>::alloc(ec.context(), self.len)?;
+    fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(MappedSlice<T>, Deps)> {
+        let buf = MappedSlice::<T>::alloc(ec.context(), self.len)?;
         let event = buf
             .fill(ec, self.value)
             .after_all(deps_as_events(&deps))
@@ -176,47 +173,47 @@ where
     }
 }
 
-// ── SharedBuffer upload (alloc + clEnqueueSVMMemcpy from host) ─────
+// ── MappedSlice upload (alloc + clEnqueueSVMMemcpy from host) ─────
 
 /// Lazy alloc + memcpy from a host source into a fresh
-/// [`SharedBuffer<T>`]. SVM analog of [`crate::upload`] — wraps
+/// [`MappedSlice<T>`]. SVM analog of [`crate::upload`] — wraps
 /// `clEnqueueSVMMemcpy` instead of `clEnqueueWriteBuffer`. The host
 /// source is kept alive by a `clSetEventCallback(CL_COMPLETE)` drop
 /// holder until the copy finishes.
-pub struct SharedBufferUpload<T> {
+pub struct MappedSliceUpload<T> {
     source: Option<UploadSource<T>>,
 }
 
-/// Allocate a [`SharedBuffer<T>`] of `source.len()` elements and
+/// Allocate a [`MappedSlice<T>`] of `source.len()` elements and
 /// memcpy `source` into it via `clEnqueueSVMMemcpy`. Mirrors
 /// [`upload`](crate::upload) on the SVM side.
 ///
 /// `T: Copy` because the memcpy is bytewise — types with non-trivial
 /// Drop or owned heap data would alias on copy. Same constraint as
-/// [`shared_buffer_filled`].
-pub fn shared_buffer_upload<T, S>(source: S) -> SharedBufferUpload<T>
+/// [`mapped_slice_filled`].
+pub fn mapped_slice_upload<T, S>(source: S) -> MappedSliceUpload<T>
 where
     T: Copy + Send + Sync + 'static,
     S: Into<UploadSource<T>>,
 {
-    SharedBufferUpload {
+    MappedSliceUpload {
         source: Some(source.into()),
     }
 }
 
-impl<T> DeviceOperation for SharedBufferUpload<T>
+impl<T> DeviceOperation for MappedSliceUpload<T>
 where
     T: Copy + Send + Sync + 'static,
 {
-    type Output = SharedBuffer<T>;
+    type Output = MappedSlice<T>;
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(SharedBuffer<T>, Deps)> {
+    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(MappedSlice<T>, Deps)> {
         let source = self
             .source
             .take()
-            .expect("SharedBufferUpload::execute called twice — internal claspr-async bug");
+            .expect("MappedSliceUpload::execute called twice — internal claspr-async bug");
         let len = source.len();
-        let buf = SharedBuffer::<T>::alloc(ec.context(), len)?;
+        let buf = MappedSlice::<T>::alloc(ec.context(), len)?;
 
         let raw_deps: Vec<opencl3::types::cl_event> =
             deps.iter().map(|d| d.as_ref().get()).collect();
@@ -253,15 +250,15 @@ where
     }
 }
 
-// ── SharedBuffer ────────────────────────────────────────────────────
+// ── MappedSlice ────────────────────────────────────────────────────
 
-/// Lazy [`SharedBuffer<T>`] (SVM) alloc. Built by [`shared_buffer_alloc`].
-pub struct SharedBufferAlloc<T> {
+/// Lazy [`MappedSlice<T>`] (SVM) alloc. Built by [`mapped_slice_alloc`].
+pub struct MappedSliceAlloc<T> {
     len: usize,
     _phantom: PhantomData<fn() -> T>,
 }
 
-/// Allocate a [`SharedBuffer<T>`] (SVM coarse-grain) of `len`
+/// Allocate a [`MappedSlice<T>`] (SVM coarse-grain) of `len`
 /// elements when the chain reaches this op.
 ///
 /// Surfaces [`Error::SvmNotAvailable`] at execute time if the running
@@ -269,24 +266,24 @@ pub struct SharedBufferAlloc<T> {
 /// constructor.
 ///
 /// [`Error::SvmNotAvailable`]: claspr::Error::SvmNotAvailable
-pub fn shared_buffer_alloc<T>(len: usize) -> SharedBufferAlloc<T>
+pub fn mapped_slice_alloc<T>(len: usize) -> MappedSliceAlloc<T>
 where
     T: Send + 'static,
 {
-    SharedBufferAlloc {
+    MappedSliceAlloc {
         len,
         _phantom: PhantomData,
     }
 }
 
-impl<T> DeviceOperation for SharedBufferAlloc<T>
+impl<T> DeviceOperation for MappedSliceAlloc<T>
 where
     T: Send + 'static,
 {
-    type Output = SharedBuffer<T>;
+    type Output = MappedSlice<T>;
 
-    fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(SharedBuffer<T>, Deps)> {
-        let buf = SharedBuffer::<T>::alloc(ec.context(), self.len)?;
+    fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(MappedSlice<T>, Deps)> {
+        let buf = MappedSlice::<T>::alloc(ec.context(), self.len)?;
         Ok((buf, deps))
     }
 }

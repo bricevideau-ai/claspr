@@ -1,13 +1,13 @@
-//! `SharedBuffer::fill` / `SharedBuffer::copy_to` + the Tier 2
-//! `shared_buffer_filled` op — SVM analogs of `DeviceSlice::fill` /
+//! `MappedSlice::fill` / `MappedSlice::copy_to` + the Tier 2
+//! `mapped_slice_filled` op — SVM analogs of `DeviceSlice::fill` /
 //! `DeviceSlice::copy_to` / `device_slice_filled`.
 //!
 //! Skips on devices without SVM (most desktop GPUs have it; llvmpipe
 //! reports SVM 2.0 fine, but the no-SVM error path is also worth
 //! exercising).
 
-use claspr::{Buffer, Context, SharedBuffer, SvmLevel};
-use claspr_async::{DeviceOperation, shared_buffer, shared_buffer_filled, shared_buffer_upload};
+use claspr::{Buffer, Context, MappedSlice, SvmLevel};
+use claspr_async::{DeviceOperation, mapped_slice, mapped_slice_filled, mapped_slice_upload};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;
@@ -26,10 +26,10 @@ fn ctx_with_svm() -> Option<Context> {
 
 #[test]
 fn tier1_svm_fill_writes_pattern() {
-    // Alloc SharedBuffer + fill + read back via map. Pattern lands
+    // Alloc MappedSlice + fill + read back via map. Pattern lands
     // in every slot, error_count stays clean.
     let Some(ctx) = ctx_with_svm() else { return };
-    let buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     buf.fill(&ctx, 0xDEAD_BEEFu32).wait().expect("fill");
 
     let g = buf.map(&ctx).expect("map");
@@ -45,8 +45,8 @@ fn tier1_svm_copy_to_propagates_contents() {
     // Also exercises auto-register on BOTH src and dst so Drop on
     // either side waits for the copy.
     let Some(ctx) = ctx_with_svm() else { return };
-    let src = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc src");
-    let dst = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc dst");
+    let src = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc src");
+    let dst = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc dst");
 
     src.fill(&ctx, 42u32).wait().expect("fill src");
     src.copy_to(&dst, &ctx).wait().expect("copy src→dst");
@@ -66,8 +66,8 @@ fn tier1_svm_copy_length_mismatch_errors() {
     // src and dst must have the same length — surfaces our typed
     // LengthMismatch (checked before the unsafe enqueue).
     let Some(ctx) = ctx_with_svm() else { return };
-    let src = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc src");
-    let dst = SharedBuffer::<u32>::alloc(&ctx, N / 2).expect("alloc dst");
+    let src = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc src");
+    let dst = MappedSlice::<u32>::alloc(&ctx, N / 2).expect("alloc dst");
 
     let err = src.copy_to(&dst, &ctx).wait().expect_err("length mismatch");
     assert!(
@@ -77,15 +77,15 @@ fn tier1_svm_copy_length_mismatch_errors() {
 }
 
 #[test]
-fn tier2_shared_buffer_filled_threads_into_kernel() {
+fn tier2_mapped_slice_filled_threads_into_kernel() {
     // Lazy alloc+fill on SVM, then run a kernel that takes the
-    // SharedBuffer as a slice arg (via the KernelSliceArg<T>
+    // MappedSlice as a slice arg (via the KernelSliceArg<T>
     // widening), then read back via map.
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    // shared_buffer_filled produces SharedBuffer<u32>; scale by 2.
-    let buf = shared_buffer_filled(5u32, N)
+    // mapped_slice_filled produces MappedSlice<u32>; scale by 2.
+    let buf = mapped_slice_filled(5u32, N)
         .and_then(|buf| kernels.scale_u32([N], buf, 2))
         .sync(&ctx)
         .expect("filled svm chain");
@@ -95,7 +95,7 @@ fn tier2_shared_buffer_filled_threads_into_kernel() {
 }
 
 #[test]
-fn tier2_shared_buffer_upload_threads_into_kernel() {
+fn tier2_mapped_slice_upload_threads_into_kernel() {
     // alloc SVM + clEnqueueSVMMemcpy from a host literal, then scale
     // by 3 in a kernel. The host source is kept alive by the drop
     // callback registered on the memcpy event; the buffer's last_use
@@ -103,7 +103,7 @@ fn tier2_shared_buffer_upload_threads_into_kernel() {
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = shared_buffer_upload::<u32, _>(vec![1u32, 2, 3, 4, 5, 6, 7, 8])
+    let buf = mapped_slice_upload::<u32, _>(vec![1u32, 2, 3, 4, 5, 6, 7, 8])
         .and_then(|buf| kernels.scale_u32([8], buf, 3))
         .sync(&ctx)
         .expect("upload + scale");
@@ -113,12 +113,12 @@ fn tier2_shared_buffer_upload_threads_into_kernel() {
 }
 
 #[test]
-fn macro_shared_buffer_repeat_arm() {
-    // `shared_buffer![v; N]` → shared_buffer_filled(v, N).
+fn macro_mapped_slice_repeat_arm() {
+    // `mapped_slice![v; N]` → mapped_slice_filled(v, N).
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = shared_buffer![4u32; N]
+    let buf = mapped_slice![4u32; N]
         .and_then(|buf| kernels.scale_u32([N], buf, 5))
         .sync(&ctx)
         .expect("macro repeat");
@@ -127,12 +127,12 @@ fn macro_shared_buffer_repeat_arm() {
 }
 
 #[test]
-fn macro_shared_buffer_literal_arm() {
-    // `shared_buffer![a, b, c]` → shared_buffer_upload(vec![a, b, c]).
+fn macro_mapped_slice_literal_arm() {
+    // `mapped_slice![a, b, c]` → mapped_slice_upload(vec![a, b, c]).
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = shared_buffer![10u32, 20, 30, 40]
+    let buf = mapped_slice![10u32, 20, 30, 40]
         .and_then(|buf| kernels.scale_u32([4], buf, 2))
         .sync(&ctx)
         .expect("macro literal");
@@ -141,7 +141,7 @@ fn macro_shared_buffer_literal_arm() {
 }
 
 #[test]
-fn tier2_shared_buffer_filled_surfaces_svm_not_available() {
+fn tier2_mapped_slice_filled_surfaces_svm_not_available() {
     // Run without SVM: should surface SvmNotAvailable at execute.
     let Ok(ctx) = Context::any() else {
         eprintln!("SKIP: no OpenCL device");
@@ -151,7 +151,7 @@ fn tier2_shared_buffer_filled_surfaces_svm_not_available() {
         eprintln!("SKIP: device supports SVM, can't test no-SVM path here");
         return;
     }
-    let err = shared_buffer_filled(0u32, N)
+    let err = mapped_slice_filled(0u32, N)
         .sync(&ctx)
         .expect_err("expected SvmNotAvailable");
     assert!(matches!(err, claspr::Error::SvmNotAvailable), "got {err:?}",);

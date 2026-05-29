@@ -1,6 +1,6 @@
 //! `Buffer<T>` plumbing — validates the trait's documented contract:
 //! a polymorphic accessor for `len`/`is_empty`/`ctx` that works across
-//! `DeviceSlice<T>` and `SharedBuffer<T>`.
+//! `DeviceSlice<T>` and `MappedSlice<T>`.
 //!
 //! Per the trait's rustdoc this is **explicitly not** a tier-
 //! polymorphism point — there is no uniform `upload` verb across the
@@ -8,7 +8,7 @@
 //! committing to a tier is exactly the use case the trait exists
 //! for; this file proves that use case compiles and runs.
 
-use claspr::{Buffer, Context, DeviceSlice, SharedBuffer, SvmLevel};
+use claspr::{Buffer, Context, DeviceSlice, MappedSlice, SvmLevel};
 
 const N: usize = 128;
 
@@ -45,10 +45,10 @@ fn buffer_accessor_works_uniformly_across_tiers() {
     println!("{d}");
     assert!(d.contains(&format!("{N} elements")));
 
-    // SharedBuffer when available — the other tier currently covered.
+    // MappedSlice when available — the other tier currently covered.
     if ctx.svm_capability() != SvmLevel::None {
-        let shared = SharedBuffer::<u32>::alloc(&ctx, N).expect("SharedBuffer alloc");
-        let d = describe("SharedBuffer", &shared);
+        let shared = MappedSlice::<u32>::alloc(&ctx, N).expect("MappedSlice alloc");
+        let d = describe("MappedSlice", &shared);
         println!("{d}");
         assert!(d.contains(&format!("{N} elements")));
     }

@@ -65,10 +65,10 @@ pub mod error;
 pub mod future;
 pub mod image;
 pub mod launch;
+pub mod mapped;
 pub mod op;
 pub mod ppm;
 pub mod queue;
-pub mod svm;
 pub mod usm;
 #[doc(hidden)]
 pub mod util;
@@ -93,7 +93,7 @@ pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 
 #[cfg(feature = "async-events")]
 pub use future::{CopyFuture, EventFuture, EventFutureExt, LaunchFuture, ReadFuture, WriteFuture};
-pub use svm::{SharedBuffer, SharedReadGuard, SharedWriteGuard, SvmCopyOp, SvmFillOp};
+pub use mapped::{MappedReadGuard, MappedSlice, MappedWriteGuard, SvmCopyOp, SvmFillOp};
 pub use usm::USMSlice;
 
 // Stage-3 proc-macro frontend.

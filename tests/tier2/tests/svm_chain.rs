@@ -1,21 +1,21 @@
-//! SVM (`SharedBuffer<T>`) inside a Tier 2 async chain.
+//! SVM (`MappedSlice<T>`) inside a Tier 2 async chain.
 //!
 //! The existing `host_view.rs` test goes through `acquire_host_view` /
 //! `release_to_device` — the proper RAII path. This file complements
-//! it: SharedBuffer threaded through a chain *as the kernel's input*,
+//! it: MappedSlice threaded through a chain *as the kernel's input*,
 //! exercising the `KernelArg::register_completion` auto-registration
 //! on every launch in the chain. Verifies that:
 //!
-//! - SharedBuffer composes with `with_context` for direct kernel
+//! - MappedSlice composes with `with_context` for direct kernel
 //!   launches on the chain's executor
 //! - the buffer survives the chain's drop ordering (no UB even when
-//!   the chain ends with the SharedBuffer Drop firing)
+//!   the chain ends with the MappedSlice Drop firing)
 //! - multiple kernel launches on the SVM in flight on the OOO queue
 //!   are all in the eventual `clEnqueueSVMFree` wait-list
 //!
 //! Skips on devices without SVM (e.g. some configurations of rusticl).
 
-use claspr::{Context, SharedBuffer, SvmLevel};
+use claspr::{Context, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
 
 const N: usize = 256;
@@ -33,15 +33,15 @@ fn ctx_with_svm() -> Option<Context> {
 }
 
 #[test]
-fn shared_buffer_threads_through_typed_launchers() {
+fn mapped_slice_threads_through_typed_launchers() {
     // Originally framed as a Tier 2 chain via `with_context`; with
     // that removed, this is just plain Tier 1 with `&ctx` as the
-    // launcher. Same coverage: SharedBuffer + the typed launchers'
+    // launcher. Same coverage: MappedSlice + the typed launchers'
     // KernelSliceArg widening + map-based readback.
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     let (buf, fill_evt) = kernels.fill_u32([N], buf, 6u32).submit(&ctx).expect("fill");
     let buf = kernels
         .scale_u32([N], buf, 7u32)
@@ -64,7 +64,7 @@ fn many_in_flight_svm_launches_drop_safely() {
     // `clEnqueueSVMFree` wait-list must include every launch's event.
     let Some(ctx) = ctx_with_svm() else { return };
 
-    let mut buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     // 8 successive scales on the same SVM. Each .submit() doesn't
     // block; each launch auto-registers via `KernelArg::register_completion`.

@@ -8,7 +8,7 @@
 //! | Buffer | Acquire | Release |
 //! |---|---|---|
 //! | [`DeviceSlice<T>`] | non-blocking `clEnqueueMapBuffer` (READ \| WRITE or READ only) | `clEnqueueUnmapMemObject` |
-//! | [`SharedBuffer<T>`] | non-blocking `clEnqueueSVMMap` | `clEnqueueSVMUnmap` |
+//! | [`MappedSlice<T>`] | non-blocking `clEnqueueSVMMap` | `clEnqueueSVMUnmap` |
 //!
 //! All three view types implement [`crate::mappable::Mappable`] so
 //! the closure inside `and_then_host` receives the underlying slice
@@ -48,7 +48,7 @@ use crate::exec_ctx::ExecutionContext;
 use crate::mappable::Mappable;
 use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
 use claspr::util::{RetainedQueue, mapped_slice, mapped_slice_mut};
-use claspr::{Buffer, DeviceSlice, Error, Event, Launcher, Result, SharedBuffer};
+use claspr::{Buffer, DeviceSlice, Error, Event, Launcher, MappedSlice, Result};
 use opencl3::command_queue::{
     CommandQueue, enqueue_map_buffer, enqueue_svm_map, enqueue_svm_unmap, enqueue_unmap_mem_object,
 };
@@ -452,56 +452,51 @@ where
     fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
 }
 
-// HostBuffer host-view support removed 2026-05-29 alongside the
-// HostBuffer type itself (CL_MEM_ALLOC_HOST_PTR + persistent map is
-// spec-UB). Use SharedBuffer for SVM-backed host access, or USMSlice
-// when CL_DEVICE_SVM_FINE_GRAIN_SYSTEM is available.
+// ── MappedSlice: non-blocking SVM map/unmap ────────────────────────
 
-// ── SharedBuffer: non-blocking SVM map/unmap ────────────────────────
-
-impl<T> HostAccessibleExt for SharedBuffer<T>
+impl<T> HostAccessibleExt for MappedSlice<T>
 where
     T: Send + Sync + 'static,
 {
-    type AcquireOp = AcquireSharedBufferOp<T, ReadWrite>;
-    type AcquireReadOp = AcquireSharedBufferOp<T, ReadOnly>;
+    type AcquireOp = AcquireMappedSliceOp<T, ReadWrite>;
+    type AcquireReadOp = AcquireMappedSliceOp<T, ReadOnly>;
     fn acquire_host_view(self) -> Self::AcquireOp {
-        AcquireSharedBufferOp {
+        AcquireMappedSliceOp {
             buf: Some(self),
             _access: PhantomData,
         }
     }
     fn acquire_host_view_read(self) -> Self::AcquireReadOp {
-        AcquireSharedBufferOp {
+        AcquireMappedSliceOp {
             buf: Some(self),
             _access: PhantomData,
         }
     }
 }
 
-/// Combinator returned by `SharedBuffer::acquire_host_view{,_read}`.
+/// Combinator returned by `MappedSlice::acquire_host_view{,_read}`.
 /// Issues a non-blocking `clEnqueueSVMMap` with `deps` as the
-/// wait-list and produces a [`SharedBufferHostView`]. The map event
+/// wait-list and produces a [`MappedSliceHostView`]. The map event
 /// is returned in the output `Deps` so downstream stages (including
 /// an `and_then_host` worker) gate on it before touching the SVM
 /// memory.
-pub struct AcquireSharedBufferOp<T, A: MapAccess> {
-    buf: Option<SharedBuffer<T>>,
+pub struct AcquireMappedSliceOp<T, A: MapAccess> {
+    buf: Option<MappedSlice<T>>,
     _access: PhantomData<A>,
 }
 
-impl<T, A> DeviceOperation for AcquireSharedBufferOp<T, A>
+impl<T, A> DeviceOperation for AcquireMappedSliceOp<T, A>
 where
     T: Send + Sync + 'static,
     A: MapAccess,
 {
-    type Output = SharedBufferHostView<T, A>;
+    type Output = MappedSliceHostView<T, A>;
 
     fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let buf = self
             .buf
             .take()
-            .expect("AcquireSharedBufferOp::execute called twice");
+            .expect("AcquireMappedSliceOp::execute called twice");
         let size = buf.len() * std::mem::size_of::<T>();
         let ptr = buf.ptr();
         // Retain the queue for the view's defensive Drop-time unmap.
@@ -528,7 +523,7 @@ where
             )
             .map_err(cl_to_err)?
         };
-        let view = SharedBufferHostView {
+        let view = MappedSliceHostView {
             buf: Some(buf),
             queue,
             unmap_done: false,
@@ -538,13 +533,13 @@ where
     }
 }
 
-/// Host view of a [`SharedBuffer<T>`] — a live SVM map.
+/// Host view of a [`MappedSlice<T>`] — a live SVM map.
 ///
 /// Deref behaviour mirrors [`DeviceSliceHostView`]: `&[T]` always;
 /// `&mut [T]` only for the [`ReadWrite`] access mode (type-system
 /// enforcement against accidental writes through a read-only map).
-pub struct SharedBufferHostView<T, A: MapAccess> {
-    buf: Option<SharedBuffer<T>>,
+pub struct MappedSliceHostView<T, A: MapAccess> {
+    buf: Option<MappedSlice<T>>,
     /// Retained `cl_command_queue` handle for the matching SVM unmap.
     queue: RetainedQueue,
     /// Set to `true` once `release_to_device` enqueued the unmap, so
@@ -553,19 +548,19 @@ pub struct SharedBufferHostView<T, A: MapAccess> {
     _access: PhantomData<A>,
 }
 
-// SAFETY: SharedBuffer is itself Send (per its own impl). The
+// SAFETY: MappedSlice is itself Send (per its own impl). The
 // queue is wrapped in RetainedQueue which is independently Send.
-unsafe impl<T: Send, A: MapAccess> Send for SharedBufferHostView<T, A> {}
+unsafe impl<T: Send, A: MapAccess> Send for MappedSliceHostView<T, A> {}
 
-impl<T, A: MapAccess> Drop for SharedBufferHostView<T, A> {
+impl<T, A: MapAccess> Drop for MappedSliceHostView<T, A> {
     fn drop(&mut self) {
         if !self.unmap_done
             && let Some(buf) = self.buf.as_ref()
         {
             // Defensive sync unmap on the error path between acquire
             // and release. Issue the unmap, wait for it, register the
-            // event on the SharedBuffer so its own clEnqueueSVMFree
-            // (in SharedBuffer::drop) doesn't race against an unmap
+            // event on the MappedSlice so its own clEnqueueSVMFree
+            // (in MappedSlice::drop) doesn't race against an unmap
             // still in flight on this queue.
             //
             // SAFETY: ptr was mapped in acquire; unmap exactly once
@@ -587,13 +582,13 @@ impl<T, A: MapAccess> Drop for SharedBufferHostView<T, A> {
     }
 }
 
-impl<T, A: MapAccess> Deref for SharedBufferHostView<T, A> {
+impl<T, A: MapAccess> Deref for MappedSliceHostView<T, A> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         let buf = self
             .buf
             .as_ref()
-            .expect("SharedBufferHostView already released");
+            .expect("MappedSliceHostView already released");
         // SAFETY: the SVM pointer is valid and mapped between
         // acquire's clEnqueueSVMMap and release's / Drop's unmap.
         // CL_MAP_READ is always granted (both access modes set it).
@@ -601,12 +596,12 @@ impl<T, A: MapAccess> Deref for SharedBufferHostView<T, A> {
     }
 }
 
-impl<T> DerefMut for SharedBufferHostView<T, ReadWrite> {
+impl<T> DerefMut for MappedSliceHostView<T, ReadWrite> {
     fn deref_mut(&mut self) -> &mut [T] {
         let buf = self
             .buf
             .as_ref()
-            .expect("SharedBufferHostView already released");
+            .expect("MappedSliceHostView already released");
         // SAFETY: same as Deref — plus the SVM map was acquired with
         // CL_MAP_WRITE (ReadWrite::MAP_FLAGS includes it) so mutation
         // is permitted by the OpenCL runtime.
@@ -614,47 +609,43 @@ impl<T> DerefMut for SharedBufferHostView<T, ReadWrite> {
     }
 }
 
-impl<T, A> SharedBufferHostView<T, A>
+impl<T, A> MappedSliceHostView<T, A>
 where
     T: Send + 'static,
     A: MapAccess,
 {
     /// Enqueue the matching `clEnqueueSVMUnmap` waiting on `deps`,
-    /// and yield the [`SharedBuffer`] back. The unmap event ends up
+    /// and yield the [`MappedSlice`] back. The unmap event ends up
     /// in the chain's `Deps` so downstream device commands wait on
     /// it before touching the SVM allocation, and is also recorded
-    /// on the [`SharedBuffer`] so its eventual
+    /// on the [`MappedSlice`] so its eventual
     /// `clEnqueueSVMFree` (on drop) ordering is preserved.
-    pub fn release_to_device(self) -> ReleaseSharedBufferOp<T, A> {
-        ReleaseSharedBufferOp { view: Some(self) }
+    pub fn release_to_device(self) -> ReleaseMappedSliceOp<T, A> {
+        ReleaseMappedSliceOp { view: Some(self) }
     }
 }
 
-/// Combinator returned by [`SharedBufferHostView::release_to_device`].
-pub struct ReleaseSharedBufferOp<T, A: MapAccess> {
-    view: Option<SharedBufferHostView<T, A>>,
+/// Combinator returned by [`MappedSliceHostView::release_to_device`].
+pub struct ReleaseMappedSliceOp<T, A: MapAccess> {
+    view: Option<MappedSliceHostView<T, A>>,
 }
 
-impl<T, A> DeviceOperation for ReleaseSharedBufferOp<T, A>
+impl<T, A> DeviceOperation for ReleaseMappedSliceOp<T, A>
 where
     T: Send + 'static,
     A: MapAccess,
 {
-    type Output = SharedBuffer<T>;
+    type Output = MappedSlice<T>;
 
-    fn execute(
-        mut self,
-        ctx: &ExecutionContext<'_>,
-        deps: Deps,
-    ) -> Result<(SharedBuffer<T>, Deps)> {
+    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(MappedSlice<T>, Deps)> {
         let mut view = self
             .view
             .take()
-            .expect("ReleaseSharedBufferOp::execute called twice");
+            .expect("ReleaseMappedSliceOp::execute called twice");
         let buf = view
             .buf
             .take()
-            .expect("SharedBufferHostView already released");
+            .expect("MappedSliceHostView already released");
         let q_raw = ctx.cl_queue().get();
         let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let (wait_count, wait_ptr) = if wait_list.is_empty() {
@@ -668,9 +659,9 @@ where
         };
         view.unmap_done = true; // suppress Drop's defensive unmap
         // Build one Arc<Event> reused as both the chain's Dep and the
-        // SharedBuffer's use-list entry — so its eventual SVMFree
+        // MappedSlice's use-list entry — so its eventual SVMFree
         // queue-orders after the unmap regardless of when the
-        // SharedBuffer ends up dropping.
+        // MappedSlice ends up dropping.
         let arc_event = std::sync::Arc::new(Event::new(unmap_event));
         buf.register_use(std::sync::Arc::clone(&arc_event));
         // view drops here — only the retained queue release fires.
@@ -678,12 +669,12 @@ where
     }
 }
 
-/// `Mappable` impls so a `SharedBufferHostView` can pass its inner
+/// `Mappable` impls so a `MappedSliceHostView` can pass its inner
 /// slice straight into an [`AndThenHost`](crate::AndThenHost) closure.
 /// The SVM map is already in place from acquire; `map`/`unmap` are
 /// no-ops here, and the map event reaches the worker via
 /// `source_evts` (the `Deps` carried through the chain).
-impl<T> Mappable for SharedBufferHostView<T, ReadWrite>
+impl<T> Mappable for MappedSliceHostView<T, ReadWrite>
 where
     T: Send + 'static,
 {
@@ -701,7 +692,7 @@ where
         let buf = self
             .buf
             .as_ref()
-            .expect("SharedBufferHostView already released");
+            .expect("MappedSliceHostView already released");
         Ok((
             HostViewHandle {
                 ptr: buf.ptr(),
@@ -724,7 +715,7 @@ where
     fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
 }
 
-impl<T> Mappable for SharedBufferHostView<T, ReadOnly>
+impl<T> Mappable for MappedSliceHostView<T, ReadOnly>
 where
     T: Send + Sync + 'static,
 {
@@ -742,7 +733,7 @@ where
         let buf = self
             .buf
             .as_ref()
-            .expect("SharedBufferHostView already released");
+            .expect("MappedSliceHostView already released");
         Ok((
             HostViewHandle {
                 ptr: buf.ptr(),

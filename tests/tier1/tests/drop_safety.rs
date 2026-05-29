@@ -40,8 +40,8 @@ fn device_slice_drop_while_kernel_in_flight() {
     assert_eq!(ctx.error_count(), 0, "no release errors expected");
 }
 
-// (SharedBuffer drop-while-in-flight is covered separately in
+// (MappedSlice drop-while-in-flight is covered separately in
 // tests/svm.rs, which exercises the cross-queue `register_use` path —
 // the proc-macro-emitted typed launch only accepts `&DeviceSlice<T>`,
-// so SharedBuffer needs the lower-level `ctx.launch` route or the
+// so MappedSlice needs the lower-level `ctx.launch` route or the
 // host-view RAII flow.)

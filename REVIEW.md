@@ -6,7 +6,7 @@ The previous version of this doc was a pre-merge review of `runtime-redesign`. M
 
 | Prior item | Status |
 |---|---|
-| (1) Sticky-error counter wiring | Done — covered across `DeviceSlice` / `Queue` / `SharedBuffer` Drop; `tier1/drop_safety.rs` + `tier1/svm.rs` assert `ctx.error_count() == 0` after forced drops |
+| (1) Sticky-error counter wiring | Done — covered across `DeviceSlice` / `Queue` / `MappedSlice` Drop; `tier1/drop_safety.rs` + `tier1/svm.rs` assert `ctx.error_count() == 0` after forced drops |
 | (2) Kernel-launching multi-device test | Done — `tier1/multi_device.rs::launch_runs_on_each_device_via_proc_macro_launcher`, with the sub-device fallback so it actually fires on common single-device boxes |
 | (3) Verify `&Queue<OutOfOrder>` through the proc-macro | Exercised — `tier1/svm.rs` uses `Queue::<OutOfOrder>::on_device` against macro-typed `kernels.fill_u32` / `scale_u32` flows |
 | (4) `launch_with_deps` losing macro typing | Resolved via the two-tier design — Tier 1 has `.submit()` returning `Event`, Tier 2 has macro-emitted `_op` variants composable in chains |
@@ -26,7 +26,7 @@ That's a substantial set of paper-cuts closed since the last review. What follow
 
 **Multi-device coverage uses the right kind of clever** — `tier1/multi_device.rs` has a three-stage fallback (real ≥2 devices → sub-device partition → skip). The sub-device path means the test actually fires on the common single-CPU-device dev box, instead of always green-because-skipped.
 
-**Drop safety + cross-queue ordering for `SharedBuffer`** is the load-bearing safety story, and `tier1/svm.rs` covers 7 distinct facets: basic round-trip, cross-queue `last_use`, explicit `register_use`, OOO auto-registration, empty wait-list arm, read-only map, multi-kernel pipeline. The auto-registration test validates that `KernelArg::register_completion` actually does its job under concurrent OOO launches — the bit that prevents UB in real usage.
+**Drop safety + cross-queue ordering for `MappedSlice`** is the load-bearing safety story, and `tier1/svm.rs` covers 7 distinct facets: basic round-trip, cross-queue `last_use`, explicit `register_use`, OOO auto-registration, empty wait-list arm, read-only map, multi-kernel pipeline. The auto-registration test validates that `KernelArg::register_completion` actually does its job under concurrent OOO launches — the bit that prevents UB in real usage.
 
 **Examples function as integration tests.** `async-pipeline` and `batch-inference` validate the device computation against an identical host implementation; both have `#[test]` blocks at the bottom so `cargo test` exercises them. `raymarch` does pixel-level host validation too. Examples that are also tests — the right pattern.
 
@@ -54,11 +54,11 @@ That's a fair design tradeoff (closure runs on a worker thread; returning involv
 
 The current shape pushes ergonomic cost onto every user who wants a reduction (which is most of them).
 
-### 3. `SharedBuffer` falls out of the typed kernel wrappers
+### 3. `MappedSlice` falls out of the typed kernel wrappers
 
 Visible in both `tier1/svm.rs` and `tier2/svm_chain.rs`: every SVM kernel launch drops to `LaunchOp::new(&ec, &kernel, [N].into_launch_spec(), (&buf, …))` because the proc-macro-emitted `kernels.foo(...)` only accepts `&DeviceSlice<T>`. From `tier1/svm.rs`:
 
-> We can't pass `&SharedBuffer` to the typed `kernels.fill_u32` (which is typed against `DeviceSlice<u32>`), so we drop to the lower-level path: build the LaunchOp manually via a kernel handle and the `KernelArgs` tuple.
+> We can't pass `&MappedSlice` to the typed `kernels.fill_u32` (which is typed against `DeviceSlice<u32>`), so we drop to the lower-level path: build the LaunchOp manually via a kernel handle and the `KernelArgs` tuple.
 
 The fix is broadening the trait bound on the macro signature (`impl KernelArg<T>` instead of `&DeviceSlice<T>`), or emitting a separate `kernels.foo_svm(...)`. But it's not done. Users who want SVM lose all the type safety the rest of claspr provides — which is the wrong incentive direction, since SVM is the easiest path on capable devices and making it the least ergonomic punishes the use case.
 
@@ -74,7 +74,7 @@ I'd lean toward the first — one f64 + one `cl::Float3` kernel in a `tests/kern
 
 ### 5. No stress tests
 
-The biggest test runs 8 in-flight launches. The Vec-accumulation pattern in `SharedBuffer` (events drained at Drop) could grow unboundedly if a user holds a `SharedBuffer` while submitting thousands of ops. A test that submits 1000+ ops onto an OOO queue holding a single SVM and asserts memory stays bounded (and `error_count == 0`) would be cheap insurance against a regression that's otherwise invisible.
+The biggest test runs 8 in-flight launches. The Vec-accumulation pattern in `MappedSlice` (events drained at Drop) could grow unboundedly if a user holds a `MappedSlice` while submitting thousands of ops. A test that submits 1000+ ops onto an OOO queue holding a single SVM and asserts memory stays bounded (and `error_count == 0`) would be cheap insurance against a regression that's otherwise invisible.
 
 ### 6. README is significantly stale
 
@@ -87,7 +87,7 @@ A reader landing on github gets a wrong first impression of where the project is
 - **`tier2/cross_device.rs` is a single test** for the cross-device DeviceSlice flow. Given how load-bearing multi-device + memory transfer is for HPC, this feels light compared to multi-device kernel-launch coverage (3 tests in `tier1/multi_device.rs`). Cross-context buffer flow (download + re-upload) stays user-managed per the design — but it's where most users will hit problems first.
 - **`tier2/arc_split.rs`** (2 tests, 0 `assert!` macros) covers shape but not error or N=1 edge cases.
 - **`tier2/conditional.rs`** has 8 tests for `DynOp` but mostly verifies the wrapper compiles. Doesn't test that the non-taken branch is actually skipped at runtime — you could feed a `cond=false` branch that panics in its closure and prove it never fires.
-- **No `drop_safety.rs` coverage for `SharedBuffer`** directly — SVM has its own file but the more general "drop a SharedBuffer while a *non-launch* operation is in flight" pattern isn't covered there. (The cross-queue last-use case in `tier1/svm.rs` covers part of this.)
+- **No `drop_safety.rs` coverage for `MappedSlice`** directly — SVM has its own file but the more general "drop a MappedSlice while a *non-launch* operation is in flight" pattern isn't covered there. (The cross-queue last-use case in `tier1/svm.rs` covers part of this.)
 
 None of these block anything; they're incremental hardening.
 
@@ -96,7 +96,7 @@ None of these block anything; they're incremental hardening.
 If I had to rank these, this is the order I'd attack them:
 
 1. **README rewrite** — public-facing, cheap, high signal.
-2. **`SharedBuffer` through the typed launchers** (#3) — paper-cut visible in every SVM-touching test; the workaround code is exactly what claspr is supposed to abstract away.
+2. **`MappedSlice` through the typed launchers** (#3) — paper-cut visible in every SVM-touching test; the workaround code is exactly what claspr is supposed to abstract away.
 3. **Tier 2 error fidelity** (#1) — the most likely to bite a real user. A `Mutex<Option<Error>>` on the chain that the host-closure worker populates is a few-dozen-line change that restores variant-matching.
 4. **fp64 / vector test kernels** (#4) — closes the only meaningful coverage hole.
 5. **`and_then_host` value-returning variant** (#2) — quality-of-life; could land alongside the error-fidelity fix since both touch the host-closure plumbing.
@@ -106,6 +106,6 @@ If I had to rank these, this is the order I'd attack them:
 
 The project is in a **healthier shape than I expected** given how recently the runtime-redesign + tier1/tier2 rewrite landed. The test discipline carries the cost of the rewrite gracefully — there's a coherent shape across 20 test files, the hardest correctness story (SVM Drop + cross-queue) is exercised carefully, and the two-tier architecture works in practice (async-pipeline + batch-inference are real-feeling examples, not stubs).
 
-The remaining concerns are **rough edges around the seams**, not architectural problems. The biggest single thing a new contributor would notice is the stale README; the biggest single thing an existing user would notice is `SharedBuffer` falling out of the typed launcher system. Neither is hard to fix.
+The remaining concerns are **rough edges around the seams**, not architectural problems. The biggest single thing a new contributor would notice is the stale README; the biggest single thing an existing user would notice is `MappedSlice` falling out of the typed launcher system. Neither is hard to fix.
 
 — Reviewed 2026-05-28 on the linux box. Public surface, all 20 tier test files, both new examples, CLAUDE.md, IMPLEMENTATION-PLAN.md.

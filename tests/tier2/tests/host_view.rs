@@ -7,7 +7,7 @@
 //! be called inside the closure; the view passes through `and_then`
 //! to `release_to_device` unchanged.
 
-use claspr::{Context, SharedBuffer, SvmLevel};
+use claspr::{Context, MappedSlice, SvmLevel};
 use claspr_async::{
     DeviceOperation, DeviceOperationHostExt, HostAccessibleExt, download, upload, value,
 };
@@ -132,10 +132,10 @@ fn acquire_host_view_read_just_inspect_and_drop() {
     assert_eq!(*first_cell.lock().unwrap(), 52, "13 * 4 = 52");
 }
 
-// ── SharedBuffer (coarse-grain SVM map/unmap) ───────────────────────
+// ── MappedSlice (coarse-grain SVM map/unmap) ───────────────────────
 
 #[test]
-fn shared_buffer_acquire_release_round_trip() {
+fn mapped_slice_acquire_release_round_trip() {
     let Ok(ctx) = Context::any() else {
         eprintln!("SKIP: no OpenCL device");
         return;
@@ -145,7 +145,7 @@ fn shared_buffer_acquire_release_round_trip() {
         return;
     }
 
-    let buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("SharedBuffer alloc");
+    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("MappedSlice alloc");
 
     let mut buf = value(buf)
         .and_then(|b| b.acquire_host_view())
@@ -157,7 +157,7 @@ fn shared_buffer_acquire_release_round_trip() {
         })
         .and_then(|view| view.release_to_device())
         .sync(&ctx)
-        .expect("SharedBuffer round-trip");
+        .expect("MappedSlice round-trip");
 
     // Re-acquire via Tier 1 to read back without another chain.
     let guard = buf.map_mut(&ctx).expect("re-map");
@@ -169,7 +169,7 @@ fn shared_buffer_acquire_release_round_trip() {
 }
 
 #[test]
-fn shared_buffer_acquire_release_read_only() {
+fn mapped_slice_acquire_release_read_only() {
     // Read-only SVM map: clEnqueueSVMMap with CL_MAP_READ only.
     // Closure sees `&[u32]` (no DerefMut, no &mut access). Unmap is
     // cheaper since the runtime knows no writes to commit.
@@ -182,8 +182,8 @@ fn shared_buffer_acquire_release_read_only() {
         return;
     }
 
-    // Seed the SharedBuffer via Tier 1 first.
-    let mut buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("SharedBuffer alloc");
+    // Seed the MappedSlice via Tier 1 first.
+    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("MappedSlice alloc");
     {
         let mut guard = buf.map_mut(&ctx).expect("seed map");
         for (i, x) in guard.iter_mut().enumerate() {
@@ -206,7 +206,7 @@ fn shared_buffer_acquire_release_read_only() {
         })
         .and_then(|view| view.release_to_device())
         .sync(&ctx)
-        .expect("SharedBuffer read-only chain");
+        .expect("MappedSlice read-only chain");
 
     assert_eq!(*first_cell.lock().unwrap(), 100);
     let expected_sum: u32 = (0..N as u32).map(|i| 100 + i).sum();

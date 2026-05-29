@@ -1,6 +1,6 @@
-//! Stress test: many concurrent OOO launches on one `SharedBuffer`.
+//! Stress test: many concurrent OOO launches on one `MappedSlice`.
 //!
-//! `SharedBuffer::last_use` accumulates `Arc<Event>` per launch and
+//! `MappedSlice::last_use` accumulates `Arc<Event>` per launch and
 //! only drains at Drop. Today the largest in-tree run is 4 iterations
 //! (`tests/tier1/tests/svm.rs::kernel_launches_on_ooo_queue_register_themselves_for_drop`),
 //! which doesn't pin the "many in flight at once" case. This test
@@ -15,7 +15,7 @@
 //! assertions: if a drop fired the underlying release eagerly, the
 //! runtime would either hang, crash, or surface a sticky error").
 
-use claspr::{Context, OutOfOrder, Queue, SharedBuffer, SvmLevel};
+use claspr::{Context, MappedSlice, OutOfOrder, Queue, SvmLevel};
 use claspr_test_kernels::kernels;
 
 const N: usize = 256;
@@ -44,7 +44,7 @@ fn thousand_ooo_launches_on_one_sharedbuffer_drop_safely() {
     let ooo = Queue::<OutOfOrder>::on_device(&ctx, &device).expect("ooo queue");
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let mut buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     // Each iteration submits without blocking on prior events —
     // each launch auto-registers via KernelArg::register_completion
     // and ends up in the buffer's last_use Vec.

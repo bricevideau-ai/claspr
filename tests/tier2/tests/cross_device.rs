@@ -73,7 +73,7 @@ fn ctx_two_devices() -> Option<(Context, Device, Device)> {
 }
 
 #[test]
-fn pipeline_spans_two_devices_via_shared_buffer() {
+fn pipeline_spans_two_devices_via_mapped_slice() {
     // Both devices share the cl_context, so a `DeviceSlice<T>` is
     // valid on either device's queue. Stage 1 on device 0, stage 2
     // on device 1; the chain is fully non-blocking — each kernel is

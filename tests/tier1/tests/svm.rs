@@ -1,14 +1,14 @@
-//! SharedBuffer round-trip + cross-queue Drop ordering.
+//! MappedSlice round-trip + cross-queue Drop ordering.
 //!
 //! Tests both the basic map/map_mut RAII pattern AND the
 //! `register_use` cross-queue Drop fix. The Drop test deliberately
 //! schedules work on a separate command queue, pushes that work's
-//! event onto the SharedBuffer's in-flight-use list, then lets
-//! SharedBuffer drop — its `clEnqueueSVMFree` must queue-order
+//! event onto the MappedSlice's in-flight-use list, then lets
+//! MappedSlice drop — its `clEnqueueSVMFree` must queue-order
 //! behind the cross-queue work via the event wait-list instead of
 //! deadlocking or freeing while the unmap is still in flight.
 
-use claspr::{Context, Device, InOrder, Launcher, OutOfOrder, Queue, SharedBuffer, SvmLevel};
+use claspr::{Context, Device, InOrder, Launcher, MappedSlice, OutOfOrder, Queue, SvmLevel};
 use claspr_test_kernels::kernels;
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ fn ctx_with_svm() -> Option<Context> {
 fn map_mut_then_map_round_trip() {
     let Some(ctx) = ctx_with_svm() else { return };
 
-    let mut buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     {
         let mut view = buf.map_mut(&ctx).expect("map_mut");
         for (i, slot) in view.iter_mut().enumerate() {
@@ -46,12 +46,12 @@ fn map_mut_then_map_round_trip() {
 
 #[test]
 fn drop_orders_after_cross_queue_unmap_via_last_use() {
-    // The whole point of #94: SharedBuffer can be used on a queue
+    // The whole point of #94: MappedSlice can be used on a queue
     // distinct from its Context's default in-order queue, and Drop's
     // clEnqueueSVMFree must wait for that cross-queue work to finish
     // before reclaiming the allocation.
     //
-    // We simulate the path SharedBufferHostView takes: enqueue an
+    // We simulate the path MappedSliceHostView takes: enqueue an
     // unmap on a separate queue, wrap the event in Arc<Event>, set
     // it as last_use, then drop. The drop's free queue-orders on the
     // unmap event via wait-list — no host-side wait, no UB.
@@ -60,14 +60,14 @@ fn drop_orders_after_cross_queue_unmap_via_last_use() {
     let device: Device = ctx.device().clone();
     let other_queue = Queue::<InOrder>::on_device(&ctx, &device).expect("aux queue");
 
-    let mut buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     // Write something so the unmap has data to flush.
     {
         let mut view = buf.map_mut(&other_queue).expect("map_mut on aux");
         for slot in view.iter_mut() {
             *slot = 99;
         }
-    } // unmap-and-set-last_use happens inside SharedWriteGuard::Drop
+    } // unmap-and-set-last_use happens inside MappedWriteGuard::Drop
 
     // Sanity: at Drop time, last_use may be set. Drop's free uses it
     // as a wait-list entry, so this drop should not block the host
@@ -85,13 +85,13 @@ fn drop_orders_after_cross_queue_unmap_via_last_use() {
 fn explicit_register_use_orders_drop_after_cross_queue_event() {
     // Demonstrate the public register_use API directly: enqueue work
     // on a separate queue, manually feed the event back into the
-    // SharedBuffer, drop. Same expected outcome as above but via the
+    // MappedSlice, drop. Same expected outcome as above but via the
     // user-facing API path (not the host_view internal helper).
     let Some(ctx) = ctx_with_svm() else { return };
     let device: Device = ctx.device().clone();
     let other_queue = Queue::<InOrder>::on_device(&ctx, &device).expect("aux queue");
 
-    let buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     // Issue a marker on the aux queue to manufacture an event.
     // SAFETY: empty wait-list is always valid.
     let marker =
@@ -109,7 +109,7 @@ fn explicit_register_use_orders_drop_after_cross_queue_event() {
 #[test]
 fn kernel_launches_on_ooo_queue_register_themselves_for_drop() {
     // The auto-registration path: kernel launches that take a
-    // SharedBuffer as a KernelArg should record their completion event
+    // MappedSlice as a KernelArg should record their completion event
     // on the buffer's in-flight-use list (via
     // `KernelArg::register_completion`). Drop's `clEnqueueSVMFree`
     // wait-list then includes every launch, so the free queue-orders
@@ -125,10 +125,10 @@ fn kernel_launches_on_ooo_queue_register_themselves_for_drop() {
     let ooo = Queue::<OutOfOrder>::on_device(&ctx, &device).expect("ooo queue");
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let mut buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     // Issue several launches on the OOO queue, all consuming `&buf`
     // via the typed launcher (now generic over KernelSliceArg, so
-    // `SharedBuffer<u32>` flows through `kernels.fill_u32` directly).
+    // `MappedSlice<u32>` flows through `kernels.fill_u32` directly).
     // On an OOO queue, the events may finish in any order — without
     // Vec accumulation, only the most recently registered would gate
     // the free, which would race the others.
@@ -139,7 +139,7 @@ fn kernel_launches_on_ooo_queue_register_themselves_for_drop() {
             .expect("submit");
         buf = returned;
         // Hold each Event briefly; auto-register has already happened
-        // via the SharedBuffer KernelArg impl.
+        // via the MappedSlice KernelArg impl.
         drop(event);
     }
     // Drop the buffer WITHOUT explicit sync. The Vec inside `buf` has
@@ -159,7 +159,7 @@ fn alloc_then_immediate_drop_uses_empty_wait_list() {
     // None/empty arm of the Vec-drain path.
     let Some(ctx) = ctx_with_svm() else { return };
     {
-        let _buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+        let _buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     } // immediate drop, no use registered
     ctx.cl_queue().finish().expect("finish");
     assert_eq!(ctx.error_count(), 0);
@@ -168,9 +168,9 @@ fn alloc_then_immediate_drop_uses_empty_wait_list() {
 #[test]
 fn read_only_map_via_map_guard() {
     // Existing tests use map_mut. This exercises the read-only path
-    // (`map(launcher)` → SharedReadGuard derefs to &[T]).
+    // (`map(launcher)` → MappedReadGuard derefs to &[T]).
     let Some(ctx) = ctx_with_svm() else { return };
-    let mut buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     {
         // Populate via map_mut...
         let mut g = buf.map_mut(&ctx).expect("map_mut");
@@ -188,14 +188,14 @@ fn read_only_map_via_map_guard() {
 
 #[test]
 fn multi_kernel_svm_pipeline_via_typed_launchers() {
-    // Two-stage compute pipeline operating entirely on a SharedBuffer:
+    // Two-stage compute pipeline operating entirely on a MappedSlice:
     // fill → scale → read back via map. Both kernels run on an OOO
     // queue and take the SVM as a `KernelArg`; the auto-registration
     // path (KernelArg::register_completion) records each launch's
     // event on `buf`, so the buffer's eventual Drop can wait on every
     // in-flight use.
     //
-    // SharedBuffer flows through `kernels.fill_u32` / `kernels.scale_u32`
+    // MappedSlice flows through `kernels.fill_u32` / `kernels.scale_u32`
     // directly thanks to the `KernelSliceArg<T>` widening on the
     // emitted typed launchers — same surface as DeviceSlice.
     let Some(ctx) = ctx_with_svm() else { return };
@@ -203,7 +203,7 @@ fn multi_kernel_svm_pipeline_via_typed_launchers() {
     let ooo = Queue::<OutOfOrder>::on_device(&ctx, &device).expect("ooo queue");
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = SharedBuffer::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
 
     // Stage 1: fill_u32 with 4.
     let (buf, fill_event) = kernels

@@ -32,7 +32,7 @@ Today's claspr API has three different shapes for "enqueue something":
 
 - `DeviceSlice::upload` / `download` block via `CL_BLOCKING` (sync, no event)
 - `DeviceSlice::copy_to` returns an `Event` (async, event-back)
-- `Image2D::download_bytes`, `SharedBuffer::map_mut` block
+- `Image2D::download_bytes`, `MappedSlice::map_mut` block
 - Kernel launches: `Launcher::launch` is sync, `LauncherAsync::launch_with_deps` is async-with-event
 
 Three+ verb shapes for users to learn. Plus inconsistencies:
@@ -106,7 +106,7 @@ host slice, copy_to to a host slice, etc.):
 | `.track()`   | `Result<BorrowHandle<'a, T>>`     | ✗ typestate error |
 | `.tracked()` | → Tracked                         | ✗ typestate error |
 
-For **resource ops** (`SharedBuffer::map_mut`, etc.):
+For **resource ops** (`MappedSlice::map_mut`, etc.):
 
 |              | `Untracked`                   | `Tracked` |
 |---|---|---|
@@ -173,7 +173,7 @@ callback anyway, we just expose it instead of dropping.
 
 Discipline: **any op that enqueues returns a builder; any op that pure-constructs returns the value directly.**
 
-- Allocators (`DeviceSlice::alloc`, `SharedBuffer::alloc`, `Image2D::alloc`) are pure context ops — they `clCreateBuffer`/`clCreateImage` only, no enqueue. Return `Result<Self>` directly.
+- Allocators (`DeviceSlice::alloc`, `MappedSlice::alloc`, `Image2D::alloc`) are pure context ops — they `clCreateBuffer`/`clCreateImage` only, no enqueue. Return `Result<Self>` directly.
 - Transfer ops (`copy_from` / `copy_to` / kernel launch / image read-write / SVM map-unmap / queue barrier-finish) all return `OpBuilder<...>` and require a terminal.
 
 For the prototype path, sync sugar constructors that combine alloc + transfer + wait:
@@ -237,7 +237,7 @@ impl<T: Unpin> Future for Pending<T> {
 }
 ```
 
-Returned by `.track()` on resource ops (`SharedBuffer::map_mut`, etc.).
+Returned by `.track()` on resource ops (`MappedSlice::map_mut`, etc.).
 The resource `T` is held *inside* the Pending — the only way to access
 it is `.wait()` or `.await`, both of which yield `(T, Handle)`. The
 compiler enforces "don't touch the resource until the op completes"
@@ -269,7 +269,7 @@ impl<'a, T: Unpin> Future for BorrowHandle<'a, T> {
 
 Returned by `.track()` on copy ops whose destination is a borrowed
 `&mut [T]` (`DeviceSlice::copy_to`, `Image2D::copy_to`, `HostBuffer`,
-`SharedBuffer` host transfers). The lifetime `'a` ties the handle to
+`MappedSlice` host transfers). The lifetime `'a` ties the handle to
 the destination — the borrow checker rejects any user attempt to read
 the destination while the handle is alive. `.wait()` / `.await`
 consumes the handle, releasing the borrow.
@@ -319,9 +319,9 @@ been submitted yet; there's no cl_event to wait on. The user must call
 `.track()` first to get a Handle. This is a hard rule — keeps lifetimes
 sane and the model honest about what events actually exist.
 
-## SharedBuffer guards — DECIDED
+## MappedSlice guards — DECIDED
 
-`SharedBuffer::map_mut` returns a builder; terminals can yield the
+`MappedSlice::map_mut` returns a builder; terminals can yield the
 guard alone (untracked), `(guard, Handle)` (tracked), or a
 `Pending<MapGuard>` (track for deferred completion). Unmap is
 explicit, no RAII fallback.
@@ -454,13 +454,13 @@ until someone waits on its output.) That's baseline for both v0 and v1.
 |---|---|---|---|
 | `DeviceSlice<T>` | `alloc(&ctx, len)`, `from_slice(&ctx, &data)` (sync sugar) | `copy_from(launcher, src)`, `copy_to(launcher, dst)` | `()` |
 | `HostBuffer<T>` | `alloc(&ctx, len)`, `from_slice(&ctx, &data)` (sync sugar) | `copy_from(launcher, src)`, `copy_to(launcher, dst)` * | `()` |
-| `SharedBuffer<T>` | `alloc(&ctx, len)`, `from_slice(&ctx, &data)` (sync sugar) | `map_mut(launcher)` | `MapGuard` |
+| `MappedSlice<T>` | `alloc(&ctx, len)`, `from_slice(&ctx, &data)` (sync sugar) | `map_mut(launcher)` | `MapGuard` |
 | | | `unmap(guard)`, `copy_from`, `copy_to` * | `()` |
 | `Image2D<A, F>` | `alloc(&ctx, width, height)` | `copy_from(launcher, host_pixels)`, `copy_to(launcher, host_pixels)` | `()` |
 | `Queue<O>` | `new(&ctx)`, `on_device(&ctx, &dev)` | `marker()`, `barrier()`, `finish()` | `()` |
 | Kernels (proc-macro emits) | (none) | per-kernel: `foo(launcher, grid, args...)` returns named OpBuilder | `()` |
 
-\* `HostBuffer` and `SharedBuffer` transfers may be pure host memcpy
+\* `HostBuffer` and `MappedSlice` transfers may be pure host memcpy
 under the hood (no enqueue) but still return OpBuilders for API
 uniformity. See open Q.
 
@@ -549,7 +549,7 @@ let dur = h.event().profiling_command_end()?
 ### Scenario 7 — map profiling (async)
 
 ```rust
-async fn map_profiled(shared: &SharedBuffer<u8>, q: &Queue<InOrder>) -> Result<()> {
+async fn map_profiled(shared: &MappedSlice<u8>, q: &Queue<InOrder>) -> Result<()> {
     let (g, h) = shared.map_mut(q).tracked().await?;    // (guard, handle)
     let map_dur = h.event().profiling_command_end()?
                 - h.event().profiling_command_start()?;
@@ -562,7 +562,7 @@ async fn map_profiled(shared: &SharedBuffer<u8>, q: &Queue<InOrder>) -> Result<(
 ### Scenario 8 — deferred map via `Pending<MapGuard>`
 
 ```rust
-async fn deferred_map(shared: &SharedBuffer<u8>, q: &Queue<InOrder>) -> Result<()> {
+async fn deferred_map(shared: &MappedSlice<u8>, q: &Queue<InOrder>) -> Result<()> {
     let p = shared.map_mut(q).track()?;      // Pending<MapGuard>, not yet usable
     do_other_async_work().await?;            // map happens in background
     let (g, _h) = p.await?;                  // wait for map, then access guard
@@ -648,8 +648,8 @@ You get the error at compile time, not a heisenbug at runtime.
   - `DeviceSlice::copy_to` (current cross-buffer) → unified into the new `copy_from`/`copy_to` dispatch.
   - `HostBuffer` gets the same `alloc` + `copy_from` + `copy_to` + `from_slice` surface.
 - `claspr/src/svm.rs`:
-  - `SharedBuffer::map_mut` returns a builder; terminal returns guard alone (untracked) or `(guard, Handle)` (tracked).
-  - New `SharedBuffer::unmap(guard)` builder.
+  - `MappedSlice::map_mut` returns a builder; terminal returns guard alone (untracked) or `(guard, Handle)` (tracked).
+  - New `MappedSlice::unmap(guard)` builder.
   - Guard's Drop panics if not explicit-unmapped (guarded on `!thread::panicking()`).
 - `claspr/src/image.rs`: image read/write rewritten as `copy_from`/`copy_to` builders.
 - `claspr/src/future.rs`: `EventFuture` deleted (Handle's Future impl replaces it). The `async-events` feature flag retires.
@@ -700,7 +700,7 @@ Atomic rewrite on a fresh branch (e.g. `execution-model-rewrite` cut from `runti
 2. Refactor `Launcher` trait (strip `launch()` default, remove `LauncherAsync`).
 3. Rewrite `DeviceSlice` (`alloc` / `copy_from` / `copy_to` / `from_slice` + builder).
 4. Rewrite `HostBuffer` (same surface).
-5. Rewrite `SharedBuffer` (explicit unmap, guard with panic-on-Drop).
+5. Rewrite `MappedSlice` (explicit unmap, guard with panic-on-Drop).
 6. Rewrite `Image2D` (`copy_from` / `copy_to` builders with `.region(...)` / `.row_pitch(...)` modifiers).
 7. Add `Queue::marker()` / `barrier()` / `finish()` builders.
 8. Update `claspr-macros` (emit named per-kernel typestate-parameterised builders).
@@ -723,7 +723,7 @@ Single PR with this commit structure keeps git history reviewable even if interm
 - **v0 auto-flush** is "always clFlush on each touch"; v1 logical-clock is deferred until profiling shows the redundant flushes matter.
 - **Construction vs enqueue split** — pure constructors return `Result<Self>`; enqueue ops return `OpBuilder<...>`. `from_slice` sync sugar bridges the common prototype case.
 - **`copy_from` / `copy_to`** replaces `upload` / `download`. Single verb pair, direction via parameter type. Matches `cust` naming.
-- **SharedBuffer unmap is explicit** — no RAII fallback. Guard's Drop panics (or leaks in panic-in-panic) if unmap was forgotten. Composability and async-safety win over implicit cleanup.
+- **MappedSlice unmap is explicit** — no RAII fallback. Guard's Drop panics (or leaks in panic-in-panic) if unmap was forgotten. Composability and async-safety win over implicit cleanup.
 - **`.after()` accepts Handles only** — not in-progress builders. Hard rule. Builders must be terminated with `.track()` to be usable as deps.
 - **Handle is Clone + Send + Sync** — cheap clone via cl_event refcount + Arc clone. Enables fan-out without lifetime tangles.
 - **`Handle::wait(&self)`** — by reference, not by value. Handle remains usable after for profiling, further deps, etc.
@@ -734,7 +734,7 @@ Single PR with this commit structure keeps git history reviewable even if interm
 - **HostBuffer / SVM `copy_from`/`copy_to` always go through CL enqueue** — even though the buffers are host-visible and the impl could short-circuit to plain memcpy after sync, going through `clEnqueueSVMMemcpy` / `clEnqueueWriteBuffer` gives uniform semantics (Handle, deps, tracked variants all work the same as for DeviceSlice) and lets the queue handle ordering for free. Users who want the "I'll do the memcpy myself after sync" pattern can write it explicitly: `q.finish().await?; host.copy_from_slice(hb.as_slice())` or `let g = svm.map_mut(q).await?; host.copy_from_slice(&g); svm.unmap(g).await?`. That's a user-side choice, not our implementation's.
 - **`Pending<T>` for resource-op `.track()`** — earlier conservative call ("no `.track()` on resource ops") was wrong. The deferred-resource pattern is safe via a wrapper that holds the resource internally and only releases it on `.wait()` / `.await`. The compiler enforces "don't touch the resource until the op completes" because there's no method on `Pending<T>` that yields `T` without going through the wait. `Pending<T>` is NOT Clone (single ownership of the resource); `Pending<T>::wait()` returns `(T, Handle)` so the user gets the resource AND a Handle for profiling. Validated via spike.
 - **`BorrowHandle<'a, T>` for copy-op `.track()`** — when the op's destination is a borrowed `&mut [T]`, `.track()` returns a Handle with a `PhantomData<&'a mut [T]>` so the destination borrow is extended for the lifetime of the handle. Rust's borrow checker rejects any attempt to read the destination while the handle is alive (`E0499: cannot borrow as mutable more than once at a time`). `.wait()` / `.await` consumes the handle, releasing the borrow. Validated via spike.
-- **`.detach()` is method-absent on borrowed-source/dest copy ops** — fundamentally unsafe. The OpBuilder takes `&mut [T]` (or `&[T]`); `.detach()` would consume the builder and end the borrow, but the CL runtime keeps using the pointer after the non-blocking enqueue returns. The user could read/write the host slice while the runtime is mid-transfer — UB. Forced users to use `.wait()` (simple sync) or `.track() -> BorrowHandle<'a, T>` (overlap pattern). For users wanting zero-event fire-and-forget into host-side storage, the answer is to use a host-managed buffer type (`HostBuffer`, `SharedBuffer`) where the "host side" is CL-managed memory with no external Rust borrow. Spike validates this rejection produces a clean `E0599: no method named 'detach' found` error.
+- **`.detach()` is method-absent on borrowed-source/dest copy ops** — fundamentally unsafe. The OpBuilder takes `&mut [T]` (or `&[T]`); `.detach()` would consume the builder and end the borrow, but the CL runtime keeps using the pointer after the non-blocking enqueue returns. The user could read/write the host slice while the runtime is mid-transfer — UB. Forced users to use `.wait()` (simple sync) or `.track() -> BorrowHandle<'a, T>` (overlap pattern). For users wanting zero-event fire-and-forget into host-side storage, the answer is to use a host-managed buffer type (`HostBuffer`, `MappedSlice`) where the "host side" is CL-managed memory with no external Rust borrow. Spike validates this rejection produces a clean `E0599: no method named 'detach' found` error.
 
 ## References
 
@@ -761,7 +761,7 @@ The thin wrapper around OpenCL primitives. Direct, simple, sequential.
 - `copy_from` / `copy_to` verbs (matches cust naming).
 - `from_slice` sync sugar constructor.
 - Auto-flush v0 on `Handle::wait` / Future poll / IntoDeps.
-- `SharedBuffer::map_mut` returns a guard, explicit `unmap`, panic-on-Drop.
+- `MappedSlice::map_mut` returns a guard, explicit `unmap`, panic-on-Drop.
 - `Image2D<A, F>` format/access typestate.
 
 **What's dropped from V1:**
@@ -869,7 +869,7 @@ All 14 scenarios compile and run:
    Equivalent to cuda-oxide's `Arc<CudaModule>` pattern.
 
 2. **`Arc<T>` requires `T: Sync` for `.arc()`** — small bound, easy
-   to satisfy (`DeviceSlice`, `SharedBuffer` are Send+Sync since
+   to satisfy (`DeviceSlice`, `MappedSlice` are Send+Sync since
    `cl_mem` is thread-safe per CL spec).
 
 3. **Conditional graphs need type erasure (`DynOp`/`Box<dyn ...>`)** —
@@ -1002,7 +1002,7 @@ non-blocking and safe to call while commands are in flight. This is
 the same property cuda-oxide engineered into `DeviceBox` via
 `cuMemFreeAsync`; OpenCL gives it to us by default.
 
-**`clSVMFree`** (for SVM — `SharedBuffer<T>`): **immediate, UB if used
+**`clSVMFree`** (for SVM — `MappedSlice<T>`): **immediate, UB if used
 while commands in flight.**
 
 > Note that clSVMFree does NOT wait for previously enqueued commands
@@ -1021,7 +1021,7 @@ The Tier 1/Tier 2 design therefore:
   non-blocking, safe always. (We already wrap opencl3's Drop in
   `ManuallyDrop` to capture release errors into the sticky-error
   counter; the semantics are correct.)
-- **`SharedBuffer::Drop`** calls `clEnqueueSVMFree` on the source
+- **`MappedSlice::Drop`** calls `clEnqueueSVMFree` on the source
   queue with the last-known event as a dep. The Rust `Arc<QueueInner>`
   it holds is dropped immediately after; if that hits zero,
   `clReleaseCommandQueue` fires; CL defers queue deletion until the
@@ -1029,7 +1029,7 @@ The Tier 1/Tier 2 design therefore:
   lazy-deletion semantics — no callback-keep-alive gymnastics needed
   in Rust.
 
-> ⚠️ **Audit item for current claspr Tier 1**: today's `SharedBuffer`
+> ⚠️ **Audit item for current claspr Tier 1**: today's `MappedSlice`
 > may be calling `clSVMFree` directly via opencl3 wrappers. That's
 > UB if the buffer is dropped while a kernel is using it. Needs
 > verification + fix to use `clEnqueueSVMFree`.
@@ -1132,7 +1132,7 @@ The Tier 1/Tier 2 design therefore:
 
     Per buffer type:
     - `DeviceSlice<T>`: acquire = d2h to scratch Vec; release = h2d back
-    - `SharedBuffer<T>` (coarse SVM): acquire = clEnqueueSVMMap; release = clEnqueueSVMUnmap
+    - `MappedSlice<T>` (coarse SVM): acquire = clEnqueueSVMMap; release = clEnqueueSVMUnmap
     - `HostBuffer<T>` (persistent-mapped): acquire/release = no-op (value-wrap)
     - Fine-grain SVM / Shared USM: acquire/release = no-op
 

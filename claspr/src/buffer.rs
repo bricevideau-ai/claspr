@@ -4,8 +4,8 @@
 //! One tier lives in this module: [`DeviceSlice<T>`] —
 //! `CL_MEM_READ_WRITE`, accessed via [`upload`](DeviceSlice::upload)
 //! / [`download`](DeviceSlice::download). The host-mapped tier (SVM
-//! / [`SharedBuffer`](crate::svm::SharedBuffer)) lives in
-//! [`crate::svm`].
+//! / [`MappedSlice`](crate::mapped::MappedSlice)) lives in
+//! [`crate::mapped`].
 //!
 //! See the [`Buffer`] trait's own docs for what it does and does
 //! not abstract over.
@@ -25,7 +25,7 @@ use std::ptr;
 // ── Buffer trait ────────────────────────────────────────────────────
 
 /// Common accessors shared by the buffer tiers — [`DeviceSlice`]
-/// and [`crate::svm::SharedBuffer`].
+/// and [`crate::mapped::MappedSlice`].
 ///
 /// **Scope: plumbing, not tier polymorphism.** This trait exposes
 /// only the inspect-the-buffer accessors that mean the same thing
@@ -36,8 +36,8 @@ use std::ptr;
 ///
 /// - [`DeviceSlice::upload`] / [`DeviceSlice::download`] enqueue a
 ///   `clEnqueueRead`/`WriteBuffer` against a [`Launcher`].
-/// - [`SharedBuffer`](crate::svm::SharedBuffer) maps lazily on demand
-///   via [`SharedBuffer::map_mut`](crate::svm::SharedBuffer::map_mut)
+/// - [`MappedSlice`](crate::mapped::MappedSlice) maps lazily on demand
+///   via [`MappedSlice::map_mut`](crate::mapped::MappedSlice::map_mut)
 ///   and unmaps when the guard drops.
 /// - [`USMSlice`](crate::usm::USMSlice) wraps a host `Vec<T>` directly
 ///   — no map step at all, requires fine-grain-system SVM.
@@ -98,7 +98,7 @@ pub trait Buffer<T> {
 /// [`DeviceSlice::download`].
 ///
 /// Host code never sees the bytes directly — for that, use
-/// [`crate::svm::SharedBuffer<T>`] (coarse-grain SVM) or
+/// [`crate::mapped::MappedSlice<T>`] (coarse-grain SVM) or
 /// [`crate::usm::USMSlice<T>`] (fine-grain-system SVM over a host
 /// `Vec<T>`).
 ///
@@ -698,5 +698,5 @@ impl<T> Buffer<T> for DeviceSlice<T> {
 // writes the buffer, so the "zero-copy host-and-kernel share
 // memory" semantics it was reaching for were UB by construction.
 // Use [`USMSlice`](crate::USMSlice) (fine-grain system SVM) for
-// that role on supporting devices, or [`SharedBuffer`](crate::SharedBuffer)
+// that role on supporting devices, or [`MappedSlice`](crate::MappedSlice)
 // with the map-guard pattern for coarse-grain SVM.
