@@ -246,7 +246,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // Slices get a fresh generic type parameter each (e.g. `__D0`,
     // `__D1`, ...) bounded `: ::claspr::KernelSliceArg<elem>`. This
     // lets the same emitted method accept `DeviceSlice<T>`,
-    // `HostBuffer<T>`, or `SharedBuffer<T>` interchangeably while
+    // `SharedBuffer<T>`, or `USMSlice<T>` interchangeably while
     // keeping the flow-through Output typed precisely.
     let mut host_names: Vec<TokenStream2> = Vec::new();
     let mut method_params: Vec<TokenStream2> = Vec::new();
@@ -581,8 +581,8 @@ enum ParamRole {
     Builtin,
     /// Slice param (`#[spirv(cross_workgroup)] &mut [T]`). Becomes a
     /// generic type parameter `D: KernelSliceArg<T>` on the emitted
-    /// method + Op, so any of `DeviceSlice<T>` / `HostBuffer<T>` /
-    /// `SharedBuffer<T>` can flow through.
+    /// method + Op, so any of `DeviceSlice<T>` / `SharedBuffer<T>` /
+    /// `USMSlice<T>` can flow through.
     Slice {
         name: TokenStream2,
         /// The `T` from `&mut [T]` — used to constrain the generic.

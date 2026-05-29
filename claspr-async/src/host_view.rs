@@ -8,8 +8,7 @@
 //! | Buffer | Acquire | Release |
 //! |---|---|---|
 //! | [`DeviceSlice<T>`] | non-blocking `clEnqueueMapBuffer` (READ \| WRITE or READ only) | `clEnqueueUnmapMemObject` |
-//! | [`HostBuffer<T>`] | no-op — buffer is permanently mapped | no-op |
-//! | [`SharedBuffer<T>`] | blocking `clEnqueueSVMMap` | `clEnqueueSVMUnmap` |
+//! | [`SharedBuffer<T>`] | non-blocking `clEnqueueSVMMap` | `clEnqueueSVMUnmap` |
 //!
 //! All three view types implement [`crate::mappable::Mappable`] so
 //! the closure inside `and_then_host` receives the underlying slice
@@ -49,7 +48,7 @@ use crate::exec_ctx::ExecutionContext;
 use crate::mappable::Mappable;
 use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
 use claspr::util::{RetainedQueue, mapped_slice, mapped_slice_mut};
-use claspr::{Buffer, DeviceSlice, Error, Event, HostBuffer, Launcher, Result, SharedBuffer};
+use claspr::{Buffer, DeviceSlice, Error, Event, Launcher, Result, SharedBuffer};
 use opencl3::command_queue::{
     CommandQueue, enqueue_map_buffer, enqueue_svm_map, enqueue_svm_unmap, enqueue_unmap_mem_object,
 };
@@ -106,8 +105,9 @@ pub use access::{MapAccess, ReadOnly, ReadWrite};
 pub trait HostAccessibleExt: Sized {
     /// The acquire op type for this buffer kind (read/write).
     type AcquireOp: DeviceOperation;
-    /// The acquire op type for the read-only variant. Same kind for
-    /// types where read/write is a no-op (e.g. [`HostBuffer`]).
+    /// The acquire op type for the read-only variant. May be the
+    /// same kind as the read/write op when the only difference is
+    /// the `cl_map_flags` constant.
     type AcquireReadOp: DeviceOperation;
 
     /// Acquire a read/write host view. Closure inside
@@ -452,151 +452,10 @@ where
     fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
 }
 
-// ── HostBuffer: zero-copy — acquire/release are no-ops ──────────────
-
-impl<T> HostAccessibleExt for HostBuffer<T>
-where
-    T: Send + 'static,
-{
-    type AcquireOp = AcquireHostBufferOp<T>;
-    type AcquireReadOp = AcquireHostBufferOp<T>;
-    fn acquire_host_view(self) -> AcquireHostBufferOp<T> {
-        AcquireHostBufferOp { buf: Some(self) }
-    }
-    fn acquire_host_view_read(self) -> AcquireHostBufferOp<T> {
-        AcquireHostBufferOp { buf: Some(self) }
-    }
-}
-
-/// Combinator returned by `HostBuffer::acquire_host_view{,_read}`. No
-/// CL command — the buffer is permanently mapped already
-/// (`CL_MEM_ALLOC_HOST_PTR` + persistent map), so the view just wraps
-/// the buf.
-pub struct AcquireHostBufferOp<T> {
-    buf: Option<HostBuffer<T>>,
-}
-
-impl<T> DeviceOperation for AcquireHostBufferOp<T>
-where
-    T: Send + 'static,
-{
-    type Output = HostBufferHostView<T>;
-
-    fn execute(
-        mut self,
-        _ctx: &ExecutionContext<'_>,
-        deps: Deps,
-    ) -> Result<(HostBufferHostView<T>, Deps)> {
-        let buf = self
-            .buf
-            .take()
-            .expect("AcquireHostBufferOp::execute called twice");
-        // No CL command (zero-copy persistent map), but we still need
-        // to wait on pending device writes before the host derefs the
-        // map. Drain deps synchronously and forward an empty list.
-        for ev in &deps {
-            ev.as_ref().wait()?;
-        }
-        Ok((HostBufferHostView { buf }, Vec::new()))
-    }
-}
-
-/// Host view of a [`HostBuffer<T>`]. Same shape as
-/// [`DeviceSliceHostView`] but the underlying pointer is the
-/// HostBuffer's always-mapped one.
-pub struct HostBufferHostView<T> {
-    buf: HostBuffer<T>,
-}
-
-impl<T> Deref for HostBufferHostView<T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] {
-        // HostBuffer derefs to [T] via its persistent map.
-        &self.buf
-    }
-}
-
-impl<T> DerefMut for HostBufferHostView<T> {
-    fn deref_mut(&mut self) -> &mut [T] {
-        &mut self.buf
-    }
-}
-
-impl<T> HostBufferHostView<T>
-where
-    T: Send + 'static,
-{
-    /// Symmetric counterpart of [`HostAccessibleExt::acquire_host_view`].
-    /// Since [`HostBuffer`] is zero-copy, release is also a no-op —
-    /// just hand the buffer back.
-    pub fn release_to_device(self) -> ReleaseHostBufferOp<T> {
-        ReleaseHostBufferOp {
-            view: Some(self.buf),
-        }
-    }
-}
-
-/// Combinator returned by [`HostBufferHostView::release_to_device`].
-pub struct ReleaseHostBufferOp<T> {
-    view: Option<HostBuffer<T>>,
-}
-
-impl<T> DeviceOperation for ReleaseHostBufferOp<T>
-where
-    T: Send + 'static,
-{
-    type Output = HostBuffer<T>;
-    fn execute(mut self, _ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(HostBuffer<T>, Deps)> {
-        // No CL command. Forward deps unchanged so downstream device
-        // ops still wait on anything pending elsewhere in the chain.
-        Ok((
-            self.view
-                .take()
-                .expect("ReleaseHostBufferOp::execute called twice"),
-            deps,
-        ))
-    }
-}
-
-/// Mappable impl so a `HostBufferHostView` can pass its inner
-/// slice straight into an [`AndThenHost`](crate::AndThenHost) closure.
-impl<T> Mappable for HostBufferHostView<T>
-where
-    T: Send + 'static,
-{
-    type View<'a>
-        = &'a mut [T]
-    where
-        Self: 'a;
-    type MapHandle = HostViewHandle<T>;
-
-    fn map(
-        &self,
-        _queue: &CommandQueue,
-        _deps: &[cl_event],
-    ) -> Result<(Self::MapHandle, Vec<Event>)> {
-        let ptr = self.buf.as_ptr() as *mut T;
-        Ok((
-            HostViewHandle {
-                ptr,
-                len: self.buf.len(),
-                _t: PhantomData,
-            },
-            Vec::new(),
-        ))
-    }
-    fn enqueue_unmap(
-        _handle: &mut Self::MapHandle,
-        _queue: &CommandQueue,
-        _wait_for: &[cl_event],
-    ) -> Result<Vec<Event>> {
-        Ok(Vec::new())
-    }
-    fn view<'a>(handle: &'a mut Self::MapHandle) -> Self::View<'a> {
-        unsafe { mapped_slice_mut(handle.ptr, handle.len) }
-    }
-    fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
-}
+// HostBuffer host-view support removed 2026-05-29 alongside the
+// HostBuffer type itself (CL_MEM_ALLOC_HOST_PTR + persistent map is
+// spec-UB). Use SharedBuffer for SVM-backed host access, or USMSlice
+// when CL_DEVICE_SVM_FINE_GRAIN_SYSTEM is available.
 
 // ── SharedBuffer: non-blocking SVM map/unmap ────────────────────────
 

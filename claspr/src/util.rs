@@ -20,10 +20,10 @@ use std::slice;
 /// `clEnqueueMapBuffer` returns a host pointer that's only valid
 /// until the matching `clEnqueueUnmapMemObject` fires. Code that
 /// holds a mapped pointer across an arbitrary lifetime (the host
-/// view types, the `Mappable` handles, [`HostBuffer`](crate::HostBuffer))
-/// needs to keep a `cl_command_queue` alive for the eventual unmap
-/// even if the original `Launcher` that supplied the queue has
-/// long since dropped.
+/// view types, the `Mappable` handles) needs to keep a
+/// `cl_command_queue` alive for the eventual unmap even if the
+/// original `Launcher` that supplied the queue has long since
+/// dropped.
 ///
 /// Construct with [`RetainedQueue::from_queue`] (safe — borrows a
 /// live `CommandQueue`). Drop releases the retained reference. The

@@ -55,10 +55,9 @@ pub mod transfer_to_device;
 pub mod usm;
 
 pub use alloc::{
-    DeviceSliceAlloc, DeviceSliceFilled, HostBufferAlloc, HostBufferFilled, HostBufferUpload,
-    SharedBufferAlloc, SharedBufferFilled, SharedBufferUpload, device_slice_alloc,
-    device_slice_filled, host_buffer_alloc, host_buffer_filled, host_buffer_upload,
-    shared_buffer_alloc, shared_buffer_filled, shared_buffer_upload,
+    DeviceSliceAlloc, DeviceSliceFilled, SharedBufferAlloc, SharedBufferFilled, SharedBufferUpload,
+    device_slice_alloc, device_slice_filled, shared_buffer_alloc, shared_buffer_filled,
+    shared_buffer_upload,
 };
 pub use and_then_host::{AndThenHost, AndThenHostWithContext, DeviceOperationHostExt};
 pub use arc::ArcSplit;
@@ -71,9 +70,8 @@ pub use exec_ctx::ExecutionContext;
 pub use fan_out::{FanOut, FanOutExt, fan_out};
 pub use future::ChainFuture;
 pub use host_view::{
-    AcquireDeviceSliceOp, AcquireHostBufferOp, AcquireSharedBufferOp, DeviceSliceHostView,
-    HostAccessibleExt, HostBufferHostView, ReleaseDeviceSliceOp, ReleaseHostBufferOp,
-    ReleaseSharedBufferOp, SharedBufferHostView,
+    AcquireDeviceSliceOp, AcquireSharedBufferOp, DeviceSliceHostView, HostAccessibleExt,
+    ReleaseDeviceSliceOp, ReleaseSharedBufferOp, SharedBufferHostView,
 };
 pub use mappable::{DeviceSliceMapHandle, Mappable};
 pub use on_device::OnDevice;
@@ -152,28 +150,6 @@ macro_rules! shared_buffer {
     };
 }
 
-/// `vec!`-shaped sugar for producing a [`HostBuffer<T>`] op —
-/// host-pinned analog of [`device_slice!`](crate::device_slice!) /
-/// [`shared_buffer!`](crate::shared_buffer!).
-///
-/// Two arms mirror [`vec!`](std::vec):
-///
-/// - `host_buffer![value; count]` — alloc + slice-fill through the
-///   persistent host map. Expands to
-///   [`host_buffer_filled(value, count)`](crate::host_buffer_filled).
-/// - `host_buffer![a, b, c]` — alloc + memcpy from a host literal.
-///   Expands to
-///   [`host_buffer_upload(vec![a, b, c])`](crate::host_buffer_upload).
-///
-/// Both arms are pure host writes (no clEnqueue) — the OpenCL
-/// runtime synchronises at the next kernel-launch boundary that
-/// consumes the buffer.
-#[macro_export]
-macro_rules! host_buffer {
-    [$value:expr; $count:expr] => {
-        $crate::host_buffer_filled($value, $count)
-    };
-    [$($v:expr),* $(,)?] => {
-        $crate::host_buffer_upload(::std::vec![$($v),*])
-    };
-}
+// `host_buffer!` macro removed 2026-05-29 when HostBuffer was
+// deleted (see commit log). Use `device_slice!` or `shared_buffer!`
+// instead; for fine-grain-system SVM use `usm_slice(vec)`.

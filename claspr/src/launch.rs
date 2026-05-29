@@ -35,7 +35,7 @@
 //! Rust types). The stage-2 build-time codegen and stage-3 proc-macro
 //! will tighten this to compile-time checks.
 
-use crate::buffer::{DeviceSlice, HostBuffer};
+use crate::buffer::DeviceSlice;
 use opencl3::event::Event;
 use opencl3::kernel::ExecuteKernel;
 use std::sync::Arc;
@@ -104,10 +104,10 @@ mod kernel_slice_arg_sealed {
 ///
 /// - [`crate::DeviceSlice<T>`] — `clCreateBuffer`-backed device
 ///   memory, the default.
-/// - [`crate::HostBuffer<T>`] — `CL_MEM_ALLOC_HOST_PTR` zero-copy
-///   host-mapped memory.
 /// - [`crate::SharedBuffer<T>`] — coarse-grain SVM, when the device
 ///   supports it.
+/// - [`crate::USMSlice<T>`] — fine-grain-system SVM wrapping a host
+///   `Vec<T>`, when the device supports it.
 ///
 /// The trait extends [`KernelArg`] (so the underlying
 /// `clSetKernelArg` plumbing is reused) and is sealed — claspr owns
@@ -122,13 +122,6 @@ pub trait KernelSliceArg<T>: KernelArg + Send + 'static + kernel_slice_arg_seale
 
 impl<T: Send + 'static> kernel_slice_arg_sealed::Sealed for DeviceSlice<T> {}
 impl<T: Send + 'static> KernelSliceArg<T> for DeviceSlice<T> {
-    fn element_count(&self) -> usize {
-        crate::Buffer::len(self)
-    }
-}
-
-impl<T: Send + Sync + 'static> kernel_slice_arg_sealed::Sealed for HostBuffer<T> {}
-impl<T: Send + Sync + 'static> KernelSliceArg<T> for HostBuffer<T> {
     fn element_count(&self) -> usize {
         crate::Buffer::len(self)
     }
@@ -165,10 +158,10 @@ impl<T: Send + Sync + 'static> KernelSliceArg<T> for Arc<DeviceSlice<T>> {
     }
 }
 
-// `DeviceSlice` and `HostBuffer` live in `buffer`, but their
-// `KernelArg` impls belong here with the rest of the launch surface
-// so `set_arg` plumbing is in one place. Both decompose into the
-// same `(buffer, len)` pair that rust-gpu's slice param expects.
+// `DeviceSlice` lives in `buffer`, but its `KernelArg` impl belongs
+// here with the rest of the launch surface so `set_arg` plumbing is
+// in one place. Decomposes into the `(buffer, len)` pair that
+// rust-gpu's slice param expects.
 impl<T> KernelArg for DeviceSlice<T> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         let len: usize = self.len;
@@ -180,16 +173,6 @@ impl<T> KernelArg for DeviceSlice<T> {
     // refcount-based, so the runtime defers actual deletion until
     // in-flight commands using the buffer finish. No host-side
     // bookkeeping needed.
-}
-
-impl<T> KernelArg for HostBuffer<T> {
-    fn set(&self, exec: &mut ExecuteKernel<'_>) {
-        let len: usize = crate::Buffer::len(self);
-        unsafe {
-            exec.set_arg(self.buffer()).set_arg(&len);
-        }
-    }
-    // Same as `DeviceSlice`: `cl_mem` lazy release.
 }
 
 // Arc<DeviceSlice<T>> just delegates to the inner DeviceSlice. The

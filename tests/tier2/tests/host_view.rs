@@ -7,7 +7,7 @@
 //! be called inside the closure; the view passes through `and_then`
 //! to `release_to_device` unchanged.
 
-use claspr::{Buffer, Context, HostBuffer, SharedBuffer, SvmLevel};
+use claspr::{Context, SharedBuffer, SvmLevel};
 use claspr_async::{
     DeviceOperation, DeviceOperationHostExt, HostAccessibleExt, download, upload, value,
 };
@@ -130,34 +130,6 @@ fn acquire_host_view_read_just_inspect_and_drop() {
         .expect("read-only inspect chain");
 
     assert_eq!(*first_cell.lock().unwrap(), 52, "13 * 4 = 52");
-}
-
-// ── HostBuffer (zero-copy persistent map) ───────────────────────────
-
-#[test]
-fn host_buffer_acquire_release_is_zero_copy_passthrough() {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
-    let buf = HostBuffer::<u32>::from_slice(&ctx, &vec![5u32; N]).expect("alloc HostBuffer");
-
-    let returned_buf: HostBuffer<u32> = value(buf)
-        .and_then(|b| b.acquire_host_view())
-        .and_then_host(|slice: &mut [u32]| {
-            // Same direct-slice closure signature as the DeviceSlice
-            // path. For HostBuffer the bytes are at the persistent
-            // mapped pointer; the closure mutates in place.
-            slice[0] = 999;
-            Ok(())
-        })
-        .and_then(|view| view.release_to_device())
-        .sync(&ctx)
-        .expect("HostBuffer round-trip");
-
-    assert_eq!(returned_buf[0], 999, "host edit should be visible");
-    assert_eq!(returned_buf[1], 5);
-    assert_eq!(returned_buf.len(), N);
 }
 
 // ── SharedBuffer (coarse-grain SVM map/unmap) ───────────────────────

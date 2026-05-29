@@ -8,7 +8,7 @@
 //! sticky error on the context. We force every drop, then poke the
 //! context for errors and finish the queue.
 
-use claspr::{Context, DeviceSlice, HostBuffer, Launcher};
+use claspr::{Context, DeviceSlice, Launcher};
 use claspr_test_kernels::kernels;
 
 const N: usize = 4096;
@@ -38,25 +38,6 @@ fn device_slice_drop_while_kernel_in_flight() {
     // Force pending work to complete via the context's default queue.
     ctx.cl_queue().finish().expect("finish");
     assert_eq!(ctx.error_count(), 0, "no release errors expected");
-}
-
-#[test]
-fn host_buffer_drop_after_non_blocking_write() {
-    // HostBuffer's typed launch path takes the buffer's KernelArg
-    // impl directly; the simpler check here is that a non-blocking
-    // device read (from a fresh DeviceSlice) into the HostBuffer
-    // keeps the HostBuffer alive until completion. Drop the HostBuffer
-    // before finish; the mapped pointer must not be unmapped while
-    // the runtime still holds it.
-    let Some(ctx) = ctx() else { return };
-    let mut src = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc src");
-    let host = vec![5u32; N];
-    src.write(&ctx, &host).wait().expect("write");
-    let mut dst = HostBuffer::<u32>::alloc(&ctx, N).expect("alloc host");
-    let _event = src.read(&ctx, &mut dst[..]).submit().expect("submit");
-    drop(dst);
-    ctx.cl_queue().finish().expect("finish");
-    assert_eq!(ctx.error_count(), 0);
 }
 
 // (SharedBuffer drop-while-in-flight is covered separately in

@@ -11,7 +11,7 @@
 //! `SharedBuffer::alloc` returns [`crate::Error::SvmNotAvailable`]
 //! when the device reports [`crate::SvmLevel::None`]. Check
 //! `ctx.svm_capability()` if you want to fall back to a
-//! [`crate::DeviceSlice`] or [`crate::HostBuffer`] gracefully.
+//! [`crate::DeviceSlice`] gracefully.
 //!
 //! # Example
 //!

@@ -2,7 +2,7 @@
 //!
 //! Two ergonomic primitives added together:
 //!
-//! - `device_slice_alloc` / `host_buffer_alloc` / `shared_buffer_alloc`:
+//! - `device_slice_alloc` / `shared_buffer_alloc`:
 //!   lazy `DeviceOperation` versions of the synchronous constructors,
 //!   making bundle-hoisted-alloc and `and_then_with_context`-of-an-op
 //!   chains express cleanly.
@@ -15,10 +15,9 @@
 //! shape (hoisted bundle + chained `and_then_with_context`) work
 //! end-to-end on a real device.
 
-use claspr::{Buffer, Context, Error, HostBuffer, SharedBuffer, SvmLevel};
+use claspr::{Buffer, Context, Error, SharedBuffer, SvmLevel};
 use claspr_async::{
-    DeviceOperation, bundle, device_slice_alloc, download, host_buffer_alloc, shared_buffer_alloc,
-    upload, value,
+    DeviceOperation, bundle, device_slice_alloc, download, shared_buffer_alloc, upload, value,
 };
 use claspr_test_kernels::kernels;
 
@@ -49,19 +48,6 @@ fn device_slice_alloc_produces_buffer_usable_in_kernel() {
         .expect("alloc + fill chain");
     assert_eq!(result.len(), N);
     assert!(result.iter().all(|&v| v == 42));
-}
-
-#[test]
-fn host_buffer_alloc_produces_buffer_of_requested_len() {
-    // HostBuffer's contents are uninit at alloc time — don't read
-    // them. Just confirm the alloc op produces a buffer of the
-    // requested length, materialised through the chain terminal.
-    let Some(ctx) = ctx() else { return };
-    let buf: HostBuffer<u32> = host_buffer_alloc::<u32>(N).sync(&ctx).expect("alloc");
-    assert_eq!(buf.len(), N);
-    // Drop here exercises the HostBuffer unmap-on-Drop path, which
-    // is the failure mode most likely to regress if the alloc op
-    // didn't go through `HostBuffer::alloc` cleanly.
 }
 
 #[test]
