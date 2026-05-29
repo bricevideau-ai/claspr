@@ -1,6 +1,6 @@
 //! `Buffer<T>` plumbing — validates the trait's documented contract:
 //! a polymorphic accessor for `len`/`is_empty`/`ctx` that works across
-//! `DeviceSlice<T>` and `MappedSlice<T>`.
+//! `DeviceSlice<T>`, `MappedSlice<T>`, and `USMSlice<T>`.
 //!
 //! Per the trait's rustdoc this is **explicitly not** a tier-
 //! polymorphism point — there is no uniform `upload` verb across the
@@ -8,7 +8,7 @@
 //! committing to a tier is exactly the use case the trait exists
 //! for; this file proves that use case compiles and runs.
 
-use claspr::{Buffer, Context, DeviceSlice, MappedSlice, SvmLevel};
+use claspr::{Buffer, Context, DeviceSlice, MappedSlice, SvmLevel, USMSlice};
 
 const N: usize = 128;
 
@@ -45,10 +45,18 @@ fn buffer_accessor_works_uniformly_across_tiers() {
     println!("{d}");
     assert!(d.contains(&format!("{N} elements")));
 
-    // MappedSlice when available — the other tier currently covered.
+    // MappedSlice (coarse-grain SVM) when available.
     if ctx.svm_capability() != SvmLevel::None {
-        let shared = MappedSlice::<u32>::alloc(&ctx, N).expect("MappedSlice alloc");
-        let d = describe("MappedSlice", &shared);
+        let mapped = MappedSlice::<u32>::alloc(&ctx, N).expect("MappedSlice alloc");
+        let d = describe("MappedSlice", &mapped);
+        println!("{d}");
+        assert!(d.contains(&format!("{N} elements")));
+    }
+
+    // USMSlice (fine-grain-system SVM) when available.
+    if ctx.svm_capability() == SvmLevel::FineSystem {
+        let usm = USMSlice::<u32>::new(&ctx, vec![0u32; N]).expect("USMSlice new");
+        let d = describe("USMSlice", &usm);
         println!("{d}");
         assert!(d.contains(&format!("{N} elements")));
     }
