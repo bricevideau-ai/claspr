@@ -149,3 +149,27 @@ macro_rules! mapped_slice {
         $crate::mapped_slice_upload(::std::vec![$($v),*])
     };
 }
+
+/// `vec!`-shaped sugar for producing a [`USMSlice<T>`](claspr::USMSlice)
+/// op — symmetric with [`device_slice!`](crate::device_slice!) /
+/// [`mapped_slice!`](crate::mapped_slice!).
+///
+/// Both arms expand to [`usm_slice`](crate::usm_slice) over a host
+/// `Vec<T>` — USMSlice always wraps an existing host allocation, so
+/// there's no cheap on-device fill path to distinguish from the
+/// literal arm. The macro exists for syntactic symmetry across the
+/// tier family, not for cost-path sugar.
+///
+/// ```ignore
+/// let buf_op = usm_slice![0u32; N];
+/// let buf_op = usm_slice![1u32, 2, 3, 4];
+/// ```
+#[macro_export]
+macro_rules! usm_slice {
+    [$value:expr; $count:expr] => {
+        $crate::usm_slice(::std::vec![$value; $count])
+    };
+    [$($v:expr),* $(,)?] => {
+        $crate::usm_slice(::std::vec![$($v),*])
+    };
+}

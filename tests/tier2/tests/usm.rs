@@ -100,6 +100,36 @@ fn usm_slice_drop_waits_for_in_flight_kernel() {
 }
 
 #[test]
+fn macro_usm_slice_repeat_arm() {
+    // `usm_slice![v; N]` → usm_slice(vec![v; N]).
+    let Some(ctx) = ctx_with_fine_system() else {
+        return;
+    };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let buf = usm_slice![6u32; N]
+        .and_then(|s| kernels.scale_u32([N], s, 5))
+        .sync(&ctx)
+        .expect("macro repeat");
+    assert!(buf.iter().all(|&v| v == 30));
+}
+
+#[test]
+fn macro_usm_slice_literal_arm() {
+    // `usm_slice![a, b, c]` → usm_slice(vec![a, b, c]).
+    let Some(ctx) = ctx_with_fine_system() else {
+        return;
+    };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let buf = usm_slice![10u32, 20, 30, 40]
+        .and_then(|s| kernels.scale_u32([4], s, 2))
+        .sync(&ctx)
+        .expect("macro literal");
+    assert_eq!(&buf[..], &[20u32, 40, 60, 80]);
+}
+
+#[test]
 fn usm_slice_host_writes_visible_to_kernel_via_deref_mut() {
     // Mutate via DerefMut, then launch. With fine-grain system,
     // host writes are visible to the kernel without any sync.
