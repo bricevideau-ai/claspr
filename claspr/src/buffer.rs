@@ -1,15 +1,11 @@
 //! Typed device-side buffers and the [`Buffer`] trait that abstracts
 //! over them.
 //!
-//! Two tiers live in this module:
-//!
-//! | Type | Backing | Host access | Use case |
-//! |------|---------|-------------|----------|
-//! | [`DeviceSlice<T>`] | `CL_MEM_READ_WRITE` | via [`upload`](DeviceSlice::upload) / [`download`](DeviceSlice::download) | classic device-side buffer, opaque host pointer |
-//! | [`HostBuffer<T>`] | `CL_MEM_ALLOC_HOST_PTR` + persistent map | direct via `Deref<Target=[T]>` + `DerefMut` | pinned, runtime-chosen-host-accessible memory; zero-copy where the device supports it |
-//!
-//! The third tier (SVM / [`SharedBuffer`](crate::svm::SharedBuffer))
-//! lives in [`crate::svm`].
+//! One tier lives in this module: [`DeviceSlice<T>`] —
+//! `CL_MEM_READ_WRITE`, accessed via [`upload`](DeviceSlice::upload)
+//! / [`download`](DeviceSlice::download). The host-mapped tier (SVM
+//! / [`SharedBuffer`](crate::svm::SharedBuffer)) lives in
+//! [`crate::svm`].
 //!
 //! See the [`Buffer`] trait's own docs for what it does and does
 //! not abstract over.

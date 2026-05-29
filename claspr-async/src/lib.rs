@@ -52,6 +52,7 @@ pub mod op;
 pub mod profile;
 pub mod transfer;
 pub mod transfer_to_device;
+pub mod usm;
 
 pub use alloc::{
     DeviceSliceAlloc, DeviceSliceFilled, HostBufferAlloc, HostBufferFilled, HostBufferUpload,
@@ -83,6 +84,7 @@ pub use op::{
 pub use profile::{DeviceOperationProfileExt, Profiled};
 pub use transfer::{Download, Upload, UploadSource, download, upload};
 pub use transfer_to_device::{TransferToDevice, transfer_to_device};
+pub use usm::{UsmSliceOp, usm_slice};
 
 /// `vec!`-shaped sugar for producing a [`DeviceSlice<T>`] op.
 ///

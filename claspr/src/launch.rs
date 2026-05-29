@@ -141,6 +141,13 @@ impl<T: Send + 'static> KernelSliceArg<T> for crate::SharedBuffer<T> {
     }
 }
 
+impl<T: Send + 'static> kernel_slice_arg_sealed::Sealed for crate::USMSlice<T> {}
+impl<T: Send + 'static> KernelSliceArg<T> for crate::USMSlice<T> {
+    fn element_count(&self) -> usize {
+        crate::Buffer::len(self)
+    }
+}
+
 // `Arc<DeviceSlice<T>>` — share one cl_mem across N parallel chain
 // branches without re-uploading. Pair with [`claspr_async::Arced`]
 // (built by `.arc()` on a `DeviceOperation` whose Output is
