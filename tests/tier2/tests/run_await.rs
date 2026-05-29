@@ -11,7 +11,7 @@
 //! need a full async runtime.
 
 use claspr::Context;
-use claspr_async::{DeviceOperation, download, upload, value, with_context};
+use claspr_async::{DeviceOperation, DeviceOperationHostExt, download, upload, value};
 use claspr_test_kernels::kernels;
 use futures::executor::block_on;
 
@@ -57,17 +57,21 @@ fn await_propagates_chain_error() {
         return;
     };
 
-    // Force the chain to fail by passing a bogus length to a download
-    // — DeviceSlice::download returns LengthMismatch if dst.len() !=
-    // self.len().
-    let chain = value(vec![0u32; 16]).and_then(upload).and_then(|buf| {
-        with_context(move |ec| {
-            let mut wrong_size = vec![0u32; 8];
-            // This errors synchronously inside execute.
-            buf.read(ec, &mut wrong_size).wait()?;
-            Ok::<_, claspr::Error>(wrong_size)
-        })
-    });
+    // Synthesize a chain error from inside an `.and_then_host` step
+    // and assert it surfaces at `.run().await`. The original test
+    // used a `with_context` closure to do a fallible Tier 1 read
+    // with a mismatched destination size; with `with_context`
+    // removed, we construct the same error variant directly. The
+    // test's intent (chain Err → terminal Err) is preserved; the
+    // mechanism (where the error originates) is different.
+    let chain = value(vec![0u32; 16]).and_then(upload).and_then_host(
+        |view: &mut [u32]| -> claspr::Result<()> {
+            Err(claspr::Error::LengthMismatch {
+                src: view.len(),
+                dst: 8,
+            })
+        },
+    );
 
     let err = block_on(chain.run(&ctx)).expect_err("chain should error");
     assert!(

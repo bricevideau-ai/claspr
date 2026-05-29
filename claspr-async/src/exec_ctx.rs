@@ -4,13 +4,12 @@
 //! Carries the [`Context`], the current [`Device`], and a borrowed
 //! [`CommandQueue`] to enqueue on. Implements [`Launcher`] so any
 //! existing Tier 1 op (e.g. proc-macro-generated `kernels.foo(...)`)
-//! composes directly inside a chain:
+//! composes directly inside a chain via `.and_then_with_context`:
 //!
 //! ```ignore
-//! with_context(move |ctx| {
-//!     // ctx: &ExecutionContext implements Launcher
-//!     kernels.foo(ctx, [N], &buf).wait()?;  // Tier 1 inside Tier 2
-//!     Ok(buf)
+//! .and_then_with_context(|ec, buf| {
+//!     // ec: &ExecutionContext implements Launcher
+//!     kernels.foo([N], buf, scalar).on_device(ec.device_at(1))
 //! })
 //! ```
 //!

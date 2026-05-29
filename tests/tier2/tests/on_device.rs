@@ -111,8 +111,7 @@ fn on_device_preserves_host_error_slot_across_routing() {
             })
         });
 
-    // DeviceSlice<u32> doesn't impl Debug; can't use `.expect_err`.
-    let err = chain.sync(&ctx).err().expect("expected branch B error");
+    let err = chain.sync(&ctx).expect_err("expected branch B error");
     assert!(
         matches!(&err, Error::Build { log } if log == "routed-chain abort"),
         "got {err:?}",

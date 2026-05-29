@@ -71,9 +71,7 @@ fn shared_buffer_alloc_succeeds_or_surfaces_svm_not_available() {
     if ctx.svm_capability() == SvmLevel::None {
         // The synchronous SharedBuffer::alloc gates on SVM; the
         // lazy op should surface the same Err at execute time.
-        // (SharedBuffer doesn't impl Debug so we can't print it on
-        // failure — match on the Err arm directly.)
-        let err = result.err().expect("expected SvmNotAvailable");
+        let err = result.expect_err("expected SvmNotAvailable");
         assert!(
             matches!(err, Error::SvmNotAvailable),
             "expected SvmNotAvailable on no-SVM device, got {err:?}",

@@ -25,6 +25,7 @@ use opencl3::memory::{
     release_mem_object,
 };
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_event, cl_int, cl_mem};
+use std::fmt;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
@@ -589,6 +590,19 @@ impl<'a, T> MigrateOp<'a, T> {
     }
 }
 
+/// Metadata-only `Debug` — never reads device memory (would block /
+/// fault) and doesn't require `T: Debug` (the element type doesn't
+/// flow through). Useful for `Result<DeviceSlice<T>, _>::expect_err`
+/// / `.unwrap` and generic `{:?}` chain-output debugging.
+impl<T> fmt::Debug for DeviceSlice<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceSlice")
+            .field("len", &self.len)
+            .field("element_size", &std::mem::size_of::<T>())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T> Buffer<T> for DeviceSlice<T> {
     fn len(&self) -> usize {
         self.len
@@ -700,6 +714,17 @@ impl<T> HostBuffer<T> {
     /// Borrow the underlying opencl3 [`ClBuffer`](opencl3::memory::Buffer).
     pub fn buffer(&self) -> &ClBuffer<T> {
         &self.buffer
+    }
+}
+
+/// Metadata-only `Debug` — does not deref into the mapped host slice
+/// (could be huge / sensitive) and doesn't require `T: Debug`.
+impl<T> fmt::Debug for HostBuffer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostBuffer")
+            .field("len", &self.len)
+            .field("element_size", &std::mem::size_of::<T>())
+            .finish_non_exhaustive()
     }
 }
 

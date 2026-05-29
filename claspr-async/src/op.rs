@@ -13,9 +13,8 @@
 //! Combinators thread this through automatically: `and_then` forwards
 //! source's events to next, `bundle!` / `fan_out` clone the input
 //! deps to each child and join the children's events via
-//! `clEnqueueMarkerWithWaitList`. Host-only ops ([`Value`],
-//! [`WithContext`]) wait on `deps` synchronously before running their
-//! closure and return an empty event list.
+//! `clEnqueueMarkerWithWaitList`. Host-only ops ([`Value`])
+//! pass `deps` through unchanged and return an empty event list.
 //!
 //! The terminals ([`sync`](DeviceOperation::sync) /
 //! [`run`](DeviceOperation::run)) wait on the final events before
@@ -24,10 +23,10 @@
 //! ## Combinators (this module)
 //!
 //! - [`value(v)`](value) — lift a host value into the chain.
-//! - [`with_context(|ctx| ...)`](with_context) — defer construction
-//!   of an op until the [`ExecutionContext`] is available.
 //! - [`.and_then(|out| next_op)`](DeviceOperation::and_then) —
 //!   sequential dependency.
+//! - [`.and_then_with_context(|ec, out| next_op)`](DeviceOperation::and_then_with_context)
+//!   — same, with the running [`ExecutionContext`] in scope.
 //! - [`.arc()`](DeviceOperation::arc) — wrap output in `Arc<T>`.
 
 use crate::exec_ctx::ExecutionContext;
@@ -64,11 +63,12 @@ pub fn wrap_event(event: Event) -> Dep {
 
 /// Anything that describes lazy device work.
 ///
-/// Built up via free constructors ([`value`], [`with_context`], plus
-/// the proc-macro-emitted `kernels.foo_op(...)`) and the combinator
-/// methods on this trait. Executes when the user picks a terminal —
-/// [`sync`](Self::sync) (blocking) or [`run`](Self::run) (async
-/// `.await`).
+/// Built up via free constructors ([`value`], [`upload`](crate::upload),
+/// [`download`](crate::download), the alloc combinators in
+/// [`crate::alloc`], plus the proc-macro-emitted `kernels.foo(...)`)
+/// and the combinator methods on this trait. Executes when the user
+/// picks a terminal — [`sync`](Self::sync) (blocking) or
+/// [`run`](Self::run) (async `.await`).
 pub trait DeviceOperation: Send + Sized {
     /// The host value this op produces when it finishes.
     type Output: Send;
@@ -156,11 +156,10 @@ pub trait DeviceOperation: Send + Sized {
     /// Closure returns an op (`U: DeviceOperation`), not a
     /// `Result<value>` — mirroring `.and_then`. If the closure body
     /// needs synchronous fallible setup, push that into a lazy op
-    /// (e.g. one of the alloc combinators in [`crate::alloc`]) or
-    /// nest a [`with_context`] inside the closure.
+    /// (e.g. one of the alloc combinators in [`crate::alloc`]).
     ///
-    /// Saves a level of closure nesting compared to
-    /// `.and_then(|prev| with_context(move |ec| { ... }))`.
+    /// For host-side work mid-chain with `ec` access, see
+    /// [`and_then_host_with_context`](crate::DeviceOperationHostExt::and_then_host_with_context).
     fn and_then_with_context<F, U>(self, f: F) -> AndThenWithContext<Self, F>
     where
         F: FnOnce(&ExecutionContext<'_>, Self::Output) -> U + Send,
@@ -256,12 +255,11 @@ where
     // chains using the same context. The chain's own commands are
     // already covered: `events` contains the chain's final events,
     // which transitively gate every upstream chain command via
-    // OpenCL's event semantics. Orphan commands from a
-    // `with_context` closure that called `.submit()` and discarded
-    // the event are the caller's responsibility (see
-    // `with_context`'s rustdoc) — they must either chain those
-    // events back into the chain's deps, or use `.wait()` terminals
-    // inside the closure.
+    // OpenCL's event semantics. Untracked commands from inside an
+    // `.and_then_with_context` closure that called `.submit()` and
+    // discarded the event are the caller's responsibility — they
+    // must chain the event back into the chain's deps or use
+    // `.wait()` terminals inside the closure.
     //
     // Prefer a stashed host error (from an `and_then_host` worker)
     // over the CL cascade — that's the whole point of the slot. The
@@ -298,56 +296,6 @@ impl<T: Send> DeviceOperation for Value<T> {
                 .expect("Value::execute called twice — internal claspr-async bug"),
             deps,
         ))
-    }
-}
-
-// ── WithContext: defer construction until the ctx is known ──────────
-
-/// Lazy wrapper around a closure that produces a host value given the
-/// running [`ExecutionContext`].
-///
-/// **Note on dependencies:** the closure can't naturally accept
-/// per-call `deps`, so `execute` waits on `deps` synchronously
-/// before running the closure (ensuring any device state the closure
-/// might read is consistent). The closure's own enqueues are
-/// expected to use `.wait()` terminals — if they use `.submit()`,
-/// those events are untracked by the chain and may strand commands
-/// the terminal's defensive `queue.finish()` will catch (but not
-/// chain into downstream ops).
-pub struct WithContext<F> {
-    f: Option<F>,
-}
-
-pub fn with_context<F, O>(f: F) -> WithContext<F>
-where
-    F: FnOnce(&ExecutionContext<'_>) -> Result<O> + Send,
-    O: Send,
-{
-    WithContext { f: Some(f) }
-}
-
-impl<F, O> DeviceOperation for WithContext<F>
-where
-    F: FnOnce(&ExecutionContext<'_>) -> Result<O> + Send,
-    O: Send,
-{
-    type Output = O;
-
-    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(O, Deps)> {
-        // Drain deps before running the closure — anything the
-        // closure might read from device state needs to be ready.
-        for ev in &deps {
-            ev.wait()?;
-        }
-        let out = (self
-            .f
-            .take()
-            .expect("WithContext::execute called twice — internal claspr-async bug"))(
-            ctx
-        )?;
-        // Closure assumed to use .wait() on its internal Tier 1 ops;
-        // no events to forward.
-        Ok((out, Vec::new()))
     }
 }
 

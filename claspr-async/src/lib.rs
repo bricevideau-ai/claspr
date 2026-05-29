@@ -11,32 +11,22 @@
 //!
 //! ```ignore
 //! use claspr::Context;
-//! use claspr_async::{DeviceOperation, value, with_context};
+//! use claspr_async::{DeviceOperation, download, upload};
 //!
 //! let ctx = Context::any()?;
+//! let kernels = gpu::kernels(&ctx)?;
 //!
-//! // A chain: lift a Vec to device, run a kernel, then download.
-//! let result: Vec<u32> = value(input_vec)
-//!     .and_then(|v| with_context(move |c| Ok(claspr::DeviceSlice::upload(c, &v)?)))
-//!     .and_then(|buf| with_context(move |c| {
-//!         kernels.foo_op(c, [N], &buf)?;  // proc-macro-emitted Tier 2 op
-//!         Ok(buf)
-//!     }))
-//!     .and_then(|buf| with_context(move |c| {
-//!         let mut out = vec![0u32; buf.len()];
-//!         Ok(buf.download(c)?)
-//!         Ok(out)
-//!     }))
+//! // Lift a Vec to device, run a kernel, then download.
+//! let result: Vec<u32> = upload(input_vec)
+//!     .and_then(|buf| kernels.foo([N], buf, scalar))
+//!     .and_then(download)
 //!     .sync(&ctx)?;
 //! ```
-//!
-//! The proc-macro-emitted Tier 2 wrappers (landing in Phase 4) will
-//! reduce that to a single `.foo_op(...).and_then(...)` chain.
 //!
 //! ## Crate layout (mirrors [`IMPLEMENTATION-PLAN.md`])
 //!
 //! - [`op`] — [`DeviceOperation`] trait + the core combinators
-//!   ([`AndThen`], [`Arced`], [`Value`], [`WithContext`]).
+//!   ([`AndThen`], [`AndThenWithContext`], [`Arced`], [`Value`]).
 //! - [`exec_ctx`] — [`ExecutionContext`] (passed to each op's
 //!   `execute`; implements [`claspr::Launcher`] so existing Tier 1
 //!   ops compose into the chain).
@@ -85,8 +75,8 @@ pub use host_view::{
 pub use mappable::{DeviceSliceMapHandle, Mappable};
 pub use on_device::OnDevice;
 pub use op::{
-    AndThen, AndThenWithContext, Arced, Dep, Deps, DeviceOperation, Value, WithContext,
-    deps_as_events, value, with_context, wrap_event,
+    AndThen, AndThenWithContext, Arced, Dep, Deps, DeviceOperation, Value, deps_as_events, value,
+    wrap_event,
 };
 pub use profile::{DeviceOperationProfileExt, Profiled};
 pub use transfer::{Download, Upload, UploadSource, download, upload};

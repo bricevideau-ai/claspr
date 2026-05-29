@@ -109,7 +109,7 @@ fn closure_err_surfaces_rich_variant_via_host_error_slot() {
             })
         });
 
-    let err = chain.sync(&ctx).err().expect("expected host error");
+    let err = chain.sync(&ctx).expect_err("expected host error");
     assert!(
         matches!(&err, Error::Build { log } if log == "ec-aware host abort"),
         "got {err:?}",

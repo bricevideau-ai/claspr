@@ -73,7 +73,7 @@ fn error_after_some_device_work_still_propagates() {
             })
         })
         .sync(&ctx);
-    let err = result.err().expect("expected error");
+    let err = result.expect_err("expected error");
     assert!(
         matches!(&err, Error::Build { log } if log == "post-kernel abort"),
         "got {err:?}",

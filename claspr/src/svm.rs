@@ -47,6 +47,7 @@ use opencl3::event::{Event, release_event};
 use opencl3::kernel::ExecuteKernel;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, CL_MEM_READ_WRITE, svm_alloc};
 use opencl3::types::{CL_BLOCKING, cl_event, cl_int, cl_uint};
+use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -194,6 +195,18 @@ impl<T> SharedBuffer<T> {
     /// out-of-band, or interoperating with hand-written OpenCL).
     pub fn ptr(&self) -> *mut T {
         self.ptr
+    }
+}
+
+/// Metadata-only `Debug` — does not read through the SVM pointer
+/// (would race with in-flight kernel work and require holding a map
+/// guard) and doesn't require `T: Debug`.
+impl<T> fmt::Debug for SharedBuffer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedBuffer")
+            .field("len", &self.len)
+            .field("element_size", &std::mem::size_of::<T>())
+            .finish_non_exhaustive()
     }
 }
 
