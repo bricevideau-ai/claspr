@@ -10,7 +10,7 @@
 //! See the [`Buffer`] trait's own docs for what it does and does
 //! not abstract over.
 
-use crate::access::{Frozen, MemMode, ReadWrite};
+use crate::access::{Frozen, HostReadable, HostWritable, KernelWritable, MemMode, ReadWrite};
 use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
@@ -203,13 +203,18 @@ impl<T> DeviceSlice<T, ReadWrite> {
     }
 }
 
-impl<T, M: MemMode> DeviceSlice<T, M> {
+impl<T, M: MemMode + HostWritable> DeviceSlice<T, M> {
     /// Begin writing `data` into this buffer. Returns a lazy
     /// [`WriteOp`] builder — pick a terminal ([`wait`](WriteOp::wait),
     /// [`submit`](WriteOp::submit), `.await`) to actually run.
     ///
     /// `data.len()` must equal `self.len()` (checked at terminal time —
     /// the terminals return [`Error::LengthMismatch`] otherwise).
+    ///
+    /// **Marker constraint:** `M: HostWritable`. Compiles for
+    /// `ReadWrite` / `ReadOnly`. Markers that mark the buffer
+    /// host-read-only (`HostReadOnly`, `Frozen`) or host-no-access
+    /// (`DeviceScratch`) intentionally don't allow `write`.
     pub fn write<'a, L: Launcher + ?Sized>(
         &'a mut self,
         launcher: &'a L,
@@ -224,13 +229,19 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
             profile_cb: None,
         }
     }
+}
 
+impl<T, M: MemMode + HostReadable> DeviceSlice<T, M> {
     /// Begin reading the buffer into `dst`. Returns a lazy [`ReadOp`]
     /// builder — call [`wait`](ReadOp::wait), [`submit`](ReadOp::submit),
     /// or `.await` on it to actually run.
     ///
     /// `dst.len()` must equal `self.len()` (checked at terminal time —
     /// the terminals return [`Error::LengthMismatch`] otherwise).
+    ///
+    /// **Marker constraint:** `M: HostReadable`. Compiles for every
+    /// marker except `DeviceScratch` (`CL_MEM_HOST_NO_ACCESS` —
+    /// host can't touch the bytes).
     pub fn read<'a, L: Launcher + ?Sized>(
         &'a self,
         launcher: &'a L,
@@ -245,7 +256,9 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
             profile_cb: None,
         }
     }
+}
 
+impl<T, M: MemMode> DeviceSlice<T, M> {
     /// Borrow the underlying opencl3 [`ClBuffer`](opencl3::memory::Buffer)
     /// for cases that need direct OpenCL access.
     pub fn buffer(&self) -> &ClBuffer<T> {
@@ -316,9 +329,14 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
     /// requires `&mut Buffer<T>` even though the cl_mem handle
     /// itself is shared / opaque at the OpenCL level — same shape
     /// as [`write`](Self::write).
+    ///
+    /// **Marker constraint:** `M: KernelWritable`. Runtime-side fill
+    /// counts as a write at the OpenCL level, so kernel-RO markers
+    /// (`ReadOnly`, `Frozen`) can't be filled.
     pub fn fill<'a, L: Launcher + ?Sized>(&'a mut self, launcher: &'a L, value: T) -> FillOp<'a, T>
     where
         T: Copy,
+        M: KernelWritable,
     {
         FillOp {
             queue: launcher.cl_queue(),

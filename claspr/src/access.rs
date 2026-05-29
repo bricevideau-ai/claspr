@@ -129,6 +129,44 @@ impl KernelReadable for Frozen {}
 impl KernelReadable for DeviceScratch {}
 impl KernelWritable for DeviceScratch {}
 
+// ── Host-side classification traits ────────────────────────────────
+//
+// Mirror of [`KernelReadable`] / [`KernelWritable`] for the host axis.
+// Gate `DeviceSlice::read` / `write` / `acquire_host_view_*` at the
+// type level so misuse is a compile error rather than a runtime
+// `CL_INVALID_OPERATION` from the OpenCL driver.
+//
+// - [`HostReadable`] — host may read the buffer's bytes via
+//   `clEnqueueReadBuffer` / `clEnqueueMapBuffer(CL_MAP_READ)`. True for
+//   every marker except `DeviceScratch` (`CL_MEM_HOST_NO_ACCESS`).
+// - [`HostWritable`] — host may write the buffer's bytes via
+//   `clEnqueueWriteBuffer` / `clEnqueueMapBuffer(CL_MAP_WRITE)`. False
+//   for `HostReadOnly`, `Frozen` (`CL_MEM_HOST_READ_ONLY`) and
+//   `DeviceScratch` (`CL_MEM_HOST_NO_ACCESS`).
+
+/// The host may read the buffer's bytes.
+pub trait HostReadable: HostAccess {}
+
+/// The host may write the buffer's bytes.
+pub trait HostWritable: HostAccess {}
+
+// ReadWrite / ReadOnly / WriteOnly: default host access = RW
+impl HostReadable for ReadWrite {}
+impl HostWritable for ReadWrite {}
+impl HostReadable for ReadOnly {}
+impl HostWritable for ReadOnly {}
+impl HostReadable for WriteOnly {}
+impl HostWritable for WriteOnly {}
+
+// HostReadOnly: host-read-only
+impl HostReadable for HostReadOnly {}
+
+// Frozen: host-read-only
+impl HostReadable for Frozen {}
+
+// DeviceScratch: host-no-access — neither readable nor writable from
+// the host. Don't impl either trait.
+
 // ── Kernel-side variants × Host RW (the "no host restriction" row) ──
 
 /// Default — kernel reads/writes, host reads/writes.

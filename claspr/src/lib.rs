@@ -77,8 +77,8 @@ pub mod util;
 // ── Public surface ────────────────────────────────────────────────────
 
 pub use access::{
-    DeviceScratch, Frozen, HostAccess, HostReadOnly, KernelAccess, KernelReadable, KernelWritable,
-    MemMode, ReadOnly, ReadWrite, WriteOnly,
+    DeviceScratch, Frozen, HostAccess, HostReadOnly, HostReadable, HostWritable, KernelAccess,
+    KernelReadable, KernelWritable, MemMode, ReadOnly, ReadWrite, WriteOnly,
 };
 pub use buffer::{Buffer, CopyOp, DeviceSlice, FillOp, MigrateOp, ReadOp, WriteOp};
 pub use context::{Context, SvmLevel};
