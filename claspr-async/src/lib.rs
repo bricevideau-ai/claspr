@@ -57,9 +57,11 @@ pub mod fan_out;
 pub mod future;
 pub mod host_view;
 pub mod mappable;
+pub mod on_device;
 pub mod op;
 pub mod profile;
 pub mod transfer;
+pub mod transfer_to_device;
 
 pub use alloc::{
     DeviceSliceAlloc, HostBufferAlloc, SharedBufferAlloc, device_slice_alloc, host_buffer_alloc,
@@ -81,9 +83,11 @@ pub use host_view::{
     ReleaseSharedBufferOp, SharedBufferHostView,
 };
 pub use mappable::{DeviceSliceMapHandle, Mappable};
+pub use on_device::OnDevice;
 pub use op::{
     AndThen, AndThenWithContext, Arced, Dep, Deps, DeviceOperation, Value, WithContext,
     deps_as_events, value, with_context, wrap_event,
 };
 pub use profile::{DeviceOperationProfileExt, Profiled};
 pub use transfer::{Download, Upload, UploadSource, download, upload};
+pub use transfer_to_device::{TransferToDevice, transfer_to_device};

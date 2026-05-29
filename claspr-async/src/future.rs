@@ -164,17 +164,19 @@ where
         }
     };
     drop(chain_evts);
-    // 3a. clFlush — push the queue to the device without blocking.
-    //     The async terminal otherwise has no sync point: pocl
-    //     happens to push commands eagerly, but rusticl is spec-strict
-    //     and keeps the marker in `CL_QUEUED` forever without an
-    //     explicit flush, so the CL_COMPLETE callback never fires
-    //     and the future deadlocks. clFlush returns immediately;
-    //     completion still happens asynchronously via the callback.
-    if let Err(e) = queue.raw().flush() {
+    // 3a. clFlush — push every queue the chain touched to its
+    //     device without blocking. The async terminal otherwise has
+    //     no sync point: pocl happens to push commands eagerly, but
+    //     rusticl is spec-strict and keeps commands in `CL_QUEUED`
+    //     forever without explicit flush, so the marker's
+    //     CL_COMPLETE callback would never fire and the future
+    //     would deadlock. flush_all covers `.on_device(&dev_b)` /
+    //     `transfer_to_device(buf, &dev_b)` chains where commands
+    //     land on non-primary queues.
+    if let Err(e) = context.flush_all_outoforder_queues() {
         drop(queue);
         context.invalidate_default_outoforder_queue(&device);
-        return ChainFuture::Errored(Some(Error::OpenCl(e)));
+        return ChainFuture::Errored(Some(e));
     }
     // 4. Wrap in a Future that polls the marker via
     //    clSetEventCallback (the EventFuture machinery from claspr).

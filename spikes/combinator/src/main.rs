@@ -36,10 +36,10 @@
 //! `transfer_to_device`), the scenario uses the closest production-
 //! API equivalent and notes the gap in a comment.
 
-use claspr::{Context, Device, InOrder, Queue};
+use claspr::{Context, Device};
 use claspr_async::{
     DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, DynOp, bundle, download,
-    fan_out, upload, value, with_context,
+    fan_out, transfer_to_device, upload, value,
 };
 use std::sync::Arc;
 
@@ -440,30 +440,36 @@ fn scenario_14_cross_device(ctx: &Context, devs: &[Device]) -> claspr::Result<()
         eprintln!("  SKIP: needs ≥2 devices/sub-devices");
         return Ok(());
     }
-    let q_a = Queue::<InOrder>::on_device(ctx, &devs[0]).expect("queue on dev_a");
-    let q_b = Queue::<InOrder>::on_device(ctx, &devs[1]).expect("queue on dev_b");
-    let q_a_ref = &q_a;
-    let q_b_ref = &q_b;
     let kernels = gpu::kernels(ctx)?;
     let kernels_ref = &kernels;
 
-    // Two stages, one queue per device. `with_context` opts each
-    // stage into a specific queue — the default OOO routing isn't
-    // aware of cross-device intent yet (Tier 2 open question #4 in
-    // EXECUTION-MODEL.md).
+    // Fully non-blocking cross-device pipeline. The two production
+    // primitives that map to OpenCL's actual decomposition:
+    //
+    //   transfer_to_device(buf, &dev) — explicit cl_mem migration
+    //       (clEnqueueMigrateMemObjects). May be a no-op or real
+    //       data movement depending on topology; either way it's a
+    //       queue command, not host-blocking.
+    //   .on_device(&dev) — per-op kernel routing (the kernel
+    //       enqueues on `dev`'s default OOO queue).
+    //
+    // Device handles come from `ec.context().devices()` (via
+    // `ec.device_at(i)`) inside `.and_then_with_context` closures,
+    // not from external captures — the chain is portable across
+    // contexts and doesn't assume "upload landed buf on devs[0]"
+    // (upload lands on context.device(), which may be either).
     let result: Vec<f32> = upload(vec![1.0f32; N])
-        .and_then(move |buf| {
-            with_context(move |_ec| {
-                let buf = kernels_ref.scale([N], buf, 2.0).wait(q_a_ref)?;
-                Ok::<_, claspr::Error>(buf)
-            })
+        .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(0)))
+        .and_then_with_context(move |ec, buf| {
+            kernels_ref.scale([N], buf, 2.0).on_device(ec.device_at(0))
         })
-        .and_then(move |buf| {
-            with_context(move |_ec| {
-                let buf = kernels_ref.scale([N], buf, 10.0).wait(q_b_ref)?;
-                Ok::<_, claspr::Error>(buf)
-            })
+        .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(1)))
+        .and_then_with_context(move |ec, buf| {
+            kernels_ref.scale([N], buf, 10.0).on_device(ec.device_at(1))
         })
+        // Migrate back before download (mirrors the original spike's
+        // terminal transfer).
+        .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(0)))
         .and_then(download)
         .sync(ctx)?;
     println!("  result[0..4] = {:?}", &result[..4]);

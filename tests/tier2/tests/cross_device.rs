@@ -1,19 +1,21 @@
 //! Spike scenario 14 — cross-device pipeline within a single
 //! multi-device Context. The shared `cl_context` makes events on one
 //! device's queue valid as deps for ops on another device's queue,
-//! so the chain naturally spans devices.
+//! so the chain spans devices naturally via `.on_device(&dev)` /
+//! `transfer_to_device(buf, &dev)` (both non-blocking; the chain
+//! never host-blocks).
 //!
-//! Skips when only one device is available. Today's claspr-async
-//! `ExecutionContext` picks the context's default OOO queue, which
-//! is per-device — so the chain runs on whichever device the context
-//! considers default. Cross-device routing would require
-//! `op.on_device(&dev_b)` per-op (Tier 2 open question 4) or manual
-//! `with_context` + per-device queues. We exercise the latter form
-//! to validate the multi-device path doesn't break the chain plumbing.
+//! Device handles come from `ec.context().devices()` inside
+//! `.and_then_with_context` closures (via the `ec.device_at(i)`
+//! shortcut), not from external captures — chain stays portable
+//! across contexts.
+//!
+//! Skips when only one device is available (no real multi-device
+//! platform AND no sub-device partition support).
 
 use claspr::device::Platform;
-use claspr::{Context, Device, DeviceSlice};
-use claspr_async::{DeviceOperation, download, upload, with_context};
+use claspr::{Context, Device};
+use claspr_async::{DeviceOperation, download, upload};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;
@@ -73,35 +75,26 @@ fn ctx_two_devices() -> Option<(Context, Device, Device)> {
 #[test]
 fn pipeline_spans_two_devices_via_shared_buffer() {
     // Both devices share the cl_context, so a `DeviceSlice<T>` is
-    // valid on either device's queue. Stage 1 on device A, stage 2
-    // on device B; the buffer's cl_mem refcount + per-queue command
-    // ordering does the cross-device sync.
-    //
-    // We use `with_context` to opt into a specific queue per stage
-    // (the default OOO routing isn't aware of cross-device intent).
-    let Some((ctx, dev_a, dev_b)) = ctx_two_devices() else {
+    // valid on either device's queue. Stage 1 on device 0, stage 2
+    // on device 1; the chain is fully non-blocking — each kernel is
+    // routed via `.on_device(ec.device_at(i))`, no `.wait()` inside
+    // any closure. Device handles are pulled from `ec` rather than
+    // captured from outer scope (chain stays portable across
+    // contexts).
+    let Some((ctx, _dev_a, _dev_b)) = ctx_two_devices() else {
         return;
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let q_a = claspr::Queue::<claspr::InOrder>::on_device(&ctx, &dev_a).expect("queue on dev_a");
-    let q_b = claspr::Queue::<claspr::InOrder>::on_device(&ctx, &dev_b).expect("queue on dev_b");
-    let q_a_ref = &q_a;
-    let q_b_ref = &q_b;
-
     let result: Vec<u32> = upload(vec![0u32; N])
-        .and_then(move |buf| {
-            with_context(move |_ec| {
-                let buf = kernels_ref.fill_u32([N], buf, 3).wait(q_a_ref)?;
-                Ok::<DeviceSlice<u32>, claspr::Error>(buf)
-            })
+        .and_then_with_context(move |ec, buf| {
+            kernels_ref.fill_u32([N], buf, 3).on_device(ec.device_at(0))
         })
-        .and_then(move |buf| {
-            with_context(move |_ec| {
-                let buf = kernels_ref.scale_u32([N], buf, 4).wait(q_b_ref)?;
-                Ok::<DeviceSlice<u32>, claspr::Error>(buf)
-            })
+        .and_then_with_context(move |ec, buf| {
+            kernels_ref
+                .scale_u32([N], buf, 4)
+                .on_device(ec.device_at(1))
         })
         .and_then(download)
         .sync(&ctx)

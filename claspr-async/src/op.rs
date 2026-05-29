@@ -180,6 +180,27 @@ pub trait DeviceOperation: Send + Sized {
     {
         Arced { source: self }
     }
+
+    /// Route this op's `execute` to `device`'s default out-of-order
+    /// queue instead of the chain's primary queue. Downstream stages
+    /// resume on the parent's queue; the routed op's events are valid
+    /// across both via OpenCL's shared-context event semantics.
+    ///
+    /// Pair with [`transfer_to_device`](crate::transfer_to_device)
+    /// when explicit buffer migration is wanted as its own chain
+    /// stage. The common idiom pulls the device handle from `ec`
+    /// inside an `and_then_with_context` so the chain is portable
+    /// across contexts:
+    ///
+    /// ```ignore
+    /// .and_then_with_context(|ec, buf|
+    ///     kernels.foo([N], buf).on_device(ec.device_at(1)))
+    /// ```
+    ///
+    /// See [`crate::OnDevice`] for the full design rationale.
+    fn on_device(self, device: &claspr::Device) -> crate::on_device::OnDevice<Self> {
+        crate::on_device::OnDevice::new(self, device.clone())
+    }
 }
 
 /// Shared body of [`DeviceOperation::sync`]: build the
@@ -209,6 +230,14 @@ where
             return Err(ctx.take_host_error().unwrap_or(e));
         }
     };
+    // Push every per-device OOO queue the chain touched (via
+    // `.on_device` / `transfer_to_device`). Required for non-eager
+    // implementations (rusticl): commands on secondary queues sit in
+    // CL_QUEUED until explicit flush, and the event waits below would
+    // deadlock. No-op on eager implementations (pocl).
+    if let Err(e) = context.flush_all_outoforder_queues() {
+        return Err(ctx.take_host_error().unwrap_or(e));
+    }
     // Wait on every final event. Most chains have at most one (after
     // a join marker); fan-outs may have several. Record the first
     // error but keep waiting on the rest so we don't strand

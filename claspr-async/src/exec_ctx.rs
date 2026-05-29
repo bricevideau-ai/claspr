@@ -63,6 +63,30 @@ impl<'ctx> ExecutionContext<'ctx> {
         }
     }
 
+    /// Sibling-constructor: build a fresh `ExecutionContext` that
+    /// shares the host-error slot with an existing one but targets a
+    /// different device + queue. Used by the [`OnDevice`](crate::OnDevice)
+    /// combinator to route a sub-chain to a non-default device's queue
+    /// without losing the chain-wide error stash.
+    ///
+    /// The new EC's lifetime `'a` is whatever lifetime the caller
+    /// can provide for `context` and `cl_queue` — typically a
+    /// stack-local `Arc<Queue>` whose `.raw()` is borrowed for the
+    /// duration of the child op's `execute()`.
+    pub(crate) fn with_host_error_slot<'a>(
+        context: &'a Context,
+        device: Device,
+        cl_queue: &'a CommandQueue,
+        host_error: Arc<Mutex<Option<Error>>>,
+    ) -> ExecutionContext<'a> {
+        ExecutionContext {
+            context,
+            device,
+            cl_queue,
+            host_error,
+        }
+    }
+
     /// Cheap `Arc` clone of the host-error slot for an `and_then_host`
     /// worker to carry across `thread::spawn`. Workers populate it
     /// (first-writer-wins) before signalling negative user-event
@@ -84,11 +108,32 @@ impl<'ctx> ExecutionContext<'ctx> {
         self.context
     }
 
-    /// The [`Device`] this op currently targets. Cross-device
-    /// re-routing (`.on_device(&other)`) lands in a later phase;
-    /// for now the device is fixed for the whole chain.
+    /// The [`Device`] this op currently targets. Use
+    /// [`DeviceOperation::on_device`](crate::DeviceOperation::on_device)
+    /// to route a sub-chain to a different device's queue, or
+    /// [`transfer_to_device`](crate::transfer_to_device) to migrate
+    /// the buffer between devices in the same context.
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// The chain's running context's full device list — same as
+    /// `self.context().devices()`, surfaced here for ergonomics
+    /// inside `.and_then_with_context` closures.
+    pub fn devices(&self) -> &[Device] {
+        self.context.devices()
+    }
+
+    /// Shortcut for `&self.context().devices()[i]`. Panics if `i` is
+    /// out of range (mirrors slice indexing). The common use is
+    /// inside `.and_then_with_context` to route or transfer:
+    ///
+    /// ```ignore
+    /// .and_then_with_context(|ec, buf|
+    ///     kernels.foo([N], buf).on_device(ec.device_at(1)))
+    /// ```
+    pub fn device_at(&self, i: usize) -> &Device {
+        &self.context.devices()[i]
     }
 }
 

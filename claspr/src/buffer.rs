@@ -229,6 +229,34 @@ impl<T> DeviceSlice<T> {
             profile_cb: None,
         }
     }
+
+    /// Begin a `clEnqueueMigrateMemObjects` for this buffer on
+    /// `launcher`'s queue — hints the OpenCL runtime to ensure the
+    /// buffer resides on the queue's device's memory before subsequent
+    /// commands access it from that device.
+    ///
+    /// On topologies where all devices in the context share physical
+    /// memory (sub-devices of one CPU, integrated GPUs in a single
+    /// context) the migration is typically a no-op. On distributed
+    /// topologies (two dGPUs in one `cl_context`) it triggers a real
+    /// memory transfer. Either way the call returns a builder; the
+    /// terminals enqueue the migrate as a queue command (non-blocking
+    /// via [`submit`](MigrateOp::submit) / `.await` — does NOT
+    /// host-block the chain).
+    ///
+    /// Returns a lazy [`MigrateOp`] builder — call
+    /// [`wait`](MigrateOp::wait), [`submit`](MigrateOp::submit), or
+    /// `.await` on it. The target device is implicit in `launcher`'s
+    /// queue (`clEnqueueMigrateMemObjects` migrates to the queue's
+    /// device per spec).
+    pub fn migrate<'a, L: Launcher + ?Sized>(&'a self, launcher: &'a L) -> MigrateOp<'a, T> {
+        MigrateOp {
+            queue: launcher.cl_queue(),
+            buffer: &self.buffer,
+            deps: Vec::new(),
+            profile_cb: None,
+        }
+    }
 }
 
 // ── UploadOp / ReadOp / CopyOp builders ─────────────────────────────
@@ -479,6 +507,80 @@ impl<'a, T> CopyOp<'a, T> {
         let event = unsafe {
             self.queue
                 .enqueue_copy_buffer(self.src, self.dst, 0, 0, bytes, &self.deps)?
+        };
+        if let Some(cb) = self.profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
+        Ok(event)
+    }
+}
+
+/// Lazy builder for `clEnqueueMigrateMemObjects`. Returned by
+/// [`DeviceSlice::migrate`]. Target device is implicit — it's
+/// `launcher`'s queue's device.
+///
+/// Always uses flags = 0 (default migrate-to-this-queue's-device
+/// semantics; preserves current contents). The hint
+/// `CL_MIGRATE_MEM_OBJECT_CONTENT_UNDEFINED` for cases where the
+/// caller knows the buffer's data isn't needed could be added later
+/// as an opt-in modifier; for now the conservative default is right.
+pub struct MigrateOp<'a, T> {
+    queue: &'a CommandQueue,
+    buffer: &'a ClBuffer<T>,
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
+}
+
+impl<'a, T> MigrateOp<'a, T> {
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
+    }
+
+    /// Add multiple wait-list events at once.
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        self.deps.extend(events.into_iter().map(|e| e.get()));
+        self
+    }
+
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    /// Sync terminal — enqueue the migrate and wait on its event.
+    pub fn wait(self) -> Result<()> {
+        let event = self.into_event()?;
+        event.wait()?;
+        Ok(())
+    }
+
+    /// Non-blocking terminal — enqueue and return the completion event.
+    pub fn submit(self) -> Result<Event> {
+        self.into_event()
+    }
+
+    pub(crate) fn into_event(self) -> Result<Event> {
+        // SAFETY: `enqueue_migrate_mem_object` is unsafe because the
+        // mem_objects pointer must point to a valid `cl_mem` for the
+        // queue's context. We pass exactly one `cl_mem` from a
+        // `ClBuffer` we own a reference to, which is alive for the
+        // call. The buffer must belong to the queue's context — the
+        // caller's responsibility, same constraint as `enqueue_copy_buffer`.
+        let mem_handle: cl_mem = self.buffer.get();
+        let event = unsafe {
+            self.queue.enqueue_migrate_mem_object(
+                1,
+                &mem_handle as *const cl_mem,
+                0, // flags: default = migrate to queue's device, preserve content
+                &self.deps,
+            )?
         };
         if let Some(cb) = self.profile_cb {
             register_profiling_callback(&event, cb)?;

@@ -252,6 +252,37 @@ impl Context {
         *slot = None;
     }
 
+    /// Flush every per-device out-of-order queue this context has
+    /// lazily instantiated. No-op for devices whose queue has never
+    /// been accessed (lazy construction in
+    /// [`default_outoforder_queue`](Self::default_outoforder_queue)
+    /// means the slot stays empty until first use).
+    ///
+    /// Used by `claspr-async`'s terminals (sync / run) to push
+    /// multi-device chains on non-eager implementations: rusticl
+    /// (spec-strict) keeps enqueued commands in `CL_QUEUED` until an
+    /// explicit `clFlush`, so a chain that touches `dev_b`'s queue
+    /// via `.on_device(&dev_b)` would deadlock at the trailing
+    /// marker without this. pocl flushes eagerly so the call is a
+    /// no-op there.
+    ///
+    /// Per-queue `clFlush` is non-blocking; the call returns once
+    /// every touched queue has been pushed (it does NOT wait for
+    /// commands to complete — that's the terminal's separate
+    /// event-wait responsibility).
+    pub fn flush_all_outoforder_queues(&self) -> Result<()> {
+        for slot in &self.inner.queues {
+            let guard = slot
+                .out_of_order
+                .lock()
+                .expect("DeviceQueues out_of_order mutex poisoned");
+            if let Some(q) = guard.as_ref() {
+                q.raw().flush()?;
+            }
+        }
+        Ok(())
+    }
+
     /// `true` if the context was built with `.profiling(true)`.
     /// Every default queue and every [`Queue::new`](crate::queue::Queue::new) /
     /// [`Queue::on_device`](crate::queue::Queue::on_device) built off
