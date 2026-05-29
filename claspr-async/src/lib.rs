@@ -47,6 +47,7 @@
 //! [claspr]: https://docs.rs/claspr
 //! [`LaunchOp`]: claspr::LaunchOp
 
+pub mod alloc;
 pub mod and_then_host;
 pub mod arc;
 pub mod bundle;
@@ -60,6 +61,10 @@ pub mod op;
 pub mod profile;
 pub mod transfer;
 
+pub use alloc::{
+    DeviceSliceAlloc, HostBufferAlloc, SharedBufferAlloc, device_slice_alloc, host_buffer_alloc,
+    shared_buffer_alloc,
+};
 pub use and_then_host::{AndThenHost, DeviceOperationHostExt};
 pub use arc::ArcSplit;
 pub use bundle::{
@@ -77,8 +82,8 @@ pub use host_view::{
 };
 pub use mappable::{DeviceSliceMapHandle, Mappable};
 pub use op::{
-    AndThen, Arced, Dep, Deps, DeviceOperation, Value, WithContext, deps_as_events, value,
-    with_context, wrap_event,
+    AndThen, AndThenWithContext, Arced, Dep, Deps, DeviceOperation, Value, WithContext,
+    deps_as_events, value, with_context, wrap_event,
 };
 pub use profile::{DeviceOperationProfileExt, Profiled};
 pub use transfer::{Download, Upload, UploadSource, download, upload};

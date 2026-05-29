@@ -147,6 +147,31 @@ pub trait DeviceOperation: Send + Sized {
         }
     }
 
+    /// Like [`and_then`](Self::and_then), but the closure also
+    /// receives the running [`ExecutionContext`] — handy when the
+    /// next op needs `ec.context()` (e.g. to compose with
+    /// [`device_slice_alloc`](crate::device_slice_alloc) etc.) or
+    /// `ec` as a [`claspr::Launcher`].
+    ///
+    /// Closure returns an op (`U: DeviceOperation`), not a
+    /// `Result<value>` — mirroring `.and_then`. If the closure body
+    /// needs synchronous fallible setup, push that into a lazy op
+    /// (e.g. one of the alloc combinators in [`crate::alloc`]) or
+    /// nest a [`with_context`] inside the closure.
+    ///
+    /// Saves a level of closure nesting compared to
+    /// `.and_then(|prev| with_context(move |ec| { ... }))`.
+    fn and_then_with_context<F, U>(self, f: F) -> AndThenWithContext<Self, F>
+    where
+        F: FnOnce(&ExecutionContext<'_>, Self::Output) -> U + Send,
+        U: DeviceOperation,
+    {
+        AndThenWithContext {
+            source: self,
+            f: Some(f),
+        }
+    }
+
     /// Wrap this op's output in [`Arc<T>`](std::sync::Arc) for sharing
     /// across downstream branches.
     fn arc(self) -> Arced<Self>
@@ -313,6 +338,37 @@ where
             .take()
             .expect("AndThen::execute called twice — internal claspr-async bug"))(
             prior
+        );
+        next.execute(ctx, prior_evts)
+    }
+}
+
+// ── AndThenWithContext ──────────────────────────────────────────────
+
+/// Sequential combinator with `ec` access. Built by
+/// [`DeviceOperation::and_then_with_context`]. Same shape as
+/// [`AndThen`], only the closure signature differs (it also receives
+/// `&ExecutionContext`).
+pub struct AndThenWithContext<S, F> {
+    source: S,
+    f: Option<F>,
+}
+
+impl<S, F, U> DeviceOperation for AndThenWithContext<S, F>
+where
+    S: DeviceOperation,
+    F: FnOnce(&ExecutionContext<'_>, S::Output) -> U + Send,
+    U: DeviceOperation,
+{
+    type Output = U::Output;
+
+    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(U::Output, Deps)> {
+        let (prior, prior_evts) = self.source.execute(ctx, deps)?;
+        let next = (self
+            .f
+            .take()
+            .expect("AndThenWithContext::execute called twice — internal claspr-async bug"))(
+            ctx, prior,
         );
         next.execute(ctx, prior_evts)
     }
