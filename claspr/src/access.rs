@@ -48,6 +48,42 @@
 //!   reads, host updates between launches."
 //! - `DeviceScratch` — host never observes it; pure intermediate.
 //!
+//! ## Compile-fail spec (the typestate scheme's enforcement points)
+//!
+//! Frozen → `&mut [T]` kernel param: rejected because Frozen doesn't
+//! impl [`KernelWritable`].
+//!
+//! ```compile_fail
+//! use claspr::{Context, DeviceSlice, Frozen};
+//! let ctx = Context::any().unwrap();
+//! let frozen: DeviceSlice<u32, Frozen> =
+//!     DeviceSlice::from_slice(&ctx, &[0u32; 16]).unwrap();
+//! let kernels = claspr_test_kernels::kernels::kernels(&ctx).unwrap();
+//! let _ = kernels.scale_u32([16], frozen, 2);  // ← &mut [u32]: ERROR
+//! ```
+//!
+//! Frozen → `.write(...)`: rejected because Frozen doesn't impl
+//! [`HostWritable`].
+//!
+//! ```compile_fail
+//! use claspr::{Context, DeviceSlice, Frozen, Launcher};
+//! let ctx = Context::any().unwrap();
+//! let mut frozen: DeviceSlice<u32, Frozen> =
+//!     DeviceSlice::from_slice(&ctx, &[0u32; 16]).unwrap();
+//! let _ = frozen.write(&ctx, &[1u32; 16]);  // ← HostWritable: ERROR
+//! ```
+//!
+//! Frozen → `.fill(...)`: rejected because Frozen doesn't impl
+//! [`KernelWritable`].
+//!
+//! ```compile_fail
+//! use claspr::{Context, DeviceSlice, Frozen, Launcher};
+//! let ctx = Context::any().unwrap();
+//! let mut frozen: DeviceSlice<u32, Frozen> =
+//!     DeviceSlice::from_slice(&ctx, &[0u32; 16]).unwrap();
+//! let _ = frozen.fill(&ctx, 9u32);  // ← KernelWritable: ERROR
+//! ```
+//!
 //! [`DeviceSlice`]: crate::DeviceSlice
 //! [`Image2D`]: crate::Image2D
 
