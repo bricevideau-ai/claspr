@@ -77,7 +77,7 @@
 use crate::exec_ctx::ExecutionContext;
 use crate::mappable::Mappable;
 use crate::op::{Deps, DeviceOperation, wrap_event};
-use claspr::{Error, Launcher, Result, complete_user_event, create_user_event};
+use claspr::{Context, Error, Launcher, Result, complete_user_event, create_user_event};
 use opencl3::event::CL_COMPLETE;
 use opencl3::types::{cl_event, cl_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -85,6 +85,16 @@ use std::sync::Arc;
 
 /// Combinator built by [`DeviceOperationHostExt::and_then_host`].
 pub struct AndThenHost<S, F> {
+    source: S,
+    f: Option<F>,
+}
+
+/// Combinator built by
+/// [`DeviceOperationHostExt::and_then_host_with_context`]. Same
+/// shape as [`AndThenHost`] but the closure also receives `&Context`
+/// so it can read device / context properties or build per-context
+/// host state.
+pub struct AndThenHostWithContext<S, F> {
     source: S,
     f: Option<F>,
 }
@@ -114,6 +124,33 @@ where
         F: for<'a> FnOnce(<Self::Output as Mappable>::View<'a>) -> Result<()> + Send + 'static,
     {
         AndThenHost {
+            source: self,
+            f: Some(f),
+        }
+    }
+
+    /// Like [`and_then_host`](Self::and_then_host) but the closure
+    /// also receives a [`&Context`](claspr::Context) — the chain's
+    /// running context, for host-side use (read device props,
+    /// iterate `context.devices()`, etc.).
+    ///
+    /// Same async / worker-thread semantics as `and_then_host`:
+    /// the closure runs on a per-call worker thread; the chain
+    /// continues at execute time; mutations to the view commit
+    /// via the matching unmap; errors propagate through the
+    /// user-event signal + the host-error slot.
+    ///
+    /// `Context` is `Arc`-backed so the clone the worker holds is
+    /// cheap. The closure body shouldn't outlive the chain run
+    /// — the `Context` clone keeps it alive for the worker's
+    /// lifetime regardless.
+    fn and_then_host_with_context<F>(self, f: F) -> AndThenHostWithContext<Self, F>
+    where
+        F: for<'a> FnOnce(&Context, <Self::Output as Mappable>::View<'a>) -> Result<()>
+            + Send
+            + 'static,
+    {
+        AndThenHostWithContext {
             source: self,
             f: Some(f),
         }
@@ -242,6 +279,127 @@ where
             unmap_events.into_iter().map(wrap_event).collect()
         };
         Ok((input, deps_out))
+    }
+}
+
+impl<S, F> DeviceOperation for AndThenHostWithContext<S, F>
+where
+    S: DeviceOperation,
+    S::Output: Mappable,
+    F: for<'a> FnOnce(&Context, <S::Output as Mappable>::View<'a>) -> Result<()> + Send + 'static,
+{
+    type Output = S::Output;
+
+    /// Mirrors [`AndThenHost::execute`] — same worker / user-event /
+    /// host-error-slot plumbing. Only difference: captures a
+    /// `Context` clone (cheap, Arc-backed) for the worker so the
+    /// closure can be invoked as `f(&context, view)`.
+    ///
+    /// Closure-HRTB inference doesn't go through GAT-based view
+    /// types, so this can't cleanly delegate to `AndThenHost` by
+    /// wrapping the user closure — the wrapped form fails to match
+    /// the `for<'a> FnOnce(View<'a>) -> Result<()>` bound at the
+    /// type-checker level. Duplicated body is the simpler answer.
+    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+        let (input, source_evts) = self.source.execute(ctx, deps)?;
+        let q = ctx.cl_queue();
+
+        let source_cl: Vec<cl_event> = source_evts.iter().map(|d| d.as_ref().get()).collect();
+        let (mut handle, map_events) = input.map(q, &source_cl)?;
+
+        let user_event = Arc::new(create_user_event(ctx.context())?);
+
+        let unmap_events =
+            match <S::Output as Mappable>::enqueue_unmap(&mut handle, q, &[user_event.get()]) {
+                Ok(evs) => evs,
+                Err(e) => {
+                    let _ = complete_user_event(&user_event, -1);
+                    return Err(e);
+                }
+            };
+
+        let f = self
+            .f
+            .take()
+            .expect("AndThenHostWithContext::execute called twice — internal claspr-async bug");
+        // Cheap Arc-backed clone — gives the worker thread its own
+        // 'static handle on the running context.
+        let worker_context: Context = ctx.context().clone();
+        let worker_user_event = Arc::clone(&user_event);
+        let worker_map_events = map_events;
+        let worker_source_evts = source_evts;
+        let worker_host_error = ctx.host_error_slot();
+        std::thread::spawn(move || {
+            let (status, mut handle, rust_err) = run_worker_with_context::<S::Output, F>(
+                handle,
+                worker_map_events,
+                worker_source_evts,
+                worker_context,
+                f,
+            );
+            if let Some(err) = rust_err {
+                let mut slot = worker_host_error.lock().unwrap();
+                if slot.is_none() {
+                    *slot = Some(err);
+                }
+            }
+            if status < 0 {
+                <S::Output as Mappable>::mark_unmap_not_done(&mut handle);
+                drop(handle);
+            }
+            let _ = complete_user_event(&worker_user_event, status);
+        });
+
+        let deps_out: Deps = if unmap_events.is_empty() {
+            vec![user_event]
+        } else {
+            unmap_events.into_iter().map(wrap_event).collect()
+        };
+        Ok((input, deps_out))
+    }
+}
+
+/// Twin of [`run_worker`] for [`AndThenHostWithContext`]. Only
+/// difference: the closure receives `&Context` (passed by reference
+/// from the owned `context` held on the worker's stack frame) along
+/// with the view.
+fn run_worker_with_context<O, F>(
+    handle: O::MapHandle,
+    map_events: Vec<claspr::Event>,
+    source_evts: Deps,
+    context: Context,
+    f: F,
+) -> (cl_int, O::MapHandle, Option<Error>)
+where
+    O: Mappable,
+    F: for<'a> FnOnce(&Context, <O as Mappable>::View<'a>) -> Result<()> + Send + 'static,
+{
+    let mut handle = handle;
+    for ev in &source_evts {
+        if ev.as_ref().wait().is_err() {
+            return (-1, handle, None);
+        }
+    }
+    for ev in &map_events {
+        if let Err(e) = ev.wait() {
+            return (-1, handle, Some(Error::OpenCl(e)));
+        }
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let view = <O as Mappable>::view(&mut handle);
+        f(&context, view)
+    }));
+    match result {
+        Ok(Ok(())) => (CL_COMPLETE as cl_int, handle, None),
+        Ok(Err(rust_err)) => (-1, handle, Some(rust_err)),
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            (-1, handle, Some(Error::HostPanic(msg)))
+        }
     }
 }
 

@@ -67,7 +67,7 @@ pub use alloc::{
     DeviceSliceAlloc, HostBufferAlloc, SharedBufferAlloc, device_slice_alloc, host_buffer_alloc,
     shared_buffer_alloc,
 };
-pub use and_then_host::{AndThenHost, DeviceOperationHostExt};
+pub use and_then_host::{AndThenHost, AndThenHostWithContext, DeviceOperationHostExt};
 pub use arc::ArcSplit;
 pub use bundle::{
     Bundle2, Bundle3, Bundle4, Bundle5, Bundle6, Bundle7, Bundle8, Bundle9, Bundle10, Bundle11,
