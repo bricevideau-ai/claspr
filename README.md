@@ -81,7 +81,7 @@ let result: Vec<u32> = upload(input)
     .sync(&ctx)?;
 ```
 
-`.sync(&ctx)` enqueues the whole chain on the per-device out-of-order queue, the OpenCL runtime overlaps stages, and host-side work (via `.and_then_host`) slots in without serialising through the submitting thread. `.run(&ctx)` returns a `Future` for the same chain. Combinators include `bundle!(a, b, c)` for heterogeneous parallel composition, `fan_out(items, |i| op)` for N-way homogeneous parallelism, and `DynOp<T>` for type-erased branches. See `examples/async-pipeline` and `examples/batch-inference`.
+`.sync(&ctx)` enqueues the whole chain on the per-device out-of-order queue, the OpenCL runtime overlaps stages, and host-side work (via `.and_then_host`) slots in without serialising through the submitting thread. `.run(&ctx)` returns a `Future` for the same chain. Combinators include `bundle!(a, b, c)` for heterogeneous parallel composition, `items.fan_out(|i| op)` for N-way homogeneous parallelism on a `Vec`, and `DynOp<T>` for type-erased branches. See `examples/async-pipeline` and `examples/batch-inference`.
 
 ## Workspace layout
 
