@@ -150,37 +150,42 @@ fn scenario_2_bundle_parallel(ctx: &Context) -> claspr::Result<()> {
 }
 
 fn scenario_3_diamond(ctx: &Context) -> claspr::Result<()> {
-    println!("\n=== Scenario 3: diamond (fan-out + fan-in via Arc<[f32]>) ===");
-    // Two branches read the same shared input (each uploads its own
-    // copy from a shared `Arc<[f32]>`); their outputs are combined.
+    println!("\n=== Scenario 3: diamond (fan-out + fan-in via Arc<DeviceSlice<f32>>) ===");
+    // Two branches read the same shared device buffer. One upload, one
+    // cl_mem, one Arc — each branch gets an Arc::clone, the typed
+    // launcher accepts `Arc<DeviceSlice<T>>` directly via the
+    // KernelSliceArg<T> widening (claspr/src/launch.rs). OpenCL's
+    // refcounted cl_mem keeps the buffer alive until the last clone
+    // drops.
     //
-    // claspr's per-call Op consumes slice args by value, so we can't
-    // share a single DeviceSlice across branches. Host-side Arc-share
-    // (Arc<[f32]>) lets both branches' uploads borrow the same heap
-    // allocation; the upload's keep-alive callback drops each clone
-    // when its write completes.
+    // Matches the original spike's `.arc()` shape; pre-rebase
+    // workaround used host-side Arc<[T]> + duplicate upload, which
+    // was N× memory + N× upload for N branches.
     let kernels = gpu::kernels(ctx)?;
     let kernels_ref = &kernels;
-    let shared: Arc<[f32]> = vec![5.0f32; N].into();
     let len = N as u32;
-    let s1 = Arc::clone(&shared);
-    let s2 = Arc::clone(&shared);
 
-    let result: Vec<f32> = bundle!(
-        bundle!(upload(s1), upload(vec![0.0f32; N])).and_then(move |(sh_buf, out)| kernels_ref
-            .add_shared_bias([N], out, sh_buf, len, 100.0)
-            .and_then(|(out, _sh)| value(out))),
-        bundle!(upload(s2), upload(vec![0.0f32; N])).and_then(move |(sh_buf, out)| kernels_ref
-            .add_shared_bias([N], out, sh_buf, len, 200.0)
-            .and_then(|(out, _sh)| value(out))),
-    )
-    .and_then(move |(a, b)| {
-        kernels_ref
-            .add_inplace([N], a, b)
-            .and_then(|(out, _b)| value(out))
-    })
-    .and_then(download)
-    .sync(ctx)?;
+    let result: Vec<f32> = upload(vec![5.0f32; N])
+        .arc()
+        .and_then(move |shared: Arc<claspr::DeviceSlice<f32>>| {
+            let s1 = Arc::clone(&shared);
+            let s2 = Arc::clone(&shared);
+            bundle!(
+                upload(vec![0.0f32; N]).and_then(move |out| kernels_ref
+                    .add_shared_bias([N], out, s1, len, 100.0)
+                    .and_then(|(out, _sh)| value(out))),
+                upload(vec![0.0f32; N]).and_then(move |out| kernels_ref
+                    .add_shared_bias([N], out, s2, len, 200.0)
+                    .and_then(|(out, _sh)| value(out))),
+            )
+            .and_then(move |(a, b)| {
+                kernels_ref
+                    .add_inplace([N], a, b)
+                    .and_then(|(out, _b)| value(out))
+            })
+            .and_then(download)
+        })
+        .sync(ctx)?;
     println!("  combined[0..4] = {:?}", &result[..4]);
     // (5 + 100) + (5 + 200) = 310
     assert!((result[0] - 310.0).abs() < EPS);

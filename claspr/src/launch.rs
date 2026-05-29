@@ -38,6 +38,7 @@
 use crate::buffer::{DeviceSlice, HostBuffer};
 use opencl3::event::Event;
 use opencl3::kernel::ExecuteKernel;
+use std::sync::Arc;
 use std::time::Duration;
 
 // ── KernelArg ─────────────────────────────────────────────────────────
@@ -140,6 +141,23 @@ impl<T: Send + 'static> KernelSliceArg<T> for crate::SharedBuffer<T> {
     }
 }
 
+// `Arc<DeviceSlice<T>>` — share one cl_mem across N parallel chain
+// branches without re-uploading. Pair with [`claspr_async::Arced`]
+// (built by `.arc()` on a `DeviceOperation` whose Output is
+// `DeviceSlice<T>`): the chain produces `Arc<DeviceSlice<T>>`, each
+// branch gets an `Arc::clone`, the kernel launcher accepts the Arc
+// directly, the underlying `cl_mem` lives until the last clone drops
+// (refcounted by `Arc` + lazy by OpenCL on top).
+//
+// `T: Sync` is needed because `Arc<DeviceSlice<T>>: Send` requires
+// `DeviceSlice<T>: Send + Sync` which propagates `T: Sync`.
+impl<T: Send + Sync + 'static> kernel_slice_arg_sealed::Sealed for Arc<DeviceSlice<T>> {}
+impl<T: Send + Sync + 'static> KernelSliceArg<T> for Arc<DeviceSlice<T>> {
+    fn element_count(&self) -> usize {
+        crate::Buffer::len(&**self)
+    }
+}
+
 // `DeviceSlice` and `HostBuffer` live in `buffer`, but their
 // `KernelArg` impls belong here with the rest of the launch surface
 // so `set_arg` plumbing is in one place. Both decompose into the
@@ -165,6 +183,18 @@ impl<T> KernelArg for HostBuffer<T> {
         }
     }
     // Same as `DeviceSlice`: `cl_mem` lazy release.
+}
+
+// Arc<DeviceSlice<T>> just delegates to the inner DeviceSlice. The
+// blanket `impl<T: KernelArg> KernelArg for &T` then makes
+// `&Arc<DeviceSlice<T>>` (which is what the proc-macro-emitted
+// launcher hands to LaunchOp) a `KernelArg` too.
+impl<T> KernelArg for Arc<DeviceSlice<T>> {
+    fn set(&self, exec: &mut ExecuteKernel<'_>) {
+        (**self).set(exec);
+    }
+    // No `register_completion` override — DeviceSlice doesn't have one
+    // either (cl_mem lifetime is refcounted by the OpenCL runtime).
 }
 
 // ── ScalarArg + scalar_arg! macro ─────────────────────────────────────
