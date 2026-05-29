@@ -55,8 +55,8 @@ pub mod transfer_to_device;
 
 pub use alloc::{
     DeviceSliceAlloc, DeviceSliceFilled, HostBufferAlloc, SharedBufferAlloc, SharedBufferFilled,
-    device_slice_alloc, device_slice_filled, host_buffer_alloc, shared_buffer_alloc,
-    shared_buffer_filled,
+    SharedBufferUpload, device_slice_alloc, device_slice_filled, host_buffer_alloc,
+    shared_buffer_alloc, shared_buffer_filled, shared_buffer_upload,
 };
 pub use and_then_host::{AndThenHost, AndThenHostWithContext, DeviceOperationHostExt};
 pub use arc::ArcSplit;
@@ -115,5 +115,36 @@ macro_rules! device_slice {
     };
     [$($v:expr),* $(,)?] => {
         $crate::upload(::std::vec![$($v),*])
+    };
+}
+
+/// `vec!`-shaped sugar for producing a [`SharedBuffer<T>`] op — SVM
+/// analog of [`device_slice!`](crate::device_slice!).
+///
+/// Two arms mirror [`vec!`](std::vec):
+///
+/// - `shared_buffer![value; count]` — alloc + `clEnqueueSVMMemFill`.
+///   Expands to [`shared_buffer_filled(value, count)`](crate::shared_buffer_filled).
+/// - `shared_buffer![a, b, c]` — alloc + `clEnqueueSVMMemcpy` from a
+///   host literal. Expands to [`shared_buffer_upload(vec![a, b, c])`](crate::shared_buffer_upload).
+///
+/// Both arms gate on SVM availability and surface
+/// [`Error::SvmNotAvailable`](claspr::Error::SvmNotAvailable) at
+/// execute time on devices without SVM.
+///
+/// ```ignore
+/// // SVM alloc + on-device fill with 0u32.
+/// let buf_op = shared_buffer![0u32; N];
+///
+/// // SVM alloc + SVM memcpy from a host literal.
+/// let buf_op = shared_buffer![1u32, 2, 3, 4];
+/// ```
+#[macro_export]
+macro_rules! shared_buffer {
+    [$value:expr; $count:expr] => {
+        $crate::shared_buffer_filled($value, $count)
+    };
+    [$($v:expr),* $(,)?] => {
+        $crate::shared_buffer_upload(::std::vec![$($v),*])
     };
 }

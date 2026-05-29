@@ -7,7 +7,7 @@
 //! exercising).
 
 use claspr::{Buffer, Context, SharedBuffer, SvmLevel};
-use claspr_async::{DeviceOperation, shared_buffer_filled};
+use claspr_async::{DeviceOperation, shared_buffer, shared_buffer_filled, shared_buffer_upload};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;
@@ -92,6 +92,52 @@ fn tier2_shared_buffer_filled_threads_into_kernel() {
     assert_eq!(buf.len(), N);
     let g = buf.map(&ctx).expect("map");
     assert!(g.iter().all(|&v| v == 10));
+}
+
+#[test]
+fn tier2_shared_buffer_upload_threads_into_kernel() {
+    // alloc SVM + clEnqueueSVMMemcpy from a host literal, then scale
+    // by 3 in a kernel. The host source is kept alive by the drop
+    // callback registered on the memcpy event; the buffer's last_use
+    // includes the memcpy event so Drop's SVMFree waits.
+    let Some(ctx) = ctx_with_svm() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let buf = shared_buffer_upload::<u32, _>(vec![1u32, 2, 3, 4, 5, 6, 7, 8])
+        .and_then(|buf| kernels.scale_u32([8], buf, 3))
+        .sync(&ctx)
+        .expect("upload + scale");
+    assert_eq!(buf.len(), 8);
+    let g = buf.map(&ctx).expect("map");
+    assert_eq!(&g[..], &[3u32, 6, 9, 12, 15, 18, 21, 24]);
+}
+
+#[test]
+fn macro_shared_buffer_repeat_arm() {
+    // `shared_buffer![v; N]` → shared_buffer_filled(v, N).
+    let Some(ctx) = ctx_with_svm() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let buf = shared_buffer![4u32; N]
+        .and_then(|buf| kernels.scale_u32([N], buf, 5))
+        .sync(&ctx)
+        .expect("macro repeat");
+    let g = buf.map(&ctx).expect("map");
+    assert!(g.iter().all(|&v| v == 20));
+}
+
+#[test]
+fn macro_shared_buffer_literal_arm() {
+    // `shared_buffer![a, b, c]` → shared_buffer_upload(vec![a, b, c]).
+    let Some(ctx) = ctx_with_svm() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let buf = shared_buffer![10u32, 20, 30, 40]
+        .and_then(|buf| kernels.scale_u32([4], buf, 2))
+        .sync(&ctx)
+        .expect("macro literal");
+    let g = buf.map(&ctx).expect("map");
+    assert_eq!(&g[..], &[20u32, 40, 60, 80]);
 }
 
 #[test]

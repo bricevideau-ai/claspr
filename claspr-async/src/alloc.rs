@@ -47,8 +47,12 @@
 
 use crate::exec_ctx::ExecutionContext;
 use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
-use claspr::{DeviceSlice, HostBuffer, Result, SharedBuffer};
+use crate::transfer::UploadSource;
+use claspr::{DeviceSlice, HostBuffer, Launcher, Result, SharedBuffer, register_drop_callback};
+use opencl3::event::{Event, retain_event};
+use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 // ── DeviceSlice ─────────────────────────────────────────────────────
 
@@ -204,6 +208,83 @@ where
             .fill(ec, self.value)
             .after_all(deps_as_events(&deps))
             .submit()?;
+        Ok((buf, vec![wrap_event(event)]))
+    }
+}
+
+// ── SharedBuffer upload (alloc + clEnqueueSVMMemcpy from host) ─────
+
+/// Lazy alloc + memcpy from a host source into a fresh
+/// [`SharedBuffer<T>`]. SVM analog of [`crate::upload`] — wraps
+/// `clEnqueueSVMMemcpy` instead of `clEnqueueWriteBuffer`. The host
+/// source is kept alive by a `clSetEventCallback(CL_COMPLETE)` drop
+/// holder until the copy finishes.
+pub struct SharedBufferUpload<T> {
+    source: Option<UploadSource<T>>,
+}
+
+/// Allocate a [`SharedBuffer<T>`] of `source.len()` elements and
+/// memcpy `source` into it via `clEnqueueSVMMemcpy`. Mirrors
+/// [`upload`](crate::upload) on the SVM side.
+///
+/// `T: Copy` because the memcpy is bytewise — types with non-trivial
+/// Drop or owned heap data would alias on copy. Same constraint as
+/// [`shared_buffer_filled`].
+pub fn shared_buffer_upload<T, S>(source: S) -> SharedBufferUpload<T>
+where
+    T: Copy + Send + Sync + 'static,
+    S: Into<UploadSource<T>>,
+{
+    SharedBufferUpload {
+        source: Some(source.into()),
+    }
+}
+
+impl<T> DeviceOperation for SharedBufferUpload<T>
+where
+    T: Copy + Send + Sync + 'static,
+{
+    type Output = SharedBuffer<T>;
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(SharedBuffer<T>, Deps)> {
+        let source = self
+            .source
+            .take()
+            .expect("SharedBufferUpload::execute called twice — internal claspr-async bug");
+        let len = source.len();
+        let buf = SharedBuffer::<T>::alloc(ec.context(), len)?;
+
+        let raw_deps: Vec<opencl3::types::cl_event> =
+            deps.iter().map(|d| d.as_ref().get()).collect();
+        let size = len * std::mem::size_of::<T>();
+        // SAFETY: buf.ptr() is a fresh, valid SVM allocation in the
+        // queue's context. source.as_slice().as_ptr() is stable for
+        // the lifetime of `source`; the drop callback below keeps
+        // `source` alive until the copy event fires. CL_NON_BLOCKING
+        // so we return immediately and chain on the event.
+        let event = unsafe {
+            ec.cl_queue().enqueue_svm_mem_cpy(
+                opencl3::types::CL_NON_BLOCKING,
+                buf.ptr() as *mut c_void,
+                source.as_slice().as_ptr() as *const c_void,
+                size,
+                &raw_deps,
+            )?
+        };
+        register_drop_callback(&event, Box::new(source))?;
+
+        // Auto-register on the buffer's last_use so Drop's
+        // clEnqueueSVMFree waits for the memcpy. Need clRetainEvent
+        // since we hand the original Event to the chain's deps_out
+        // and an independent Event to the buffer's last_use list.
+        // SAFETY: event.get() is live; retain is paired with the
+        // Event::drop inside the Arc.
+        unsafe {
+            retain_event(event.get())
+                .map_err(|code| claspr::Error::OpenCl(opencl3::error_codes::ClError(code)))?;
+        }
+        buf.register_use(Arc::new(Event::new(event.get())));
+
         Ok((buf, vec![wrap_event(event)]))
     }
 }
