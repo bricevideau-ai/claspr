@@ -38,8 +38,8 @@
 
 use claspr::{Context, Device};
 use claspr_async::{
-    DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, DynOp, bundle, download,
-    fan_out, transfer_to_device, upload, value,
+    DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, DynOp, bundle,
+    device_slice_alloc, download, fan_out, transfer_to_device, upload, value,
 };
 use std::sync::Arc;
 
@@ -170,11 +170,15 @@ fn scenario_3_diamond(ctx: &Context) -> claspr::Result<()> {
         .and_then(move |shared: Arc<claspr::DeviceSlice<f32>>| {
             let s1 = Arc::clone(&shared);
             let s2 = Arc::clone(&shared);
+            // Output buffers: `add_shared_bias` writes `out` without
+            // reading, so a fresh uninitialised alloc is fine — no
+            // need to upload zeros (would be a wasted host→device
+            // write the kernel immediately overwrites).
             bundle!(
-                upload(vec![0.0f32; N]).and_then(move |out| kernels_ref
+                device_slice_alloc::<f32>(N).and_then(move |out| kernels_ref
                     .add_shared_bias([N], out, s1, len, 100.0)
                     .and_then(|(out, _sh)| value(out))),
-                upload(vec![0.0f32; N]).and_then(move |out| kernels_ref
+                device_slice_alloc::<f32>(N).and_then(move |out| kernels_ref
                     .add_shared_bias([N], out, s2, len, 200.0)
                     .and_then(|(out, _sh)| value(out))),
             )
