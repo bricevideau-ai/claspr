@@ -180,15 +180,25 @@ impl<
 {
 }
 
-// ── USMSlice (same — marker-parameterisation is a follow-up) ──
+// ── USMSlice<T, M> impls ───────────────────────────────────────────
 
-impl<T: Send + 'static> kernel_slice_arg_sealed::Sealed for crate::USMSlice<T> {}
-impl<T: Send + 'static> KernelSliceReadArg<T> for crate::USMSlice<T> {
+impl<T: Send + 'static, M: crate::access::MemMode> kernel_slice_arg_sealed::Sealed
+    for crate::USMSlice<T, M>
+{
+}
+impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadable>
+    KernelSliceReadArg<T> for crate::USMSlice<T, M>
+{
     fn element_count(&self) -> usize {
         crate::Buffer::len(self)
     }
 }
-impl<T: Send + 'static> KernelSliceReadWriteArg<T> for crate::USMSlice<T> {}
+impl<
+    T: Send + 'static,
+    M: crate::access::MemMode + crate::access::KernelReadable + crate::access::KernelWritable,
+> KernelSliceReadWriteArg<T> for crate::USMSlice<T, M>
+{
+}
 
 // `Arc<DeviceSlice<T, M>>` — share one cl_mem across N parallel chain
 // branches without re-uploading. Pair with [`claspr_async::Arced`]

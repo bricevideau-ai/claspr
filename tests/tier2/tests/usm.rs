@@ -43,13 +43,13 @@ fn usm_slice_capability_gate() {
     match ctx.svm_capability() {
         SvmLevel::FineSystem => {
             // Positive path: construction succeeds.
-            let s = claspr::USMSlice::new(&ctx, vec![1u32, 2, 3])
+            let s = claspr::USMSlice::<u32>::new(&ctx, vec![1u32, 2, 3])
                 .expect("FineSystem device should construct USMSlice");
             assert_eq!(s.len(), 3);
         }
         _ => {
             // Negative path: NotSupported.
-            let err = claspr::USMSlice::new(&ctx, vec![1u32, 2, 3])
+            let err = claspr::USMSlice::<u32>::new(&ctx, vec![1u32, 2, 3])
                 .expect_err("non-FineSystem device should error");
             assert!(matches!(err, claspr::Error::NotSupported(_)), "got {err:?}",);
         }
@@ -90,7 +90,7 @@ fn usm_slice_drop_waits_for_in_flight_kernel() {
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = claspr::USMSlice::new(&ctx, vec![3u32; N]).expect("USM new");
+    let buf = claspr::USMSlice::<u32>::new(&ctx, vec![3u32; N]).expect("USM new");
     // Tier 1 submit — non-blocking, returns Event.
     let (buf, _evt) = kernels.scale_u32([N], buf, 4).submit(&ctx).expect("submit");
     // Drop immediately. The Vec must NOT free until the kernel
@@ -152,7 +152,7 @@ fn usm_slice_host_writes_visible_to_kernel_via_deref_mut() {
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let mut buf = claspr::USMSlice::new(&ctx, vec![0u32; N]).expect("USM new");
+    let mut buf = claspr::USMSlice::<u32>::new(&ctx, vec![0u32; N]).expect("USM new");
     // Host write via DerefMut.
     for (i, slot) in buf.iter_mut().enumerate() {
         *slot = i as u32;

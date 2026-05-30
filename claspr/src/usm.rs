@@ -29,6 +29,7 @@
 //!
 //! [`Error::NotSupported`]: crate::Error::NotSupported
 
+use crate::access::{HostReadable, HostWritable, KernelWritable, MemMode, ReadWrite};
 use crate::buffer::Buffer;
 use crate::context::{Context, SvmLevel};
 use crate::error::{Error, Result};
@@ -36,6 +37,7 @@ use crate::launch::KernelArg;
 use opencl3::event::{Event, retain_event};
 use opencl3::kernel::ExecuteKernel;
 use std::fmt;
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
@@ -60,7 +62,7 @@ use std::sync::{Arc, Mutex};
 /// the kernel. Unlike `MappedSlice`'s `clEnqueueSVMFree` (which can
 /// queue-order behind in-flight events), the host `Vec` drop is
 /// synchronous — so the wait must be too.
-pub struct USMSlice<T> {
+pub struct USMSlice<T, M: MemMode = ReadWrite> {
     data: Vec<T>,
     ctx: Context,
     /// Every kernel-launch event that received this slice's SVM
@@ -68,6 +70,16 @@ pub struct USMSlice<T> {
     /// [`register_use`](Self::register_use). Drop waits on each
     /// before letting the host Vec drop.
     in_flight: Mutex<Vec<Arc<Event>>>,
+    /// Type-level access-mode tag. USMSlice's backing memory is just
+    /// a Rust `Vec<T>` — no `cl_mem_flags` at construction time. The
+    /// marker exists purely to enable type-level method gating
+    /// uniformly with `DeviceSlice<T, M>` and `MappedSlice<T, M>`:
+    /// markers without `HostWritable` lose `DerefMut`, markers
+    /// without `KernelWritable` lose kernel-write capability, etc.
+    /// The OpenCL runtime can't independently enforce these (no
+    /// flag goes through) — the safety boundary is the Rust type
+    /// system.
+    _mode: PhantomData<fn() -> M>,
 }
 
 // SAFETY: USMSlice contains an owned Vec<T> plus an Arc<Event> Vec;
@@ -79,11 +91,11 @@ pub struct USMSlice<T> {
 // code holds either is fine at the OpenCL level (fine-grain semantics)
 // but the user is responsible for not racing host-side mutation with
 // in-flight kernel writes — same contract as any shared-memory model.
-unsafe impl<T: Send> Send for USMSlice<T> {}
-unsafe impl<T: Sync> Sync for USMSlice<T> {}
+unsafe impl<T: Send, M: MemMode> Send for USMSlice<T, M> {}
+unsafe impl<T: Sync, M: MemMode> Sync for USMSlice<T, M> {}
 
-impl<T> USMSlice<T> {
-    /// Wrap `data` as a USMSlice. Errors with
+impl<T, M: MemMode> USMSlice<T, M> {
+    /// Wrap `data` as a USMSlice with the marker `M`. Errors with
     /// [`Error::NotSupported`](crate::Error::NotSupported) if the
     /// context's device doesn't advertise
     /// `CL_DEVICE_SVM_FINE_GRAIN_SYSTEM`.
@@ -100,6 +112,7 @@ impl<T> USMSlice<T> {
             data,
             ctx: ctx.clone(),
             in_flight: Mutex::new(Vec::new()),
+            _mode: PhantomData,
         })
     }
 
@@ -124,25 +137,23 @@ impl<T> USMSlice<T> {
     }
 }
 
-impl<T: Default + Copy + Send + 'static> USMSlice<T> {
+impl<T: Default + Copy + Send + 'static, M: MemMode + KernelWritable> USMSlice<T, M> {
     /// Allocate a USMSlice of `len` elements initialised to
     /// `T::default()`. Convenience wrapper over
     /// [`new(ctx, vec![T::default(); len])`](Self::new), symmetric
     /// with [`DeviceSlice::alloc`](crate::DeviceSlice::alloc) and
     /// [`MappedSlice::alloc`](crate::MappedSlice::alloc).
     ///
-    /// No perf win over the explicit `new` form — the Vec still needs
-    /// to be initialised before construction (`USMSlice` derefs to
-    /// `&[T]` so uninit bytes would be unsound to expose). The benefit
-    /// is API symmetry across tiers and a shorter call site for the
-    /// common "I just want N zeroed elements the kernel will fill"
-    /// pattern.
+    /// The `M: KernelWritable` bound mirrors the alloc constructors
+    /// on the other tiers — markers that mark the buffer kernel-RO
+    /// (`ReadOnly`, `Frozen`) construct from initial data via
+    /// [`new`](Self::new) instead.
     pub fn alloc(ctx: &Context, len: usize) -> Result<Self> {
         Self::new(ctx, vec![T::default(); len])
     }
 }
 
-impl<T> Buffer<T> for USMSlice<T> {
+impl<T, M: MemMode> Buffer<T> for USMSlice<T, M> {
     fn len(&self) -> usize {
         self.data.len()
     }
@@ -152,14 +163,14 @@ impl<T> Buffer<T> for USMSlice<T> {
     }
 }
 
-impl<T> Deref for USMSlice<T> {
+impl<T, M: MemMode + HostReadable> Deref for USMSlice<T, M> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         &self.data
     }
 }
 
-impl<T> DerefMut for USMSlice<T> {
+impl<T, M: MemMode + HostWritable + HostReadable> DerefMut for USMSlice<T, M> {
     fn deref_mut(&mut self) -> &mut [T] {
         &mut self.data
     }
@@ -167,7 +178,7 @@ impl<T> DerefMut for USMSlice<T> {
 
 /// Metadata-only `Debug` — doesn't print the Vec contents (could be
 /// huge / sensitive) and doesn't require `T: Debug`.
-impl<T> fmt::Debug for USMSlice<T> {
+impl<T, M: MemMode> fmt::Debug for USMSlice<T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("USMSlice")
             .field("len", &self.data.len())
@@ -176,7 +187,7 @@ impl<T> fmt::Debug for USMSlice<T> {
     }
 }
 
-impl<T> KernelArg for USMSlice<T> {
+impl<T, M: MemMode> KernelArg for USMSlice<T, M> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         // Same slice-decomposition as MappedSlice: SVM pointer
         // first (via clSetKernelArgSVMPointer), then length as a
@@ -211,7 +222,7 @@ impl<T> KernelArg for USMSlice<T> {
     }
 }
 
-impl<T> Drop for USMSlice<T> {
+impl<T, M: MemMode> Drop for USMSlice<T, M> {
     fn drop(&mut self) {
         // Block host-side on every in-flight event before the Vec
         // drops. Unlike MappedSlice (where clEnqueueSVMFree can
