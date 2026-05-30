@@ -160,16 +160,25 @@ impl<
 {
 }
 
-// ── MappedSlice (only ReadWrite for now — marker-parameterisation
-// is a follow-up) ──
+// ── MappedSlice<T, M> impls ────────────────────────────────────────
 
-impl<T: Send + 'static> kernel_slice_arg_sealed::Sealed for crate::MappedSlice<T> {}
-impl<T: Send + 'static> KernelSliceReadArg<T> for crate::MappedSlice<T> {
+impl<T: Send + 'static, M: crate::access::MemMode> kernel_slice_arg_sealed::Sealed
+    for crate::MappedSlice<T, M>
+{
+}
+impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadable>
+    KernelSliceReadArg<T> for crate::MappedSlice<T, M>
+{
     fn element_count(&self) -> usize {
         crate::Buffer::len(self)
     }
 }
-impl<T: Send + 'static> KernelSliceReadWriteArg<T> for crate::MappedSlice<T> {}
+impl<
+    T: Send + 'static,
+    M: crate::access::MemMode + crate::access::KernelReadable + crate::access::KernelWritable,
+> KernelSliceReadWriteArg<T> for crate::MappedSlice<T, M>
+{
+}
 
 // ── USMSlice (same — marker-parameterisation is a follow-up) ──
 

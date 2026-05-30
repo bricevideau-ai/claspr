@@ -496,11 +496,11 @@ where
 
 // ── MappedSlice: non-blocking SVM map/unmap ────────────────────────
 
-impl<T> HostReadableExt for MappedSlice<T>
+impl<T, M: MemMode + HostReadable> HostReadableExt for MappedSlice<T, M>
 where
     T: Send + Sync + 'static,
 {
-    type AcquireReadOp = AcquireMappedSliceOp<T, MapReadOnly>;
+    type AcquireReadOp = AcquireMappedSliceOp<T, M, MapReadOnly>;
     fn acquire_host_view_read(self) -> Self::AcquireReadOp {
         AcquireMappedSliceOp {
             buf: Some(self),
@@ -509,11 +509,11 @@ where
     }
 }
 
-impl<T> HostWritableExt for MappedSlice<T>
+impl<T, M: MemMode + HostWritable + HostReadable> HostWritableExt for MappedSlice<T, M>
 where
     T: Send + Sync + 'static,
 {
-    type AcquireOp = AcquireMappedSliceOp<T, MapReadWrite>;
+    type AcquireOp = AcquireMappedSliceOp<T, M, MapReadWrite>;
     fn acquire_host_view(self) -> Self::AcquireOp {
         AcquireMappedSliceOp {
             buf: Some(self),
@@ -528,17 +528,18 @@ where
 /// is returned in the output `Deps` so downstream stages (including
 /// an `and_then_host` worker) gate on it before touching the SVM
 /// memory.
-pub struct AcquireMappedSliceOp<T, A: MapAccess> {
-    buf: Option<MappedSlice<T>>,
+pub struct AcquireMappedSliceOp<T, M: MemMode, A: MapAccess> {
+    buf: Option<MappedSlice<T, M>>,
     _access: PhantomData<A>,
 }
 
-impl<T, A> DeviceOperation for AcquireMappedSliceOp<T, A>
+impl<T, M, A> DeviceOperation for AcquireMappedSliceOp<T, M, A>
 where
     T: Send + Sync + 'static,
+    M: MemMode,
     A: MapAccess,
 {
-    type Output = MappedSliceHostView<T, A>;
+    type Output = MappedSliceHostView<T, M, A>;
 
     fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let buf = self
@@ -586,8 +587,8 @@ where
 /// Deref behaviour mirrors [`DeviceSliceHostView`]: `&[T]` always;
 /// `&mut [T]` only for the [`MapReadWrite`] access mode (type-system
 /// enforcement against accidental writes through a read-only map).
-pub struct MappedSliceHostView<T, A: MapAccess> {
-    buf: Option<MappedSlice<T>>,
+pub struct MappedSliceHostView<T, M: MemMode, A: MapAccess> {
+    buf: Option<MappedSlice<T, M>>,
     /// Retained `cl_command_queue` handle for the matching SVM unmap.
     queue: RetainedQueue,
     /// Set to `true` once `release_to_device` enqueued the unmap, so
@@ -598,9 +599,9 @@ pub struct MappedSliceHostView<T, A: MapAccess> {
 
 // SAFETY: MappedSlice is itself Send (per its own impl). The
 // queue is wrapped in RetainedQueue which is independently Send.
-unsafe impl<T: Send, A: MapAccess> Send for MappedSliceHostView<T, A> {}
+unsafe impl<T: Send, M: MemMode, A: MapAccess> Send for MappedSliceHostView<T, M, A> {}
 
-impl<T, A: MapAccess> Drop for MappedSliceHostView<T, A> {
+impl<T, M: MemMode, A: MapAccess> Drop for MappedSliceHostView<T, M, A> {
     fn drop(&mut self) {
         if !self.unmap_done
             && let Some(buf) = self.buf.as_ref()
@@ -630,7 +631,7 @@ impl<T, A: MapAccess> Drop for MappedSliceHostView<T, A> {
     }
 }
 
-impl<T, A: MapAccess> Deref for MappedSliceHostView<T, A> {
+impl<T, M: MemMode, A: MapAccess> Deref for MappedSliceHostView<T, M, A> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         let buf = self
@@ -644,7 +645,7 @@ impl<T, A: MapAccess> Deref for MappedSliceHostView<T, A> {
     }
 }
 
-impl<T> DerefMut for MappedSliceHostView<T, MapReadWrite> {
+impl<T, M: MemMode> DerefMut for MappedSliceHostView<T, M, MapReadWrite> {
     fn deref_mut(&mut self) -> &mut [T] {
         let buf = self
             .buf
@@ -657,9 +658,10 @@ impl<T> DerefMut for MappedSliceHostView<T, MapReadWrite> {
     }
 }
 
-impl<T, A> MappedSliceHostView<T, A>
+impl<T, M, A> MappedSliceHostView<T, M, A>
 where
     T: Send + 'static,
+    M: MemMode,
     A: MapAccess,
 {
     /// Enqueue the matching `clEnqueueSVMUnmap` waiting on `deps`,
@@ -668,24 +670,29 @@ where
     /// it before touching the SVM allocation, and is also recorded
     /// on the [`MappedSlice`] so its eventual
     /// `clEnqueueSVMFree` (on drop) ordering is preserved.
-    pub fn release_to_device(self) -> ReleaseMappedSliceOp<T, A> {
+    pub fn release_to_device(self) -> ReleaseMappedSliceOp<T, M, A> {
         ReleaseMappedSliceOp { view: Some(self) }
     }
 }
 
 /// Combinator returned by [`MappedSliceHostView::release_to_device`].
-pub struct ReleaseMappedSliceOp<T, A: MapAccess> {
-    view: Option<MappedSliceHostView<T, A>>,
+pub struct ReleaseMappedSliceOp<T, M: MemMode, A: MapAccess> {
+    view: Option<MappedSliceHostView<T, M, A>>,
 }
 
-impl<T, A> DeviceOperation for ReleaseMappedSliceOp<T, A>
+impl<T, M, A> DeviceOperation for ReleaseMappedSliceOp<T, M, A>
 where
     T: Send + 'static,
+    M: MemMode,
     A: MapAccess,
 {
-    type Output = MappedSlice<T>;
+    type Output = MappedSlice<T, M>;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(MappedSlice<T>, Deps)> {
+    fn execute(
+        mut self,
+        ctx: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> Result<(MappedSlice<T, M>, Deps)> {
         let mut view = self
             .view
             .take()
@@ -722,7 +729,7 @@ where
 /// The SVM map is already in place from acquire; `map`/`unmap` are
 /// no-ops here, and the map event reaches the worker via
 /// `source_evts` (the `Deps` carried through the chain).
-impl<T> Mappable for MappedSliceHostView<T, MapReadWrite>
+impl<T, M: MemMode> Mappable for MappedSliceHostView<T, M, MapReadWrite>
 where
     T: Send + 'static,
 {
@@ -763,7 +770,7 @@ where
     fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
 }
 
-impl<T> Mappable for MappedSliceHostView<T, MapReadOnly>
+impl<T, M: MemMode> Mappable for MappedSliceHostView<T, M, MapReadOnly>
 where
     T: Send + Sync + 'static,
 {

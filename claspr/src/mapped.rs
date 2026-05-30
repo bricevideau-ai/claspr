@@ -37,6 +37,7 @@
 //! assert_eq!(view[0], 0);
 //! ```
 
+use crate::access::{HostReadable, HostWritable, KernelWritable, MemMode, ReadWrite};
 use crate::buffer::Buffer;
 use crate::context::{Context, SvmLevel};
 use crate::error::{Error, Result};
@@ -46,10 +47,11 @@ use crate::queue::Launcher;
 use opencl3::command_queue::{CommandQueue, enqueue_svm_map, enqueue_svm_unmap};
 use opencl3::event::{Event, release_event, retain_event};
 use opencl3::kernel::ExecuteKernel;
-use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, CL_MEM_READ_WRITE, svm_alloc};
+use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, svm_alloc};
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_event, cl_int, cl_uint};
 use std::ffi::c_void;
 use std::fmt;
+use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -97,7 +99,7 @@ fn cl_to_err(code: cl_int) -> Error {
 ///
 /// [lo]: crate::LaunchOp
 /// [ka]: crate::KernelArg::register_completion
-pub struct MappedSlice<T> {
+pub struct MappedSlice<T, M: MemMode = ReadWrite> {
     ptr: *mut T,
     len: usize,
     ctx: Context,
@@ -117,16 +119,25 @@ pub struct MappedSlice<T> {
     /// `Arc<MappedSlice<T>>` (e.g. through `.arc()` in claspr-async
     /// chains) and multiple threads may register concurrently.
     last_use: Mutex<Vec<Arc<Event>>>,
+    /// Type-level access-mode tag. SVM at the OpenCL level only
+    /// accepts kernel-side flags (`CL_MEM_READ_WRITE` /
+    /// `CL_MEM_READ_ONLY` / `CL_MEM_WRITE_ONLY`); the host-side
+    /// portion of [`MemMode`] is type-level only — SVM allocations
+    /// are always host-RW at the runtime. The marker still gates
+    /// which methods are callable from Rust, which gives users the
+    /// same compile-time enforcement as `DeviceSlice<T, M>` even
+    /// though the OpenCL runtime won't independently check.
+    _mode: PhantomData<fn() -> M>,
 }
 
 // SAFETY: the SVM pointer is a runtime-owned allocation in
 // host-accessible memory; OpenCL guarantees thread-safety for API
 // calls on it (CL §3.4.1). Aliasing is governed by the map guards,
 // which use the borrow checker to enforce exclusivity for `map_mut`.
-unsafe impl<T: Send> Send for MappedSlice<T> {}
-unsafe impl<T: Sync> Sync for MappedSlice<T> {}
+unsafe impl<T: Send, M: MemMode> Send for MappedSlice<T, M> {}
+unsafe impl<T: Sync, M: MemMode> Sync for MappedSlice<T, M> {}
 
-impl<T: Default + Copy> MappedSlice<T> {
+impl<T: Default + Copy, M: MemMode + KernelWritable> MappedSlice<T, M> {
     /// Allocate `len` elements of T in SVM memory, zero-initialised
     /// via `clEnqueueSVMMemFill(T::default())` on the context's
     /// default queue. Blocks until the fill completes.
@@ -134,14 +145,10 @@ impl<T: Default + Copy> MappedSlice<T> {
     /// Returns [`Error::SvmNotAvailable`] if the context's device
     /// reports [`SvmLevel::None`] for `CL_DEVICE_SVM_CAPABILITIES`.
     ///
-    /// The `T: Default + Copy` bound makes the buffer's contents a
-    /// valid `T` value before any read; matches
-    /// [`DeviceSlice::alloc`](crate::DeviceSlice::alloc) and
-    /// [`USMSlice::alloc`](crate::USMSlice::alloc).
-    ///
-    /// The `unsafe` [`alloc_uninit`](Self::alloc_uninit) escape
-    /// hatch skips the fill but requires the caller to overwrite
-    /// every byte before any read — see its safety contract.
+    /// The `M: KernelWritable` bound excludes [`crate::ReadOnly`] and
+    /// [`crate::Frozen`] (kernel-RO at the SVM level); those markers
+    /// use [`from_slice`](Self::from_slice) to bake in initial data.
+    /// Matches [`DeviceSlice::alloc`](crate::DeviceSlice::alloc).
     pub fn alloc(ctx: &Context, len: usize) -> Result<Self> {
         // SAFETY: synchronous fill below overwrites every byte
         // before returning, so no path can observe uninit data.
@@ -151,7 +158,7 @@ impl<T: Default + Copy> MappedSlice<T> {
     }
 }
 
-impl<T> MappedSlice<T> {
+impl<T, M: MemMode + KernelWritable> MappedSlice<T, M> {
     /// Allocate `len` elements of T in SVM memory, leaving the bytes
     /// uninitialised. Cheaper than [`alloc`](Self::alloc) when the
     /// caller writes the whole buffer before any read.
@@ -159,24 +166,21 @@ impl<T> MappedSlice<T> {
     /// # Safety
     ///
     /// Same contract as [`DeviceSlice::alloc_uninit`](crate::DeviceSlice::alloc_uninit):
-    /// every byte must be written before any read (host map / SVM
-    /// copy / kernel that reads). rust-gpu has no `MaybeUninit` story,
-    /// so a kernel that reads uninit bytes interprets them as `T` at
-    /// the SPIR-V level — arbitrary garbage for numeric `T`, UB for
-    /// types with invalid bit patterns.
+    /// every byte must be written before any read.
     pub unsafe fn alloc_uninit(ctx: &Context, len: usize) -> Result<Self> {
         if ctx.svm_capability() == SvmLevel::None {
             return Err(Error::SvmNotAvailable);
         }
         let size = len.saturating_mul(std::mem::size_of::<T>());
-        // SAFETY: CL_MEM_READ_WRITE is a valid flag combination;
-        // alignment is the natural alignment of T (must fit in u32 —
-        // any T with alignment > u32::MAX is degenerate). svm_alloc
-        // returns null on failure, which cl3 maps to CL_INVALID_VALUE.
+        // SAFETY: M::KERNEL_FLAGS is one of the valid SVM-side flag
+        // bits (READ_WRITE / READ_ONLY / WRITE_ONLY — never the
+        // CL_MEM_HOST_* bits, which SVM doesn't accept; only the
+        // kernel-side classification is forwarded to the runtime).
+        // Alignment is the natural alignment of T.
         let raw = unsafe {
             svm_alloc(
                 ctx.raw_context().get(),
-                CL_MEM_READ_WRITE,
+                M::KERNEL_FLAGS,
                 size,
                 std::mem::align_of::<T>() as cl_uint,
             )
@@ -187,9 +191,82 @@ impl<T> MappedSlice<T> {
             len,
             ctx: ctx.clone(),
             last_use: Mutex::new(Vec::new()),
+            _mode: PhantomData,
+        })
+    }
+}
+
+// ── from_slice / from_vec — bake in initial data via SVM map ───────
+//
+// Same role as DeviceSlice::from_slice but the underlying mechanism
+// differs: clSVMAlloc doesn't accept CL_MEM_COPY_HOST_PTR, so we
+// alloc + map + memcpy + unmap. The CopyOp flavoured fill path would
+// also work but pays an extra round trip; the map path is one CL call.
+
+impl<T: Copy, M: MemMode> MappedSlice<T, M> {
+    /// Create an SVM buffer whose contents are copied from `data` at
+    /// construction time. Errors with
+    /// [`Error::SvmNotAvailable`](crate::Error::SvmNotAvailable) if
+    /// the device doesn't support SVM.
+    ///
+    /// Works for any marker — for kernel-RO markers like
+    /// [`crate::ReadOnly`] / [`crate::Frozen`] this is the ONLY
+    /// constructor (no alloc+fill path because fill needs kernel-write
+    /// access). For other markers it's a convenience over `alloc +
+    /// map + memcpy`.
+    pub fn from_slice(ctx: &Context, data: &[T]) -> Result<Self> {
+        if ctx.svm_capability() == SvmLevel::None {
+            return Err(Error::SvmNotAvailable);
+        }
+        let size = data.len().saturating_mul(std::mem::size_of::<T>());
+        // SAFETY: M::KERNEL_FLAGS is one of the valid SVM-side flag
+        // bits. Alignment is the natural alignment of T.
+        let raw = unsafe {
+            svm_alloc(
+                ctx.raw_context().get(),
+                M::KERNEL_FLAGS,
+                size,
+                std::mem::align_of::<T>() as cl_uint,
+            )
+            .map_err(cl_to_err)?
+        };
+        // Map for write, memcpy, unmap. Blocking is fine for
+        // construction.
+        // SAFETY: raw is a fresh, live SVM allocation in ctx; the
+        // queue we use is ctx's default queue; the size matches what
+        // we just allocated.
+        let queue = ctx.cl_queue();
+        unsafe {
+            enqueue_svm_map(
+                queue.get(),
+                opencl3::types::CL_BLOCKING,
+                CL_MAP_WRITE,
+                raw,
+                size,
+                0,
+                std::ptr::null(),
+            )
+            .map_err(cl_to_err)?;
+            // memcpy from host to the now-host-accessible SVM region.
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, raw as *mut u8, size);
+            enqueue_svm_unmap(queue.get(), raw, 0, std::ptr::null()).map_err(cl_to_err)?;
+        }
+        Ok(MappedSlice {
+            ptr: raw.cast::<T>(),
+            len: data.len(),
+            ctx: ctx.clone(),
+            last_use: Mutex::new(Vec::new()),
+            _mode: PhantomData,
         })
     }
 
+    /// Take a Vec by value — wrapper over [`from_slice`](Self::from_slice).
+    pub fn from_vec(ctx: &Context, data: Vec<T>) -> Result<Self> {
+        Self::from_slice(ctx, &data)
+    }
+}
+
+impl<T, M: MemMode> MappedSlice<T, M> {
     /// Append `event` to this buffer's in-flight-use list. Drop passes
     /// every accumulated event to `clEnqueueSVMFree`'s wait-list, so
     /// the free is queue-ordered after every recorded use — including
@@ -214,7 +291,10 @@ impl<T> MappedSlice<T> {
     ///
     /// The map is blocking — `clEnqueueSVMMap` with `CL_TRUE` for
     /// the blocking flag and `CL_MAP_READ`.
-    pub fn map<'a, L: Launcher>(&'a self, launcher: &L) -> Result<MappedReadGuard<'a, T>> {
+    pub fn map<'a, L: Launcher>(&'a self, launcher: &L) -> Result<MappedReadGuard<'a, T, M>>
+    where
+        M: HostReadable,
+    {
         MappedReadGuard::new(self, launcher)
     }
 
@@ -222,7 +302,13 @@ impl<T> MappedSlice<T> {
     /// guard that derefs to `&mut [T]` and unmaps on Drop. The
     /// `&mut self` receiver gives the borrow checker the
     /// exclusivity guarantee needed for `DerefMut`.
-    pub fn map_mut<'a, L: Launcher>(&'a mut self, launcher: &L) -> Result<MappedWriteGuard<'a, T>> {
+    pub fn map_mut<'a, L: Launcher>(
+        &'a mut self,
+        launcher: &L,
+    ) -> Result<MappedWriteGuard<'a, T, M>>
+    where
+        M: HostWritable + HostReadable,
+    {
         MappedWriteGuard::new(self, launcher)
     }
 
@@ -241,9 +327,18 @@ impl<T> MappedSlice<T> {
     /// resulting event is auto-registered on this buffer's
     /// last-use list, so Drop's `clEnqueueSVMFree` waits for the
     /// fill to finish.
-    pub fn fill<'a, L: Launcher + ?Sized>(&'a self, launcher: &'a L, value: T) -> SvmFillOp<'a, T>
+    ///
+    /// **Marker constraint:** `M: KernelWritable`. Runtime-side fill
+    /// requires write access at the OpenCL level; kernel-RO markers
+    /// (`ReadOnly`, `Frozen`) reject it.
+    pub fn fill<'a, L: Launcher + ?Sized>(
+        &'a self,
+        launcher: &'a L,
+        value: T,
+    ) -> SvmFillOp<'a, T, M>
     where
         T: Copy,
+        M: KernelWritable,
     {
         SvmFillOp {
             queue: launcher.cl_queue(),
@@ -263,11 +358,11 @@ impl<T> MappedSlice<T> {
     /// time). The resulting event is registered on **both** buffers'
     /// last-use lists so Drop on either side is ordered after the
     /// copy.
-    pub fn copy_to<'a, L: Launcher + ?Sized>(
+    pub fn copy_to<'a, L: Launcher + ?Sized, M2: MemMode>(
         &'a self,
-        dst: &'a MappedSlice<T>,
+        dst: &'a MappedSlice<T, M2>,
         launcher: &'a L,
-    ) -> SvmCopyOp<'a, T> {
+    ) -> SvmCopyOp<'a, T, M, M2> {
         SvmCopyOp {
             queue: launcher.cl_queue(),
             src: self,
@@ -281,7 +376,7 @@ impl<T> MappedSlice<T> {
 /// Metadata-only `Debug` — does not read through the SVM pointer
 /// (would race with in-flight kernel work and require holding a map
 /// guard) and doesn't require `T: Debug`.
-impl<T> fmt::Debug for MappedSlice<T> {
+impl<T, M: MemMode> fmt::Debug for MappedSlice<T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MappedSlice")
             .field("len", &self.len)
@@ -290,7 +385,7 @@ impl<T> fmt::Debug for MappedSlice<T> {
     }
 }
 
-impl<T> Buffer<T> for MappedSlice<T> {
+impl<T, M: MemMode> Buffer<T> for MappedSlice<T, M> {
     fn len(&self) -> usize {
         self.len
     }
@@ -309,15 +404,15 @@ impl<T> Buffer<T> for MappedSlice<T> {
 
 /// Lazy builder for `clEnqueueSVMMemFill`. Returned by
 /// [`MappedSlice::fill`].
-pub struct SvmFillOp<'a, T: Copy> {
+pub struct SvmFillOp<'a, T: Copy, M: MemMode> {
     queue: &'a CommandQueue,
-    owner: &'a MappedSlice<T>,
+    owner: &'a MappedSlice<T, M>,
     pattern: T,
     deps: Vec<cl_event>,
     profile_cb: Option<ProfileCb>,
 }
 
-impl<'a, T: Copy> SvmFillOp<'a, T> {
+impl<'a, T: Copy, M: MemMode> SvmFillOp<'a, T, M> {
     pub fn after(mut self, event: &Event) -> Self {
         self.deps.push(event.get());
         self
@@ -385,15 +480,15 @@ impl<'a, T: Copy> SvmFillOp<'a, T> {
 
 /// Lazy builder for `clEnqueueSVMMemcpy`. Returned by
 /// [`MappedSlice::copy_to`].
-pub struct SvmCopyOp<'a, T> {
+pub struct SvmCopyOp<'a, T, M1: MemMode, M2: MemMode> {
     queue: &'a CommandQueue,
-    src: &'a MappedSlice<T>,
-    dst: &'a MappedSlice<T>,
+    src: &'a MappedSlice<T, M1>,
+    dst: &'a MappedSlice<T, M2>,
     deps: Vec<cl_event>,
     profile_cb: Option<ProfileCb>,
 }
 
-impl<'a, T> SvmCopyOp<'a, T> {
+impl<'a, T, M1: MemMode, M2: MemMode> SvmCopyOp<'a, T, M1, M2> {
     pub fn after(mut self, event: &Event) -> Self {
         self.deps.push(event.get());
         self
@@ -469,7 +564,7 @@ impl<'a, T> SvmCopyOp<'a, T> {
     }
 }
 
-impl<T> Drop for MappedSlice<T> {
+impl<T, M: MemMode> Drop for MappedSlice<T, M> {
     fn drop(&mut self) {
         // Use `clEnqueueSVMFree` on the context's default queue, NOT
         // the immediate `clSVMFree`. Per the CL spec, `clSVMFree` does
@@ -505,7 +600,7 @@ impl<T> Drop for MappedSlice<T> {
     }
 }
 
-impl<T> KernelArg for MappedSlice<T> {
+impl<T, M: MemMode> KernelArg for MappedSlice<T, M> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         // Slice decomposition matches rust-gpu's
         // `#[spirv(cross_workgroup)] &mut [T]` lowering: SVM
@@ -544,13 +639,13 @@ impl<T> KernelArg for MappedSlice<T> {
 
 /// RAII guard for a SVM read map. Drop issues `clEnqueueSVMUnmap`
 /// and the inner `RetainedQueue` releases the queue handle.
-pub struct MappedReadGuard<'a, T> {
-    buf: &'a MappedSlice<T>,
+pub struct MappedReadGuard<'a, T, M: MemMode> {
+    buf: &'a MappedSlice<T, M>,
     queue: crate::util::RetainedQueue,
 }
 
-impl<'a, T> MappedReadGuard<'a, T> {
-    fn new<L: Launcher>(buf: &'a MappedSlice<T>, launcher: &L) -> Result<Self> {
+impl<'a, T, M: MemMode> MappedReadGuard<'a, T, M> {
+    fn new<L: Launcher>(buf: &'a MappedSlice<T, M>, launcher: &L) -> Result<Self> {
         let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
         // SAFETY: blocking map for read; queue is alive (RetainedQueue).
         let evt = unsafe {
@@ -570,7 +665,7 @@ impl<'a, T> MappedReadGuard<'a, T> {
     }
 }
 
-impl<T> Deref for MappedReadGuard<'_, T> {
+impl<T, M: MemMode> Deref for MappedReadGuard<'_, T, M> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         // SAFETY: the SVM pointer is valid + mapped for read for
@@ -579,7 +674,7 @@ impl<T> Deref for MappedReadGuard<'_, T> {
     }
 }
 
-impl<T> Drop for MappedReadGuard<'_, T> {
+impl<T, M: MemMode> Drop for MappedReadGuard<'_, T, M> {
     fn drop(&mut self) {
         // SAFETY: ptr was mapped in `new`; unmap exactly once now.
         // The `queue: RetainedQueue` field drops after this body
@@ -596,13 +691,13 @@ impl<T> Drop for MappedReadGuard<'_, T> {
 
 /// RAII guard for a SVM write map. Drop issues `clEnqueueSVMUnmap`
 /// and the inner `RetainedQueue` releases the queue handle.
-pub struct MappedWriteGuard<'a, T> {
-    buf: &'a mut MappedSlice<T>,
+pub struct MappedWriteGuard<'a, T, M: MemMode> {
+    buf: &'a mut MappedSlice<T, M>,
     queue: crate::util::RetainedQueue,
 }
 
-impl<'a, T> MappedWriteGuard<'a, T> {
-    fn new<L: Launcher>(buf: &'a mut MappedSlice<T>, launcher: &L) -> Result<Self> {
+impl<'a, T, M: MemMode> MappedWriteGuard<'a, T, M> {
+    fn new<L: Launcher>(buf: &'a mut MappedSlice<T, M>, launcher: &L) -> Result<Self> {
         let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
         let ptr = buf.ptr;
         let len = buf.len;
@@ -624,7 +719,7 @@ impl<'a, T> MappedWriteGuard<'a, T> {
     }
 }
 
-impl<T> Deref for MappedWriteGuard<'_, T> {
+impl<T, M: MemMode> Deref for MappedWriteGuard<'_, T, M> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         // SAFETY: see MappedReadGuard.
@@ -632,7 +727,7 @@ impl<T> Deref for MappedWriteGuard<'_, T> {
     }
 }
 
-impl<T> DerefMut for MappedWriteGuard<'_, T> {
+impl<T, M: MemMode> DerefMut for MappedWriteGuard<'_, T, M> {
     fn deref_mut(&mut self) -> &mut [T] {
         // SAFETY: `&mut self` upgrades to a unique mutable slice;
         // mapped read+write for the guard's lifetime.
@@ -640,7 +735,7 @@ impl<T> DerefMut for MappedWriteGuard<'_, T> {
     }
 }
 
-impl<T> Drop for MappedWriteGuard<'_, T> {
+impl<T, M: MemMode> Drop for MappedWriteGuard<'_, T, M> {
     fn drop(&mut self) {
         let unmap =
             unsafe { enqueue_svm_unmap(self.queue.raw(), self.buf.ptr.cast(), 0, ptr::null()) };
