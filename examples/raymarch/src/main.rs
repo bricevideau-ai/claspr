@@ -87,7 +87,7 @@ mod gpu {
     #[claspr::kernel]
     pub fn raymarch(
         #[spirv(global_invocation_id)] id: USizeVec3,
-        image: &mut Image!(2D, type=u32, sampled=false),
+        #[spirv(image_access = "write_only")] image: &mut Image!(2D, type=u32, sampled=false),
         width: u32,
         height: u32,
     ) {

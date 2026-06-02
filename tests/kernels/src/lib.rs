@@ -84,7 +84,6 @@ pub mod kernels {
         let i = id.x;
         dst[i] = src[i].wrapping_add(0);
     }
-
 }
 
 #[claspr::device]

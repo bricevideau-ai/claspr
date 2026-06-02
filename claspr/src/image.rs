@@ -1,11 +1,26 @@
-//! 2D image helpers — format- and access-typed.
+//! Image helpers — format- and access-typed, dimensionality-specific.
 //!
-//! [`Image2D<A, F>`] is a generic 2D image parameterised on
-//! [`ImageAccess`] (`ReadOnly` / `WriteOnly` / `ReadWrite` ZST
-//! markers) and [`Format`](format::Format) (`R8G8B8A8Uint`,
-//! `R8G8B8A8Unorm`, `R32Float`, etc.). The proc-macro emits
-//! matching `&Image2D<A, F>` parameters for `&Image!(format=...,
-//! sampled=...)` kernel parameters.
+//! Three concrete types, one per supported OpenCL image dimensionality:
+//!
+//! - [`Image1D<A, F>`] — 1D images (`CL_MEM_OBJECT_IMAGE1D`).
+//! - [`Image2D<A, F>`] — 2D images (`CL_MEM_OBJECT_IMAGE2D`).
+//! - [`Image3D<A, F>`] — 3D images (`CL_MEM_OBJECT_IMAGE3D`).
+//!
+//! Each is parameterised on [`ImageAccess`] (`ReadOnly` /
+//! `WriteOnly` / `ReadWrite` ZST markers) and
+//! [`Format`](format::Format) (`R8G8B8A8Uint`, `R8G8B8A8Unorm`,
+//! `R32Float`, etc.). The proc-macro picks the right one based on
+//! the leading `1D`/`2D`/`3D` ident in the kernel's `Image!(...)`
+//! parameter type.
+//!
+//! Why three concrete types rather than one generic over
+//! dimensionality: the underlying `cl_image_desc` shape differs
+//! per-dim (1D needs only width; 2D adds height; 3D adds depth),
+//! the host-side `download` shape differs (`width` vs
+//! `width*height` vs `width*height*depth`), and the SPIR-V
+//! `OpTypeImage` `Dim` operand on the kernel side is distinct per
+//! dimensionality — so the host-side type must match what the
+//! kernel expects, otherwise `clSetKernelArg` rejects the call.
 //!
 //! ## Format-naming convention
 //!
@@ -33,7 +48,9 @@ use crate::context::Context;
 use crate::launch::KernelArg;
 use crate::queue::Launcher;
 use opencl3::kernel::ExecuteKernel;
-use opencl3::memory::{CL_MEM_OBJECT_IMAGE2D, ClMem, Image};
+use opencl3::memory::{
+    CL_MEM_OBJECT_IMAGE1D, CL_MEM_OBJECT_IMAGE2D, CL_MEM_OBJECT_IMAGE3D, ClMem, Image,
+};
 use opencl3::types::{CL_BLOCKING, cl_image_desc, cl_image_format};
 use std::marker::PhantomData;
 use std::ptr;
@@ -71,7 +88,57 @@ pub mod format {
 
     mod sealed {
         pub trait Sealed {}
+        pub trait FamilySealed {}
     }
+
+    /// Sampled-type family of an image format — the kernel-side
+    /// view of what `read_imagef`/`read_imageui`/`read_imagei`
+    /// returns and what `write_image*` accepts.
+    ///
+    /// OpenCL deliberately decouples kernel sampled-type from host
+    /// storage format: a `type=u32` kernel reads/writes `uint`
+    /// values regardless of whether the host allocated
+    /// `R8G8B8A8Uint`, `R32Uint`, `R32G32B32A32Uint`, etc. The
+    /// runtime translates between the storage format and the
+    /// kernel's sampled type. The family marker captures *that*
+    /// kernel-side view, not the storage format itself.
+    ///
+    /// The three marker ZSTs ([`Uint`] / [`Sint`] / [`Float`])
+    /// implement this trait; every [`Format`] impl declares its
+    /// family via the [`Format::SampledFamily`] associated type.
+    ///
+    /// Bound used by the proc-macro to constrain host-side
+    /// `Image<dim>D<A, F>` arguments to kernels that declare a
+    /// matching `type=` keyword (`type=u32` → `Uint`, `type=i32` →
+    /// `Sint`, `type=f32` → `Float`).
+    pub trait SampledTypeFamily: sealed::FamilySealed {}
+
+    /// Unsigned-integer sampled-type family. Kernel sees `uint`
+    /// values via `read_imageui`/`write_imageui`. Implemented for
+    /// every `*Uint` storage format (`R8G8B8A8Uint`, `R32Uint`,
+    /// `R32G32B32A32Uint`, …).
+    #[derive(Clone, Copy, Debug)]
+    pub struct Uint;
+    impl sealed::FamilySealed for Uint {}
+    impl SampledTypeFamily for Uint {}
+
+    /// Signed-integer sampled-type family. Kernel sees `int`
+    /// values via `read_imagei`/`write_imagei`. Implemented for
+    /// every `*Sint` storage format.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Sint;
+    impl sealed::FamilySealed for Sint {}
+    impl SampledTypeFamily for Sint {}
+
+    /// Floating-point sampled-type family. Kernel sees `float`
+    /// values via `read_imagef`/`write_imagef`. Implemented by both
+    /// `*Float`/`*Unorm`/`*Snorm`/`*HalfFloat` storage formats —
+    /// the OpenCL runtime converts each of these to/from float at
+    /// access time per the channel data-type spec.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Float;
+    impl sealed::FamilySealed for Float {}
+    impl SampledTypeFamily for Float {}
 
     /// Sealed trait for image storage formats. See the module
     /// docs for the format-naming convention (`*Uint`/`*Unorm`/
@@ -86,15 +153,19 @@ pub mod format {
         /// `[u8; 4]` for RGBA8 integer formats, `f32` for
         /// `R32Float`, `[f32; 4]` for `Rgba32Float`, etc.
         type Pixel: Copy;
+        /// Which kernel-side sampled-type family the storage
+        /// format translates to / from. See [`SampledTypeFamily`].
+        type SampledFamily: SampledTypeFamily;
     }
 
     macro_rules! format_zst {
-        ($name:ident, $order:ident, $ctype:ident, $pixel:ty) => {
+        ($name:ident, $order:ident, $ctype:ident, $pixel:ty, $family:ident) => {
             #[doc = concat!(
-                                                    "OpenCL image format: ",
-                                                    stringify!($order), " / ", stringify!($ctype),
-                                                    ". Pixel type: `", stringify!($pixel), "`."
-                                                )]
+                            "OpenCL image format: ",
+                            stringify!($order), " / ", stringify!($ctype),
+                            ". Pixel type: `", stringify!($pixel), "`. ",
+                            "Sampled-type family: [`", stringify!($family), "`]."
+                        )]
             #[derive(Clone, Copy, Debug)]
             pub struct $name;
             impl sealed::Sealed for $name {}
@@ -102,6 +173,7 @@ pub mod format {
                 const CHANNEL_ORDER: cl_channel_order = $order;
                 const CHANNEL_TYPE: cl_channel_type = $ctype;
                 type Pixel = $pixel;
+                type SampledFamily = $family;
             }
         };
     }
@@ -109,34 +181,34 @@ pub mod format {
     // RGBA8 family — `Uint`/`Sint` for integer kernel access,
     // `Unorm`/`Snorm` for normalized-float kernel access. Picking
     // the wrong one silently corrupts kernel writes.
-    format_zst!(R8G8B8A8Uint, CL_RGBA, CL_UNSIGNED_INT8, [u8; 4]);
-    format_zst!(R8G8B8A8Sint, CL_RGBA, CL_SIGNED_INT8, [i8; 4]);
-    format_zst!(R8G8B8A8Unorm, CL_RGBA, CL_UNORM_INT8, [u8; 4]);
-    format_zst!(R8G8B8A8Snorm, CL_RGBA, CL_SNORM_INT8, [i8; 4]);
+    format_zst!(R8G8B8A8Uint, CL_RGBA, CL_UNSIGNED_INT8, [u8; 4], Uint);
+    format_zst!(R8G8B8A8Sint, CL_RGBA, CL_SIGNED_INT8, [i8; 4], Sint);
+    format_zst!(R8G8B8A8Unorm, CL_RGBA, CL_UNORM_INT8, [u8; 4], Float);
+    format_zst!(R8G8B8A8Snorm, CL_RGBA, CL_SNORM_INT8, [i8; 4], Float);
 
     // RGBA16 family
-    format_zst!(R16G16B16A16Uint, CL_RGBA, CL_UNSIGNED_INT16, [u16; 4]);
-    format_zst!(R16G16B16A16Sint, CL_RGBA, CL_SIGNED_INT16, [i16; 4]);
-    format_zst!(R16G16B16A16Unorm, CL_RGBA, CL_UNORM_INT16, [u16; 4]);
-    format_zst!(R16G16B16A16Snorm, CL_RGBA, CL_SNORM_INT16, [i16; 4]);
-    format_zst!(R16G16B16A16Float, CL_RGBA, CL_HALF_FLOAT, [u16; 4]); // half = u16 bits
+    format_zst!(R16G16B16A16Uint, CL_RGBA, CL_UNSIGNED_INT16, [u16; 4], Uint);
+    format_zst!(R16G16B16A16Sint, CL_RGBA, CL_SIGNED_INT16, [i16; 4], Sint);
+    format_zst!(R16G16B16A16Unorm, CL_RGBA, CL_UNORM_INT16, [u16; 4], Float);
+    format_zst!(R16G16B16A16Snorm, CL_RGBA, CL_SNORM_INT16, [i16; 4], Float);
+    format_zst!(R16G16B16A16Float, CL_RGBA, CL_HALF_FLOAT, [u16; 4], Float); // half = u16 bits
 
     // RGBA32 family
-    format_zst!(R32G32B32A32Float, CL_RGBA, CL_FLOAT, [f32; 4]);
-    format_zst!(R32G32B32A32Uint, CL_RGBA, CL_UNSIGNED_INT32, [u32; 4]);
-    format_zst!(R32G32B32A32Sint, CL_RGBA, CL_SIGNED_INT32, [i32; 4]);
+    format_zst!(R32G32B32A32Float, CL_RGBA, CL_FLOAT, [f32; 4], Float);
+    format_zst!(R32G32B32A32Uint, CL_RGBA, CL_UNSIGNED_INT32, [u32; 4], Uint);
+    format_zst!(R32G32B32A32Sint, CL_RGBA, CL_SIGNED_INT32, [i32; 4], Sint);
     /// Alias of [`R32G32B32A32Float`] — common short form.
     pub type Rgba32Float = R32G32B32A32Float;
 
     // Single- and two-channel
-    format_zst!(R32Float, CL_R, CL_FLOAT, f32);
-    format_zst!(R32Uint, CL_R, CL_UNSIGNED_INT32, u32);
-    format_zst!(R32Sint, CL_R, CL_SIGNED_INT32, i32);
-    format_zst!(R16Float, CL_R, CL_HALF_FLOAT, u16);
-    format_zst!(R8Unorm, CL_R, CL_UNORM_INT8, u8);
+    format_zst!(R32Float, CL_R, CL_FLOAT, f32, Float);
+    format_zst!(R32Uint, CL_R, CL_UNSIGNED_INT32, u32, Uint);
+    format_zst!(R32Sint, CL_R, CL_SIGNED_INT32, i32, Sint);
+    format_zst!(R16Float, CL_R, CL_HALF_FLOAT, u16, Float);
+    format_zst!(R8Unorm, CL_R, CL_UNORM_INT8, u8, Float);
 
-    format_zst!(R32G32Float, CL_RG, CL_FLOAT, [f32; 2]);
-    format_zst!(R32G32Uint, CL_RG, CL_UNSIGNED_INT32, [u32; 2]);
+    format_zst!(R32G32Float, CL_RG, CL_FLOAT, [f32; 2], Float);
+    format_zst!(R32G32Uint, CL_RG, CL_UNSIGNED_INT32, [u32; 2], Uint);
 }
 
 // ── Image2D ─────────────────────────────────────────────────────────
@@ -174,35 +246,13 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
     /// support — check `ctx.device().cl3().image_support()` first
     /// if you want to fall back gracefully.
     pub fn alloc(ctx: &Context, width: u32, height: u32) -> Result<Self> {
-        let format = cl_image_format {
-            image_channel_order: F::CHANNEL_ORDER,
-            image_channel_data_type: F::CHANNEL_TYPE,
-        };
-        let desc = cl_image_desc {
-            image_type: CL_MEM_OBJECT_IMAGE2D,
-            image_width: width as usize,
-            image_height: height as usize,
-            image_depth: 0,
-            image_array_size: 0,
-            image_row_pitch: 0,
-            image_slice_pitch: 0,
-            num_mip_levels: 0,
-            num_samples: 0,
-            buffer: ptr::null_mut(),
-        };
-        // SAFETY: null host pointer + CL_MEM_* access flag means
-        // OpenCL allocates fresh device memory and ignores the
-        // host-pointer contract that makes `Image::create`
-        // generally unsafe.
-        let image = unsafe {
-            Image::create(
-                ctx.raw_context(),
-                A::KERNEL_FLAGS,
-                &format,
-                &desc,
-                ptr::null_mut(),
-            )?
-        };
+        let image = alloc_image::<A, F>(
+            ctx,
+            CL_MEM_OBJECT_IMAGE2D,
+            width as usize,
+            height as usize,
+            1,
+        )?;
         Ok(Image2D {
             image,
             width,
@@ -220,27 +270,8 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
     pub fn download_bytes<L: Launcher>(&self, launcher: &L) -> Result<Vec<u8>> {
         let pixel_count = (self.width as usize) * (self.height as usize);
         let mut bytes = vec![0u8; pixel_count * std::mem::size_of::<F::Pixel>()];
-        let origin = [0usize, 0, 0];
         let region = [self.width as usize, self.height as usize, 1];
-        // SAFETY: blocking read into a freshly-allocated Vec<u8>;
-        // byte count matches the image's pixel layout by
-        // construction (F picks both the channel format and the
-        // per-pixel size).
-        unsafe {
-            launcher
-                .cl_queue()
-                .enqueue_read_image(
-                    &self.image,
-                    CL_BLOCKING,
-                    origin.as_ptr(),
-                    region.as_ptr(),
-                    0,
-                    0,
-                    bytes.as_mut_ptr().cast(),
-                    &[],
-                )?
-                .wait()?;
-        }
+        read_image_into(launcher, &self.image, region, bytes.as_mut_ptr())?;
         Ok(bytes)
     }
 
@@ -252,24 +283,8 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
     {
         let pixel_count = (self.width as usize) * (self.height as usize);
         let mut pixels = vec![<F::Pixel as Default>::default(); pixel_count];
-        let origin = [0usize, 0, 0];
         let region = [self.width as usize, self.height as usize, 1];
-        // SAFETY: see download_bytes.
-        unsafe {
-            launcher
-                .cl_queue()
-                .enqueue_read_image(
-                    &self.image,
-                    CL_BLOCKING,
-                    origin.as_ptr(),
-                    region.as_ptr(),
-                    0,
-                    0,
-                    pixels.as_mut_ptr().cast(),
-                    &[],
-                )?
-                .wait()?;
-        }
+        read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
         Ok(pixels)
     }
 
@@ -296,6 +311,489 @@ impl<A: KernelAccess, F: format::Format> KernelArg for Image2D<A, F> {
             exec.set_arg(&cl_mem_handle);
         }
     }
+}
+
+// ── Internal: shared alloc + read helpers ──────────────────────────
+//
+// The per-dim wrappers below all funnel through these two functions.
+// Each owns its own `width`/`height`/`depth` fields (since
+// dimensionality changes the semantics of those), but the
+// `clCreateImage` and `clEnqueueReadImage` calls themselves only
+// differ in the `cl_image_desc` shape and the `region` triple — so
+// we centralise both here.
+
+fn alloc_image<A: KernelAccess, F: format::Format>(
+    ctx: &Context,
+    image_type: opencl3::types::cl_mem_object_type,
+    width: usize,
+    height: usize,
+    depth: usize,
+) -> Result<Image> {
+    let format = cl_image_format {
+        image_channel_order: F::CHANNEL_ORDER,
+        image_channel_data_type: F::CHANNEL_TYPE,
+    };
+    let desc = cl_image_desc {
+        image_type,
+        image_width: width,
+        image_height: height,
+        image_depth: depth,
+        image_array_size: 0,
+        image_row_pitch: 0,
+        image_slice_pitch: 0,
+        num_mip_levels: 0,
+        num_samples: 0,
+        buffer: ptr::null_mut(),
+    };
+    // SAFETY: null host pointer + CL_MEM_* access flag means
+    // OpenCL allocates fresh device memory and ignores the
+    // host-pointer contract that makes `Image::create` generally
+    // unsafe.
+    let image = unsafe {
+        Image::create(
+            ctx.raw_context(),
+            A::KERNEL_FLAGS,
+            &format,
+            &desc,
+            ptr::null_mut(),
+        )?
+    };
+    Ok(image)
+}
+
+fn read_image_into<L: Launcher>(
+    launcher: &L,
+    image: &Image,
+    region: [usize; 3],
+    out_ptr: *mut u8,
+) -> Result<()> {
+    let origin = [0usize, 0, 0];
+    // SAFETY: blocking read into a freshly-allocated buffer at
+    // `out_ptr`; the caller has sized the buffer to match
+    // `region.iter().product() * size_of::<F::Pixel>()`.
+    unsafe {
+        launcher
+            .cl_queue()
+            .enqueue_read_image(
+                image,
+                CL_BLOCKING,
+                origin.as_ptr(),
+                region.as_ptr(),
+                0,
+                0,
+                out_ptr.cast(),
+                &[],
+            )?
+            .wait()?;
+    }
+    Ok(())
+}
+
+// ── Image1D ─────────────────────────────────────────────────────────
+
+/// A 1D image with compile-time access mode and storage format.
+///
+/// `A` and `F` carry the same meaning as on [`Image2D`]. The
+/// underlying OpenCL object is created with
+/// `CL_MEM_OBJECT_IMAGE1D`. Use this when the kernel side declares
+/// `Image!(1D, type=..., sampled=...)`.
+pub struct Image1D<A: KernelAccess, F: format::Format> {
+    image: Image,
+    width: u32,
+    #[allow(dead_code)]
+    ctx: Context,
+    _access: PhantomData<A>,
+    _format: PhantomData<F>,
+}
+
+impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
+    /// Allocate a `width`-pixel 1D image. Pure context op.
+    pub fn alloc(ctx: &Context, width: u32) -> Result<Self> {
+        let image = alloc_image::<A, F>(ctx, CL_MEM_OBJECT_IMAGE1D, width as usize, 1, 1)?;
+        Ok(Self {
+            image,
+            width,
+            ctx: ctx.clone(),
+            _access: PhantomData,
+            _format: PhantomData,
+        })
+    }
+
+    /// Read this image as raw bytes — `Vec<u8>` of length
+    /// `width * size_of::<F::Pixel>()`.
+    pub fn download_bytes<L: Launcher>(&self, launcher: &L) -> Result<Vec<u8>> {
+        let pixel_count = self.width as usize;
+        let mut bytes = vec![0u8; pixel_count * std::mem::size_of::<F::Pixel>()];
+        let region = [pixel_count, 1, 1];
+        read_image_into(launcher, &self.image, region, bytes.as_mut_ptr())?;
+        Ok(bytes)
+    }
+
+    /// Read this image into a host `Vec<F::Pixel>` of length `width`.
+    /// Blocking.
+    pub fn download<L: Launcher>(&self, launcher: &L) -> Result<Vec<F::Pixel>>
+    where
+        F::Pixel: Default,
+    {
+        let pixel_count = self.width as usize;
+        let mut pixels = vec![<F::Pixel as Default>::default(); pixel_count];
+        let region = [pixel_count, 1, 1];
+        read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
+        Ok(pixels)
+    }
+
+    /// Width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Borrow the underlying opencl3 [`Image`].
+    pub fn image(&self) -> &Image {
+        &self.image
+    }
+}
+
+impl<A: KernelAccess, F: format::Format> KernelArg for Image1D<A, F> {
+    fn set(&self, exec: &mut ExecuteKernel<'_>) {
+        let cl_mem_handle = self.image.get();
+        unsafe {
+            exec.set_arg(&cl_mem_handle);
+        }
+    }
+}
+
+// ── Image3D ─────────────────────────────────────────────────────────
+
+/// A 3D image with compile-time access mode and storage format.
+///
+/// `A` and `F` carry the same meaning as on [`Image2D`]. The
+/// underlying OpenCL object is created with
+/// `CL_MEM_OBJECT_IMAGE3D`. Use this when the kernel side declares
+/// `Image!(3D, type=..., sampled=...)`.
+pub struct Image3D<A: KernelAccess, F: format::Format> {
+    image: Image,
+    width: u32,
+    height: u32,
+    depth: u32,
+    #[allow(dead_code)]
+    ctx: Context,
+    _access: PhantomData<A>,
+    _format: PhantomData<F>,
+}
+
+impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
+    /// Allocate a `width × height × depth` 3D image. Pure context op.
+    pub fn alloc(ctx: &Context, width: u32, height: u32, depth: u32) -> Result<Self> {
+        let image = alloc_image::<A, F>(
+            ctx,
+            CL_MEM_OBJECT_IMAGE3D,
+            width as usize,
+            height as usize,
+            depth as usize,
+        )?;
+        Ok(Self {
+            image,
+            width,
+            height,
+            depth,
+            ctx: ctx.clone(),
+            _access: PhantomData,
+            _format: PhantomData,
+        })
+    }
+
+    /// Read this image as raw bytes — `Vec<u8>` of length
+    /// `width * height * depth * size_of::<F::Pixel>()`.
+    pub fn download_bytes<L: Launcher>(&self, launcher: &L) -> Result<Vec<u8>> {
+        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
+        let mut bytes = vec![0u8; pixel_count * std::mem::size_of::<F::Pixel>()];
+        let region = [
+            self.width as usize,
+            self.height as usize,
+            self.depth as usize,
+        ];
+        read_image_into(launcher, &self.image, region, bytes.as_mut_ptr())?;
+        Ok(bytes)
+    }
+
+    /// Read this image into a host `Vec<F::Pixel>` of length
+    /// `width * height * depth`. Blocking.
+    pub fn download<L: Launcher>(&self, launcher: &L) -> Result<Vec<F::Pixel>>
+    where
+        F::Pixel: Default,
+    {
+        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
+        let mut pixels = vec![<F::Pixel as Default>::default(); pixel_count];
+        let region = [
+            self.width as usize,
+            self.height as usize,
+            self.depth as usize,
+        ];
+        read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
+        Ok(pixels)
+    }
+
+    /// Width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Height in pixels.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Depth in pixels.
+    pub fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    /// Borrow the underlying opencl3 [`Image`].
+    pub fn image(&self) -> &Image {
+        &self.image
+    }
+}
+
+impl<A: KernelAccess, F: format::Format> KernelArg for Image3D<A, F> {
+    fn set(&self, exec: &mut ExecuteKernel<'_>) {
+        let cl_mem_handle = self.image.get();
+        unsafe {
+            exec.set_arg(&cl_mem_handle);
+        }
+    }
+}
+
+// ── KernelImage*Arg traits ──────────────────────────────────────────
+//
+// Per-dim + per-access trait family. Each variant pins the
+// kernel-side access qualifier the kernel declared via `&`/`&mut`
+// (plus optional `#[spirv(image_access = ...)]` override on the
+// rust-gpu side); the proc-macro on this side picks the right
+// trait variant to bound the wrapper's image parameter on.
+//
+// Three peer traits per dim — exact-access match, no inheritance:
+//   `KernelImage<dim>DReadArg<SF>`      — kernel declared ReadOnly
+//   `KernelImage<dim>DWriteArg<SF>`     — kernel declared WriteOnly
+//   `KernelImage<dim>DReadWriteArg<SF>` — kernel declared ReadWrite
+//
+// Each is parameterised on a [`format::SampledTypeFamily`] marker
+// (`Uint`/`Sint`/`Float`) rather than a concrete `F`. Rationale:
+// OpenCL Kernel images carry only sampled-type info at compile time
+// (`OpTypeImage` `Image Format = Unknown`); a `type=u32` kernel
+// can be paired with any uint-family host storage format
+// (`R8G8B8A8Uint`, `R32Uint`, `R32G32B32A32Uint`, …) and the
+// runtime translates. Parameterising on family rather than F keeps
+// that flexibility while still type-checking the family match.
+//
+// Why exact-access (not subset):
+//   - `clGetKernelArgInfo` returns exactly one of READ_ONLY /
+//     WRITE_ONLY / READ_WRITE / NONE; drivers reject mismatched
+//     `cl_mem` access flags at `clSetKernelArg` time.
+//   - OpenCL C spec forbids sampler-based reads on `read_write`
+//     images, so `ReadWrite` is not a strict superset of `ReadOnly`
+//     for kernels that might sample.
+// Each access marker on the host side maps to exactly one trait
+// variant.
+//
+// All extend [`KernelArg`] so the underlying `clSetKernelArg`
+// plumbing is reused, and are sealed in this crate.
+
+mod kernel_image_arg_sealed {
+    pub trait Sealed {}
+}
+
+// `Image<dim>D<A, F>` is `Send` when both `A: Send` and `F: Send`
+// (PhantomData propagation). All access + format marker ZSTs in
+// this crate impl `Send` via their `#[derive(Clone, Copy, Debug)]`,
+// but the bound has to appear explicitly here for the trait impls
+// to satisfy the supertrait `Send + 'static`.
+
+/// Host-side counterpart for a kernel `&Image!(1D, type=...)`
+/// parameter (kernel declared `ReadOnly`).
+///
+/// Implemented only by `Image1D<ReadOnly, F>` where `F`'s sampled
+/// family matches the kernel-side `type=` keyword. Other access
+/// markers (`WriteOnly`, `ReadWrite`) are intentionally rejected —
+/// see the section comment above for the "exact-access" rationale.
+pub trait KernelImage1DReadArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel `&mut Image!(1D, ...,
+/// access="write_only")` parameter.
+///
+/// Implemented only by `Image1D<WriteOnly, F>` where `F`'s sampled
+/// family matches. WriteOnly host images can't be read on the
+/// kernel side, but they don't need `ImageReadWrite` capability —
+/// the right choice for OpenCL 1.2 output kernels.
+pub trait KernelImage1DWriteArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel `&mut Image!(1D, ...)`
+/// parameter (kernel declared `ReadWrite` — default for `&mut`).
+///
+/// Implemented only by `Image1D<ReadWrite, F>` where `F`'s sampled
+/// family matches. Requires `ImageReadWrite` capability + OpenCL
+/// 2.0+ device support; the rust-gpu codegen auto-declares the
+/// capability when emitting any `ReadWrite OpTypeImage`.
+pub trait KernelImage1DReadWriteArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel `&Image!(2D, type=...)`
+/// parameter — see [`KernelImage1DReadArg`] for details.
+pub trait KernelImage2DReadArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel `&mut Image!(2D, ...,
+/// access="write_only")` parameter — see [`KernelImage1DWriteArg`].
+pub trait KernelImage2DWriteArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel `&mut Image!(2D, ...)`
+/// parameter — see [`KernelImage1DReadWriteArg`].
+pub trait KernelImage2DReadWriteArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel `&Image!(3D, type=...)`
+/// parameter — see [`KernelImage1DReadArg`].
+pub trait KernelImage3DReadArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel `&mut Image!(3D, ...,
+/// access="write_only")` parameter — see [`KernelImage1DWriteArg`].
+pub trait KernelImage3DWriteArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel `&mut Image!(3D, ...)`
+/// parameter — see [`KernelImage1DReadWriteArg`].
+pub trait KernelImage3DReadWriteArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+{
+}
+
+// ── Sealed marker impls (one per (Image<dim>D, A, F) combo) ────────
+//
+// `kernel_image_arg_sealed::Sealed` is required by every
+// `KernelImage<dim>D*Arg` trait. We blanket-impl it on every
+// concrete `Image<dim>D<A, F>` regardless of access marker, since
+// the access-specific gating happens on the per-access trait
+// impls below.
+
+impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
+    kernel_image_arg_sealed::Sealed for Image1D<A, F>
+{
+}
+impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
+    kernel_image_arg_sealed::Sealed for Image2D<A, F>
+{
+}
+impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
+    kernel_image_arg_sealed::Sealed for Image3D<A, F>
+{
+}
+
+// ── Per-(dim, access) impls ──────────────────────────────────────
+//
+// Each access marker (`ReadOnly`/`WriteOnly`/`ReadWrite`) impls
+// one or more trait variants per dim, parameterised on `F`'s
+// `SampledFamily` so the proc-macro's
+// `<F: format::Format<SampledFamily = K>>` bound on the wrapper
+// method picks the right impl per kernel `type=` keyword.
+//
+// Compatibility partial order (per OpenCL `clSetKernelArg` rules):
+//   - `ReadOnly`  host image → satisfies `Read` kernel arg only
+//   - `WriteOnly` host image → satisfies `Write` kernel arg only
+//   - `ReadWrite` host image → satisfies all three (`Read`,
+//     `Write`, `ReadWrite`) — the host promises the cl_mem can be
+//     bound to any kernel access qualifier; the runtime constrains
+//     only "writing to CL_MEM_READ_ONLY is undefined" and "reading
+//     from CL_MEM_WRITE_ONLY is undefined", neither of which fires
+//     when ReadWrite is the host flag.
+//
+// This three-way pattern lets a single `Image2D<ReadWrite, F>` flow
+// through a pipeline that mixes write-only producer kernels and
+// read-only consumer kernels — the common image-pipeline case —
+// without intermediate retype operations on the cl_mem.
+
+// Image1D
+impl<F: format::Format + Send + 'static> KernelImage1DReadArg<F::SampledFamily>
+    for Image1D<ReadOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage1DWriteArg<F::SampledFamily>
+    for Image1D<WriteOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage1DReadArg<F::SampledFamily>
+    for Image1D<ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage1DWriteArg<F::SampledFamily>
+    for Image1D<ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage1DReadWriteArg<F::SampledFamily>
+    for Image1D<ReadWrite, F>
+{
+}
+
+// Image2D
+impl<F: format::Format + Send + 'static> KernelImage2DReadArg<F::SampledFamily>
+    for Image2D<ReadOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage2DWriteArg<F::SampledFamily>
+    for Image2D<WriteOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage2DReadArg<F::SampledFamily>
+    for Image2D<ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage2DWriteArg<F::SampledFamily>
+    for Image2D<ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage2DReadWriteArg<F::SampledFamily>
+    for Image2D<ReadWrite, F>
+{
+}
+
+// Image3D
+impl<F: format::Format + Send + 'static> KernelImage3DReadArg<F::SampledFamily>
+    for Image3D<ReadOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage3DWriteArg<F::SampledFamily>
+    for Image3D<WriteOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage3DReadArg<F::SampledFamily>
+    for Image3D<ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage3DWriteArg<F::SampledFamily>
+    for Image3D<ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage3DReadWriteArg<F::SampledFamily>
+    for Image3D<ReadWrite, F>
+{
 }
 
 // ── Back-compat alias ───────────────────────────────────────────────

@@ -241,13 +241,32 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // slices by value (so they can flow through Tier 2 chains and so
     // Tier 1 terminals can return them back). Scalars are by-value.
     // `op_arg_pass` is what we hand to LaunchOp::new from inside the
-    // terminal / execute: `&name` for slices, `name` for scalars.
+    // terminal / execute: `&name` for slices/images, `name` for scalars.
     //
-    // Slices get a fresh generic type parameter each (e.g. `__D0`,
-    // `__D1`, ...) bounded `: ::claspr::KernelSliceArg<elem>`. This
-    // lets the same emitted method accept `DeviceSlice<T>`,
-    // `MappedSlice<T>`, or `USMSlice<T>` interchangeably while
-    // keeping the flow-through Output typed precisely.
+    // Slices get one fresh generic type parameter each
+    // (`__claspr_D0`, `__claspr_D1`, …) bounded
+    // `: ::claspr::KernelSliceArg<elem>`. This lets the same emitted
+    // method accept `DeviceSlice<T>`, `MappedSlice<T>`, or
+    // `USMSlice<T>` interchangeably while keeping the flow-through
+    // Output typed precisely.
+    //
+    // Images get *two* fresh generics each — a format generic
+    // `__claspr_F0` bounded
+    // `: ::claspr::image::format::Format<SampledFamily = <K>>` and
+    // an image generic `__claspr_I0` bounded
+    // `: ::claspr::KernelImage<dim>D<Access>Arg<<K>>`. `<K>` is the
+    // sampled-type-family marker derived from the kernel's `type=`
+    // keyword (`type=u32` → `Uint`, `i32` → `Sint`, `f32` → `Float`).
+    // `<Access>` is `Read`, `Write`, or `ReadWrite` based on the
+    // kernel-side `&`/`&mut` mutability + optional
+    // `#[spirv(image_access = "...")]` override. The two generics
+    // together let the same wrapper method accept any
+    // `Image<dim>D<A, F>` with matching access marker + matching
+    // sampled-family — e.g. a `type=u32` kernel accepts
+    // `Image2D<ReadOnly, R8G8B8A8Uint>`, `Image2D<ReadOnly, R32Uint>`,
+    // `Image2D<ReadOnly, R32G32B32A32Uint>` etc. interchangeably,
+    // and the wrapper flows the user's concrete type through to
+    // Output without coercion.
     let mut host_names: Vec<TokenStream2> = Vec::new();
     let mut method_params: Vec<TokenStream2> = Vec::new();
     let mut arg_types: Vec<TokenStream2> = Vec::new();
@@ -255,9 +274,15 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     let mut output_names: Vec<TokenStream2> = Vec::new();
     let mut output_types: Vec<TokenStream2> = Vec::new();
     // `(generic_ident, bound_token_stream)` — populated once per
-    // slice param, in source order. Drives the `<__D0, __D1, ...>` +
+    // slice param + twice per image param, in source order. Drives
+    // the `<__claspr_D0, __claspr_F0, __claspr_I0, ...>` +
     // `where`-equivalent inline bounds on every emitted impl block.
-    let mut slice_generics: Vec<(TokenStream2, TokenStream2)> = Vec::new();
+    let mut generics: Vec<(TokenStream2, TokenStream2)> = Vec::new();
+    // Per-kind counters so the `__claspr_D{n}` / `__claspr_F{n}` /
+    // `__claspr_I{n}` names stay stable per slice/image regardless
+    // of interleaving with other param kinds.
+    let mut slice_gen_idx = 0usize;
+    let mut image_gen_idx = 0usize;
 
     for input in &func.sig.inputs {
         let FnArg::Typed(pt) = input else {
@@ -274,7 +299,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 mutable,
             } => {
                 // Allocate a fresh generic per slice.
-                let gid = quote::format_ident!("__claspr_D{}", slice_generics.len());
+                let gid = quote::format_ident!("__claspr_D{}", slice_gen_idx);
+                slice_gen_idx += 1;
                 let gid_tt: TokenStream2 = quote! { #gid };
                 // Pick the appropriate bound based on slice mutability.
                 // Kernel `&[T]` → KernelSliceReadArg<T> (any buffer whose
@@ -287,7 +313,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 } else {
                     quote! { #gid: ::claspr::KernelSliceReadArg<#elem> }
                 };
-                slice_generics.push((gid_tt.clone(), bound));
+                generics.push((gid_tt.clone(), bound));
 
                 host_names.push(pname.clone());
                 method_params.push(quote! { #pname: #gid_tt });
@@ -296,13 +322,40 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
             }
-            ParamRole::Image { name: pname, ty } => {
+            ParamRole::Image {
+                name: pname,
+                dim,
+                family,
+                access_segment,
+            } => {
+                // One fresh generic per image param: the image
+                // generic, constrained to the matching
+                // `KernelImage<dim>D<Access>Arg<family>` trait. The
+                // family marker (`Uint`/`Sint`/`Float`) is a
+                // concrete type, not a generic — the runtime trait
+                // impls pick the right one based on the format `F`
+                // inside the user's `Image<dim>D<A, F>` via F's
+                // `SampledFamily` associated type. No separate
+                // `__claspr_F` generic is needed; that was an
+                // earlier shape that introduced an unused type
+                // parameter on the emitted Op struct.
+                let iid = quote::format_ident!("__claspr_I{}", image_gen_idx);
+                image_gen_idx += 1;
+                let iid_tt: TokenStream2 = quote! { #iid };
+
+                let trait_name = quote::format_ident!("KernelImage{}D{}Arg", dim, access_segment);
+
+                generics.push((
+                    iid_tt.clone(),
+                    quote! { #iid: ::claspr::#trait_name<#family> },
+                ));
+
                 host_names.push(pname.clone());
-                method_params.push(quote! { #pname: #ty });
-                arg_types.push(ty.clone());
+                method_params.push(quote! { #pname: #iid_tt });
+                arg_types.push(iid_tt.clone());
                 op_arg_pass.push(quote! { &#pname });
                 output_names.push(pname.clone());
-                output_types.push(ty);
+                output_types.push(iid_tt);
             }
             ParamRole::Scalar { name: pname, ty } => {
                 host_names.push(pname.clone());
@@ -320,16 +373,16 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     //   `<__D0: K..., __D1: K...>`  — for declarator positions (impl
     //                                  blocks, method generic lists).
     //   `(empty)`                   — when there are no slice params.
-    let slice_gen_decl: TokenStream2 = if slice_generics.is_empty() {
+    let gen_decl: TokenStream2 = if generics.is_empty() {
         quote! {}
     } else {
-        let bounds = slice_generics.iter().map(|(_, b)| b);
+        let bounds = generics.iter().map(|(_, b)| b);
         quote! { < #( #bounds ),* > }
     };
-    let slice_gen_use: TokenStream2 = if slice_generics.is_empty() {
+    let gen_use: TokenStream2 = if generics.is_empty() {
         quote! {}
     } else {
-        let ids = slice_generics.iter().map(|(id, _)| id);
+        let ids = generics.iter().map(|(id, _)| id);
         quote! { < #( #ids ),* > }
     };
 
@@ -394,11 +447,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     Ok(quote! {
         impl #kernels_path {
             #[allow(clippy::too_many_arguments)]
-            #vis fn #name #slice_gen_decl (
+            #vis fn #name #gen_decl (
                 &self,
                 grid: impl ::claspr::IntoLaunchSpec,
                 #(#method_params),*
-            ) -> #op_mod_ident::Op #slice_gen_use {
+            ) -> #op_mod_ident::Op #gen_use {
                 #op_mod_ident::Op {
                     kernel: self.kernel(#kernel_name_lit),
                     spec: ::claspr::IntoLaunchSpec::into_launch_spec(grid),
@@ -414,7 +467,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         pub mod #op_mod_ident {
             use super::*;
 
-            pub struct Op #slice_gen_decl {
+            pub struct Op #gen_decl {
                 /// Per-launch `cl_kernel` minted by `clCreateKernel`.
                 /// Owned and never aliased, so `clSetKernelArg` on it
                 /// can't race with any other launch.
@@ -432,7 +485,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
             // Op is `Send` automatically — every field is Send. No
             // unsafe impl, no lifetime, no `&Kernels` borrow.
 
-            impl #slice_gen_decl Op #slice_gen_use {
+            impl #gen_decl Op #gen_use {
                 /// Add a cross-queue dependency. Takes the event by
                 /// value because the Op may be moved into an executor
                 /// thread; a borrowed `&Event` could outlive the
@@ -526,7 +579,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 }
             }
 
-            impl #slice_gen_decl ::claspr_async::DeviceOperation for Op #slice_gen_use {
+            impl #gen_decl ::claspr_async::DeviceOperation for Op #gen_use {
                 type Output = #output_ty;
 
                 fn execute(
@@ -608,12 +661,28 @@ enum ParamRole {
         /// `&[T]` (emits `KernelSliceReadArg<T>`).
         mutable: bool,
     },
-    /// Image param (`&Image!(...)` / `&mut Image!(...)`). Stays
-    /// concrete (no generic widening yet — only one image type per
-    /// access+format combo).
+    /// Image param (`&Image!(...)` / `&mut Image!(...)`). Becomes a
+    /// pair of generic type parameters on the emitted method:
+    ///   - `__claspr_F{n}: format::Format<SampledFamily = K>`
+    ///   - `__claspr_I{n}: KernelImage<dim>D<Access>Arg<K>`
+    ///
+    /// `K` is the sampled-type family (`Uint`/`Sint`/`Float`)
+    /// derived from the kernel's `type=` keyword. `<Access>` is
+    /// `Read`/`Write`/`ReadWrite` derived from `&`/`&mut` plus the
+    /// optional `#[spirv(image_access = "...")]` override. `<dim>`
+    /// is `1D`/`2D`/`3D` from the `Image!(<dim>, ...)` token.
     Image {
         name: TokenStream2,
-        ty: TokenStream2,
+        /// `1` / `2` / `3` — picks `Image1D` / `Image2D` /
+        /// `Image3D` host wrapper + the matching trait family.
+        dim: u32,
+        /// Sampled-type-family marker path:
+        /// `::claspr::image::format::Uint` etc.
+        family: TokenStream2,
+        /// Trait family name segment: `Read`, `Write`, or
+        /// `ReadWrite`. Spliced via `format_ident!` into
+        /// `KernelImage<dim>D<segment>Arg<family>`.
+        access_segment: &'static str,
     },
     /// Scalar param (no spirv attribute). Passed by value, doesn't
     /// thread through Output.
@@ -659,12 +728,12 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
             mutable,
         });
     }
-    if let Some(info) = classify_image_param(&pt.ty) {
-        let access = info.access;
-        let format = info.format;
+    if let Some(info) = classify_image_param(pt)? {
         return Ok(ParamRole::Image {
             name: pname,
-            ty: quote! { ::claspr::Image2D<#access, #format> },
+            dim: info.dim,
+            family: info.family,
+            access_segment: info.access_segment,
         });
     }
     let t = &pt.ty;
@@ -706,15 +775,22 @@ fn find_spirv_attr(attrs: &[Attribute]) -> Option<Attribute> {
 enum SpirvKind {
     /// `#[spirv(cross_workgroup)]` — host-supplied buffer; translate type.
     CrossWorkgroup,
+    /// `#[spirv(image_access = "...")]` — host-supplied image with
+    /// explicit access-qualifier override on the kernel side. Param
+    /// stays in the host signature; the macro inspects this attr (in
+    /// addition to the Image! tokens) when picking the host-side
+    /// trait-bound variant.
+    ImageAccess,
     /// Anything else (`#[spirv(global_invocation_id)]`, `workgroup`, …)
     /// — drop from host signature.
     Builtin,
 }
 
 fn spirv_attr_kind(attr: &Attribute) -> SpirvKind {
-    // We want to know whether the inner meta starts with `cross_workgroup`.
-    // Use the parse_args-as-token-stream path so we don't have to enumerate
-    // every spirv attribute syn might know about.
+    // We want to know whether the inner meta starts with `cross_workgroup`,
+    // `image_access`, or something else. Use the parse_args-as-token-stream
+    // path so we don't have to enumerate every spirv attribute syn might
+    // know about.
     let tokens = attr.meta.require_list().ok().map(|l| l.tokens.clone());
     let Some(tokens) = tokens else {
         return SpirvKind::Builtin;
@@ -726,115 +802,281 @@ fn spirv_attr_kind(attr: &Attribute) -> SpirvKind {
             _ => None,
         })
         .unwrap_or_default();
-    if first_ident == "cross_workgroup" {
-        SpirvKind::CrossWorkgroup
-    } else {
-        SpirvKind::Builtin
+    match first_ident.as_str() {
+        "cross_workgroup" => SpirvKind::CrossWorkgroup,
+        "image_access" => SpirvKind::ImageAccess,
+        _ => SpirvKind::Builtin,
     }
 }
 
-/// Parsed `Image!(...)` parameter info: the access-mode and format
-/// type paths to splice into the generated `&Image2D<A, F>` arg.
+/// Parsed `Image!(...)` parameter info: dim + sampled-type family +
+/// access-trait segment, threaded through to the macro emission to
+/// drive per-image generic decls + the trait bound on the wrapper
+/// method.
 struct ImageInfo {
-    access: TokenStream2,
-    format: TokenStream2,
+    /// `1` / `2` / `3` from the leading `Image!(<dim>, ...)` ident.
+    dim: u32,
+    /// Path to the sampled-type-family marker ZST —
+    /// `::claspr::image::format::{Uint, Sint, Float}` — derived from
+    /// the kernel's `type=` keyword.
+    family: TokenStream2,
+    /// One of `Read` / `Write` / `ReadWrite` — gets spliced via
+    /// `format_ident!` into
+    /// `::claspr::KernelImage<dim>D<segment>Arg<family>` to form the
+    /// trait bound on the wrapper's image generic.
+    access_segment: &'static str,
 }
 
-/// Recognise `&Image!(...)` / `&mut Image!(...)` and parse the
-/// macro's token list to pick the matching claspr `Image2D<A, F>`
-/// host-side type.
+/// Recognise `&Image!(...)` / `&mut Image!(...)` and translate the
+/// macro tokens + param attributes into the (dim, family,
+/// access_segment) tuple the emission needs.
 ///
-/// Mapping:
+/// Access derivation (independent of `Image!` tokens — looks at
+/// `&`/`&mut` + the optional `#[spirv(image_access = "...")]`
+/// param attribute claspr-macros recognised from rust-gpu's new
+/// kernel-side keyword):
+///   - `&Image!(...)` → `Read` (kernel declared `ReadOnly`)
+///   - `&mut Image!(...)` → `ReadWrite` by default; `Write` if
+///     `#[spirv(image_access = "write_only")]` overrides;
+///     `ReadWrite` if `read_write` (redundant but accepted).
+///   - `#[spirv(image_access = "read_only")]` on `&` is redundant
+///     but accepted; on `&mut` is a coherence error.
+///   - `read_write`/`write_only` on `&` is a coherence error.
 ///
-/// - `access=` token (if present) wins: `read_only` → `ReadOnly`,
-///   `write_only` → `WriteOnly`, `read_write` → `ReadWrite`.
-/// - Otherwise the default is `ReadWrite` — matching rust-gpu's
-///   unspecified-access behaviour (OpenCL treats it as both
-///   readable and writable). The host-side reference mutability
-///   (`&` vs `&mut`) is intentionally NOT used to pick access, so
-///   that today's `&mut Image!(2D, type=u32, ...)` kernels keep
-///   accepting the existing `Image2DRgba8` allocator (which is
-///   `Image2D<ReadWrite, ...>`).
-/// - `format=<name>` token (if present) wins for format selection:
-///   the name is taken as a `::claspr::image::format::<name>` ZST.
-/// - Otherwise, `type=u32` / `type=f32` / `type=i32` pick sensible
-///   defaults: `R8G8B8A8Uint` / `R32G32B32A32Float` / `R8G8B8A8Sint`.
-/// - Otherwise (no `type=` either) the default is `R8G8B8A8Uint`
-///   — same as the legacy `Image2DRgba8` alias.
+/// Coherence errors mirror what rust-gpu enforces on the kernel
+/// side — both sides should reject the same shapes.
 ///
-/// Returns `None` if `ty` doesn't look like an `Image!(...)` ref.
-fn classify_image_param(ty: &Type) -> Option<ImageInfo> {
-    let Type::Reference(TypeReference { elem, .. }) = ty else {
-        return None;
+/// Sampled-family derivation from the `type=` keyword inside
+/// `Image!(...)`:
+///   - `type=u32`/`u8`/`u16`/`u64` → `Uint`
+///   - `type=i32`/`i8`/`i16`/`i64` → `Sint`
+///   - `type=f32`/`f64` → `Float`
+///   - (no `type=`) → `Uint` default (matches rust-gpu's behaviour
+///     when neither `type=` nor `format=` is set; the user should
+///     really write `type=u32` explicitly, but we don't fail here)
+///
+/// Dim derivation from the leading `Image!(<dim>, ...)` ident:
+///   - `1D` → 1; `2D` → 2; `3D` → 3
+///   - other shapes (`cube`, `rect`, `buffer`, `subpass`) → error
+///     pointing at the unsupported dim (claspr doesn't currently
+///     wrap these — extension worth doing when first needed)
+///
+/// Returns `Ok(None)` if `pt.ty` doesn't look like an `Image!(...)`
+/// ref. `Err` if it does but something's incoherent.
+fn classify_image_param(pt: &PatType) -> syn::Result<Option<ImageInfo>> {
+    let Type::Reference(TypeReference {
+        elem, mutability, ..
+    }) = &*pt.ty
+    else {
+        return Ok(None);
     };
     let Type::Macro(TypeMacro { mac }) = &**elem else {
-        return None;
+        return Ok(None);
     };
     if !mac.path.is_ident("Image") {
-        return None;
+        return Ok(None);
     }
-    let (access_tok, format_tok, type_tok) = parse_image_tokens(mac.tokens.clone());
+    let mutable = mutability.is_some();
+    let span = pt.ty.span();
 
-    let access = match access_tok.as_deref() {
-        Some("read_only") => quote! { ::claspr::ReadOnly },
-        Some("write_only") => quote! { ::claspr::WriteOnly },
-        Some("read_write") | None => quote! { ::claspr::ReadWrite },
+    let (dim_tok, type_tok) = parse_image_tokens(mac.tokens.clone());
+
+    let dim = match dim_tok.as_deref() {
+        Some("1D") => 1,
+        Some("2D") => 2,
+        Some("3D") => 3,
         Some(other) => {
-            // Unknown access keyword — fall back to ReadWrite and
-            // let the runtime sort it out. We could span-error here
-            // but tolerating unknown tokens keeps the macro forward-
-            // compatible with future rust-gpu Image! grammar.
-            let _ = other;
-            quote! { ::claspr::ReadWrite }
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "claspr::kernel: unsupported Image! dimensionality `{other}`. \
+                     Only `1D`, `2D`, and `3D` map to claspr host wrappers (cube/rect/buffer/subpass \
+                     have no claspr `Image*D<A, F>` counterpart yet)"
+                ),
+            ));
+        }
+        None => {
+            return Err(syn::Error::new(
+                span,
+                "claspr::kernel: Image! parameter missing dimensionality — expected `Image!(1D, ...)`, \
+                 `Image!(2D, ...)`, or `Image!(3D, ...)` as the first token",
+            ));
         }
     };
 
-    let format = if let Some(fname) = format_tok {
-        let ident = quote::format_ident!("{}", fname);
-        quote! { ::claspr::image::format::#ident }
-    } else {
-        match type_tok.as_deref() {
-            Some("f32") => quote! { ::claspr::image::format::R32G32B32A32Float },
-            Some("i32") => quote! { ::claspr::image::format::R8G8B8A8Sint },
-            // `u32` and the catch-all both map to the RGBA8 uint
-            // format — same as the legacy `Image2DRgba8` alias.
-            _ => quote! { ::claspr::image::format::R8G8B8A8Uint },
+    let family = match type_tok.as_deref() {
+        Some("f32") | Some("f64") => quote! { ::claspr::image::format::Float },
+        Some("i32") | Some("i64") | Some("i8") | Some("i16") => {
+            quote! { ::claspr::image::format::Sint }
         }
+        // `u32`/`u8`/`u16`/`u64` + the no-`type=` catch-all map to
+        // `Uint`, matching the existing default that pairs with
+        // rust-gpu's `Image!(...)` when no `type=` is given.
+        _ => quote! { ::claspr::image::format::Uint },
     };
 
-    Some(ImageInfo { access, format })
+    // Access derivation. The override (if present) wins over the
+    // mutability-based default; mismatch is a coherence error.
+    let explicit_access = read_image_access_attr(&pt.attrs);
+    let access_segment_str = match (mutable, explicit_access.as_deref()) {
+        // No override — derive from mutability.
+        (false, None) => "Read",
+        (true, None) => "ReadWrite",
+        // Explicit override aligned with mutability.
+        (false, Some("read_only")) => "Read",
+        (true, Some("read_write")) => "ReadWrite",
+        (true, Some("write_only")) => "Write",
+        // Coherence violations.
+        (false, Some("write_only")) | (false, Some("read_write")) => {
+            return Err(syn::Error::new(
+                span,
+                "claspr::kernel: `#[spirv(image_access = \"write_only\"|\"read_write\")]` requires \
+                 a `&mut Image!` parameter, but this is `&Image!`",
+            ));
+        }
+        (true, Some("read_only")) => {
+            return Err(syn::Error::new(
+                span,
+                "claspr::kernel: `#[spirv(image_access = \"read_only\")]` requires a `&Image!` \
+                 parameter, but this is `&mut Image!`",
+            ));
+        }
+        (_, Some(other)) => {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "claspr::kernel: unknown image_access `{other}` — expected `read_only`, \
+                     `write_only`, or `read_write`"
+                ),
+            ));
+        }
+    };
+    Ok(Some(ImageInfo {
+        dim,
+        family,
+        access_segment: access_segment_str,
+    }))
 }
 
-/// Scan an `Image!(...)` token list for `access=<ident>`,
-/// `format=<ident>`, and `type=<ident>` key/value pairs. Tokens are
-/// comma-separated; standalone idents (`2D`, `3D`, …) are ignored.
-fn parse_image_tokens(tokens: TokenStream2) -> (Option<String>, Option<String>, Option<String>) {
-    let mut access = None;
-    let mut format = None;
-    let mut type_ = None;
+/// Find a `#[spirv(image_access = "<value>")]` attribute on the
+/// param and return the string value if present. Mirrors rust-gpu's
+/// kernel-side recognition of the same attribute — see
+/// `crates/rustc_codegen_spirv/src/attr.rs::parse_image_access_attr`
+/// on the rust-gpu side; both must agree on the recognised set
+/// (`read_only` / `write_only` / `read_write`).
+fn read_image_access_attr(attrs: &[Attribute]) -> Option<String> {
+    for attr in attrs {
+        if !attr.path().is_ident("spirv") {
+            continue;
+        }
+        let Ok(meta) = attr.meta.require_list() else {
+            continue;
+        };
+        let tts: Vec<proc_macro2::TokenTree> = meta.tokens.clone().into_iter().collect();
+        // Look for `image_access = "<value>"` — five-token sequence:
+        // Ident("image_access") Punct('=') Literal("...")
+        // (with optional commas before/after — we just scan for the
+        // ident, then advance two slots looking for the literal).
+        for i in 0..tts.len() {
+            let Some(proc_macro2::TokenTree::Ident(key)) = tts.get(i) else {
+                continue;
+            };
+            if *key != "image_access" {
+                continue;
+            }
+            let (
+                Some(proc_macro2::TokenTree::Punct(eq)),
+                Some(proc_macro2::TokenTree::Literal(lit)),
+            ) = (tts.get(i + 1), tts.get(i + 2))
+            else {
+                continue;
+            };
+            if eq.as_char() != '=' {
+                continue;
+            }
+            // Literal::to_string includes the surrounding quotes —
+            // strip them. We accept double-quoted strings only.
+            let s = lit.to_string();
+            if let Some(inner) = s.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+                return Some(inner.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Scan an `Image!(...)` token list for the leading dim ident
+/// (`1D`/`2D`/`3D`/`cube`/etc.) and the `type=<ident>` value. Other
+/// keywords (`sampled=`, `arrayed=`, `multisampled=`, `depth=`,
+/// `format=`, `components=`) are recognised by rust-gpu's `Image!`
+/// macro but don't influence the claspr host-wrapper signature —
+/// `format=` is Shader-only and unreachable from claspr's OpenCL
+/// Kernel target, the rest are runtime/usage hints that the host
+/// `Image<dim>D<A, F>` doesn't need to encode.
+///
+/// Returns `(dim_ident, type_value)`. Dim recognition handles both
+/// the `LitInt`-suffix form (`1D` is `1` with suffix `D`) and the
+/// bare `Ident` form (`cube`, `rect`, `buffer`, `subpass`).
+fn parse_image_tokens(tokens: TokenStream2) -> (Option<String>, Option<String>) {
+    let mut dim: Option<String> = None;
+    let mut type_: Option<String> = None;
     let tts: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
     let mut i = 0;
     while i < tts.len() {
-        // Look for `<ident> = <ident>` triples.
+        // First-token-only: dim ident. Subsequent positions only
+        // accept keyword=value triples.
+        if dim.is_none() {
+            match &tts[i] {
+                proc_macro2::TokenTree::Literal(lit) => {
+                    // rust-gpu's parser accepts `1D`/`2D`/`3D` as
+                    // `LitInt` with a suffix; reconstruct the form.
+                    let s = lit.to_string();
+                    if matches!(s.as_str(), "1D" | "2D" | "3D") {
+                        dim = Some(s);
+                        i += 1;
+                        // skip trailing comma if any
+                        if matches!(
+                            tts.get(i),
+                            Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == ','
+                        ) {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                }
+                proc_macro2::TokenTree::Ident(id) => {
+                    let s = id.to_string();
+                    if matches!(s.as_str(), "cube" | "rect" | "buffer" | "subpass") {
+                        dim = Some(s);
+                        i += 1;
+                        if matches!(
+                            tts.get(i),
+                            Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == ','
+                        ) {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Look for `<ident> = <ident>` triples (Image! `key=value`
+        // form). Standalone idents elsewhere (e.g. `sampled` shorthand
+        // for `sampled=true`) get skipped without comment.
         if let (
             Some(proc_macro2::TokenTree::Ident(key)),
             Some(proc_macro2::TokenTree::Punct(eq)),
             Some(proc_macro2::TokenTree::Ident(val)),
         ) = (tts.get(i), tts.get(i + 1), tts.get(i + 2))
             && eq.as_char() == '='
+            && *key == "type"
         {
-            let k = key.to_string();
-            let v = val.to_string();
-            match k.as_str() {
-                "access" => access = Some(v),
-                "format" => format = Some(v),
-                "type" => type_ = Some(v),
-                _ => {}
-            }
+            type_ = Some(val.to_string());
             i += 3;
             continue;
         }
         i += 1;
     }
-    (access, format, type_)
+    (dim, type_)
 }

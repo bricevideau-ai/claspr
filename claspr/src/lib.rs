@@ -84,7 +84,12 @@ pub use buffer::{Buffer, CopyOp, DeviceSlice, FillOp, MigrateOp, ReadOp, WriteOp
 pub use context::{Context, SvmLevel};
 pub use device::{Device, DeviceType, Platform};
 pub use error::{Error, Result};
-pub use image::{Image2D, Image2DRgba8, ImageAccess, format};
+pub use image::{
+    Image1D, Image2D, Image2DRgba8, Image3D, ImageAccess, KernelImage1DReadArg,
+    KernelImage1DReadWriteArg, KernelImage1DWriteArg, KernelImage2DReadArg,
+    KernelImage2DReadWriteArg, KernelImage2DWriteArg, KernelImage3DReadArg,
+    KernelImage3DReadWriteArg, KernelImage3DWriteArg, format,
+};
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, KernelSliceArg, KernelSliceReadArg,
     KernelSliceReadWriteArg, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,

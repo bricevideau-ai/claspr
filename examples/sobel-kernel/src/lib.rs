@@ -35,7 +35,7 @@ pub mod gpu {
     pub fn sobel(
         #[spirv(global_invocation_id)] id: USizeVec3,
         input: &Image!(2D, type=u32, sampled=false),
-        output: &mut Image!(2D, type=u32, sampled=false),
+        #[spirv(image_access = "write_only")] output: &mut Image!(2D, type=u32, sampled=false),
         width: u32,
         height: u32,
     ) {
