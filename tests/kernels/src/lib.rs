@@ -5,13 +5,27 @@
 //! that set risks tripping spirv-opt / spirv-val edge cases we'd
 //! otherwise be debugging instead of validating the runtime.
 //!
-//! Design constraints (per [`IMPLEMENTATION-PLAN.md`] Phase 5):
+//! ## Two device modules
+//!
+//! - [`mod@kernels`] — u32-only kernels (`fill_u32` / `add_u32` /
+//!   `scale_u32` / `copy_u32`). Compiled without `Capability::Float64`
+//!   so the emitted SPIR-V is consumable by every backend, including
+//!   devices that don't support fp64 at all (e.g. rusticl/iris on
+//!   Ice Lake, which SEGVs when handed a `Float64`-declaring program).
+//! - [`mod@kernels_f64`] — `fill_f64` / `scale_f64`. Compiled *with*
+//!   `Capability::Float64`. Runtime tests that load this module skip
+//!   when the device doesn't advertise fp64.
+//!
+//! The split is the reason — keeping the fp64 kernels in their own
+//! module means u32-only tests never load a program that mentions
+//! `OpCapability Float64`, even transitively. See `build.rs` for how
+//! the per-module capability set is selected.
+//!
+//! ## Design constraints (per [`IMPLEMENTATION-PLAN.md`] Phase 5)
 //!
 //! - **OpenCL 1.2 only**, max portability across pocl / rusticl / Intel.
 //! - **`u32` and `f64` scalars / slices only** — no vector or struct
-//!   args. The `f64` kernels (`fill_f64` / `scale_f64`) need the
-//!   `Float64` device capability; runtime tests skip when the device
-//!   doesn't advertise it.
+//!   args.
 //! - **Read-then-write bodies only** (`data[i] = f(data[i], ...)`).
 //!   Writes that don't first read the slice trip rust-gpu's pipeline
 //!   on the same workspace where read-then-write builds clean. For
@@ -71,6 +85,10 @@ pub mod kernels {
         dst[i] = src[i].wrapping_add(0);
     }
 
+}
+
+#[claspr::device]
+pub mod kernels_f64 {
     /// Replace every element with `value` — the `f64` analogue of
     /// `fill_u32`. The `data[i] * 0.0 + value` shape preserves the
     /// read-then-write the codegen wants. NaN-safe only when callers

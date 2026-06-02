@@ -18,7 +18,7 @@
 //! f64 scalars and that `DeviceSlice<f64>` round-trips correctly.
 
 use claspr::{Context, DeviceSlice};
-use claspr_test_kernels::kernels;
+use claspr_test_kernels::kernels_f64 as kernels;
 
 const N: usize = 256;
 

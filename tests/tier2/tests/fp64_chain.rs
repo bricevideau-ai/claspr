@@ -9,7 +9,7 @@
 
 use claspr::Context;
 use claspr_async::{DeviceOperation, download, upload};
-use claspr_test_kernels::kernels;
+use claspr_test_kernels::kernels_f64 as kernels;
 
 const N: usize = 256;
 
