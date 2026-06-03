@@ -1,0 +1,21 @@
+[package]
+name = "claspr-test-image-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Image kernels for claspr's runtime integration tests — separated from claspr-test-kernels because image kernels need the `image()` build preset (no DebugPrintfThenExit panic strategy, which conflicts with image emission)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+claspr = { path = "../../claspr" }
+claspr-async = { path = "../../claspr-async" }
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true

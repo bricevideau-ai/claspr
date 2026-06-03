@@ -1,0 +1,16 @@
+error[E0271]: type mismatch resolving `<R32Sint as Format>::SampledFamily == Float`
+  --> compile_fail/image/family_mismatch_float_vs_sint.rs:11:52
+   |
+11 |     let _ = kernels.fill_pattern([4usize, 4usize], img, 4u32, 4u32);
+   |                     ------------                   ^^^ expected `Float`, found `Sint`
+   |                     |
+   |                     required by a bound introduced by this call
+   |
+note: required by a bound in `claspr_test_image_kernels::dim2_float::Kernels::fill_pattern`
+  --> $WORKSPACE/tests/image-kernels/src/lib.rs
+   |
+   |     #[claspr::kernel]
+   |     ^^^^^^^^^^^^^^^^^ required by this bound in `Kernels::fill_pattern`
+   |     pub fn fill_pattern(
+   |            ------------ required by a bound in this associated function
+   = note: this error originates in the attribute macro `claspr::kernel` (in Nightly builds, run with -Z macro-backtrace for more info)

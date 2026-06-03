@@ -15,6 +15,10 @@ path = "src/lib.rs"
 [dependencies]
 claspr = { path = "../../claspr" }
 claspr-test-kernels = { path = "../kernels" }
+claspr-test-image-kernels = { path = "../image-kernels" }
+
+[dev-dependencies]
+trybuild = "1.0"
 
 [lints]
 workspace = true

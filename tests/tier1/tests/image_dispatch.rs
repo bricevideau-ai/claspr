@@ -1,0 +1,224 @@
+//! Runtime exercise of claspr's image trait dispatch.
+//!
+//! What this file actually proves (over and above the examples,
+//! which only ever use the default `R8G8B8A8Uint` 2D RGBA8 shape):
+//!
+//! - Non-default formats round-trip through `clCreateImage` +
+//!   `clEnqueueWriteImage` + `clEnqueueReadImage` for every
+//!   sampled-type family the trait dispatch advertises:
+//!   `R32Uint` (Uint, single channel), `R32Sint` (Sint, single
+//!   channel), `R32Float` (Float, single channel), and
+//!   `R32G32B32A32Uint` (Uint, four channel).
+//! - The kernel-side `&Image!(2D, type=u32, sampled=false)` /
+//!   `&Image!(2D, type=f32, …)` / `&Image!(2D, type=i32, …)`
+//!   actually accepts host-side `Image2D<A, F>` whose
+//!   `F::SampledFamily` matches the kernel's `type=`. Mismatches
+//!   are covered by `image_compile_fail.rs` (compile-fail tests
+//!   via `trybuild`).
+//! - The `WriteOnly` (host) and `ReadOnly` (host) access markers
+//!   each bind to a kernel whose access qualifier matches
+//!   (write-only fill kernel ↔ `Image2D<WriteOnly, _>`; read-only
+//!   image→buffer kernel ↔ `Image2D<ReadOnly, _>`).
+//!
+//! All tests skip cleanly when no OpenCL device is available or
+//! the device doesn't advertise image support.
+
+use claspr::{
+    Context, DeviceSlice, ReadOnly, WriteOnly,
+    image::format::{R8G8B8A8Uint, R32Float, R32G32B32A32Uint, R32Sint, R32Uint},
+};
+
+const W: u32 = 16;
+const H: u32 = 8;
+
+fn ctx() -> Option<Context> {
+    let ctx = match Context::any() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIP: no OpenCL device ({e})");
+            return None;
+        }
+    };
+    if !ctx.device().cl3().image_support().unwrap_or(false) {
+        eprintln!("SKIP: device has no image support");
+        return None;
+    }
+    Some(ctx)
+}
+
+/// Write-only 2D Uint image, default `R8G8B8A8Uint` format
+/// (this is what the examples already exercise — included here
+/// as a baseline so the new trait dispatch can be compared
+/// against the existing-success path on this machine).
+#[test]
+fn fill_pattern_rgba8_uint() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim2_uint::kernels(&ctx).unwrap();
+    let img = claspr::Image2D::<WriteOnly, R8G8B8A8Uint>::alloc(&ctx, W, H).unwrap();
+    let img = kernels
+        .fill_pattern([W as usize, H as usize], img, W, H)
+        .wait(&ctx)
+        .unwrap();
+    let bytes = img.download_bytes(&ctx).unwrap();
+    // Pixel (0,0) is value 0 → R=0; pixel (1,0) → R=1; pixel (0,1) → R=W (16).
+    // Each pixel is 4 bytes (RGBA8); R channel is byte 0 of each pixel.
+    assert_eq!(bytes[0], 0); // pixel (0,0) R
+    assert_eq!(bytes[4], 1); // pixel (1,0) R
+    assert_eq!(bytes[(W as usize) * 4], W as u8); // pixel (0,1) R
+    assert_eq!(bytes[3], 0xFF); // pixel (0,0) A
+}
+
+/// Write-only 2D Uint image, **non-default** `R32Uint` format
+/// (single-channel u32). Proves the Uint family accepts formats
+/// other than RGBA8.
+#[test]
+fn fill_pattern_r32_uint() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim2_uint::kernels(&ctx).unwrap();
+    let img = claspr::Image2D::<WriteOnly, R32Uint>::alloc(&ctx, W, H).unwrap();
+    let img = kernels
+        .fill_pattern([W as usize, H as usize], img, W, H)
+        .wait(&ctx)
+        .unwrap();
+    let pixels: Vec<u32> = img.download(&ctx).unwrap();
+    // The kernel writes (x + y*W, 0, 0, 0xFFFF_FFFF) per pixel.
+    // R32Uint is single-channel so only the .x part survives the
+    // read-back — the other components are dropped by the hardware
+    // per the OpenCL image storage spec.
+    assert_eq!(pixels.len(), (W * H) as usize);
+    for y in 0..H {
+        for x in 0..W {
+            let got = pixels[(y * W + x) as usize];
+            let want = x + y * W;
+            assert_eq!(got, want, "pixel ({x},{y}): got {got}, want {want}");
+        }
+    }
+}
+
+/// Write-only 2D Uint image, four-channel `R32G32B32A32Uint`
+/// format. Proves the kernel's UVec4-output write_imageui survives
+/// the wider channel layout.
+#[test]
+fn fill_pattern_rgba32_uint() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim2_uint::kernels(&ctx).unwrap();
+    let img = claspr::Image2D::<WriteOnly, R32G32B32A32Uint>::alloc(&ctx, W, H).unwrap();
+    let img = kernels
+        .fill_pattern([W as usize, H as usize], img, W, H)
+        .wait(&ctx)
+        .unwrap();
+    let pixels: Vec<[u32; 4]> = img.download(&ctx).unwrap();
+    for y in 0..H {
+        for x in 0..W {
+            let got = pixels[(y * W + x) as usize];
+            assert_eq!(got[0], x + y * W);
+            assert_eq!(got[1], 0);
+            assert_eq!(got[2], 0);
+            assert_eq!(got[3], 0xFFFF_FFFF);
+        }
+    }
+}
+
+/// Write-only 2D Float image, `R32Float` format. Proves the
+/// Float family.
+#[test]
+fn fill_pattern_r32_float() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim2_float::kernels(&ctx).unwrap();
+    let img = claspr::Image2D::<WriteOnly, R32Float>::alloc(&ctx, W, H).unwrap();
+    let img = kernels
+        .fill_pattern([W as usize, H as usize], img, W, H)
+        .wait(&ctx)
+        .unwrap();
+    let pixels: Vec<f32> = img.download(&ctx).unwrap();
+    for y in 0..H {
+        for x in 0..W {
+            let got = pixels[(y * W + x) as usize];
+            // Single-channel format keeps only .x = px as f32.
+            let want = x as f32;
+            assert_eq!(got, want, "pixel ({x},{y}): got {got}, want {want}");
+        }
+    }
+}
+
+/// Write-only 2D Sint image, `R32Sint` format. Proves the Sint
+/// family.
+#[test]
+fn fill_pattern_r32_sint() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim2_sint::kernels(&ctx).unwrap();
+    let img = claspr::Image2D::<WriteOnly, R32Sint>::alloc(&ctx, W, H).unwrap();
+    let img = kernels
+        .fill_pattern([W as usize, H as usize], img, W, H)
+        .wait(&ctx)
+        .unwrap();
+    let pixels: Vec<i32> = img.download(&ctx).unwrap();
+    for y in 0..H {
+        for x in 0..W {
+            let got = pixels[(y * W + x) as usize];
+            // Kernel writes (px - py, -(px - py), 0, 1); single channel keeps .x.
+            let want = (x as i32) - (y as i32);
+            assert_eq!(got, want, "pixel ({x},{y}): got {got}, want {want}");
+        }
+    }
+}
+
+/// Read-only 2D Float image (host-seeded via `upload`) →
+/// kernel copies pixels into a `DeviceSlice<f32>`. Proves the
+/// `&Image` (ReadOnly access qualifier) kernel-param path and
+/// the host `upload` API at the same time.
+#[test]
+fn read_only_float_image_to_buffer() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim2_float::kernels(&ctx).unwrap();
+
+    let mut img = claspr::Image2D::<ReadOnly, R32Float>::alloc(&ctx, W, H).unwrap();
+    let mut seed = vec![0.0f32; (W * H) as usize];
+    for y in 0..H {
+        for x in 0..W {
+            seed[(y * W + x) as usize] = (x as f32) + (y as f32) * 100.0;
+        }
+    }
+    img.upload(&ctx, &seed).unwrap();
+
+    // Seed with finite values so the `out[i] * 0.0` trick in the
+    // kernel produces a clean zero (NaN otherwise).
+    let zeros = vec![0.0f32; (W * H) as usize];
+    let out = DeviceSlice::<f32>::from_slice(&ctx, &zeros).unwrap();
+
+    let (_img, out) = kernels
+        .copy_to_buffer([W as usize, H as usize], img, out, W, H)
+        .wait(&ctx)
+        .unwrap();
+    let mut result = vec![0.0f32; (W * H) as usize];
+    out.read(&ctx, &mut result).wait().unwrap();
+    assert_eq!(result, seed, "kernel-read pixels should match host-seeded");
+}
+
+/// Read-only 2D Sint image, host-seeded → kernel-copied. Sint
+/// family + `&Image` read path.
+#[test]
+fn read_only_sint_image_to_buffer() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim2_sint::kernels(&ctx).unwrap();
+
+    let mut img = claspr::Image2D::<ReadOnly, R32Sint>::alloc(&ctx, W, H).unwrap();
+    let mut seed = vec![0i32; (W * H) as usize];
+    for y in 0..H {
+        for x in 0..W {
+            seed[(y * W + x) as usize] = (x as i32) - (y as i32) * 10;
+        }
+    }
+    img.upload(&ctx, &seed).unwrap();
+
+    let zeros = vec![0i32; (W * H) as usize];
+    let out = DeviceSlice::<i32>::from_slice(&ctx, &zeros).unwrap();
+
+    let (_img, out) = kernels
+        .copy_to_buffer([W as usize, H as usize], img, out, W, H)
+        .wait(&ctx)
+        .unwrap();
+    let mut result = vec![0i32; (W * H) as usize];
+    out.read(&ctx, &mut result).wait().unwrap();
+    assert_eq!(result, seed);
+}

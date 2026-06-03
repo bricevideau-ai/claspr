@@ -1,0 +1,26 @@
+error[E0277]: the trait bound `Image2D<ReadOnly, R32Uint>: KernelImage2DWriteArg<Uint>` is not satisfied
+  --> compile_fail/image/access_read_only_to_write.rs:12:52
+   |
+12 |     let _ = kernels.fill_pattern([4usize, 4usize], img, 4u32, 4u32);
+   |                     ------------                   ^^^ the trait `KernelImage2DWriteArg<Uint>` is not implemented for `Image2D<ReadOnly, R32Uint>`
+   |                     |
+   |                     required by a bound introduced by this call
+   |
+help: the following other types implement trait `KernelImage2DWriteArg<SF>`
+  --> $WORKSPACE/claspr/src/image.rs
+   |
+   | / impl<F: format::Format + Send + 'static> KernelImage2DWriteArg<F::SampledFamily>
+   | |     for Image2D<WriteOnly, F>
+   | |_____________________________^ `Image2D<WriteOnly, F>`
+...
+   | / impl<F: format::Format + Send + 'static> KernelImage2DWriteArg<F::SampledFamily>
+   | |     for Image2D<ReadWrite, F>
+   | |_____________________________^ `Image2D<ReadWrite, F>`
+note: required by a bound in `claspr_test_image_kernels::dim2_uint::Kernels::fill_pattern`
+  --> $WORKSPACE/tests/image-kernels/src/lib.rs
+   |
+   |     #[claspr::kernel]
+   |     ^^^^^^^^^^^^^^^^^ required by this bound in `Kernels::fill_pattern`
+   |     pub fn fill_pattern(
+   |            ------------ required by a bound in this associated function
+   = note: this error originates in the attribute macro `claspr::kernel` (in Nightly builds, run with -Z macro-backtrace for more info)
