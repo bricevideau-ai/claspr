@@ -343,7 +343,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 image_gen_idx += 1;
                 let iid_tt: TokenStream2 = quote! { #iid };
 
-                let trait_name = quote::format_ident!("KernelImage{}D{}Arg", dim, access_segment);
+                let trait_name = quote::format_ident!("KernelImage{}{}Arg", dim, access_segment);
 
                 generics.push((
                     iid_tt.clone(),
@@ -673,9 +673,13 @@ enum ParamRole {
     /// is `1D`/`2D`/`3D` from the `Image!(<dim>, ...)` token.
     Image {
         name: TokenStream2,
-        /// `1` / `2` / `3` — picks `Image1D` / `Image2D` /
-        /// `Image3D` host wrapper + the matching trait family.
-        dim: u32,
+        /// Dim segment as it appears in the host trait name —
+        /// `"1D"` / `"2D"` / `"3D"` / `"Buffer"`. Spliced via
+        /// `format_ident!` into
+        /// `KernelImage<dim><Access>Arg<family>` (note: the literal
+        /// `D` is part of the dim segment, not the trait stem, so
+        /// `Buffer` works as a drop-in too).
+        dim: &'static str,
         /// Sampled-type-family marker path:
         /// `::claspr::image::format::Uint` etc.
         family: TokenStream2,
@@ -814,8 +818,11 @@ fn spirv_attr_kind(attr: &Attribute) -> SpirvKind {
 /// drive per-image generic decls + the trait bound on the wrapper
 /// method.
 struct ImageInfo {
-    /// `1` / `2` / `3` from the leading `Image!(<dim>, ...)` ident.
-    dim: u32,
+    /// Dim segment as it appears in the host trait + wrapper name:
+    /// `"1D"`/`"2D"`/`"3D"` from `Image!(1D|2D|3D, ...)`, `"Buffer"`
+    /// from `Image!(buffer, ...)`. Spliced into
+    /// `KernelImage<dim><Access>Arg`.
+    dim: &'static str,
     /// Path to the sampled-type-family marker ZST —
     /// `::claspr::image::format::{Uint, Sint, Float}` — derived from
     /// the kernel's `type=` keyword.
@@ -882,16 +889,22 @@ fn classify_image_param(pt: &PatType) -> syn::Result<Option<ImageInfo>> {
     let (dim_tok, type_tok) = parse_image_tokens(mac.tokens.clone());
 
     let dim = match dim_tok.as_deref() {
-        Some("1D") => 1,
-        Some("2D") => 2,
-        Some("3D") => 3,
+        Some("1D") => "1D",
+        Some("2D") => "2D",
+        Some("3D") => "3D",
+        // rust-gpu's `Image!(buffer, ...)` (lowercase ident,
+        // matching spirv-std-macros) → `Image1DBuffer` host wrapper
+        // + `KernelImageBuffer*Arg` trait family. Backed by a
+        // `cl_mem` buffer object, so it can either own its storage
+        // (alloc) or view an existing `DeviceSlice<T>`.
+        Some("buffer") => "Buffer",
         Some(other) => {
             return Err(syn::Error::new(
                 span,
                 format!(
                     "claspr::kernel: unsupported Image! dimensionality `{other}`. \
-                     Only `1D`, `2D`, and `3D` map to claspr host wrappers (cube/rect/buffer/subpass \
-                     have no claspr `Image*D<A, F>` counterpart yet)"
+                     Supported: `1D`, `2D`, `3D`, `buffer` (cube/rect/subpass \
+                     have no claspr host counterpart yet)"
                 ),
             ));
         }
@@ -899,7 +912,7 @@ fn classify_image_param(pt: &PatType) -> syn::Result<Option<ImageInfo>> {
             return Err(syn::Error::new(
                 span,
                 "claspr::kernel: Image! parameter missing dimensionality — expected `Image!(1D, ...)`, \
-                 `Image!(2D, ...)`, or `Image!(3D, ...)` as the first token",
+                 `Image!(2D, ...)`, `Image!(3D, ...)`, or `Image!(buffer, ...)` as the first token",
             ));
         }
     };

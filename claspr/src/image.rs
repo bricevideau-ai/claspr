@@ -796,6 +796,38 @@ pub trait KernelImage2DReadWriteArg<SF: format::SampledTypeFamily>:
 {
 }
 
+/// Host-side counterpart for a kernel `&Image!(buffer, type=...)`
+/// parameter — see [`KernelImage1DReadArg`].
+///
+/// Implemented by [`Image1DBuffer<ReadOnly, F>`] and
+/// [`Image1DBuffer<ReadWrite, F>`]. The kernel-side
+/// `image1d_buffer_t` reads/writes typed pixels backed by a
+/// `cl_mem` buffer object — `clCreateImage` with
+/// `CL_MEM_OBJECT_IMAGE1D_BUFFER` shares storage with the buffer
+/// it was created from, so the same data can be read as a typed
+/// 1D image from a kernel and as raw bytes (or typed elements)
+/// through the buffer API.
+pub trait KernelImageBufferReadArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel `&mut Image!(buffer, ...,
+/// access="write_only")` parameter — see
+/// [`KernelImageBufferReadArg`] for the storage model.
+pub trait KernelImageBufferWriteArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel `&mut Image!(buffer, ...)`
+/// parameter (kernel declared `ReadWrite`) — see
+/// [`KernelImageBufferReadArg`].
+pub trait KernelImageBufferReadWriteArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+{
+}
+
 /// Host-side counterpart for a kernel `&Image!(3D, type=...)`
 /// parameter — see [`KernelImage1DReadArg`].
 pub trait KernelImage3DReadArg<SF: format::SampledTypeFamily>:
@@ -924,6 +956,214 @@ impl<F: format::Format + Send + 'static> KernelImage3DWriteArg<F::SampledFamily>
 }
 impl<F: format::Format + Send + 'static> KernelImage3DReadWriteArg<F::SampledFamily>
     for Image3D<ReadWrite, F>
+{
+}
+
+// ── Image1DBuffer ─────────────────────────────────────────────────
+//
+// Image view of an OpenCL buffer object: the kernel sees an
+// `image1d_buffer_t` (SPIR-V `OpTypeImage Dim=Buffer`), the host
+// sees a `cl_mem` buffer. Storage is shared — host can use
+// `clEnqueueRead/WriteBuffer` against the same `cl_mem` to access
+// the same bytes the kernel reads/writes as typed pixels.
+//
+// Why use it over a normal `DeviceSlice<T>` slice arg: the kernel
+// gets format-aware access (e.g. UNORM normalisation, sint/uint
+// channel-type interpretation) with hardware support and no
+// per-element conversion code. Why use it over [`Image1D`]: the
+// max width is `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` (typically GB-
+// scale) rather than `CL_DEVICE_IMAGE2D_MAX_*` (typically MB-
+// scale).
+//
+// Created with `CL_MEM_OBJECT_IMAGE1D_BUFFER`. The
+// `cl_image_desc::buffer` field of the desc passed to
+// `clCreateImage` is the underlying `cl_mem`; we own it
+// internally via [`opencl3::memory::Buffer`] so the image and
+// its storage drop together.
+
+/// A 1D image-buffer with compile-time access mode and storage
+/// format — backs a kernel-side `image1d_buffer_t`
+/// (`Image!(buffer, ...)`).
+///
+/// `A` is the kernel-side access marker; `F` is the channel
+/// format. The underlying OpenCL object is created with
+/// `CL_MEM_OBJECT_IMAGE1D_BUFFER` over an internally-owned
+/// `cl_mem` buffer (one allocation per image-buffer).
+///
+/// Use this when you want format-aware kernel access (hardware
+/// UNORM↔float conversion, etc.) over a 1D-indexed dataset with
+/// the buffer-size max rather than the 2D-image-size max.
+pub struct Image1DBuffer<A: KernelAccess, F: format::Format> {
+    image: Image,
+    // `ClBuffer<u8>` — the storage backing the image. We hold it
+    // so it stays alive as long as the image-buffer does; OpenCL
+    // retains its own ref via the image-create, but we keep an
+    // explicit owner here for symmetry with the per-dim wrappers.
+    #[allow(dead_code)]
+    backing: opencl3::memory::Buffer<u8>,
+    width: u32,
+    #[allow(dead_code)]
+    ctx: Context,
+    _access: PhantomData<A>,
+    _format: PhantomData<F>,
+}
+
+impl<A: KernelAccess, F: format::Format> Image1DBuffer<A, F> {
+    /// Allocate an image-buffer of `width` pixels — also allocates
+    /// the backing `cl_mem` buffer internally (size `width *
+    /// size_of::<F::Pixel>()` bytes).
+    pub fn alloc(ctx: &Context, width: u32) -> Result<Self> {
+        let pixel_bytes = std::mem::size_of::<F::Pixel>();
+        let byte_len = (width as usize) * pixel_bytes;
+        // SAFETY: null host pointer + `KERNEL_FLAGS` access flag —
+        // OpenCL allocates fresh device memory and ignores the
+        // host-pointer contract that makes `Buffer::create` unsafe.
+        let backing: opencl3::memory::Buffer<u8> = unsafe {
+            opencl3::memory::Buffer::<u8>::create(
+                ctx.raw_context(),
+                A::KERNEL_FLAGS,
+                byte_len,
+                ptr::null_mut(),
+            )?
+        };
+        let format = cl_image_format {
+            image_channel_order: F::CHANNEL_ORDER,
+            image_channel_data_type: F::CHANNEL_TYPE,
+        };
+        let desc = cl_image_desc {
+            image_type: opencl3::memory::CL_MEM_OBJECT_IMAGE1D_BUFFER,
+            image_width: width as usize,
+            image_height: 0,
+            image_depth: 0,
+            image_array_size: 0,
+            image_row_pitch: 0,
+            image_slice_pitch: 0,
+            num_mip_levels: 0,
+            num_samples: 0,
+            buffer: backing.get(),
+        };
+        // SAFETY: `buffer` in the desc points at the backing
+        // `cl_mem` we just allocated; OpenCL retains it and the
+        // image shares its storage. Host-ptr null is correct
+        // because we're not initialising from a host buffer.
+        let image = unsafe {
+            Image::create(
+                ctx.raw_context(),
+                A::KERNEL_FLAGS,
+                &format,
+                &desc,
+                ptr::null_mut(),
+            )?
+        };
+        Ok(Self {
+            image,
+            backing,
+            width,
+            ctx: ctx.clone(),
+            _access: PhantomData,
+            _format: PhantomData,
+        })
+    }
+
+    /// Read this image-buffer as raw bytes — `Vec<u8>` of length
+    /// `width * size_of::<F::Pixel>()`. Goes through the image
+    /// `clEnqueueReadImage` path (region/origin semantics).
+    pub fn download_bytes<L: Launcher>(&self, launcher: &L) -> Result<Vec<u8>> {
+        let pixel_count = self.width as usize;
+        let mut bytes = vec![0u8; pixel_count * std::mem::size_of::<F::Pixel>()];
+        let region = [pixel_count, 1, 1];
+        read_image_into(launcher, &self.image, region, bytes.as_mut_ptr())?;
+        Ok(bytes)
+    }
+
+    /// Read this image-buffer into a host `Vec<F::Pixel>` of
+    /// length `width`. Blocking.
+    pub fn download<L: Launcher>(&self, launcher: &L) -> Result<Vec<F::Pixel>>
+    where
+        F::Pixel: Default,
+    {
+        let pixel_count = self.width as usize;
+        let mut pixels = vec![<F::Pixel as Default>::default(); pixel_count];
+        let region = [pixel_count, 1, 1];
+        read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
+        Ok(pixels)
+    }
+
+    /// Write `bytes` to this image-buffer. Length must equal
+    /// `width * size_of::<F::Pixel>()`. Blocking.
+    pub fn upload_bytes<L: Launcher>(&mut self, launcher: &L, bytes: &[u8]) -> Result<()> {
+        let pixel_count = self.width as usize;
+        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
+        assert_eq!(
+            bytes.len(),
+            expected,
+            "Image1DBuffer::upload_bytes: buffer length {} ≠ expected {}",
+            bytes.len(),
+            expected,
+        );
+        let region = [pixel_count, 1, 1];
+        write_image_from(launcher, &mut self.image, region, bytes.as_ptr())
+    }
+
+    /// Write a typed pixel slice. Length must equal `width`.
+    pub fn upload<L: Launcher>(&mut self, launcher: &L, pixels: &[F::Pixel]) -> Result<()> {
+        let pixel_count = self.width as usize;
+        assert_eq!(
+            pixels.len(),
+            pixel_count,
+            "Image1DBuffer::upload: pixel count {} ≠ expected {}",
+            pixels.len(),
+            pixel_count,
+        );
+        let region = [pixel_count, 1, 1];
+        write_image_from(launcher, &mut self.image, region, pixels.as_ptr().cast())
+    }
+
+    /// Width in pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Borrow the underlying opencl3 [`Image`].
+    pub fn image(&self) -> &Image {
+        &self.image
+    }
+}
+
+impl<A: KernelAccess, F: format::Format> KernelArg for Image1DBuffer<A, F> {
+    fn set(&self, exec: &mut ExecuteKernel<'_>) {
+        let cl_mem_handle = self.image.get();
+        unsafe {
+            exec.set_arg(&cl_mem_handle);
+        }
+    }
+}
+
+impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
+    kernel_image_arg_sealed::Sealed for Image1DBuffer<A, F>
+{
+}
+
+// Per-access impls for Image1DBuffer — same partial order as
+// the dim-1/2/3 wrappers above.
+impl<F: format::Format + Send + 'static> KernelImageBufferReadArg<F::SampledFamily>
+    for Image1DBuffer<ReadOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
+    for Image1DBuffer<WriteOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImageBufferReadArg<F::SampledFamily>
+    for Image1DBuffer<ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
+    for Image1DBuffer<ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImageBufferReadWriteArg<F::SampledFamily>
+    for Image1DBuffer<ReadWrite, F>
 {
 }
 
