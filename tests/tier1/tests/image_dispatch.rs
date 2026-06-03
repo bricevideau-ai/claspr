@@ -24,7 +24,7 @@
 //! the device doesn't advertise image support.
 
 use claspr::{
-    Context, DeviceSlice, ReadOnly, WriteOnly,
+    Context, DeviceSlice, Image3D, ReadOnly, WriteOnly,
     image::format::{R8G8B8A8Uint, R32Float, R32G32B32A32Uint, R32Sint, R32Uint},
 };
 
@@ -221,4 +221,33 @@ fn read_only_sint_image_to_buffer() {
     let mut result = vec![0i32; (W * H) as usize];
     out.read(&ctx, &mut result).wait().unwrap();
     assert_eq!(result, seed);
+}
+
+/// 3D image — write-only, `R32Uint` format. Proves the
+/// `Image3D` runtime + the `KernelImage3DWriteArg<Uint>` trait
+/// bound emitted by the proc-macro for `&mut Image!(3D, …)`.
+/// (Dim=3D doesn't carry a per-Dim capability requirement in
+/// the SPIR-V core spec, so it works on the same OpenCL 1.2
+/// `image()` build preset as Dim=2D.)
+#[test]
+fn dim3_fill_pattern_r32_uint() {
+    const D: u32 = 4;
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim3_uint::kernels(&ctx).unwrap();
+    let img = Image3D::<WriteOnly, R32Uint>::alloc(&ctx, W, H, D).unwrap();
+    let img = kernels
+        .fill_pattern([W as usize, H as usize, D as usize], img, W, H, D)
+        .wait(&ctx)
+        .unwrap();
+    let pixels: Vec<u32> = img.download(&ctx).unwrap();
+    assert_eq!(pixels.len(), (W * H * D) as usize);
+    for z in 0..D {
+        for y in 0..H {
+            for x in 0..W {
+                let idx = (z * W * H + y * W + x) as usize;
+                let want = x + y * W + z * W * H;
+                assert_eq!(pixels[idx], want, "voxel ({x},{y},{z})");
+            }
+        }
+    }
 }

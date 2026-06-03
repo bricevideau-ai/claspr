@@ -21,12 +21,15 @@
 //! - [`mod@dim2_sint`] — 2D / `type=i32` / write-only fill +
 //!   read-only image→buffer copy. Sint family.
 //!
-//! 1D and 3D image kernels are intentionally absent — rust-gpu is
-//! missing the auto-declare for `OpCapability Sampled1D` / `Image1D`
-//! (and the equivalent Image3D pairing), so kernels emitting
-//! `OpTypeImage Dim=1D`/`Dim=3D` get rejected by spirv-val on OpenCL
-//! 1.2. See the gating note above the (absent) modules below for the
-//! follow-up.
+//! - [`mod@dim3_uint`] — 3D / `type=u32` / write-only fill.
+//!   Proves the `Image3D` runtime + `KernelImage3D*Arg` trait
+//!   family round-trip.
+//!
+//! 1D image kernels are intentionally absent — rust-gpu is missing
+//! the auto-declare for `OpCapability Image1D` when an
+//! `OpTypeImage Dim=1D` is emitted on Kernel; spirv-val rejects.
+//! 3D needs no extra capability (Dim=3D carries no per-Dim cap
+//! requirement in the SPIR-V core spec) so it is exercised here.
 
 #[claspr::device]
 pub mod dim2_uint {
@@ -159,12 +162,45 @@ pub mod dim2_sint {
     }
 }
 
-// Dim1D / Dim3D kernels are intentionally absent — rust-gpu does not
-// yet auto-declare `OpCapability Sampled1D` / `Image1D` when an
-// `OpTypeImage Dim=1D` is emitted on Kernel, and the OpenCL 1.2 image
-// preset rejects modules whose OpTypeImage references uncovered
-// capabilities. Once rust-gpu auto-declares the dim capability (paired
-// rule to the existing ImageBasic/ImageReadWrite auto-declare), add a
-// `dim1_uint` + `dim3_uint` module here mirroring `dim2_uint`. The
-// Image1D / Image3D runtime + KernelImage{1,3}D*Arg traits already
-// exist in claspr; only the kernel side is gated.
+// Dim1D kernels are intentionally absent — rust-gpu does not yet
+// auto-declare `OpCapability Image1D` when an `OpTypeImage Dim=1D`
+// is emitted on Kernel; spirv-val then rejects the module.
+// Once rust-gpu auto-declares the dim capability, add a
+// `dim1_uint` module mirroring `dim3_uint`. The Image1D runtime +
+// KernelImage1D*Arg traits already exist in claspr; only the
+// kernel side is gated.
+
+#[claspr::device]
+pub mod dim3_uint {
+    #[cfg(target_arch = "spirv")]
+    use spirv_std::{
+        Image,
+        glam::{IVec3, USizeVec3, UVec4},
+    };
+
+    /// 3D image fill. Coord is `IVec3` per spirv-std's
+    /// `ImageCoordinate<S, Dim::ThreeD, Arrayed::False>` impl
+    /// (a 3-component integer vector).
+    #[claspr::kernel]
+    pub fn fill_pattern(
+        #[spirv(global_invocation_id)] id: USizeVec3,
+        #[spirv(image_access = "write_only")] image: &mut Image!(3D, type=u32, sampled=false),
+        width: u32,
+        height: u32,
+        depth: u32,
+    ) {
+        let px = id.x as u32;
+        let py = id.y as u32;
+        let pz = id.z as u32;
+        if px >= width || py >= height || pz >= depth {
+            return;
+        }
+        let v = px + py * width + pz * width * height;
+        unsafe {
+            image.write(
+                IVec3::new(px as i32, py as i32, pz as i32),
+                UVec4::new(v, 0, 0, 0),
+            );
+        }
+    }
+}
