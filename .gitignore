@@ -1,4 +1,7 @@
 /target
+# ui_test writes per-fixture compile artifacts to
+# `<crate>/target/ui/...`; not the workspace's root target dir.
+**/target/ui/
 Cargo.lock.*
 *.swp
 *.ppm

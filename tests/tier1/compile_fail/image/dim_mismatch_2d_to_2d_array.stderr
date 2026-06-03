@@ -7,20 +7,17 @@ error[E0277]: the trait bound `Image2D<WriteOnly, R32Uint>: KernelImage2DArrayWr
    |                     required by a bound introduced by this call
    |
 help: the following other types implement trait `KernelImage2DArrayWriteArg<SF>`
-  --> $WORKSPACE/claspr/src/image.rs
+  --> claspr/src/image.rs:1336:0
+  ::: claspr/src/image.rs:1337:34
    |
-   | / impl<F: format::Format + Send + 'static> KernelImage2DArrayWriteArg<F::SampledFamily>
-   | |     for Image2DArray<WriteOnly, F>
-   | |__________________________________^ `Image2DArray<WriteOnly, F>`
-...
-   | / impl<F: format::Format + Send + 'static> KernelImage2DArrayWriteArg<F::SampledFamily>
-   | |     for Image2DArray<ReadWrite, F>
-   | |__________________________________^ `Image2DArray<ReadWrite, F>`
+   = note: `Image2DArray<WriteOnly, F>`
+  ::: claspr/src/image.rs:1345:34
+   |
+   = note: `Image2DArray<ReadWrite, F>`
 note: required by a bound in `claspr_test_image_kernels::dim2_array_uint::Kernels::fill_pattern`
-  --> $WORKSPACE/tests/image-kernels/src/lib.rs
-   |
-   |     #[claspr::kernel]
-   |     ^^^^^^^^^^^^^^^^^ required by this bound in `Kernels::fill_pattern`
-   |     pub fn fill_pattern(
-   |            ------------ required by a bound in this associated function
+  --> tests/image-kernels/src/lib.rs:325:4
    = note: this error originates in the attribute macro `claspr::kernel` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0277`.

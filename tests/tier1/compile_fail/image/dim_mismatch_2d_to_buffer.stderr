@@ -7,28 +7,23 @@ error[E0277]: the trait bound `Image2D<WriteOnly, R32Uint>: KernelImageBufferWri
    |                     required by a bound introduced by this call
    |
 help: the following other types implement trait `KernelImageBufferWriteArg<SF>`
-  --> $WORKSPACE/claspr/src/image.rs
+  --> claspr/src/image.rs:1544:0
+  ::: claspr/src/image.rs:1545:35
    |
-   | / impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
-   | |     for Image1DBuffer<WriteOnly, F>
-   | |___________________________________^ `Image1DBuffer<WriteOnly, F>`
-...
-   | / impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
-   | |     for Image1DBuffer<ReadWrite, F>
-   | |___________________________________^ `Image1DBuffer<ReadWrite, F>`
-...
-   | / impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
-   | |     for Image1DBufferView<'_, WriteOnly, F>
-   | |___________________________________________^ `Image1DBufferView<'_, WriteOnly, F>`
-...
-   | / impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
-   | |     for Image1DBufferView<'_, ReadWrite, F>
-   | |___________________________________________^ `Image1DBufferView<'_, ReadWrite, F>`
+   = note: `Image1DBuffer<WriteOnly, F>`
+  ::: claspr/src/image.rs:1553:35
+   |
+   = note: `Image1DBuffer<ReadWrite, F>`
+  ::: claspr/src/image.rs:1729:43
+   |
+   = note: `Image1DBufferView<'_, WriteOnly, F>`
+  ::: claspr/src/image.rs:1737:43
+   |
+   = note: `Image1DBufferView<'_, ReadWrite, F>`
 note: required by a bound in `claspr_test_image_kernels::dim_buffer_uint::Kernels::fill_pattern`
-  --> $WORKSPACE/tests/image-kernels/src/lib.rs
-   |
-   |     #[claspr::kernel]
-   |     ^^^^^^^^^^^^^^^^^ required by this bound in `Kernels::fill_pattern`
-   |     pub fn fill_pattern(
-   |            ------------ required by a bound in this associated function
+  --> tests/image-kernels/src/lib.rs:248:4
    = note: this error originates in the attribute macro `claspr::kernel` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0277`.

@@ -18,7 +18,15 @@ claspr-test-kernels = { path = "../kernels" }
 claspr-test-image-kernels = { path = "../image-kernels" }
 
 [dev-dependencies]
-trybuild = "1.0"
+ui_test = "0.30"
+
+# `ui_test` requires harness = false so its `fn main()` actually runs
+# instead of cargo test looking for `#[test]`s. The test crate `image_compile_fail`
+# lives in `tests/image_compile_fail.rs` as before; only the harness mode changes.
+[[test]]
+name = "image_compile_fail"
+path = "tests/image_compile_fail.rs"
+harness = false
 
 [lints]
 workspace = true
