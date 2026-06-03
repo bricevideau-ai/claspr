@@ -81,13 +81,19 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --workspace --target $TARGET
 
-      - name: cargo build --workspace
-        run: cargo build --workspace --target $TARGET
+      # Build in release so the artifact cache is reused verbatim by
+      # the `cargo test --release` step below. Same profile = zero
+      # rebuild between the two steps.
+      - name: cargo build --workspace --release
+        run: cargo build --workspace --release --target $TARGET
 
       - name: cargo test --workspace
         # Workspace covers claspr unit tests, the tier1 / tier2
         # integration test suites, and the small async-pipeline /
         # batch-inference examples' inline tests. Tests that need an
         # OpenCL device skip gracefully if none is present, but with
-        # rusticl installed above they actually execute.
+        # rusticl installed above they actually execute. `--release`
+        # matches the build step above so artifacts are reused —
+        # release also surfaces a handful of kernel-codegen issues
+        # that don't appear in debug.
         run: cargo test --workspace --release --target $TARGET
