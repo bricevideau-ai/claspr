@@ -161,11 +161,11 @@ pub mod format {
     macro_rules! format_zst {
         ($name:ident, $order:ident, $ctype:ident, $pixel:ty, $family:ident) => {
             #[doc = concat!(
-                            "OpenCL image format: ",
-                            stringify!($order), " / ", stringify!($ctype),
-                            ". Pixel type: `", stringify!($pixel), "`. ",
-                            "Sampled-type family: [`", stringify!($family), "`]."
-                        )]
+                                        "OpenCL image format: ",
+                                        stringify!($order), " / ", stringify!($ctype),
+                                        ". Pixel type: `", stringify!($pixel), "`. ",
+                                        "Sampled-type family: [`", stringify!($family), "`]."
+                                    )]
             #[derive(Clone, Copy, Debug)]
             pub struct $name;
             impl sealed::Sealed for $name {}
@@ -288,6 +288,39 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
         Ok(pixels)
     }
 
+    /// Write `bytes` to this image. The buffer must be exactly
+    /// `width * height * size_of::<F::Pixel>()` bytes — shorter or
+    /// longer is undefined behaviour at the OpenCL layer; we catch
+    /// it with an assertion. Blocking.
+    pub fn upload_bytes<L: Launcher>(&mut self, launcher: &L, bytes: &[u8]) -> Result<()> {
+        let pixel_count = (self.width as usize) * (self.height as usize);
+        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
+        assert_eq!(
+            bytes.len(),
+            expected,
+            "Image2D::upload_bytes: buffer length {} ≠ expected {}",
+            bytes.len(),
+            expected,
+        );
+        let region = [self.width as usize, self.height as usize, 1];
+        write_image_from(launcher, &mut self.image, region, bytes.as_ptr())
+    }
+
+    /// Write a typed pixel slice to this image. Length must be
+    /// exactly `width * height`. Blocking.
+    pub fn upload<L: Launcher>(&mut self, launcher: &L, pixels: &[F::Pixel]) -> Result<()> {
+        let pixel_count = (self.width as usize) * (self.height as usize);
+        assert_eq!(
+            pixels.len(),
+            pixel_count,
+            "Image2D::upload: pixel count {} ≠ expected {}",
+            pixels.len(),
+            pixel_count,
+        );
+        let region = [self.width as usize, self.height as usize, 1];
+        write_image_from(launcher, &mut self.image, region, pixels.as_ptr().cast())
+    }
+
     /// Width in pixels.
     pub fn width(&self) -> u32 {
         self.width
@@ -389,6 +422,34 @@ fn read_image_into<L: Launcher>(
     Ok(())
 }
 
+fn write_image_from<L: Launcher>(
+    launcher: &L,
+    image: &mut Image,
+    region: [usize; 3],
+    in_ptr: *const u8,
+) -> Result<()> {
+    let origin = [0usize, 0, 0];
+    // SAFETY: blocking write from a caller-supplied buffer at
+    // `in_ptr`; the caller has sized the buffer to match
+    // `region.iter().product() * size_of::<F::Pixel>()`.
+    unsafe {
+        launcher
+            .cl_queue()
+            .enqueue_write_image(
+                image,
+                CL_BLOCKING,
+                origin.as_ptr(),
+                region.as_ptr(),
+                0,
+                0,
+                in_ptr as *mut _,
+                &[],
+            )?
+            .wait()?;
+    }
+    Ok(())
+}
+
 // ── Image1D ─────────────────────────────────────────────────────────
 
 /// A 1D image with compile-time access mode and storage format.
@@ -440,6 +501,37 @@ impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
         let region = [pixel_count, 1, 1];
         read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
         Ok(pixels)
+    }
+
+    /// Write `bytes` to this image. Length must be exactly
+    /// `width * size_of::<F::Pixel>()`. Blocking.
+    pub fn upload_bytes<L: Launcher>(&mut self, launcher: &L, bytes: &[u8]) -> Result<()> {
+        let pixel_count = self.width as usize;
+        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
+        assert_eq!(
+            bytes.len(),
+            expected,
+            "Image1D::upload_bytes: buffer length {} ≠ expected {}",
+            bytes.len(),
+            expected,
+        );
+        let region = [pixel_count, 1, 1];
+        write_image_from(launcher, &mut self.image, region, bytes.as_ptr())
+    }
+
+    /// Write a typed pixel slice to this image. Length must be
+    /// exactly `width`. Blocking.
+    pub fn upload<L: Launcher>(&mut self, launcher: &L, pixels: &[F::Pixel]) -> Result<()> {
+        let pixel_count = self.width as usize;
+        assert_eq!(
+            pixels.len(),
+            pixel_count,
+            "Image1D::upload: pixel count {} ≠ expected {}",
+            pixels.len(),
+            pixel_count,
+        );
+        let region = [pixel_count, 1, 1];
+        write_image_from(launcher, &mut self.image, region, pixels.as_ptr().cast())
     }
 
     /// Width in pixels.
@@ -531,6 +623,45 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
         ];
         read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
         Ok(pixels)
+    }
+
+    /// Write `bytes` to this image. Length must be exactly
+    /// `width * height * depth * size_of::<F::Pixel>()`. Blocking.
+    pub fn upload_bytes<L: Launcher>(&mut self, launcher: &L, bytes: &[u8]) -> Result<()> {
+        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
+        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
+        assert_eq!(
+            bytes.len(),
+            expected,
+            "Image3D::upload_bytes: buffer length {} ≠ expected {}",
+            bytes.len(),
+            expected,
+        );
+        let region = [
+            self.width as usize,
+            self.height as usize,
+            self.depth as usize,
+        ];
+        write_image_from(launcher, &mut self.image, region, bytes.as_ptr())
+    }
+
+    /// Write a typed pixel slice to this image. Length must be
+    /// exactly `width * height * depth`. Blocking.
+    pub fn upload<L: Launcher>(&mut self, launcher: &L, pixels: &[F::Pixel]) -> Result<()> {
+        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
+        assert_eq!(
+            pixels.len(),
+            pixel_count,
+            "Image3D::upload: pixel count {} ≠ expected {}",
+            pixels.len(),
+            pixel_count,
+        );
+        let region = [
+            self.width as usize,
+            self.height as usize,
+            self.depth as usize,
+        ];
+        write_image_from(launcher, &mut self.image, region, pixels.as_ptr().cast())
     }
 
     /// Width in pixels.
