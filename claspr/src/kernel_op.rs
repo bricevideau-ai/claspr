@@ -1,5 +1,5 @@
 //! [`KernelOp`] — the host-side enqueue contract emitted by
-//! [`claspr_macros::kernel`][k] on every generated kernel `Op`.
+//! [`claspr_macros::kernel`] on every generated kernel `Op`.
 //!
 //! This trait exists so the proc-macro can stay free of any
 //! `claspr-async` reference. The macro emits one inherent terminal
@@ -18,8 +18,6 @@
 //!   `#[cfg]`-gated macro emission.
 //!
 //! See `claspr-macros/src/lib.rs` for the emission site.
-//!
-//! [k]: claspr_macros::kernel
 
 use crate::queue::Launcher;
 use crate::{Event, Result, cl_event};
