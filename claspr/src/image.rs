@@ -50,7 +50,8 @@ use crate::launch::KernelArg;
 use crate::queue::Launcher;
 use opencl3::kernel::ExecuteKernel;
 use opencl3::memory::{
-    CL_MEM_OBJECT_IMAGE1D, CL_MEM_OBJECT_IMAGE2D, CL_MEM_OBJECT_IMAGE3D, ClMem, Image,
+    CL_MEM_OBJECT_IMAGE1D, CL_MEM_OBJECT_IMAGE1D_ARRAY, CL_MEM_OBJECT_IMAGE2D,
+    CL_MEM_OBJECT_IMAGE2D_ARRAY, CL_MEM_OBJECT_IMAGE3D, ClMem, Image,
 };
 use opencl3::types::{CL_BLOCKING, cl_image_desc, cl_image_format};
 use std::marker::PhantomData;
@@ -253,6 +254,7 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
             width as usize,
             height as usize,
             1,
+            0,
         )?;
         Ok(Image2D {
             image,
@@ -362,6 +364,7 @@ fn alloc_image<A: KernelAccess, F: format::Format>(
     width: usize,
     height: usize,
     depth: usize,
+    array_size: usize,
 ) -> Result<Image> {
     let format = cl_image_format {
         image_channel_order: F::CHANNEL_ORDER,
@@ -372,7 +375,7 @@ fn alloc_image<A: KernelAccess, F: format::Format>(
         image_width: width,
         image_height: height,
         image_depth: depth,
-        image_array_size: 0,
+        image_array_size: array_size,
         image_row_pitch: 0,
         image_slice_pitch: 0,
         num_mip_levels: 0,
@@ -471,7 +474,7 @@ pub struct Image1D<A: KernelAccess, F: format::Format> {
 impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
     /// Allocate a `width`-pixel 1D image. Pure context op.
     pub fn alloc(ctx: &Context, width: u32) -> Result<Self> {
-        let image = alloc_image::<A, F>(ctx, CL_MEM_OBJECT_IMAGE1D, width as usize, 1, 1)?;
+        let image = alloc_image::<A, F>(ctx, CL_MEM_OBJECT_IMAGE1D, width as usize, 1, 1, 0)?;
         Ok(Self {
             image,
             width,
@@ -583,6 +586,7 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
             width as usize,
             height as usize,
             depth as usize,
+            0,
         )?;
         Ok(Self {
             image,
@@ -850,6 +854,62 @@ pub trait KernelImage3DReadWriteArg<SF: format::SampledTypeFamily>:
 {
 }
 
+// 1D-array and 2D-array trait families — mirror the dim-1/2/3
+// pattern. Kernel-side coord is one component wider than the
+// non-arrayed form: `Image!(1D, arrayed=true, ...)` takes
+// `IVec2(x, layer)`, `Image!(2D, arrayed=true, ...)` takes
+// `IVec3(x, y, layer)`. Host-side region for upload/download
+// substitutes the array_size dimension for height (1D-array) or
+// depth (2D-array) per the OpenCL spec.
+
+/// Host-side counterpart for a kernel
+/// `&Image!(1D, arrayed=true, type=...)` parameter — see
+/// [`KernelImage1DReadArg`].
+pub trait KernelImage1DArrayReadArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel
+/// `&mut Image!(1D, arrayed=true, ..., access="write_only")`
+/// parameter — see [`KernelImage1DWriteArg`].
+pub trait KernelImage1DArrayWriteArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel
+/// `&mut Image!(1D, arrayed=true, ...)` parameter — see
+/// [`KernelImage1DReadWriteArg`].
+pub trait KernelImage1DArrayReadWriteArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel
+/// `&Image!(2D, arrayed=true, type=...)` parameter — see
+/// [`KernelImage1DReadArg`].
+pub trait KernelImage2DArrayReadArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel
+/// `&mut Image!(2D, arrayed=true, ..., access="write_only")`
+/// parameter — see [`KernelImage1DWriteArg`].
+pub trait KernelImage2DArrayWriteArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
+{
+}
+
+/// Host-side counterpart for a kernel
+/// `&mut Image!(2D, arrayed=true, ...)` parameter — see
+/// [`KernelImage1DReadWriteArg`].
+pub trait KernelImage2DArrayReadWriteArg<SF: format::SampledTypeFamily>:
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
+{
+}
+
 // ── Sealed marker impls (one per (Image<dim>D, A, F) combo) ────────
 //
 // `kernel_image_arg_sealed::Sealed` is required by every
@@ -957,6 +1017,336 @@ impl<F: format::Format + Send + 'static> KernelImage3DWriteArg<F::SampledFamily>
 }
 impl<F: format::Format + Send + 'static> KernelImage3DReadWriteArg<F::SampledFamily>
     for Image3D<ReadWrite, F>
+{
+}
+
+// ── Image1DArray ─────────────────────────────────────────────────
+//
+// A stack of N independent 1D images with the same format. The
+// kernel addresses one as `image1d_array_t` with an `IVec2(x,
+// layer)` coordinate. Created with `CL_MEM_OBJECT_IMAGE1D_ARRAY`;
+// the host-side `region` for upload/download is `[width,
+// array_size, 1]` (the array_size dimension takes the slot
+// height occupies for 2D).
+
+/// A 1D image array with compile-time access mode and storage
+/// format. `array_size` layers of `width` pixels each.
+///
+/// Use this when the kernel side declares
+/// `Image!(1D, arrayed=true, type=..., sampled=...)`. The
+/// kernel-side coordinate is `IVec2(x, layer)`.
+pub struct Image1DArray<A: KernelAccess, F: format::Format> {
+    image: Image,
+    width: u32,
+    array_size: u32,
+    #[allow(dead_code)]
+    ctx: Context,
+    _access: PhantomData<A>,
+    _format: PhantomData<F>,
+}
+
+impl<A: KernelAccess, F: format::Format> Image1DArray<A, F> {
+    /// Allocate a `width × array_size` image array. Pure context op.
+    pub fn alloc(ctx: &Context, width: u32, array_size: u32) -> Result<Self> {
+        let image = alloc_image::<A, F>(
+            ctx,
+            CL_MEM_OBJECT_IMAGE1D_ARRAY,
+            width as usize,
+            1,
+            1,
+            array_size as usize,
+        )?;
+        Ok(Self {
+            image,
+            width,
+            array_size,
+            ctx: ctx.clone(),
+            _access: PhantomData,
+            _format: PhantomData,
+        })
+    }
+
+    /// Read this image array as raw bytes — `Vec<u8>` of length
+    /// `width * array_size * size_of::<F::Pixel>()`.
+    pub fn download_bytes<L: Launcher>(&self, launcher: &L) -> Result<Vec<u8>> {
+        let pixel_count = (self.width as usize) * (self.array_size as usize);
+        let mut bytes = vec![0u8; pixel_count * std::mem::size_of::<F::Pixel>()];
+        // 1D-array region: [width, array_size, 1] per OpenCL spec.
+        let region = [self.width as usize, self.array_size as usize, 1];
+        read_image_into(launcher, &self.image, region, bytes.as_mut_ptr())?;
+        Ok(bytes)
+    }
+
+    /// Read this image array into a host `Vec<F::Pixel>` of
+    /// length `width * array_size`. Layers are laid out
+    /// contiguously: layer-0 first, then layer-1, etc.
+    pub fn download<L: Launcher>(&self, launcher: &L) -> Result<Vec<F::Pixel>>
+    where
+        F::Pixel: Default,
+    {
+        let pixel_count = (self.width as usize) * (self.array_size as usize);
+        let mut pixels = vec![<F::Pixel as Default>::default(); pixel_count];
+        let region = [self.width as usize, self.array_size as usize, 1];
+        read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
+        Ok(pixels)
+    }
+
+    /// Write `bytes` to this image array. Length must equal
+    /// `width * array_size * size_of::<F::Pixel>()`.
+    pub fn upload_bytes<L: Launcher>(&mut self, launcher: &L, bytes: &[u8]) -> Result<()> {
+        let pixel_count = (self.width as usize) * (self.array_size as usize);
+        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
+        assert_eq!(
+            bytes.len(),
+            expected,
+            "Image1DArray::upload_bytes: buffer length {} ≠ expected {}",
+            bytes.len(),
+            expected,
+        );
+        let region = [self.width as usize, self.array_size as usize, 1];
+        write_image_from(launcher, &mut self.image, region, bytes.as_ptr())
+    }
+
+    /// Write a typed pixel slice. Length must equal
+    /// `width * array_size`. Layers are read contiguously.
+    pub fn upload<L: Launcher>(&mut self, launcher: &L, pixels: &[F::Pixel]) -> Result<()> {
+        let pixel_count = (self.width as usize) * (self.array_size as usize);
+        assert_eq!(
+            pixels.len(),
+            pixel_count,
+            "Image1DArray::upload: pixel count {} ≠ expected {}",
+            pixels.len(),
+            pixel_count,
+        );
+        let region = [self.width as usize, self.array_size as usize, 1];
+        write_image_from(launcher, &mut self.image, region, pixels.as_ptr().cast())
+    }
+
+    /// Width in pixels (per layer).
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Number of layers.
+    pub fn array_size(&self) -> u32 {
+        self.array_size
+    }
+
+    /// Borrow the underlying opencl3 [`Image`].
+    pub fn image(&self) -> &Image {
+        &self.image
+    }
+}
+
+impl<A: KernelAccess, F: format::Format> KernelArg for Image1DArray<A, F> {
+    fn set(&self, exec: &mut ExecuteKernel<'_>) {
+        let cl_mem_handle = self.image.get();
+        unsafe {
+            exec.set_arg(&cl_mem_handle);
+        }
+    }
+}
+
+impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
+    kernel_image_arg_sealed::Sealed for Image1DArray<A, F>
+{
+}
+
+impl<F: format::Format + Send + 'static> KernelImage1DArrayReadArg<F::SampledFamily>
+    for Image1DArray<ReadOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage1DArrayWriteArg<F::SampledFamily>
+    for Image1DArray<WriteOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage1DArrayReadArg<F::SampledFamily>
+    for Image1DArray<ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage1DArrayWriteArg<F::SampledFamily>
+    for Image1DArray<ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage1DArrayReadWriteArg<F::SampledFamily>
+    for Image1DArray<ReadWrite, F>
+{
+}
+
+// ── Image2DArray ─────────────────────────────────────────────────
+//
+// A stack of N independent 2D images with the same format. The
+// kernel addresses one as `image2d_array_t` with an `IVec3(x, y,
+// layer)` coordinate. Created with `CL_MEM_OBJECT_IMAGE2D_ARRAY`;
+// the host-side `region` for upload/download is `[width, height,
+// array_size]`.
+
+/// A 2D image array with compile-time access mode and storage
+/// format. `array_size` layers of `width × height` pixels each.
+///
+/// Use this when the kernel side declares
+/// `Image!(2D, arrayed=true, type=..., sampled=...)`. The
+/// kernel-side coordinate is `IVec3(x, y, layer)`.
+pub struct Image2DArray<A: KernelAccess, F: format::Format> {
+    image: Image,
+    width: u32,
+    height: u32,
+    array_size: u32,
+    #[allow(dead_code)]
+    ctx: Context,
+    _access: PhantomData<A>,
+    _format: PhantomData<F>,
+}
+
+impl<A: KernelAccess, F: format::Format> Image2DArray<A, F> {
+    /// Allocate a `width × height × array_size` image array.
+    /// Pure context op.
+    pub fn alloc(ctx: &Context, width: u32, height: u32, array_size: u32) -> Result<Self> {
+        let image = alloc_image::<A, F>(
+            ctx,
+            CL_MEM_OBJECT_IMAGE2D_ARRAY,
+            width as usize,
+            height as usize,
+            1,
+            array_size as usize,
+        )?;
+        Ok(Self {
+            image,
+            width,
+            height,
+            array_size,
+            ctx: ctx.clone(),
+            _access: PhantomData,
+            _format: PhantomData,
+        })
+    }
+
+    /// Read this image array as raw bytes.
+    pub fn download_bytes<L: Launcher>(&self, launcher: &L) -> Result<Vec<u8>> {
+        let pixel_count =
+            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
+        let mut bytes = vec![0u8; pixel_count * std::mem::size_of::<F::Pixel>()];
+        let region = [
+            self.width as usize,
+            self.height as usize,
+            self.array_size as usize,
+        ];
+        read_image_into(launcher, &self.image, region, bytes.as_mut_ptr())?;
+        Ok(bytes)
+    }
+
+    /// Read this image array into a host `Vec<F::Pixel>` of
+    /// length `width * height * array_size`.
+    pub fn download<L: Launcher>(&self, launcher: &L) -> Result<Vec<F::Pixel>>
+    where
+        F::Pixel: Default,
+    {
+        let pixel_count =
+            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
+        let mut pixels = vec![<F::Pixel as Default>::default(); pixel_count];
+        let region = [
+            self.width as usize,
+            self.height as usize,
+            self.array_size as usize,
+        ];
+        read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
+        Ok(pixels)
+    }
+
+    /// Write `bytes` to this image array. Length must equal
+    /// `width * height * array_size * size_of::<F::Pixel>()`.
+    pub fn upload_bytes<L: Launcher>(&mut self, launcher: &L, bytes: &[u8]) -> Result<()> {
+        let pixel_count =
+            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
+        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
+        assert_eq!(
+            bytes.len(),
+            expected,
+            "Image2DArray::upload_bytes: buffer length {} ≠ expected {}",
+            bytes.len(),
+            expected,
+        );
+        let region = [
+            self.width as usize,
+            self.height as usize,
+            self.array_size as usize,
+        ];
+        write_image_from(launcher, &mut self.image, region, bytes.as_ptr())
+    }
+
+    /// Write a typed pixel slice. Length must equal
+    /// `width * height * array_size`.
+    pub fn upload<L: Launcher>(&mut self, launcher: &L, pixels: &[F::Pixel]) -> Result<()> {
+        let pixel_count =
+            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
+        assert_eq!(
+            pixels.len(),
+            pixel_count,
+            "Image2DArray::upload: pixel count {} ≠ expected {}",
+            pixels.len(),
+            pixel_count,
+        );
+        let region = [
+            self.width as usize,
+            self.height as usize,
+            self.array_size as usize,
+        ];
+        write_image_from(launcher, &mut self.image, region, pixels.as_ptr().cast())
+    }
+
+    /// Width in pixels (per layer).
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Height in pixels (per layer).
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Number of layers.
+    pub fn array_size(&self) -> u32 {
+        self.array_size
+    }
+
+    /// Borrow the underlying opencl3 [`Image`].
+    pub fn image(&self) -> &Image {
+        &self.image
+    }
+}
+
+impl<A: KernelAccess, F: format::Format> KernelArg for Image2DArray<A, F> {
+    fn set(&self, exec: &mut ExecuteKernel<'_>) {
+        let cl_mem_handle = self.image.get();
+        unsafe {
+            exec.set_arg(&cl_mem_handle);
+        }
+    }
+}
+
+impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
+    kernel_image_arg_sealed::Sealed for Image2DArray<A, F>
+{
+}
+
+impl<F: format::Format + Send + 'static> KernelImage2DArrayReadArg<F::SampledFamily>
+    for Image2DArray<ReadOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage2DArrayWriteArg<F::SampledFamily>
+    for Image2DArray<WriteOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage2DArrayReadArg<F::SampledFamily>
+    for Image2DArray<ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage2DArrayWriteArg<F::SampledFamily>
+    for Image2DArray<ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImage2DArrayReadWriteArg<F::SampledFamily>
+    for Image2DArray<ReadWrite, F>
 {
 }
 

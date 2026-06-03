@@ -886,19 +886,44 @@ fn classify_image_param(pt: &PatType) -> syn::Result<Option<ImageInfo>> {
     let mutable = mutability.is_some();
     let span = pt.ty.span();
 
-    let (dim_tok, type_tok) = parse_image_tokens(mac.tokens.clone());
+    let (dim_tok, type_tok, arrayed) = parse_image_tokens(mac.tokens.clone());
 
-    let dim = match dim_tok.as_deref() {
-        Some("1D") => "1D",
-        Some("2D") => "2D",
-        Some("3D") => "3D",
+    let dim = match (dim_tok.as_deref(), arrayed) {
+        (Some("1D"), false) => "1D",
+        (Some("2D"), false) => "2D",
+        (Some("3D"), false) => "3D",
+        // `Image!(1D, arrayed=true, ...)` / `Image!(2D, arrayed=true, ...)`
+        // → `Image1DArray<A, F>` / `Image2DArray<A, F>` host wrapper
+        // + the matching `KernelImage<dim>Array*Arg` trait family.
+        // Kernel-side coord is one component wider than the
+        // non-arrayed form (IVec2 for 1D-array, IVec3 for 2D-array).
+        (Some("1D"), true) => "1DArray",
+        (Some("2D"), true) => "2DArray",
+        (Some("3D"), true) => {
+            // 3D-arrayed isn't a thing in SPIR-V or OpenCL —
+            // there's no `image3d_array_t`. Catch it explicitly so
+            // the error points at the user's mistake instead of
+            // failing later with a missing-trait diagnostic.
+            return Err(syn::Error::new(
+                span,
+                "claspr::kernel: `Image!(3D, arrayed=true, ...)` is not legal — \
+                 3D image arrays don't exist in OpenCL / SPIR-V",
+            ));
+        }
         // rust-gpu's `Image!(buffer, ...)` (lowercase ident,
         // matching spirv-std-macros) → `Image1DBuffer` host wrapper
         // + `KernelImageBuffer*Arg` trait family. Backed by a
         // `cl_mem` buffer object, so it can either own its storage
         // (alloc) or view an existing `DeviceSlice<T>`.
-        Some("buffer") => "Buffer",
-        Some(other) => {
+        (Some("buffer"), false) => "Buffer",
+        (Some("buffer"), true) => {
+            return Err(syn::Error::new(
+                span,
+                "claspr::kernel: `Image!(buffer, arrayed=true, ...)` is not legal — \
+                 image buffers are inherently 1D and don't support arraying",
+            ));
+        }
+        (Some(other), _) => {
             return Err(syn::Error::new(
                 span,
                 format!(
@@ -908,7 +933,7 @@ fn classify_image_param(pt: &PatType) -> syn::Result<Option<ImageInfo>> {
                 ),
             ));
         }
-        None => {
+        (None, _) => {
             return Err(syn::Error::new(
                 span,
                 "claspr::kernel: Image! parameter missing dimensionality — expected `Image!(1D, ...)`, \
@@ -1018,21 +1043,28 @@ fn read_image_access_attr(attrs: &[Attribute]) -> Option<String> {
     None
 }
 
-/// Scan an `Image!(...)` token list for the leading dim ident
-/// (`1D`/`2D`/`3D`/`cube`/etc.) and the `type=<ident>` value. Other
-/// keywords (`sampled=`, `arrayed=`, `multisampled=`, `depth=`,
-/// `format=`, `components=`) are recognised by rust-gpu's `Image!`
-/// macro but don't influence the claspr host-wrapper signature —
-/// `format=` is Shader-only and unreachable from claspr's OpenCL
-/// Kernel target, the rest are runtime/usage hints that the host
-/// `Image<dim>D<A, F>` doesn't need to encode.
+/// Scan an `Image!(...)` token list for:
+/// - the leading dim ident (`1D`/`2D`/`3D`/`cube`/etc.),
+/// - the `type=<ident>` value (drives the sampled-type family),
+/// - the `arrayed=true|false` flag (drives the `*Array` host
+///   wrapper selection).
 ///
-/// Returns `(dim_ident, type_value)`. Dim recognition handles both
-/// the `LitInt`-suffix form (`1D` is `1` with suffix `D`) and the
-/// bare `Ident` form (`cube`, `rect`, `buffer`, `subpass`).
-fn parse_image_tokens(tokens: TokenStream2) -> (Option<String>, Option<String>) {
+/// Other keywords (`sampled=`, `multisampled=`, `depth=`,
+/// `format=`, `components=`) are recognised by rust-gpu's
+/// `Image!` macro but don't influence the claspr host-wrapper
+/// signature — `format=` is Shader-only and unreachable from
+/// claspr's OpenCL Kernel target, the rest are runtime/usage
+/// hints that the host `Image<dim>D<A, F>` doesn't need to
+/// encode.
+///
+/// Returns `(dim_ident, type_value, arrayed)`. Dim recognition
+/// handles both the `LitInt`-suffix form (`1D` is `1` with
+/// suffix `D`) and the bare `Ident` form (`cube`, `rect`,
+/// `buffer`, `subpass`). `arrayed` defaults to false if absent.
+fn parse_image_tokens(tokens: TokenStream2) -> (Option<String>, Option<String>, bool) {
     let mut dim: Option<String> = None;
     let mut type_: Option<String> = None;
+    let mut arrayed = false;
     let tts: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
     let mut i = 0;
     while i < tts.len() {
@@ -1083,13 +1115,22 @@ fn parse_image_tokens(tokens: TokenStream2) -> (Option<String>, Option<String>) 
             Some(proc_macro2::TokenTree::Ident(val)),
         ) = (tts.get(i), tts.get(i + 1), tts.get(i + 2))
             && eq.as_char() == '='
-            && *key == "type"
         {
-            type_ = Some(val.to_string());
-            i += 3;
-            continue;
+            if *key == "type" {
+                type_ = Some(val.to_string());
+                i += 3;
+                continue;
+            }
+            if *key == "arrayed" {
+                // `arrayed=true` or `arrayed=false`. Anything else
+                // is treated as false (mirroring how rust-gpu's
+                // macro parses bool literals).
+                arrayed = *val == "true";
+                i += 3;
+                continue;
+            }
         }
         i += 1;
     }
-    (dim, type_)
+    (dim, type_, arrayed)
 }
