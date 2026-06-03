@@ -32,6 +32,14 @@
 //!   `Image1DBuffer` runtime + `KernelImageBuffer*Arg` trait
 //!   family + the rust-gpu auto-declare of `OpCapability
 //!   ImageBuffer` for `OpTypeImage Dim=Buffer`.
+//! - [`mod@dim1_array_uint`] — 1D-array / `type=u32` /
+//!   write-only fill. Coord is `IVec2(x, layer)`. Proves the
+//!   `Image1DArray` runtime + `KernelImage1DArray*Arg` trait
+//!   family + the spirv-std `(OneD, Arrayed::True)` coord impl.
+//! - [`mod@dim2_array_uint`] — 2D-array / `type=u32` /
+//!   write-only fill. Coord is `IVec3(x, y, layer)`. Proves
+//!   the `Image2DArray` runtime + `KernelImage2DArray*Arg`
+//!   trait family.
 
 #[claspr::device]
 pub mod dim2_uint {
@@ -270,5 +278,74 @@ pub mod dim_buffer_uint {
         let pixel: UVec4 = unsafe { image.read(px as i32) };
         let i = px as usize;
         out[i] = out[i].wrapping_mul(0).wrapping_add(pixel.x);
+    }
+}
+
+#[claspr::device]
+pub mod dim1_array_uint {
+    #[cfg(target_arch = "spirv")]
+    use spirv_std::{
+        Image,
+        glam::{IVec2, USizeVec3, UVec4},
+    };
+
+    /// 1D-array image fill. Coord is `IVec2(x, layer)`. Per-layer
+    /// pattern: `pixel = layer * width + x` so we can verify each
+    /// layer independently from the host side after download.
+    #[claspr::kernel]
+    pub fn fill_pattern(
+        #[spirv(global_invocation_id)] id: USizeVec3,
+        #[spirv(image_access = "write_only")] image: &mut Image!(1D, arrayed=true, type=u32, sampled=false),
+        width: u32,
+        array_size: u32,
+    ) {
+        let px = id.x as u32;
+        let layer = id.y as u32;
+        if px >= width || layer >= array_size {
+            return;
+        }
+        let v = layer.wrapping_mul(width).wrapping_add(px);
+        unsafe {
+            image.write(IVec2::new(px as i32, layer as i32), UVec4::new(v, 0, 0, 0));
+        }
+    }
+}
+
+#[claspr::device]
+pub mod dim2_array_uint {
+    #[cfg(target_arch = "spirv")]
+    use spirv_std::{
+        Image,
+        glam::{IVec3, USizeVec3, UVec4},
+    };
+
+    /// 2D-array image fill. Coord is `IVec3(x, y, layer)`.
+    /// Per-layer pattern packs the layer into the .x channel so
+    /// host-side verification can distinguish layers.
+    #[claspr::kernel]
+    pub fn fill_pattern(
+        #[spirv(global_invocation_id)] id: USizeVec3,
+        #[spirv(image_access = "write_only")] image: &mut Image!(2D, arrayed=true, type=u32, sampled=false),
+        width: u32,
+        height: u32,
+        array_size: u32,
+    ) {
+        let px = id.x as u32;
+        let py = id.y as u32;
+        let layer = id.z as u32;
+        if px >= width || py >= height || layer >= array_size {
+            return;
+        }
+        let v = layer
+            .wrapping_mul(width)
+            .wrapping_mul(height)
+            .wrapping_add(py.wrapping_mul(width))
+            .wrapping_add(px);
+        unsafe {
+            image.write(
+                IVec3::new(px as i32, py as i32, layer as i32),
+                UVec4::new(v, 0, 0, 0),
+            );
+        }
     }
 }

@@ -24,8 +24,8 @@
 //! the device doesn't advertise image support.
 
 use claspr::{
-    Context, DeviceSlice, Image1D, Image1DBuffer, Image1DBufferView, Image3D, ReadOnly, ReadWrite,
-    WriteOnly,
+    Context, DeviceSlice, Image1D, Image1DArray, Image1DBuffer, Image1DBufferView, Image2DArray,
+    Image3D, ReadOnly, ReadWrite, WriteOnly,
     image::format::{R8G8B8A8Uint, R32Float, R32G32B32A32Uint, R32Sint, R32Uint},
 };
 
@@ -373,4 +373,71 @@ fn dim_buffer_read_to_slice() {
     let mut result = vec![0u32; N as usize];
     out.read(&ctx, &mut result).wait().unwrap();
     assert_eq!(result, seed);
+}
+
+/// 1D image array — write-only fill, `R32Uint` format.
+/// Proves the `Image1DArray` runtime + the new
+/// `KernelImage1DArrayWriteArg<Uint>` trait bound + the
+/// spirv-std `ImageCoordinate<S, OneD, Arrayed::True>` impl.
+///
+/// Per-layer pattern: `pixel = layer * width + x`. After
+/// download, layer-N starts at offset `N * width` in the
+/// output Vec.
+#[test]
+fn dim1_array_fill_pattern_r32_uint() {
+    const WIDTH: u32 = 16;
+    const LAYERS: u32 = 4;
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim1_array_uint::kernels(&ctx).unwrap();
+    let img = Image1DArray::<WriteOnly, R32Uint>::alloc(&ctx, WIDTH, LAYERS).unwrap();
+    // 2D launch grid: (width, array_size). The kernel uses id.y
+    // as the layer index.
+    let img = kernels
+        .fill_pattern([WIDTH as usize, LAYERS as usize], img, WIDTH, LAYERS)
+        .wait(&ctx)
+        .unwrap();
+    let pixels: Vec<u32> = img.download(&ctx).unwrap();
+    assert_eq!(pixels.len(), (WIDTH * LAYERS) as usize);
+    for layer in 0..LAYERS {
+        for x in 0..WIDTH {
+            let idx = (layer * WIDTH + x) as usize;
+            let want = layer * WIDTH + x;
+            assert_eq!(pixels[idx], want, "1D-array (x={x}, layer={layer})");
+        }
+    }
+}
+
+/// 2D image array — write-only fill, `R32Uint` format.
+/// Proves the `Image2DArray` runtime + the new
+/// `KernelImage2DArrayWriteArg<Uint>` trait bound. Coord is
+/// `IVec3(x, y, layer)`.
+#[test]
+fn dim2_array_fill_pattern_r32_uint() {
+    const LW: u32 = 8;
+    const LH: u32 = 4;
+    const LAYERS: u32 = 3;
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim2_array_uint::kernels(&ctx).unwrap();
+    let img = Image2DArray::<WriteOnly, R32Uint>::alloc(&ctx, LW, LH, LAYERS).unwrap();
+    let img = kernels
+        .fill_pattern(
+            [LW as usize, LH as usize, LAYERS as usize],
+            img,
+            LW,
+            LH,
+            LAYERS,
+        )
+        .wait(&ctx)
+        .unwrap();
+    let pixels: Vec<u32> = img.download(&ctx).unwrap();
+    assert_eq!(pixels.len(), (LW * LH * LAYERS) as usize);
+    for layer in 0..LAYERS {
+        for y in 0..LH {
+            for x in 0..LW {
+                let idx = (layer * LW * LH + y * LW + x) as usize;
+                let want = layer * LW * LH + y * LW + x;
+                assert_eq!(pixels[idx], want, "2D-array (x={x}, y={y}, layer={layer})");
+            }
+        }
+    }
 }

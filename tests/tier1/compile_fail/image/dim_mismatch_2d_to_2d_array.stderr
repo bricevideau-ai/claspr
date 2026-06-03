@@ -1,0 +1,26 @@
+error[E0277]: the trait bound `Image2D<WriteOnly, R32Uint>: KernelImage2DArrayWriteArg<Uint>` is not satisfied
+  --> compile_fail/image/dim_mismatch_2d_to_2d_array.rs:11:60
+   |
+11 |     let _ = kernels.fill_pattern([8usize, 4usize, 3usize], img, 8u32, 4u32, 3u32);
+   |                     ------------                           ^^^ the trait `KernelImage2DArrayWriteArg<Uint>` is not implemented for `Image2D<WriteOnly, R32Uint>`
+   |                     |
+   |                     required by a bound introduced by this call
+   |
+help: the following other types implement trait `KernelImage2DArrayWriteArg<SF>`
+  --> $WORKSPACE/claspr/src/image.rs
+   |
+   | / impl<F: format::Format + Send + 'static> KernelImage2DArrayWriteArg<F::SampledFamily>
+   | |     for Image2DArray<WriteOnly, F>
+   | |__________________________________^ `Image2DArray<WriteOnly, F>`
+...
+   | / impl<F: format::Format + Send + 'static> KernelImage2DArrayWriteArg<F::SampledFamily>
+   | |     for Image2DArray<ReadWrite, F>
+   | |__________________________________^ `Image2DArray<ReadWrite, F>`
+note: required by a bound in `claspr_test_image_kernels::dim2_array_uint::Kernels::fill_pattern`
+  --> $WORKSPACE/tests/image-kernels/src/lib.rs
+   |
+   |     #[claspr::kernel]
+   |     ^^^^^^^^^^^^^^^^^ required by this bound in `Kernels::fill_pattern`
+   |     pub fn fill_pattern(
+   |            ------------ required by a bound in this associated function
+   = note: this error originates in the attribute macro `claspr::kernel` (in Nightly builds, run with -Z macro-backtrace for more info)
