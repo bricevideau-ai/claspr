@@ -27,6 +27,11 @@
 //! - [`mod@dim3_uint`] — 3D / `type=u32` / write-only fill.
 //!   Proves the `Image3D` runtime + `KernelImage3D*Arg` trait
 //!   family round-trip.
+//! - [`mod@dim_buffer_uint`] — 1D-buffer / `type=u32` /
+//!   write-only fill + read-only image→buffer copy. Proves the
+//!   `Image1DBuffer` runtime + `KernelImageBuffer*Arg` trait
+//!   family + the rust-gpu auto-declare of `OpCapability
+//!   ImageBuffer` for `OpTypeImage Dim=Buffer`.
 
 #[claspr::device]
 pub mod dim2_uint {
@@ -218,5 +223,52 @@ pub mod dim3_uint {
                 UVec4::new(v, 0, 0, 0),
             );
         }
+    }
+}
+
+#[claspr::device]
+pub mod dim_buffer_uint {
+    #[cfg(target_arch = "spirv")]
+    use spirv_std::{
+        Image,
+        glam::{USizeVec3, UVec4},
+    };
+
+    /// Image-buffer write fill — same shape as `dim1_uint` since
+    /// 1D and buffer images both take a scalar `i32` coordinate
+    /// and write `UVec4` typed pixels.
+    #[claspr::kernel]
+    pub fn fill_pattern(
+        #[spirv(global_invocation_id)] id: USizeVec3,
+        #[spirv(image_access = "write_only")] image: &mut Image!(buffer, type=u32, sampled=false),
+        width: u32,
+    ) {
+        let px = id.x as u32;
+        if px >= width {
+            return;
+        }
+        unsafe {
+            image.write(px as i32, UVec4::new(px.wrapping_mul(3), 0, 0, 0));
+        }
+    }
+
+    /// Read every image-buffer pixel and copy the .x channel to a
+    /// linear slice. Proves the read-only image-buffer path +
+    /// kernel can pair image-buffer with a regular `&mut [T]`
+    /// slice arg in the same launch.
+    #[claspr::kernel]
+    pub fn copy_to_buffer(
+        #[spirv(global_invocation_id)] id: USizeVec3,
+        image: &Image!(buffer, type=u32, sampled=false),
+        #[spirv(cross_workgroup)] out: &mut [u32],
+        width: u32,
+    ) {
+        let px = id.x as u32;
+        if px >= width {
+            return;
+        }
+        let pixel: UVec4 = unsafe { image.read(px as i32) };
+        let i = px as usize;
+        out[i] = out[i].wrapping_mul(0).wrapping_add(pixel.x);
     }
 }

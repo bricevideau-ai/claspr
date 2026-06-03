@@ -24,7 +24,7 @@
 //! the device doesn't advertise image support.
 
 use claspr::{
-    Context, DeviceSlice, Image1D, Image3D, ReadOnly, WriteOnly,
+    Context, DeviceSlice, Image1D, Image1DBuffer, Image3D, ReadOnly, WriteOnly,
     image::format::{R8G8B8A8Uint, R32Float, R32G32B32A32Uint, R32Sint, R32Uint},
 };
 
@@ -271,4 +271,52 @@ fn dim3_fill_pattern_r32_uint() {
             }
         }
     }
+}
+
+/// Image-buffer (1D image backed by a `cl_mem` buffer) — write
+/// path. Proves the `Image1DBuffer` runtime + the new
+/// `KernelImageBufferWriteArg<Uint>` trait bound + the rust-gpu
+/// auto-declare of `OpCapability ImageBuffer` for
+/// `OpTypeImage Dim=Buffer`.
+#[test]
+fn dim_buffer_fill_pattern_r32_uint() {
+    const N: u32 = 64;
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim_buffer_uint::kernels(&ctx).unwrap();
+    let img = Image1DBuffer::<WriteOnly, R32Uint>::alloc(&ctx, N).unwrap();
+    let img = kernels
+        .fill_pattern([N as usize], img, N)
+        .wait(&ctx)
+        .unwrap();
+    let pixels: Vec<u32> = img.download(&ctx).unwrap();
+    assert_eq!(pixels.len(), N as usize);
+    for x in 0..N {
+        assert_eq!(pixels[x as usize], x.wrapping_mul(3));
+    }
+}
+
+/// Image-buffer read path. Seed via `upload`, kernel reads
+/// pixels and copies the .x channel to a `DeviceSlice<u32>`.
+/// Proves the `&Image!(buffer, …)` → `KernelImageBufferReadArg`
+/// bound + cross-arg (image-buffer + slice) on the same launch.
+#[test]
+fn dim_buffer_read_to_slice() {
+    const N: u32 = 64;
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim_buffer_uint::kernels(&ctx).unwrap();
+
+    let mut img = Image1DBuffer::<ReadOnly, R32Uint>::alloc(&ctx, N).unwrap();
+    let seed: Vec<u32> = (0..N).map(|x| x * 7 + 1).collect();
+    img.upload(&ctx, &seed).unwrap();
+
+    let zeros = vec![0u32; N as usize];
+    let out = DeviceSlice::<u32>::from_slice(&ctx, &zeros).unwrap();
+
+    let (_img, out) = kernels
+        .copy_to_buffer([N as usize], img, out, N)
+        .wait(&ctx)
+        .unwrap();
+    let mut result = vec![0u32; N as usize];
+    out.read(&ctx, &mut result).wait().unwrap();
+    assert_eq!(result, seed);
 }
