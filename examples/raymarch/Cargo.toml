@@ -13,7 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 claspr = { path = "../../claspr" }
-claspr-async = { path = "../../claspr-async" }
 # spirv-std host arms provide the host-side implementations of cl::Float3
 # arithmetic + opencl_std::* math intrinsics, so the same `pixel_color`
 # function used by the kernel can also run on the CPU for validation.

@@ -66,6 +66,7 @@ pub mod error;
 #[cfg(feature = "async-events")]
 pub mod future;
 pub mod image;
+pub mod kernel_op;
 pub mod launch;
 pub mod mapped;
 pub mod op;
@@ -94,6 +95,7 @@ pub use image::{
     KernelImage2DWriteArg, KernelImage3DReadArg, KernelImage3DReadWriteArg, KernelImage3DWriteArg,
     KernelImageBufferReadArg, KernelImageBufferReadWriteArg, KernelImageBufferWriteArg, format,
 };
+pub use kernel_op::KernelOp;
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, KernelSliceArg, KernelSliceReadArg,
     KernelSliceReadWriteArg, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,

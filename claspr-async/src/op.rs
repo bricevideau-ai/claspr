@@ -379,3 +379,34 @@ where
         Ok((Arc::new(out), evts))
     }
 }
+
+// ── Blanket: KernelOp → DeviceOperation ─────────────────────────────
+//
+// Every proc-macro-generated kernel `Op` implements
+// [`claspr::KernelOp`]. This blanket lifts that single enqueue contract
+// into Tier 2 chain composition, so kernel Ops flow through
+// `and_then` / `bundle!` / `fan_out` without the macro itself ever
+// mentioning `claspr-async`. The split is the reason Tier 1-only
+// consumers can omit this crate from their dep graph.
+//
+// `O: 'static` — chains need to move Ops into futures and across
+// executor threads; the bound stays here (not on `KernelOp`) so
+// Tier 1 callers aren't burdened.
+//
+// Coherence: `DeviceOperation` is owned by this crate, so the orphan
+// rules permit the blanket. No existing concrete `DeviceOperation`
+// impl in this crate also implements `KernelOp`, so there's no
+// overlap to resolve.
+impl<O> DeviceOperation for O
+where
+    O: claspr::KernelOp + 'static,
+{
+    type Output = O::Output;
+
+    fn execute(self, ctx: &ExecutionContext<'_>, chain_deps: Deps) -> Result<(Self::Output, Deps)> {
+        let raw: Vec<claspr::cl_event> = chain_deps.iter().map(|d| d.as_ref().get()).collect();
+        let (out, event) = self.enqueue_into(ctx, &raw)?;
+        drop(chain_deps);
+        Ok((out, vec![wrap_event(event)]))
+    }
+}

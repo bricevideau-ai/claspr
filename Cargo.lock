@@ -248,7 +248,6 @@ name = "claspr-test-image-kernels"
 version = "0.0.0"
 dependencies = [
  "claspr",
- "claspr-async",
  "claspr-build",
 ]
 
@@ -257,7 +256,6 @@ name = "claspr-test-kernels"
 version = "0.0.0"
 dependencies = [
  "claspr",
- "claspr-async",
  "claspr-build",
 ]
 
@@ -295,7 +293,6 @@ name = "collatz-example"
 version = "0.0.0"
 dependencies = [
  "claspr",
- "claspr-async",
  "claspr-build",
 ]
 
@@ -826,7 +823,6 @@ name = "mandelbrot-kernel"
 version = "0.0.0"
 dependencies = [
  "claspr",
- "claspr-async",
  "claspr-build",
  "num-complex",
 ]
@@ -1037,7 +1033,6 @@ name = "raymarch-example"
 version = "0.0.0"
 dependencies = [
  "claspr",
- "claspr-async",
  "claspr-build",
  "spirv-std",
 ]
@@ -1313,7 +1308,6 @@ name = "sobel-kernel"
 version = "0.0.0"
 dependencies = [
  "claspr",
- "claspr-async",
  "claspr-build",
 ]
 

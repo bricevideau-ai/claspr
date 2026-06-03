@@ -436,10 +436,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // it has **no lifetime parameter** — moving Ops into `tokio::spawn`
     // / threads / `'static` futures is straightforward.
     //
-    // Tier 2 use requires `claspr-async` in the user's dep graph (the
-    // DeviceOperation impl references it unconditionally). For purely
-    // Tier 1 use, the dep is still required to type-check the impl —
-    // a price paid once per kernel-crate.
+    // Tier 2 (`DeviceOperation`) is provided by a blanket
+    // `impl<O: claspr::KernelOp + 'static> DeviceOperation for O`
+    // in `claspr-async` — so the macro emits only the inherent
+    // terminals + a `KernelOp` impl, never mentions `claspr-async`,
+    // and Tier 1-only consumers can leave `claspr-async` out of
+    // their dep graph entirely.
     //
     // `#[allow(clippy::too_many_arguments)]` — the wrapper's arg count
     // is determined by the kernel's declared signature, not user
@@ -532,38 +534,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 where
                     L: ::claspr::Launcher,
                 {
-                    let Op { kernel, spec, args, deps, profile_cb } = self;
-                    // Validate cross-context match for every caller-added
-                    // dep. The launcher's context is known here; the
-                    // check is two CL info queries + a pointer compare
-                    // per dep (cheap), and surfaces mismatches as a
-                    // clear panic instead of a cryptic CL_INVALID_CONTEXT
-                    // at enqueue time.
-                    for ev in &deps {
-                        ::claspr::assert_same_context(
-                            ev,
-                            launcher.cl_queue(),
-                            concat!("kernel `", stringify!(#name), "` Op::submit"),
-                        );
-                    }
-                    let #op_args_tuple_init = args;
-                    // Hand LaunchOp raw cl_event handles; `deps` (owned
-                    // events) stays alive until after the enqueue returns,
-                    // at which point OpenCL has retained them internally
-                    // for the wait list.
-                    let raw_deps: ::std::vec::Vec<::claspr::cl_event> =
-                        deps.iter().map(|e| e.get()).collect();
-                    let event = ::claspr::LaunchOp::new(
-                        launcher,
-                        &kernel,
-                        spec,
-                        #op_launch_args_tuple,
-                    )
-                    .with_state(raw_deps, profile_cb)
-                    .submit()?;
-                    ::core::mem::drop(deps);
-                    ::core::mem::drop(kernel);
-                    ::core::result::Result::Ok((#output_expr, event))
+                    <Self as ::claspr::KernelOp>::enqueue_into(self, launcher, &[])
                 }
 
                 /// Tier 1 blocking terminal — `submit` then `event.wait`.
@@ -579,37 +550,49 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 }
             }
 
-            impl #gen_decl ::claspr_async::DeviceOperation for Op #gen_use {
+            // Single enqueue body shared by `.submit` (Tier 1) and by
+            // `claspr-async`'s blanket `DeviceOperation` impl (Tier 2).
+            // `extra_deps` is the chain's upstream wait-list when called
+            // from the Tier 2 blanket impl; an empty slice when called
+            // from `.submit`.
+            impl #gen_decl ::claspr::KernelOp for Op #gen_use {
                 type Output = #output_ty;
 
-                fn execute(
+                fn enqueue_into<L>(
                     self,
-                    ctx: &::claspr_async::ExecutionContext<'_>,
-                    chain_deps: ::claspr_async::Deps,
-                ) -> ::claspr::Result<(Self::Output, ::claspr_async::Deps)> {
+                    launcher: &L,
+                    extra_deps: &[::claspr::cl_event],
+                ) -> ::claspr::Result<(Self::Output, ::claspr::Event)>
+                where
+                    L: ::claspr::Launcher,
+                {
                     let Op { kernel, spec, args, deps, profile_cb } = self;
-                    // Validate cross-context match for caller-added deps.
-                    // Chain-supplied deps are produced by upstream ops on
-                    // the same chain's ExecutionContext, so they're always
-                    // from the same Context — no check needed there.
+                    // Validate cross-context match for every caller-added
+                    // dep. The launcher's context is known here; the
+                    // check is two CL info queries + a pointer compare
+                    // per dep (cheap), and surfaces mismatches as a
+                    // clear panic instead of a cryptic CL_INVALID_CONTEXT
+                    // at enqueue time. Chain-supplied `extra_deps` come
+                    // from the same ExecutionContext upstream, so they
+                    // don't need re-checking.
                     for ev in &deps {
                         ::claspr::assert_same_context(
                             ev,
-                            ::claspr::Launcher::cl_queue(ctx),
-                            concat!("kernel `", stringify!(#name), "` Op::execute"),
+                            launcher.cl_queue(),
+                            concat!("kernel `", stringify!(#name), "` KernelOp::enqueue_into"),
                         );
                     }
-                    // Merge caller-added (owned Events) with chain-supplied
-                    // deps (Arc<Event>) into a single Vec<cl_event>. Both
-                    // sources stay alive until after the enqueue.
+                    // Hand LaunchOp raw cl_event handles; `deps` (owned
+                    // events) stays alive until after the enqueue returns,
+                    // at which point OpenCL has retained them internally
+                    // for the wait list.
                     let mut raw_deps: ::std::vec::Vec<::claspr::cl_event> =
-                        deps.iter().map(|e| e.get()).collect();
-                    for d in &chain_deps {
-                        raw_deps.push(d.as_ref().get());
-                    }
+                        ::std::vec::Vec::with_capacity(deps.len() + extra_deps.len());
+                    raw_deps.extend(deps.iter().map(|e| e.get()));
+                    raw_deps.extend_from_slice(extra_deps);
                     let #op_args_tuple_init = args;
                     let event = ::claspr::LaunchOp::new(
-                        ctx,
+                        launcher,
                         &kernel,
                         spec,
                         #op_launch_args_tuple,
@@ -617,12 +600,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     .with_state(raw_deps, profile_cb)
                     .submit()?;
                     ::core::mem::drop(deps);
-                    ::core::mem::drop(chain_deps);
                     ::core::mem::drop(kernel);
-                    ::core::result::Result::Ok((
-                        #output_expr,
-                        ::std::vec![::claspr_async::wrap_event(event)],
-                    ))
+                    ::core::result::Result::Ok((#output_expr, event))
                 }
             }
         }
