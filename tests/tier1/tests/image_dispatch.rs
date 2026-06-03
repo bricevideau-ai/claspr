@@ -24,7 +24,7 @@
 //! the device doesn't advertise image support.
 
 use claspr::{
-    Context, DeviceSlice, Image3D, ReadOnly, WriteOnly,
+    Context, DeviceSlice, Image1D, Image3D, ReadOnly, WriteOnly,
     image::format::{R8G8B8A8Uint, R32Float, R32G32B32A32Uint, R32Sint, R32Uint},
 };
 
@@ -221,6 +221,27 @@ fn read_only_sint_image_to_buffer() {
     let mut result = vec![0i32; (W * H) as usize];
     out.read(&ctx, &mut result).wait().unwrap();
     assert_eq!(result, seed);
+}
+
+/// 1D image — write-only, `R32Uint` format. Proves the
+/// `Image1D` runtime + the `KernelImage1DWriteArg<Uint>` trait
+/// bound + the rust-gpu auto-declare of `OpCapability Image1D`
+/// for `OpTypeImage Dim=1D` on Kernel (without that auto-declare,
+/// spirv-val rejects the module).
+#[test]
+fn dim1_fill_pattern_r32_uint() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim1_uint::kernels(&ctx).unwrap();
+    let img = Image1D::<WriteOnly, R32Uint>::alloc(&ctx, W).unwrap();
+    let img = kernels
+        .fill_pattern([W as usize], img, W)
+        .wait(&ctx)
+        .unwrap();
+    let pixels: Vec<u32> = img.download(&ctx).unwrap();
+    assert_eq!(pixels.len(), W as usize);
+    for x in 0..W {
+        assert_eq!(pixels[x as usize], x, "pixel {x}");
+    }
 }
 
 /// 3D image — write-only, `R32Uint` format. Proves the

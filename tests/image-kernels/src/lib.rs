@@ -21,15 +21,12 @@
 //! - [`mod@dim2_sint`] — 2D / `type=i32` / write-only fill +
 //!   read-only image→buffer copy. Sint family.
 //!
+//! - [`mod@dim1_uint`] — 1D / `type=u32` / write-only fill.
+//!   Proves the `Image1D` runtime + `KernelImage1D*Arg` trait
+//!   family round-trip.
 //! - [`mod@dim3_uint`] — 3D / `type=u32` / write-only fill.
 //!   Proves the `Image3D` runtime + `KernelImage3D*Arg` trait
 //!   family round-trip.
-//!
-//! 1D image kernels are intentionally absent — rust-gpu is missing
-//! the auto-declare for `OpCapability Image1D` when an
-//! `OpTypeImage Dim=1D` is emitted on Kernel; spirv-val rejects.
-//! 3D needs no extra capability (Dim=3D carries no per-Dim cap
-//! requirement in the SPIR-V core spec) so it is exercised here.
 
 #[claspr::device]
 pub mod dim2_uint {
@@ -162,13 +159,32 @@ pub mod dim2_sint {
     }
 }
 
-// Dim1D kernels are intentionally absent — rust-gpu does not yet
-// auto-declare `OpCapability Image1D` when an `OpTypeImage Dim=1D`
-// is emitted on Kernel; spirv-val then rejects the module.
-// Once rust-gpu auto-declares the dim capability, add a
-// `dim1_uint` module mirroring `dim3_uint`. The Image1D runtime +
-// KernelImage1D*Arg traits already exist in claspr; only the
-// kernel side is gated.
+#[claspr::device]
+pub mod dim1_uint {
+    #[cfg(target_arch = "spirv")]
+    use spirv_std::{
+        Image,
+        glam::{USizeVec3, UVec4},
+    };
+
+    /// 1D image fill. Coord is a bare `i32` per spirv-std's
+    /// `ImageCoordinate<S: Scalar, Dim::OneD, Arrayed::False>`
+    /// scalar impl.
+    #[claspr::kernel]
+    pub fn fill_pattern(
+        #[spirv(global_invocation_id)] id: USizeVec3,
+        #[spirv(image_access = "write_only")] image: &mut Image!(1D, type=u32, sampled=false),
+        width: u32,
+    ) {
+        let px = id.x as u32;
+        if px >= width {
+            return;
+        }
+        unsafe {
+            image.write(px as i32, UVec4::new(px, 0, 0, 0));
+        }
+    }
+}
 
 #[claspr::device]
 pub mod dim3_uint {
