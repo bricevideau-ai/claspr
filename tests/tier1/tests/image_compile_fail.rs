@@ -18,9 +18,21 @@
 //!
 //! Run via `cargo test -p claspr-tier1-tests --test image_compile_fail`.
 //! No OpenCL device needed — these are pure compile checks.
+//!
+//! The `compile_pass/image/sanity.rs` fixture is included for a
+//! second reason: trybuild has a known intermittent bug in its
+//! bulk `cargo check --bins --keep-going` mode (upstream issues
+//! #299, #286, #242) where some fixtures' errors are dropped from
+//! the diagnostic stream and the runner reports them as
+//! "succeeded when expected to fail". The bulk mode kicks in only
+//! when *all* fixtures are `compile_fail`. Including one `pass`
+//! fixture flips trybuild's `has_pass = true` and routes everything
+//! through the reliable per-bin code path. See the comment at the
+//! top of `compile_pass/image/sanity.rs` for the long story.
 
 #[test]
 fn image_compile_fail() {
     let t = trybuild::TestCases::new();
+    t.pass("compile_pass/image/*.rs");
     t.compile_fail("compile_fail/image/*.rs");
 }
