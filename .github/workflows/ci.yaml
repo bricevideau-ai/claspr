@@ -68,8 +68,14 @@ jobs:
             echo "$fixtures" | xargs rustfmt --check
           fi
 
+      # `--release` so the artifact cache produced here is reused
+      # verbatim by the build + test steps below — without the flag,
+      # clippy compiled the whole workspace in debug, then cargo test
+      # --release recompiled it all from scratch (two full passes per
+      # CI run). Release-mode clippy is a hair slower but it pays for
+      # the build + test steps almost entirely.
       - name: Clippy
-        run: cargo clippy --all-targets --target $TARGET -- -D warnings
+        run: cargo clippy --release --all-targets --target $TARGET -- -D warnings
 
       # `cargo doc` warnings as errors — catches broken intra-doc
       # links, ambiguous symbol references (module-vs-macro,
