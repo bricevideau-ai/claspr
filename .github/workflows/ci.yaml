@@ -81,11 +81,13 @@ jobs:
       # links, ambiguous symbol references (module-vs-macro,
       # function-vs-module), and stale method references in
       # docstrings. --no-deps skips ~minutes of doc-building for
-      # external crates we don't control.
+      # external crates we don't control. --release matches the
+      # clippy + build + test profile so this step reuses their
+      # cache instead of triggering a full debug recompile.
       - name: Cargo doc
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --workspace --target $TARGET
+        run: cargo doc --no-deps --workspace --release --target $TARGET
 
       # Build in release so the artifact cache is reused verbatim by
       # the `cargo test --release` step below. Same profile = zero
