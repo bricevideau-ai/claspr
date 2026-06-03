@@ -85,8 +85,8 @@ pub use context::{Context, SvmLevel};
 pub use device::{Device, DeviceType, Platform};
 pub use error::{Error, Result};
 pub use image::{
-    Image1D, Image1DBuffer, Image2D, Image2DRgba8, Image3D, ImageAccess, KernelImage1DReadArg,
-    KernelImage1DReadWriteArg, KernelImage1DWriteArg, KernelImage2DReadArg,
+    Image1D, Image1DBuffer, Image1DBufferView, Image2D, Image2DRgba8, Image3D, ImageAccess,
+    KernelImage1DReadArg, KernelImage1DReadWriteArg, KernelImage1DWriteArg, KernelImage2DReadArg,
     KernelImage2DReadWriteArg, KernelImage2DWriteArg, KernelImage3DReadArg,
     KernelImage3DReadWriteArg, KernelImage3DWriteArg, KernelImageBufferReadArg,
     KernelImageBufferReadWriteArg, KernelImageBufferWriteArg, format,

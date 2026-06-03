@@ -43,7 +43,8 @@
 //! `R8G8B8A8Uint` for rust-gpu's `type=u32` kernel default.
 
 use crate::Result;
-use crate::access::KernelAccess;
+use crate::access::{KernelAccess, MemMode};
+use crate::buffer::{Buffer, DeviceSlice};
 use crate::context::Context;
 use crate::launch::KernelArg;
 use crate::queue::Launcher;
@@ -747,7 +748,7 @@ mod kernel_image_arg_sealed {
 /// markers (`WriteOnly`, `ReadWrite`) are intentionally rejected —
 /// see the section comment above for the "exact-access" rationale.
 pub trait KernelImage1DReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -759,7 +760,7 @@ pub trait KernelImage1DReadArg<SF: format::SampledTypeFamily>:
 /// kernel side, but they don't need `ImageReadWrite` capability —
 /// the right choice for OpenCL 1.2 output kernels.
 pub trait KernelImage1DWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -771,28 +772,28 @@ pub trait KernelImage1DWriteArg<SF: format::SampledTypeFamily>:
 /// 2.0+ device support; the rust-gpu codegen auto-declares the
 /// capability when emitting any `ReadWrite OpTypeImage`.
 pub trait KernelImage1DReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
 {
 }
 
 /// Host-side counterpart for a kernel `&Image!(2D, type=...)`
 /// parameter — see [`KernelImage1DReadArg`] for details.
 pub trait KernelImage2DReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
 {
 }
 
 /// Host-side counterpart for a kernel `&mut Image!(2D, ...,
 /// access="write_only")` parameter — see [`KernelImage1DWriteArg`].
 pub trait KernelImage2DWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
 {
 }
 
 /// Host-side counterpart for a kernel `&mut Image!(2D, ...)`
 /// parameter — see [`KernelImage1DReadWriteArg`].
 pub trait KernelImage2DReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -808,7 +809,7 @@ pub trait KernelImage2DReadWriteArg<SF: format::SampledTypeFamily>:
 /// 1D image from a kernel and as raw bytes (or typed elements)
 /// through the buffer API.
 pub trait KernelImageBufferReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -816,7 +817,7 @@ pub trait KernelImageBufferReadArg<SF: format::SampledTypeFamily>:
 /// access="write_only")` parameter — see
 /// [`KernelImageBufferReadArg`] for the storage model.
 pub trait KernelImageBufferWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -824,28 +825,28 @@ pub trait KernelImageBufferWriteArg<SF: format::SampledTypeFamily>:
 /// parameter (kernel declared `ReadWrite`) — see
 /// [`KernelImageBufferReadArg`].
 pub trait KernelImageBufferReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
 {
 }
 
 /// Host-side counterpart for a kernel `&Image!(3D, type=...)`
 /// parameter — see [`KernelImage1DReadArg`].
 pub trait KernelImage3DReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
 {
 }
 
 /// Host-side counterpart for a kernel `&mut Image!(3D, ...,
 /// access="write_only")` parameter — see [`KernelImage1DWriteArg`].
 pub trait KernelImage3DWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
 {
 }
 
 /// Host-side counterpart for a kernel `&mut Image!(3D, ...)`
 /// parameter — see [`KernelImage1DReadWriteArg`].
 pub trait KernelImage3DReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -1164,6 +1165,190 @@ impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFam
 }
 impl<F: format::Format + Send + 'static> KernelImageBufferReadWriteArg<F::SampledFamily>
     for Image1DBuffer<ReadWrite, F>
+{
+}
+
+// ── Image1DBufferView ─────────────────────────────────────────────
+//
+// A borrowed image-buffer view over an existing [`DeviceSlice`]:
+// the kernel sees an `image1d_buffer_t`, the host holds the slice;
+// both refer to the same `cl_mem`. No extra allocation — the
+// view's image is created with `desc.buffer = slice.cl_mem`, and
+// OpenCL retains the slice's `cl_mem` until the view drops.
+//
+// Lifetime: `'a` ties the view to a borrow of the slice. As long
+// as the view exists, the slice cannot be moved (Rust borrow
+// rule); when the view drops, `Image::drop` releases its retain on
+// the slice's `cl_mem` and the slice's own retain remains.
+//
+// Why this is interesting: it lets a single allocation appear as
+// both a typed buffer and a format-aware 1D image in the same
+// pipeline — write to it with a normal `&mut [T]` kernel arg,
+// then read it from a different kernel as an `image1d_buffer_t`
+// to get hardware UNORM↔float conversion. No copies, no
+// retypes.
+//
+// Aliasing caveat: like passing the same `DeviceSlice` twice as
+// `&mut [T]` args to one launch, holding a view while also
+// passing the slice itself to a kernel that writes through it is
+// UB at the OpenCL level. claspr doesn't enforce the constraint
+// — Rust borrow rules don't track device-side mutation. The user
+// is expected to sequence reads + writes through queue
+// dependencies (or just not alias).
+//
+// The view's kernel-access marker is *derived* from the slice's
+// `MemMode` (since `MemMode: KernelAccess`), not chosen freely —
+// the cl_mem was allocated with the slice's `KERNEL_FLAGS`, and
+// the image inherits that.
+
+/// A 1D-image-buffer view over an existing [`DeviceSlice`] —
+/// shares storage with the slice, no copy.
+///
+/// The kernel-side access marker is whatever the slice's
+/// `MemMode` resolved to (`MemMode: KernelAccess`), so a
+/// `DeviceSlice<f32, ReadWrite>` yields a view that satisfies
+/// any of the `KernelImageBuffer*Arg` trait variants; a
+/// `DeviceSlice<f32, ReadOnly>` only satisfies
+/// `KernelImageBufferReadArg`.
+///
+/// Width is derived from the slice's byte length and the
+/// format's pixel size — the constructor errors if the byte
+/// length isn't an exact multiple of `size_of::<F::Pixel>()`.
+pub struct Image1DBufferView<'a, M: MemMode, F: format::Format> {
+    image: Image,
+    width: u32,
+    // PhantomData carries (a) the borrow on the slice via `&'a ()`
+    // so the view can't outlive the slice, (b) the slice's
+    // `MemMode` so the trait impls below can match on M, and (c)
+    // the format so trait dispatch picks the right `SampledFamily`.
+    _borrow: PhantomData<&'a ()>,
+    _mode: PhantomData<M>,
+    _format: PhantomData<F>,
+}
+
+impl<'a, M: MemMode, F: format::Format> Image1DBufferView<'a, M, F> {
+    /// View `slice` as an image-buffer with format `F`. The
+    /// kernel-side access is `M`'s `KernelAccess` (i.e. the same
+    /// `CL_MEM_READ_ONLY`/`READ_WRITE`/`WRITE_ONLY` the slice was
+    /// allocated with — OpenCL won't accept a different access on
+    /// the view since the cl_mem is shared).
+    ///
+    /// Errors if `slice.byte_len() % size_of::<F::Pixel>() != 0` —
+    /// a partial trailing pixel is rejected since the kernel-side
+    /// indexing would silently read past the data.
+    pub fn view_of<T>(slice: &'a DeviceSlice<T, M>) -> Result<Self> {
+        let pixel_bytes = std::mem::size_of::<F::Pixel>();
+        let byte_len = slice.len() * std::mem::size_of::<T>();
+        assert_eq!(
+            byte_len % pixel_bytes,
+            0,
+            "Image1DBufferView::view_of: slice byte length {} is not a multiple of pixel size {} \
+             (format = {})",
+            byte_len,
+            pixel_bytes,
+            std::any::type_name::<F>(),
+        );
+        let width = byte_len / pixel_bytes;
+        let format = cl_image_format {
+            image_channel_order: F::CHANNEL_ORDER,
+            image_channel_data_type: F::CHANNEL_TYPE,
+        };
+        let desc = cl_image_desc {
+            image_type: opencl3::memory::CL_MEM_OBJECT_IMAGE1D_BUFFER,
+            image_width: width,
+            image_height: 0,
+            image_depth: 0,
+            image_array_size: 0,
+            image_row_pitch: 0,
+            image_slice_pitch: 0,
+            num_mip_levels: 0,
+            num_samples: 0,
+            buffer: slice.buffer().get(),
+        };
+        // SAFETY: `buffer` in desc points at the slice's `cl_mem`,
+        // which Rust's borrow rule keeps alive for `'a`. OpenCL
+        // additionally `clRetainMemObject`s it. Host-ptr null is
+        // correct (no host-side init data — the slice IS the data).
+        // Access flags match the slice's because the cl_mem was
+        // created with `M::KERNEL_FLAGS`; passing a different
+        // access flag here would yield CL_INVALID_VALUE.
+        let image = unsafe {
+            Image::create(
+                slice.ctx().raw_context(),
+                M::KERNEL_FLAGS,
+                &format,
+                &desc,
+                ptr::null_mut(),
+            )?
+        };
+        Ok(Self {
+            image,
+            width: width as u32,
+            _borrow: PhantomData,
+            _mode: PhantomData,
+            _format: PhantomData,
+        })
+    }
+
+    /// Width in pixels — derived from the slice's byte length and
+    /// the format's pixel size.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Borrow the underlying opencl3 [`Image`].
+    pub fn image(&self) -> &Image {
+        &self.image
+    }
+}
+
+impl<M: MemMode, F: format::Format> KernelArg for Image1DBufferView<'_, M, F> {
+    fn set(&self, exec: &mut ExecuteKernel<'_>) {
+        let cl_mem_handle = self.image.get();
+        unsafe {
+            exec.set_arg(&cl_mem_handle);
+        }
+    }
+}
+
+// Sealed marker — same as the owned form. `'static` bound on M
+// holds because all access markers (ReadOnly/WriteOnly/ReadWrite)
+// are ZSTs that are themselves `'static`, but the view itself
+// carries the `'a` lifetime via PhantomData<&'a ()>, so the
+// sealed impl needs the explicit `'a` parameter.
+impl<M: MemMode + Send, F: format::Format + Send + 'static> kernel_image_arg_sealed::Sealed
+    for Image1DBufferView<'_, M, F>
+{
+}
+
+// Per-(M, access-trait) impls. Same partial-order rules as the
+// owned form, but bridged via M's KernelAccess marker:
+//   - DeviceSlice<T, ReadOnly>  → view satisfies Read only
+//   - DeviceSlice<T, WriteOnly> → view satisfies Write only
+//   - DeviceSlice<T, ReadWrite> → view satisfies all three
+//
+// We list these as concrete-M impls (no blanket over generic M)
+// because the trait family is access-discriminated, not
+// MemMode-discriminated — coherence requires us to spell out the
+// (M, trait) pairs.
+impl<F: format::Format + Send + 'static> KernelImageBufferReadArg<F::SampledFamily>
+    for Image1DBufferView<'_, ReadOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
+    for Image1DBufferView<'_, WriteOnly, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImageBufferReadArg<F::SampledFamily>
+    for Image1DBufferView<'_, ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
+    for Image1DBufferView<'_, ReadWrite, F>
+{
+}
+impl<F: format::Format + Send + 'static> KernelImageBufferReadWriteArg<F::SampledFamily>
+    for Image1DBufferView<'_, ReadWrite, F>
 {
 }
 
