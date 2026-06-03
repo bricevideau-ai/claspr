@@ -16,7 +16,7 @@
 //! the keep-alive callback on the write event drops the Arc when the
 //! transfer finishes, so the runtime tracks lifetime automatically.
 //!
-//! [`fan_out`][fo] enqueues every branch on the chain's out-of-order
+//! [`fan_out`](claspr_async::fan_out()) enqueues every branch on the chain's out-of-order
 //! queue with independent event chains; a single
 //! `clEnqueueMarkerWithWaitList` joins them at the end. The OOO
 //! scheduler decides how much to overlap on the device.
@@ -24,7 +24,6 @@
 //! Verifies every batch's output against a host reference.
 //!
 //! [as]: claspr_async::transfer::UploadSource
-//! [fo]: claspr_async::fan_out
 
 use claspr::Context;
 use claspr_async::{DeviceOperation, bundle, download, fan_out, upload};

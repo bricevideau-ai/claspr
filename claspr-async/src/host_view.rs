@@ -40,7 +40,7 @@
 //!
 //! For pure host inspection without writing back, use
 //! [`DeviceSlice::acquire_host_view_read`] (alias
-//! [`HostAccessibleExt::acquire_host_view_read`]): the view passes
+//! [`HostReadableExt::acquire_host_view_read`]): the view passes
 //! `&[T]` to the closure, the underlying map uses `CL_MAP_READ` only
 //! (no writeback on unmap).
 

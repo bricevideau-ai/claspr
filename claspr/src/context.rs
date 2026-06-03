@@ -3,12 +3,12 @@
 //!
 //! Each `Context` carries a per-device pair of lazy default queues
 //! (in-order + out-of-order). Most user code never names a
-//! [`Queue`](crate::queue::Queue) explicitly — passing `&ctx` to a
+//! [`Queue`] explicitly — passing `&ctx` to a
 //! generated launch wrapper routes through the in-order default
 //! for [`ctx.device()`](Context::device). Advanced callers reach
 //! for [`Context::default_inorder_queue`] /
 //! [`Context::default_outoforder_queue`] (per device, lazy) or
-//! create explicit [`Queue<O>`](crate::queue::Queue) handles when
+//! create explicit [`Queue<O>`] handles when
 //! they want their own command stream.
 //!
 //! Profiling is opt-in on the [`ContextBuilder`]; the per-device

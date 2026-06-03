@@ -1,6 +1,6 @@
 //! Variadic homogeneous parallel composition — [`FanOut`].
 //!
-//! Where [`Bundle`](crate::bundle) is heterogeneous (each child has
+//! Where [`Bundle`](crate::bundle!) is heterogeneous (each child has
 //! its own type), `FanOut` takes a `Vec<I>` of inputs and a closure
 //! that turns each input into a [`DeviceOperation`]. The N children
 //! are all the same op type; the output is `Vec<U::Output>`.

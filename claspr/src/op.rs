@@ -81,7 +81,7 @@ pub struct ProfilingInfo {
 }
 
 impl ProfilingInfo {
-    /// Wall-clock kernel runtime — `end - start` as a [`Duration`].
+    /// Wall-clock kernel runtime — `end - start` as a [`Duration`](std::time::Duration).
     pub fn duration(&self) -> std::time::Duration {
         std::time::Duration::from_nanos(self.end.saturating_sub(self.start))
     }

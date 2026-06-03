@@ -5,7 +5,7 @@
 //! of the chain's primary queue. Use for kernel launches on a
 //! non-default device in a multi-device chain.
 //!
-//! Pair with [`transfer_to_device`](crate::transfer_to_device) to
+//! Pair with [`transfer_to_device`](crate::transfer_to_device()) to
 //! explicitly migrate buffers between devices — that primitive
 //! handles the `cl_mem` residency; this one handles where the kernel
 //! actually enqueues.

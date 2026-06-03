@@ -3,7 +3,7 @@
 //! This crate is the **runtime helper layer**: typed `Context`,
 //! `DeviceSlice<T>`, kernel argument plumbing, image helpers, and the
 //! `#[claspr::kernel]` / `#[claspr::device]` proc-macro re-exports.
-//! The matching build-script library [`claspr-build`] handles
+//! The matching build-script library `claspr-build` handles
 //! compiling the rust-gpu kernel sub-crates into SPIR-V at build time.
 //!
 //! ## Quickstart
@@ -38,14 +38,15 @@
 //!
 //! ## Crate structure
 //!
-//! - [`Context`] — device, OpenCL context, command queue, and the
-//!   [`launch`](Context::launch) entry point.
+//! - [`Context`] — device, OpenCL context, and command queue
+//!   (the default in-order / out-of-order queues are the launcher
+//!   surface for Tier 1 ops).
 //! - [`DeviceSlice<T>`] — typed device buffer + length, mirrors
 //!   rust-gpu's slice decomposition.
 //! - [`KernelArg`] / [`KernelArgs`] / [`ScalarArg`] — typed launch
 //!   surface. User structs opt in via the [`scalar_arg!`] macro.
 //! - [`Image2DRgba8`] + [`write_ppm_rgba8`] — render-to-image helpers.
-//! - [`device`] / [`kernel`] — proc-macros from `claspr-macros`.
+//! - [`device`](macro@device) / [`kernel`] — proc-macros from `claspr-macros`.
 //!
 //! ## Error type
 //!

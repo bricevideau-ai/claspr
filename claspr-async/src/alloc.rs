@@ -105,7 +105,7 @@ pub struct DeviceSliceFilled<T: Copy> {
 }
 
 /// Allocate a [`DeviceSlice<T>`] of `len` elements all set to
-/// `value`. Argument order mirrors [`vec!`](std::vec)'s `[value; count]`
+/// `value`. Argument order mirrors [`vec!`](std::vec!)'s `[value; count]`
 /// shape.
 ///
 /// Compared to `upload(vec![value; len])`: no host allocation of `len`
@@ -152,9 +152,9 @@ pub struct MappedSliceFilled<T: Copy> {
 }
 
 /// Allocate a [`MappedSlice<T>`] of `len` elements all set to
-/// `value`. Argument order mirrors [`vec!`](std::vec)'s
+/// `value`. Argument order mirrors [`vec!`](std::vec!)'s
 /// `[value; count]` shape — same as
-/// [`device_slice_filled`](crate::device_slice_filled), just SVM.
+/// [`device_slice_filled`], just SVM.
 ///
 /// Surfaces [`Error::SvmNotAvailable`](claspr::Error::SvmNotAvailable)
 /// at execute time on devices without SVM (same gate as

@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 /// A single tracked event in a [`Deps`] chain. Arc-wrapped so it can
 /// be cheaply shared across parallel branches in
-/// [`bundle!`](crate::bundle!) / [`fan_out`](crate::fan_out) without
+/// [`bundle!`](crate::bundle!) / [`fan_out`](crate::fan_out()) without
 /// extra `clRetainEvent` calls.
 pub type Dep = Arc<Event>;
 
@@ -185,7 +185,7 @@ pub trait DeviceOperation: Send + Sized {
     /// resume on the parent's queue; the routed op's events are valid
     /// across both via OpenCL's shared-context event semantics.
     ///
-    /// Pair with [`transfer_to_device`](crate::transfer_to_device)
+    /// Pair with [`transfer_to_device`](crate::transfer_to_device())
     /// when explicit buffer migration is wanted as its own chain
     /// stage. The common idiom pulls the device handle from `ec`
     /// inside an `and_then_with_context` so the chain is portable

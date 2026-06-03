@@ -2,8 +2,8 @@
 //! over them.
 //!
 //! One tier lives in this module: [`DeviceSlice<T>`] —
-//! `CL_MEM_READ_WRITE`, accessed via [`upload`](DeviceSlice::upload)
-//! / [`download`](DeviceSlice::download). The host-mapped tier (SVM
+//! `CL_MEM_READ_WRITE`, accessed via [`upload`](DeviceSlice::write)
+//! / [`download`](DeviceSlice::read). The host-mapped tier (SVM
 //! / [`MappedSlice`](crate::mapped::MappedSlice)) lives in
 //! [`crate::mapped`].
 //!
@@ -36,7 +36,7 @@ use std::ptr;
 /// stay on each concrete type because their signatures and lifetimes
 /// genuinely differ:
 ///
-/// - [`DeviceSlice::upload`] / [`DeviceSlice::download`] enqueue a
+/// - [`DeviceSlice::write`] / [`DeviceSlice::read`] enqueue a
 ///   `clEnqueueRead`/`WriteBuffer` against a [`Launcher`].
 /// - [`MappedSlice`](crate::mapped::MappedSlice) maps lazily on demand
 ///   via [`MappedSlice::map_mut`](crate::mapped::MappedSlice::map_mut)
@@ -96,8 +96,8 @@ pub trait Buffer<T> {
 /// claspr sets both — see the [`KernelArg`] impl in [`crate::launch`].
 ///
 /// Construct via [`DeviceSlice::alloc`] (zero-initialised) or
-/// [`DeviceSlice::upload`] (with initial host data). Read back via
-/// [`DeviceSlice::download`]. The `unsafe`
+/// [`DeviceSlice::from_slice`] (with initial host data). Read back via
+/// [`DeviceSlice::read`]. The `unsafe`
 /// [`alloc_uninit`](DeviceSlice::alloc_uninit) escape hatch exists
 /// for internal claspr ops that immediately write the whole buffer
 /// before exposing it — see its doc-comment for the safety contract.
@@ -416,7 +416,7 @@ impl<T: Copy, M: MemMode> DeviceSlice<T, M> {
 
 /// Lazy builder for `clEnqueueWriteBuffer`. Returned by
 /// [`DeviceSlice::write`]. Writes into an existing buffer; for the
-/// "alloc + write in one shot" convenience, see [`DeviceSlice::upload`].
+/// "alloc + write in one shot" convenience, see [`DeviceSlice::from_slice`].
 pub struct WriteOp<'a, T> {
     queue: &'a CommandQueue,
     buffer: &'a mut ManuallyDrop<ClBuffer<T>>,
@@ -508,7 +508,7 @@ impl<'a, T> WriteOp<'a, T> {
 }
 
 /// Lazy builder for `clEnqueueReadBuffer`. Returned by
-/// [`DeviceSlice::download`].
+/// [`DeviceSlice::read`].
 pub struct ReadOp<'a, T> {
     queue: &'a CommandQueue,
     buffer: &'a ClBuffer<T>,

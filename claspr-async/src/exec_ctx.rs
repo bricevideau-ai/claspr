@@ -110,7 +110,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// The [`Device`] this op currently targets. Use
     /// [`DeviceOperation::on_device`](crate::DeviceOperation::on_device)
     /// to route a sub-chain to a different device's queue, or
-    /// [`transfer_to_device`](crate::transfer_to_device) to migrate
+    /// [`transfer_to_device`](crate::transfer_to_device()) to migrate
     /// the buffer between devices in the same context.
     pub fn device(&self) -> &Device {
         &self.device

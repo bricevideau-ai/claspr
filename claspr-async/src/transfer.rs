@@ -3,7 +3,7 @@
 //!
 //! Where the Tier 1 builders [`DeviceSlice::write`] /
 //! [`DeviceSlice::read`] take a borrowed source / destination and a
-//! [`Launcher`], these consume ownership and pick the chain's queue
+//! [`Launcher`](claspr::Launcher), these consume ownership and pick the chain's queue
 //! from the [`ExecutionContext`] at execute time. That makes them
 //! compose cleanly into combinator chains:
 //!

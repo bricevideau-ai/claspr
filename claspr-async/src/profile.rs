@@ -33,7 +33,7 @@
 //! println!("foo + bar took {:?}", info.duration());
 //! ```
 //!
-//! [`Bundle`]: crate::bundle
+//! [`Bundle`]: crate::Bundle2
 //! [`FanOut`]: crate::FanOut
 //! [`LaunchOp::profiled`]: claspr::LaunchOp::profiled
 

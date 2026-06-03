@@ -79,7 +79,7 @@ fn cl_to_err(code: cl_int) -> Error {
 /// recorded automatically:
 ///
 /// - **Kernel launches** that take `MappedSlice<T>` as a `KernelArg`:
-///   [`LaunchOp::into_event`][lo] calls [`KernelArg::register_completion`][ka]
+///   [`LaunchOp::into_event`][lo] calls [`KernelArg::register_completion`]
 ///   after enqueue, which retains the completion event and pushes it
 ///   onto this buffer's in-flight-use list.
 /// - **Host-view release** path: `MappedSliceHostView::Drop` /
@@ -98,7 +98,6 @@ fn cl_to_err(code: cl_int) -> Error {
 /// stay Drop-safe.
 ///
 /// [lo]: crate::LaunchOp
-/// [ka]: crate::KernelArg::register_completion
 pub struct MappedSlice<T, M: MemMode = ReadWrite> {
     ptr: *mut T,
     len: usize,
@@ -206,7 +205,7 @@ impl<T, M: MemMode + KernelWritable> MappedSlice<T, M> {
 impl<T: Copy, M: MemMode> MappedSlice<T, M> {
     /// Create an SVM buffer whose contents are copied from `data` at
     /// construction time. Errors with
-    /// [`Error::SvmNotAvailable`](crate::Error::SvmNotAvailable) if
+    /// [`Error::SvmNotAvailable`] if
     /// the device doesn't support SVM.
     ///
     /// Works for any marker — for kernel-RO markers like

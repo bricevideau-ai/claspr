@@ -21,7 +21,7 @@
 //! `OpCapability Float64`, even transitively. See `build.rs` for how
 //! the per-module capability set is selected.
 //!
-//! ## Design constraints (per [`IMPLEMENTATION-PLAN.md`] Phase 5)
+//! ## Design constraints (per `IMPLEMENTATION-PLAN.md` Phase 5)
 //!
 //! - **OpenCL 1.2 only**, max portability across pocl / rusticl / Intel.
 //! - **`u32` and `f64` scalars / slices only** — no vector or struct

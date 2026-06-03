@@ -114,7 +114,7 @@ use std::path::{Path, PathBuf};
 // spirv-builder as a separate build-dependency.
 pub use spirv_builder::{Capability, ShaderPanicStrategy};
 
-/// Boxed-error result alias used by all [`claspr_build`] entry points.
+/// Boxed-error result alias used by all `claspr_build` entry points.
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync + 'static>>;
 
 /// Deferred-construction settings for [`SpirvBuilder`].
@@ -246,7 +246,7 @@ impl CompileBuilder {
 
     /// Set the SPIR-V target environment string passed to rust-gpu
     /// (e.g. `"spirv-unknown-opencl2.0"`). Call order is irrelevant —
-    /// settings accumulate and apply when [`build`][Self::build] runs.
+    /// settings accumulate and apply when [`write_to`][Self::write_to] runs.
     pub fn target_env(mut self, target: impl Into<String>) -> Self {
         self.settings.target_env = target.into();
         self
@@ -533,9 +533,9 @@ pub fn compile_from_host(src_file: impl AsRef<Path>) -> HostBuilder {
 ///
 /// The preset / capability / panic-strategy methods carry the same
 /// semantics as on [`CompileBuilder`]; the terminal call is
-/// [`write_to`] just like the explicit-kernel-crate flow.
-///
-/// [`write_to`]: Self::write_to
+/// [`write`](Self::write), which writes into `OUT_DIR` (the
+/// `CompileBuilder` flow's [`write_to`](CompileBuilder::write_to)
+/// requires an explicit path).
 pub struct HostBuilder {
     settings: SpirvBuilderSettings,
     src_file: PathBuf,

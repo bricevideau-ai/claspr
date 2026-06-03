@@ -3,7 +3,7 @@
 //! `KernelImage1D*Arg` (non-arrayed) — the arrayed bit on the
 //! kernel side splits the trait family in two, by design.
 
-use claspr::{Context, WriteOnly, image::format::R32Uint};
+use claspr::{image::format::R32Uint, Context, WriteOnly};
 
 fn main() {
     let ctx = Context::any().unwrap();

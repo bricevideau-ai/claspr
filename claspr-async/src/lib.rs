@@ -23,7 +23,7 @@
 //!     .sync(&ctx)?;
 //! ```
 //!
-//! ## Crate layout (mirrors [`IMPLEMENTATION-PLAN.md`])
+//! ## Crate layout (mirrors `IMPLEMENTATION-PLAN.md`)
 //!
 //! - [`op`] — [`DeviceOperation`] trait + the core combinators
 //!   ([`AndThen`], [`AndThenWithContext`], [`Arced`], [`Value`]).
@@ -85,9 +85,9 @@ pub use transfer::{Download, Upload, UploadSource, download, upload};
 pub use transfer_to_device::{TransferToDevice, transfer_to_device};
 pub use usm::{UsmSliceAlloc, UsmSliceOp, usm_slice, usm_slice_alloc};
 
-/// `vec!`-shaped sugar for producing a [`DeviceSlice<T>`] op.
+/// `vec!`-shaped sugar for producing a [`DeviceSlice<T>`](claspr::DeviceSlice) op.
 ///
-/// Two arms mirror [`vec!`](std::vec):
+/// Two arms mirror [`vec!`](std::vec!):
 ///
 /// - `device_slice![value; count]` — alloc + `clEnqueueFillBuffer`
 ///   on the chain's queue. No host allocation, no host→device
@@ -120,10 +120,10 @@ macro_rules! device_slice {
     };
 }
 
-/// `vec!`-shaped sugar for producing a [`MappedSlice<T>`] op — SVM
+/// `vec!`-shaped sugar for producing a [`MappedSlice<T>`](claspr::MappedSlice) op — SVM
 /// analog of [`device_slice!`](crate::device_slice!).
 ///
-/// Two arms mirror [`vec!`](std::vec):
+/// Two arms mirror [`vec!`](std::vec!):
 ///
 /// - `mapped_slice![value; count]` — alloc + `clEnqueueSVMMemFill`.
 ///   Expands to [`mapped_slice_filled(value, count)`](crate::mapped_slice_filled).
@@ -155,7 +155,7 @@ macro_rules! mapped_slice {
 /// op — symmetric with [`device_slice!`](crate::device_slice!) /
 /// [`mapped_slice!`](crate::mapped_slice!).
 ///
-/// Both arms expand to [`usm_slice`](crate::usm_slice) over a host
+/// Both arms expand to [`usm_slice`](crate::usm_slice!) over a host
 /// `Vec<T>` — USMSlice always wraps an existing host allocation, so
 /// there's no cheap on-device fill path to distinguish from the
 /// literal arm. The macro exists for syntactic symmetry across the

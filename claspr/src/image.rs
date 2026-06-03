@@ -67,7 +67,7 @@ use std::ptr;
 
 pub use crate::access::{ReadOnly, ReadWrite, WriteOnly};
 
-/// Backward-compat alias for [`KernelAccess`](crate::access::KernelAccess).
+/// Backward-compat alias for [`KernelAccess`].
 /// Image2D's marker bound is now `A: KernelAccess` directly.
 pub use crate::access::KernelAccess as ImageAccess;
 
@@ -76,9 +76,9 @@ pub use crate::access::KernelAccess as ImageAccess;
 /// Image storage formats — channel order + channel type pair from
 /// the OpenCL spec, expressed as ZST markers.
 ///
-/// Each format ZST implements [`Format`], which carries the
+/// Each format ZST implements [`Format`](format::Format), which carries the
 /// `CHANNEL_ORDER` / `CHANNEL_TYPE` constants the runtime needs
-/// and the [`Pixel`](Format::Pixel) associated type used by
+/// and the [`Pixel`](format::Format::Pixel) associated type used by
 /// [`Image2D::download`] to size the host buffer.
 pub mod format {
     use opencl3::memory::{

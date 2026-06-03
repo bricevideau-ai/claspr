@@ -2,7 +2,7 @@
 //! (`KernelImage2DWriteArg<Uint>`). `Image1D` only impls the
 //! `KernelImage1D*Arg` trait family, not the 2D one.
 
-use claspr::{Context, WriteOnly, image::format::R32Uint};
+use claspr::{image::format::R32Uint, Context, WriteOnly};
 
 fn main() {
     let ctx = Context::any().unwrap();

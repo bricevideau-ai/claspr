@@ -5,7 +5,7 @@
 //! Requires `CL_DEVICE_SVM_FINE_GRAIN_SYSTEM` (the OpenCL 2.0+
 //! capability where any host pointer is valid in a kernel — no
 //! allocator call, no map/unmap, no explicit sync). claspr's
-//! [`SvmLevel::FineSystem`](crate::SvmLevel::FineSystem) reports it;
+//! [`SvmLevel::FineSystem`] reports it;
 //! [`USMSlice::new`] errors with [`Error::NotSupported`] when absent.
 //!
 //! # Why "USM"
@@ -46,8 +46,8 @@ use std::sync::{Arc, Mutex};
 /// the same pointer.
 ///
 /// Construction gates on
-/// [`SvmLevel::FineSystem`](crate::SvmLevel::FineSystem) — errors
-/// with [`Error::NotSupported`](crate::Error::NotSupported) on
+/// [`SvmLevel::FineSystem`] — errors
+/// with [`Error::NotSupported`] on
 /// devices without fine-grain system SVM. Host access goes through
 /// `Deref<Target=[T]>` / `DerefMut` directly on the wrapped Vec;
 /// kernel access goes through `clSetKernelArgSVMPointer` (driven by
@@ -96,7 +96,7 @@ unsafe impl<T: Sync, M: MemMode> Sync for USMSlice<T, M> {}
 
 impl<T, M: MemMode> USMSlice<T, M> {
     /// Wrap `data` as a USMSlice with the marker `M`. Errors with
-    /// [`Error::NotSupported`](crate::Error::NotSupported) if the
+    /// [`Error::NotSupported`] if the
     /// context's device doesn't advertise
     /// `CL_DEVICE_SVM_FINE_GRAIN_SYSTEM`.
     ///
