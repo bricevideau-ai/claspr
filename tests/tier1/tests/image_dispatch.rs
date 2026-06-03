@@ -24,7 +24,8 @@
 //! the device doesn't advertise image support.
 
 use claspr::{
-    Context, DeviceSlice, Image1D, Image1DBuffer, Image3D, ReadOnly, WriteOnly,
+    Context, DeviceSlice, Image1D, Image1DBuffer, Image1DBufferView, Image3D, ReadOnly, ReadWrite,
+    WriteOnly,
     image::format::{R8G8B8A8Uint, R32Float, R32G32B32A32Uint, R32Sint, R32Uint},
 };
 
@@ -293,6 +294,59 @@ fn dim_buffer_fill_pattern_r32_uint() {
     for x in 0..N {
         assert_eq!(pixels[x as usize], x.wrapping_mul(3));
     }
+}
+
+/// Image-buffer **view** over an existing `DeviceSlice`.
+/// Allocates a `DeviceSlice<u32, ReadWrite>` and seeds it via
+/// `from_slice`, constructs an `Image1DBufferView<'_, ReadWrite,
+/// R32Uint>` over it (no copy — shared cl_mem), and reads it
+/// through the image-buffer kernel. The kernel-read values
+/// should match the host-written ones byte-for-byte.
+#[test]
+fn dim_buffer_view_of_slice() {
+    const N: u32 = 64;
+    let Some(ctx) = ctx() else { return };
+    let kernels = claspr_test_image_kernels::dim_buffer_uint::kernels(&ctx).unwrap();
+
+    // Host writes through the slice path.
+    let seed: Vec<u32> = (0..N).map(|x| x.wrapping_mul(13).wrapping_add(5)).collect();
+    let slice = DeviceSlice::<u32>::from_slice(&ctx, &seed).unwrap();
+
+    // No copy — the view shares the slice's cl_mem.
+    let view = Image1DBufferView::<ReadWrite, R32Uint>::view_of(&slice).unwrap();
+    assert_eq!(view.width(), N);
+
+    // Output slice for the kernel to write into.
+    let zeros = vec![0u32; N as usize];
+    let out = DeviceSlice::<u32>::from_slice(&ctx, &zeros).unwrap();
+
+    // Kernel reads the view (as `image1d_buffer_t`), writes to out.
+    let (_view, out) = kernels
+        .copy_to_buffer([N as usize], view, out, N)
+        .wait(&ctx)
+        .unwrap();
+
+    let mut result = vec![0u32; N as usize];
+    out.read(&ctx, &mut result).wait().unwrap();
+    assert_eq!(
+        result, seed,
+        "kernel-read pixels through view should match host-seeded slice"
+    );
+}
+
+/// Image-buffer view over a slice with reinterpret: the slice
+/// is `DeviceSlice<u32>` but the view sees it as `R32Uint`
+/// (matching), exercising the byte-length arithmetic in
+/// `view_of` (16 u32 elements = 16 R32Uint pixels = 64 bytes).
+#[test]
+fn dim_buffer_view_width_derived_from_slice_bytes() {
+    const N: u32 = 16;
+    let Some(ctx) = ctx() else { return };
+    let zeros = vec![0u32; N as usize];
+    let slice = DeviceSlice::<u32>::from_slice(&ctx, &zeros).unwrap();
+    let view = Image1DBufferView::<ReadWrite, R32Uint>::view_of(&slice).unwrap();
+    // 16 u32 = 64 bytes; pixel size 4 → 16 pixels.
+    assert_eq!(view.width(), N);
 }
 
 /// Image-buffer read path. Seed via `upload`, kernel reads

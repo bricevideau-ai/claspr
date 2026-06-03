@@ -1,22 +1,14 @@
-error[E0277]: the trait bound `Image2D<WriteOnly, R32Uint>: KernelImageBufferWriteArg<Uint>` is not satisfied
-  --> compile_fail/image/dim_mismatch_2d_to_buffer.rs:11:45
+error[E0277]: the trait bound `Image1DBufferView<'_, ReadOnly, R32Uint>: KernelImageBufferWriteArg<Uint>` is not satisfied
+  --> compile_fail/image/view_access_mismatch.rs:15:45
    |
-11 |     let _ = kernels.fill_pattern([16usize], img, 16u32);
-   |                     ------------            ^^^ the trait `KernelImageBufferWriteArg<Uint>` is not implemented for `Image2D<WriteOnly, R32Uint>`
+15 |     let _ = kernels.fill_pattern([16usize], view, 16u32);
+   |                     ------------            ^^^^ the trait `KernelImageBufferWriteArg<Uint>` is not implemented for `Image1DBufferView<'_, ReadOnly, R32Uint>`
    |                     |
    |                     required by a bound introduced by this call
    |
 help: the following other types implement trait `KernelImageBufferWriteArg<SF>`
   --> $WORKSPACE/claspr/src/image.rs
    |
-   | / impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
-   | |     for Image1DBuffer<WriteOnly, F>
-   | |___________________________________^ `Image1DBuffer<WriteOnly, F>`
-...
-   | / impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
-   | |     for Image1DBuffer<ReadWrite, F>
-   | |___________________________________^ `Image1DBuffer<ReadWrite, F>`
-...
    | / impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
    | |     for Image1DBufferView<'_, WriteOnly, F>
    | |___________________________________________^ `Image1DBufferView<'_, WriteOnly, F>`

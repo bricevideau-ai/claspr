@@ -1,0 +1,11 @@
+error[E0597]: `slice` does not live long enough
+  --> compile_fail/image/view_outlives_slice.rs:12:58
+   |
+10 |     let view = {
+   |         ---- borrow later stored here
+11 |         let slice = DeviceSlice::<u32>::from_slice(&ctx, &[0u32; 16]).unwrap();
+   |             ----- binding `slice` declared here
+12 |         Image1DBufferView::<ReadWrite, R32Uint>::view_of(&slice).unwrap()
+   |                                                          ^^^^^^ borrowed value does not live long enough
+13 |     };
+   |     - `slice` dropped here while still borrowed
