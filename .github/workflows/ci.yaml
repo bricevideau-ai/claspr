@@ -56,8 +56,30 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all -- --check
 
+      # `cargo fmt --all` only walks the workspace member sources; the
+      # trybuild compile-fail fixtures under tests/*/compile_fail/*.rs
+      # aren't part of any [lib]/[[bin]] tree, so `cargo fmt` skips
+      # them. Run rustfmt directly on the fixtures to keep import
+      # ordering / whitespace consistent.
+      - name: Rustfmt (compile-fail fixtures)
+        run: |
+          fixtures=$(find tests/*/compile_fail -name '*.rs' 2>/dev/null || true)
+          if [ -n "$fixtures" ]; then
+            echo "$fixtures" | xargs rustfmt --check
+          fi
+
       - name: Clippy
         run: cargo clippy --all-targets --target $TARGET -- -D warnings
+
+      # `cargo doc` warnings as errors — catches broken intra-doc
+      # links, ambiguous symbol references (module-vs-macro,
+      # function-vs-module), and stale method references in
+      # docstrings. --no-deps skips ~minutes of doc-building for
+      # external crates we don't control.
+      - name: Cargo doc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --workspace --target $TARGET
 
       - name: cargo build --workspace
         run: cargo build --workspace --target $TARGET
