@@ -55,9 +55,9 @@
 //! }
 //!
 //! fn main() -> claspr::Result<()> {
-//!     let ctx = Context::new()?;
+//!     let ctx = Context::any()?;
 //!     let kernels = gpu::kernels(&ctx)?;
-//!     // kernels.collatz_kernel(&ctx, [n], &buf).wait()?;
+//!     // kernels.collatz_kernel([n], buf).wait(&ctx)?;
 //!     Ok(())
 //! }
 //! ```
@@ -93,7 +93,7 @@
 //!     }
 //! }
 //!
-//! let ctx = claspr::Context::new()?;
+//! let ctx = claspr::Context::any()?;
 //! // Embedded bytes from the build script:
 //! let kernels = gpu::Kernels::load_from(&ctx, generated::SPV_BYTES)?;
 //! // Or from any other source (file, network, generated):

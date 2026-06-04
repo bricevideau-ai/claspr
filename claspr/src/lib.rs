@@ -12,7 +12,7 @@
 //! `examples/`):
 //!
 //! ```ignore
-//! use claspr::Context;
+//! use claspr::{Context, DeviceSlice};
 //!
 //! #[claspr::device]
 //! mod gpu {
@@ -24,12 +24,13 @@
 //! }
 //!
 //! fn main() -> claspr::Result<()> {
-//!     let ctx = Context::new()?;
+//!     let ctx = Context::any()?;
 //!     let kernels = gpu::kernels(&ctx)?;
 //!     let mut data: Vec<u32> = (1..=1024).collect();
-//!     let buf = ctx.upload(&data)?;
-//!     kernels.collatz_kernel(&ctx, [data.len()], &buf).wait()?;
-//!     buf.download(&ctx, &mut data).wait()?;
+//!     let mut buf = DeviceSlice::<u32>::alloc(&ctx, data.len())?;
+//!     buf.write(&ctx, &data).wait()?;
+//!     let buf = kernels.collatz_kernel([data.len()], buf).wait(&ctx)?;
+//!     buf.read(&ctx, &mut data).wait()?;
 //!     Ok(())
 //! }
 //! ```
