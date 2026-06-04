@@ -48,21 +48,14 @@ use crate::exec_ctx::ExecutionContext;
 use crate::mappable::Mappable;
 use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
 use claspr::access::{HostReadable, HostWritable, MemMode};
+use claspr::map_primitive;
 use claspr::util::{RetainedQueue, mapped_slice, mapped_slice_mut};
-use claspr::{Buffer, DeviceSlice, Error, Event, Launcher, MappedSlice, Result};
-use opencl3::command_queue::{
-    CommandQueue, enqueue_map_buffer, enqueue_svm_map, enqueue_svm_unmap, enqueue_unmap_mem_object,
-};
+use claspr::{Buffer, DeviceSlice, Event, Launcher, MappedSlice, Result};
+use opencl3::command_queue::CommandQueue;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, ClMem};
-use opencl3::types::{CL_NON_BLOCKING, cl_event, cl_map_flags};
+use opencl3::types::{cl_event, cl_map_flags};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use std::ptr;
-
-/// Wrap a raw cl3 status code into our typed [`Error`].
-fn cl_to_err(code: opencl3::types::cl_int) -> Error {
-    Error::OpenCl(opencl3::error_codes::ClError(code))
-}
 
 // ── Map-flag markers (host-side map access mode) ───────────────────
 //
@@ -208,28 +201,19 @@ where
         let len = Buffer::len(&buf);
         let size = len * std::mem::size_of::<T>();
         let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
-        let (wait_count, wait_ptr) = if wait_list.is_empty() {
-            (0, ptr::null())
-        } else {
-            (wait_list.len() as u32, wait_list.as_ptr())
-        };
-        let mut host_ptr_raw: opencl3::types::cl_mem = ptr::null_mut();
         // SAFETY: cl_mem is live (we hold the DeviceSlice); the
-        // map size matches the allocation's byte length; deps stays
-        // alive for the call.
-        let map_event = unsafe {
-            enqueue_map_buffer(
+        // map size matches the allocation's byte length; wait_list
+        // stays alive for the call.
+        let (host_ptr_raw, map_event) = unsafe {
+            map_primitive::map_buffer(
                 map_queue.raw(),
                 cl_mem,
-                CL_NON_BLOCKING,
+                false,
                 A::MAP_FLAGS,
                 0,
                 size,
-                &mut host_ptr_raw,
-                wait_count,
-                wait_ptr,
-            )
-            .map_err(cl_to_err)?
+                &wait_list,
+            )?
         };
         let view = DeviceSliceHostView {
             buf: Some(buf),
@@ -239,7 +223,7 @@ where
             unmap_done: false,
             _access: PhantomData,
         };
-        Ok((view, vec![wrap_event(Event::new(map_event))]))
+        Ok((view, vec![wrap_event(map_event)]))
     }
 }
 
@@ -306,21 +290,18 @@ impl<T, M: MemMode, A: MapAccess> Drop for DeviceSliceHostView<T, M, A> {
             // release which strict implementations reject.
             //
             // SAFETY: host_ptr came from our own acquire; map_queue
-            // and cl_mem are live (we hold the DeviceSlice). Wrap
-            // the resulting cl_event in claspr::Event so its Drop
-            // releases it without an explicit release_event call.
+            // and cl_mem are live (we hold the DeviceSlice).
             let res = unsafe {
-                enqueue_unmap_mem_object(
+                map_primitive::unmap_mem_object(
                     self.map_queue.raw(),
                     buf.buffer().get(),
                     self.host_ptr.cast(),
-                    0,
-                    ptr::null(),
+                    &[],
                 )
             };
             if let Ok(ev) = res {
-                let _ = opencl3::event::wait_for_events(&[ev]);
-                let _ = Event::new(ev); // drops, releases the event
+                let _ = ev.wait();
+                // `ev` drops here, releasing the cl_event.
             }
         }
         // The `map_queue: RetainedQueue` field drops after this body
@@ -373,26 +354,19 @@ where
             .expect("DeviceSliceHostView already released");
         let q_raw = ctx.cl_queue().get();
         let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
-        let (wait_count, wait_ptr) = if wait_list.is_empty() {
-            (0, ptr::null())
-        } else {
-            (wait_list.len() as u32, wait_list.as_ptr())
-        };
         // SAFETY: host_ptr is the mapped pointer from acquire;
         // cl_mem is the buffer it was mapped from.
         let unmap_event = unsafe {
-            enqueue_unmap_mem_object(
+            map_primitive::unmap_mem_object(
                 q_raw,
                 buf.buffer().get(),
                 view.host_ptr.cast(),
-                wait_count,
-                wait_ptr,
-            )
-            .map_err(cl_to_err)?
+                &wait_list,
+            )?
         };
         view.unmap_done = true; // suppress Drop's defensive unmap
         // view drops here — only the RetainedQueue release fires.
-        Ok((buf, vec![wrap_event(Event::new(unmap_event))]))
+        Ok((buf, vec![wrap_event(unmap_event)]))
     }
 }
 
@@ -551,26 +525,19 @@ where
         // Retain the queue for the view's defensive Drop-time unmap.
         let queue = RetainedQueue::from_queue(ctx.cl_queue())?;
         let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
-        let (wait_count, wait_ptr) = if wait_list.is_empty() {
-            (0, ptr::null())
-        } else {
-            (wait_list.len() as u32, wait_list.as_ptr())
-        };
         // SAFETY: non-blocking SVM map. `ptr` came from clSVMAlloc on
         // the same context; `size` is the allocation's exact byte
         // length. Wait-list events stay alive across the call via the
         // `deps` Vec.
         let map_event = unsafe {
-            enqueue_svm_map(
+            map_primitive::svm_map(
                 queue.raw(),
-                CL_NON_BLOCKING,
+                false,
                 A::MAP_FLAGS,
                 ptr.cast(),
                 size,
-                wait_count,
-                wait_ptr,
-            )
-            .map_err(cl_to_err)?
+                &wait_list,
+            )?
         };
         let view = MappedSliceHostView {
             buf: Some(buf),
@@ -578,7 +545,7 @@ where
             unmap_done: false,
             _access: PhantomData,
         };
-        Ok((view, vec![wrap_event(Event::new(map_event))]))
+        Ok((view, vec![wrap_event(map_event)]))
     }
 }
 
@@ -614,12 +581,11 @@ impl<T, M: MemMode, A: MapAccess> Drop for MappedSliceHostView<T, M, A> {
             //
             // SAFETY: ptr was mapped in acquire; unmap exactly once
             // per acquire (we never reach this branch if unmap_done).
-            let res =
-                unsafe { enqueue_svm_unmap(self.queue.raw(), buf.ptr().cast(), 0, ptr::null()) };
+            let res = unsafe { map_primitive::svm_unmap(self.queue.raw(), buf.ptr().cast(), &[]) };
             match res {
                 Ok(evt) => {
-                    let _ = opencl3::event::wait_for_events(&[evt]);
-                    buf.register_use(std::sync::Arc::new(Event::new(evt)));
+                    let _ = evt.wait();
+                    buf.register_use(std::sync::Arc::new(evt));
                 }
                 Err(_) => {
                     buf.ctx().record_err();
@@ -703,21 +669,14 @@ where
             .expect("MappedSliceHostView already released");
         let q_raw = ctx.cl_queue().get();
         let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
-        let (wait_count, wait_ptr) = if wait_list.is_empty() {
-            (0, ptr::null())
-        } else {
-            (wait_list.len() as u32, wait_list.as_ptr())
-        };
         // SAFETY: ptr was mapped in acquire; unmap exactly once.
-        let unmap_event = unsafe {
-            enqueue_svm_unmap(q_raw, buf.ptr().cast(), wait_count, wait_ptr).map_err(cl_to_err)?
-        };
+        let unmap_event = unsafe { map_primitive::svm_unmap(q_raw, buf.ptr().cast(), &wait_list)? };
         view.unmap_done = true; // suppress Drop's defensive unmap
         // Build one Arc<Event> reused as both the chain's Dep and the
         // MappedSlice's use-list entry — so its eventual SVMFree
         // queue-orders after the unmap regardless of when the
         // MappedSlice ends up dropping.
-        let arc_event = std::sync::Arc::new(Event::new(unmap_event));
+        let arc_event = std::sync::Arc::new(unmap_event);
         buf.register_use(std::sync::Arc::clone(&arc_event));
         // view drops here — only the retained queue release fires.
         Ok((buf, vec![arc_event]))

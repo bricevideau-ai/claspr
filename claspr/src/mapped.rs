@@ -42,18 +42,17 @@ use crate::buffer::Buffer;
 use crate::context::{Context, SvmLevel};
 use crate::error::{Error, Result};
 use crate::launch::KernelArg;
+use crate::map_primitive;
 use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
 use crate::queue::Launcher;
-use opencl3::command_queue::{enqueue_svm_map, enqueue_svm_unmap};
-use opencl3::event::{Event, release_event, retain_event};
+use opencl3::event::{Event, retain_event};
 use opencl3::kernel::ExecuteKernel;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, svm_alloc};
-use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_event, cl_int, cl_uint};
+use opencl3::types::{CL_NON_BLOCKING, cl_event, cl_int, cl_uint};
 use std::ffi::c_void;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
-use std::ptr;
 use std::sync::{Arc, Mutex};
 
 fn cl_to_err(code: cl_int) -> Error {
@@ -236,19 +235,10 @@ impl<T: Copy, M: MemMode> MappedSlice<T, M> {
         // we just allocated.
         let queue = ctx.cl_queue();
         unsafe {
-            enqueue_svm_map(
-                queue.get(),
-                opencl3::types::CL_BLOCKING,
-                CL_MAP_WRITE,
-                raw,
-                size,
-                0,
-                std::ptr::null(),
-            )
-            .map_err(cl_to_err)?;
+            let _map_evt = map_primitive::svm_map(queue.get(), true, CL_MAP_WRITE, raw, size, &[])?;
             // memcpy from host to the now-host-accessible SVM region.
             std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, raw as *mut u8, size);
-            enqueue_svm_unmap(queue.get(), raw, 0, std::ptr::null()).map_err(cl_to_err)?;
+            let _unmap_evt = map_primitive::svm_unmap(queue.get(), raw, &[])?;
         }
         Ok(MappedSlice {
             ptr: raw.cast::<T>(),
@@ -691,19 +681,17 @@ impl<'a, T, M: MemMode> MappedReadGuard<'a, T, M> {
     fn new<L: Launcher>(buf: &'a MappedSlice<T, M>, launcher: &L) -> Result<Self> {
         let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
         // SAFETY: blocking map for read; queue is alive (RetainedQueue).
-        let evt = unsafe {
-            enqueue_svm_map(
+        // `_evt` drops at end of statement and releases the cl_event.
+        let _evt = unsafe {
+            map_primitive::svm_map(
                 queue.raw(),
-                CL_BLOCKING,
+                true,
                 CL_MAP_READ,
                 buf.ptr.cast(),
                 buf.len * std::mem::size_of::<T>(),
-                0,
-                ptr::null(),
-            )
-            .map_err(cl_to_err)?
+                &[],
+            )?
         };
-        unsafe { release_event(evt).map_err(cl_to_err)? };
         Ok(MappedReadGuard { buf, queue })
     }
 }
@@ -722,12 +710,9 @@ impl<T, M: MemMode> Drop for MappedReadGuard<'_, T, M> {
         // SAFETY: ptr was mapped in `new`; unmap exactly once now.
         // The `queue: RetainedQueue` field drops after this body
         // returns, releasing the queue handle.
-        let unmap =
-            unsafe { enqueue_svm_unmap(self.queue.raw(), self.buf.ptr.cast(), 0, ptr::null()) };
-        if let Ok(evt) = unmap {
-            let _ = unsafe { release_event(evt) };
-        } else {
-            self.buf.ctx.record_err();
+        match unsafe { map_primitive::svm_unmap(self.queue.raw(), self.buf.ptr.cast(), &[]) } {
+            Ok(_evt) => {} // _evt drops here, releasing the cl_event
+            Err(_) => self.buf.ctx.record_err(),
         }
     }
 }
@@ -745,19 +730,17 @@ impl<'a, T, M: MemMode> MappedWriteGuard<'a, T, M> {
         let ptr = buf.ptr;
         let len = buf.len;
         // SAFETY: blocking map for read+write.
-        let evt = unsafe {
-            enqueue_svm_map(
+        // `_evt` drops at end of statement and releases the cl_event.
+        let _evt = unsafe {
+            map_primitive::svm_map(
                 queue.raw(),
-                CL_BLOCKING,
+                true,
                 CL_MAP_READ | CL_MAP_WRITE,
                 ptr.cast(),
                 len * std::mem::size_of::<T>(),
-                0,
-                ptr::null(),
-            )
-            .map_err(cl_to_err)?
+                &[],
+            )?
         };
-        unsafe { release_event(evt).map_err(cl_to_err)? };
         Ok(MappedWriteGuard { buf, queue })
     }
 }
@@ -780,12 +763,9 @@ impl<T, M: MemMode> DerefMut for MappedWriteGuard<'_, T, M> {
 
 impl<T, M: MemMode> Drop for MappedWriteGuard<'_, T, M> {
     fn drop(&mut self) {
-        let unmap =
-            unsafe { enqueue_svm_unmap(self.queue.raw(), self.buf.ptr.cast(), 0, ptr::null()) };
-        if let Ok(evt) = unmap {
-            let _ = unsafe { release_event(evt) };
-        } else {
-            self.buf.ctx.record_err();
+        match unsafe { map_primitive::svm_unmap(self.queue.raw(), self.buf.ptr.cast(), &[]) } {
+            Ok(_evt) => {} // _evt drops here, releasing the cl_event
+            Err(_) => self.buf.ctx.record_err(),
         }
     }
 }

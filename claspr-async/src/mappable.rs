@@ -35,17 +35,12 @@
 //! leak its mapped state. This is the only blocking call in the
 //! whole module, and only fires on the error path.
 
+use claspr::map_primitive;
 use claspr::util::{RetainedQueue, mapped_slice_mut};
 use claspr::{Buffer, DeviceSlice, Event, Result};
-use opencl3::command_queue::{CommandQueue, enqueue_map_buffer, enqueue_unmap_mem_object};
-use opencl3::error_codes::ClError;
+use opencl3::command_queue::CommandQueue;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, ClMem};
-use opencl3::types::{CL_NON_BLOCKING, cl_event, cl_mem};
-use std::ptr;
-
-fn cl_to_err(code: opencl3::types::cl_int) -> claspr::Error {
-    claspr::Error::OpenCl(ClError(code))
-}
+use opencl3::types::{cl_event, cl_mem};
 
 // ── Trait ───────────────────────────────────────────────────────────
 
@@ -142,17 +137,16 @@ impl<T> Drop for DeviceSliceMapHandle<T> {
             // SAFETY: host_ptr came from a successful map call on
             // self.cl_mem via self.map_queue. We unmap exactly once.
             let res = unsafe {
-                enqueue_unmap_mem_object(
+                map_primitive::unmap_mem_object(
                     self.map_queue.raw(),
                     self.cl_mem,
                     self.host_ptr.cast(),
-                    0,
-                    ptr::null(),
+                    &[],
                 )
             };
             if let Ok(ev) = res {
-                let _ = opencl3::event::wait_for_events(&[ev]);
-                let _ = Event::new(ev); // drops -> releases the event
+                let _ = ev.wait();
+                // `ev` drops here, releasing the cl_event.
             }
         }
         // The `map_queue: RetainedQueue` field drops after this body
@@ -179,29 +173,20 @@ where
         // defensive Drop-time unmap if anything between this map
         // and `enqueue_unmap` errors out.
         let map_queue = RetainedQueue::from_queue(queue)?;
-        let (wait_count, wait_ptr) = if deps.is_empty() {
-            (0, ptr::null())
-        } else {
-            (deps.len() as u32, deps.as_ptr())
-        };
-        let mut host_ptr_raw: *mut std::ffi::c_void = ptr::null_mut();
         // SAFETY: cl_mem is a live buffer (we just borrowed `&self`);
         // the size matches the allocation's element-count × element
         // size; deps points to live cl_events for the duration of
-        // this call; host_ptr_raw is a stable out-param.
-        let map_event = unsafe {
-            enqueue_map_buffer(
+        // this call.
+        let (host_ptr_raw, map_event) = unsafe {
+            map_primitive::map_buffer(
                 map_queue.raw(),
                 cl_mem,
-                CL_NON_BLOCKING,
+                false,
                 CL_MAP_READ | CL_MAP_WRITE,
                 0,
                 size,
-                &mut host_ptr_raw,
-                wait_count,
-                wait_ptr,
-            )
-            .map_err(cl_to_err)?
+                deps,
+            )?
         };
         let handle = DeviceSliceMapHandle {
             host_ptr: host_ptr_raw.cast::<T>(),
@@ -210,7 +195,7 @@ where
             len,
             unmap_enqueued: false,
         };
-        Ok((handle, vec![Event::new(map_event)]))
+        Ok((handle, vec![map_event]))
     }
 
     fn enqueue_unmap(
@@ -219,26 +204,14 @@ where
         wait_for: &[cl_event],
     ) -> Result<Vec<Event>> {
         let q_raw = queue.get();
-        let (wait_count, wait_ptr) = if wait_for.is_empty() {
-            (0, ptr::null())
-        } else {
-            (wait_for.len() as u32, wait_for.as_ptr())
-        };
         // SAFETY: handle.cl_mem is the buffer we mapped, host_ptr
         // is the pointer we got back. Enqueue exactly once per
         // map (the unmap_enqueued flag guards against double-unmap).
         let unmap_event = unsafe {
-            enqueue_unmap_mem_object(
-                q_raw,
-                handle.cl_mem,
-                handle.host_ptr.cast(),
-                wait_count,
-                wait_ptr,
-            )
-            .map_err(cl_to_err)?
+            map_primitive::unmap_mem_object(q_raw, handle.cl_mem, handle.host_ptr.cast(), wait_for)?
         };
         handle.unmap_enqueued = true;
-        Ok(vec![Event::new(unmap_event)])
+        Ok(vec![unmap_event])
     }
 
     fn view<'a>(handle: &'a mut Self::MapHandle) -> Self::View<'a> {

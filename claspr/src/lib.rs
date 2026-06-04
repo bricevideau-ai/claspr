@@ -69,6 +69,7 @@ pub mod future;
 pub mod image;
 pub mod kernel_op;
 pub mod launch;
+pub mod map_primitive;
 pub mod mapped;
 pub mod op;
 pub mod ppm;
