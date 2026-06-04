@@ -13,6 +13,7 @@ members = [
     "examples/two-device",
     "examples/async-pipeline",
     "examples/batch-inference",
+    "examples/spv-introspect",
     "tests/kernels",
     "tests/image-kernels",
     "tests/explicit-compile",

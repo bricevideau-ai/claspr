@@ -1,0 +1,15 @@
+[package]
+name = "spv_introspect_demo_kernel"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Tiny rust-gpu kernel set whose SPIR-V is introspected at runtime by the parent `spv-introspect-example` binary. Two kernels with distinct arg shapes (scalar + slice, dual slice) so the demo can show off the arg-table walker on multiple entry points."
+
+[workspace]
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+spirv-std = { git = "https://github.com/bricevideau-ai/rust-gpu.git", branch = "opencl-kernel-support" }
+glam = { version = ">=0.30.8, <0.33", default-features = false, features = ["libm"] }

@@ -4,6 +4,11 @@
 # spirv-builder compiles via a forked nightly + spirv target).
 # Also covers ui_test's per-fixture `target/ui/`.
 **/target/
+# Nested `Cargo.lock` files from kernel sub-crates that detach
+# themselves via `[workspace]`. The root workspace's Cargo.lock
+# stays tracked (root-anchored `/target` is excluded above, so
+# this isn't ambiguous with the root lockfile).
+**/kernel/Cargo.lock
 Cargo.lock.*
 *.swp
 *.ppm

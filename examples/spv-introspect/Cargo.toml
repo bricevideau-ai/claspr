@@ -1,0 +1,22 @@
+[package]
+name = "spv-introspect-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Runtime SPIR-V introspection demo — load a SPIR-V binary, walk every kernel entry point and dump its arg table via OpenCL's clGetKernelArgInfo. Showcases the no-build-script / no-typed-wrappers path now that `Kernels::load_from(&ctx, &spv)` exists."
+
+[[bin]]
+name = "spv_introspect_example"
+path = "src/main.rs"
+
+[dependencies]
+claspr = { path = "../../claspr" }
+opencl3.workspace = true
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true
