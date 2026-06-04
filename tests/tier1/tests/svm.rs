@@ -32,13 +32,13 @@ fn map_mut_then_map_round_trip() {
 
     let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     {
-        let mut view = buf.map_mut(&ctx).expect("map_mut");
+        let mut view = buf.map_mut().wait(&ctx).expect("map_mut");
         for (i, slot) in view.iter_mut().enumerate() {
             *slot = i as u32;
         }
     } // unmap on Drop
 
-    let view = buf.map(&ctx).expect("map");
+    let view = buf.map().wait(&ctx).expect("map");
     for (i, &v) in view.iter().enumerate() {
         assert_eq!(v, i as u32);
     }
@@ -63,7 +63,7 @@ fn drop_orders_after_cross_queue_unmap_via_last_use() {
     let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     // Write something so the unmap has data to flush.
     {
-        let mut view = buf.map_mut(&other_queue).expect("map_mut on aux");
+        let mut view = buf.map_mut().wait(&other_queue).expect("map_mut on aux");
         for slot in view.iter_mut() {
             *slot = 99;
         }
@@ -173,14 +173,14 @@ fn read_only_map_via_map_guard() {
     let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     {
         // Populate via map_mut...
-        let mut g = buf.map_mut(&ctx).expect("map_mut");
+        let mut g = buf.map_mut().wait(&ctx).expect("map_mut");
         for (i, slot) in g.iter_mut().enumerate() {
             *slot = (i as u32).wrapping_mul(7);
         }
     } // unmap
 
     // ...then read back via read-only map.
-    let g = buf.map(&ctx).expect("map");
+    let g = buf.map().wait(&ctx).expect("map");
     for (i, &v) in g.iter().enumerate() {
         assert_eq!(v, (i as u32).wrapping_mul(7));
     }
@@ -219,6 +219,6 @@ fn multi_kernel_svm_pipeline_via_typed_launchers() {
         .expect("scale after fill");
 
     // Read result via map: every slot is 4 * 5 = 20.
-    let g = buf.map(&ctx).expect("map");
+    let g = buf.map().wait(&ctx).expect("map");
     assert!(g.iter().all(|&v| v == 20));
 }

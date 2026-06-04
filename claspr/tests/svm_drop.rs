@@ -72,7 +72,7 @@ fn alloc_drop_with_map_in_between() -> Result<()> {
     {
         let mut buf = MappedSlice::<u32>::alloc(&ctx, 16)?;
         {
-            let mut guard = buf.map_mut(&ctx)?;
+            let mut guard = buf.map_mut().wait(&ctx)?;
             for (i, x) in guard.iter_mut().enumerate() {
                 *x = i as u32;
             }

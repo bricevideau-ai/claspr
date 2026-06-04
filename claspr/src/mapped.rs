@@ -285,30 +285,36 @@ impl<T, M: MemMode> MappedSlice<T, M> {
             .push(event);
     }
 
-    /// Map this buffer for host read access. Returns a RAII guard
-    /// that derefs to `&[T]` and unmaps on Drop.
+    /// Begin a host read map of this buffer. Returns a lazy [`MapOp`]
+    /// builder — call [`wait`](MapOp::wait) on it with a launcher to
+    /// actually issue the `clEnqueueSVMMap(CL_BLOCKING, CL_MAP_READ)`
+    /// and receive a RAII [`MappedReadGuard`] that derefs to `&[T]`
+    /// and unmaps on Drop.
     ///
-    /// The map is blocking — `clEnqueueSVMMap` with `CL_TRUE` for
-    /// the blocking flag and `CL_MAP_READ`.
-    pub fn map<'a, L: Launcher>(&'a self, launcher: &L) -> Result<MappedReadGuard<'a, T, M>>
+    /// Mirrors the late-bind pattern of every other claspr op
+    /// (`buf.write(&data).wait(&ctx)?`, `kernels.foo([N], buf).wait(&ctx)?`)
+    /// — the launcher arrives at the terminal, not at construction.
+    /// Non-blocking variant (`.submit(&launcher)`) is a deferred
+    /// follow-up (see `claspr-scope-launcher-followup` memory).
+    pub fn map(&self) -> MapOp<'_, T, M>
     where
         M: HostReadable,
     {
-        MappedReadGuard::new(self, launcher)
+        MapOp { owner: self }
     }
 
-    /// Map this buffer for host read+write access. Returns a RAII
-    /// guard that derefs to `&mut [T]` and unmaps on Drop. The
-    /// `&mut self` receiver gives the borrow checker the
-    /// exclusivity guarantee needed for `DerefMut`.
-    pub fn map_mut<'a, L: Launcher>(
-        &'a mut self,
-        launcher: &L,
-    ) -> Result<MappedWriteGuard<'a, T, M>>
+    /// Begin a host read+write map of this buffer. Returns a lazy
+    /// [`MapMutOp`] builder — call [`wait`](MapMutOp::wait) on it
+    /// with a launcher to issue the
+    /// `clEnqueueSVMMap(CL_BLOCKING, CL_MAP_READ | CL_MAP_WRITE)` and
+    /// receive a RAII [`MappedWriteGuard`] that derefs to `&mut [T]`
+    /// and unmaps on Drop. The `&mut self` receiver gives the borrow
+    /// checker the exclusivity guarantee needed for `DerefMut`.
+    pub fn map_mut(&mut self) -> MapMutOp<'_, T, M>
     where
         M: HostWritable + HostReadable,
     {
-        MappedWriteGuard::new(self, launcher)
+        MapMutOp { owner: self }
     }
 
     /// Raw SVM pointer for direct use (e.g. passing to a kernel arg
@@ -622,6 +628,53 @@ impl<T, M: MemMode> KernelArg for MappedSlice<T, M> {
         }
         let owned = Event::from(raw);
         self.register_use(Arc::new(owned));
+    }
+}
+
+// ── Map builders (Op shape, late-bind launcher) ────────────────────
+//
+// Construction is `buf.map()` / `buf.map_mut()` — no launcher yet,
+// just borrows `buf`. The terminal `.wait(&launcher)?` issues the
+// `clEnqueueSVMMap` and returns the matching guard. Matches the
+// post-`f19457d` Op pattern (`buf.write(&data).wait(&ctx)?`,
+// `kernels.foo([N], buf).wait(&ctx)?`).
+//
+// `.submit(&launcher)` (non-blocking) is intentionally not provided
+// yet — the design question for it is bigger than just adding the
+// terminal (see [[claspr-scope-launcher-followup]] for the
+// SVM-vs-cl_mem split). Today's chain users go through
+// `claspr-async`'s `host_view` combinator instead.
+
+/// Lazy builder for [`MappedSlice::map`]. Borrows the source buffer;
+/// the terminal `.wait(&launcher)?` issues the blocking SVM map and
+/// returns a [`MappedReadGuard`].
+pub struct MapOp<'a, T, M: MemMode> {
+    owner: &'a MappedSlice<T, M>,
+}
+
+impl<'a, T, M: MemMode + HostReadable> MapOp<'a, T, M> {
+    /// Blocking terminal — enqueue `clEnqueueSVMMap(CL_TRUE, CL_MAP_READ)`
+    /// on `launcher`'s queue and return a RAII guard that derefs to
+    /// `&[T]` and unmaps on Drop.
+    pub fn wait<L: Launcher>(self, launcher: &L) -> Result<MappedReadGuard<'a, T, M>> {
+        MappedReadGuard::new(self.owner, launcher)
+    }
+}
+
+/// Lazy builder for [`MappedSlice::map_mut`]. Borrows the source
+/// buffer mutably; the terminal `.wait(&launcher)?` issues the
+/// blocking SVM map and returns a [`MappedWriteGuard`].
+pub struct MapMutOp<'a, T, M: MemMode> {
+    owner: &'a mut MappedSlice<T, M>,
+}
+
+impl<'a, T, M: MemMode + HostWritable + HostReadable> MapMutOp<'a, T, M> {
+    /// Blocking terminal — enqueue
+    /// `clEnqueueSVMMap(CL_TRUE, CL_MAP_READ | CL_MAP_WRITE)` on
+    /// `launcher`'s queue and return a RAII guard that derefs to
+    /// `&mut [T]` and unmaps on Drop.
+    pub fn wait<L: Launcher>(self, launcher: &L) -> Result<MappedWriteGuard<'a, T, M>> {
+        MappedWriteGuard::new(self.owner, launcher)
     }
 }
 

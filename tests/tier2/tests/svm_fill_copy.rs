@@ -32,7 +32,7 @@ fn tier1_svm_fill_writes_pattern() {
     let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
     buf.fill(0xDEAD_BEEFu32).wait(&ctx).expect("fill");
 
-    let g = buf.map(&ctx).expect("map");
+    let g = buf.map().wait(&ctx).expect("map");
     assert!(g.iter().all(|&v| v == 0xDEAD_BEEF));
     drop(g);
     drop(buf);
@@ -51,7 +51,7 @@ fn tier1_svm_copy_to_propagates_contents() {
     src.fill(42u32).wait(&ctx).expect("fill src");
     src.copy_to(&dst).wait(&ctx).expect("copy src→dst");
 
-    let g = dst.map(&ctx).expect("map dst");
+    let g = dst.map().wait(&ctx).expect("map dst");
     assert!(g.iter().all(|&v| v == 42));
     drop(g);
     // Drop src first — last_use should include the copy event,
@@ -90,7 +90,7 @@ fn tier2_mapped_slice_filled_threads_into_kernel() {
         .sync(&ctx)
         .expect("filled svm chain");
     assert_eq!(buf.len(), N);
-    let g = buf.map(&ctx).expect("map");
+    let g = buf.map().wait(&ctx).expect("map");
     assert!(g.iter().all(|&v| v == 10));
 }
 
@@ -108,7 +108,7 @@ fn tier2_mapped_slice_upload_threads_into_kernel() {
         .sync(&ctx)
         .expect("upload + scale");
     assert_eq!(buf.len(), 8);
-    let g = buf.map(&ctx).expect("map");
+    let g = buf.map().wait(&ctx).expect("map");
     assert_eq!(&g[..], &[3u32, 6, 9, 12, 15, 18, 21, 24]);
 }
 
@@ -122,7 +122,7 @@ fn macro_mapped_slice_repeat_arm() {
         .and_then(|buf| kernels.scale_u32([N], buf, 5))
         .sync(&ctx)
         .expect("macro repeat");
-    let g = buf.map(&ctx).expect("map");
+    let g = buf.map().wait(&ctx).expect("map");
     assert!(g.iter().all(|&v| v == 20));
 }
 
@@ -136,7 +136,7 @@ fn macro_mapped_slice_literal_arm() {
         .and_then(|buf| kernels.scale_u32([4], buf, 2))
         .sync(&ctx)
         .expect("macro literal");
-    let g = buf.map(&ctx).expect("map");
+    let g = buf.map().wait(&ctx).expect("map");
     assert_eq!(&g[..], &[20u32, 40, 60, 80]);
 }
 

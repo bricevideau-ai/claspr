@@ -49,7 +49,7 @@ fn mapped_slice_threads_through_typed_launchers() {
         .wait(&ctx)
         .expect("scale");
 
-    let g = buf.map(&ctx).expect("map");
+    let g = buf.map().wait(&ctx).expect("map");
     let result_sum: u32 = g.iter().copied().sum();
     drop(g);
 

@@ -161,7 +161,7 @@ fn mapped_slice_acquire_release_round_trip() {
         .expect("MappedSlice round-trip");
 
     // Re-acquire via Tier 1 to read back without another chain.
-    let guard = buf.map_mut(&ctx).expect("re-map");
+    let guard = buf.map_mut().wait(&ctx).expect("re-map");
     assert!(
         guard.iter().all(|&v| v == 11),
         "host writes should persist via SVM"
@@ -186,7 +186,7 @@ fn mapped_slice_acquire_release_read_only() {
     // Seed the MappedSlice via Tier 1 first.
     let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("MappedSlice alloc");
     {
-        let mut guard = buf.map_mut(&ctx).expect("seed map");
+        let mut guard = buf.map_mut().wait(&ctx).expect("seed map");
         for (i, x) in guard.iter_mut().enumerate() {
             *x = 100 + i as u32;
         }
@@ -216,7 +216,7 @@ fn mapped_slice_acquire_release_read_only() {
     // Buffer is unchanged — re-map and verify the original seed
     // values survived (read-only map doesn't write back).
     let mut buf = buf;
-    let guard = buf.map_mut(&ctx).expect("verify map");
+    let guard = buf.map_mut().wait(&ctx).expect("verify map");
     for (i, &v) in guard.iter().enumerate() {
         assert_eq!(v, 100 + i as u32, "read-only map must not modify data");
     }
