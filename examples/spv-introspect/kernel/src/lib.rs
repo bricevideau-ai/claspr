@@ -7,11 +7,6 @@
 //! different `cl_kernel_arg_address_qualifier` values
 //! (CL_KERNEL_ARG_ADDRESS_GLOBAL for slices, _PRIVATE for scalars)
 //! and varying mutability on the same kernel.
-//!
-//! Read-then-write shapes (`data[i] = data[i].wrapping_mul(0).wrapping_add(value)`,
-//! `out[i] = out[i].wrapping_mul(0).wrapping_add(a[i].wrapping_add(b[i]))`)
-//! survive spirv-opt's dead-store elimination — same trick
-//! `tests/kernels` uses.
 
 #![no_std]
 
@@ -25,7 +20,7 @@ pub fn fill_u32(
     value: u32,
 ) {
     let i = id.x;
-    data[i] = data[i].wrapping_mul(0).wrapping_add(value);
+    data[i] = value;
 }
 
 #[spirv(kernel)]
@@ -36,5 +31,5 @@ pub fn add_u32(
     #[spirv(cross_workgroup)] out: &mut [u32],
 ) {
     let i = id.x;
-    out[i] = out[i].wrapping_mul(0).wrapping_add(a[i].wrapping_add(b[i]));
+    out[i] = a[i].wrapping_add(b[i]);
 }

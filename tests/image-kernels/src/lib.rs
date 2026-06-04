@@ -122,7 +122,7 @@ pub mod dim2_float {
         }
         let pixel: Vec4 = unsafe { image.read(Int2::new(px as i32, py as i32)) };
         let i = (py * width + px) as usize;
-        out[i] = out[i] * 0.0 + pixel.x;
+        out[i] = pixel.x;
     }
 }
 
@@ -168,7 +168,7 @@ pub mod dim2_sint {
         }
         let pixel: IVec4 = unsafe { image.read(Int2::new(px as i32, py as i32)) };
         let i = (py * width + px) as usize;
-        out[i] = out[i].wrapping_mul(0).wrapping_add(pixel.x);
+        out[i] = pixel.x;
     }
 }
 
@@ -277,7 +277,7 @@ pub mod dim_buffer_uint {
         }
         let pixel: UVec4 = unsafe { image.read(px as i32) };
         let i = px as usize;
-        out[i] = out[i].wrapping_mul(0).wrapping_add(pixel.x);
+        out[i] = pixel.x;
     }
 }
 

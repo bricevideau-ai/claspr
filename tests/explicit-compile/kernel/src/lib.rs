@@ -1,9 +1,8 @@
 //! Trivial rust-gpu kernel crate exercising the explicit
 //! `claspr_build::compile(...)` path.
 //!
-//! Shape mirrors `tests/kernels`'s `fill_u32` — read-then-write so
-//! it survives rust-gpu's optimizer, no fp64 / no images / no
-//! groups so the OpenCL 1.2 target accepts it on every ICD.
+//! Shape mirrors `tests/kernels`'s `fill_u32`. No fp64 / no images
+//! / no groups so the OpenCL 1.2 target accepts it on every ICD.
 
 #![no_std]
 
@@ -17,5 +16,5 @@ pub fn fill_u32(
     value: u32,
 ) {
     let i = id.x;
-    data[i] = data[i].wrapping_mul(0).wrapping_add(value);
+    data[i] = value;
 }

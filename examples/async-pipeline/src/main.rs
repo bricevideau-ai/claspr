@@ -56,14 +56,8 @@ pub mod gpu {
         threshold: u32,
     ) {
         let i = id.x;
-        // Read-then-write: avoid the rust-gpu pure-write codegen
-        // gotcha (the same pattern claspr-test-kernels documents in
-        // its module comment).
-        let v = data[i];
-        if v < threshold {
-            data[i] = v.wrapping_mul(0);
-        } else {
-            data[i] = v;
+        if data[i] < threshold {
+            data[i] = 0;
         }
     }
 }

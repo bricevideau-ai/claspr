@@ -68,14 +68,7 @@ mod tests {
         };
         let kernels = gpu::Kernels::load_from(&ctx, generated::SPV_BYTES).expect("load kernels");
 
-        let mut buf = DeviceSlice::<u32>::alloc(&ctx, 64).expect("alloc");
-        // Seed with 1s so the fill has something to overwrite — the
-        // kernel does `data[i] = data[i].wrapping_mul(0).wrapping_add(value)`
-        // (read-then-write to survive spirv-opt), so an unreadable
-        // initial state would feed UB to the mul, even though the
-        // mul-by-0 erases it.
-        let seed = vec![1u32; 64];
-        buf.write(&ctx, &seed).wait().expect("seed write");
+        let buf = DeviceSlice::<u32>::alloc(&ctx, 64).expect("alloc");
 
         let buf = kernels
             .fill_u32([64usize], buf, 0xdead_beefu32)

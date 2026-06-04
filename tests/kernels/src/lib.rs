@@ -1,9 +1,8 @@
 //! Simple, portable kernels used by claspr's runtime integration tests.
 //!
-//! Shapes mirror the patterns from rust-gpu's `tests/compiletests/ui/lang/kernel/slices/`
-//! (fill / copy / safe_read_write / dynamic_index) — anything outside
-//! that set risks tripping spirv-opt / spirv-val edge cases we'd
-//! otherwise be debugging instead of validating the runtime.
+//! Shapes mirror the patterns from rust-gpu's
+//! `tests/compiletests/ui/lang/kernel/slices/` (fill / copy /
+//! safe_read_write / dynamic_index) — well-trodden ground.
 //!
 //! ## Two device modules
 //!
@@ -26,18 +25,11 @@
 //! - **OpenCL 1.2 only**, max portability across pocl / rusticl / Intel.
 //! - **`u32` and `f64` scalars / slices only** — no vector or struct
 //!   args.
-//! - **Read-then-write bodies only** (`data[i] = f(data[i], ...)`).
-//!   Writes that don't first read the slice trip rust-gpu's pipeline
-//!   on the same workspace where read-then-write builds clean. For
-//!   the `f64` fills, callers must write a *finite* initial value
-//!   first (alloc → write → fill) — otherwise the `data[i] * 0.0`
-//!   trick that dodges spirv-opt produces NaN on uninit memory.
 //! - **One operation per kernel** — runtime tests compose them.
 
 #[claspr::device]
 pub mod kernels {
-    /// Replace every element with `value` (encoded as `data[i] * 0 + value`
-    /// so the codegen sees a read-then-write — see module docs for why).
+    /// Replace every element with `value`.
     #[claspr::kernel]
     pub fn fill_u32(
         #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
@@ -45,7 +37,7 @@ pub mod kernels {
         value: u32,
     ) {
         let i = id.x;
-        data[i] = data[i].wrapping_mul(0).wrapping_add(value);
+        data[i] = value;
     }
 
     /// Element-wise `out[i] = a[i] + b[i]`.
@@ -71,10 +63,7 @@ pub mod kernels {
         data[i] = data[i].wrapping_mul(factor);
     }
 
-    /// `dst[i] = src[i]`. The `wrapping_add(0)` keeps spirv-opt from
-    /// dropping the kernel — the simpler `dst[i] = src[i]` survives
-    /// rust-gpu codegen but vanishes during opt, leaving the kernel
-    /// out of the entry-point list.
+    /// `dst[i] = src[i]`.
     #[claspr::kernel]
     pub fn copy_u32(
         #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
@@ -82,16 +71,14 @@ pub mod kernels {
         #[spirv(cross_workgroup)] dst: &mut [u32],
     ) {
         let i = id.x;
-        dst[i] = src[i].wrapping_add(0);
+        dst[i] = src[i];
     }
 }
 
 #[claspr::device]
 pub mod kernels_f64 {
     /// Replace every element with `value` — the `f64` analogue of
-    /// `fill_u32`. The `data[i] * 0.0 + value` shape preserves the
-    /// read-then-write the codegen wants. NaN-safe only when callers
-    /// have written a finite initial value first (see module docs).
+    /// `fill_u32`.
     #[claspr::kernel]
     pub fn fill_f64(
         #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
@@ -99,11 +86,11 @@ pub mod kernels_f64 {
         value: f64,
     ) {
         let i = id.x;
-        data[i] = data[i] * 0.0 + value;
+        data[i] = value;
     }
 
     /// Multiply every element by `factor` in place — the `f64`
-    /// analogue of `scale_u32`. Naturally read-then-write.
+    /// analogue of `scale_u32`.
     #[claspr::kernel]
     pub fn scale_f64(
         #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
