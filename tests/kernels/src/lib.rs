@@ -7,10 +7,11 @@
 //! ## Two device modules
 //!
 //! - [`mod@kernels`] — u32-only kernels (`fill_u32` / `add_u32` /
-//!   `scale_u32` / `copy_u32`). Compiled without `Capability::Float64`
-//!   so the emitted SPIR-V is consumable by every backend, including
-//!   devices that don't support fp64 at all (e.g. rusticl/iris on
-//!   Ice Lake, which SEGVs when handed a `Float64`-declaring program).
+//!   `scale_u32` / `copy_u32` / `local_id_u32` / `global_id_u32`).
+//!   Compiled without `Capability::Float64` so the emitted SPIR-V is
+//!   consumable by every backend, including devices that don't
+//!   support fp64 at all (e.g. rusticl/iris on Ice Lake, which SEGVs
+//!   when handed a `Float64`-declaring program).
 //! - [`mod@kernels_f64`] — `fill_f64` / `scale_f64`. Compiled *with*
 //!   `Capability::Float64`. Runtime tests that load this module skip
 //!   when the device doesn't advertise fp64.
@@ -72,6 +73,32 @@ pub mod kernels {
     ) {
         let i = id.x;
         dst[i] = src[i];
+    }
+
+    /// Write `local_invocation_id().x` into the global slot — used by
+    /// runtime tests to verify the local work-size took effect. With
+    /// `local=[L]`, the output should be `[0, 1, …, L-1]` repeating
+    /// once per workgroup.
+    #[claspr::kernel]
+    pub fn local_id_u32(
+        #[spirv(global_invocation_id)] gid: ::glam::USizeVec3,
+        #[spirv(local_invocation_id)] lid: ::glam::USizeVec3,
+        #[spirv(cross_workgroup)] data: &mut [u32],
+    ) {
+        data[gid.x] = lid.x as u32;
+    }
+
+    /// Write `global_invocation_id().x` into the global slot — used by
+    /// runtime tests to verify `global_offset` took effect. With
+    /// `global_size=[N]` and `global_offset=[K]`,
+    /// `global_invocation_id().x` ranges over `K..K+N` and writes land
+    /// at the same indices.
+    #[claspr::kernel]
+    pub fn global_id_u32(
+        #[spirv(global_invocation_id)] gid: ::glam::USizeVec3,
+        #[spirv(cross_workgroup)] data: &mut [u32],
+    ) {
+        data[gid.x] = gid.x as u32;
     }
 }
 
