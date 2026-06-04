@@ -156,11 +156,11 @@ pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync + 'stati
 /// Both [`CompileBuilder`] and [`HostBuilder`] embed one and apply it
 /// to a fresh [`SpirvBuilder`] at terminal-call time. Call order
 /// doesn't matter — `target_env` no longer rebuilds anything mid-chain.
-#[derive(Default)]
 struct SpirvBuilderSettings {
     target_env: String,
     capabilities: Vec<Capability>,
     panic_strategy: Option<ShaderPanicStrategy>,
+    spirv_metadata: SpirvMetadata,
     customizers: Vec<Box<dyn Fn(SpirvBuilder) -> SpirvBuilder>>,
 }
 
@@ -168,7 +168,21 @@ impl SpirvBuilderSettings {
     fn new() -> Self {
         Self {
             target_env: "spirv-unknown-opencl1.2".to_string(),
-            ..Self::default()
+            capabilities: Vec::new(),
+            panic_strategy: None,
+            // `NameVariables` adds `OpName` for kernel-arg interface
+            // variables so `clGetKernelArgInfo`'s name field has
+            // something to recover. spirv-builder's own default is
+            // `None` (strip everything), which silently breaks
+            // arg-name introspection on every ICD; the cost of
+            // `NameVariables` is a few hundred bytes per kernel,
+            // worth it for the runtime debuggability win. `Full`
+            // adds `OpLine` debug info too — useful for source-line
+            // backtraces, but currently trips SPIRV-LLVM-Translator
+            // on PoCL ≤ 7.2-pre. Users who want either extreme can
+            // override via `.spirv_metadata(...)`.
+            spirv_metadata: SpirvMetadata::NameVariables,
+            customizers: Vec::new(),
         }
     }
 
@@ -185,6 +199,7 @@ impl SpirvBuilderSettings {
         if let Some(ps) = self.panic_strategy {
             sb = sb.shader_panic_strategy(ps);
         }
+        sb = sb.spirv_metadata(self.spirv_metadata);
         for f in &self.customizers {
             sb = f(sb);
         }
@@ -238,6 +253,29 @@ impl CompileBuilder {
     /// Set the panic strategy used by SPIR-T to lower `panic!`/`abort`.
     pub fn panic_strategy(mut self, strategy: ShaderPanicStrategy) -> Self {
         self.settings.panic_strategy = Some(strategy);
+        self
+    }
+
+    /// Control what debug metadata (`OpName` / `OpLine`) is emitted
+    /// into the SPIR-V binary. claspr-build defaults to
+    /// [`SpirvMetadata::NameVariables`] so kernel-arg names survive
+    /// `clGetKernelArgInfo` round-trip — spirv-builder's own
+    /// default of [`SpirvMetadata::None`] silently breaks
+    /// arg-name introspection.
+    ///
+    /// - [`SpirvMetadata::None`] — strip everything. Smallest
+    ///   binary; no arg names recoverable from the ICD.
+    /// - [`SpirvMetadata::NameVariables`] (default) — `OpName`
+    ///   for interface variables. Few-hundred-bytes-per-kernel
+    ///   cost; arg names become recoverable on PoCL ≥ 7.2 / Intel
+    ///   NEO / rusticl.
+    /// - [`SpirvMetadata::Full`] — `OpName` + `OpLine`. Useful for
+    ///   source-line backtraces in driver diagnostics. Trips
+    ///   SPIRV-LLVM-Translator on PoCL ≤ 7.2-pre with an
+    ///   unimplemented-opcode assertion; use sparingly until that
+    ///   is fixed upstream.
+    pub fn spirv_metadata(mut self, metadata: SpirvMetadata) -> Self {
+        self.settings.spirv_metadata = metadata;
         self
     }
 
@@ -537,6 +575,16 @@ impl HostBuilder {
     /// Set the panic strategy.
     pub fn panic_strategy(mut self, strategy: ShaderPanicStrategy) -> Self {
         self.settings.panic_strategy = Some(strategy);
+        self
+    }
+
+    /// Control what debug metadata (`OpName` / `OpLine`) is emitted
+    /// into the SPIR-V binary. See
+    /// [`CompileBuilder::spirv_metadata`] for the full rationale —
+    /// claspr-build defaults to [`SpirvMetadata::NameVariables`]
+    /// for arg-name introspection.
+    pub fn spirv_metadata(mut self, metadata: SpirvMetadata) -> Self {
+        self.settings.spirv_metadata = metadata;
         self
     }
 
