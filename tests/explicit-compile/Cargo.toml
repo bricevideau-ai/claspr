@@ -1,0 +1,20 @@
+[package]
+name = "claspr-explicit-compile-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "End-to-end coverage for the `claspr_build::compile().write_to(...)` path + the `claspr::kernels!` host-side macro. Locks in correctness of both halves of the runtime-codegen flow."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+claspr = { path = "../../claspr" }
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true

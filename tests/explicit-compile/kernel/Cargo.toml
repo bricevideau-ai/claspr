@@ -1,0 +1,24 @@
+[package]
+name = "claspr_explicit_compile_kernel"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Tiny rust-gpu kernel crate exercised by the explicit `claspr_build::compile` path. Compiled to SPIR-V by the parent crate's build.rs."
+
+# Standalone workspace — this crate is *inside* the claspr workspace
+# tree but must compile via spirv-builder, which forks its own
+# nightly toolchain + spirv target. Detaching from the parent
+# workspace prevents cargo from trying to associate it with the host
+# workspace.
+[workspace]
+
+[lib]
+crate-type = ["dylib"]
+
+# Direct git deps because this crate is its own workspace and can't
+# inherit from `[workspace.dependencies]`. The branch + version
+# floor must match the rest of the workspace; bump together with
+# the host pin if rust-gpu moves.
+[dependencies]
+spirv-std = { git = "https://github.com/bricevideau-ai/rust-gpu.git", branch = "opencl-kernel-support" }
+glam = { version = ">=0.30.8, <0.33", default-features = false, features = ["libm"] }

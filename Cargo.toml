@@ -15,6 +15,7 @@ members = [
     "examples/batch-inference",
     "tests/kernels",
     "tests/image-kernels",
+    "tests/explicit-compile",
     "tests/tier1",
     "tests/tier2",
 ]

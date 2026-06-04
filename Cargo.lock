@@ -321,6 +321,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "claspr-explicit-compile-test"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+ "claspr-build",
+]
+
+[[package]]
 name = "claspr-macros"
 version = "0.0.0"
 dependencies = [

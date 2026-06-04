@@ -113,7 +113,7 @@ pub use mapped::{MappedReadGuard, MappedSlice, MappedWriteGuard, SvmCopyOp, SvmF
 pub use usm::USMSlice;
 
 // Stage-3 proc-macro frontend.
-pub use claspr_macros::{device, kernel};
+pub use claspr_macros::{device, kernel, kernels};
 
 // Re-exports from opencl3 — the types users actually touch through
 // claspr's API.

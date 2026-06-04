@@ -1,7 +1,9 @@
 /target
-# ui_test writes per-fixture compile artifacts to
-# `<crate>/target/ui/...`; not the workspace's root target dir.
-**/target/ui/
+# Nested `target/` dirs from sub-crates that act as their own
+# `[workspace]` (notably `tests/explicit-compile/kernel/`, which
+# spirv-builder compiles via a forked nightly + spirv target).
+# Also covers ui_test's per-fixture `target/ui/`.
+**/target/
 Cargo.lock.*
 *.swp
 *.ppm
