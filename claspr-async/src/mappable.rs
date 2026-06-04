@@ -37,7 +37,7 @@
 
 use claspr::map_primitive;
 use claspr::util::{RetainedQueue, mapped_slice_mut};
-use claspr::{Buffer, DeviceSlice, Event, Result};
+use claspr::{Buffer, Context, DeviceSlice, Event, Result};
 use opencl3::command_queue::CommandQueue;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, ClMem};
 use opencl3::types::{cl_event, cl_mem};
@@ -119,6 +119,11 @@ pub struct DeviceSliceMapHandle<T> {
     /// blocking unmap path can use it even if the original
     /// `CommandQueue` was dropped by the caller.
     map_queue: RetainedQueue,
+    /// `Context` clone for `record_err` on Drop-path unmap failure —
+    /// matches the policy used by the SVM-side `MappedSliceHostView`
+    /// and the Tier 1 SVM guards. `Context` is `Arc`-backed so the
+    /// clone is cheap.
+    ctx: Context,
     len: usize,
     /// `true` once `enqueue_unmap` ran. If the handle drops with
     /// this still `false`, `Drop` issues a blocking unmap to keep
@@ -144,9 +149,12 @@ impl<T> Drop for DeviceSliceMapHandle<T> {
                     &[],
                 )
             };
-            if let Ok(ev) = res {
-                let _ = ev.wait();
-                // `ev` drops here, releasing the cl_event.
+            match res {
+                Ok(ev) => {
+                    let _ = ev.wait();
+                    // `ev` drops here, releasing the cl_event.
+                }
+                Err(_) => self.ctx.record_err(),
             }
         }
         // The `map_queue: RetainedQueue` field drops after this body
@@ -192,6 +200,7 @@ where
             host_ptr: host_ptr_raw.cast::<T>(),
             cl_mem,
             map_queue,
+            ctx: self.ctx().clone(),
             len,
             unmap_enqueued: false,
         };

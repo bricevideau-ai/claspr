@@ -10,7 +10,7 @@ error[E0382]: borrow of moved value: `view`
    |                         ^^^^^ value borrowed here after move
    |
 note: `DeviceSliceHostView::<T, M, A>::release_to_device` takes ownership of the receiver `self`, which moves `view`
-  --> claspr-async/src/host_view.rs:321:29
+  --> claspr-async/src/host_view.rs:324:29
    = note: borrow occurs due to deref coercion to `[u32]`
 
 error: aborting due to 1 previous error

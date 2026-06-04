@@ -299,9 +299,12 @@ impl<T, M: MemMode, A: MapAccess> Drop for DeviceSliceHostView<T, M, A> {
                     &[],
                 )
             };
-            if let Ok(ev) = res {
-                let _ = ev.wait();
-                // `ev` drops here, releasing the cl_event.
+            match res {
+                Ok(ev) => {
+                    let _ = ev.wait();
+                    // `ev` drops here, releasing the cl_event.
+                }
+                Err(_) => buf.ctx().record_err(),
             }
         }
         // The `map_queue: RetainedQueue` field drops after this body
