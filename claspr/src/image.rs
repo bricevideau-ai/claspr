@@ -882,6 +882,162 @@ impl<'a, T: Copy> ImageFillOp<'a, T> {
     }
 }
 
+// ── ImageHostTransfer trait ────────────────────────────────────────
+//
+// Abstracts the per-image-type alloc / pixel-count / write / read
+// surface so a single pair of Tier 2 combinators (`image_upload` /
+// `image_download` in `claspr-async`) can handle every image type.
+// Each image type implements this with its own `Dims` shape: 1D
+// gets `u32`, 2D gets `(u32, u32)`, 3D gets `(u32, u32, u32)`, etc.
+//
+// This is a trait rather than a generic struct because the per-dim
+// `alloc` signatures are genuinely different — there's no
+// single-parameter constructor that works for all of them. The
+// trait lets users name the image type at the call site
+// (`image_upload::<Image2D<RW, R32Uint>>(pixels, (32, 32))`) and
+// the combinator dispatches to the right `alloc` + region shape.
+
+/// Polymorphism over the owning image types ([`Image2D`] /
+/// [`Image1D`] / [`Image3D`] / [`Image1DArray`] / [`Image2DArray`])
+/// so a single Tier 2 transfer combinator can produce or consume
+/// any of them. Implemented by every owning image type.
+///
+/// `Image1DBuffer` is **not** included — it shares storage with a
+/// `cl_mem` buffer, so the natural chain shape there is to upload
+/// a `DeviceSlice<T>` first then `Image1DBufferView::view_of(&slice)`
+/// to view it. The trait's `alloc` would also need an `image-buffer`
+/// distinct signature.
+pub trait ImageHostTransfer: Sized + Send + 'static {
+    /// Dimension args for [`alloc`](Self::alloc). Concrete shape
+    /// per image type — `u32` for 1D, `(u32, u32)` for 2D and
+    /// 1DArray, `(u32, u32, u32)` for 3D and 2DArray.
+    type Dims: Copy + Send + 'static;
+    /// The pixel type (`F::Pixel`).
+    type Pixel: Send + 'static;
+
+    /// Allocate an image of the given dims on `ctx`.
+    fn alloc(ctx: &Context, dims: Self::Dims) -> Result<Self>;
+
+    /// Number of pixels in this image — product of all dimensions.
+    /// Used by the combinator to size the host `Vec<Pixel>` on
+    /// download.
+    fn pixel_count(&self) -> usize;
+
+    /// Construct a write Op for this image. Returned Op's pixel
+    /// length must equal [`pixel_count`](Self::pixel_count).
+    fn write_op<'a>(&'a mut self, pixels: &'a [Self::Pixel]) -> ImageWriteOp<'a, Self::Pixel>;
+
+    /// Construct a read Op into `dst`. `dst.len()` must equal
+    /// [`pixel_count`](Self::pixel_count) — returns
+    /// `Error::LengthMismatch` otherwise.
+    fn read_op<'a>(&'a self, dst: &'a mut [Self::Pixel]) -> Result<ImageReadOp<'a, Self::Pixel>>;
+}
+
+impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static> ImageHostTransfer
+    for Image2D<A, F>
+where
+    F::Pixel: Send + 'static,
+{
+    type Dims = (u32, u32);
+    type Pixel = F::Pixel;
+    fn alloc(ctx: &Context, dims: (u32, u32)) -> Result<Self> {
+        Image2D::alloc(ctx, dims.0, dims.1)
+    }
+    fn pixel_count(&self) -> usize {
+        (self.width() as usize) * (self.height() as usize)
+    }
+    fn write_op<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
+        self.write(pixels)
+    }
+    fn read_op<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
+        self.read(dst)
+    }
+}
+
+impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static> ImageHostTransfer
+    for Image1D<A, F>
+where
+    F::Pixel: Send + 'static,
+{
+    type Dims = u32;
+    type Pixel = F::Pixel;
+    fn alloc(ctx: &Context, width: u32) -> Result<Self> {
+        Image1D::alloc(ctx, width)
+    }
+    fn pixel_count(&self) -> usize {
+        self.width() as usize
+    }
+    fn write_op<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
+        self.write(pixels)
+    }
+    fn read_op<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
+        self.read(dst)
+    }
+}
+
+impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static> ImageHostTransfer
+    for Image3D<A, F>
+where
+    F::Pixel: Send + 'static,
+{
+    type Dims = (u32, u32, u32);
+    type Pixel = F::Pixel;
+    fn alloc(ctx: &Context, dims: (u32, u32, u32)) -> Result<Self> {
+        Image3D::alloc(ctx, dims.0, dims.1, dims.2)
+    }
+    fn pixel_count(&self) -> usize {
+        (self.width() as usize) * (self.height() as usize) * (self.depth() as usize)
+    }
+    fn write_op<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
+        self.write(pixels)
+    }
+    fn read_op<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
+        self.read(dst)
+    }
+}
+
+impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static> ImageHostTransfer
+    for Image1DArray<A, F>
+where
+    F::Pixel: Send + 'static,
+{
+    type Dims = (u32, u32);
+    type Pixel = F::Pixel;
+    fn alloc(ctx: &Context, dims: (u32, u32)) -> Result<Self> {
+        Image1DArray::alloc(ctx, dims.0, dims.1)
+    }
+    fn pixel_count(&self) -> usize {
+        (self.width() as usize) * (self.array_size() as usize)
+    }
+    fn write_op<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
+        self.write(pixels)
+    }
+    fn read_op<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
+        self.read(dst)
+    }
+}
+
+impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static> ImageHostTransfer
+    for Image2DArray<A, F>
+where
+    F::Pixel: Send + 'static,
+{
+    type Dims = (u32, u32, u32);
+    type Pixel = F::Pixel;
+    fn alloc(ctx: &Context, dims: (u32, u32, u32)) -> Result<Self> {
+        Image2DArray::alloc(ctx, dims.0, dims.1, dims.2)
+    }
+    fn pixel_count(&self) -> usize {
+        (self.width() as usize) * (self.height() as usize) * (self.array_size() as usize)
+    }
+    fn write_op<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
+        self.write(pixels)
+    }
+    fn read_op<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
+        self.read(dst)
+    }
+}
+
 // ── Per-type method helpers — region builders ──────────────────────
 //
 // Each `Image*Type::write` / `.read` / `.copy_to` / `.fill` method

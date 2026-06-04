@@ -46,6 +46,7 @@ pub mod exec_ctx;
 pub mod fan_out;
 pub mod future;
 pub mod host_view;
+pub mod image_transfer;
 pub mod mappable;
 pub mod on_device;
 pub mod op;
@@ -74,6 +75,7 @@ pub use host_view::{
     HostReadableExt, HostWritableExt, MappedSliceHostView, ReleaseDeviceSliceOp,
     ReleaseMappedSliceOp,
 };
+pub use image_transfer::{ImageDownload, ImageUpload, image_download, image_upload};
 pub use mappable::{DeviceSliceMapHandle, Mappable};
 pub use on_device::OnDevice;
 pub use op::{
