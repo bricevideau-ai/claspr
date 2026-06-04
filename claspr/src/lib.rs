@@ -89,7 +89,8 @@ pub use device::{Device, DeviceType, Platform};
 pub use error::{Error, Result};
 pub use image::{
     Image1D, Image1DArray, Image1DBuffer, Image1DBufferView, Image2D, Image2DArray, Image2DRgba8,
-    Image3D, ImageAccess, KernelImage1DArrayReadArg, KernelImage1DArrayReadWriteArg,
+    Image3D, ImageAccess, ImageCopyOp, ImageFillOp, ImageReadAlloc, ImageReadBytesAlloc,
+    ImageReadOp, ImageWriteOp, KernelImage1DArrayReadArg, KernelImage1DArrayReadWriteArg,
     KernelImage1DArrayWriteArg, KernelImage1DReadArg, KernelImage1DReadWriteArg,
     KernelImage1DWriteArg, KernelImage2DArrayReadArg, KernelImage2DArrayReadWriteArg,
     KernelImage2DArrayWriteArg, KernelImage2DReadArg, KernelImage2DReadWriteArg,

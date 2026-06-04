@@ -60,7 +60,7 @@ fn fill_pattern_rgba8_uint() {
         .fill_pattern([W as usize, H as usize], img, W, H)
         .wait(&ctx)
         .unwrap();
-    let bytes = img.download_bytes(&ctx).unwrap();
+    let bytes = img.read_bytes_alloc().wait(&ctx).unwrap();
     // Pixel (0,0) is value 0 → R=0; pixel (1,0) → R=1; pixel (0,1) → R=W (16).
     // Each pixel is 4 bytes (RGBA8); R channel is byte 0 of each pixel.
     assert_eq!(bytes[0], 0); // pixel (0,0) R
@@ -81,7 +81,7 @@ fn fill_pattern_r32_uint() {
         .fill_pattern([W as usize, H as usize], img, W, H)
         .wait(&ctx)
         .unwrap();
-    let pixels: Vec<u32> = img.download(&ctx).unwrap();
+    let pixels: Vec<u32> = img.read_alloc().wait(&ctx).unwrap();
     // The kernel writes (x + y*W, 0, 0, 0xFFFF_FFFF) per pixel.
     // R32Uint is single-channel so only the .x part survives the
     // read-back — the other components are dropped by the hardware
@@ -108,7 +108,7 @@ fn fill_pattern_rgba32_uint() {
         .fill_pattern([W as usize, H as usize], img, W, H)
         .wait(&ctx)
         .unwrap();
-    let pixels: Vec<[u32; 4]> = img.download(&ctx).unwrap();
+    let pixels: Vec<[u32; 4]> = img.read_alloc().wait(&ctx).unwrap();
     for y in 0..H {
         for x in 0..W {
             let got = pixels[(y * W + x) as usize];
@@ -131,7 +131,7 @@ fn fill_pattern_r32_float() {
         .fill_pattern([W as usize, H as usize], img, W, H)
         .wait(&ctx)
         .unwrap();
-    let pixels: Vec<f32> = img.download(&ctx).unwrap();
+    let pixels: Vec<f32> = img.read_alloc().wait(&ctx).unwrap();
     for y in 0..H {
         for x in 0..W {
             let got = pixels[(y * W + x) as usize];
@@ -153,7 +153,7 @@ fn fill_pattern_r32_sint() {
         .fill_pattern([W as usize, H as usize], img, W, H)
         .wait(&ctx)
         .unwrap();
-    let pixels: Vec<i32> = img.download(&ctx).unwrap();
+    let pixels: Vec<i32> = img.read_alloc().wait(&ctx).unwrap();
     for y in 0..H {
         for x in 0..W {
             let got = pixels[(y * W + x) as usize];
@@ -180,7 +180,7 @@ fn read_only_float_image_to_buffer() {
             seed[(y * W + x) as usize] = (x as f32) + (y as f32) * 100.0;
         }
     }
-    img.upload(&ctx, &seed).unwrap();
+    img.write(&seed).wait(&ctx).unwrap();
 
     // Seed with finite values so the `out[i] * 0.0` trick in the
     // kernel produces a clean zero (NaN otherwise).
@@ -210,7 +210,7 @@ fn read_only_sint_image_to_buffer() {
             seed[(y * W + x) as usize] = (x as i32) - (y as i32) * 10;
         }
     }
-    img.upload(&ctx, &seed).unwrap();
+    img.write(&seed).wait(&ctx).unwrap();
 
     let zeros = vec![0i32; (W * H) as usize];
     let out = DeviceSlice::<i32>::from_slice(&ctx, &zeros).unwrap();
@@ -238,7 +238,7 @@ fn dim1_fill_pattern_r32_uint() {
         .fill_pattern([W as usize], img, W)
         .wait(&ctx)
         .unwrap();
-    let pixels: Vec<u32> = img.download(&ctx).unwrap();
+    let pixels: Vec<u32> = img.read_alloc().wait(&ctx).unwrap();
     assert_eq!(pixels.len(), W as usize);
     for x in 0..W {
         assert_eq!(pixels[x as usize], x, "pixel {x}");
@@ -261,7 +261,7 @@ fn dim3_fill_pattern_r32_uint() {
         .fill_pattern([W as usize, H as usize, D as usize], img, W, H, D)
         .wait(&ctx)
         .unwrap();
-    let pixels: Vec<u32> = img.download(&ctx).unwrap();
+    let pixels: Vec<u32> = img.read_alloc().wait(&ctx).unwrap();
     assert_eq!(pixels.len(), (W * H * D) as usize);
     for z in 0..D {
         for y in 0..H {
@@ -289,7 +289,7 @@ fn dim_buffer_fill_pattern_r32_uint() {
         .fill_pattern([N as usize], img, N)
         .wait(&ctx)
         .unwrap();
-    let pixels: Vec<u32> = img.download(&ctx).unwrap();
+    let pixels: Vec<u32> = img.read_alloc().wait(&ctx).unwrap();
     assert_eq!(pixels.len(), N as usize);
     for x in 0..N {
         assert_eq!(pixels[x as usize], x.wrapping_mul(3));
@@ -361,7 +361,7 @@ fn dim_buffer_read_to_slice() {
 
     let mut img = Image1DBuffer::<ReadOnly, R32Uint>::alloc(&ctx, N).unwrap();
     let seed: Vec<u32> = (0..N).map(|x| x * 7 + 1).collect();
-    img.upload(&ctx, &seed).unwrap();
+    img.write(&seed).wait(&ctx).unwrap();
 
     let zeros = vec![0u32; N as usize];
     let out = DeviceSlice::<u32>::from_slice(&ctx, &zeros).unwrap();
@@ -396,7 +396,7 @@ fn dim1_array_fill_pattern_r32_uint() {
         .fill_pattern([WIDTH as usize, LAYERS as usize], img, WIDTH, LAYERS)
         .wait(&ctx)
         .unwrap();
-    let pixels: Vec<u32> = img.download(&ctx).unwrap();
+    let pixels: Vec<u32> = img.read_alloc().wait(&ctx).unwrap();
     assert_eq!(pixels.len(), (WIDTH * LAYERS) as usize);
     for layer in 0..LAYERS {
         for x in 0..WIDTH {
@@ -429,7 +429,7 @@ fn dim2_array_fill_pattern_r32_uint() {
         )
         .wait(&ctx)
         .unwrap();
-    let pixels: Vec<u32> = img.download(&ctx).unwrap();
+    let pixels: Vec<u32> = img.read_alloc().wait(&ctx).unwrap();
     assert_eq!(pixels.len(), (LW * LH * LAYERS) as usize);
     for layer in 0..LAYERS {
         for y in 0..LH {

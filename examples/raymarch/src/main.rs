@@ -139,7 +139,7 @@ fn run() -> claspr::Result<bool> {
     let img = kernels
         .raymarch([WIDTH as usize, HEIGHT as usize], img, WIDTH, HEIGHT)
         .wait(&ctx)?;
-    let pixels = img.download_bytes(&ctx)?;
+    let pixels = img.read_bytes_alloc().wait(&ctx)?;
 
     // Host vs. device pixel comparison. Walking every pixel through
     // `pixel_color` on the CPU is doable but slow — we stride by `STEP`

@@ -46,14 +46,17 @@ use crate::Result;
 use crate::access::{KernelAccess, MemMode};
 use crate::buffer::{Buffer, DeviceSlice};
 use crate::context::Context;
+use crate::error::Error;
 use crate::launch::KernelArg;
+use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
 use crate::queue::Launcher;
+use opencl3::event::Event;
 use opencl3::kernel::ExecuteKernel;
 use opencl3::memory::{
     CL_MEM_OBJECT_IMAGE1D, CL_MEM_OBJECT_IMAGE1D_ARRAY, CL_MEM_OBJECT_IMAGE2D,
     CL_MEM_OBJECT_IMAGE2D_ARRAY, CL_MEM_OBJECT_IMAGE3D, ClMem, Image,
 };
-use opencl3::types::{CL_BLOCKING, cl_image_desc, cl_image_format};
+use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_event, cl_image_desc, cl_image_format};
 use std::marker::PhantomData;
 use std::ptr;
 
@@ -79,7 +82,7 @@ pub use crate::access::KernelAccess as ImageAccess;
 /// Each format ZST implements [`Format`](format::Format), which carries the
 /// `CHANNEL_ORDER` / `CHANNEL_TYPE` constants the runtime needs
 /// and the [`Pixel`](format::Format::Pixel) associated type used by
-/// [`Image2D::download`] to size the host buffer.
+/// [`Image2D::read`] to size the host buffer.
 pub mod format {
     use opencl3::memory::{
         CL_FLOAT, CL_HALF_FLOAT, CL_R, CL_RG, CL_RGBA, CL_SIGNED_INT8, CL_SIGNED_INT16,
@@ -222,11 +225,12 @@ pub mod format {
 /// `&Image` vs `&mut Image` parameters. `F` is a
 /// [`Format`](format::Format) ZST that picks the channel order +
 /// channel type and the per-pixel host element type used by
-/// [`download`](Image2D::download).
+/// [`read`](Image2D::read) / [`read_alloc`](Image2D::read_alloc).
 ///
 /// Construct via [`Image2D::alloc`]; read back via
-/// [`Image2D::download`] (typed pixels) or
-/// [`Image2D::download_bytes`] (raw bytes for byte-oriented sinks
+/// [`Image2D::read`] (caller-supplied dst) /
+/// [`Image2D::read_alloc`] (returns a fresh Vec) /
+/// [`Image2D::read_bytes_alloc`] (raw bytes for byte-oriented sinks
 /// like the PPM helper). Kernel arguments accept `&Image2D<A, F>`
 /// directly.
 pub struct Image2D<A: KernelAccess, F: format::Format> {
@@ -266,62 +270,114 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
         })
     }
 
-    /// Read this image as raw bytes — `Vec<u8>` of length
-    /// `width * height * size_of::<F::Pixel>()`. Useful when
-    /// handing the data to a byte-oriented sink (file write, PPM
-    /// helper, …).
-    pub fn download_bytes<L: Launcher>(&self, launcher: &L) -> Result<Vec<u8>> {
+    /// Begin reading this image into a caller-supplied
+    /// `Vec<F::Pixel>` of length `width * height`. Returns a lazy
+    /// [`ImageReadOp`] — pick a terminal
+    /// (`.wait(&launcher)?` blocking, `.submit(&launcher)?`
+    /// non-blocking).
+    pub fn read<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
         let pixel_count = (self.width as usize) * (self.height as usize);
-        let mut bytes = vec![0u8; pixel_count * std::mem::size_of::<F::Pixel>()];
-        let region = [self.width as usize, self.height as usize, 1];
-        read_image_into(launcher, &self.image, region, bytes.as_mut_ptr())?;
-        Ok(bytes)
+        image_read_op(
+            &self.image,
+            [self.width as usize, self.height as usize, 1],
+            dst,
+            pixel_count,
+            "Image2D",
+        )
     }
 
-    /// Read this image into a host `Vec<F::Pixel>` of length
-    /// `width * height`. Blocking.
-    pub fn download<L: Launcher>(&self, launcher: &L) -> Result<Vec<F::Pixel>>
-    where
-        F::Pixel: Default,
-    {
-        let pixel_count = (self.width as usize) * (self.height as usize);
-        let mut pixels = vec![<F::Pixel as Default>::default(); pixel_count];
-        let region = [self.width as usize, self.height as usize, 1];
-        read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
-        Ok(pixels)
-    }
-
-    /// Write `bytes` to this image. The buffer must be exactly
-    /// `width * height * size_of::<F::Pixel>()` bytes — shorter or
-    /// longer is undefined behaviour at the OpenCL layer; we catch
-    /// it with an assertion. Blocking.
-    pub fn upload_bytes<L: Launcher>(&mut self, launcher: &L, bytes: &[u8]) -> Result<()> {
+    /// Same as [`read`](Self::read) but raw bytes — caller-supplied
+    /// `&mut [u8]` of length `width * height * size_of::<F::Pixel>()`.
+    pub fn read_bytes<'a>(&'a self, dst: &'a mut [u8]) -> Result<ImageReadOp<'a, u8>> {
         let pixel_count = (self.width as usize) * (self.height as usize);
         let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        assert_eq!(
-            bytes.len(),
+        image_read_bytes_op(
+            &self.image,
+            [self.width as usize, self.height as usize, 1],
+            dst,
             expected,
-            "Image2D::upload_bytes: buffer length {} ≠ expected {}",
-            bytes.len(),
-            expected,
-        );
-        let region = [self.width as usize, self.height as usize, 1];
-        write_image_from(launcher, &mut self.image, region, bytes.as_ptr())
+            "Image2D",
+        )
     }
 
-    /// Write a typed pixel slice to this image. Length must be
-    /// exactly `width * height`. Blocking.
-    pub fn upload<L: Launcher>(&mut self, launcher: &L, pixels: &[F::Pixel]) -> Result<()> {
+    /// Convenience — `read` into a fresh `Vec`. The Op allocates
+    /// and the terminal yields the `Vec`. Matches the existing
+    /// `download(&launcher)` ergonomics in a lazy-builder shape.
+    pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
+    where
+        F::Pixel: Default + Copy,
+    {
+        ImageReadAlloc {
+            image: &self.image,
+            region: [self.width as usize, self.height as usize, 1],
+            pixel_count: (self.width as usize) * (self.height as usize),
+            _format: PhantomData::<F>,
+        }
+    }
+
+    /// Same as [`read_alloc`](Self::read_alloc) but returns raw bytes.
+    pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
+        ImageReadBytesAlloc {
+            image: &self.image,
+            region: [self.width as usize, self.height as usize, 1],
+            byte_len: (self.width as usize)
+                * (self.height as usize)
+                * std::mem::size_of::<F::Pixel>(),
+            _format: PhantomData::<F>,
+        }
+    }
+
+    /// Begin writing a typed pixel slice to this image. `pixels.len()`
+    /// must equal `width * height` (asserted). Returns a lazy
+    /// [`ImageWriteOp`].
+    pub fn write<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
         let pixel_count = (self.width as usize) * (self.height as usize);
-        assert_eq!(
-            pixels.len(),
+        image_write_op(
+            &mut self.image,
+            [self.width as usize, self.height as usize, 1],
+            pixels,
             pixel_count,
-            "Image2D::upload: pixel count {} ≠ expected {}",
-            pixels.len(),
-            pixel_count,
-        );
-        let region = [self.width as usize, self.height as usize, 1];
-        write_image_from(launcher, &mut self.image, region, pixels.as_ptr().cast())
+            "Image2D",
+        )
+    }
+
+    /// Same as [`write`](Self::write) but raw bytes — must be
+    /// exactly `width * height * size_of::<F::Pixel>()` bytes.
+    pub fn write_bytes<'a>(&'a mut self, bytes: &'a [u8]) -> ImageWriteOp<'a, u8> {
+        let pixel_count = (self.width as usize) * (self.height as usize);
+        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
+        image_write_bytes_op(
+            &mut self.image,
+            [self.width as usize, self.height as usize, 1],
+            bytes,
+            expected,
+            "Image2D",
+        )
+    }
+
+    /// Begin copying this image into `dst`. Both images must have
+    /// the same dimensions and format-compatible pixel sizes
+    /// (`clEnqueueCopyImage` surfaces format mismatches as
+    /// `CL_IMAGE_FORMAT_MISMATCH` at terminal time).
+    pub fn copy_to<'a, A2: KernelAccess>(&'a self, dst: &'a mut Image2D<A2, F>) -> ImageCopyOp<'a> {
+        image_copy_op(
+            &self.image,
+            &mut dst.image,
+            [self.width as usize, self.height as usize, 1],
+        )
+    }
+
+    /// Begin filling every pixel with `pattern`. The 4-component
+    /// pattern follows OpenCL's `clEnqueueFillImage` shape —
+    /// match `T` to the format's `SampledTypeFamily` (`u32` for
+    /// `Uint`, `i32` for `Sint`, `f32` for `Float` / `Unorm` /
+    /// `Snorm`).
+    pub fn fill<T: Copy>(&mut self, pattern: [T; 4]) -> ImageFillOp<'_, T> {
+        image_fill_op(
+            &mut self.image,
+            [self.width as usize, self.height as usize, 1],
+            pattern,
+        )
     }
 
     /// Width in pixels.
@@ -398,60 +454,557 @@ fn alloc_image<A: KernelAccess, F: format::Format>(
     Ok(image)
 }
 
-fn read_image_into<L: Launcher>(
-    launcher: &L,
-    image: &Image,
+// ── Image transfer ops ─────────────────────────────────────────────
+//
+// Same lazy-builder / late-bind-launcher shape as the buffer ops
+// (`WriteOp`/`ReadOp`/`CopyOp`/`FillOp`). Each image type's
+// `.write` / `.read` / `.read_alloc` / `.copy_to` / `.fill` method
+// returns one of these Ops; the caller picks `.wait(&launcher)?`
+// (blocking) or `.submit(&launcher)?` (non-blocking, returns
+// `Event`) plus the usual `.after(&event)` / `.profiled(cb)`
+// modifiers.
+//
+// The Op types are dimensionality-agnostic — they hold the image
+// + a 3-component region (unused dims = 1) + the host
+// pointer/length. The per-type methods (`Image2D::write`,
+// `Image1D::write`, ...) are thin wrappers that pass the right
+// region shape. The actual `enqueue_*_image` call lives in one
+// place per op.
+
+/// Lazy builder for `clEnqueueWriteImage`. Constructed via
+/// `image.write(...)` / `image.write_bytes(...)` on any image type.
+pub struct ImageWriteOp<'a, T> {
+    image: &'a mut Image,
     region: [usize; 3],
-    out_ptr: *mut u8,
-) -> Result<()> {
-    let origin = [0usize, 0, 0];
-    // SAFETY: blocking read into a freshly-allocated buffer at
-    // `out_ptr`; the caller has sized the buffer to match
-    // `region.iter().product() * size_of::<F::Pixel>()`.
-    unsafe {
-        launcher
-            .cl_queue()
-            .enqueue_read_image(
-                image,
-                CL_BLOCKING,
-                origin.as_ptr(),
-                region.as_ptr(),
-                0,
-                0,
-                out_ptr.cast(),
-                &[],
-            )?
-            .wait()?;
-    }
-    Ok(())
+    data: *const T,
+    /// Lifetime tag — the data pointer is borrowed for `'a`. The
+    /// Op holds a raw pointer rather than `&'a [T]` because the
+    /// builder paths cover both typed-pixel and raw-byte payloads
+    /// (the raw bytes case needs `*const u8` not `&[Pixel]`).
+    _borrow: PhantomData<&'a [T]>,
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
 }
 
-fn write_image_from<L: Launcher>(
-    launcher: &L,
-    image: &mut Image,
-    region: [usize; 3],
-    in_ptr: *const u8,
-) -> Result<()> {
-    let origin = [0usize, 0, 0];
-    // SAFETY: blocking write from a caller-supplied buffer at
-    // `in_ptr`; the caller has sized the buffer to match
-    // `region.iter().product() * size_of::<F::Pixel>()`.
-    unsafe {
-        launcher
-            .cl_queue()
-            .enqueue_write_image(
-                image,
-                CL_BLOCKING,
-                origin.as_ptr(),
-                region.as_ptr(),
-                0,
-                0,
-                in_ptr as *mut _,
-                &[],
-            )?
-            .wait()?;
+// SAFETY: `*const T` isn't Send by default but the host pointer
+// here is borrowed for `'a` and only read once during the
+// blocking or non-blocking `enqueue_write_image` call. The Op is
+// moved between functions on the host thread but never crosses
+// thread boundaries in claspr today — keeping it !Send is the
+// honest answer until Tier 2 needs it.
+//
+// (We do NOT impl Send.)
+
+impl<'a, T> ImageWriteOp<'a, T> {
+    /// Add a queue-side wait dependency. Chainable.
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
     }
-    Ok(())
+
+    /// Add multiple wait-list events at once.
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        self.deps.extend(events.into_iter().map(|e| e.get()));
+        self
+    }
+
+    /// Register a completion callback that receives the write's
+    /// [`ProfilingInfo`]. Requires the queue to have
+    /// `CL_QUEUE_PROFILING_ENABLE`.
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    /// Sync terminal — enqueue the write with `CL_TRUE` on
+    /// `launcher`'s queue; the driver blocks until the image has
+    /// been written.
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+        let event = enqueue_image_write(self, launcher, CL_BLOCKING)?;
+        // CL_BLOCKING already waited for the write at the driver
+        // level; we just need to attach the profiling callback if
+        // one was registered and let the Event drop.
+        drop(event);
+        Ok(())
+    }
+
+    /// Non-blocking terminal — enqueue the write with `CL_FALSE`
+    /// on `launcher`'s queue, return the completion event. `data`
+    /// must outlive the event.
+    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        enqueue_image_write(self, launcher, CL_NON_BLOCKING)
+    }
+}
+
+fn enqueue_image_write<'a, T, L: Launcher + ?Sized>(
+    op: ImageWriteOp<'a, T>,
+    launcher: &L,
+    blocking: opencl3::types::cl_bool,
+) -> Result<Event> {
+    let ImageWriteOp {
+        image,
+        region,
+        data,
+        _borrow: _,
+        deps,
+        profile_cb,
+    } = op;
+    let origin = [0usize, 0, 0];
+    // SAFETY: `data` is borrowed for `'a` (encoded in the
+    // PhantomData); under CL_BLOCKING the driver finishes reading
+    // it before returning, under CL_NON_BLOCKING the caller
+    // contract (data outlives the event) covers liveness.
+    let event = unsafe {
+        launcher.cl_queue().enqueue_write_image(
+            image,
+            blocking,
+            origin.as_ptr(),
+            region.as_ptr(),
+            0,
+            0,
+            data as *mut std::ffi::c_void,
+            &deps,
+        )?
+    };
+    if let Some(cb) = profile_cb {
+        register_profiling_callback(&event, cb)?;
+    }
+    Ok(event)
+}
+
+/// Lazy builder for `clEnqueueReadImage`. Constructed via
+/// `image.read(...)` (caller-supplied dst) or
+/// `image.read_alloc()` (op allocates dst). Same `.wait`/`.submit`
+/// terminals + `.after`/`.profiled` modifiers as
+/// [`ImageWriteOp`].
+pub struct ImageReadOp<'a, T> {
+    image: &'a Image,
+    region: [usize; 3],
+    dst: *mut T,
+    _borrow: PhantomData<&'a mut [T]>,
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
+}
+
+impl<'a, T> ImageReadOp<'a, T> {
+    /// Add a queue-side wait dependency.
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
+    }
+
+    /// Add multiple wait-list events at once.
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        self.deps.extend(events.into_iter().map(|e| e.get()));
+        self
+    }
+
+    /// Register a completion callback for profiling info.
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    /// Sync terminal — enqueue the read with `CL_TRUE` on
+    /// `launcher`'s queue; the driver blocks until `dst` has been
+    /// filled.
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+        let event = enqueue_image_read(self, launcher, CL_BLOCKING)?;
+        drop(event);
+        Ok(())
+    }
+
+    /// Non-blocking terminal — enqueue the read with `CL_FALSE`
+    /// on `launcher`'s queue, return the completion event. `dst`
+    /// is only valid after the event fires; the caller must keep
+    /// `dst` alive until then.
+    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        enqueue_image_read(self, launcher, CL_NON_BLOCKING)
+    }
+}
+
+fn enqueue_image_read<'a, T, L: Launcher + ?Sized>(
+    op: ImageReadOp<'a, T>,
+    launcher: &L,
+    blocking: opencl3::types::cl_bool,
+) -> Result<Event> {
+    let ImageReadOp {
+        image,
+        region,
+        dst,
+        _borrow: _,
+        deps,
+        profile_cb,
+    } = op;
+    let origin = [0usize, 0, 0];
+    // SAFETY: `dst` is borrowed for `'a` (PhantomData) — under
+    // CL_BLOCKING the driver fills it before returning; under
+    // CL_NON_BLOCKING the caller contract covers liveness.
+    let event = unsafe {
+        launcher.cl_queue().enqueue_read_image(
+            image,
+            blocking,
+            origin.as_ptr(),
+            region.as_ptr(),
+            0,
+            0,
+            dst as *mut std::ffi::c_void,
+            &deps,
+        )?
+    };
+    if let Some(cb) = profile_cb {
+        register_profiling_callback(&event, cb)?;
+    }
+    Ok(event)
+}
+
+/// Convenience builder — `image.read_alloc()`. Allocates a
+/// `Vec<F::Pixel>` of the right size at terminal time and yields
+/// it through the terminal's return value. Mirrors the old
+/// `download` ergonomics in a lazy-builder shape, but only offers
+/// `.wait(&launcher)?` (blocking) because non-blocking + owned-output
+/// requires the chain machinery and is properly handled by the
+/// Tier 2 `download(image)` combinator instead.
+pub struct ImageReadAlloc<'a, F: format::Format> {
+    image: &'a Image,
+    region: [usize; 3],
+    pixel_count: usize,
+    _format: PhantomData<F>,
+}
+
+impl<'a, F: format::Format> ImageReadAlloc<'a, F>
+where
+    F::Pixel: Default + Copy,
+{
+    /// Blocking — allocate the Vec, enqueue + wait, return it.
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Vec<F::Pixel>> {
+        let mut pixels = vec![<F::Pixel as Default>::default(); self.pixel_count];
+        let op = ImageReadOp {
+            image: self.image,
+            region: self.region,
+            dst: pixels.as_mut_ptr(),
+            _borrow: PhantomData,
+            deps: Vec::new(),
+            profile_cb: None,
+        };
+        op.wait(launcher)?;
+        Ok(pixels)
+    }
+}
+
+/// Like [`ImageReadAlloc`] but returns raw bytes. Useful for
+/// PPM-write paths and byte-oriented sinks that don't want the
+/// pixel-type round-trip.
+pub struct ImageReadBytesAlloc<'a, F: format::Format> {
+    image: &'a Image,
+    region: [usize; 3],
+    byte_len: usize,
+    _format: PhantomData<F>,
+}
+
+impl<'a, F: format::Format> ImageReadBytesAlloc<'a, F> {
+    /// Blocking — allocate the Vec, enqueue + wait, return it.
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Vec<u8>> {
+        let mut bytes = vec![0u8; self.byte_len];
+        let op = ImageReadOp::<u8> {
+            image: self.image,
+            region: self.region,
+            dst: bytes.as_mut_ptr(),
+            _borrow: PhantomData,
+            deps: Vec::new(),
+            profile_cb: None,
+        };
+        op.wait(launcher)?;
+        Ok(bytes)
+    }
+}
+
+/// Lazy builder for `clEnqueueCopyImage`. Constructed via
+/// `src.copy_to(dst)` on any image type — the two images must
+/// have matching dimensions and format-compatible pixel sizes
+/// (OpenCL surfaces format mismatches as `CL_IMAGE_FORMAT_MISMATCH`
+/// at terminal time).
+pub struct ImageCopyOp<'a> {
+    src: &'a Image,
+    dst: &'a mut Image,
+    region: [usize; 3],
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
+}
+
+impl<'a> ImageCopyOp<'a> {
+    /// Add a queue-side wait dependency.
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
+    }
+
+    /// Add multiple wait-list events at once.
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        self.deps.extend(events.into_iter().map(|e| e.get()));
+        self
+    }
+
+    /// Register a completion callback for profiling info.
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    /// Sync terminal — `enqueue + event.wait`. `clEnqueueCopyImage`
+    /// has no blocking flag, so `.wait()` is enqueue + event.wait.
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+        let event = self.into_event(launcher)?;
+        event.wait()?;
+        Ok(())
+    }
+
+    /// Non-blocking terminal — enqueue and return the event.
+    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        self.into_event(launcher)
+    }
+
+    pub(crate) fn into_event<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        let origin = [0usize, 0, 0];
+        // SAFETY: src/dst must belong to the queue's context; the
+        // image types' construction enforces this at the
+        // type-system level (both came from a Context). Region
+        // bounds match by construction (`copy_to` is only callable
+        // on same-dim image types, see the per-type method
+        // signatures).
+        let event = unsafe {
+            launcher.cl_queue().enqueue_copy_image(
+                self.src,
+                self.dst,
+                origin.as_ptr(),
+                origin.as_ptr(),
+                self.region.as_ptr(),
+                &self.deps,
+            )?
+        };
+        if let Some(cb) = self.profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
+        Ok(event)
+    }
+}
+
+/// Lazy builder for `clEnqueueFillImage`. Constructed via
+/// `image.fill(pattern)` on any image type. The pattern is one
+/// "fill color" appropriate to the image format —
+/// OpenCL's `clEnqueueFillImage` takes a 4-component value (4
+/// `f32`s, 4 `i32`s, or 4 `u32`s depending on
+/// `cl_channel_data_type`); claspr surfaces this as a generic
+/// `[T; 4]` and trusts the caller to use the matching T per the
+/// format's `SampledTypeFamily`.
+pub struct ImageFillOp<'a, T: Copy> {
+    image: &'a mut Image,
+    region: [usize; 3],
+    pattern: [T; 4],
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
+}
+
+impl<'a, T: Copy> ImageFillOp<'a, T> {
+    /// Add a queue-side wait dependency.
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
+    }
+
+    /// Add multiple wait-list events at once.
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        self.deps.extend(events.into_iter().map(|e| e.get()));
+        self
+    }
+
+    /// Register a completion callback for profiling info.
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    /// Sync terminal — `enqueue + event.wait`. `clEnqueueFillImage`
+    /// has no blocking flag.
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+        let event = self.into_event(launcher)?;
+        event.wait()?;
+        Ok(())
+    }
+
+    /// Non-blocking terminal — enqueue and return the event.
+    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        self.into_event(launcher)
+    }
+
+    pub(crate) fn into_event<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        let origin = [0usize, 0, 0];
+        // SAFETY: `pattern.as_ptr()` is a valid 4-component fill
+        // value the runtime byte-copies into every pixel inside
+        // `region`. Image lifetime is borrowed for `'a`.
+        let event = unsafe {
+            launcher.cl_queue().enqueue_fill_image(
+                self.image,
+                self.pattern.as_ptr() as *const std::ffi::c_void,
+                origin.as_ptr(),
+                self.region.as_ptr(),
+                &self.deps,
+            )?
+        };
+        if let Some(cb) = self.profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
+        Ok(event)
+    }
+}
+
+// ── Per-type method helpers — region builders ──────────────────────
+//
+// Each `Image*Type::write` / `.read` / `.copy_to` / `.fill` method
+// hands its dim-specific `[usize; 3]` region to one of the Op
+// constructors below. Centralising the "build an op" step keeps
+// per-image-type methods to a single line each.
+
+fn image_write_op<'a, T>(
+    image: &'a mut Image,
+    region: [usize; 3],
+    pixels: &'a [T],
+    expected_pixel_count: usize,
+    type_name: &'static str,
+) -> ImageWriteOp<'a, T> {
+    assert_eq!(
+        pixels.len(),
+        expected_pixel_count,
+        "{type_name}::write: pixel count {} ≠ expected {}",
+        pixels.len(),
+        expected_pixel_count,
+    );
+    ImageWriteOp {
+        image,
+        region,
+        data: pixels.as_ptr(),
+        _borrow: PhantomData,
+        deps: Vec::new(),
+        profile_cb: None,
+    }
+}
+
+fn image_write_bytes_op<'a>(
+    image: &'a mut Image,
+    region: [usize; 3],
+    bytes: &'a [u8],
+    expected_bytes: usize,
+    type_name: &'static str,
+) -> ImageWriteOp<'a, u8> {
+    assert_eq!(
+        bytes.len(),
+        expected_bytes,
+        "{type_name}::write_bytes: buffer length {} ≠ expected {}",
+        bytes.len(),
+        expected_bytes,
+    );
+    ImageWriteOp {
+        image,
+        region,
+        data: bytes.as_ptr(),
+        _borrow: PhantomData,
+        deps: Vec::new(),
+        profile_cb: None,
+    }
+}
+
+fn image_read_op<'a, T>(
+    image: &'a Image,
+    region: [usize; 3],
+    dst: &'a mut [T],
+    expected_pixel_count: usize,
+    _type_name: &'static str,
+) -> Result<ImageReadOp<'a, T>> {
+    if dst.len() != expected_pixel_count {
+        return Err(Error::LengthMismatch {
+            src: expected_pixel_count,
+            dst: dst.len(),
+        });
+    }
+    Ok(ImageReadOp {
+        image,
+        region,
+        dst: dst.as_mut_ptr(),
+        _borrow: PhantomData,
+        deps: Vec::new(),
+        profile_cb: None,
+    })
+}
+
+fn image_read_bytes_op<'a>(
+    image: &'a Image,
+    region: [usize; 3],
+    dst: &'a mut [u8],
+    expected_bytes: usize,
+    _type_name: &'static str,
+) -> Result<ImageReadOp<'a, u8>> {
+    if dst.len() != expected_bytes {
+        return Err(Error::LengthMismatch {
+            src: expected_bytes,
+            dst: dst.len(),
+        });
+    }
+    Ok(ImageReadOp {
+        image,
+        region,
+        dst: dst.as_mut_ptr(),
+        _borrow: PhantomData,
+        deps: Vec::new(),
+        profile_cb: None,
+    })
+}
+
+fn image_copy_op<'a>(src: &'a Image, dst: &'a mut Image, region: [usize; 3]) -> ImageCopyOp<'a> {
+    ImageCopyOp {
+        src,
+        dst,
+        region,
+        deps: Vec::new(),
+        profile_cb: None,
+    }
+}
+
+fn image_fill_op<'a, T: Copy>(
+    image: &'a mut Image,
+    region: [usize; 3],
+    pattern: [T; 4],
+) -> ImageFillOp<'a, T> {
+    ImageFillOp {
+        image,
+        region,
+        pattern,
+        deps: Vec::new(),
+        profile_cb: None,
+    }
 }
 
 // ── Image1D ─────────────────────────────────────────────────────────
@@ -484,58 +1037,83 @@ impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
         })
     }
 
-    /// Read this image as raw bytes — `Vec<u8>` of length
-    /// `width * size_of::<F::Pixel>()`.
-    pub fn download_bytes<L: Launcher>(&self, launcher: &L) -> Result<Vec<u8>> {
-        let pixel_count = self.width as usize;
-        let mut bytes = vec![0u8; pixel_count * std::mem::size_of::<F::Pixel>()];
-        let region = [pixel_count, 1, 1];
-        read_image_into(launcher, &self.image, region, bytes.as_mut_ptr())?;
-        Ok(bytes)
+    /// See [`Image2D::read`] — same shape, 1D region.
+    pub fn read<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
+        image_read_op(
+            &self.image,
+            [self.width as usize, 1, 1],
+            dst,
+            self.width as usize,
+            "Image1D",
+        )
     }
 
-    /// Read this image into a host `Vec<F::Pixel>` of length `width`.
-    /// Blocking.
-    pub fn download<L: Launcher>(&self, launcher: &L) -> Result<Vec<F::Pixel>>
+    /// See [`Image2D::read_bytes`].
+    pub fn read_bytes<'a>(&'a self, dst: &'a mut [u8]) -> Result<ImageReadOp<'a, u8>> {
+        let expected = (self.width as usize) * std::mem::size_of::<F::Pixel>();
+        image_read_bytes_op(
+            &self.image,
+            [self.width as usize, 1, 1],
+            dst,
+            expected,
+            "Image1D",
+        )
+    }
+
+    /// See [`Image2D::read_alloc`].
+    pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
     where
-        F::Pixel: Default,
+        F::Pixel: Default + Copy,
     {
-        let pixel_count = self.width as usize;
-        let mut pixels = vec![<F::Pixel as Default>::default(); pixel_count];
-        let region = [pixel_count, 1, 1];
-        read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
-        Ok(pixels)
+        ImageReadAlloc {
+            image: &self.image,
+            region: [self.width as usize, 1, 1],
+            pixel_count: self.width as usize,
+            _format: PhantomData::<F>,
+        }
     }
 
-    /// Write `bytes` to this image. Length must be exactly
-    /// `width * size_of::<F::Pixel>()`. Blocking.
-    pub fn upload_bytes<L: Launcher>(&mut self, launcher: &L, bytes: &[u8]) -> Result<()> {
-        let pixel_count = self.width as usize;
-        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        assert_eq!(
-            bytes.len(),
-            expected,
-            "Image1D::upload_bytes: buffer length {} ≠ expected {}",
-            bytes.len(),
-            expected,
-        );
-        let region = [pixel_count, 1, 1];
-        write_image_from(launcher, &mut self.image, region, bytes.as_ptr())
+    /// See [`Image2D::read_bytes_alloc`].
+    pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
+        ImageReadBytesAlloc {
+            image: &self.image,
+            region: [self.width as usize, 1, 1],
+            byte_len: (self.width as usize) * std::mem::size_of::<F::Pixel>(),
+            _format: PhantomData::<F>,
+        }
     }
 
-    /// Write a typed pixel slice to this image. Length must be
-    /// exactly `width`. Blocking.
-    pub fn upload<L: Launcher>(&mut self, launcher: &L, pixels: &[F::Pixel]) -> Result<()> {
-        let pixel_count = self.width as usize;
-        assert_eq!(
-            pixels.len(),
-            pixel_count,
-            "Image1D::upload: pixel count {} ≠ expected {}",
-            pixels.len(),
-            pixel_count,
-        );
-        let region = [pixel_count, 1, 1];
-        write_image_from(launcher, &mut self.image, region, pixels.as_ptr().cast())
+    /// See [`Image2D::write`].
+    pub fn write<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
+        image_write_op(
+            &mut self.image,
+            [self.width as usize, 1, 1],
+            pixels,
+            self.width as usize,
+            "Image1D",
+        )
+    }
+
+    /// See [`Image2D::write_bytes`].
+    pub fn write_bytes<'a>(&'a mut self, bytes: &'a [u8]) -> ImageWriteOp<'a, u8> {
+        let expected = (self.width as usize) * std::mem::size_of::<F::Pixel>();
+        image_write_bytes_op(
+            &mut self.image,
+            [self.width as usize, 1, 1],
+            bytes,
+            expected,
+            "Image1D",
+        )
+    }
+
+    /// See [`Image2D::copy_to`].
+    pub fn copy_to<'a, A2: KernelAccess>(&'a self, dst: &'a mut Image1D<A2, F>) -> ImageCopyOp<'a> {
+        image_copy_op(&self.image, &mut dst.image, [self.width as usize, 1, 1])
+    }
+
+    /// See [`Image2D::fill`].
+    pub fn fill<T: Copy>(&mut self, pattern: [T; 4]) -> ImageFillOp<'_, T> {
+        image_fill_op(&mut self.image, [self.width as usize, 1, 1], pattern)
     }
 
     /// Width in pixels.
@@ -599,74 +1177,129 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
         })
     }
 
-    /// Read this image as raw bytes — `Vec<u8>` of length
-    /// `width * height * depth * size_of::<F::Pixel>()`.
-    pub fn download_bytes<L: Launcher>(&self, launcher: &L) -> Result<Vec<u8>> {
+    /// See [`Image2D::read`] — same shape, 3D region.
+    pub fn read<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
         let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
-        let mut bytes = vec![0u8; pixel_count * std::mem::size_of::<F::Pixel>()];
-        let region = [
-            self.width as usize,
-            self.height as usize,
-            self.depth as usize,
-        ];
-        read_image_into(launcher, &self.image, region, bytes.as_mut_ptr())?;
-        Ok(bytes)
+        image_read_op(
+            &self.image,
+            [
+                self.width as usize,
+                self.height as usize,
+                self.depth as usize,
+            ],
+            dst,
+            pixel_count,
+            "Image3D",
+        )
     }
 
-    /// Read this image into a host `Vec<F::Pixel>` of length
-    /// `width * height * depth`. Blocking.
-    pub fn download<L: Launcher>(&self, launcher: &L) -> Result<Vec<F::Pixel>>
-    where
-        F::Pixel: Default,
-    {
-        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
-        let mut pixels = vec![<F::Pixel as Default>::default(); pixel_count];
-        let region = [
-            self.width as usize,
-            self.height as usize,
-            self.depth as usize,
-        ];
-        read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
-        Ok(pixels)
-    }
-
-    /// Write `bytes` to this image. Length must be exactly
-    /// `width * height * depth * size_of::<F::Pixel>()`. Blocking.
-    pub fn upload_bytes<L: Launcher>(&mut self, launcher: &L, bytes: &[u8]) -> Result<()> {
+    /// See [`Image2D::read_bytes`].
+    pub fn read_bytes<'a>(&'a self, dst: &'a mut [u8]) -> Result<ImageReadOp<'a, u8>> {
         let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
         let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        assert_eq!(
-            bytes.len(),
+        image_read_bytes_op(
+            &self.image,
+            [
+                self.width as usize,
+                self.height as usize,
+                self.depth as usize,
+            ],
+            dst,
             expected,
-            "Image3D::upload_bytes: buffer length {} ≠ expected {}",
-            bytes.len(),
-            expected,
-        );
-        let region = [
-            self.width as usize,
-            self.height as usize,
-            self.depth as usize,
-        ];
-        write_image_from(launcher, &mut self.image, region, bytes.as_ptr())
+            "Image3D",
+        )
     }
 
-    /// Write a typed pixel slice to this image. Length must be
-    /// exactly `width * height * depth`. Blocking.
-    pub fn upload<L: Launcher>(&mut self, launcher: &L, pixels: &[F::Pixel]) -> Result<()> {
+    /// See [`Image2D::read_alloc`].
+    pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
+    where
+        F::Pixel: Default + Copy,
+    {
         let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
-        assert_eq!(
-            pixels.len(),
+        ImageReadAlloc {
+            image: &self.image,
+            region: [
+                self.width as usize,
+                self.height as usize,
+                self.depth as usize,
+            ],
             pixel_count,
-            "Image3D::upload: pixel count {} ≠ expected {}",
-            pixels.len(),
+            _format: PhantomData::<F>,
+        }
+    }
+
+    /// See [`Image2D::read_bytes_alloc`].
+    pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
+        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
+        ImageReadBytesAlloc {
+            image: &self.image,
+            region: [
+                self.width as usize,
+                self.height as usize,
+                self.depth as usize,
+            ],
+            byte_len: pixel_count * std::mem::size_of::<F::Pixel>(),
+            _format: PhantomData::<F>,
+        }
+    }
+
+    /// See [`Image2D::write`].
+    pub fn write<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
+        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
+        image_write_op(
+            &mut self.image,
+            [
+                self.width as usize,
+                self.height as usize,
+                self.depth as usize,
+            ],
+            pixels,
             pixel_count,
-        );
-        let region = [
-            self.width as usize,
-            self.height as usize,
-            self.depth as usize,
-        ];
-        write_image_from(launcher, &mut self.image, region, pixels.as_ptr().cast())
+            "Image3D",
+        )
+    }
+
+    /// See [`Image2D::write_bytes`].
+    pub fn write_bytes<'a>(&'a mut self, bytes: &'a [u8]) -> ImageWriteOp<'a, u8> {
+        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
+        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
+        image_write_bytes_op(
+            &mut self.image,
+            [
+                self.width as usize,
+                self.height as usize,
+                self.depth as usize,
+            ],
+            bytes,
+            expected,
+            "Image3D",
+        )
+    }
+
+    /// See [`Image2D::copy_to`].
+    pub fn copy_to<'a, A2: KernelAccess>(&'a self, dst: &'a mut Image3D<A2, F>) -> ImageCopyOp<'a> {
+        image_copy_op(
+            &self.image,
+            &mut dst.image,
+            [
+                self.width as usize,
+                self.height as usize,
+                self.depth as usize,
+            ],
+        )
+    }
+
+    /// See [`Image2D::fill`].
+    pub fn fill<T: Copy>(&mut self, pattern: [T; 4]) -> ImageFillOp<'_, T> {
+        image_fill_op(
+            &mut self.image,
+            [
+                self.width as usize,
+                self.height as usize,
+                self.depth as usize,
+            ],
+            pattern,
+        )
     }
 
     /// Width in pixels.
@@ -1066,60 +1699,101 @@ impl<A: KernelAccess, F: format::Format> Image1DArray<A, F> {
         })
     }
 
-    /// Read this image array as raw bytes — `Vec<u8>` of length
-    /// `width * array_size * size_of::<F::Pixel>()`.
-    pub fn download_bytes<L: Launcher>(&self, launcher: &L) -> Result<Vec<u8>> {
+    /// See [`Image2D::read`] — region is `[width, array_size, 1]`
+    /// per OpenCL spec; layers are laid out contiguously: layer-0
+    /// first, then layer-1, etc.
+    pub fn read<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
         let pixel_count = (self.width as usize) * (self.array_size as usize);
-        let mut bytes = vec![0u8; pixel_count * std::mem::size_of::<F::Pixel>()];
-        // 1D-array region: [width, array_size, 1] per OpenCL spec.
-        let region = [self.width as usize, self.array_size as usize, 1];
-        read_image_into(launcher, &self.image, region, bytes.as_mut_ptr())?;
-        Ok(bytes)
+        image_read_op(
+            &self.image,
+            [self.width as usize, self.array_size as usize, 1],
+            dst,
+            pixel_count,
+            "Image1DArray",
+        )
     }
 
-    /// Read this image array into a host `Vec<F::Pixel>` of
-    /// length `width * array_size`. Layers are laid out
-    /// contiguously: layer-0 first, then layer-1, etc.
-    pub fn download<L: Launcher>(&self, launcher: &L) -> Result<Vec<F::Pixel>>
-    where
-        F::Pixel: Default,
-    {
-        let pixel_count = (self.width as usize) * (self.array_size as usize);
-        let mut pixels = vec![<F::Pixel as Default>::default(); pixel_count];
-        let region = [self.width as usize, self.array_size as usize, 1];
-        read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
-        Ok(pixels)
-    }
-
-    /// Write `bytes` to this image array. Length must equal
-    /// `width * array_size * size_of::<F::Pixel>()`.
-    pub fn upload_bytes<L: Launcher>(&mut self, launcher: &L, bytes: &[u8]) -> Result<()> {
+    /// See [`Image2D::read_bytes`].
+    pub fn read_bytes<'a>(&'a self, dst: &'a mut [u8]) -> Result<ImageReadOp<'a, u8>> {
         let pixel_count = (self.width as usize) * (self.array_size as usize);
         let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        assert_eq!(
-            bytes.len(),
+        image_read_bytes_op(
+            &self.image,
+            [self.width as usize, self.array_size as usize, 1],
+            dst,
             expected,
-            "Image1DArray::upload_bytes: buffer length {} ≠ expected {}",
-            bytes.len(),
-            expected,
-        );
-        let region = [self.width as usize, self.array_size as usize, 1];
-        write_image_from(launcher, &mut self.image, region, bytes.as_ptr())
+            "Image1DArray",
+        )
     }
 
-    /// Write a typed pixel slice. Length must equal
-    /// `width * array_size`. Layers are read contiguously.
-    pub fn upload<L: Launcher>(&mut self, launcher: &L, pixels: &[F::Pixel]) -> Result<()> {
+    /// See [`Image2D::read_alloc`].
+    pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
+    where
+        F::Pixel: Default + Copy,
+    {
+        ImageReadAlloc {
+            image: &self.image,
+            region: [self.width as usize, self.array_size as usize, 1],
+            pixel_count: (self.width as usize) * (self.array_size as usize),
+            _format: PhantomData::<F>,
+        }
+    }
+
+    /// See [`Image2D::read_bytes_alloc`].
+    pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
         let pixel_count = (self.width as usize) * (self.array_size as usize);
-        assert_eq!(
-            pixels.len(),
+        ImageReadBytesAlloc {
+            image: &self.image,
+            region: [self.width as usize, self.array_size as usize, 1],
+            byte_len: pixel_count * std::mem::size_of::<F::Pixel>(),
+            _format: PhantomData::<F>,
+        }
+    }
+
+    /// See [`Image2D::write`].
+    pub fn write<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
+        let pixel_count = (self.width as usize) * (self.array_size as usize);
+        image_write_op(
+            &mut self.image,
+            [self.width as usize, self.array_size as usize, 1],
+            pixels,
             pixel_count,
-            "Image1DArray::upload: pixel count {} ≠ expected {}",
-            pixels.len(),
-            pixel_count,
-        );
-        let region = [self.width as usize, self.array_size as usize, 1];
-        write_image_from(launcher, &mut self.image, region, pixels.as_ptr().cast())
+            "Image1DArray",
+        )
+    }
+
+    /// See [`Image2D::write_bytes`].
+    pub fn write_bytes<'a>(&'a mut self, bytes: &'a [u8]) -> ImageWriteOp<'a, u8> {
+        let pixel_count = (self.width as usize) * (self.array_size as usize);
+        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
+        image_write_bytes_op(
+            &mut self.image,
+            [self.width as usize, self.array_size as usize, 1],
+            bytes,
+            expected,
+            "Image1DArray",
+        )
+    }
+
+    /// See [`Image2D::copy_to`].
+    pub fn copy_to<'a, A2: KernelAccess>(
+        &'a self,
+        dst: &'a mut Image1DArray<A2, F>,
+    ) -> ImageCopyOp<'a> {
+        image_copy_op(
+            &self.image,
+            &mut dst.image,
+            [self.width as usize, self.array_size as usize, 1],
+        )
+    }
+
+    /// See [`Image2D::fill`].
+    pub fn fill<T: Copy>(&mut self, pattern: [T; 4]) -> ImageFillOp<'_, T> {
+        image_fill_op(
+            &mut self.image,
+            [self.width as usize, self.array_size as usize, 1],
+            pattern,
+        )
     }
 
     /// Width in pixels (per layer).
@@ -1221,77 +1895,139 @@ impl<A: KernelAccess, F: format::Format> Image2DArray<A, F> {
         })
     }
 
-    /// Read this image array as raw bytes.
-    pub fn download_bytes<L: Launcher>(&self, launcher: &L) -> Result<Vec<u8>> {
+    /// See [`Image2D::read`] — 2D-array region is
+    /// `[width, height, array_size]`.
+    pub fn read<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
         let pixel_count =
             (self.width as usize) * (self.height as usize) * (self.array_size as usize);
-        let mut bytes = vec![0u8; pixel_count * std::mem::size_of::<F::Pixel>()];
-        let region = [
-            self.width as usize,
-            self.height as usize,
-            self.array_size as usize,
-        ];
-        read_image_into(launcher, &self.image, region, bytes.as_mut_ptr())?;
-        Ok(bytes)
+        image_read_op(
+            &self.image,
+            [
+                self.width as usize,
+                self.height as usize,
+                self.array_size as usize,
+            ],
+            dst,
+            pixel_count,
+            "Image2DArray",
+        )
     }
 
-    /// Read this image array into a host `Vec<F::Pixel>` of
-    /// length `width * height * array_size`.
-    pub fn download<L: Launcher>(&self, launcher: &L) -> Result<Vec<F::Pixel>>
-    where
-        F::Pixel: Default,
-    {
-        let pixel_count =
-            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
-        let mut pixels = vec![<F::Pixel as Default>::default(); pixel_count];
-        let region = [
-            self.width as usize,
-            self.height as usize,
-            self.array_size as usize,
-        ];
-        read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
-        Ok(pixels)
-    }
-
-    /// Write `bytes` to this image array. Length must equal
-    /// `width * height * array_size * size_of::<F::Pixel>()`.
-    pub fn upload_bytes<L: Launcher>(&mut self, launcher: &L, bytes: &[u8]) -> Result<()> {
+    /// See [`Image2D::read_bytes`].
+    pub fn read_bytes<'a>(&'a self, dst: &'a mut [u8]) -> Result<ImageReadOp<'a, u8>> {
         let pixel_count =
             (self.width as usize) * (self.height as usize) * (self.array_size as usize);
         let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        assert_eq!(
-            bytes.len(),
+        image_read_bytes_op(
+            &self.image,
+            [
+                self.width as usize,
+                self.height as usize,
+                self.array_size as usize,
+            ],
+            dst,
             expected,
-            "Image2DArray::upload_bytes: buffer length {} ≠ expected {}",
-            bytes.len(),
-            expected,
-        );
-        let region = [
-            self.width as usize,
-            self.height as usize,
-            self.array_size as usize,
-        ];
-        write_image_from(launcher, &mut self.image, region, bytes.as_ptr())
+            "Image2DArray",
+        )
     }
 
-    /// Write a typed pixel slice. Length must equal
-    /// `width * height * array_size`.
-    pub fn upload<L: Launcher>(&mut self, launcher: &L, pixels: &[F::Pixel]) -> Result<()> {
+    /// See [`Image2D::read_alloc`].
+    pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
+    where
+        F::Pixel: Default + Copy,
+    {
         let pixel_count =
             (self.width as usize) * (self.height as usize) * (self.array_size as usize);
-        assert_eq!(
-            pixels.len(),
+        ImageReadAlloc {
+            image: &self.image,
+            region: [
+                self.width as usize,
+                self.height as usize,
+                self.array_size as usize,
+            ],
             pixel_count,
-            "Image2DArray::upload: pixel count {} ≠ expected {}",
-            pixels.len(),
+            _format: PhantomData::<F>,
+        }
+    }
+
+    /// See [`Image2D::read_bytes_alloc`].
+    pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
+        let pixel_count =
+            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
+        ImageReadBytesAlloc {
+            image: &self.image,
+            region: [
+                self.width as usize,
+                self.height as usize,
+                self.array_size as usize,
+            ],
+            byte_len: pixel_count * std::mem::size_of::<F::Pixel>(),
+            _format: PhantomData::<F>,
+        }
+    }
+
+    /// See [`Image2D::write`].
+    pub fn write<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
+        let pixel_count =
+            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
+        image_write_op(
+            &mut self.image,
+            [
+                self.width as usize,
+                self.height as usize,
+                self.array_size as usize,
+            ],
+            pixels,
             pixel_count,
-        );
-        let region = [
-            self.width as usize,
-            self.height as usize,
-            self.array_size as usize,
-        ];
-        write_image_from(launcher, &mut self.image, region, pixels.as_ptr().cast())
+            "Image2DArray",
+        )
+    }
+
+    /// See [`Image2D::write_bytes`].
+    pub fn write_bytes<'a>(&'a mut self, bytes: &'a [u8]) -> ImageWriteOp<'a, u8> {
+        let pixel_count =
+            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
+        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
+        image_write_bytes_op(
+            &mut self.image,
+            [
+                self.width as usize,
+                self.height as usize,
+                self.array_size as usize,
+            ],
+            bytes,
+            expected,
+            "Image2DArray",
+        )
+    }
+
+    /// See [`Image2D::copy_to`].
+    pub fn copy_to<'a, A2: KernelAccess>(
+        &'a self,
+        dst: &'a mut Image2DArray<A2, F>,
+    ) -> ImageCopyOp<'a> {
+        image_copy_op(
+            &self.image,
+            &mut dst.image,
+            [
+                self.width as usize,
+                self.height as usize,
+                self.array_size as usize,
+            ],
+        )
+    }
+
+    /// See [`Image2D::fill`].
+    pub fn fill<T: Copy>(&mut self, pattern: [T; 4]) -> ImageFillOp<'_, T> {
+        image_fill_op(
+            &mut self.image,
+            [
+                self.width as usize,
+                self.height as usize,
+                self.array_size as usize,
+            ],
+            pattern,
+        )
     }
 
     /// Width in pixels (per layer).
@@ -1456,58 +2192,87 @@ impl<A: KernelAccess, F: format::Format> Image1DBuffer<A, F> {
         })
     }
 
-    /// Read this image-buffer as raw bytes — `Vec<u8>` of length
-    /// `width * size_of::<F::Pixel>()`. Goes through the image
-    /// `clEnqueueReadImage` path (region/origin semantics).
-    pub fn download_bytes<L: Launcher>(&self, launcher: &L) -> Result<Vec<u8>> {
-        let pixel_count = self.width as usize;
-        let mut bytes = vec![0u8; pixel_count * std::mem::size_of::<F::Pixel>()];
-        let region = [pixel_count, 1, 1];
-        read_image_into(launcher, &self.image, region, bytes.as_mut_ptr())?;
-        Ok(bytes)
+    /// See [`Image2D::read`] — image-buffer goes through the image
+    /// path (`clEnqueueReadImage`), region is `[width, 1, 1]`.
+    pub fn read<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
+        image_read_op(
+            &self.image,
+            [self.width as usize, 1, 1],
+            dst,
+            self.width as usize,
+            "Image1DBuffer",
+        )
     }
 
-    /// Read this image-buffer into a host `Vec<F::Pixel>` of
-    /// length `width`. Blocking.
-    pub fn download<L: Launcher>(&self, launcher: &L) -> Result<Vec<F::Pixel>>
+    /// See [`Image2D::read_bytes`].
+    pub fn read_bytes<'a>(&'a self, dst: &'a mut [u8]) -> Result<ImageReadOp<'a, u8>> {
+        let expected = (self.width as usize) * std::mem::size_of::<F::Pixel>();
+        image_read_bytes_op(
+            &self.image,
+            [self.width as usize, 1, 1],
+            dst,
+            expected,
+            "Image1DBuffer",
+        )
+    }
+
+    /// See [`Image2D::read_alloc`].
+    pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
     where
-        F::Pixel: Default,
+        F::Pixel: Default + Copy,
     {
-        let pixel_count = self.width as usize;
-        let mut pixels = vec![<F::Pixel as Default>::default(); pixel_count];
-        let region = [pixel_count, 1, 1];
-        read_image_into(launcher, &self.image, region, pixels.as_mut_ptr().cast())?;
-        Ok(pixels)
+        ImageReadAlloc {
+            image: &self.image,
+            region: [self.width as usize, 1, 1],
+            pixel_count: self.width as usize,
+            _format: PhantomData::<F>,
+        }
     }
 
-    /// Write `bytes` to this image-buffer. Length must equal
-    /// `width * size_of::<F::Pixel>()`. Blocking.
-    pub fn upload_bytes<L: Launcher>(&mut self, launcher: &L, bytes: &[u8]) -> Result<()> {
-        let pixel_count = self.width as usize;
-        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        assert_eq!(
-            bytes.len(),
-            expected,
-            "Image1DBuffer::upload_bytes: buffer length {} ≠ expected {}",
-            bytes.len(),
-            expected,
-        );
-        let region = [pixel_count, 1, 1];
-        write_image_from(launcher, &mut self.image, region, bytes.as_ptr())
+    /// See [`Image2D::read_bytes_alloc`].
+    pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
+        ImageReadBytesAlloc {
+            image: &self.image,
+            region: [self.width as usize, 1, 1],
+            byte_len: (self.width as usize) * std::mem::size_of::<F::Pixel>(),
+            _format: PhantomData::<F>,
+        }
     }
 
-    /// Write a typed pixel slice. Length must equal `width`.
-    pub fn upload<L: Launcher>(&mut self, launcher: &L, pixels: &[F::Pixel]) -> Result<()> {
-        let pixel_count = self.width as usize;
-        assert_eq!(
-            pixels.len(),
-            pixel_count,
-            "Image1DBuffer::upload: pixel count {} ≠ expected {}",
-            pixels.len(),
-            pixel_count,
-        );
-        let region = [pixel_count, 1, 1];
-        write_image_from(launcher, &mut self.image, region, pixels.as_ptr().cast())
+    /// See [`Image2D::write`].
+    pub fn write<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
+        image_write_op(
+            &mut self.image,
+            [self.width as usize, 1, 1],
+            pixels,
+            self.width as usize,
+            "Image1DBuffer",
+        )
+    }
+
+    /// See [`Image2D::write_bytes`].
+    pub fn write_bytes<'a>(&'a mut self, bytes: &'a [u8]) -> ImageWriteOp<'a, u8> {
+        let expected = (self.width as usize) * std::mem::size_of::<F::Pixel>();
+        image_write_bytes_op(
+            &mut self.image,
+            [self.width as usize, 1, 1],
+            bytes,
+            expected,
+            "Image1DBuffer",
+        )
+    }
+
+    /// See [`Image2D::copy_to`].
+    pub fn copy_to<'a, A2: KernelAccess>(
+        &'a self,
+        dst: &'a mut Image1DBuffer<A2, F>,
+    ) -> ImageCopyOp<'a> {
+        image_copy_op(&self.image, &mut dst.image, [self.width as usize, 1, 1])
+    }
+
+    /// See [`Image2D::fill`].
+    pub fn fill<T: Copy>(&mut self, pattern: [T; 4]) -> ImageFillOp<'_, T> {
+        image_fill_op(&mut self.image, [self.width as usize, 1, 1], pattern)
     }
 
     /// Width in pixels.
