@@ -40,6 +40,7 @@
 pub mod alloc;
 pub mod and_then_host;
 pub mod arc;
+pub mod buffer_ops;
 pub mod bundle;
 pub mod dyn_op;
 pub mod exec_ctx;
@@ -62,6 +63,10 @@ pub use alloc::{
 };
 pub use and_then_host::{AndThenHost, AndThenHostWithContext, DeviceOperationHostExt};
 pub use arc::ArcSplit;
+pub use buffer_ops::{
+    DeviceSliceCopyOp, DeviceSliceFillOp, DeviceSliceWriteOp, MappedSliceCopyOp, MappedSliceFillOp,
+    device_slice_copy, device_slice_fill, device_slice_write, mapped_slice_copy, mapped_slice_fill,
+};
 pub use bundle::{
     Bundle2, Bundle3, Bundle4, Bundle5, Bundle6, Bundle7, Bundle8, Bundle9, Bundle10, Bundle11,
     Bundle12, Bundle13, Bundle14, Bundle15, Bundle16,
