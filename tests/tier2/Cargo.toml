@@ -19,6 +19,15 @@ claspr-test-kernels = { path = "../kernels" }
 # Just for `block_on` in the async-terminal tests — no need for tokio's
 # full machinery.
 futures = { version = "0.3", default-features = false, features = ["executor", "std"] }
+ui_test = "0.30"
+
+# ui_test requires harness = false so its `fn main()` runs instead of
+# cargo test scanning for `#[test]`s. Same pattern as
+# `tests/tier1/Cargo.toml`'s `image_compile_fail` harness.
+[[test]]
+name = "safety_compile_fail"
+path = "tests/safety_compile_fail.rs"
+harness = false
 
 [lints]
 workspace = true

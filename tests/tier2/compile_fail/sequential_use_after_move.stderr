@@ -1,0 +1,14 @@
+error[E0382]: use of moved value: `buf`
+  --> compile_fail/sequential_use_after_move.rs:24:19
+   |
+18 |     let buf = DeviceSlice::<u32>::alloc(&ctx, 4).unwrap();
+   |         --- move occurs because `buf` has type `DeviceSlice<u32>`, which does not implement the `Copy` trait
+...
+23 |         .fill_u32([4usize], buf, 1u32)
+   |                             --- value moved here
+24 |         .and_then(|_first_out| kernels.scale_u32([4usize], buf, 2u32));
+   |                   ^^^^^^^^^^^^ value used here after move  --- use occurs due to use in closure
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0382`.

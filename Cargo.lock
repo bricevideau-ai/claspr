@@ -371,6 +371,7 @@ dependencies = [
  "claspr-async",
  "claspr-test-kernels",
  "futures",
+ "ui_test",
 ]
 
 [[package]]
