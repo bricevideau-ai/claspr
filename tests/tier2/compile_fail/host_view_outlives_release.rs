@@ -14,8 +14,7 @@
 //! the chain.
 
 use claspr::ReadWrite;
-use claspr_async::host_view::MapReadWrite;
-use claspr_async::DeviceSliceHostView;
+use claspr_async::{DeviceSliceHostView, MapReadWrite};
 
 #[allow(dead_code)]
 fn forbidden(view: DeviceSliceHostView<u32, ReadWrite, MapReadWrite>) {

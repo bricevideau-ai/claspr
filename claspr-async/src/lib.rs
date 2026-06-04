@@ -72,8 +72,8 @@ pub use fan_out::{FanOut, FanOutExt, fan_out};
 pub use future::ChainFuture;
 pub use host_view::{
     AcquireDeviceSliceOp, AcquireMappedSliceOp, DeviceSliceHostView, HostAccessibleExt,
-    HostReadableExt, HostWritableExt, MappedSliceHostView, ReleaseDeviceSliceOp,
-    ReleaseMappedSliceOp,
+    HostReadableExt, HostWritableExt, MapAccess, MapReadOnly, MapReadWrite, MappedSliceHostView,
+    ReleaseDeviceSliceOp, ReleaseMappedSliceOp,
 };
 pub use image_transfer::{ImageDownload, ImageUpload, image_download, image_upload};
 pub use mappable::{DeviceSliceMapHandle, Mappable};
