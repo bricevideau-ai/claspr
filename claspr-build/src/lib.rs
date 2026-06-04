@@ -146,7 +146,7 @@ use std::path::{Path, PathBuf};
 // Re-exported so build scripts that need to pass extra
 // capabilities / a non-default panic strategy don't have to add
 // spirv-builder as a separate build-dependency.
-pub use spirv_builder::{Capability, ShaderPanicStrategy};
+pub use spirv_builder::{Capability, ShaderPanicStrategy, SpirvMetadata};
 
 /// Boxed-error result alias used by all `claspr_build` entry points.
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync + 'static>>;

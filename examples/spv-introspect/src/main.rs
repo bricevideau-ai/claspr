@@ -16,34 +16,34 @@
 //! ## What you'll see across ICDs
 //!
 //! `clGetKernelArgInfo` requires the program to have been built
-//! with `-cl-kernel-arg-info` (we pass it). Even with the flag,
-//! what comes back depends on:
+//! with `-cl-kernel-arg-info` (we pass it). It also requires the
+//! SPIR-V to carry `OpName` instructions for arg names to be
+//! recoverable at all. spirv-builder's default
+//! `SpirvMetadata::None` *strips every `OpName`* — so the demo's
+//! `build.rs` opts into `SpirvMetadata::NameVariables`, which
+//! adds `OpName` for interface variables without the larger
+//! `OpLine` debug info that `Full` brings (the latter trips
+//! SPIRV-LLVM-Translator on PoCL with an unimplemented opcode).
 //!
-//! 1. **The ICD's implementation** of arg-info recovery from
-//!    SPIR-V binaries.
-//! 2. **What the SPIR-V actually carries** — types are always
-//!    encoded in the type system; names live in optional `OpName`
-//!    decorations.
+//! Even with names present, what comes back depends on the ICD's
+//! arg-info recovery. Observed matrix on the embedded demo:
 //!
-//! On the embedded demo (compiled by rust-gpu's OpenCL Kernel
-//! target), the observed matrix is:
+//! | ICD                  | address | type | name |
+//! |----------------------|---------|------|------|
+//! | rusticl/llvmpipe     | ✓       | `<n/a>` | ✓ |
+//! | PoCL 7.2-pre (PR#2166)| ✓      | ✓    | ✓ |
+//! | Intel NEO (legacy)   | ✓       | ✓    | ✓ |
 //!
-//! | ICD                  | address | access | type      | name       |
-//! |----------------------|---------|--------|-----------|------------|
-//! | rusticl/llvmpipe     | ✓       | n/a    | `<n/a>`   | `<n/a>`    |
-//! | PoCL 7.2-pre (PR#2166)| ✓      | n/a    | ✓ (`int*`, `long`) | `<empty>` |
-//! | Intel NEO (legacy)   | ✓       | n/a    | ✓         | `<empty>`  |
-//!
-//! Names are universally missing because rust-gpu's Kernel-target
-//! emission doesn't currently produce `OpName` instructions for
-//! kernel arguments — even PoCL's [PR #2166][pocl-pr], which
-//! recovers names from `llvm::Argument`, has nothing to read.
-//! Type recovery on PoCL ≥ 7.2 / NEO is real and useful.
+//! Type names are missing on rusticl because Mesa's arg-info
+//! implementation doesn't reflect type info from SPIR-V binaries
+//! yet (file an issue if you need it). PoCL ≥ 7.2 with PR #2166
+//! and Intel NEO both round-trip the full table.
 //!
 //! Note the **doubled argument count** for slice kernels: a Rust
 //! `&[u32]` lowers to a `(global int*, private long)` pair at the
 //! Kernel-target SPIR-V level (pointer + length). `fill_u32(data: &mut [u32], value: u32)`
-//! becomes 3 args; `add_u32(a, b, out)` becomes 6.
+//! becomes 3 args (`data`, `data.len`, `value`); `add_u32(a, b, out)`
+//! becomes 6.
 //!
 //! Switch ICDs via `OCL_ICD_VENDORS=/path/to/<icd>.icd` to compare.
 //! The demo treats missing fields as soft errors and prints
