@@ -44,7 +44,7 @@ use crate::error::{Error, Result};
 use crate::launch::KernelArg;
 use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
 use crate::queue::Launcher;
-use opencl3::command_queue::{CommandQueue, enqueue_svm_map, enqueue_svm_unmap};
+use opencl3::command_queue::{enqueue_svm_map, enqueue_svm_unmap};
 use opencl3::event::{Event, release_event, retain_event};
 use opencl3::kernel::ExecuteKernel;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, svm_alloc};
@@ -152,7 +152,7 @@ impl<T: Default + Copy, M: MemMode + KernelWritable> MappedSlice<T, M> {
         // SAFETY: synchronous fill below overwrites every byte
         // before returning, so no path can observe uninit data.
         let slice = unsafe { Self::alloc_uninit(ctx, len)? };
-        slice.fill(ctx, T::default()).wait()?;
+        slice.fill(T::default()).wait(ctx)?;
         Ok(slice)
     }
 }
@@ -330,17 +330,12 @@ impl<T, M: MemMode> MappedSlice<T, M> {
     /// **Marker constraint:** `M: KernelWritable`. Runtime-side fill
     /// requires write access at the OpenCL level; kernel-RO markers
     /// (`ReadOnly`, `Frozen`) reject it.
-    pub fn fill<'a, L: Launcher + ?Sized>(
-        &'a self,
-        launcher: &'a L,
-        value: T,
-    ) -> SvmFillOp<'a, T, M>
+    pub fn fill(&self, value: T) -> SvmFillOp<'_, T, M>
     where
         T: Copy,
         M: KernelWritable,
     {
         SvmFillOp {
-            queue: launcher.cl_queue(),
             owner: self,
             pattern: value,
             deps: Vec::new(),
@@ -357,13 +352,11 @@ impl<T, M: MemMode> MappedSlice<T, M> {
     /// time). The resulting event is registered on **both** buffers'
     /// last-use lists so Drop on either side is ordered after the
     /// copy.
-    pub fn copy_to<'a, L: Launcher + ?Sized, M2: MemMode>(
+    pub fn copy_to<'a, M2: MemMode>(
         &'a self,
         dst: &'a MappedSlice<T, M2>,
-        launcher: &'a L,
     ) -> SvmCopyOp<'a, T, M, M2> {
         SvmCopyOp {
-            queue: launcher.cl_queue(),
             src: self,
             dst,
             deps: Vec::new(),
@@ -404,7 +397,6 @@ impl<T, M: MemMode> Buffer<T> for MappedSlice<T, M> {
 /// Lazy builder for `clEnqueueSVMMemFill`. Returned by
 /// [`MappedSlice::fill`].
 pub struct SvmFillOp<'a, T: Copy, M: MemMode> {
-    queue: &'a CommandQueue,
     owner: &'a MappedSlice<T, M>,
     pattern: T,
     deps: Vec<cl_event>,
@@ -433,24 +425,24 @@ impl<'a, T: Copy, M: MemMode> SvmFillOp<'a, T, M> {
         self
     }
 
-    pub fn wait(self) -> Result<()> {
-        let event = self.into_event()?;
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+        let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
-    pub fn submit(self) -> Result<Event> {
-        self.into_event()
+    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        self.into_event(launcher)
     }
 
-    pub(crate) fn into_event(self) -> Result<Event> {
+    pub(crate) fn into_event<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         let size = self.owner.len * std::mem::size_of::<T>();
         // SAFETY: svm_ptr is a valid SVM allocation in the queue's
         // context (caller's responsibility — same as
         // `DeviceSlice::fill`). Pattern is a single T byte-copied
         // across the buffer.
         let event = unsafe {
-            self.queue.enqueue_svm_mem_fill(
+            launcher.cl_queue().enqueue_svm_mem_fill(
                 self.owner.ptr as *mut c_void,
                 std::slice::from_ref(&self.pattern),
                 size,
@@ -480,7 +472,6 @@ impl<'a, T: Copy, M: MemMode> SvmFillOp<'a, T, M> {
 /// Lazy builder for `clEnqueueSVMMemcpy`. Returned by
 /// [`MappedSlice::copy_to`].
 pub struct SvmCopyOp<'a, T, M1: MemMode, M2: MemMode> {
-    queue: &'a CommandQueue,
     src: &'a MappedSlice<T, M1>,
     dst: &'a MappedSlice<T, M2>,
     deps: Vec<cl_event>,
@@ -509,17 +500,17 @@ impl<'a, T, M1: MemMode, M2: MemMode> SvmCopyOp<'a, T, M1, M2> {
         self
     }
 
-    pub fn wait(self) -> Result<()> {
-        let event = self.into_event()?;
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+        let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
-    pub fn submit(self) -> Result<Event> {
-        self.into_event()
+    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        self.into_event(launcher)
     }
 
-    pub(crate) fn into_event(self) -> Result<Event> {
+    pub(crate) fn into_event<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         if self.src.len != self.dst.len {
             return Err(Error::LengthMismatch {
                 src: self.src.len,
@@ -533,7 +524,7 @@ impl<'a, T, M1: MemMode, M2: MemMode> SvmCopyOp<'a, T, M1, M2> {
         // event encodes completion; .wait()/.submit() pick how to
         // observe it.
         let event = unsafe {
-            self.queue.enqueue_svm_mem_cpy(
+            launcher.cl_queue().enqueue_svm_mem_cpy(
                 CL_NON_BLOCKING,
                 self.dst.ptr as *mut c_void,
                 self.src.ptr as *const c_void,

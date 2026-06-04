@@ -116,8 +116,8 @@ fn launch_runs_on_each_device_via_proc_macro_launcher() {
 
     let mut host_a = vec![0u32; N];
     let mut host_b = vec![0u32; N];
-    buf_a.read(&q_a, &mut host_a).wait().expect("read a");
-    buf_b.read(&q_b, &mut host_b).wait().expect("read b");
+    buf_a.read(&mut host_a).wait(&q_a).expect("read a");
+    buf_b.read(&mut host_b).wait(&q_b).expect("read b");
     assert!(host_a.iter().all(|&v| v == 7));
     assert!(host_b.iter().all(|&v| v == 9));
 }

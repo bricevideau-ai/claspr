@@ -32,7 +32,7 @@ fn fill_kernel_writes_value_to_every_element() {
         .expect("launch");
 
     let mut out = vec![0u32; N];
-    buf.read(&ctx, &mut out).wait().expect("read");
+    buf.read(&mut out).wait(&ctx).expect("read");
     assert!(out.iter().all(|&v| v == 0xfeed_cafe));
 }
 
@@ -43,13 +43,13 @@ fn write_kernel_read_round_trip() {
 
     let initial: Vec<u32> = (0..N as u32).collect();
     let mut buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
-    buf.write(&ctx, &initial).wait().expect("write");
+    buf.write(&initial).wait(&ctx).expect("write");
 
     // Scale by 3, then read back.
     let buf = kernels.scale_u32([N], buf, 3).wait(&ctx).expect("scale");
 
     let mut out = vec![0u32; N];
-    buf.read(&ctx, &mut out).wait().expect("read");
+    buf.read(&mut out).wait(&ctx).expect("read");
     for (i, &v) in out.iter().enumerate() {
         assert_eq!(v, (i as u32).wrapping_mul(3), "elem {i}");
     }
@@ -67,13 +67,13 @@ fn multi_buffer_kernel_combines_inputs() {
 
     let host_a: Vec<u32> = vec![10; N];
     let host_b: Vec<u32> = vec![32; N];
-    a.write(&ctx, &host_a).wait().expect("write a");
-    b.write(&ctx, &host_b).wait().expect("write b");
+    a.write(&host_a).wait(&ctx).expect("write a");
+    b.write(&host_b).wait(&ctx).expect("write b");
 
     let (_a, _b, out) = kernels.add_u32([N], a, b, out).wait(&ctx).expect("add");
 
     let mut host_out = vec![0u32; N];
-    out.read(&ctx, &mut host_out).wait().expect("read");
+    out.read(&mut host_out).wait(&ctx).expect("read");
     assert!(host_out.iter().all(|&v| v == 42));
 }
 
@@ -97,6 +97,6 @@ fn submit_returns_event_for_cross_queue_chaining() {
         .expect("scale after");
 
     let mut out = vec![0u32; N];
-    buf.read(&ctx, &mut out).wait().expect("read");
+    buf.read(&mut out).wait(&ctx).expect("read");
     assert!(out.iter().all(|&v| v == 42));
 }

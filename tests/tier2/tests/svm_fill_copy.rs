@@ -30,7 +30,7 @@ fn tier1_svm_fill_writes_pattern() {
     // in every slot, error_count stays clean.
     let Some(ctx) = ctx_with_svm() else { return };
     let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
-    buf.fill(&ctx, 0xDEAD_BEEFu32).wait().expect("fill");
+    buf.fill(0xDEAD_BEEFu32).wait(&ctx).expect("fill");
 
     let g = buf.map(&ctx).expect("map");
     assert!(g.iter().all(|&v| v == 0xDEAD_BEEF));
@@ -48,8 +48,8 @@ fn tier1_svm_copy_to_propagates_contents() {
     let src = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc src");
     let dst = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc dst");
 
-    src.fill(&ctx, 42u32).wait().expect("fill src");
-    src.copy_to(&dst, &ctx).wait().expect("copy src→dst");
+    src.fill(42u32).wait(&ctx).expect("fill src");
+    src.copy_to(&dst).wait(&ctx).expect("copy src→dst");
 
     let g = dst.map(&ctx).expect("map dst");
     assert!(g.iter().all(|&v| v == 42));
@@ -69,7 +69,7 @@ fn tier1_svm_copy_length_mismatch_errors() {
     let src = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc src");
     let dst = MappedSlice::<u32>::alloc(&ctx, N / 2).expect("alloc dst");
 
-    let err = src.copy_to(&dst, &ctx).wait().expect_err("length mismatch");
+    let err = src.copy_to(&dst).wait(&ctx).expect_err("length mismatch");
     assert!(
         matches!(err, claspr::Error::LengthMismatch { src: 64, dst: 32 }),
         "got {err:?}",

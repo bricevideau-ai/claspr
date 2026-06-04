@@ -70,7 +70,7 @@
 //! let ctx = Context::any().unwrap();
 //! let mut frozen: DeviceSlice<u32, Frozen> =
 //!     DeviceSlice::from_slice(&ctx, &[0u32; 16]).unwrap();
-//! let _ = frozen.write(&ctx, &[1u32; 16]);  // ← HostWritable: ERROR
+//! let _ = frozen.write(&[1u32; 16]).wait(&ctx);  // ← HostWritable: ERROR
 //! ```
 //!
 //! Frozen → `.fill(...)`: rejected because Frozen doesn't impl
@@ -81,7 +81,7 @@
 //! let ctx = Context::any().unwrap();
 //! let mut frozen: DeviceSlice<u32, Frozen> =
 //!     DeviceSlice::from_slice(&ctx, &[0u32; 16]).unwrap();
-//! let _ = frozen.fill(&ctx, 9u32);  // ← KernelWritable: ERROR
+//! let _ = frozen.fill(9u32).wait(&ctx);  // ← KernelWritable: ERROR
 //! ```
 //!
 //! Frozen → `.acquire_host_view()` (mut variant): rejected because

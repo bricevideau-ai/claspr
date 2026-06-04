@@ -182,99 +182,15 @@ impl Future for LaunchFuture {
     }
 }
 
-// ── Buffer-op IntoFuture impls ───────────────────────────────────────
+// ── Buffer-op IntoFuture impls removed ──────────────────────────────
 //
-// Same shape as LaunchFuture: enqueue eagerly in `into_future`, wrap
-// the resulting Event in an EventFuture (or surface a setup error).
-// UploadOp carries an extra payload — the freshly-allocated
-// DeviceSlice — that the future yields when the write completes.
-
-/// Future returned by `.await` on a [`crate::buffer::ReadOp`].
-pub enum ReadFuture {
-    Errored(Option<Error>),
-    Running(EventFuture),
-}
-
-impl Future for ReadFuture {
-    type Output = Result<()>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match &mut *self {
-            ReadFuture::Errored(slot) => {
-                Poll::Ready(Err(slot.take().expect("ReadFuture polled after Ready")))
-            }
-            ReadFuture::Running(ef) => Pin::new(ef).poll(cx),
-        }
-    }
-}
-
-impl<'a, T> IntoFuture for crate::buffer::ReadOp<'a, T> {
-    type Output = Result<()>;
-    type IntoFuture = ReadFuture;
-    fn into_future(self) -> ReadFuture {
-        match self.submit() {
-            Ok(ev) => ReadFuture::Running(ev.into_future()),
-            Err(e) => ReadFuture::Errored(Some(e)),
-        }
-    }
-}
-
-/// Future returned by `.await` on a [`crate::buffer::CopyOp`].
-pub enum CopyFuture {
-    Errored(Option<Error>),
-    Running(EventFuture),
-}
-
-impl Future for CopyFuture {
-    type Output = Result<()>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match &mut *self {
-            CopyFuture::Errored(slot) => {
-                Poll::Ready(Err(slot.take().expect("CopyFuture polled after Ready")))
-            }
-            CopyFuture::Running(ef) => Pin::new(ef).poll(cx),
-        }
-    }
-}
-
-impl<'a, T> IntoFuture for crate::buffer::CopyOp<'a, T> {
-    type Output = Result<()>;
-    type IntoFuture = CopyFuture;
-    fn into_future(self) -> CopyFuture {
-        match self.into_event() {
-            Ok(ev) => CopyFuture::Running(ev.into_future()),
-            Err(e) => CopyFuture::Errored(Some(e)),
-        }
-    }
-}
-
-/// Future returned by `.await` on a [`crate::buffer::WriteOp`].
-pub enum WriteFuture {
-    Errored(Option<Error>),
-    Running(EventFuture),
-}
-
-impl Future for WriteFuture {
-    type Output = Result<()>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match &mut *self {
-            WriteFuture::Errored(slot) => {
-                Poll::Ready(Err(slot.take().expect("WriteFuture polled after Ready")))
-            }
-            WriteFuture::Running(ef) => Pin::new(ef).poll(cx),
-        }
-    }
-}
-
-impl<'a, T> IntoFuture for crate::buffer::WriteOp<'a, T> {
-    type Output = Result<()>;
-    type IntoFuture = WriteFuture;
-    fn into_future(self) -> WriteFuture {
-        match self.submit() {
-            Ok(ev) => WriteFuture::Running(ev.into_future()),
-            Err(e) => WriteFuture::Errored(Some(e)),
-        }
-    }
-}
+// `WriteOp` / `ReadOp` / `CopyOp` (and friends) used to implement
+// `IntoFuture`, letting users write `buf.write(&ctx, &data).await`.
+// With the launcher-at-terminal API (`buf.write(&data).wait(&ctx)?`),
+// `IntoFuture` no longer has a place to thread `&launcher` —
+// `into_future(self) -> Self::IntoFuture` takes nothing extra. The
+// equivalent path is now `op.submit(&ctx)?.await` (`Event: IntoFuture`
+// is unchanged). The impls were never exercised in tests or examples.
 
 // ── LaunchOp IntoFuture ─────────────────────────────────────────────
 

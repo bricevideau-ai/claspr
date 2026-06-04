@@ -30,7 +30,7 @@ fn frozen_from_slice_round_trip_via_read() {
     assert_eq!(claspr::Buffer::len(&frozen), N);
 
     let mut out = vec![0u32; N];
-    frozen.read(&ctx, &mut out).wait().expect("read frozen");
+    frozen.read(&mut out).wait(&ctx).expect("read frozen");
     assert_eq!(out, input_data, "Frozen bytes should match init data");
 }
 
@@ -55,7 +55,7 @@ fn frozen_threads_into_kernel_as_read_only_input() {
         .expect("kernel launch with Frozen inputs");
 
     let mut host = vec![0u32; N];
-    out.read(&ctx, &mut host).wait().expect("read");
+    out.read(&mut host).wait(&ctx).expect("read");
     assert!(host.iter().all(|&v| v == 8), "Frozen a + Frozen b = 8 each");
 }
 

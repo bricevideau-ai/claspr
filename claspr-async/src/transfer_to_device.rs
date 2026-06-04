@@ -86,9 +86,9 @@ where
         let target_q = ec.context().default_outoforder_queue(&self.device)?;
         // Enqueue migrate with upstream deps as the wait-list.
         let event = buf
-            .migrate(&*target_q)
+            .migrate()
             .after_all(deps_as_events(&deps))
-            .submit()?;
+            .submit(&*target_q)?;
         Ok((buf, vec![wrap_event(event)]))
     }
 }

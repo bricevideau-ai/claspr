@@ -95,9 +95,9 @@ fn run() -> claspr::Result<bool> {
     let inputs: Vec<u32> = (1..=N as u32).collect();
     let half = N / 2;
     let mut buf0 = DeviceSlice::<u32>::alloc(&ctx, half)?;
-    buf0.write(&q0, &inputs[..half]).wait()?;
+    buf0.write(&inputs[..half]).wait(&q0)?;
     let mut buf1 = DeviceSlice::<u32>::alloc(&ctx, N - half)?;
-    buf1.write(&q1, &inputs[half..]).wait()?;
+    buf1.write(&inputs[half..]).wait(&q1)?;
 
     // Stage 2: cross-buffer copy through q1 — allocate a fresh
     // buffer on the shared context, copy buf0's data into it
@@ -105,15 +105,15 @@ fn run() -> claspr::Result<bool> {
     // `DeviceSlice::copy_to` path within a possibly-multi-device
     // context.
     let mut mirror = DeviceSlice::<u32>::alloc(&ctx, half)?;
-    buf0.copy_to(&mut mirror, &q1).wait()?;
+    buf0.copy_to(&mut mirror).wait(&q1)?;
 
     // Stage 3: download back via the respective queues and verify.
     let mut out0 = vec![0u32; half];
     let mut out1 = vec![0u32; N - half];
     let mut mirror_out = vec![0u32; half];
-    buf0.read(&q0, &mut out0).wait()?;
-    buf1.read(&q1, &mut out1).wait()?;
-    mirror.read(&q1, &mut mirror_out).wait()?;
+    buf0.read(&mut out0).wait(&q0)?;
+    buf1.read(&mut out1).wait(&q1)?;
+    mirror.read(&mut mirror_out).wait(&q1)?;
 
     assert_eq!(out0, inputs[..half], "buf0 round-trip mismatch");
     assert_eq!(out1, inputs[half..], "buf1 round-trip mismatch");

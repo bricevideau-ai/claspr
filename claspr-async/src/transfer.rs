@@ -154,9 +154,9 @@ where
         // event from .submit() goes into the keep-alive callback +
         // becomes the next op's dep.
         let event = buf
-            .write(ctx, source.as_slice())
+            .write(source.as_slice())
             .after_all(deps_as_events(&deps))
-            .submit()?;
+            .submit(ctx)?;
         // Move `source` into a Box, hand to OpenCL's user_data. The
         // thunk drops it when CL_COMPLETE fires — exactly when the
         // runtime is done reading from the host heap.
@@ -206,9 +206,9 @@ where
             .expect("Download::execute called twice — internal claspr-async bug");
         let mut out = vec![T::default(); buf.len()];
         let event = buf
-            .read(ctx, &mut out)
+            .read(&mut out)
             .after_all(deps_as_events(&deps))
-            .submit()?;
+            .submit(ctx)?;
         Ok((out, vec![wrap_event(event)]))
     }
 }

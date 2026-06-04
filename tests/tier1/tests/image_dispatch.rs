@@ -192,7 +192,7 @@ fn read_only_float_image_to_buffer() {
         .wait(&ctx)
         .unwrap();
     let mut result = vec![0.0f32; (W * H) as usize];
-    out.read(&ctx, &mut result).wait().unwrap();
+    out.read(&mut result).wait(&ctx).unwrap();
     assert_eq!(result, seed, "kernel-read pixels should match host-seeded");
 }
 
@@ -220,7 +220,7 @@ fn read_only_sint_image_to_buffer() {
         .wait(&ctx)
         .unwrap();
     let mut result = vec![0i32; (W * H) as usize];
-    out.read(&ctx, &mut result).wait().unwrap();
+    out.read(&mut result).wait(&ctx).unwrap();
     assert_eq!(result, seed);
 }
 
@@ -327,7 +327,7 @@ fn dim_buffer_view_of_slice() {
         .unwrap();
 
     let mut result = vec![0u32; N as usize];
-    out.read(&ctx, &mut result).wait().unwrap();
+    out.read(&mut result).wait(&ctx).unwrap();
     assert_eq!(
         result, seed,
         "kernel-read pixels through view should match host-seeded slice"
@@ -371,7 +371,7 @@ fn dim_buffer_read_to_slice() {
         .wait(&ctx)
         .unwrap();
     let mut result = vec![0u32; N as usize];
-    out.read(&ctx, &mut result).wait().unwrap();
+    out.read(&mut result).wait(&ctx).unwrap();
     assert_eq!(result, seed);
 }
 

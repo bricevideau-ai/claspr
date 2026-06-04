@@ -15,7 +15,7 @@ use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
 use crate::queue::Launcher;
-use opencl3::command_queue::CommandQueue;
+
 use opencl3::event::Event;
 use opencl3::memory::{Buffer as ClBuffer, CL_MEM_COPY_HOST_PTR, ClMem, release_mem_object};
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_event, cl_mem};
@@ -160,7 +160,7 @@ impl<T: Default + Copy, M: MemMode + KernelWritable> DeviceSlice<T, M> {
         // synchronous `fill` below before returning. No path from
         // here can observe the uninit bytes.
         let mut slice = unsafe { Self::alloc_uninit(ctx, len)? };
-        slice.fill(ctx, T::default()).wait()?;
+        slice.fill(T::default()).wait(ctx)?;
         Ok(slice)
     }
 }
@@ -218,13 +218,8 @@ impl<T, M: MemMode + HostWritable> DeviceSlice<T, M> {
     /// `ReadWrite` / `ReadOnly`. Markers that mark the buffer
     /// host-read-only (`HostReadOnly`, `Frozen`) or host-no-access
     /// (`DeviceScratch`) intentionally don't allow `write`.
-    pub fn write<'a, L: Launcher + ?Sized>(
-        &'a mut self,
-        launcher: &'a L,
-        data: &'a [T],
-    ) -> WriteOp<'a, T> {
+    pub fn write<'a>(&'a mut self, data: &'a [T]) -> WriteOp<'a, T> {
         WriteOp {
-            queue: launcher.cl_queue(),
             buffer: &mut self.buffer,
             dst_len: self.len,
             data,
@@ -245,13 +240,8 @@ impl<T, M: MemMode + HostReadable> DeviceSlice<T, M> {
     /// **Marker constraint:** `M: HostReadable`. Compiles for every
     /// marker except `DeviceScratch` (`CL_MEM_HOST_NO_ACCESS` —
     /// host can't touch the bytes).
-    pub fn read<'a, L: Launcher + ?Sized>(
-        &'a self,
-        launcher: &'a L,
-        dst: &'a mut [T],
-    ) -> ReadOp<'a, T> {
+    pub fn read<'a>(&'a self, dst: &'a mut [T]) -> ReadOp<'a, T> {
         ReadOp {
-            queue: launcher.cl_queue(),
             buffer: &self.buffer,
             src_len: self.len,
             dst,
@@ -275,13 +265,8 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
     /// Both buffers must be on the same `Context` — OpenCL's
     /// `clEnqueueCopyBuffer` only works within one context. For
     /// cross-context transfers, download to host then re-upload.
-    pub fn copy_to<'a, L: Launcher + ?Sized, M2: MemMode>(
-        &'a self,
-        dst: &'a mut DeviceSlice<T, M2>,
-        launcher: &'a L,
-    ) -> CopyOp<'a, T> {
+    pub fn copy_to<'a, M2: MemMode>(&'a self, dst: &'a mut DeviceSlice<T, M2>) -> CopyOp<'a, T> {
         CopyOp {
-            queue: launcher.cl_queue(),
             src: &self.buffer,
             dst: &mut dst.buffer,
             src_len: self.len,
@@ -310,9 +295,8 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
     /// `.await` on it. The target device is implicit in `launcher`'s
     /// queue (`clEnqueueMigrateMemObjects` migrates to the queue's
     /// device per spec).
-    pub fn migrate<'a, L: Launcher + ?Sized>(&'a self, launcher: &'a L) -> MigrateOp<'a, T> {
+    pub fn migrate(&self) -> MigrateOp<'_, T> {
         MigrateOp {
-            queue: launcher.cl_queue(),
             buffer: &self.buffer,
             deps: Vec::new(),
             profile_cb: None,
@@ -336,13 +320,12 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
     /// **Marker constraint:** `M: KernelWritable`. Runtime-side fill
     /// counts as a write at the OpenCL level, so kernel-RO markers
     /// (`ReadOnly`, `Frozen`) can't be filled.
-    pub fn fill<'a, L: Launcher + ?Sized>(&'a mut self, launcher: &'a L, value: T) -> FillOp<'a, T>
+    pub fn fill<'a>(&'a mut self, value: T) -> FillOp<'a, T>
     where
         T: Copy,
         M: KernelWritable,
     {
         FillOp {
-            queue: launcher.cl_queue(),
             buffer: &mut self.buffer,
             len: self.len,
             pattern: value,
@@ -418,7 +401,6 @@ impl<T: Copy, M: MemMode> DeviceSlice<T, M> {
 /// [`DeviceSlice::write`]. Writes into an existing buffer; for the
 /// "alloc + write in one shot" convenience, see [`DeviceSlice::from_slice`].
 pub struct WriteOp<'a, T> {
-    queue: &'a CommandQueue,
     buffer: &'a mut ManuallyDrop<ClBuffer<T>>,
     dst_len: usize,
     data: &'a [T],
@@ -454,9 +436,9 @@ impl<'a, T> WriteOp<'a, T> {
         self
     }
 
-    /// Sync terminal — enqueue the write with `CL_TRUE`; the driver
-    /// blocks until the buffer has been written.
-    pub fn wait(self) -> Result<()> {
+    /// Sync terminal — enqueue the write with `CL_TRUE` on `launcher`'s
+    /// queue; the driver blocks until the buffer has been written.
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         if self.data.len() != self.dst_len {
             return Err(Error::LengthMismatch {
                 src: self.data.len(),
@@ -466,7 +448,7 @@ impl<'a, T> WriteOp<'a, T> {
         // SAFETY: CL_TRUE — the driver waits for the write to complete
         // before returning.
         let event = unsafe {
-            self.queue.enqueue_write_buffer(
+            launcher.cl_queue().enqueue_write_buffer(
                 &mut **self.buffer,
                 CL_BLOCKING,
                 0,
@@ -480,9 +462,10 @@ impl<'a, T> WriteOp<'a, T> {
         Ok(())
     }
 
-    /// Non-blocking terminal — enqueue the write with `CL_FALSE`,
-    /// return the completion event. `data` must outlive the event.
-    pub fn submit(self) -> Result<Event> {
+    /// Non-blocking terminal — enqueue the write with `CL_FALSE` on
+    /// `launcher`'s queue, return the completion event. `data` must
+    /// outlive the event.
+    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         if self.data.len() != self.dst_len {
             return Err(Error::LengthMismatch {
                 src: self.data.len(),
@@ -492,7 +475,7 @@ impl<'a, T> WriteOp<'a, T> {
         // SAFETY: CL_FALSE; the write may complete after this call
         // returns. `data` must stay alive until the event fires.
         let event = unsafe {
-            self.queue.enqueue_write_buffer(
+            launcher.cl_queue().enqueue_write_buffer(
                 &mut **self.buffer,
                 CL_NON_BLOCKING,
                 0,
@@ -510,7 +493,6 @@ impl<'a, T> WriteOp<'a, T> {
 /// Lazy builder for `clEnqueueReadBuffer`. Returned by
 /// [`DeviceSlice::read`].
 pub struct ReadOp<'a, T> {
-    queue: &'a CommandQueue,
     buffer: &'a ClBuffer<T>,
     src_len: usize,
     dst: &'a mut [T],
@@ -541,9 +523,9 @@ impl<'a, T> ReadOp<'a, T> {
         self
     }
 
-    /// Sync terminal — enqueue the read with `CL_TRUE`; the driver
-    /// blocks until `dst` has been filled.
-    pub fn wait(self) -> Result<()> {
+    /// Sync terminal — enqueue the read with `CL_TRUE` on `launcher`'s
+    /// queue; the driver blocks until `dst` has been filled.
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         if self.dst.len() != self.src_len {
             return Err(Error::LengthMismatch {
                 src: self.src_len,
@@ -553,8 +535,13 @@ impl<'a, T> ReadOp<'a, T> {
         // SAFETY: CL_TRUE — the driver waits for the read to complete
         // before returning, so `dst` is fully populated on return.
         let event = unsafe {
-            self.queue
-                .enqueue_read_buffer(self.buffer, CL_BLOCKING, 0, self.dst, &self.deps)?
+            launcher.cl_queue().enqueue_read_buffer(
+                self.buffer,
+                CL_BLOCKING,
+                0,
+                self.dst,
+                &self.deps,
+            )?
         };
         if let Some(cb) = self.profile_cb {
             register_profiling_callback(&event, cb)?;
@@ -562,10 +549,11 @@ impl<'a, T> ReadOp<'a, T> {
         Ok(())
     }
 
-    /// Non-blocking terminal — enqueue the read with `CL_FALSE`,
-    /// return the completion event. `dst` is only valid after the
-    /// event fires; the caller must keep `dst` alive until then.
-    pub fn submit(self) -> Result<Event> {
+    /// Non-blocking terminal — enqueue the read with `CL_FALSE` on
+    /// `launcher`'s queue, return the completion event. `dst` is only
+    /// valid after the event fires; the caller must keep `dst` alive
+    /// until then.
+    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         if self.dst.len() != self.src_len {
             return Err(Error::LengthMismatch {
                 src: self.src_len,
@@ -575,8 +563,13 @@ impl<'a, T> ReadOp<'a, T> {
         // SAFETY: CL_FALSE; the driver enqueues the read and returns
         // immediately. `dst` must outlive the returned event.
         let event = unsafe {
-            self.queue
-                .enqueue_read_buffer(self.buffer, CL_NON_BLOCKING, 0, self.dst, &self.deps)?
+            launcher.cl_queue().enqueue_read_buffer(
+                self.buffer,
+                CL_NON_BLOCKING,
+                0,
+                self.dst,
+                &self.deps,
+            )?
         };
         if let Some(cb) = self.profile_cb {
             register_profiling_callback(&event, cb)?;
@@ -590,7 +583,6 @@ impl<'a, T> ReadOp<'a, T> {
 /// `clEnqueueCopyBuffer`, so `.wait()` is non-blocking enqueue +
 /// `event.wait()` (same as [`LaunchOp`](crate::op::LaunchOp)).
 pub struct CopyOp<'a, T> {
-    queue: &'a CommandQueue,
     src: &'a ClBuffer<T>,
     dst: &'a mut ClBuffer<T>,
     src_len: usize,
@@ -623,18 +615,18 @@ impl<'a, T> CopyOp<'a, T> {
     }
 
     /// Sync terminal — enqueue + wait on the resulting event.
-    pub fn wait(self) -> Result<()> {
-        let event = self.into_event()?;
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+        let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
     /// Non-blocking terminal — enqueue and return the completion event.
-    pub fn submit(self) -> Result<Event> {
-        self.into_event()
+    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        self.into_event(launcher)
     }
 
-    pub(crate) fn into_event(self) -> Result<Event> {
+    pub(crate) fn into_event<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         if self.src_len != self.dst_len {
             return Err(Error::LengthMismatch {
                 src: self.src_len,
@@ -647,7 +639,8 @@ impl<'a, T> CopyOp<'a, T> {
         // above; context cross-checking is on the caller (pocl panics
         // on mismatch — preferable to a silent miscopy).
         let event = unsafe {
-            self.queue
+            launcher
+                .cl_queue()
                 .enqueue_copy_buffer(self.src, self.dst, 0, 0, bytes, &self.deps)?
         };
         if let Some(cb) = self.profile_cb {
@@ -667,7 +660,6 @@ impl<'a, T> CopyOp<'a, T> {
 /// caller knows the buffer's data isn't needed could be added later
 /// as an opt-in modifier; for now the conservative default is right.
 pub struct MigrateOp<'a, T> {
-    queue: &'a CommandQueue,
     buffer: &'a ClBuffer<T>,
     deps: Vec<cl_event>,
     profile_cb: Option<ProfileCb>,
@@ -697,18 +689,18 @@ impl<'a, T> MigrateOp<'a, T> {
     }
 
     /// Sync terminal — enqueue the migrate and wait on its event.
-    pub fn wait(self) -> Result<()> {
-        let event = self.into_event()?;
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+        let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
     /// Non-blocking terminal — enqueue and return the completion event.
-    pub fn submit(self) -> Result<Event> {
-        self.into_event()
+    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        self.into_event(launcher)
     }
 
-    pub(crate) fn into_event(self) -> Result<Event> {
+    pub(crate) fn into_event<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         // SAFETY: `enqueue_migrate_mem_object` is unsafe because the
         // mem_objects pointer must point to a valid `cl_mem` for the
         // queue's context. We pass exactly one `cl_mem` from a
@@ -717,7 +709,7 @@ impl<'a, T> MigrateOp<'a, T> {
         // caller's responsibility, same constraint as `enqueue_copy_buffer`.
         let mem_handle: cl_mem = self.buffer.get();
         let event = unsafe {
-            self.queue.enqueue_migrate_mem_object(
+            launcher.cl_queue().enqueue_migrate_mem_object(
                 1,
                 &mem_handle as *const cl_mem,
                 0, // flags: default = migrate to queue's device, preserve content
@@ -748,7 +740,6 @@ impl<T, M: MemMode> fmt::Debug for DeviceSlice<T, M> {
 /// [`DeviceSlice::fill`]. The pattern is a single `T` value; the
 /// fill spans the whole buffer (`len * size_of::<T>()` bytes).
 pub struct FillOp<'a, T: Copy> {
-    queue: &'a CommandQueue,
     buffer: &'a mut ManuallyDrop<ClBuffer<T>>,
     len: usize,
     pattern: T,
@@ -778,24 +769,24 @@ impl<'a, T: Copy> FillOp<'a, T> {
         self
     }
 
-    pub fn wait(self) -> Result<()> {
-        let event = self.into_event()?;
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+        let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
-    pub fn submit(self) -> Result<Event> {
-        self.into_event()
+    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        self.into_event(launcher)
     }
 
-    pub(crate) fn into_event(self) -> Result<Event> {
+    pub(crate) fn into_event<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         // SAFETY: `enqueue_fill_buffer` is unsafe because the buffer
         // must belong to the queue's context. Same constraint as
         // `enqueue_copy_buffer` / `enqueue_migrate_mem_object`. The
         // pattern is byte-copied (via opencl3's slice-of-pattern
         // shape) across the whole buffer.
         let event = unsafe {
-            self.queue.enqueue_fill_buffer(
+            launcher.cl_queue().enqueue_fill_buffer(
                 &mut **self.buffer,
                 std::slice::from_ref(&self.pattern),
                 0,

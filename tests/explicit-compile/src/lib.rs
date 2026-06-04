@@ -76,7 +76,7 @@ mod tests {
             .expect("launch");
 
         let mut got = vec![0u32; 64];
-        buf.read(&ctx, &mut got).wait().expect("readback");
+        buf.read(&mut got).wait(&ctx).expect("readback");
 
         assert!(
             got.iter().all(|&v| v == 0xdead_beef),
@@ -99,7 +99,7 @@ mod tests {
 
         let mut buf = DeviceSlice::<u32>::alloc(&ctx, 8).expect("alloc");
         let seed = vec![1u32; 8];
-        buf.write(&ctx, &seed).wait().expect("seed write");
+        buf.write(&seed).wait(&ctx).expect("seed write");
 
         let buf = kernels
             .fill_u32([8usize], buf, 7u32)
@@ -107,7 +107,7 @@ mod tests {
             .expect("launch");
 
         let mut got = vec![0u32; 8];
-        buf.read(&ctx, &mut got).wait().expect("readback");
+        buf.read(&mut got).wait(&ctx).expect("readback");
 
         assert_eq!(got, vec![7u32; 8]);
     }
@@ -127,7 +127,7 @@ mod tests {
         let kernels = gpu::Kernels::bind(program).expect("bind");
 
         let mut buf = DeviceSlice::<u32>::alloc(&ctx, 4).expect("alloc");
-        buf.write(&ctx, &[1u32; 4]).wait().expect("seed write");
+        buf.write(&[1u32; 4]).wait(&ctx).expect("seed write");
 
         let buf = kernels
             .fill_u32([4usize], buf, 42)
@@ -135,7 +135,7 @@ mod tests {
             .expect("launch");
 
         let mut got = vec![0u32; 4];
-        buf.read(&ctx, &mut got).wait().expect("readback");
+        buf.read(&mut got).wait(&ctx).expect("readback");
         assert_eq!(got, vec![42u32; 4]);
     }
 

@@ -133,9 +133,9 @@ where
         // Skips the redundant zero-fill alloc would otherwise do.
         let mut buf = unsafe { DeviceSlice::<T>::alloc_uninit(ec.context(), self.len)? };
         let event = buf
-            .fill(ec, self.value)
+            .fill(self.value)
             .after_all(deps_as_events(&deps))
-            .submit()?;
+            .submit(ec)?;
         Ok((buf, vec![wrap_event(event)]))
     }
 }
@@ -178,9 +178,9 @@ where
         // downstream stages gate on the returned fill event.
         let buf = unsafe { MappedSlice::<T>::alloc_uninit(ec.context(), self.len)? };
         let event = buf
-            .fill(ec, self.value)
+            .fill(self.value)
             .after_all(deps_as_events(&deps))
-            .submit()?;
+            .submit(ec)?;
         Ok((buf, vec![wrap_event(event)]))
     }
 }

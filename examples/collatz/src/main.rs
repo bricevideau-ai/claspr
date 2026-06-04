@@ -70,9 +70,9 @@ fn run() -> claspr::Result<bool> {
     let inputs: Vec<u32> = (1..=N as u32).collect();
     let mut device_results = inputs.clone();
     let mut buf = claspr::DeviceSlice::<u32>::alloc(&ctx, device_results.len())?;
-    buf.write(&ctx, &device_results).wait()?;
+    buf.write(&device_results).wait(&ctx)?;
     let buf = kernels.collatz_kernel([N], buf).wait(&ctx)?;
-    buf.read(&ctx, &mut device_results).wait()?;
+    buf.read(&mut device_results).wait(&ctx)?;
 
     // Validate every kernel output against the host-side `collatz`
     // implementation lifted from inside the device module. Same

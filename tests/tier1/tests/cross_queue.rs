@@ -46,7 +46,7 @@ fn after_event_orders_launch_on_second_queue() {
         .expect("scale after on consumer");
 
     let mut out = vec![0u32; N];
-    buf.read(&ctx, &mut out).wait().expect("read");
+    buf.read(&mut out).wait(&ctx).expect("read");
     assert!(out.iter().all(|&v| v == 42));
 }
 
@@ -77,7 +77,7 @@ fn after_all_orders_launch_after_multiple_cross_queue_events() {
         .expect("add after_all");
 
     let mut host = vec![0u32; N];
-    out.read(&ctx, &mut host).wait().expect("read");
+    out.read(&mut host).wait(&ctx).expect("read");
     assert!(host.iter().all(|&v| v == 42));
 }
 

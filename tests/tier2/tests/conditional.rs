@@ -95,7 +95,7 @@ fn dyn_op_wraps_bare_kernel_op() {
     let chain: DynOp<DeviceSlice<u32>> = DynOp::new(kernels.fill_u32([N], buf, 5));
     let buf = chain.sync(&ctx).expect("sync");
     let mut out = vec![0u32; N];
-    buf.read(&ctx, &mut out).wait().expect("read");
+    buf.read(&mut out).wait(&ctx).expect("read");
     assert!(out.iter().all(|&v| v == 5));
 }
 

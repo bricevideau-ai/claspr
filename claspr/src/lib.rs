@@ -28,9 +28,9 @@
 //!     let kernels = gpu::kernels(&ctx)?;
 //!     let mut data: Vec<u32> = (1..=1024).collect();
 //!     let mut buf = DeviceSlice::<u32>::alloc(&ctx, data.len())?;
-//!     buf.write(&ctx, &data).wait()?;
+//!     buf.write(&data).wait(&ctx)?;
 //!     let buf = kernels.collatz_kernel([data.len()], buf).wait(&ctx)?;
-//!     buf.read(&ctx, &mut data).wait()?;
+//!     buf.read(&mut data).wait(&ctx)?;
 //!     Ok(())
 //! }
 //! ```
@@ -109,7 +109,7 @@ pub use ppm::write_ppm_rgba8;
 pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 
 #[cfg(feature = "async-events")]
-pub use future::{CopyFuture, EventFuture, EventFutureExt, LaunchFuture, ReadFuture, WriteFuture};
+pub use future::{EventFuture, EventFutureExt, LaunchFuture};
 pub use mapped::{MappedReadGuard, MappedSlice, MappedWriteGuard, SvmCopyOp, SvmFillOp};
 pub use usm::USMSlice;
 

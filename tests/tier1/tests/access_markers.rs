@@ -31,11 +31,11 @@ fn readwrite_default_marker_exercises_full_surface() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let mut buf: DeviceSlice<u32> = DeviceSlice::alloc(&ctx, N).expect("alloc");
-    buf.write(&ctx, &[1u32; N]).wait().expect("write");
-    buf.fill(&ctx, 7u32).wait().expect("fill");
+    buf.write(&[1u32; N]).wait(&ctx).expect("write");
+    buf.fill(7u32).wait(&ctx).expect("fill");
     let buf = kernels.scale_u32([N], buf, 3).wait(&ctx).expect("kernel");
     let mut out = vec![0u32; N];
-    buf.read(&ctx, &mut out).wait().expect("read");
+    buf.read(&mut out).wait(&ctx).expect("read");
     assert!(out.iter().all(|&v| v == 21), "7 * 3 = 21");
 }
 
@@ -58,18 +58,18 @@ fn read_only_kernel_constant_host_can_update_via_write() {
         .wait(&ctx)
         .expect("kernel with ReadOnly source");
     let mut out = vec![0u32; N];
-    dst.read(&ctx, &mut out).wait().expect("read dst");
+    dst.read(&mut out).wait(&ctx).expect("read dst");
     assert!(out.iter().all(|&v| v == 2));
 
     // Host updates the ReadOnly buffer via write() — HostWritable.
     let mut ro = ro;
-    ro.write(&ctx, &[9u32; N]).wait().expect("host write");
+    ro.write(&[9u32; N]).wait(&ctx).expect("host write");
     // Run again with the updated bytes.
     let (_ro, dst) = kernels
         .copy_u32([N], ro, dst)
         .wait(&ctx)
         .expect("kernel re-launch");
-    dst.read(&ctx, &mut out).wait().expect("read dst again");
+    dst.read(&mut out).wait(&ctx).expect("read dst again");
     assert!(out.iter().all(|&v| v == 9));
 }
 
@@ -90,7 +90,7 @@ fn host_read_only_kernel_writes_host_inspects() {
         .wait(&ctx)
         .expect("kernel fill");
     let mut out = vec![0u32; N];
-    hro.read(&ctx, &mut out).wait().expect("host read");
+    hro.read(&mut out).wait(&ctx).expect("host read");
     assert!(out.iter().all(|&v| v == 11));
     // Re-bind to silence the unused-warning for now.
     let _ = hro;
@@ -118,7 +118,7 @@ fn device_scratch_kernel_only_no_host_access() {
         .wait(&ctx)
         .expect("kernel copy out of scratch");
     let mut out = vec![0u32; N];
-    final_buf.read(&ctx, &mut out).wait().expect("read");
+    final_buf.read(&mut out).wait(&ctx).expect("read");
     assert!(out.iter().all(|&v| v == 13));
 }
 
@@ -143,7 +143,7 @@ fn frozen_threads_through_read_position_kernel_arg() {
         .expect("kernel with Frozen source");
 
     let mut host = vec![0u32; N];
-    dst.read(&ctx, &mut host).wait().expect("read");
+    dst.read(&mut host).wait(&ctx).expect("read");
     assert!(host.iter().all(|&v| v == 6));
 }
 
