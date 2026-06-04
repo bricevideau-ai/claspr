@@ -205,8 +205,31 @@ impl<
 // (built by `.arc()` on a `DeviceOperation` whose Output is
 // `DeviceSlice<T, M>`): the chain produces `Arc<DeviceSlice<T, M>>`,
 // each branch gets an `Arc::clone`, the kernel launcher accepts the
-// Arc directly, the underlying `cl_mem` lives until the last clone
-// drops (refcounted by `Arc` + lazy by OpenCL on top).
+// Arc directly as a **read** kernel-arg slot, the underlying
+// `cl_mem` lives until the last clone drops (refcounted by `Arc` +
+// lazy by OpenCL on top).
+//
+// **Read-only by design.** `Arc` exists here for diamond/fan-out
+// sharing of *inputs* — letting two parallel kernels write through
+// clones of the same Arc would be a host-side data race the
+// borrow checker can no longer catch (`Arc::clone` gives shared
+// access, not exclusive). The single-writer guarantee for writable
+// kernel slots stays with `DeviceSlice<T, M>` directly: each
+// launcher takes ownership of the slice via the move-in/move-out
+// `Op::Output` chain, and an owned value can't simultaneously be
+// in two launchers. Write-then-share patterns: write through the
+// owned DeviceSlice first, then `.arc()` once writes are done to
+// hand the buffer out for read sharing.
+//
+// Historical note: pre-`f80202c` (the Read/Write trait split), the
+// catch-all `KernelSliceArg<T>` for `Arc<DeviceSlice>` was added in
+// `480bcba` ("true diamond sharing") explicitly for read-only fan-
+// out. The split commit mechanically gave Arc both Read and
+// ReadWrite variants, preserving the bug-of-omission — every
+// existing use of Arc in tests + examples + the combinator spike
+// is read-only. The Write impl was reachable but never exercised;
+// removing it restores the original design intent and the borrow
+// checker's single-writer story.
 //
 // `T: Sync` is needed because `Arc<DeviceSlice<T, M>>: Send` requires
 // `DeviceSlice<T, M>: Send + Sync` which propagates `T: Sync`.
@@ -221,12 +244,7 @@ impl<T: Send + Sync + 'static, M: crate::access::MemMode + crate::access::Kernel
         crate::Buffer::len(&**self)
     }
 }
-impl<
-    T: Send + Sync + 'static,
-    M: crate::access::MemMode + crate::access::KernelReadable + crate::access::KernelWritable,
-> KernelSliceReadWriteArg<T> for Arc<DeviceSlice<T, M>>
-{
-}
+// Deliberately no `KernelSliceReadWriteArg` impl — see comment above.
 
 // `DeviceSlice` lives in `buffer`, but its `KernelArg` impl belongs
 // here with the rest of the launch surface so `set_arg` plumbing is
