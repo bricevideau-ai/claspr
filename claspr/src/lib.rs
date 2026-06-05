@@ -113,7 +113,9 @@ pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 
 #[cfg(feature = "async-events")]
 pub use future::{EventFuture, EventFutureExt, LaunchFuture};
-pub use mapped::{MappedReadGuard, MappedSlice, MappedWriteGuard, SvmCopyOp, SvmFillOp};
+pub use mapped::{
+    MappedReadGuard, MappedSlice, MappedWriteGuard, SvmCopyOp, SvmFillOp, SvmWriteOp,
+};
 pub use usm::USMSlice;
 
 // Stage-3 proc-macro frontend.

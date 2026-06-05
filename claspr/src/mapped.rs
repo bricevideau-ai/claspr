@@ -359,6 +359,35 @@ impl<T, M: MemMode> MappedSlice<T, M> {
             profile_cb: None,
         }
     }
+
+    /// Begin a host→SVM memcpy from `data` into this buffer — wraps
+    /// `clEnqueueSVMMemcpy` (CL 2.0+) with a host pointer as source.
+    /// SVM analog of [`crate::DeviceSlice::write`].
+    ///
+    /// `data` is borrowed for the op's lifetime; on the non-blocking
+    /// [`submit`](SvmWriteOp::submit) terminal the caller must keep
+    /// `data` alive until the returned event fires (same contract as
+    /// [`crate::DeviceSlice::write`]'s submit). [`wait`](SvmWriteOp::wait)
+    /// has no such constraint — it blocks until the memcpy completes.
+    ///
+    /// The resulting event is auto-registered on this buffer's
+    /// last-use list, so Drop's `clEnqueueSVMFree` waits for the
+    /// memcpy to finish.
+    ///
+    /// **Marker constraint:** `M: HostWritable`. Excludes
+    /// [`crate::HostReadOnly`] and [`crate::Frozen`] — post-creation
+    /// host writes break the contract those markers advertise.
+    pub fn write<'a>(&'a self, data: &'a [T]) -> SvmWriteOp<'a, T, M>
+    where
+        M: HostWritable,
+    {
+        SvmWriteOp {
+            owner: self,
+            data,
+            deps: Vec::new(),
+            profile_cb: None,
+        }
+    }
 }
 
 /// Metadata-only `Debug` — does not read through the SVM pointer
@@ -454,6 +483,93 @@ impl<'a, T: Copy, M: MemMode> SvmFillOp<'a, T, M> {
         // registered Arc<Event> each hold an independent reference;
         // both `Event::drop`s call `clReleaseEvent` to balance.
         // SAFETY: event.get() is live; retain is paired with the
+        // Event::drop inside the Arc.
+        unsafe {
+            retain_event(event.get())
+                .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
+        }
+        self.owner
+            .register_use(std::sync::Arc::new(Event::new(event.get())));
+        Ok(event)
+    }
+}
+
+/// Lazy builder for `clEnqueueSVMMemcpy` with a host source pointer.
+/// Returned by [`MappedSlice::write`]. SVM analog of
+/// [`crate::buffer::WriteOp`].
+pub struct SvmWriteOp<'a, T, M: MemMode> {
+    owner: &'a MappedSlice<T, M>,
+    data: &'a [T],
+    deps: Vec<cl_event>,
+    profile_cb: Option<ProfileCb>,
+}
+
+impl<'a, T, M: MemMode> SvmWriteOp<'a, T, M> {
+    pub fn after(mut self, event: &Event) -> Self {
+        self.deps.push(event.get());
+        self
+    }
+
+    pub fn after_all<'e, I>(mut self, events: I) -> Self
+    where
+        I: IntoIterator<Item = &'e Event>,
+    {
+        self.deps.extend(events.into_iter().map(|e| e.get()));
+        self
+    }
+
+    pub fn profiled<F>(mut self, cb: F) -> Self
+    where
+        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
+    {
+        self.profile_cb = Some(Box::new(cb));
+        self
+    }
+
+    /// Sync terminal — enqueue + wait on the resulting event. Safe to
+    /// drop `data` immediately after this returns.
+    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+        let event = self.into_event(launcher)?;
+        event.wait()?;
+        Ok(())
+    }
+
+    /// Non-blocking terminal — enqueue and return the completion
+    /// event. `data` must outlive the event.
+    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        self.into_event(launcher)
+    }
+
+    pub(crate) fn into_event<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+        if self.data.len() != self.owner.len {
+            return Err(Error::LengthMismatch {
+                src: self.data.len(),
+                dst: self.owner.len,
+            });
+        }
+        let size = self.owner.len * std::mem::size_of::<T>();
+        // SAFETY: SVM ptr is a valid allocation in the queue's context
+        // (caller's responsibility, same as DeviceSlice::write).
+        // data.as_ptr() points to host memory borrowed for 'a. With
+        // CL_NON_BLOCKING the caller is responsible for keeping `data`
+        // alive until the event fires (documented on submit() above).
+        let event = unsafe {
+            launcher.cl_queue().enqueue_svm_mem_cpy(
+                CL_NON_BLOCKING,
+                self.owner.ptr as *mut c_void,
+                self.data.as_ptr() as *const c_void,
+                size,
+                &self.deps,
+            )?
+        };
+        if let Some(cb) = self.profile_cb {
+            register_profiling_callback(&event, cb)?;
+        }
+        // Auto-register on the buffer's last-use list so Drop's
+        // clEnqueueSVMFree waits for the memcpy. clRetainEvent so the
+        // returned `event` and the registered Arc<Event> each hold an
+        // independent refcount.
+        // SAFETY: event.get() is live; retain pairs with the
         // Event::drop inside the Arc.
         unsafe {
             retain_event(event.get())
