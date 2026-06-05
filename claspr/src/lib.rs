@@ -64,6 +64,7 @@ pub mod buffer;
 pub mod context;
 pub mod device;
 pub mod error;
+pub(crate) mod fill_kernel;
 #[cfg(feature = "async-events")]
 pub mod future;
 pub mod image;
@@ -81,8 +82,9 @@ pub mod util;
 // ── Public surface ────────────────────────────────────────────────────
 
 pub use access::{
-    DeviceScratch, Frozen, HostAccess, HostReadOnly, HostReadable, HostWritable, KernelAccess,
-    KernelReadable, KernelWritable, MemMode, ReadOnly, ReadWrite, WriteOnly,
+    DeviceScratch, FillStrategy, Fillable, Frozen, HostAccess, HostReadOnly, HostReadable,
+    HostUploadable, HostWritable, KernelAccess, KernelReadable, KernelWritable, MemMode, ReadOnly,
+    ReadWrite, RuntimeFillable, WriteOnly,
 };
 pub use buffer::{Buffer, CopyOp, DeviceSlice, FillOp, MigrateOp, ReadOp, WriteOp};
 pub use context::{Context, SvmLevel};

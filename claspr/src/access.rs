@@ -227,6 +227,78 @@ impl HostReadable for Frozen {}
 // DeviceScratch: host-no-access — neither readable nor writable from
 // the host. Don't impl either trait.
 
+// ── Bridge traits (deferral-safe aliases for Tier 1/Tier 2 bounds) ──
+//
+// `RuntimeFillable` / `HostUploadable` are super-traits that both
+// Tier 1 ops and Tier 2 ops (in `claspr-async`) reference in their
+// `where` clauses. The blanket impls today alias to `HostWritable`;
+// future bound changes are one-line edits to the impl, propagating
+// to both tiers without two-place coordination.
+//
+// `Fillable` is different — it's a *dispatch* trait. Each marker
+// picks a strategy (Runtime or DeviceKernel) for how `.fill()`
+// should execute. The user sees one `.fill()` method; the dispatch
+// is opaque.
+
+/// Markers eligible for ops that need host-side writability through
+/// the runtime — `Upload`, `MappedSliceUpload`, `*::write`, the
+/// runtime fast-path of fill. Today: aliases `HostWritable`. Future
+/// relaxations are one-line edits to the blanket impl.
+pub trait RuntimeFillable: MemMode + HostWritable {}
+impl<M: MemMode + HostWritable> RuntimeFillable for M {}
+
+/// Markers eligible for host→device alloc+write composites (Upload,
+/// MappedSliceUpload). Same gate as `RuntimeFillable` today; kept
+/// separate so the two concepts can diverge later.
+pub trait HostUploadable: MemMode + HostWritable {}
+impl<M: MemMode + HostWritable> HostUploadable for M {}
+
+/// Strategy enum returned by [`Fillable::FILL_STRATEGY`] —
+/// `.fill()`'s runtime dispatches on this to pick the right path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillStrategy {
+    /// Use `clEnqueueFillBuffer` / `clEnqueueSVMMemFill` — fastest
+    /// path; driver-optimized. Available when the marker is
+    /// `HostWritable` (the runtime touches the buffer through host
+    /// APIs).
+    Runtime,
+    /// Use a built-in fill kernel — the only path for markers that
+    /// aren't host-writable (`HostReadOnly`, `DeviceScratch`).
+    /// Slower than `Runtime` because no DMA / hardware fast-path,
+    /// but works wherever a kernel can write.
+    DeviceKernel,
+}
+
+/// Markers that support `.fill()` somehow. Each impl picks the
+/// strategy at compile time via the `FILL_STRATEGY` associated
+/// constant. Excludes `Frozen` (no write path at all).
+pub trait Fillable: MemMode {
+    const FILL_STRATEGY: FillStrategy;
+}
+impl Fillable for ReadWrite {
+    const FILL_STRATEGY: FillStrategy = FillStrategy::Runtime;
+}
+impl Fillable for ReadOnly {
+    const FILL_STRATEGY: FillStrategy = FillStrategy::Runtime;
+}
+impl Fillable for HostReadOnly {
+    const FILL_STRATEGY: FillStrategy = FillStrategy::DeviceKernel;
+}
+impl Fillable for DeviceScratch {
+    const FILL_STRATEGY: FillStrategy = FillStrategy::DeviceKernel;
+}
+impl Fillable for WriteOnly {
+    const FILL_STRATEGY: FillStrategy = FillStrategy::Runtime;
+}
+// Frozen: NOT impl Fillable — no write path exists.
+
+// No `FillablePattern` trait — fill bound is plain `T: Copy +
+// Send + 'static`. The dispatch in `FillOp::into_event` reads
+// `size_of::<T>()` at runtime and picks a fast-path kernel (sizes
+// 1/2/4/8/16) or falls back to a byte-generic kernel for other
+// sizes. Any sized POD type fills transparently — OpenCL vectors,
+// user POD structs, primitives.
+
 // ── Kernel-side variants × Host RW (the "no host restriction" row) ──
 
 /// Default — kernel reads/writes, host reads/writes.

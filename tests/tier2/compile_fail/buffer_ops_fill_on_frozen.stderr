@@ -1,24 +1,17 @@
-error[E0277]: the trait bound `Frozen: KernelWritable` is not satisfied
+error[E0277]: the trait bound `Frozen: Fillable` is not satisfied
   --> compile_fail/buffer_ops_fill_on_frozen.rs:12:31
    |
 12 |     let _ = device_slice_fill(buf, 7u32);
-   |             ----------------- ^^^ the trait `KernelWritable` is not implemented for `Frozen`
+   |             ----------------- ^^^ the trait `Fillable` is not implemented for `Frozen`
    |             |
    |             required by a bound introduced by this call
    |
-help: the following other types implement trait `KernelWritable`
-  --> claspr/src/access.rs:173:0
-   |
-   = note: `ReadWrite`
-  ::: claspr/src/access.rs:179:0
-   |
-   = note: `WriteOnly`
-  ::: claspr/src/access.rs:183:0
-   |
-   = note: `HostReadOnly`
-  ::: claspr/src/access.rs:190:0
-   |
-   = note: `DeviceScratch`
+   = help: the following other types implement trait `Fillable`:
+             DeviceScratch
+             HostReadOnly
+             ReadOnly
+             ReadWrite
+             WriteOnly
 note: required by a bound in `device_slice_fill`
   --> claspr-async/src/buffer_ops.rs:79:0
 

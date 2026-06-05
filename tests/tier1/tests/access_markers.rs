@@ -123,6 +123,55 @@ fn device_scratch_kernel_only_no_host_access() {
 }
 
 #[test]
+fn host_read_only_fill_uses_device_kernel_path() {
+    // HostReadOnly: not HostWritable → FILL_STRATEGY = DeviceKernel.
+    // .fill() under the hood launches claspr_fill_u32, not
+    // clEnqueueFillBuffer. Verify by alloc_uninit + explicit fill
+    // (skipping the alloc auto-zero) then host-read the bytes.
+    let Some(ctx) = ctx() else { return };
+
+    // SAFETY: fill below overwrites every byte before any read.
+    let buf = unsafe {
+        DeviceSlice::<u32, HostReadOnly>::alloc_uninit(&ctx, N).expect("alloc_uninit HRO")
+    };
+    let mut buf = buf;
+    buf.fill(0xCAFE_BABEu32)
+        .wait(&ctx)
+        .expect("fill via device kernel");
+    let mut out = vec![0u32; N];
+    buf.read(&mut out).wait(&ctx).expect("host read");
+    assert!(out.iter().all(|&v| v == 0xCAFE_BABE));
+}
+
+#[test]
+fn device_scratch_fill_uses_device_kernel_path() {
+    // DeviceScratch: host-no-access, can't be runtime-filled. The
+    // device-kernel dispatch fills it; verify via a kernel copy to
+    // a HostReadable buffer.
+    let Some(ctx) = ctx() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    // SAFETY: fill below overwrites every byte before any read.
+    let scratch = unsafe {
+        DeviceSlice::<u32, DeviceScratch>::alloc_uninit(&ctx, N).expect("alloc_uninit scratch")
+    };
+    let mut scratch = scratch;
+    scratch
+        .fill(0xDEAD_F00Du32)
+        .wait(&ctx)
+        .expect("fill DeviceScratch via device kernel");
+    // Copy out to a host-readable buffer for verification.
+    let out_buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc out");
+    let (_scratch, out_buf) = kernels
+        .copy_u32([N], scratch, out_buf)
+        .wait(&ctx)
+        .expect("copy out of scratch");
+    let mut out = vec![0u32; N];
+    out_buf.read(&mut out).wait(&ctx).expect("host read");
+    assert!(out.iter().all(|&v| v == 0xDEAD_F00D));
+}
+
+#[test]
 fn frozen_threads_through_read_position_kernel_arg() {
     // Frozen impls KernelReadable but not KernelWritable, so it
     // satisfies the &[u32] kernel param's KernelSliceReadArg<u32>

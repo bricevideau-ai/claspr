@@ -62,6 +62,12 @@ struct ContextInner {
     /// release failure can't propagate it; they bump this instead so
     /// callers who care can audit via [`Context::error_count`].
     error_state: AtomicU32,
+    /// Lazily-built program holding the built-in fill kernels (see
+    /// [`crate::fill_kernel`]). Built on first device-fill use via
+    /// [`Context::fill_program`]; cached for the context's lifetime.
+    /// `None` until first device-fill — most contexts that only ever
+    /// fill HostWritable buffers (runtime path) never build this.
+    fill_program: OnceLock<Program>,
 }
 
 /// Lazy queue pair for one device in a [`Context`].
@@ -351,6 +357,25 @@ impl Context {
             .raw()
     }
 
+    /// Borrow the lazily-built fill `Program` for the device-kernel
+    /// fill path (see [`crate::fill_kernel`]). Builds on first call;
+    /// subsequent calls return the cached program.
+    ///
+    /// Internal — used by [`crate::buffer::FillOp`] and
+    /// [`crate::mapped::SvmFillOp`] when the marker's
+    /// [`FillStrategy`](crate::FillStrategy) is `DeviceKernel`. Users
+    /// should not need this directly.
+    pub(crate) fn fill_program(&self) -> Result<&Program> {
+        once_lock_get_or_try_init(&self.inner.fill_program, || {
+            Program::create_and_build_from_source(
+                &self.inner.cl_context,
+                crate::fill_kernel::FILL_PROGRAM_SOURCE,
+                "",
+            )
+            .map_err(|log| Error::Build { log })
+        })
+    }
+
     // ── SVM capability query ───────────────────────────────────────
 
     /// What level of Shared Virtual Memory this context's device
@@ -489,6 +514,7 @@ impl ContextBuilder {
                 profiling: self.profiling,
                 queues,
                 error_state: AtomicU32::new(0),
+                fill_program: OnceLock::new(),
             }),
         };
         // Eagerly populate the in-order queue for devices[0] so

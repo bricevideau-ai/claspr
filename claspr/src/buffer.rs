@@ -10,13 +10,15 @@
 //! See the [`Buffer`] trait's own docs for what it does and does
 //! not abstract over.
 
-use crate::access::{HostReadable, HostWritable, KernelWritable, MemMode, ReadWrite};
+use crate::access::{FillStrategy, Fillable, HostReadable, HostWritable, MemMode, ReadWrite};
 use crate::context::Context;
 use crate::error::{Error, Result};
+use crate::fill_kernel;
 use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
 use crate::queue::Launcher;
 
 use opencl3::event::Event;
+use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::memory::{Buffer as ClBuffer, CL_MEM_COPY_HOST_PTR, ClMem, release_mem_object};
 use opencl3::types::{CL_BLOCKING, CL_NON_BLOCKING, cl_event, cl_mem};
 use std::fmt;
@@ -136,7 +138,7 @@ impl<T, M: MemMode> Drop for DeviceSlice<T, M> {
     }
 }
 
-impl<T: Default + Copy, M: MemMode + KernelWritable> DeviceSlice<T, M> {
+impl<T: Default + Copy, M: MemMode + Fillable> DeviceSlice<T, M> {
     /// Allocate a device buffer of `len` elements, zero-initialised
     /// via `clEnqueueFillBuffer(T::default())` on the context's
     /// default queue. Blocks until the fill completes.
@@ -165,7 +167,7 @@ impl<T: Default + Copy, M: MemMode + KernelWritable> DeviceSlice<T, M> {
     }
 }
 
-impl<T, M: MemMode + KernelWritable> DeviceSlice<T, M> {
+impl<T, M: MemMode + Fillable> DeviceSlice<T, M> {
     /// Allocate a device buffer of `len` elements, leaving the bytes
     /// uninitialised. Cheaper than [`alloc`](Self::alloc) when the
     /// caller writes the whole buffer before any read.
@@ -320,17 +322,19 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
     /// **Marker constraint:** `M: KernelWritable`. Runtime-side fill
     /// counts as a write at the OpenCL level, so kernel-RO markers
     /// (`ReadOnly`, `Frozen`) can't be filled.
-    pub fn fill<'a>(&'a mut self, value: T) -> FillOp<'a, T>
+    pub fn fill<'a>(&'a mut self, value: T) -> FillOp<'a, T, M>
     where
         T: Copy,
-        M: KernelWritable,
+        M: Fillable,
     {
         FillOp {
             buffer: &mut self.buffer,
+            ctx: &self.ctx,
             len: self.len,
             pattern: value,
             deps: Vec::new(),
             profile_cb: None,
+            _mode: PhantomData,
         }
     }
 }
@@ -739,15 +743,22 @@ impl<T, M: MemMode> fmt::Debug for DeviceSlice<T, M> {
 /// Lazy builder for `clEnqueueFillBuffer`. Returned by
 /// [`DeviceSlice::fill`]. The pattern is a single `T` value; the
 /// fill spans the whole buffer (`len * size_of::<T>()` bytes).
-pub struct FillOp<'a, T: Copy> {
+///
+/// Dispatch on terminal: if `M::FILL_STRATEGY == Runtime`, calls
+/// `clEnqueueFillBuffer` (driver-optimized fast path). If
+/// `DeviceKernel` (HostReadOnly, DeviceScratch), launches a
+/// built-in fill kernel from the [`crate::fill_kernel`] program.
+pub struct FillOp<'a, T: Copy, M: MemMode> {
     buffer: &'a mut ManuallyDrop<ClBuffer<T>>,
+    ctx: &'a Context,
     len: usize,
     pattern: T,
     deps: Vec<cl_event>,
     profile_cb: Option<ProfileCb>,
+    _mode: PhantomData<fn() -> M>,
 }
 
-impl<'a, T: Copy> FillOp<'a, T> {
+impl<'a, T: Copy, M: MemMode + Fillable> FillOp<'a, T, M> {
     pub fn after(mut self, event: &Event) -> Self {
         self.deps.push(event.get());
         self
@@ -780,23 +791,118 @@ impl<'a, T: Copy> FillOp<'a, T> {
     }
 
     pub(crate) fn into_event<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
-        // SAFETY: `enqueue_fill_buffer` is unsafe because the buffer
-        // must belong to the queue's context. Same constraint as
-        // `enqueue_copy_buffer` / `enqueue_migrate_mem_object`. The
-        // pattern is byte-copied (via opencl3's slice-of-pattern
-        // shape) across the whole buffer.
-        let event = unsafe {
-            launcher.cl_queue().enqueue_fill_buffer(
-                &mut **self.buffer,
-                std::slice::from_ref(&self.pattern),
-                0,
-                self.len * std::mem::size_of::<T>(),
+        let event = match M::FILL_STRATEGY {
+            FillStrategy::Runtime => {
+                // SAFETY: `enqueue_fill_buffer` is unsafe because the
+                // buffer must belong to the queue's context. Same
+                // constraint as `enqueue_copy_buffer` /
+                // `enqueue_migrate_mem_object`. The pattern is
+                // byte-copied (via opencl3's slice-of-pattern shape)
+                // across the whole buffer.
+                unsafe {
+                    launcher.cl_queue().enqueue_fill_buffer(
+                        &mut **self.buffer,
+                        std::slice::from_ref(&self.pattern),
+                        0,
+                        self.len * std::mem::size_of::<T>(),
+                        &self.deps,
+                    )?
+                }
+            }
+            FillStrategy::DeviceKernel => fill_via_kernel_buffer(
+                self.ctx,
+                launcher,
+                &**self.buffer,
+                &self.pattern,
+                self.len,
                 &self.deps,
-            )?
+            )?,
         };
         if let Some(cb) = self.profile_cb {
             register_profiling_callback(&event, cb)?;
         }
+        Ok(event)
+    }
+}
+
+/// Launch the built-in fill kernel for an OpenCL buffer (DeviceSlice
+/// backing memory). `pattern_size = size_of::<T>()` selects between
+/// the fast-path per-size kernels (1/2/4/8/16 bytes) and the
+/// byte-generic fallback. Returns the launch event.
+pub(crate) fn fill_via_kernel_buffer<T: Copy, L: Launcher + ?Sized>(
+    ctx: &Context,
+    launcher: &L,
+    buffer: &ClBuffer<T>,
+    pattern: &T,
+    count: usize,
+    deps: &[cl_event],
+) -> Result<Event> {
+    let pattern_size = std::mem::size_of::<T>();
+    let count_u32 =
+        u32::try_from(count).map_err(|_| Error::InvalidArgument("fill count exceeds u32::MAX"))?;
+    let program = ctx.fill_program()?;
+
+    if let Some(name) = fill_kernel::fast_path_kernel_name(pattern_size) {
+        let kernel = Kernel::create(program, name)?;
+        let mut exec = ExecuteKernel::new(&kernel);
+        // SAFETY: kernel arg 0 expects a `__global X*` of element
+        // size `pattern_size`. We pass our buffer's ClMem; the
+        // kernel writes `count` elements. arg 1 is the pattern by
+        // value (size matches); arg 2 is the element count.
+        unsafe {
+            exec.set_arg(buffer);
+            exec.set_arg(pattern);
+            exec.set_arg(&count_u32);
+            exec.set_global_work_size(count);
+            exec.set_event_wait_list(deps);
+            Ok(exec.enqueue_nd_range(launcher.cl_queue())?)
+        }
+    } else {
+        // Byte-generic path: allocate a tiny pattern buffer, copy
+        // pattern bytes in, launch claspr_fill_bytes.
+        let pattern_size_u32 = u32::try_from(pattern_size)
+            .map_err(|_| Error::InvalidArgument("fill pattern size exceeds u32::MAX"))?;
+        // SAFETY: pattern is a live &T whose byte representation we
+        // read for `pattern_size` bytes.
+        let pattern_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(pattern as *const T as *const u8, pattern_size) };
+        // SAFETY: create a fresh buffer in ctx's CL context, then
+        // blocking-write the pattern bytes; lifetime ends with this
+        // function — the kernel launch is serialized after the
+        // write because both go through `launcher.cl_queue`.
+        let mut pattern_buf = unsafe {
+            ClBuffer::<u8>::create(
+                ctx.raw_context(),
+                opencl3::memory::CL_MEM_READ_ONLY,
+                pattern_size,
+                ptr::null_mut(),
+            )?
+        };
+        let _write_evt = unsafe {
+            launcher.cl_queue().enqueue_write_buffer(
+                &mut pattern_buf,
+                CL_BLOCKING,
+                0,
+                pattern_bytes,
+                &[],
+            )?
+        };
+        let kernel = Kernel::create(program, fill_kernel::KERNEL_BYTES)?;
+        let mut exec = ExecuteKernel::new(&kernel);
+        // SAFETY: arg 0 = data buffer (__global uchar*), arg 1 =
+        // pattern buffer (__global const uchar*), arg 2 = pattern
+        // byte count, arg 3 = slot count.
+        let event = unsafe {
+            exec.set_arg(buffer);
+            exec.set_arg(&pattern_buf);
+            exec.set_arg(&pattern_size_u32);
+            exec.set_arg(&count_u32);
+            exec.set_global_work_size(count);
+            exec.set_event_wait_list(deps);
+            exec.enqueue_nd_range(launcher.cl_queue())?
+        };
+        // pattern_buf drops at end of fn; OpenCL retains the cl_mem
+        // internally for the in-flight kernel until completion.
         Ok(event)
     }
 }

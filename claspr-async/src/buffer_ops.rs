@@ -55,7 +55,7 @@ use crate::exec_ctx::ExecutionContext;
 use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
 use crate::transfer::UploadSource;
 use claspr::{
-    DeviceSlice, HostWritable, KernelWritable, MappedSlice, MemMode, Result, register_drop_callback,
+    DeviceSlice, Fillable, HostWritable, MappedSlice, MemMode, Result, register_drop_callback,
 };
 
 // ── DeviceSlice fill (in-place clEnqueueFillBuffer) ────────────────
@@ -79,7 +79,7 @@ pub struct DeviceSliceFillOp<T: Copy, M: MemMode> {
 pub fn device_slice_fill<T, M>(buf: DeviceSlice<T, M>, value: T) -> DeviceSliceFillOp<T, M>
 where
     T: Copy + Send + 'static,
-    M: MemMode + KernelWritable,
+    M: MemMode + Fillable,
 {
     DeviceSliceFillOp {
         buf: Some(buf),
@@ -90,7 +90,7 @@ where
 impl<T, M> DeviceOperation for DeviceSliceFillOp<T, M>
 where
     T: Copy + Send + 'static,
-    M: MemMode + KernelWritable + Send + 'static,
+    M: MemMode + Fillable + Send + 'static,
 {
     type Output = DeviceSlice<T, M>;
 
@@ -241,7 +241,7 @@ pub struct MappedSliceFillOp<T: Copy, M: MemMode> {
 pub fn mapped_slice_fill<T, M>(buf: MappedSlice<T, M>, value: T) -> MappedSliceFillOp<T, M>
 where
     T: Copy + Send + 'static,
-    M: MemMode + KernelWritable,
+    M: MemMode + Fillable,
 {
     MappedSliceFillOp {
         buf: Some(buf),
@@ -252,7 +252,7 @@ where
 impl<T, M> DeviceOperation for MappedSliceFillOp<T, M>
 where
     T: Copy + Send + 'static,
-    M: MemMode + KernelWritable + Send + 'static,
+    M: MemMode + Fillable + Send + 'static,
 {
     type Output = MappedSlice<T, M>;
 
