@@ -1,7 +1,7 @@
 error[E0277]: the trait bound `Frozen: Fillable` is not satisfied
-  --> compile_fail/buffer_ops_fill_on_frozen.rs:12:31
+  --> compile_fail/buffer_ops_fill_on_frozen.rs:11:31
    |
-12 |     let _ = device_slice_fill(buf, 7u32);
+11 |     let _ = device_slice_fill(buf, 7u32);
    |             ----------------- ^^^ the trait `Fillable` is not implemented for `Frozen`
    |             |
    |             required by a bound introduced by this call

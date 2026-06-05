@@ -182,7 +182,10 @@ fn usm_slice_uninit_returns_wrapper_assume_init_writes_via_kernel() {
     let _ = format!("{uninit:?}");
     // SAFETY: kernel fills every slot before any read below.
     let buf = unsafe { uninit.assume_init() };
-    let buf = kernels.fill_u32([N], buf, 77).wait(&ctx).expect("kernel fill");
+    let buf = kernels
+        .fill_u32([N], buf, 77)
+        .wait(&ctx)
+        .expect("kernel fill");
     // Host reads kernel's writes directly via Deref (fine-grain SVM).
     assert!(buf.iter().all(|&v| v == 77));
 }
