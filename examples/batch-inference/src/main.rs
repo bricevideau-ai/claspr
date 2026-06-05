@@ -1,32 +1,40 @@
 //! claspr-async: N independent batches in parallel via `fan_out`,
-//! each consuming the same shared weight tensor.
+//! each consuming the same shared weight tensor — uploaded **once**
+//! to the device and shared across all branches via
+//! `Arc<DeviceSlice<u32>>`.
 //!
-//! Pipeline per batch:
+//! Pipeline:
 //!
 //! ```text
-//!    upload!(batch_input) ─┐
-//!    upload!(Arc<weights>) ┴→ pointwise: batch[i] *= weight[i]
-//!                          → bias add: batch[i] += bias
-//!                          → download
-//!                          → host: sum
+//!    upload!(weights) ────→ weights_dev: Arc<DeviceSlice<u32>>   // ONCE
+//!
+//!    for each batch (in parallel on the OOO queue):
+//!      upload!(batch_input) → input_buf
+//!                            ↓ Arc::clone(&weights_dev) for read-only kernel arg
+//!                            elem_mul: input_buf[i] *= weights[i]
+//!                            ↓
+//!                            add_bias: input_buf[i] += bias
+//!                            ↓
+//!                            download → host: sum
 //! ```
 //!
-//! `weights` is held as `Arc<[u32]>` on the host; each branch uploads
-//! its own copy from the shared host data via [`UploadSource::Arc`][as] —
-//! the keep-alive callback on the write event drops the Arc when the
-//! transfer finishes, so the runtime tracks lifetime automatically.
+//! `Arc<DeviceSlice<T>>` impls `KernelSliceReadArg` only (memory
+//! `[[arc-deviceslice-readonly]]`) — exactly the right gate for a
+//! shared read-only input. The previous version uploaded weights
+//! per branch via `upload!(Arc::clone(&host_arc))`, which allocated
+//! N distinct device buffers and N × N × 4 bytes of redundant
+//! host→device DMA. The share-on-device pattern: one alloc, one
+//! DMA, N branches read from the same `cl_mem`.
 //!
-//! [`fan_out`](claspr_async::fan_out()) enqueues every branch on the chain's out-of-order
-//! queue with independent event chains; a single
+//! [`fan_out`](claspr_async::fan_out()) enqueues every branch on the
+//! chain's out-of-order queue with independent event chains; a single
 //! `clEnqueueMarkerWithWaitList` joins them at the end. The OOO
 //! scheduler decides how much to overlap on the device.
 //!
 //! Verifies every batch's output against a host reference.
-//!
-//! [as]: claspr_async::transfer::UploadSource
 
 use claspr::Context;
-use claspr_async::{DeviceOperation, bundle, download, fan_out, upload};
+use claspr_async::{DeviceOperation, download, fan_out, upload};
 use std::sync::Arc;
 
 const N: usize = 64;
@@ -70,10 +78,11 @@ fn run(ctx: Context) -> claspr::Result<()> {
     let kernels = gpu::kernels(&ctx)?;
     let kernels_ref = &kernels;
 
-    // Host-side shared weights (1, 2, 3, ..., N). Arc<[T]> so every
-    // branch's upload borrows the same heap allocation; the runtime
-    // releases the Arc when the last keep-alive callback fires.
-    let weights: Arc<[u32]> = (1..=N as u32).collect::<Vec<_>>().into();
+    // Host-side weight tensor (1, 2, 3, ..., N). Kept as a Vec so we
+    // can also use it for the host-side reference computation below
+    // (we'll then upload it ONCE to the device and share that one
+    // device buffer across all branches).
+    let weights: Vec<u32> = (1..=N as u32).collect();
 
     // Per-batch inputs: batch k contains [k, k+1, k+2, ...].
     let inputs: Vec<Vec<u32>> = (0..BATCHES)
@@ -84,26 +93,36 @@ fn run(ctx: Context) -> claspr::Result<()> {
         .map(|inp| host_inference(inp, &weights, BIAS))
         .collect();
 
-    // The full fan_out chain: each branch is its own independent
-    // upload + bundle(weights, input) + kernel + bias + download + sum.
-    // BATCHES branches run concurrently on the OOO queue.
-    // Each branch downloads to a Vec<u32>; final reduction is a
-    // host-side sum after the chain has finished. (Pre-async
-    // `and_then_host` could fold this into the chain, but the new
-    // signature only does in-place mutation — for pure reductions,
-    // host sum after `.sync()` is the natural shape.)
+    // **Upload weights ONCE** to a single device buffer, then share
+    // across all branches via `Arc<DeviceSlice<u32>>`. Per memory
+    // `[[arc-deviceslice-readonly]]`, `Arc<DeviceSlice<T>>` impls
+    // `KernelSliceReadArg` only — that's exactly what we want here:
+    // every branch's `elem_mul` reads from `weights_dev` in the
+    // `&[u32]` (read-only) kernel slot. The previous version did
+    // `upload!(weights_clone)` per branch, allocating BATCHES distinct
+    // device buffers and BATCHES × N × 4 bytes of redundant
+    // host→device DMA. With the share-on-device pattern: one alloc,
+    // one DMA, N branches read from the same `cl_mem`.
+    let weights_dev: Arc<claspr::DeviceSlice<u32>> = Arc::new(upload!(weights).sync(&ctx)?);
+
+    // The full fan_out chain: each branch uploads ONLY its own input
+    // buffer, then runs `elem_mul` against the shared weights, then
+    // bias-adds, then downloads. BATCHES branches run concurrently on
+    // the OOO queue. Final reduction is a host-side sum after the
+    // chain has finished. (Pre-async `and_then_host` could fold this
+    // into the chain, but the new signature only does in-place
+    // mutation — for pure reductions, host sum after `.sync()` is the
+    // natural shape.)
     let downloaded: Vec<Vec<u32>> = fan_out(inputs.clone(), move |input| {
-        // `Arc::clone(&weights)` is cheap; both clones share the same
-        // host allocation. The keep-alive callback on the write event
-        // drops each clone once OpenCL is done copying from it.
-        let weights_clone: Arc<[u32]> = Arc::clone(&weights);
-        bundle!(upload!(input), upload!(weights_clone))
-            .and_then(move |(input_buf, weight_buf)| {
-                // elem_mul takes `(&mut [u32], &[u32])` → both slices
-                // flow through as Output (3-tuple? no, 2-tuple of slices).
-                // We discard the weight buffer after the mul.
-                kernels_ref.elem_mul([N], input_buf, weight_buf).and_then(
-                    move |(input_buf, _weight_buf)| kernels_ref.add_bias([N], input_buf, BIAS),
+        // Cheap Arc::clone — both pointers refer to the same `cl_mem`.
+        let weights_ref = Arc::clone(&weights_dev);
+        upload!(input)
+            .and_then(move |input_buf| {
+                // elem_mul: `(a: &mut [u32], b: &[u32])`. `a` =
+                // input_buf (consumed + returned with mul applied),
+                // `b` = weights_ref (Arc, read-only KernelSliceReadArg).
+                kernels_ref.elem_mul([N], input_buf, weights_ref).and_then(
+                    move |(input_buf, _weights_arc)| kernels_ref.add_bias([N], input_buf, BIAS),
                 )
             })
             .and_then(|buf| download!(buf))

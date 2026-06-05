@@ -36,10 +36,10 @@
 //! `transfer_to_device`), the scenario uses the closest production-
 //! API equivalent and notes the gap in a comment.
 
-use claspr::{Context, Device};
+use claspr::{Context, Device, DeviceSlice};
 use claspr_async::{
     DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, DynOp, bundle,
-    device_slice, device_slice_alloc, download, fan_out, transfer_to_device, upload, value,
+    device_slice, device_slice_alloc_zero, download, fan_out, transfer_to_device, upload, value,
 };
 use std::sync::Arc;
 
@@ -411,23 +411,34 @@ fn scenario_12_profiling(ctx_profiling: &Context) -> claspr::Result<()> {
 }
 
 fn scenario_13_batch_parallelism(ctx: &Context) -> claspr::Result<()> {
-    println!("\n=== Scenario 13: batch parallelism via fan_out + implicit marker ===");
+    println!("\n=== Scenario 13: batch parallelism via fan_out + shared-on-device weights ===");
     let kernels = gpu::kernels(ctx)?;
     let kernels_ref = &kernels;
-    let weights: Arc<[f32]> = vec![0.5f32; N].into();
     let len = N as u32;
 
+    // **Upload the shared weights ONCE** before fan_out, wrap in
+    // `Arc<DeviceSlice<f32>>`, and share that one device buffer
+    // across every branch. `Arc<DeviceSlice<T>>` impls
+    // `KernelSliceReadArg` only (see memory note
+    // `[[arc-deviceslice-readonly]]`) — exactly the right gate for
+    // a shared read-only input. This avoids the previous pattern of
+    // `upload!(Arc::clone(&host_arc))` per branch, which allocated
+    // N distinct device buffers and N × N × 4 bytes of redundant
+    // host→device DMA.
+    let weights_dev: Arc<DeviceSlice<f32>> =
+        Arc::new(upload!(vec![0.5f32; N]).sync(ctx)?);
+
     let results: Vec<Vec<f32>> = fan_out((0..3).collect::<Vec<i32>>(), move |batch_idx| {
-        let w = Arc::clone(&weights);
+        // Cheap Arc::clone — every branch reads from the same cl_mem.
+        let w = Arc::clone(&weights_dev);
         bundle!(
             upload!(vec![batch_idx as f32; N]),
-            upload!(w),
             upload!(vec![0.0f32; N]),
         )
-        .and_then(move |(input, w_buf, out)| {
+        .and_then(move |(input, out)| {
             kernels_ref
-                .add_shared_bias([N], out, w_buf, len, 0.0)
-                .and_then(move |(out, _w)| {
+                .add_shared_bias([N], out, w, len, 0.0)
+                .and_then(move |(out, _w_arc)| {
                     kernels_ref
                         .add_inplace([N], out, input)
                         .and_then(|(out, _input)| value(out))
