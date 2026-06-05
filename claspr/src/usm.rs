@@ -161,7 +161,7 @@ impl<T, M: MemMode> USMSlice<T, M> {
     /// `USMSlice<T, M>` via [`unsafe fn assume_init`](USMSliceUninit::assume_init)
     /// (caller vouches every byte gets written before any read).
     ///
-    /// SVM analog of [`DeviceSlice::alloc_uninit`]. **No marker
+    /// SVM analog of [`DeviceSlice::alloc_uninit`](crate::DeviceSlice::alloc_uninit). **No marker
     /// bound** — the type-state wrapper is the safety gate, and USM
     /// markers don't affect host allocation.
     ///
