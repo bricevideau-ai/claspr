@@ -9,7 +9,9 @@
 //! module — easier to keep in sync with the marker definitions than
 //! separate trybuild fixtures.
 
-use claspr::{Context, DeviceScratch, DeviceSlice, Frozen, HostReadOnly, ReadOnly};
+use claspr::{
+    Context, DeviceScratch, DeviceSlice, DeviceSliceUninit, Frozen, HostReadOnly, ReadOnly,
+};
 use claspr_test_kernels::kernels;
 
 const N: usize = 32;
@@ -30,7 +32,7 @@ fn readwrite_default_marker_exercises_full_surface() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let mut buf: DeviceSlice<u32> = DeviceSlice::alloc(&ctx, N).expect("alloc");
+    let mut buf: DeviceSlice<u32> = DeviceSlice::alloc_zero(&ctx, N).expect("alloc");
     buf.write(&[1u32; N]).wait(&ctx).expect("write");
     buf.fill(7u32).wait(&ctx).expect("fill");
     let buf = kernels.scale_u32([N], buf, 3).wait(&ctx).expect("kernel");
@@ -52,7 +54,7 @@ fn read_only_kernel_constant_host_can_update_via_write() {
 
     // Pass as the read input of copy_u32 (signature: src: &[u32],
     // dst: &mut [u32]). ReadOnly satisfies KernelSliceReadArg.
-    let dst = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc dst");
+    let dst = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc dst");
     let (ro, dst) = kernels
         .copy_u32([N], ro, dst)
         .wait(&ctx)
@@ -82,7 +84,7 @@ fn host_read_only_kernel_writes_host_inspects() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let hro: DeviceSlice<u32, HostReadOnly> =
-        DeviceSlice::alloc(&ctx, N).expect("HostReadOnly alloc");
+        DeviceSlice::alloc_zero(&ctx, N).expect("HostReadOnly alloc");
     // Kernel writes to it (fill_u32 has `&mut [u32]` data param —
     // HostReadOnly satisfies KernelSliceReadWriteArg).
     let hro = kernels
@@ -105,14 +107,14 @@ fn device_scratch_kernel_only_no_host_access() {
 
     // Zero-init via fill — KernelWritable, OK.
     let scratch: DeviceSlice<u32, DeviceScratch> =
-        DeviceSlice::alloc(&ctx, N).expect("DeviceScratch alloc");
+        DeviceSlice::alloc_zero(&ctx, N).expect("DeviceScratch alloc");
     // Kernel-only flow: fill the scratch via kernel, then copy_u32
     // out into a ReadWrite buffer the host CAN read.
     let scratch = kernels
         .fill_u32([N], scratch, 13)
         .wait(&ctx)
         .expect("kernel fill scratch");
-    let final_buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc out");
+    let final_buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc out");
     let (_scratch, final_buf) = kernels
         .copy_u32([N], scratch, final_buf)
         .wait(&ctx)
@@ -123,6 +125,42 @@ fn device_scratch_kernel_only_no_host_access() {
 }
 
 #[test]
+fn alloc_uninit_returns_wrapper_for_arbitrary_marker() {
+    // alloc_uninit is now safe + has no marker bound (returns
+    // DeviceSliceUninit). Verify it constructs for markers that
+    // alloc_zero rejects (Frozen lacks Fillable) and that the
+    // wrapper exposes only len/ctx/Debug — no host read paths.
+    let Some(ctx) = ctx() else { return };
+    let uninit: DeviceSliceUninit<u32, Frozen> =
+        DeviceSlice::alloc_uninit(&ctx, N).expect("Frozen alloc_uninit");
+    assert_eq!(uninit.len(), N);
+    assert!(!uninit.is_empty());
+    let _ = format!("{uninit:?}");
+    // No .read() / .download() exists on the wrapper — type-checked.
+}
+
+#[test]
+fn alloc_uninit_assume_init_kernel_write_only_pattern() {
+    // The intended escape-hatch flow: alloc_uninit + assume_init +
+    // pass to a kernel that writes the whole buffer. For HostReadOnly
+    // where alloc_zero ALSO works (via device kernel), this is the
+    // "skip the redundant fill" path.
+    let Some(ctx) = ctx() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+    let uninit =
+        DeviceSlice::<u32, HostReadOnly>::alloc_uninit(&ctx, N).expect("HostReadOnly alloc_uninit");
+    // SAFETY: fill_u32 kernel writes every slot before any read.
+    let buf = unsafe { uninit.assume_init() };
+    let buf = kernels
+        .fill_u32([N], buf, 42)
+        .wait(&ctx)
+        .expect("kernel fill");
+    let mut out = vec![0u32; N];
+    buf.read(&mut out).wait(&ctx).expect("host read");
+    assert!(out.iter().all(|&v| v == 42));
+}
+
+#[test]
 fn host_read_only_fill_uses_device_kernel_path() {
     // HostReadOnly: not HostWritable → FILL_STRATEGY = DeviceKernel.
     // .fill() under the hood launches claspr_fill_u32, not
@@ -130,11 +168,9 @@ fn host_read_only_fill_uses_device_kernel_path() {
     // (skipping the alloc auto-zero) then host-read the bytes.
     let Some(ctx) = ctx() else { return };
 
+    let uninit = DeviceSlice::<u32, HostReadOnly>::alloc_uninit(&ctx, N).expect("alloc_uninit HRO");
     // SAFETY: fill below overwrites every byte before any read.
-    let buf = unsafe {
-        DeviceSlice::<u32, HostReadOnly>::alloc_uninit(&ctx, N).expect("alloc_uninit HRO")
-    };
-    let mut buf = buf;
+    let mut buf = unsafe { uninit.assume_init() };
     buf.fill(0xCAFE_BABEu32)
         .wait(&ctx)
         .expect("fill via device kernel");
@@ -151,17 +187,16 @@ fn device_scratch_fill_uses_device_kernel_path() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
+    let uninit =
+        DeviceSlice::<u32, DeviceScratch>::alloc_uninit(&ctx, N).expect("alloc_uninit scratch");
     // SAFETY: fill below overwrites every byte before any read.
-    let scratch = unsafe {
-        DeviceSlice::<u32, DeviceScratch>::alloc_uninit(&ctx, N).expect("alloc_uninit scratch")
-    };
-    let mut scratch = scratch;
+    let mut scratch = unsafe { uninit.assume_init() };
     scratch
         .fill(0xDEAD_F00Du32)
         .wait(&ctx)
         .expect("fill DeviceScratch via device kernel");
     // Copy out to a host-readable buffer for verification.
-    let out_buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc out");
+    let out_buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc out");
     let (_scratch, out_buf) = kernels
         .copy_u32([N], scratch, out_buf)
         .wait(&ctx)
@@ -185,7 +220,7 @@ fn frozen_threads_through_read_position_kernel_arg() {
     // copy_u32: kernel signature is `&[u32] src, &mut [u32] dst`.
     // src is the Frozen buffer — KernelSliceReadArg<u32> works
     // because Frozen impls KernelReadable.
-    let dst = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc dst");
+    let dst = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc dst");
     let (_src, dst) = kernels
         .copy_u32([N], frozen, dst)
         .wait(&ctx)

@@ -32,7 +32,7 @@ fn device_slice_drop_while_kernel_in_flight() {
     // completion, then check the context's sticky error counter.
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let (buf, _event) = kernels.fill_u32([N], buf, 1).submit(&ctx).expect("submit");
     drop(buf);
     // Force pending work to complete via the context's default queue.

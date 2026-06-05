@@ -15,7 +15,7 @@ use claspr_test_kernels::kernels;
 fn main() {
     let ctx = Context::any().unwrap();
     let kernels = kernels::kernels(&ctx).unwrap();
-    let buf = DeviceSlice::<u32>::alloc(&ctx, 4).unwrap();
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).unwrap();
     // First op moves `buf`. The closure should use `_first_out`,
     // not the outer `buf` — touching `buf` here is the bug we're
     // catching.

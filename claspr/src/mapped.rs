@@ -23,7 +23,7 @@
 //!     return skip("device has no SVM");
 //! }
 //!
-//! let mut buf = MappedSlice::<u32>::alloc(&ctx, 1024)?;
+//! let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, 1024)?;
 //! {
 //!     let mut view = buf.map_mut(&ctx)?;
 //!     for (i, slot) in view.iter_mut().enumerate() {
@@ -143,29 +143,32 @@ impl<T: Default + Copy, M: MemMode + Fillable> MappedSlice<T, M> {
     /// Returns [`Error::SvmNotAvailable`] if the context's device
     /// reports [`SvmLevel::None`] for `CL_DEVICE_SVM_CAPABILITIES`.
     ///
-    /// The `M: KernelWritable` bound excludes [`crate::ReadOnly`] and
-    /// [`crate::Frozen`] (kernel-RO at the SVM level); those markers
-    /// use [`from_slice`](Self::from_slice) to bake in initial data.
-    /// Matches [`DeviceSlice::alloc`](crate::DeviceSlice::alloc).
-    pub fn alloc(ctx: &Context, len: usize) -> Result<Self> {
+    /// The `M: Fillable` bound excludes [`crate::Frozen`]; markers
+    /// that need initial data without runtime writability use
+    /// [`from_slice`](Self::from_slice). Honest name: this is
+    /// `alloc + zero-init via fill`. Matches
+    /// [`DeviceSlice::alloc_zero`](crate::DeviceSlice::alloc_zero).
+    pub fn alloc_zero(ctx: &Context, len: usize) -> Result<Self> {
         // SAFETY: synchronous fill below overwrites every byte
         // before returning, so no path can observe uninit data.
-        let slice = unsafe { Self::alloc_uninit(ctx, len)? };
+        let slice = unsafe { Self::alloc_uninit(ctx, len)?.assume_init() };
         slice.fill(T::default()).wait(ctx)?;
         Ok(slice)
     }
 }
 
-impl<T, M: MemMode + Fillable> MappedSlice<T, M> {
+impl<T, M: MemMode> MappedSlice<T, M> {
     /// Allocate `len` elements of T in SVM memory, leaving the bytes
-    /// uninitialised. Cheaper than [`alloc`](Self::alloc) when the
-    /// caller writes the whole buffer before any read.
+    /// uninitialised. Returns a [`MappedSliceUninit<T, M>`] wrapper
+    /// — host reads are type-blocked, transition to an initialised
+    /// [`MappedSlice<T, M>`] via the wrapper's methods or
+    /// [`unsafe fn assume_init`](MappedSliceUninit::assume_init).
     ///
-    /// # Safety
-    ///
-    /// Same contract as [`DeviceSlice::alloc_uninit`](crate::DeviceSlice::alloc_uninit):
-    /// every byte must be written before any read.
-    pub unsafe fn alloc_uninit(ctx: &Context, len: usize) -> Result<Self> {
+    /// SVM analog of
+    /// [`DeviceSlice::alloc_uninit`](crate::DeviceSlice::alloc_uninit).
+    /// No marker bound — the type-state wrapper is the safety gate.
+    /// Surfaces [`Error::SvmNotAvailable`] on devices without SVM.
+    pub fn alloc_uninit(ctx: &Context, len: usize) -> Result<MappedSliceUninit<T, M>> {
         if ctx.svm_capability() == SvmLevel::None {
             return Err(Error::SvmNotAvailable);
         }
@@ -184,13 +187,56 @@ impl<T, M: MemMode + Fillable> MappedSlice<T, M> {
             )
             .map_err(cl_to_err)?
         };
-        Ok(MappedSlice {
-            ptr: raw.cast::<T>(),
-            len,
-            ctx: ctx.clone(),
-            last_use: Mutex::new(Vec::new()),
-            _mode: PhantomData,
+        Ok(MappedSliceUninit {
+            inner: MappedSlice {
+                ptr: raw.cast::<T>(),
+                len,
+                ctx: ctx.clone(),
+                last_use: Mutex::new(Vec::new()),
+                _mode: PhantomData,
+            },
         })
+    }
+}
+
+/// Type-state wrapper returned by [`MappedSlice::alloc_uninit`].
+/// SVM analog of [`crate::DeviceSliceUninit`] — host reads are
+/// blocked by the type system; transition via [`assume_init`](Self::assume_init).
+pub struct MappedSliceUninit<T, M: MemMode = ReadWrite> {
+    inner: MappedSlice<T, M>,
+}
+
+impl<T, M: MemMode> MappedSliceUninit<T, M> {
+    /// Skip safe initialization. See
+    /// [`crate::DeviceSliceUninit::assume_init`] for the safety
+    /// contract.
+    ///
+    /// # Safety
+    ///
+    /// Every byte must be written by SOME path before any read.
+    pub unsafe fn assume_init(self) -> MappedSlice<T, M> {
+        self.inner
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.len == 0
+    }
+
+    pub fn ctx(&self) -> &Context {
+        &self.inner.ctx
+    }
+}
+
+impl<T, M: MemMode> fmt::Debug for MappedSliceUninit<T, M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MappedSliceUninit")
+            .field("len", &self.inner.len)
+            .field("element_size", &std::mem::size_of::<T>())
+            .finish_non_exhaustive()
     }
 }
 

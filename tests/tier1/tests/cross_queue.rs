@@ -28,7 +28,7 @@ fn after_event_orders_launch_on_second_queue() {
     let q_consumer = Queue::<InOrder>::on_device(&ctx, &device).expect("consumer queue");
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
 
     // Producer queue fills with 6. Submit returns an Event we hand to
     // the consumer queue as a wait-list dep. Without `.after(event)`,
@@ -63,9 +63,9 @@ fn after_all_orders_launch_after_multiple_cross_queue_events() {
     let q_combine = Queue::<InOrder>::on_device(&ctx, &device).expect("q_combine");
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let a = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc a");
-    let b = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc b");
-    let out = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc out");
+    let a = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc a");
+    let b = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc b");
+    let out = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc out");
 
     let (a, ev_a) = kernels.fill_u32([N], a, 10).submit(&q1).expect("fill a");
     let (b, ev_b) = kernels.fill_u32([N], b, 32).submit(&q2).expect("fill b");
@@ -95,7 +95,7 @@ fn after_with_cross_context_event_panics_clearly() {
     let kernels_a = kernels::kernels(&ctx_a).expect("kernels_a");
 
     // Produce an event on ctx_a.
-    let buf_a = DeviceSlice::<u32>::alloc(&ctx_a, N).expect("alloc on ctx_a");
+    let buf_a = DeviceSlice::<u32>::alloc_zero(&ctx_a, N).expect("alloc on ctx_a");
     let (_buf_a, event_from_a) = kernels_a
         .fill_u32([N], buf_a, 1)
         .submit(&ctx_a)
@@ -103,7 +103,7 @@ fn after_with_cross_context_event_panics_clearly() {
 
     // Try to use it as an after-dep on ctx_b — should panic.
     let kernels_b = kernels::kernels(&ctx_b).expect("kernels_b");
-    let buf_b = DeviceSlice::<u32>::alloc(&ctx_b, N).expect("alloc on ctx_b");
+    let buf_b = DeviceSlice::<u32>::alloc_zero(&ctx_b, N).expect("alloc on ctx_b");
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let _ = kernels_b
             .fill_u32([N], buf_b, 2)

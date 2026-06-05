@@ -94,9 +94,9 @@ fn run() -> claspr::Result<bool> {
     // Stage 1: two halves uploaded to two queues.
     let inputs: Vec<u32> = (1..=N as u32).collect();
     let half = N / 2;
-    let mut buf0 = DeviceSlice::<u32>::alloc(&ctx, half)?;
+    let mut buf0 = DeviceSlice::<u32>::alloc_zero(&ctx, half)?;
     buf0.write(&inputs[..half]).wait(&q0)?;
-    let mut buf1 = DeviceSlice::<u32>::alloc(&ctx, N - half)?;
+    let mut buf1 = DeviceSlice::<u32>::alloc_zero(&ctx, N - half)?;
     buf1.write(&inputs[half..]).wait(&q1)?;
 
     // Stage 2: cross-buffer copy through q1 — allocate a fresh
@@ -104,7 +104,7 @@ fn run() -> claspr::Result<bool> {
     // (queued on q1), wait. Exercises the
     // `DeviceSlice::copy_to` path within a possibly-multi-device
     // context.
-    let mut mirror = DeviceSlice::<u32>::alloc(&ctx, half)?;
+    let mut mirror = DeviceSlice::<u32>::alloc_zero(&ctx, half)?;
     buf0.copy_to(&mut mirror).wait(&q1)?;
 
     // Stage 3: download back via the respective queues and verify.

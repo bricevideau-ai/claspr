@@ -39,7 +39,7 @@ fn errors_when_queue_lacks_profiling() {
     assert!(!ctx.profiling());
 
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
 
     let result = kernels
         .fill_u32([N], buf, 7)
@@ -63,7 +63,7 @@ fn delivers_monotonic_timestamps_when_enabled() {
     assert!(ctx.profiling());
 
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
 
     let (tx, rx) = std::sync::mpsc::channel();
     let _buf = kernels
@@ -93,7 +93,7 @@ fn fill_then_download_round_trip() {
         return;
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let buf = kernels.fill_u32([N], buf, 99).wait(&ctx).expect("fill_u32");
 
     let mut out = vec![0u32; N];

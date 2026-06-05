@@ -30,7 +30,7 @@ fn tier1_fill_writes_value_to_every_element() {
     // Alloc, fill, read back. No host upload, no kernel — exercise
     // the Tier 1 FillOp directly.
     let Some(ctx) = ctx() else { return };
-    let mut buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     buf.fill(42u32).wait(&ctx).expect("fill");
 
     let mut readback = vec![0u32; N];

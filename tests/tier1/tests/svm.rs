@@ -30,7 +30,7 @@ fn ctx_with_svm() -> Option<Context> {
 fn map_mut_then_map_round_trip() {
     let Some(ctx) = ctx_with_svm() else { return };
 
-    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     {
         let mut view = buf.map_mut().wait(&ctx).expect("map_mut");
         for (i, slot) in view.iter_mut().enumerate() {
@@ -60,7 +60,7 @@ fn drop_orders_after_cross_queue_unmap_via_last_use() {
     let device: Device = ctx.device().clone();
     let other_queue = Queue::<InOrder>::on_device(&ctx, &device).expect("aux queue");
 
-    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     // Write something so the unmap has data to flush.
     {
         let mut view = buf.map_mut().wait(&other_queue).expect("map_mut on aux");
@@ -91,7 +91,7 @@ fn explicit_register_use_orders_drop_after_cross_queue_event() {
     let device: Device = ctx.device().clone();
     let other_queue = Queue::<InOrder>::on_device(&ctx, &device).expect("aux queue");
 
-    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     // Issue a marker on the aux queue to manufacture an event.
     // SAFETY: empty wait-list is always valid.
     let marker =
@@ -125,7 +125,7 @@ fn kernel_launches_on_ooo_queue_register_themselves_for_drop() {
     let ooo = Queue::<OutOfOrder>::on_device(&ctx, &device).expect("ooo queue");
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     // Issue several launches on the OOO queue, all consuming `&buf`
     // via the typed launcher (now generic over KernelSliceArg, so
     // `MappedSlice<u32>` flows through `kernels.fill_u32` directly).
@@ -159,7 +159,7 @@ fn alloc_then_immediate_drop_uses_empty_wait_list() {
     // None/empty arm of the Vec-drain path.
     let Some(ctx) = ctx_with_svm() else { return };
     {
-        let _buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+        let _buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     } // immediate drop, no use registered
     ctx.cl_queue().finish().expect("finish");
     assert_eq!(ctx.error_count(), 0);
@@ -170,7 +170,7 @@ fn read_only_map_via_map_guard() {
     // Existing tests use map_mut. This exercises the read-only path
     // (`map(launcher)` → MappedReadGuard derefs to &[T]).
     let Some(ctx) = ctx_with_svm() else { return };
-    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     {
         // Populate via map_mut...
         let mut g = buf.map_mut().wait(&ctx).expect("map_mut");
@@ -203,7 +203,7 @@ fn multi_kernel_svm_pipeline_via_typed_launchers() {
     let ooo = Queue::<OutOfOrder>::on_device(&ctx, &device).expect("ooo queue");
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
 
     // Stage 1: fill_u32 with 4.
     let (buf, fill_event) = kernels

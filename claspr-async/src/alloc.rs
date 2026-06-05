@@ -84,7 +84,7 @@ where
         // DeviceSlice::alloc zero-fills synchronously on the context's
         // default queue and blocks until done, so the bytes are valid
         // when this returns. No new chain-queue event needed.
-        let buf = DeviceSlice::<T>::alloc(ec.context(), self.len)?;
+        let buf = DeviceSlice::<T>::alloc_zero(ec.context(), self.len)?;
         Ok((buf, deps))
     }
 }
@@ -128,7 +128,8 @@ where
         // Downstream stages gate on the fill event (returned in
         // deps), so no read — host or kernel — can observe uninit.
         // Skips the redundant zero-fill alloc would otherwise do.
-        let mut buf = unsafe { DeviceSlice::<T>::alloc_uninit(ec.context(), self.len)? };
+        let mut buf =
+            unsafe { DeviceSlice::<T>::alloc_uninit(ec.context(), self.len)?.assume_init() };
         let event = buf
             .fill(self.value)
             .after_all(deps_as_events(&deps))
@@ -173,7 +174,7 @@ where
         // SAFETY: alloc_uninit returns uninit SVM bytes; the
         // immediate fill below overwrites the whole buffer, and
         // downstream stages gate on the returned fill event.
-        let buf = unsafe { MappedSlice::<T>::alloc_uninit(ec.context(), self.len)? };
+        let buf = unsafe { MappedSlice::<T>::alloc_uninit(ec.context(), self.len)?.assume_init() };
         let event = buf
             .fill(self.value)
             .after_all(deps_as_events(&deps))
@@ -226,7 +227,7 @@ where
         // .write() below overwrites every byte from `source`.
         // Downstream stages gate on the returned write event so no
         // read can observe uninit data.
-        let buf = unsafe { MappedSlice::<T>::alloc_uninit(ec.context(), len)? };
+        let buf = unsafe { MappedSlice::<T>::alloc_uninit(ec.context(), len)?.assume_init() };
         // Lift Tier 1's `SvmWriteOp` — same auto-register-on-last_use
         // bookkeeping is inside .submit(), so this wrapper just adds
         // the host-source keep-alive callback (parallel to `Upload`).
@@ -278,7 +279,7 @@ where
     fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(MappedSlice<T>, Deps)> {
         // MappedSlice::alloc zero-fills synchronously on the context's
         // default queue and blocks until done.
-        let buf = MappedSlice::<T>::alloc(ec.context(), self.len)?;
+        let buf = MappedSlice::<T>::alloc_zero(ec.context(), self.len)?;
         Ok((buf, deps))
     }
 }

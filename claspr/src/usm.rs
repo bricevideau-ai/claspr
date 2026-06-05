@@ -29,7 +29,7 @@
 //!
 //! [`Error::NotSupported`]: crate::Error::NotSupported
 
-use crate::access::{HostReadable, HostWritable, KernelWritable, MemMode, ReadWrite};
+use crate::access::{HostReadable, HostWritable, MemMode, ReadWrite};
 use crate::buffer::Buffer;
 use crate::context::{Context, SvmLevel};
 use crate::error::{Error, Result};
@@ -137,18 +137,18 @@ impl<T, M: MemMode> USMSlice<T, M> {
     }
 }
 
-impl<T: Default + Copy + Send + 'static, M: MemMode + KernelWritable> USMSlice<T, M> {
+impl<T: Default + Copy + Send + 'static, M: MemMode> USMSlice<T, M> {
     /// Allocate a USMSlice of `len` elements initialised to
     /// `T::default()`. Convenience wrapper over
     /// [`new(ctx, vec![T::default(); len])`](Self::new), symmetric
-    /// with [`DeviceSlice::alloc`](crate::DeviceSlice::alloc) and
-    /// [`MappedSlice::alloc`](crate::MappedSlice::alloc).
+    /// with [`DeviceSlice::alloc_zero`](crate::DeviceSlice::alloc_zero)
+    /// and [`MappedSlice::alloc_zero`](crate::MappedSlice::alloc_zero).
     ///
-    /// The `M: KernelWritable` bound mirrors the alloc constructors
-    /// on the other tiers — markers that mark the buffer kernel-RO
-    /// (`ReadOnly`, `Frozen`) construct from initial data via
-    /// [`new`](Self::new) instead.
-    pub fn alloc(ctx: &Context, len: usize) -> Result<Self> {
+    /// **No marker bound** — USM is host memory backed by a Rust
+    /// `Vec<T>`, and `vec![T::default(); N]` is a pure host op that
+    /// works regardless of any kernel-side marker. USM markers gate
+    /// kernel access (via `M::KERNEL_FLAGS`), never host alloc.
+    pub fn alloc_zero(ctx: &Context, len: usize) -> Result<Self> {
         Self::new(ctx, vec![T::default(); len])
     }
 }

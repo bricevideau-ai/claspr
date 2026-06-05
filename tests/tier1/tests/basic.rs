@@ -25,7 +25,7 @@ fn fill_kernel_writes_value_to_every_element() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let buf = kernels
         .fill_u32([N], buf, 0xfeed_cafe)
         .wait(&ctx)
@@ -42,7 +42,7 @@ fn write_kernel_read_round_trip() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let initial: Vec<u32> = (0..N as u32).collect();
-    let mut buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     buf.write(&initial).wait(&ctx).expect("write");
 
     // Scale by 3, then read back.
@@ -61,9 +61,9 @@ fn multi_buffer_kernel_combines_inputs() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let mut a = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc a");
-    let mut b = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc b");
-    let out = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc out");
+    let mut a = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc a");
+    let mut b = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc b");
+    let out = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc out");
 
     let host_a: Vec<u32> = vec![10; N];
     let host_b: Vec<u32> = vec![32; N];
@@ -85,7 +85,7 @@ fn submit_returns_event_for_cross_queue_chaining() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let (buf, fill_event) = kernels
         .fill_u32([N], buf, 7)
         .submit(&ctx)

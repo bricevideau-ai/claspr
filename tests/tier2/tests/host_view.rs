@@ -146,7 +146,7 @@ fn mapped_slice_acquire_release_round_trip() {
         return;
     }
 
-    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("MappedSlice alloc");
+    let buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("MappedSlice alloc");
 
     let mut buf = value(buf)
         .and_then(|b| b.acquire_host_view())
@@ -184,7 +184,7 @@ fn mapped_slice_acquire_release_read_only() {
     }
 
     // Seed the MappedSlice via Tier 1 first.
-    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("MappedSlice alloc");
+    let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("MappedSlice alloc");
     {
         let mut guard = buf.map_mut().wait(&ctx).expect("seed map");
         for (i, x) in guard.iter_mut().enumerate() {

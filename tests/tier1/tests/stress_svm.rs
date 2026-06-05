@@ -44,7 +44,7 @@ fn thousand_ooo_launches_on_one_sharedbuffer_drop_safely() {
     let ooo = Queue::<OutOfOrder>::on_device(&ctx, &device).expect("ooo queue");
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     // Each iteration submits without blocking on prior events —
     // each launch auto-registers via KernelArg::register_completion
     // and ends up in the buffer's last_use Vec.

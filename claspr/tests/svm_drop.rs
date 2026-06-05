@@ -30,7 +30,7 @@ fn alloc_and_drop_basic() -> Result<()> {
         return Ok(());
     };
 
-    let buf = MappedSlice::<u32>::alloc(&ctx, 1024)?;
+    let buf = MappedSlice::<u32>::alloc_zero(&ctx, 1024)?;
     drop(buf);
 
     // The drop enqueues an SVM free. The context's default queue
@@ -50,7 +50,7 @@ fn alloc_drop_many_in_sequence() -> Result<()> {
     };
 
     for _ in 0..32 {
-        let buf = MappedSlice::<u32>::alloc(&ctx, 256)?;
+        let buf = MappedSlice::<u32>::alloc_zero(&ctx, 256)?;
         drop(buf);
     }
 
@@ -70,7 +70,7 @@ fn alloc_drop_with_map_in_between() -> Result<()> {
     };
 
     {
-        let mut buf = MappedSlice::<u32>::alloc(&ctx, 16)?;
+        let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, 16)?;
         {
             let mut guard = buf.map_mut().wait(&ctx)?;
             for (i, x) in guard.iter_mut().enumerate() {

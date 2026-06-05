@@ -23,7 +23,7 @@ fn tuple_form_sets_local_size_via_local_invocation_id() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     const N: usize = 64;
     const L: usize = 8;
-    let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let buf = kernels
         .local_id_u32(([N], [L]), buf)
         .wait(&ctx)

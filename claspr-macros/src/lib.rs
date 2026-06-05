@@ -38,7 +38,7 @@
 //!     let ctx = claspr::Context::any()?;
 //!     let kernels = kernels::Kernels::load(&ctx)?;
 //!     let mut data: Vec<u32> = (1..=1024).collect();
-//!     let mut buf = claspr::DeviceSlice::alloc(&ctx, data.len())?;
+//!     let mut buf = claspr::DeviceSlice::alloc_zero(&ctx, data.len())?;
 //!     buf.write(&data).wait(&ctx)?;
 //!     // Tier 1: slices move in, come back out of `.wait()`.
 //!     let buf = kernels.collatz_kernel([data.len()], buf).wait(&ctx)?;

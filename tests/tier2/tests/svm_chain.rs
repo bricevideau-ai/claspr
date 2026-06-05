@@ -41,7 +41,7 @@ fn mapped_slice_threads_through_typed_launchers() {
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let (buf, fill_evt) = kernels.fill_u32([N], buf, 6u32).submit(&ctx).expect("fill");
     let buf = kernels
         .scale_u32([N], buf, 7u32)
@@ -64,7 +64,7 @@ fn many_in_flight_svm_launches_drop_safely() {
     // `clEnqueueSVMFree` wait-list must include every launch's event.
     let Some(ctx) = ctx_with_svm() else { return };
 
-    let mut buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     // 8 successive scales on the same SVM. Each .submit() doesn't
     // block; each launch auto-registers via `KernelArg::register_completion`.

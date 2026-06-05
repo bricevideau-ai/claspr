@@ -39,7 +39,7 @@ fn describe<T, B: Buffer<T>>(label: &str, b: &B) -> String {
 fn buffer_accessor_works_uniformly_across_tiers() {
     let Some(ctx) = ctx() else { return };
 
-    let device_slice = DeviceSlice::<u32>::alloc(&ctx, N).expect("DeviceSlice alloc");
+    let device_slice = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("DeviceSlice alloc");
 
     let d = describe("DeviceSlice", &device_slice);
     println!("{d}");
@@ -47,7 +47,7 @@ fn buffer_accessor_works_uniformly_across_tiers() {
 
     // MappedSlice (coarse-grain SVM) when available.
     if ctx.svm_capability() != SvmLevel::None {
-        let mapped = MappedSlice::<u32>::alloc(&ctx, N).expect("MappedSlice alloc");
+        let mapped = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("MappedSlice alloc");
         let d = describe("MappedSlice", &mapped);
         println!("{d}");
         assert!(d.contains(&format!("{N} elements")));
@@ -69,7 +69,7 @@ fn buffer_is_empty_matches_zero_len_alloc() {
     // OpenCL accepts size=0 for clCreateBuffer in practice (returns
     // a valid mem object); some drivers reject it. Use this test as
     // a soft check — skip the assertion if alloc errors.
-    if let Ok(b) = DeviceSlice::<u32>::alloc(&ctx, 0) {
+    if let Ok(b) = DeviceSlice::<u32>::alloc_zero(&ctx, 0) {
         assert_eq!(b.len(), 0);
         assert!(b.is_empty());
     }
@@ -81,6 +81,6 @@ fn buffer_ctx_round_trips() {
     // buffer was allocated on. Trivial but the contract is load-bearing
     // (drop ordering, queue lookups go through this).
     let Some(ctx) = ctx() else { return };
-    let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     assert!(std::ptr::eq(buf.ctx().raw_context(), ctx.raw_context()));
 }

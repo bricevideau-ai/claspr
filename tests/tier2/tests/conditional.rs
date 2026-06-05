@@ -91,7 +91,7 @@ fn dyn_op_wraps_bare_kernel_op() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     use claspr::DeviceSlice;
-    let buf = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let chain: DynOp<DeviceSlice<u32>> = DynOp::new(kernels.fill_u32([N], buf, 5));
     let buf = chain.sync(&ctx).expect("sync");
     let mut out = vec![0u32; N];

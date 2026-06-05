@@ -370,7 +370,7 @@ mod tests {
         let q = queue.raw();
 
         // Allocate + seed via Tier 1 write.
-        let mut buf = DeviceSlice::<u32>::alloc(&ctx, 4).expect("alloc");
+        let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).expect("alloc");
         let seed = [1u32, 2, 3, 4];
         buf.write(&seed).wait(&ctx).expect("seed");
 
@@ -418,7 +418,7 @@ mod tests {
         let queue = ctx.default_outoforder_queue(&device).expect("oo queue");
         let q = queue.raw();
 
-        let mut buf = DeviceSlice::<u32>::alloc(&ctx, 4).expect("alloc");
+        let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).expect("alloc");
         buf.write(&[10, 20, 30, 40]).wait(&ctx).expect("seed");
 
         type T = (DeviceSlice<u32>, u32);

@@ -82,7 +82,7 @@ where
     type Output = USMSlice<T>;
 
     fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(USMSlice<T>, Deps)> {
-        let slice = USMSlice::<T>::alloc(ec.context(), self.len)?;
+        let slice = USMSlice::<T>::alloc_zero(ec.context(), self.len)?;
         Ok((slice, deps))
     }
 }

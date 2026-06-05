@@ -27,7 +27,7 @@
 //!     let ctx = Context::any()?;
 //!     let kernels = gpu::kernels(&ctx)?;
 //!     let mut data: Vec<u32> = (1..=1024).collect();
-//!     let mut buf = DeviceSlice::<u32>::alloc(&ctx, data.len())?;
+//!     let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, data.len())?;
 //!     buf.write(&data).wait(&ctx)?;
 //!     let buf = kernels.collatz_kernel([data.len()], buf).wait(&ctx)?;
 //!     buf.read(&mut data).wait(&ctx)?;
@@ -86,7 +86,9 @@ pub use access::{
     HostUploadable, HostWritable, KernelAccess, KernelReadable, KernelWritable, MemMode, ReadOnly,
     ReadWrite, RuntimeFillable, WriteOnly,
 };
-pub use buffer::{Buffer, CopyOp, DeviceSlice, FillOp, MigrateOp, ReadOp, WriteOp};
+pub use buffer::{
+    Buffer, CopyOp, DeviceSlice, DeviceSliceUninit, FillOp, MigrateOp, ReadOp, WriteOp,
+};
 pub use context::{Context, SvmLevel};
 pub use device::{Device, DeviceType, Platform};
 pub use error::{Error, Result};
@@ -116,7 +118,8 @@ pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 #[cfg(feature = "async-events")]
 pub use future::{EventFuture, EventFutureExt, LaunchFuture};
 pub use mapped::{
-    MappedReadGuard, MappedSlice, MappedWriteGuard, SvmCopyOp, SvmFillOp, SvmWriteOp,
+    MappedReadGuard, MappedSlice, MappedSliceUninit, MappedWriteGuard, SvmCopyOp, SvmFillOp,
+    SvmWriteOp,
 };
 pub use usm::USMSlice;
 

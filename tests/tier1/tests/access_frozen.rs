@@ -47,7 +47,7 @@ fn frozen_threads_into_kernel_as_read_only_input() {
 
     let a: DeviceSlice<u32, Frozen> = DeviceSlice::from_slice(&ctx, &[3u32; N]).expect("Frozen a");
     let b: DeviceSlice<u32, Frozen> = DeviceSlice::from_slice(&ctx, &[5u32; N]).expect("Frozen b");
-    let out = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc out");
+    let out = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc out");
 
     let (_a, _b, out) = kernels
         .add_u32([N], a, b, out)

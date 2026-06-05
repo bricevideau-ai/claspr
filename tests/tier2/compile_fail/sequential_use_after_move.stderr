@@ -1,7 +1,7 @@
 error[E0382]: use of moved value: `buf`
   --> compile_fail/sequential_use_after_move.rs:24:19
    |
-18 |     let buf = DeviceSlice::<u32>::alloc(&ctx, 4).unwrap();
+18 |     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).unwrap();
    |         --- move occurs because `buf` has type `DeviceSlice<u32>`, which does not implement the `Copy` trait
 ...
 23 |         .fill_u32([4usize], buf, 1u32)

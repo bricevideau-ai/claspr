@@ -51,7 +51,7 @@ fn fill_f64_writes_value_to_every_element() {
     // docs). Then fill, then read back.
     let initial = vec![0.0f64; N];
     let mut readback = vec![-1.0f64; N];
-    let mut buf = DeviceSlice::<f64>::alloc(&ctx, N).expect("alloc");
+    let mut buf = DeviceSlice::<f64>::alloc_zero(&ctx, N).expect("alloc");
     buf.write(&initial).wait(&ctx).expect("write zeros");
 
     let buf = kernels
@@ -72,7 +72,7 @@ fn scale_f64_multiplies_each_element() {
 
     let initial = vec![2.0f64; N];
     let mut readback = vec![-1.0f64; N];
-    let mut buf = DeviceSlice::<f64>::alloc(&ctx, N).expect("alloc");
+    let mut buf = DeviceSlice::<f64>::alloc_zero(&ctx, N).expect("alloc");
     buf.write(&initial).wait(&ctx).expect("write 2.0s");
 
     let buf = kernels
@@ -93,7 +93,7 @@ fn fill_then_scale_pipeline_via_typed_launchers() {
 
     let initial = vec![0.0f64; N];
     let mut readback = vec![-1.0f64; N];
-    let mut buf = DeviceSlice::<f64>::alloc(&ctx, N).expect("alloc");
+    let mut buf = DeviceSlice::<f64>::alloc_zero(&ctx, N).expect("alloc");
     buf.write(&initial).wait(&ctx).expect("write zeros");
 
     let buf = kernels

@@ -149,7 +149,8 @@ where
         // matches source.len() since we just used it for alloc).
         // Downstream chain stages gate on the returned write event
         // so no read can observe uninit data.
-        let mut buf = unsafe { DeviceSlice::alloc_uninit(ctx.context(), source.len())? };
+        let mut buf =
+            unsafe { DeviceSlice::alloc_uninit(ctx.context(), source.len())?.assume_init() };
         // Non-blocking write with `deps` as the queue wait-list. The
         // event from .submit() goes into the keep-alive callback +
         // becomes the next op's dep.

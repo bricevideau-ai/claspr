@@ -17,7 +17,7 @@ use std::sync::Arc;
 fn main() {
     let ctx = Context::any().unwrap();
     let kernels = kernels::kernels(&ctx).unwrap();
-    let buf = DeviceSlice::<u32>::alloc(&ctx, 4).unwrap();
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).unwrap();
     let shared = Arc::new(buf);
     // `scale_u32`'s `data: &mut [u32]` slot wants `KernelSliceReadWriteArg`.
     // `Arc<DeviceSlice<u32>>` only impls the Read variant — should reject.

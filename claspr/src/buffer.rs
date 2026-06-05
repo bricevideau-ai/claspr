@@ -154,57 +154,122 @@ impl<T: Default + Copy, M: MemMode + Fillable> DeviceSlice<T, M> {
     /// [`USMSlice::alloc`](crate::USMSlice::alloc).
     ///
     /// Internally a `clCreateBuffer` + a synchronous fill. The
-    /// `unsafe` [`alloc_uninit`](Self::alloc_uninit) escape hatch
-    /// skips the fill, but is unsound unless every byte is written
-    /// before any read (kernel or host) — see its safety contract.
-    pub fn alloc(ctx: &Context, len: usize) -> Result<Self> {
+    /// [`alloc_uninit`](Self::alloc_uninit) escape hatch returns a
+    /// type-stated [`DeviceSliceUninit`] wrapper that requires
+    /// explicit initialization before any read — see its docs.
+    ///
+    /// **Honest name**: this is `alloc + zero-init via fill`, not a
+    /// pure `clCreateBuffer`. The fill cost (and the [`Fillable`]
+    /// bound it imposes on the marker) is visible at the call site.
+    pub fn alloc_zero(ctx: &Context, len: usize) -> Result<Self> {
         // SAFETY: we immediately overwrite every byte via the
         // synchronous `fill` below before returning. No path from
         // here can observe the uninit bytes.
-        let mut slice = unsafe { Self::alloc_uninit(ctx, len)? };
+        let mut slice = unsafe { Self::alloc_uninit(ctx, len)?.assume_init() };
         slice.fill(T::default()).wait(ctx)?;
         Ok(slice)
     }
 }
 
-impl<T, M: MemMode + Fillable> DeviceSlice<T, M> {
+impl<T, M: MemMode> DeviceSlice<T, M> {
     /// Allocate a device buffer of `len` elements, leaving the bytes
-    /// uninitialised. Cheaper than [`alloc`](Self::alloc) when the
-    /// caller writes the whole buffer before any read.
+    /// uninitialised. Returns a [`DeviceSliceUninit<T, M>`] wrapper
+    /// instead of a bare `DeviceSlice` — the type-state blocks host
+    /// reads (`.read()` / `download!`) at compile time so unintended
+    /// uninit-byte observation is a type error rather than UB.
     ///
-    /// # Safety
+    /// Transition to an initialised [`DeviceSlice<T, M>`] via one of
+    /// the wrapper's methods (`.fill(value)`, `.write(data)`,
+    /// `unsafe fn assume_init()`), or via a Tier 2 chain that
+    /// applies one of those. The fill / write paths are safe; the
+    /// `assume_init` escape hatch is unsafe because rust-gpu has no
+    /// `MaybeUninit` story — a kernel that reads uninit bytes
+    /// interprets them as a `T` value (arbitrary garbage for
+    /// numeric `T`; UB for `T` with invalid bit patterns like
+    /// `bool` / `NonZeroU32` / niche-optimised enums).
     ///
-    /// Every byte of the returned buffer must be written before any
-    /// read (host `read` / `download`, or a kernel that *reads* the
-    /// slice — including via a `&mut [T]` kernel arg whose body
-    /// happens to read before it writes). claspr's typed launcher
-    /// signature is `&mut [T]` regardless of whether the kernel reads
-    /// or only writes, so there is no static check that a given
-    /// kernel is write-only.
+    /// **No marker bound** — the type-state wrapper IS the safety
+    /// gate. Any `M` works at construction; subsequent
+    /// initialization paths are gated by their own marker bounds
+    /// (e.g. `.fill()` requires [`Fillable`], `.write()` requires
+    /// [`HostWritable`]).
     ///
-    /// rust-gpu has no `MaybeUninit` story, so a kernel that reads
-    /// uninit bytes interprets them as a `T` value at the SPIR-V
-    /// level. For numeric `T` this is arbitrary garbage (likely wrong
-    /// answer, not technically UB); for any `T` with invalid bit
-    /// patterns (e.g. `bool`, `NonZeroU32`, niche-optimised enums)
-    /// it is undefined behaviour.
-    ///
-    /// Use this only when you control both sides — e.g. wrapping the
-    /// alloc in a safe higher-level op that immediately enqueues a
-    /// full-buffer write (`Upload`, `DeviceSliceFilled`). Prefer
-    /// [`alloc`](Self::alloc) for user-facing code.
-    pub unsafe fn alloc_uninit(ctx: &Context, len: usize) -> Result<Self> {
+    /// Cheaper than [`alloc_zero`](Self::alloc_zero) when the caller
+    /// will overwrite the buffer immediately anyway (skips the
+    /// initial fill).
+    pub fn alloc_uninit(ctx: &Context, len: usize) -> Result<DeviceSliceUninit<T, M>> {
         // SAFETY: passing a null host pointer means OpenCL allocates
         // fresh device memory and ignores the host-pointer contract
         // that makes `Buffer::create` generally unsafe.
         let buffer =
             unsafe { ClBuffer::<T>::create(ctx.raw_context(), M::FLAGS, len, ptr::null_mut())? };
-        Ok(DeviceSlice {
-            buffer: ManuallyDrop::new(buffer),
-            len,
-            ctx: ctx.clone(),
-            _mode: PhantomData,
+        Ok(DeviceSliceUninit {
+            inner: DeviceSlice {
+                buffer: ManuallyDrop::new(buffer),
+                len,
+                ctx: ctx.clone(),
+                _mode: PhantomData,
+            },
         })
+    }
+}
+
+/// Type-state wrapper returned by
+/// [`DeviceSlice::alloc_uninit`]: the bytes are uninitialised, host
+/// reads are statically blocked, and the user must transition to an
+/// initialised [`DeviceSlice<T, M>`] via [`fill`](Self::fill),
+/// [`write`](Self::write), or
+/// [`unsafe fn assume_init`](Self::assume_init).
+///
+/// The wrapper has no `read` / `download` / `acquire_host_view`
+/// methods — attempting any of those is a compile error rather than
+/// reading uninit bytes (and possibly invoking UB for `T` with
+/// invalid bit patterns).
+pub struct DeviceSliceUninit<T, M: MemMode = ReadWrite> {
+    inner: DeviceSlice<T, M>,
+}
+
+impl<T, M: MemMode> DeviceSliceUninit<T, M> {
+    /// Skip safe initialization and assert that this buffer has
+    /// been (or will be) fully written by some other path —
+    /// typically a kernel arg launched on it that writes every
+    /// slot. Escape hatch for the rust-gpu MaybeUninit gap.
+    ///
+    /// # Safety
+    ///
+    /// The caller asserts that every byte of the buffer will be
+    /// written by SOME path (kernel, manual SVM copy, etc.) before
+    /// any read can observe the bytes. For numeric `T` an
+    /// uninit-byte read is arbitrary garbage; for `T` with invalid
+    /// bit patterns (`bool`, `NonZeroU32`, niche-optimised enums)
+    /// it is UB.
+    pub unsafe fn assume_init(self) -> DeviceSlice<T, M> {
+        self.inner
+    }
+
+    /// Length in elements — same as the eventual `DeviceSlice`'s
+    /// length.
+    pub fn len(&self) -> usize {
+        self.inner.len
+    }
+
+    /// True when length is zero.
+    pub fn is_empty(&self) -> bool {
+        self.inner.len == 0
+    }
+
+    /// The context the buffer was allocated on.
+    pub fn ctx(&self) -> &Context {
+        &self.inner.ctx
+    }
+}
+
+impl<T, M: MemMode> fmt::Debug for DeviceSliceUninit<T, M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceSliceUninit")
+            .field("len", &self.inner.len)
+            .field("element_size", &std::mem::size_of::<T>())
+            .finish_non_exhaustive()
     }
 }
 

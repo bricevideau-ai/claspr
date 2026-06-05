@@ -1,7 +1,7 @@
 error[E0382]: use of moved value: `buf`
   --> compile_fail/bundle_aliased_owned_writes.rs:17:36
    |
-13 |     let buf = DeviceSlice::<u32>::alloc(&ctx, 4).unwrap();
+13 |     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).unwrap();
    |         --- move occurs because `buf` has type `DeviceSlice<u32>`, which does not implement the `Copy` trait
 ...
 16 |         kernels.scale_u32([4usize], buf, 2u32),

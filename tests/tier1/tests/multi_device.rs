@@ -109,8 +109,8 @@ fn launch_runs_on_each_device_via_proc_macro_launcher() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     // Two independent buffers, one launch per device.
-    let buf_a = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc a");
-    let buf_b = DeviceSlice::<u32>::alloc(&ctx, N).expect("alloc b");
+    let buf_a = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc a");
+    let buf_b = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc b");
     let buf_a = kernels.fill_u32([N], buf_a, 7).wait(&q_a).expect("a");
     let buf_b = kernels.fill_u32([N], buf_b, 9).wait(&q_b).expect("b");
 

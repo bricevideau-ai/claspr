@@ -29,7 +29,7 @@ fn tier1_svm_fill_writes_pattern() {
     // Alloc MappedSlice + fill + read back via map. Pattern lands
     // in every slot, error_count stays clean.
     let Some(ctx) = ctx_with_svm() else { return };
-    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     buf.fill(0xDEAD_BEEFu32).wait(&ctx).expect("fill");
 
     let g = buf.map().wait(&ctx).expect("map");
@@ -45,8 +45,8 @@ fn tier1_svm_copy_to_propagates_contents() {
     // Also exercises auto-register on BOTH src and dst so Drop on
     // either side waits for the copy.
     let Some(ctx) = ctx_with_svm() else { return };
-    let src = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc src");
-    let dst = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc dst");
+    let src = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc src");
+    let dst = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc dst");
 
     src.fill(42u32).wait(&ctx).expect("fill src");
     src.copy_to(&dst).wait(&ctx).expect("copy src→dst");
@@ -66,8 +66,8 @@ fn tier1_svm_copy_length_mismatch_errors() {
     // src and dst must have the same length — surfaces our typed
     // LengthMismatch (checked before the unsafe enqueue).
     let Some(ctx) = ctx_with_svm() else { return };
-    let src = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc src");
-    let dst = MappedSlice::<u32>::alloc(&ctx, N / 2).expect("alloc dst");
+    let src = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc src");
+    let dst = MappedSlice::<u32>::alloc_zero(&ctx, N / 2).expect("alloc dst");
 
     let err = src.copy_to(&dst).wait(&ctx).expect_err("length mismatch");
     assert!(
@@ -83,7 +83,7 @@ fn tier1_svm_write_copies_host_data_into_buffer() {
     // tier1_svm_fill_writes_pattern but with a host source instead of
     // a single fill pattern.
     let Some(ctx) = ctx_with_svm() else { return };
-    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let host: Vec<u32> = (0..N as u32).map(|i| i.wrapping_mul(11)).collect();
     buf.write(&host).wait(&ctx).expect("write");
 
@@ -101,7 +101,7 @@ fn tier1_svm_write_length_mismatch_errors() {
     // data.len() != owner.len → typed LengthMismatch surfaces
     // before the unsafe enqueue. Same gate shape as svm_copy.
     let Some(ctx) = ctx_with_svm() else { return };
-    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let host = vec![0u32; N / 2];
     let err = buf.write(&host).wait(&ctx).expect_err("length mismatch");
     assert!(
@@ -116,7 +116,7 @@ fn tier1_svm_write_after_all_chains_after_fill() {
     // gates on the fill's event so the write lands AFTER the fill.
     // Final state: host_data, not 99s.
     let Some(ctx) = ctx_with_svm() else { return };
-    let buf = MappedSlice::<u32>::alloc(&ctx, N).expect("alloc");
+    let buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let host: Vec<u32> = (0..N as u32).collect();
 
     let fill_evt = buf.fill(99u32).submit(&ctx).expect("fill submit");
