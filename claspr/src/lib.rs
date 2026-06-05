@@ -121,7 +121,7 @@ pub use mapped::{
     MappedReadGuard, MappedSlice, MappedSliceUninit, MappedWriteGuard, SvmCopyOp, SvmFillOp,
     SvmWriteOp,
 };
-pub use usm::USMSlice;
+pub use usm::{USMSlice, USMSliceUninit};
 
 // Stage-3 proc-macro frontend.
 pub use claspr_macros::{device, kernel, kernels};

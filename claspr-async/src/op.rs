@@ -150,7 +150,7 @@ pub trait DeviceOperation: Send + Sized {
     /// Like [`and_then`](Self::and_then), but the closure also
     /// receives the running [`ExecutionContext`] — handy when the
     /// next op needs `ec.context()` (e.g. to compose with
-    /// [`device_slice_alloc`](crate::device_slice_alloc) etc.) or
+    /// [`device_slice_alloc_zero!`](crate::device_slice_alloc_zero) etc.) or
     /// `ec` as a [`claspr::Launcher`].
     ///
     /// Closure returns an op (`U: DeviceOperation`), not a

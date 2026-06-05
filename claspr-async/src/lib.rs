@@ -258,7 +258,7 @@ macro_rules! usm_slice_alloc_zero {
 ///
 /// Choose intentionally: the two arms have radically different
 /// bandwidth profiles even though they look almost identical. For
-/// the explicit form prefer [`device_slice_alloc`](crate::device_slice_alloc)
+/// the explicit form prefer [`device_slice_alloc_zero!`](crate::device_slice_alloc_zero)
 /// and [`DeviceSlice::fill`](claspr::DeviceSlice::fill) directly
 /// when the alloc + fill decomposition matters in the chain shape.
 ///

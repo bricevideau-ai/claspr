@@ -207,6 +207,32 @@ fn device_scratch_fill_uses_device_kernel_path() {
 }
 
 #[test]
+fn fill_byte_generic_kernel_for_size_12_pattern() {
+    // Exercises the `claspr_fill_bytes` fallback in the device-kernel
+    // dispatch path: T = [u32; 3] is 12 bytes, which has no
+    // specialized fast-path kernel (1/2/4/8/16 only). The fill goes
+    // through the byte-generic kernel that takes pattern as a small
+    // buffer arg + size.
+    //
+    // Marker = HostReadOnly so FILL_STRATEGY = DeviceKernel (not the
+    // runtime clEnqueueFillBuffer path, which handles 12-byte
+    // patterns natively).
+    let Some(ctx) = ctx() else { return };
+    const COUNT: usize = 8;
+    let uninit =
+        DeviceSlice::<[u32; 3], HostReadOnly>::alloc_uninit(&ctx, COUNT).expect("alloc_uninit");
+    // SAFETY: fill below overwrites every byte before any read.
+    let mut buf = unsafe { uninit.assume_init() };
+    let pattern: [u32; 3] = [7, 11, 13];
+    buf.fill(pattern)
+        .wait(&ctx)
+        .expect("fill via byte-generic kernel (size=12)");
+    let mut out = vec![[0u32; 3]; COUNT];
+    buf.read(&mut out).wait(&ctx).expect("host read");
+    assert!(out.iter().all(|&v| v == pattern));
+}
+
+#[test]
 fn frozen_threads_through_read_position_kernel_arg() {
     // Frozen impls KernelReadable but not KernelWritable, so it
     // satisfies the &[u32] kernel param's KernelSliceReadArg<u32>

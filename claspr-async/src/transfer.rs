@@ -1,5 +1,6 @@
-//! [`upload`] / [`download`] — async-capable host-to-device and
-//! device-to-host transfers as [`DeviceOperation`]s.
+//! [`upload!`](crate::upload) / [`download!`](crate::download) —
+//! async-capable host-to-device and device-to-host transfers as
+//! [`DeviceOperation`]s.
 //!
 //! Where the Tier 1 builders [`DeviceSlice::write`] /
 //! [`DeviceSlice::read`] take a borrowed source / destination and a
@@ -8,18 +9,18 @@
 //! compose cleanly into combinator chains:
 //!
 //! ```ignore
-//! upload(host_vec).and_then(|buf| kernel_op(buf)).and_then(|buf| download!(buf)).sync(&ctx)?
+//! upload!(host_vec).and_then(|buf| kernel_op(buf)).and_then(|buf| download!(buf)).sync(&ctx)?
 //! ```
 //!
 //! Both ops use **non-blocking enqueues** under the hood:
 //!
-//! - [`upload`] keeps the source host buffer alive via a
+//! - `upload!` keeps the source host buffer alive via a
 //!   `clSetEventCallback(CL_COMPLETE, ...)` that drops a boxed holder
 //!   when the write finishes (the same FFI shim Tier 1 uses for
 //!   profiling). The OpenCL spec (§5.2.1) requires the source to
 //!   stay valid until the write event fires; the drop callback is
 //!   what makes that safe with a non-blocking enqueue.
-//! - [`download`] doesn't need a keep-alive: the destination `Vec<T>`
+//! - `download!` doesn't need a keep-alive: the destination `Vec<T>`
 //!   moves up the chain (Rust `Vec` moves don't reallocate, the heap
 //!   address stays stable), the source `DeviceSlice` drops at the end
 //!   of `execute` but OpenCL retains its `cl_mem` internally until
@@ -27,7 +28,7 @@
 //!
 //! ## Sharing host data: [`UploadSource`]
 //!
-//! `upload` accepts any `impl Into<UploadSource<T>>` — currently
+//! `upload!` accepts any `impl Into<UploadSource<T>>` — currently
 //! `Vec<T>`, `Box<[T]>`, and `Arc<[T]>`. The `Arc<[T]>` variant lets
 //! the caller keep a clone of the source for their own use or upload
 //! the same data to multiple buffers without copying:
@@ -35,8 +36,8 @@
 //! ```ignore
 //! use std::sync::Arc;
 //! let weights: Arc<[f32]> = Arc::from(vec![0.1, 0.2, 0.3]);
-//! let buf_a = upload(Arc::clone(&weights)).sync(&ctx)?;
-//! let buf_b = upload(Arc::clone(&weights)).sync(&ctx)?;
+//! let buf_a = upload!(Arc::clone(&weights)).sync(&ctx)?;
+//! let buf_b = upload!(Arc::clone(&weights)).sync(&ctx)?;
 //! // weights still usable here; data heap not freed until all Arcs
 //! // (including the ones held by the keep-alive callbacks) drop.
 //! ```
@@ -49,7 +50,7 @@ use std::sync::Arc;
 
 // ── UploadSource ────────────────────────────────────────────────────
 
-/// Polymorphic host-data source for [`upload`]. Concrete variants
+/// Polymorphic host-data source for [`upload!`](crate::upload). Concrete variants
 /// cover the common cases — `Vec<T>` (move and forget), `Box<[T]>`
 /// (heap-allocated slice), `Arc<[T]>` (shared / caller retains a
 /// clone). Construct via [`From`] / [`Into`].

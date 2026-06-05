@@ -38,6 +38,7 @@ use opencl3::event::{Event, retain_event};
 use opencl3::kernel::ExecuteKernel;
 use std::fmt;
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
@@ -150,6 +151,124 @@ impl<T: Default + Copy + Send + 'static, M: MemMode> USMSlice<T, M> {
     /// kernel access (via `M::KERNEL_FLAGS`), never host alloc.
     pub fn alloc_zero(ctx: &Context, len: usize) -> Result<Self> {
         Self::new(ctx, vec![T::default(); len])
+    }
+}
+
+impl<T, M: MemMode> USMSlice<T, M> {
+    /// Allocate a USMSlice of `len` elements with uninitialised
+    /// contents. Returns a [`USMSliceUninit<T, M>`] wrapper — host
+    /// reads are type-blocked; transition to an initialised
+    /// `USMSlice<T, M>` via [`unsafe fn assume_init`](USMSliceUninit::assume_init)
+    /// (caller vouches every byte gets written before any read).
+    ///
+    /// SVM analog of [`DeviceSlice::alloc_uninit`]. **No marker
+    /// bound** — the type-state wrapper is the safety gate, and USM
+    /// markers don't affect host allocation.
+    ///
+    /// Today's implementation is `Vec::with_capacity(len) + set_len`
+    /// — the bytes are uninit at the Rust level. When the future
+    /// Intel SharedUSM backend lands (see
+    /// `[[usm-slice-shared-usm-refactor]]`), `alloc_uninit` will
+    /// dispatch to the SharedUSM-specific alloc primitive and skip
+    /// the wasted intermediate Vec entirely.
+    pub fn alloc_uninit(ctx: &Context, len: usize) -> Result<USMSliceUninit<T, M>> {
+        if ctx.svm_capability() != SvmLevel::FineSystem {
+            return Err(Error::NotSupported(
+                "CL_DEVICE_SVM_FINE_GRAIN_SYSTEM required for USMSlice",
+            ));
+        }
+        // Store as Vec<MaybeUninit<T>> until assume_init — MaybeUninit
+        // is always layout-equivalent to T but the "always valid"
+        // wrapper sidesteps the `clippy::uninit_vec` lint we'd hit
+        // with Vec<T> + set_len. The transmute back to Vec<T> happens
+        // in assume_init via from_raw_parts (no realloc, same heap
+        // address — SVM pointer stability preserved).
+        let mut data: Vec<MaybeUninit<T>> = Vec::with_capacity(len);
+        // SAFETY: MaybeUninit<T> is always valid in any bit pattern,
+        // so set_len to the freshly-allocated capacity is sound.
+        unsafe {
+            data.set_len(len);
+        }
+        Ok(USMSliceUninit {
+            data,
+            ctx: ctx.clone(),
+            _mode: PhantomData,
+        })
+    }
+}
+
+/// Type-state wrapper returned by [`USMSlice::alloc_uninit`]. SVM /
+/// fine-grain-system analog of [`crate::DeviceSliceUninit`] /
+/// [`crate::MappedSliceUninit`].
+///
+/// Today's implementation is `Vec<MaybeUninit<T>>` so the practical
+/// benefit over `USMSlice::alloc_zero` is small. The wrapper's main
+/// value is forward-compatibility: when an Intel SharedUSM backend
+/// is added to USMSlice, `alloc_uninit` there will skip the wasted
+/// intermediate Vec, and this wrapper stays the same shape across
+/// backends.
+pub struct USMSliceUninit<T, M: MemMode = ReadWrite> {
+    data: Vec<MaybeUninit<T>>,
+    ctx: Context,
+    _mode: PhantomData<fn() -> M>,
+}
+
+// SAFETY: same justification as `USMSlice` — backing storage is
+// Send/Sync whenever T is, and the MaybeUninit wrapper is layout-
+// equivalent to T.
+unsafe impl<T: Send, M: MemMode> Send for USMSliceUninit<T, M> {}
+unsafe impl<T: Sync, M: MemMode> Sync for USMSliceUninit<T, M> {}
+
+impl<T, M: MemMode> USMSliceUninit<T, M> {
+    /// Skip safe initialization. See
+    /// [`crate::DeviceSliceUninit::assume_init`] for the safety
+    /// contract.
+    ///
+    /// # Safety
+    ///
+    /// Every byte of the wrapped Vec must be written by SOME path
+    /// (kernel, host memcpy, etc.) before any read can observe the
+    /// bytes. For numeric `T` an uninit-byte read is arbitrary
+    /// garbage; for `T` with invalid bit patterns it is UB.
+    pub unsafe fn assume_init(self) -> USMSlice<T, M> {
+        // SAFETY: MaybeUninit<T> has the same layout as T. The
+        // caller has vouched that every slot is initialized.
+        // Reconstruct the Vec at the right element type without
+        // realloc — heap address stays stable, so any SVM pointer
+        // already taken from `data.as_ptr()` is still valid.
+        let mut data = self.data;
+        let ptr = data.as_mut_ptr() as *mut T;
+        let len = data.len();
+        let cap = data.capacity();
+        std::mem::forget(data);
+        let data_t: Vec<T> = unsafe { Vec::from_raw_parts(ptr, len, cap) };
+        USMSlice {
+            data: data_t,
+            ctx: self.ctx,
+            in_flight: Mutex::new(Vec::new()),
+            _mode: PhantomData,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn ctx(&self) -> &Context {
+        &self.ctx
+    }
+}
+
+impl<T, M: MemMode> fmt::Debug for USMSliceUninit<T, M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("USMSliceUninit")
+            .field("len", &self.data.len())
+            .field("element_size", &std::mem::size_of::<T>())
+            .finish_non_exhaustive()
     }
 }
 

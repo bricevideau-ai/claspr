@@ -9,7 +9,7 @@
 //! exact scenario HostBuffer failed on rusticl ("host wrote N, kernel
 //! saw 0"); it must pass here.
 
-use claspr::{Buffer, Context, SvmLevel};
+use claspr::{Buffer, Context, SvmLevel, USMSliceUninit};
 use claspr_async::{DeviceOperation, usm_slice, usm_slice_alloc_zero};
 use claspr_test_kernels::kernels;
 
@@ -163,4 +163,26 @@ fn usm_slice_host_writes_visible_to_kernel_via_deref_mut() {
     for (i, &v) in buf.iter().enumerate() {
         assert_eq!(v, (i as u32) * 2, "element {i}");
     }
+}
+
+#[test]
+fn usm_slice_uninit_returns_wrapper_assume_init_writes_via_kernel() {
+    // alloc_uninit returns USMSliceUninit (type-state). assume_init
+    // hands back the USMSlice; the kernel writes every slot before
+    // any host read. Mirrors DeviceSlice/MappedSlice alloc_uninit
+    // shape.
+    let Some(ctx) = ctx_with_fine_system() else {
+        return;
+    };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let uninit: USMSliceUninit<u32> =
+        claspr::USMSlice::<u32>::alloc_uninit(&ctx, N).expect("USM alloc_uninit");
+    assert_eq!(uninit.len(), N);
+    let _ = format!("{uninit:?}");
+    // SAFETY: kernel fills every slot before any read below.
+    let buf = unsafe { uninit.assume_init() };
+    let buf = kernels.fill_u32([N], buf, 77).wait(&ctx).expect("kernel fill");
+    // Host reads kernel's writes directly via Deref (fine-grain SVM).
+    assert!(buf.iter().all(|&v| v == 77));
 }

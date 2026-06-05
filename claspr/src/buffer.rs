@@ -97,12 +97,13 @@ pub trait Buffer<T> {
 /// pointer + `usize` length). When passed as a launch argument,
 /// claspr sets both — see the [`KernelArg`] impl in [`crate::launch`].
 ///
-/// Construct via [`DeviceSlice::alloc`] (zero-initialised) or
+/// Construct via [`DeviceSlice::alloc_zero`] (zero-initialised) or
 /// [`DeviceSlice::from_slice`] (with initial host data). Read back via
-/// [`DeviceSlice::read`]. The `unsafe`
-/// [`alloc_uninit`](DeviceSlice::alloc_uninit) escape hatch exists
-/// for internal claspr ops that immediately write the whole buffer
-/// before exposing it — see its doc-comment for the safety contract.
+/// [`DeviceSlice::read`]. The
+/// [`alloc_uninit`](DeviceSlice::alloc_uninit) escape hatch returns a
+/// [`DeviceSliceUninit<T, M>`] type-stated wrapper — see its docs for
+/// the safe transition path and the `unsafe assume_init()` escape
+/// hatch.
 ///
 /// Host code never sees the bytes directly — for that, use
 /// [`crate::mapped::MappedSlice<T>`] (coarse-grain SVM) or
@@ -150,8 +151,8 @@ impl<T: Default + Copy, M: MemMode + Fillable> DeviceSlice<T, M> {
     /// [`crate::Frozen`] — those use [`from_slice`](Self::from_slice)
     /// to bake in the initial data at create time instead).
     ///
-    /// Matches [`MappedSlice::alloc`](crate::MappedSlice::alloc) and
-    /// [`USMSlice::alloc`](crate::USMSlice::alloc).
+    /// Matches [`MappedSlice::alloc_zero`](crate::MappedSlice::alloc_zero)
+    /// and [`USMSlice::alloc_zero`](crate::USMSlice::alloc_zero).
     ///
     /// Internally a `clCreateBuffer` + a synchronous fill. The
     /// [`alloc_uninit`](Self::alloc_uninit) escape hatch returns a
@@ -217,14 +218,21 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
 /// Type-state wrapper returned by
 /// [`DeviceSlice::alloc_uninit`]: the bytes are uninitialised, host
 /// reads are statically blocked, and the user must transition to an
-/// initialised [`DeviceSlice<T, M>`] via [`fill`](Self::fill),
-/// [`write`](Self::write), or
-/// [`unsafe fn assume_init`](Self::assume_init).
+/// initialised [`DeviceSlice<T, M>`] via either
+/// [`unsafe fn assume_init`](Self::assume_init) (kernel-write-only
+/// pattern; caller vouches every byte gets written before any read)
+/// or by chaining through Tier 2 ops in `claspr-async` that consume
+/// the wrapper and produce the initialised buffer.
 ///
 /// The wrapper has no `read` / `download` / `acquire_host_view`
 /// methods — attempting any of those is a compile error rather than
 /// reading uninit bytes (and possibly invoking UB for `T` with
 /// invalid bit patterns).
+///
+/// **Note**: safe consuming `.fill()` / `.write()` methods on this
+/// wrapper are an open follow-up; for now the supported transitions
+/// are `assume_init` + Tier 1 fill/write, or the Tier 2 chain
+/// equivalents.
 pub struct DeviceSliceUninit<T, M: MemMode = ReadWrite> {
     inner: DeviceSlice<T, M>,
 }
@@ -812,7 +820,7 @@ impl<T, M: MemMode> fmt::Debug for DeviceSlice<T, M> {
 /// Dispatch on terminal: if `M::FILL_STRATEGY == Runtime`, calls
 /// `clEnqueueFillBuffer` (driver-optimized fast path). If
 /// `DeviceKernel` (HostReadOnly, DeviceScratch), launches a
-/// built-in fill kernel from the [`crate::fill_kernel`] program.
+/// built-in fill kernel from the context's cached fill program.
 pub struct FillOp<'a, T: Copy, M: MemMode> {
     buffer: &'a mut ManuallyDrop<ClBuffer<T>>,
     ctx: &'a Context,
