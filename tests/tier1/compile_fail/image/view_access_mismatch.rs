@@ -4,7 +4,7 @@
 //! with `image_access="write_only"`) must fail at the trait
 //! bound — exactly like passing `Image1DBuffer<ReadOnly>` does.
 
-use claspr::{Context, DeviceSlice, Image1DBufferView, ReadOnly, image::format::R32Uint};
+use claspr::{image::format::R32Uint, Context, DeviceSlice, Image1DBufferView, ReadOnly};
 
 fn main() {
     let ctx = Context::any().unwrap();

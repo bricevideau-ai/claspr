@@ -2,7 +2,7 @@
 //! passing a non-arrayed `Image2D` to a kernel that expects
 //! a 2D-array is rejected at the trait bound.
 
-use claspr::{Context, WriteOnly, image::format::R32Uint};
+use claspr::{image::format::R32Uint, Context, WriteOnly};
 
 fn main() {
     let ctx = Context::any().unwrap();
