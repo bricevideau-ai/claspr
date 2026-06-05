@@ -26,6 +26,19 @@
 //! host→device DMA. The share-on-device pattern: one alloc, one
 //! DMA, N branches read from the same `cl_mem`.
 //!
+//! ## When to upload per branch instead
+//!
+//! **Multi-device** `fan_out`: if each branch routes to a different
+//! device (via `transfer_to_device` or `.on_device(...)`), the
+//! shared weights need to live in *each* device's memory. The
+//! per-branch upload pattern is correct there: each branch uploads
+//! into its target device's memory. See `scenario_14_cross_device`
+//! in the combinator spike for the multi-device shape.
+//!
+//! Single-device `fan_out` (this example) has no such constraint
+//! — all branches enqueue onto the same OOO queue on the same
+//! device, so one shared device buffer suffices.
+//!
 //! [`fan_out`](claspr_async::fan_out()) enqueues every branch on the
 //! chain's out-of-order queue with independent event chains; a single
 //! `clEnqueueMarkerWithWaitList` joins them at the end. The OOO

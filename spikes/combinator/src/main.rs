@@ -416,15 +416,18 @@ fn scenario_13_batch_parallelism(ctx: &Context) -> claspr::Result<()> {
     let kernels_ref = &kernels;
     let len = N as u32;
 
-    // **Upload the shared weights ONCE** before fan_out, wrap in
-    // `Arc<DeviceSlice<f32>>`, and share that one device buffer
-    // across every branch. `Arc<DeviceSlice<T>>` impls
-    // `KernelSliceReadArg` only (see memory note
+    // **Single-device fan_out**: upload the shared weights ONCE
+    // before fan_out, wrap in `Arc<DeviceSlice<f32>>`, share across
+    // every branch via cheap `Arc::clone`. `Arc<DeviceSlice<T>>`
+    // impls `KernelSliceReadArg` only (memory
     // `[[arc-deviceslice-readonly]]`) — exactly the right gate for
-    // a shared read-only input. This avoids the previous pattern of
-    // `upload!(Arc::clone(&host_arc))` per branch, which allocated
-    // N distinct device buffers and N × N × 4 bytes of redundant
-    // host→device DMA.
+    // a shared read-only input. Saves N-1 device buffer allocs and
+    // N-1 × N × 4 bytes of redundant host→device DMA vs the older
+    // per-branch `upload!(Arc::clone(&host_arc))` pattern.
+    //
+    // For **multi-device fan_out** (each branch on a different
+    // device — see scenario_14), per-branch upload IS the right
+    // pattern: the weights have to live in each device's memory.
     let weights_dev: Arc<DeviceSlice<f32>> =
         Arc::new(upload!(vec![0.5f32; N]).sync(ctx)?);
 
