@@ -10,9 +10,9 @@
 
 use claspr::{Buffer, Context, Error, MappedSlice, SvmLevel};
 use claspr_async::{
-    DeviceOperation, bundle, device_slice_alloc_zero, device_slice_copy, device_slice_fill,
-    device_slice_write, download, mapped_slice_alloc_zero, mapped_slice_copy, mapped_slice_fill,
-    mapped_slice_upload, upload,
+    CopyTo, DeviceOperation, bundle, device_slice_alloc_zero, device_slice_fill,
+    device_slice_write, download, mapped_slice_alloc_zero, mapped_slice_fill, mapped_slice_upload,
+    upload,
 };
 use claspr_test_kernels::kernels;
 
@@ -92,7 +92,7 @@ fn device_slice_copy_propagates_src_to_dst() {
     let Some(ctx) = ctx() else { return };
     let src_data: Vec<u32> = (0..N as u32).map(|i| i * 3).collect();
     let result: Vec<u32> = bundle!(upload!(src_data.clone()), device_slice_alloc_zero!(u32, N))
-        .and_then(|(src, dst)| device_slice_copy(src, dst))
+        .and_then(|(src, dst)| src.copy_to(dst))
         .and_then(|(_src, dst)| download!(dst))
         .sync(&ctx)
         .expect("upload + alloc + copy + download");
@@ -107,7 +107,7 @@ fn device_slice_copy_returns_both_buffers() {
     let src_data: Vec<u32> = (10..10 + N as u32).collect();
     let (src_out, dst_out): (Vec<u32>, Vec<u32>) =
         bundle!(upload!(src_data.clone()), device_slice_alloc_zero!(u32, N))
-            .and_then(|(src, dst)| device_slice_copy(src, dst))
+            .and_then(|(src, dst)| src.copy_to(dst))
             .and_then(|(src, dst)| bundle!(download!(src), download!(dst)))
             .sync(&ctx)
             .expect("copy + both downloads");
@@ -122,7 +122,7 @@ fn device_slice_copy_length_mismatch_errors() {
     // surfaces the same Err.
     let Some(ctx) = ctx() else { return };
     let result = bundle!(upload!(vec![0u32; 10]), device_slice_alloc_zero!(u32, 5))
-        .and_then(|(src, dst)| device_slice_copy(src, dst))
+        .and_then(|(src, dst)| src.copy_to(dst))
         .and_then(|(_src, dst)| download!(dst))
         .sync(&ctx);
     let err = result.expect_err("copy of mismatched lengths should error");
@@ -191,9 +191,68 @@ fn mapped_slice_copy_propagates_src_to_dst() {
         mapped_slice_upload!(src_data.clone()),
         mapped_slice_alloc_zero!(u32, N),
     )
-    .and_then(|(src, dst)| mapped_slice_copy(src, dst))
+    .and_then(|(src, dst)| src.copy_to(dst))
     .sync(&ctx)
     .expect("upload + alloc + copy");
     let g = dst.map().wait(&ctx).expect("map dst for read-back");
     assert_eq!(&*g, src_data.as_slice());
+}
+
+// ── CopyTo with Uninit destination ────────────────────────────────
+
+#[test]
+fn copy_to_device_slice_uninit_propagates_and_transitions_to_init() {
+    // Exercises the (DeviceSlice, DeviceSliceUninit) CopyTo impl.
+    // The Uninit→Init transition happens inside the op — user writes
+    // `src.copy_to(uninit_dst)` and gets back a fully-initialised
+    // DeviceSlice. No `unsafe { assume_init() }` at the call site.
+    let Some(ctx) = ctx() else { return };
+    let src_data: Vec<u32> = (100..100 + N as u32).collect();
+    let result: Vec<u32> = bundle!(
+        upload!(src_data.clone()),
+        claspr_async::device_slice_alloc_uninit!(u32, N),
+    )
+    .and_then(|(src, uninit_dst)| src.copy_to(uninit_dst))
+    .and_then(|(_src, dst)| download!(dst))
+    .sync(&ctx)
+    .expect("upload + alloc_uninit + copy_to + download");
+    assert_eq!(result, src_data);
+}
+
+#[test]
+fn copy_to_mapped_slice_uninit_propagates_and_transitions_to_init() {
+    // SVM analog of the above. Exercises (MappedSlice, MappedSliceUninit).
+    let Some(ctx) = ctx_with_svm() else { return };
+    let src_data: Vec<u32> = (200..200 + N as u32).collect();
+    let (_src, dst): (MappedSlice<u32>, MappedSlice<u32>) = bundle!(
+        mapped_slice_upload!(src_data.clone()),
+        claspr_async::mapped_slice_alloc_uninit!(u32, N),
+    )
+    .and_then(|(src, uninit_dst)| src.copy_to(uninit_dst))
+    .sync(&ctx)
+    .expect("svm upload + alloc_uninit + copy_to");
+    let g = dst.map().wait(&ctx).expect("map dst");
+    assert_eq!(&*g, src_data.as_slice());
+}
+
+#[test]
+fn copy_to_cross_type_mapped_to_usm_svm_memcpy() {
+    // Cross-type (MappedSlice → USMSlice). Goes through
+    // clEnqueueSVMMemcpy with src.ptr (SVM) → dst.ptr (host ptr).
+    // Requires fine-grain-system SVM (USMSlice's gate).
+    let Some(ctx) = ctx_with_svm() else { return };
+    if ctx.svm_capability() != SvmLevel::FineSystem {
+        eprintln!("SKIP: cross-type mapped→usm needs FineSystem SVM");
+        return;
+    }
+    let src_data: Vec<u32> = (300..300 + N as u32).collect();
+    let (_src, dst): (MappedSlice<u32>, claspr::USMSlice<u32>) = bundle!(
+        mapped_slice_upload!(src_data.clone()),
+        claspr_async::usm_slice_alloc_zero!(u32, N),
+    )
+    .and_then(|(src, dst)| src.copy_to(dst))
+    .sync(&ctx)
+    .expect("svm upload + usm alloc + cross-type copy");
+    // USMSlice is host memory — read directly via Deref.
+    assert_eq!(&dst[..], src_data.as_slice());
 }

@@ -111,56 +111,9 @@ where
     }
 }
 
-// ── DeviceSlice copy (in-place clEnqueueCopyBuffer) ────────────────
-
-/// Lazy [`DeviceSlice<T>`] → [`DeviceSlice<T>`] copy. Built by
-/// [`device_slice_copy`].
-pub struct DeviceSliceCopyOp<T, M1: MemMode, M2: MemMode> {
-    bufs: Option<(DeviceSlice<T, M1>, DeviceSlice<T, M2>)>,
-}
-
-/// Copy `src` into `dst` via `clEnqueueCopyBuffer`. Both buffers pass
-/// through as the op's output tuple `(src, dst)` so the chain can
-/// keep using either.
-///
-/// No marker bound — copy is a pure device-side operation. Length
-/// mismatch surfaces as [`Error::LengthMismatch`](claspr::Error::LengthMismatch)
-/// at execute time (same gate as the Tier 1
-/// [`DeviceSlice::copy_to`](claspr::DeviceSlice::copy_to) terminal).
-pub fn device_slice_copy<T, M1, M2>(
-    src: DeviceSlice<T, M1>,
-    dst: DeviceSlice<T, M2>,
-) -> DeviceSliceCopyOp<T, M1, M2>
-where
-    T: Send + 'static,
-    M1: MemMode,
-    M2: MemMode,
-{
-    DeviceSliceCopyOp {
-        bufs: Some((src, dst)),
-    }
-}
-
-impl<T, M1, M2> DeviceOperation for DeviceSliceCopyOp<T, M1, M2>
-where
-    T: Send + 'static,
-    M1: MemMode + Send + 'static,
-    M2: MemMode + Send + 'static,
-{
-    type Output = (DeviceSlice<T, M1>, DeviceSlice<T, M2>);
-
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
-        let (src, mut dst) = self
-            .bufs
-            .take()
-            .expect("DeviceSliceCopyOp::execute called twice — internal claspr-async bug");
-        let event = src
-            .copy_to(&mut dst)
-            .after_all(deps_as_events(&deps))
-            .submit(ec)?;
-        Ok(((src, dst), vec![wrap_event(event)]))
-    }
-}
+// DeviceSlice copy moved to claspr-async/src/copy.rs as the
+// polymorphic `CopyTo` trait — covers all (src, dst) buffer-kind
+// pairs uniformly. Use `src.copy_to(dst).and_then(...)`.
 
 // ── DeviceSlice write (in-place clEnqueueWriteBuffer from host) ────
 
@@ -273,54 +226,5 @@ where
     }
 }
 
-// ── MappedSlice copy (in-place clEnqueueSVMMemcpy) ─────────────────
-
-/// Lazy [`MappedSlice<T>`] → [`MappedSlice<T>`] copy. Built by
-/// [`mapped_slice_copy`]. SVM analog of [`DeviceSliceCopyOp`].
-pub struct MappedSliceCopyOp<T, M1: MemMode, M2: MemMode> {
-    bufs: Option<(MappedSlice<T, M1>, MappedSlice<T, M2>)>,
-}
-
-/// Copy `src` into `dst` via `clEnqueueSVMMemcpy`. Both buffers pass
-/// through as the op's output tuple `(src, dst)`. Length mismatch
-/// surfaces as [`Error::LengthMismatch`](claspr::Error::LengthMismatch)
-/// at execute time.
-///
-/// Drop-ordering: the Tier 1 [`SvmCopyOp`](claspr::SvmCopyOp)
-/// `into_event` registers the copy event on *both* buffers'
-/// `last_use` lists, so each buffer's eventual `clEnqueueSVMFree`
-/// waits for this op independently.
-pub fn mapped_slice_copy<T, M1, M2>(
-    src: MappedSlice<T, M1>,
-    dst: MappedSlice<T, M2>,
-) -> MappedSliceCopyOp<T, M1, M2>
-where
-    T: Send + 'static,
-    M1: MemMode,
-    M2: MemMode,
-{
-    MappedSliceCopyOp {
-        bufs: Some((src, dst)),
-    }
-}
-
-impl<T, M1, M2> DeviceOperation for MappedSliceCopyOp<T, M1, M2>
-where
-    T: Send + 'static,
-    M1: MemMode + Send + 'static,
-    M2: MemMode + Send + 'static,
-{
-    type Output = (MappedSlice<T, M1>, MappedSlice<T, M2>);
-
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
-        let (src, dst) = self
-            .bufs
-            .take()
-            .expect("MappedSliceCopyOp::execute called twice — internal claspr-async bug");
-        let event = src
-            .copy_to(&dst)
-            .after_all(deps_as_events(&deps))
-            .submit(ec)?;
-        Ok(((src, dst), vec![wrap_event(event)]))
-    }
-}
+// MappedSlice copy moved to claspr-async/src/copy.rs (`CopyTo`
+// trait). Use `src.copy_to(dst).and_then(...)`.
