@@ -50,12 +50,12 @@
 //! ## In an async chain
 //!
 //! ```ignore
-//! use claspr_async::{DeviceOperation, download, upload};
+//! use claspr_async::{download, upload, DeviceOperation};
 //!
-//! let result: Vec<u32> = upload(initial_data)
+//! let result: Vec<u32> = upload!(initial_data)
 //!     .and_then(|buf| kernels.fill_u32([N], buf, 5))
 //!     .and_then(|buf| kernels.scale_u32([N], buf, 3))
-//!     .and_then(download)
+//!     .and_then(|buf| download!(buf))
 //!     .sync(&ctx)?;
 //! ```
 //!

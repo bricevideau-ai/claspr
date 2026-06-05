@@ -19,7 +19,7 @@
 //! // Lift a Vec to device, run a kernel, then download.
 //! let result: Vec<u32> = upload(input_vec)
 //!     .and_then(|buf| kernels.foo([N], buf, scalar))
-//!     .and_then(download)
+//!     .and_then(|buf| download!(buf))
 //!     .sync(&ctx)?;
 //! ```
 //!
@@ -57,9 +57,9 @@ pub mod transfer_to_device;
 pub mod usm;
 
 pub use alloc::{
-    DeviceSliceAlloc, DeviceSliceFilled, MappedSliceAlloc, MappedSliceFilled, MappedSliceUpload,
-    device_slice_alloc, device_slice_filled, mapped_slice_alloc, mapped_slice_filled,
-    mapped_slice_upload,
+    DeviceSliceAllocUninit, DeviceSliceAllocZero, DeviceSliceFilled, DeviceSliceFromSlice,
+    MappedSliceAllocUninit, MappedSliceAllocZero, MappedSliceFilled, MappedSliceFromSlice,
+    MappedSliceUpload,
 };
 pub use and_then_host::{AndThenHost, AndThenHostWithContext, DeviceOperationHostExt};
 pub use arc::ArcSplit;
@@ -88,9 +88,161 @@ pub use op::{
     wrap_event,
 };
 pub use profile::{DeviceOperationProfileExt, Profiled};
-pub use transfer::{Download, Upload, UploadSource, download, upload};
+pub use transfer::{Download, Upload, UploadSource};
 pub use transfer_to_device::{TransferToDevice, transfer_to_device};
-pub use usm::{UsmSliceAlloc, UsmSliceOp, usm_slice, usm_slice_alloc};
+pub use usm::{UsmSliceAllocZero, UsmSliceOp};
+
+// ── Tier 2 entry macros ────────────────────────────────────────────
+//
+// All Tier 2 buffer constructors are macros, not free fns. Two arms
+// per macro:
+//   - default arm:   foo!(args)                — uses struct's M = ReadWrite default
+//   - marker arm:    foo!(args; M)             — turbofishes M explicitly
+// Macros expand to `Foo::<T>::new(...)` / `Foo::<T, M>::new(...)`.
+// The struct method form is the canonical constructor; macros are
+// sugar to skip the type-position turbofish noise at chain entry.
+
+/// Lazy zero-init `DeviceSlice<T, M>` alloc. `device_slice_alloc_zero!(T, N)`
+/// for default marker, `device_slice_alloc_zero!(T, N; M)` for explicit.
+#[macro_export]
+macro_rules! device_slice_alloc_zero {
+    ($t:ty, $n:expr) => {
+        $crate::DeviceSliceAllocZero::<$t>::new($n)
+    };
+    ($t:ty, $n:expr; $m:ty) => {
+        $crate::DeviceSliceAllocZero::<$t, $m>::new($n)
+    };
+}
+
+/// Lazy `DeviceSliceUninit<T, M>` alloc. Output is the type-stated
+/// uninit wrapper; downstream chain stages transition via the
+/// wrapper's methods or `unsafe { uninit.assume_init() }`.
+#[macro_export]
+macro_rules! device_slice_alloc_uninit {
+    ($t:ty, $n:expr) => {
+        $crate::DeviceSliceAllocUninit::<$t>::new($n)
+    };
+    ($t:ty, $n:expr; $m:ty) => {
+        $crate::DeviceSliceAllocUninit::<$t, $m>::new($n)
+    };
+}
+
+/// Lazy alloc + fill: `device_slice_filled!(value, N)` /
+/// `device_slice_filled!(value, N; M)`. Dispatches Runtime vs
+/// DeviceKernel fill via the marker's `FillStrategy`.
+#[macro_export]
+macro_rules! device_slice_filled {
+    ($v:expr, $n:expr) => {
+        $crate::DeviceSliceFilled::<_>::new($v, $n)
+    };
+    ($v:expr, $n:expr; $m:ty) => {
+        $crate::DeviceSliceFilled::<_, $m>::new($v, $n)
+    };
+}
+
+/// Lazy alloc + `CL_MEM_COPY_HOST_PTR`. Works for **any marker**
+/// (including Frozen / ReadOnly) — data baked in at creation, no
+/// post-creation runtime write.
+#[macro_export]
+macro_rules! device_slice_from_slice {
+    ($data:expr) => {
+        $crate::DeviceSliceFromSlice::<_>::new($data)
+    };
+    ($data:expr; $m:ty) => {
+        $crate::DeviceSliceFromSlice::<_, $m>::new($data)
+    };
+}
+
+/// Lazy alloc + non-blocking host-to-device write.
+/// `upload!(src)` / `upload!(src; M)`. Bound `M: HostUploadable`.
+#[macro_export]
+macro_rules! upload {
+    ($src:expr) => {
+        $crate::Upload::<_>::new($src)
+    };
+    ($src:expr; $m:ty) => {
+        $crate::Upload::<_, $m>::new($src)
+    };
+}
+
+/// Lazy non-blocking device-to-host read. `download!(buf)`. Marker
+/// inferred from the input buffer; bound `M: HostReadable`.
+#[macro_export]
+macro_rules! download {
+    ($buf:expr) => {
+        $crate::Download::<_, _>::new($buf)
+    };
+}
+
+/// SVM analog of `device_slice_alloc_zero!`.
+#[macro_export]
+macro_rules! mapped_slice_alloc_zero {
+    ($t:ty, $n:expr) => {
+        $crate::MappedSliceAllocZero::<$t>::new($n)
+    };
+    ($t:ty, $n:expr; $m:ty) => {
+        $crate::MappedSliceAllocZero::<$t, $m>::new($n)
+    };
+}
+
+/// SVM analog of `device_slice_alloc_uninit!`.
+#[macro_export]
+macro_rules! mapped_slice_alloc_uninit {
+    ($t:ty, $n:expr) => {
+        $crate::MappedSliceAllocUninit::<$t>::new($n)
+    };
+    ($t:ty, $n:expr; $m:ty) => {
+        $crate::MappedSliceAllocUninit::<$t, $m>::new($n)
+    };
+}
+
+/// SVM analog of `device_slice_filled!`.
+#[macro_export]
+macro_rules! mapped_slice_filled {
+    ($v:expr, $n:expr) => {
+        $crate::MappedSliceFilled::<_>::new($v, $n)
+    };
+    ($v:expr, $n:expr; $m:ty) => {
+        $crate::MappedSliceFilled::<_, $m>::new($v, $n)
+    };
+}
+
+/// SVM analog of `device_slice_from_slice!`.
+#[macro_export]
+macro_rules! mapped_slice_from_slice {
+    ($data:expr) => {
+        $crate::MappedSliceFromSlice::<_>::new($data)
+    };
+    ($data:expr; $m:ty) => {
+        $crate::MappedSliceFromSlice::<_, $m>::new($data)
+    };
+}
+
+/// SVM analog of `upload!`.
+#[macro_export]
+macro_rules! mapped_slice_upload {
+    ($src:expr) => {
+        $crate::MappedSliceUpload::<_>::new($src)
+    };
+    ($src:expr; $m:ty) => {
+        $crate::MappedSliceUpload::<_, $m>::new($src)
+    };
+}
+
+// Note: `usm_slice!` is defined further below to merge with the
+// existing `vec!`-shape convenience arms (`usm_slice![v; N]` and
+// `usm_slice![a, b, c]`).
+
+/// USM zero-init alloc.
+#[macro_export]
+macro_rules! usm_slice_alloc_zero {
+    ($t:ty, $n:expr) => {
+        $crate::UsmSliceAllocZero::<$t>::new($n)
+    };
+    ($t:ty, $n:expr; $m:ty) => {
+        $crate::UsmSliceAllocZero::<$t, $m>::new($n)
+    };
+}
 
 /// `vec!`-shaped sugar for producing a [`DeviceSlice<T>`](claspr::DeviceSlice) op.
 ///
@@ -120,10 +272,10 @@ pub use usm::{UsmSliceAlloc, UsmSliceOp, usm_slice, usm_slice_alloc};
 #[macro_export]
 macro_rules! device_slice {
     [$value:expr; $count:expr] => {
-        $crate::device_slice_filled($value, $count)
+        $crate::device_slice_filled!($value, $count)
     };
     [$($v:expr),* $(,)?] => {
-        $crate::upload(::std::vec![$($v),*])
+        $crate::upload!(::std::vec![$($v),*])
     };
 }
 
@@ -151,10 +303,10 @@ macro_rules! device_slice {
 #[macro_export]
 macro_rules! mapped_slice {
     [$value:expr; $count:expr] => {
-        $crate::mapped_slice_filled($value, $count)
+        $crate::mapped_slice_filled!($value, $count)
     };
     [$($v:expr),* $(,)?] => {
-        $crate::mapped_slice_upload(::std::vec![$($v),*])
+        $crate::mapped_slice_upload!(::std::vec![$($v),*])
     };
 }
 
@@ -174,10 +326,18 @@ macro_rules! mapped_slice {
 /// ```
 #[macro_export]
 macro_rules! usm_slice {
+    // `usm_slice![v; N]` — alloc-and-fill via host vec![v; N].
     [$value:expr; $count:expr] => {
-        $crate::usm_slice(::std::vec![$value; $count])
+        $crate::UsmSliceOp::<_>::new(::std::vec![$value; $count])
     };
+    // `usm_slice!(host_vec)` — wrap an existing Vec, default marker.
+    // Put this BEFORE the bracket-list arm so single-expr paren
+    // calls don't get wrapped in another Vec.
+    ($vec:expr) => {
+        $crate::UsmSliceOp::<_>::new($vec)
+    };
+    // `usm_slice![a, b, c]` — alloc-and-fill via host vec literal.
     [$($v:expr),* $(,)?] => {
-        $crate::usm_slice(::std::vec![$($v),*])
+        $crate::UsmSliceOp::<_>::new(::std::vec![$($v),*])
     };
 }

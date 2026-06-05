@@ -7,7 +7,7 @@ use claspr_async::{upload, DeviceOperation};
 
 #[allow(dead_code)]
 fn build_chain() -> impl DeviceOperation<Output = DeviceSlice<u32>> {
-    upload(vec![1u32, 2, 3])
+    upload!(vec![1u32, 2, 3])
 }
 
 fn main() {}

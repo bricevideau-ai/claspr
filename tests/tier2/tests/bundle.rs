@@ -57,12 +57,12 @@ fn bundle2_two_kernels_on_distinct_buffers() {
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let left = upload(vec![0u32; N])
+    let left = upload!(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 0xAA))
-        .and_then(download);
-    let right = upload(vec![0u32; N])
+        .and_then(|buf| download!(buf));
+    let right = upload!(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 0xBB))
-        .and_then(download);
+        .and_then(|buf| download!(buf));
 
     let (l, r) = bundle!(left, right).sync(&ctx).expect("bundle2 kernels");
     assert!(l.iter().all(|&v| v == 0xAA), "left branch");
@@ -80,9 +80,9 @@ fn fan_out_homogeneous_kernels() {
 
     let values: Vec<u32> = (0..4).collect();
     let outs: Vec<Vec<u32>> = fan_out(values.clone(), move |v| {
-        upload(vec![0u32; N])
+        upload!(vec![0u32; N])
             .and_then(move |buf| kernels_ref.fill_u32([N], buf, v))
-            .and_then(download)
+            .and_then(|buf| download!(buf))
     })
     .sync(&ctx)
     .expect("fan_out");

@@ -22,7 +22,7 @@ use claspr_async::{upload, DeviceOperation, DeviceOperationHostExt};
 fn main() {
     let ctx = Context::any().unwrap();
     let mut escaped: Vec<&mut [u32]> = Vec::new();
-    let _ = upload(vec![1u32, 2, 3, 4])
+    let _ = upload!(vec![1u32, 2, 3, 4])
         .and_then_host(|view| {
             // Try to leak the borrow past the closure body — must
             // be rejected.

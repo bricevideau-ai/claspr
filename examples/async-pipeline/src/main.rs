@@ -3,7 +3,7 @@
 //! Demonstrates the Tier 2 chain shape on a small ML-style pipeline:
 //!
 //! ```text
-//!    upload(input)
+//!    upload!(input)
 //!      → linear(weight, bias)            // y = weight·x + bias
 //!      → relu_threshold(threshold)        // y = max(0, y) above threshold
 //!      → linear(weight, bias)             // second linear stage
@@ -91,11 +91,11 @@ fn run(ctx: Context) -> claspr::Result<()> {
     // async `and_then_host`, in-chain reductions go via Arc<Mutex<_>>
     // capture, but for "reduce after pipeline" the cleanest shape is
     // just `.sync()` then sum on the host.
-    let downloaded: Vec<u32> = upload(input)
+    let downloaded: Vec<u32> = upload!(input)
         .and_then(|buf| kernels.linear([N], buf, W1, B1))
         .and_then(|buf| kernels.relu_threshold([N], buf, THRESHOLD))
         .and_then(|buf| kernels.linear([N], buf, W2, B2))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)?;
     let loss: u32 = downloaded.iter().sum();
 

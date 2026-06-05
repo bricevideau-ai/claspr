@@ -136,7 +136,7 @@ fn alloc_uninit_returns_wrapper_for_arbitrary_marker() {
     assert_eq!(uninit.len(), N);
     assert!(!uninit.is_empty());
     let _ = format!("{uninit:?}");
-    // No .read() / .download() exists on the wrapper — type-checked.
+    // No .read() / .download!() exists on the wrapper — type-checked.
 }
 
 #[test]

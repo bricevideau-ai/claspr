@@ -67,7 +67,7 @@ fn on_device_routes_chain_to_devices_from_context() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let result: Vec<u32> = upload(vec![1u32; N])
+    let result: Vec<u32> = upload!(vec![1u32; N])
         .and_then_with_context(move |ec, buf| {
             kernels_ref
                 .scale_u32([N], buf, 3)
@@ -78,7 +78,7 @@ fn on_device_routes_chain_to_devices_from_context() {
                 .scale_u32([N], buf, 4)
                 .on_device(ec.device_at(1))
         })
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("on_device chain");
 
@@ -96,7 +96,7 @@ fn on_device_preserves_host_error_slot_across_routing() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let chain = upload(vec![1u32; N])
+    let chain = upload!(vec![1u32; N])
         .and_then_with_context(move |ec, buf| {
             kernels_ref
                 .scale_u32([N], buf, 2)
@@ -130,20 +130,20 @@ fn on_device_bundle_runs_branches_on_distinct_devices() {
     let kernels_ref = &kernels;
 
     let (a, b): (Vec<u32>, Vec<u32>) = bundle!(
-        upload(vec![1u32; N])
+        upload!(vec![1u32; N])
             .and_then_with_context(move |ec, buf| {
                 kernels_ref
                     .scale_u32([N], buf, 7)
                     .on_device(ec.device_at(0))
             })
-            .and_then(download),
-        upload(vec![1u32; N])
+            .and_then(|buf| download!(buf)),
+        upload!(vec![1u32; N])
             .and_then_with_context(move |ec, buf| {
                 kernels_ref
                     .scale_u32([N], buf, 11)
                     .on_device(ec.device_at(1))
             })
-            .and_then(download),
+            .and_then(|buf| download!(buf)),
     )
     .sync(&ctx)
     .expect("bundle across devices");

@@ -10,8 +10,8 @@
 
 use claspr::{Buffer, Context, Error, MappedSlice, SvmLevel};
 use claspr_async::{
-    DeviceOperation, bundle, device_slice_alloc, device_slice_copy, device_slice_fill,
-    device_slice_write, download, mapped_slice_alloc, mapped_slice_copy, mapped_slice_fill,
+    DeviceOperation, bundle, device_slice_alloc_zero, device_slice_copy, device_slice_fill,
+    device_slice_write, download, mapped_slice_alloc_zero, mapped_slice_copy, mapped_slice_fill,
     mapped_slice_upload, upload,
 };
 use claspr_test_kernels::kernels;
@@ -44,9 +44,9 @@ fn device_slice_fill_in_place() {
     // Alloc zeros, fill with 7, download — expect all 7s. Most basic
     // shape proving the op works at all.
     let Some(ctx) = ctx() else { return };
-    let result: Vec<u32> = device_slice_alloc::<u32>(N)
+    let result: Vec<u32> = device_slice_alloc_zero!(u32, N)
         .and_then(|buf| device_slice_fill(buf, 7u32))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("alloc + fill + download chain");
     assert_eq!(result.len(), N);
@@ -55,14 +55,14 @@ fn device_slice_fill_in_place() {
 
 #[test]
 fn device_slice_fill_chains_after_upload() {
-    // upload(values) → fill(99) — fill must wait for upload's event
+    // upload!(values) → fill(99) — fill must wait for upload's event
     // before clEnqueueFillBuffer lands, otherwise the upload could
     // arrive AFTER and overwrite. Result must be all 99s.
     let Some(ctx) = ctx() else { return };
     let input: Vec<u32> = (0..N as u32).collect();
-    let result: Vec<u32> = upload(input)
+    let result: Vec<u32> = upload!(input)
         .and_then(|buf| device_slice_fill(buf, 99u32))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("upload + fill chain");
     assert!(result.iter().all(|&v| v == 99));
@@ -75,10 +75,10 @@ fn device_slice_fill_event_threads_to_kernel() {
     // before the fill, producing 0*2 = 0 instead of 7*2 = 14.
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let result: Vec<u32> = device_slice_alloc::<u32>(N)
+    let result: Vec<u32> = device_slice_alloc_zero!(u32, N)
         .and_then(|buf| device_slice_fill(buf, 7u32))
         .and_then(|buf| kernels.scale_u32([N], buf, 2u32))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("fill → kernel → download chain");
     assert!(result.iter().all(|&v| v == 14));
@@ -88,12 +88,12 @@ fn device_slice_fill_event_threads_to_kernel() {
 
 #[test]
 fn device_slice_copy_propagates_src_to_dst() {
-    // upload src + alloc(dst) → copy → download(dst) — dst sees src.
+    // upload src + alloc(dst) → copy → download!(dst) — dst sees src.
     let Some(ctx) = ctx() else { return };
     let src_data: Vec<u32> = (0..N as u32).map(|i| i * 3).collect();
-    let result: Vec<u32> = bundle!(upload(src_data.clone()), device_slice_alloc::<u32>(N))
+    let result: Vec<u32> = bundle!(upload!(src_data.clone()), device_slice_alloc_zero!(u32, N))
         .and_then(|(src, dst)| device_slice_copy(src, dst))
-        .and_then(|(_src, dst)| download(dst))
+        .and_then(|(_src, dst)| download!(dst))
         .sync(&ctx)
         .expect("upload + alloc + copy + download");
     assert_eq!(result, src_data);
@@ -106,9 +106,9 @@ fn device_slice_copy_returns_both_buffers() {
     let Some(ctx) = ctx() else { return };
     let src_data: Vec<u32> = (10..10 + N as u32).collect();
     let (src_out, dst_out): (Vec<u32>, Vec<u32>) =
-        bundle!(upload(src_data.clone()), device_slice_alloc::<u32>(N))
+        bundle!(upload!(src_data.clone()), device_slice_alloc_zero!(u32, N))
             .and_then(|(src, dst)| device_slice_copy(src, dst))
-            .and_then(|(src, dst)| bundle!(download(src), download(dst)))
+            .and_then(|(src, dst)| bundle!(download!(src), download!(dst)))
             .sync(&ctx)
             .expect("copy + both downloads");
     assert_eq!(src_out, src_data, "src unchanged after copy");
@@ -121,9 +121,9 @@ fn device_slice_copy_length_mismatch_errors() {
     // The Tier 1 CopyOp checks at into_event time; the Tier 2 wrapper
     // surfaces the same Err.
     let Some(ctx) = ctx() else { return };
-    let result = bundle!(upload(vec![0u32; 10]), device_slice_alloc::<u32>(5))
+    let result = bundle!(upload!(vec![0u32; 10]), device_slice_alloc_zero!(u32, 5))
         .and_then(|(src, dst)| device_slice_copy(src, dst))
-        .and_then(|(_src, dst)| download(dst))
+        .and_then(|(_src, dst)| download!(dst))
         .sync(&ctx);
     let err = result.expect_err("copy of mismatched lengths should error");
     assert!(
@@ -139,9 +139,9 @@ fn device_slice_write_into_existing_buffer() {
     // alloc → write(host vec) → download — buffer sees what we wrote.
     let Some(ctx) = ctx() else { return };
     let data: Vec<u32> = (1..=N as u32).collect();
-    let result: Vec<u32> = device_slice_alloc::<u32>(N)
+    let result: Vec<u32> = device_slice_alloc_zero!(u32, N)
         .and_then(|buf| device_slice_write(buf, data.clone()))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("alloc + write + download");
     assert_eq!(result, data);
@@ -155,10 +155,10 @@ fn device_slice_write_overwrites_kernel_output() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let data: Vec<u32> = (1..=N as u32).collect();
-    let result: Vec<u32> = device_slice_alloc::<u32>(N)
+    let result: Vec<u32> = device_slice_alloc_zero!(u32, N)
         .and_then(|buf| kernels.fill_u32([N], buf, 99u32))
         .and_then(|buf| device_slice_write(buf, data.clone()))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("kernel + write + download");
     assert_eq!(result, data);
@@ -169,9 +169,9 @@ fn device_slice_write_overwrites_kernel_output() {
 #[test]
 fn mapped_slice_fill_in_place() {
     // SVM analog of device_slice_fill_in_place. Read back via
-    // Tier 1 .map() since download(buf) is DeviceSlice-only.
+    // Tier 1 .map() since download!(buf) is DeviceSlice-only.
     let Some(ctx) = ctx_with_svm() else { return };
-    let buf: MappedSlice<u32> = mapped_slice_alloc::<u32>(N)
+    let buf: MappedSlice<u32> = mapped_slice_alloc_zero!(u32, N)
         .and_then(|buf| mapped_slice_fill(buf, 7u32))
         .sync(&ctx)
         .expect("alloc + fill");
@@ -188,8 +188,8 @@ fn mapped_slice_copy_propagates_src_to_dst() {
     let Some(ctx) = ctx_with_svm() else { return };
     let src_data: Vec<u32> = (0..N as u32).map(|i| i + 1000).collect();
     let (_src, dst): (MappedSlice<u32>, MappedSlice<u32>) = bundle!(
-        mapped_slice_upload::<u32, _>(src_data.clone()),
-        mapped_slice_alloc::<u32>(N),
+        mapped_slice_upload!(src_data.clone()),
+        mapped_slice_alloc_zero!(u32, N),
     )
     .and_then(|(src, dst)| mapped_slice_copy(src, dst))
     .sync(&ctx)

@@ -8,7 +8,7 @@
 //! compose cleanly into combinator chains:
 //!
 //! ```ignore
-//! upload(host_vec).and_then(|buf| kernel_op(buf)).and_then(download).sync(&ctx)?
+//! upload(host_vec).and_then(|buf| kernel_op(buf)).and_then(|buf| download!(buf)).sync(&ctx)?
 //! ```
 //!
 //! Both ops use **non-blocking enqueues** under the hood:
@@ -43,7 +43,8 @@
 
 use crate::exec_ctx::ExecutionContext;
 use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
-use claspr::{Buffer, DeviceSlice, Result, register_drop_callback};
+use claspr::{Buffer, DeviceSlice, MemMode, ReadWrite, Result, register_drop_callback};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 // ── UploadSource ────────────────────────────────────────────────────
@@ -101,66 +102,65 @@ impl<T> From<Arc<[T]>> for UploadSource<T> {
 
 // ── upload ──────────────────────────────────────────────────────────
 
-/// Allocate a [`DeviceSlice`] of `source.len()` elements and write
-/// `source` into it.
+/// Allocate a [`DeviceSlice<T, M>`] of `source.len()` elements and
+/// write `source` into it. Built by the [`upload!`](crate::upload!)
+/// macro or directly via [`Self::new`].
 ///
 /// Non-blocking: `clEnqueueWriteBuffer(CL_FALSE)` runs on the chain's
 /// OOO queue with `deps` as wait-list. The host buffer is kept alive
 /// by a `clSetEventCallback(CL_COMPLETE)` that drops the holder when
-/// the write finishes. The returned event becomes the next op's `deps`,
-/// so a downstream read of this buffer waits for the write to complete
-/// via queue-side event ordering — no host-side block.
+/// the write finishes.
 ///
-/// See [`UploadSource`] for the sources accepted via `impl Into<...>`.
-pub fn upload<T, S>(source: S) -> Upload<T>
+/// **Marker bound:** `M: HostUploadable` — excludes `HostReadOnly`,
+/// `Frozen`, `DeviceScratch`. For those markers, use the
+/// [`device_slice_from_slice!`](crate::device_slice_from_slice!)
+/// path (`CL_MEM_COPY_HOST_PTR`, no post-creation write).
+pub struct Upload<T, M: MemMode = ReadWrite> {
+    source: Option<UploadSource<T>>,
+    _phantom: PhantomData<fn() -> M>,
+}
+
+impl<T, M> Upload<T, M>
 where
-    // `T: Sync` is required only because `UploadSource::Arc(Arc<[T]>)`
-    // needs `Arc<T>: Send` for the chain's Send bound; Vec/Box paths
-    // don't need it. Cheap to keep here; common types (u32, f32, ...)
-    // satisfy it.
     T: Send + Sync + 'static,
-    S: Into<UploadSource<T>>,
+    M: MemMode + claspr::HostUploadable + claspr::Fillable + Send + 'static,
 {
-    Upload {
-        source: Some(source.into()),
+    pub fn new<S>(source: S) -> Self
+    where
+        S: Into<UploadSource<T>>,
+    {
+        Self {
+            source: Some(source.into()),
+            _phantom: PhantomData,
+        }
     }
 }
 
-/// Combinator built by [`upload`]. Lazy — `execute` allocates, enqueues
-/// the non-blocking write, and registers a keep-alive callback on the
-/// resulting event.
-pub struct Upload<T> {
-    source: Option<UploadSource<T>>,
-}
-
-impl<T> DeviceOperation for Upload<T>
+impl<T, M> DeviceOperation for Upload<T, M>
 where
     T: Send + Sync + 'static,
+    M: MemMode + claspr::HostUploadable + claspr::Fillable + Send + 'static,
 {
-    type Output = DeviceSlice<T>;
+    type Output = DeviceSlice<T, M>;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(DeviceSlice<T>, Deps)> {
+    fn execute(
+        mut self,
+        ctx: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> Result<(DeviceSlice<T, M>, Deps)> {
         let source = self
             .source
             .take()
             .expect("Upload::execute called twice — internal claspr-async bug");
-        // SAFETY: alloc_uninit returns uninit device bytes; the
-        // non-blocking write below covers the whole buffer (len
-        // matches source.len() since we just used it for alloc).
-        // Downstream chain stages gate on the returned write event
-        // so no read can observe uninit data.
-        let mut buf =
-            unsafe { DeviceSlice::alloc_uninit(ctx.context(), source.len())?.assume_init() };
-        // Non-blocking write with `deps` as the queue wait-list. The
-        // event from .submit() goes into the keep-alive callback +
-        // becomes the next op's dep.
+        // SAFETY: write below covers every byte of the freshly-allocated
+        // buffer; downstream stages gate on the returned write event.
+        let mut buf = unsafe {
+            DeviceSlice::<T, M>::alloc_uninit(ctx.context(), source.len())?.assume_init()
+        };
         let event = buf
             .write(source.as_slice())
             .after_all(deps_as_events(&deps))
             .submit(ctx)?;
-        // Move `source` into a Box, hand to OpenCL's user_data. The
-        // thunk drops it when CL_COMPLETE fires — exactly when the
-        // runtime is done reading from the host heap.
         register_drop_callback(&event, Box::new(source))?;
         Ok((buf, vec![wrap_event(event)]))
     }
@@ -168,35 +168,28 @@ where
 
 // ── download ────────────────────────────────────────────────────────
 
-/// Consume `buf`, allocate a host `Vec<T>` of `buf.len()` elements,
-/// and non-blocking-read the buffer into it.
-///
-/// `clEnqueueReadBuffer(CL_FALSE)` runs on the chain's OOO queue with
-/// `deps` as wait-list. The Vec moves up the chain (Vec moves don't
-/// reallocate; the heap address the runtime is writing to stays
-/// stable). The `DeviceSlice` drops at end of `execute`, but OpenCL
-/// retains the `cl_mem` internally until the read completes.
-///
-/// The returned event becomes the next op's `deps` — and the chain's
-/// terminator (`.sync` / `.run().await`) waits for it before handing
-/// the Vec to the user, so the data is valid when read.
-pub fn download<T>(buf: DeviceSlice<T>) -> Download<T>
+/// Consume `buf`, allocate a host `Vec<T>`, and non-blocking-read the
+/// buffer into it. Built by [`download!`](crate::download!) or
+/// directly via [`Self::new`]. `M` is whatever marker the input buffer
+/// carries; bound `M: HostReadable` (excludes `DeviceScratch`).
+pub struct Download<T, M: MemMode = ReadWrite> {
+    buf: Option<DeviceSlice<T, M>>,
+}
+
+impl<T, M> Download<T, M>
 where
     T: Clone + Default + Send + 'static,
+    M: MemMode + claspr::HostReadable + Send + 'static,
 {
-    Download { buf: Some(buf) }
+    pub fn new(buf: DeviceSlice<T, M>) -> Self {
+        Self { buf: Some(buf) }
+    }
 }
 
-/// Combinator built by [`download`]. Lazy — `execute` allocs the
-/// destination Vec and enqueues the non-blocking read when the chain
-/// reaches it.
-pub struct Download<T> {
-    buf: Option<DeviceSlice<T>>,
-}
-
-impl<T> DeviceOperation for Download<T>
+impl<T, M> DeviceOperation for Download<T, M>
 where
     T: Clone + Default + Send + 'static,
+    M: MemMode + claspr::HostReadable + Send + 'static,
 {
     type Output = Vec<T>;
 

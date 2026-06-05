@@ -28,7 +28,7 @@ fn acquire_host_edit_release_round_trip() {
 
     // upload all-3s → scale by 2 (all 6s) → host view (edit [0]=999)
     // → release → scale by 10 (all 60s, except [0]=9990) → download.
-    let result: Vec<u32> = upload(vec![3u32; N])
+    let result: Vec<u32> = upload!(vec![3u32; N])
         .and_then(|buf| kernels.scale_u32([N], buf, 2))
         .and_then(|buf| buf.acquire_host_view())
         .and_then_host(|slice: &mut [u32]| {
@@ -39,7 +39,7 @@ fn acquire_host_edit_release_round_trip() {
         })
         .and_then(|view| view.release_to_device())
         .and_then(|buf| kernels.scale_u32([N], buf, 10))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("host_view chain");
 
@@ -58,11 +58,11 @@ fn acquire_immediately_release_is_a_round_trip() {
         return;
     };
 
-    let result: Vec<u32> = upload(vec![42u32; N])
+    let result: Vec<u32> = upload!(vec![42u32; N])
         .and_then(|buf| buf.acquire_host_view())
         .and_then_host(|_slice: &mut [u32]| Ok(()))
         .and_then(|view| view.release_to_device())
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("round-trip");
     assert!(result.iter().all(|&v| v == 42));
@@ -85,7 +85,7 @@ fn acquire_host_view_read_inspects_without_writeback() {
     let sum_cell = std::sync::Arc::new(std::sync::Mutex::new(0u32));
     let cell = std::sync::Arc::clone(&sum_cell);
 
-    let result: Vec<u32> = upload(vec![0u32; N])
+    let result: Vec<u32> = upload!(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 7))
         .and_then(|buf| buf.acquire_host_view_read())
         .and_then_host(move |slice: &[u32]| {
@@ -98,7 +98,7 @@ fn acquire_host_view_read_inspects_without_writeback() {
         // The buffer is unchanged because we mapped READ-only —
         // downstream device work sees the original fill.
         .and_then(|buf| kernels.scale_u32([N], buf, 3))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("read-only view chain");
 
@@ -119,7 +119,7 @@ fn acquire_host_view_read_just_inspect_and_drop() {
     let first_cell = std::sync::Arc::new(std::sync::Mutex::new(0u32));
     let cell = std::sync::Arc::clone(&first_cell);
 
-    let _buf = upload(vec![13u32; N])
+    let _buf = upload!(vec![13u32; N])
         .and_then(|buf| kernels.scale_u32([N], buf, 4))
         .and_then(|buf| buf.acquire_host_view_read())
         .and_then_host(move |slice: &[u32]| {

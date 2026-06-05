@@ -1,41 +1,44 @@
-//! [`usm_slice`] — Tier 2 lazy wrapper for [`USMSlice<T>`].
+//! Tier 2 lazy wrappers for [`USMSlice<T, M>`].
 //!
 //! Construction is pure host code (no enqueue), so `execute` just
-//! wraps the host Vec via [`USMSlice::new`] and passes `deps`
-//! through unchanged.
+//! wraps the host Vec via [`USMSlice::new`] / [`USMSlice::alloc_zero`]
+//! and passes `deps` through unchanged.
 
 use crate::exec_ctx::ExecutionContext;
 use crate::op::{Deps, DeviceOperation};
-use claspr::{Result, USMSlice};
+use claspr::{MemMode, ReadWrite, Result, USMSlice};
 use std::marker::PhantomData;
 
-/// Combinator built by [`usm_slice`].
-pub struct UsmSliceOp<T> {
-    data: Option<Vec<T>>,
-}
-
-/// Wrap a host `Vec<T>` as a [`USMSlice<T>`] at chain execute time.
-/// Errors at execute with `Error::NotSupported` if the chain's
-/// device doesn't advertise fine-grain system SVM.
+/// Wrap a host `Vec<T>` as a [`USMSlice<T, M>`] at chain execute
+/// time. Built by the [`usm_slice!`](crate::usm_slice!) macro.
 ///
-/// No enqueue: the USM slice IS the host Vec's memory, so there's
-/// nothing to wait on for "construction." Downstream chain stages
-/// receive the slice immediately and inherit the upstream `deps`
-/// unchanged.
-pub fn usm_slice<T>(data: Vec<T>) -> UsmSliceOp<T>
-where
-    T: Send + 'static,
-{
-    UsmSliceOp { data: Some(data) }
+/// **No marker bound** — USM is host memory, any marker works.
+pub struct UsmSliceOp<T, M: MemMode = ReadWrite> {
+    data: Option<Vec<T>>,
+    _phantom: PhantomData<fn() -> M>,
 }
 
-impl<T> DeviceOperation for UsmSliceOp<T>
+impl<T, M> UsmSliceOp<T, M>
 where
     T: Send + 'static,
+    M: MemMode + Send + 'static,
 {
-    type Output = USMSlice<T>;
+    pub fn new(data: Vec<T>) -> Self {
+        Self {
+            data: Some(data),
+            _phantom: PhantomData,
+        }
+    }
+}
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(USMSlice<T>, Deps)> {
+impl<T, M> DeviceOperation for UsmSliceOp<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + Send + 'static,
+{
+    type Output = USMSlice<T, M>;
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(USMSlice<T, M>, Deps)> {
         let data = self
             .data
             .take()
@@ -45,44 +48,40 @@ where
     }
 }
 
-/// Lazy [`USMSlice<T>`] alloc, symmetric with
-/// [`device_slice_alloc`](crate::device_slice_alloc) /
-/// [`mapped_slice_alloc`](crate::mapped_slice_alloc). Allocates a
-/// host `Vec<T>` of `len` elements initialised to `T::default()` and
-/// wraps it via [`USMSlice::alloc`].
+/// Lazy [`USMSlice<T, M>`] alloc symmetric with
+/// [`DeviceSliceAllocZero`](crate::DeviceSliceAllocZero) /
+/// [`MappedSliceAllocZero`](crate::MappedSliceAllocZero). Built by
+/// the [`usm_slice_alloc_zero!`](crate::usm_slice_alloc_zero!) macro.
 ///
-/// Same shape as the existing [`usm_slice`] op, but skips the
-/// per-call-site `vec![v; N]` boilerplate when the caller doesn't
-/// care about the initial pattern (kernel will overwrite). No perf
-/// win over the explicit form — the Vec still needs to be initialised
-/// before construction since USMSlice derefs to `&[T]`.
-pub struct UsmSliceAlloc<T> {
+/// **No marker bound** — USM is host memory; `vec![T::default(); N]`
+/// works regardless of the kernel-side marker.
+pub struct UsmSliceAllocZero<T, M: MemMode = ReadWrite> {
     len: usize,
-    _phantom: PhantomData<fn() -> T>,
+    _phantom: PhantomData<fn() -> (T, M)>,
 }
 
-/// Build a [`UsmSliceAlloc`] op for the chain. Errors at execute time
-/// with [`Error::NotSupported`](claspr::Error::NotSupported) when the
-/// running device doesn't advertise fine-grain system SVM (same gate
-/// as [`usm_slice`]).
-pub fn usm_slice_alloc<T>(len: usize) -> UsmSliceAlloc<T>
+impl<T, M> UsmSliceAllocZero<T, M>
 where
     T: Default + Copy + Send + 'static,
+    M: MemMode + Send + 'static,
 {
-    UsmSliceAlloc {
-        len,
-        _phantom: PhantomData,
+    pub fn new(len: usize) -> Self {
+        Self {
+            len,
+            _phantom: PhantomData,
+        }
     }
 }
 
-impl<T> DeviceOperation for UsmSliceAlloc<T>
+impl<T, M> DeviceOperation for UsmSliceAllocZero<T, M>
 where
     T: Default + Copy + Send + 'static,
+    M: MemMode + Send + 'static,
 {
-    type Output = USMSlice<T>;
+    type Output = USMSlice<T, M>;
 
-    fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(USMSlice<T>, Deps)> {
-        let slice = USMSlice::<T>::alloc_zero(ec.context(), self.len)?;
+    fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(USMSlice<T, M>, Deps)> {
+        let slice = USMSlice::<T, M>::alloc_zero(ec.context(), self.len)?;
         Ok((slice, deps))
     }
 }

@@ -53,9 +53,9 @@ fn fan_out_of_kernel_ops_runs_each_branch() {
     let kernels_ref = &kernels;
     let fill_values: Vec<u32> = vec![100, 200, 300, 400];
     let outputs: Vec<Vec<u32>> = fan_out(fill_values.clone(), move |val| {
-        upload(vec![0u32; N])
+        upload!(vec![0u32; N])
             .and_then(move |buf| kernels_ref.fill_u32([N], buf, val))
-            .and_then(download)
+            .and_then(|buf| download!(buf))
     })
     .sync(&ctx)
     .expect("fan_out chain");

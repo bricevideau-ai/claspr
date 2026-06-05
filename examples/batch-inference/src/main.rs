@@ -4,8 +4,8 @@
 //! Pipeline per batch:
 //!
 //! ```text
-//!    upload(batch_input) ─┐
-//!    upload(Arc<weights>) ┴→ pointwise: batch[i] *= weight[i]
+//!    upload!(batch_input) ─┐
+//!    upload!(Arc<weights>) ┴→ pointwise: batch[i] *= weight[i]
 //!                          → bias add: batch[i] += bias
 //!                          → download
 //!                          → host: sum
@@ -97,7 +97,7 @@ fn run(ctx: Context) -> claspr::Result<()> {
         // host allocation. The keep-alive callback on the write event
         // drops each clone once OpenCL is done copying from it.
         let weights_clone: Arc<[u32]> = Arc::clone(&weights);
-        bundle!(upload(input), upload(weights_clone))
+        bundle!(upload!(input), upload!(weights_clone))
             .and_then(move |(input_buf, weight_buf)| {
                 // elem_mul takes `(&mut [u32], &[u32])` → both slices
                 // flow through as Output (3-tuple? no, 2-tuple of slices).
@@ -106,7 +106,7 @@ fn run(ctx: Context) -> claspr::Result<()> {
                     move |(input_buf, _weight_buf)| kernels_ref.add_bias([N], input_buf, BIAS),
                 )
             })
-            .and_then(download)
+            .and_then(|buf| download!(buf))
     })
     .sync(&ctx)?;
     let outputs: Vec<u32> = downloaded.iter().map(|v| v.iter().sum()).collect();

@@ -17,7 +17,8 @@
 
 use claspr::{Buffer, Context, Error, MappedSlice, SvmLevel};
 use claspr_async::{
-    DeviceOperation, bundle, device_slice_alloc, download, mapped_slice_alloc, upload, value,
+    DeviceOperation, bundle, device_slice_alloc_zero, download, mapped_slice_alloc_zero, upload,
+    value,
 };
 use claspr_test_kernels::kernels;
 
@@ -41,9 +42,9 @@ fn device_slice_alloc_produces_buffer_usable_in_kernel() {
     // resulting DeviceSlice<T> is a valid, kernel-launchable buffer.
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let result: Vec<u32> = device_slice_alloc::<u32>(N)
+    let result: Vec<u32> = device_slice_alloc_zero!(u32, N)
         .and_then(|buf| kernels.fill_u32([N], buf, 42))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("alloc + fill chain");
     assert_eq!(result.len(), N);
@@ -53,7 +54,7 @@ fn device_slice_alloc_produces_buffer_usable_in_kernel() {
 #[test]
 fn mapped_slice_alloc_succeeds_or_surfaces_svm_not_available() {
     let Some(ctx) = ctx() else { return };
-    let result = mapped_slice_alloc::<u32>(N).sync(&ctx);
+    let result = mapped_slice_alloc_zero!(u32, N).sync(&ctx);
     if ctx.svm_capability() == SvmLevel::None {
         // The synchronous MappedSlice::alloc gates on SVM; the
         // lazy op should surface the same Err at execute time.
@@ -80,12 +81,12 @@ fn hoisted_bundle_uploads_and_alloc_feed_three_arg_kernel() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let result: Vec<u32> = bundle!(
-        upload(vec![1u32; N]),
-        upload(vec![2u32; N]),
-        device_slice_alloc::<u32>(N),
+        upload!(vec![1u32; N]),
+        upload!(vec![2u32; N]),
+        device_slice_alloc_zero!(u32, N),
     )
     .and_then(|(a, b, out)| kernels.add_u32([N], a, b, out))
-    .and_then(|(_a, _b, out)| download(out))
+    .and_then(|(_a, _b, out)| download!(out))
     .sync(&ctx)
     .expect("hoisted bundle chain");
     assert_eq!(result.len(), N);
@@ -101,14 +102,14 @@ fn and_then_with_context_closure_returns_kernel_op_directly() {
     // parameter); the kernel call returns the next chain op.
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let result: Vec<u32> = upload(vec![6u32; N])
+    let result: Vec<u32> = upload!(vec![6u32; N])
         .and_then_with_context(|ec, buf| {
             // Use ec — proves it's accessible without a wrapping
             // with_context layer.
             let _dev = ec.device().clone();
             kernels.scale_u32([N], buf, 5)
         })
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("and_then_with_context chain");
     assert_eq!(result.len(), N);
@@ -124,18 +125,18 @@ fn and_then_with_context_composes_lazy_alloc_inside_closure() {
     // execute time if it ever does.
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let result: Vec<u32> = upload(vec![7u32; N])
+    let result: Vec<u32> = upload!(vec![7u32; N])
         .and_then_with_context(|_ec, buf| {
             // Build a sub-chain: pair the upstream buf with a fresh
             // alloc, then add them via a 3-arg kernel.
             bundle!(
                 value(buf),
-                upload(vec![1u32; N]),
-                device_slice_alloc::<u32>(N)
+                upload!(vec![1u32; N]),
+                device_slice_alloc_zero!(u32, N)
             )
             .and_then(|(a, b, out)| kernels.add_u32([N], a, b, out))
         })
-        .and_then(|(_a, _b, out)| download(out))
+        .and_then(|(_a, _b, out)| download!(out))
         .sync(&ctx)
         .expect("alloc-via-and_then_with_context chain");
     assert!(result.iter().all(|&v| v == 8));

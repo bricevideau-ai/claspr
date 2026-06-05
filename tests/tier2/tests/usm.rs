@@ -10,7 +10,7 @@
 //! saw 0"); it must pass here.
 
 use claspr::{Buffer, Context, SvmLevel};
-use claspr_async::{DeviceOperation, usm_slice, usm_slice_alloc};
+use claspr_async::{DeviceOperation, usm_slice, usm_slice_alloc_zero};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;
@@ -68,7 +68,7 @@ fn usm_slice_threads_into_kernel() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let host_data = vec![5u32; N];
-    let buf = usm_slice(host_data)
+    let buf = usm_slice!(host_data)
         .and_then(|s| kernels.scale_u32([N], s, 7))
         .sync(&ctx)
         .expect("usm slice chain");
@@ -102,20 +102,20 @@ fn usm_slice_drop_waits_for_in_flight_kernel() {
 #[test]
 fn usm_slice_alloc_produces_zero_initialised_buffer() {
     // Symmetric with device_slice_alloc / mapped_slice_alloc:
-    // `usm_slice_alloc::<T>(N)` allocates a host Vec of length N
+    // `usm_slice_alloc_zero!(T, N)` allocates a host Vec of length N
     // initialised to T::default(). Before any kernel runs, every
     // element is T::default() (zero for u32).
     let Some(ctx) = ctx_with_fine_system() else {
         return;
     };
-    let buf = usm_slice_alloc::<u32>(N).sync(&ctx).expect("alloc");
+    let buf = usm_slice_alloc_zero!(u32, N).sync(&ctx).expect("alloc");
     assert_eq!(buf.len(), N);
     assert!(buf.iter().all(|&v| v == 0), "alloc should zero-init");
 }
 
 #[test]
 fn macro_usm_slice_repeat_arm() {
-    // `usm_slice![v; N]` → usm_slice(vec![v; N]).
+    // `usm_slice![v; N]` → usm_slice!(vec![v; N]).
     let Some(ctx) = ctx_with_fine_system() else {
         return;
     };
@@ -130,7 +130,7 @@ fn macro_usm_slice_repeat_arm() {
 
 #[test]
 fn macro_usm_slice_literal_arm() {
-    // `usm_slice![a, b, c]` → usm_slice(vec![a, b, c]).
+    // `usm_slice![a, b, c]` → usm_slice!(vec![a, b, c]).
     let Some(ctx) = ctx_with_fine_system() else {
         return;
     };

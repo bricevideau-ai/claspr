@@ -32,13 +32,13 @@ fn f64_chain_via_async_combinators() {
     let Some(ctx) = ctx_with_f64() else { return };
     let kernels = kernels::kernels(&ctx).expect("kernels load");
 
-    // upload(0.0s) → fill(1.0) → scale(4.0) → download → expect 4.0
+    // upload!(0.0s) → fill(1.0) → scale(4.0) → download → expect 4.0
     // The upload writes finite zeros so the fill_f64's `data[i] * 0.0`
     // sees a defined value.
-    let result: Vec<f64> = upload(vec![0.0f64; N])
+    let result: Vec<f64> = upload!(vec![0.0f64; N])
         .and_then(|buf| kernels.fill_f64([N], buf, 1.0))
         .and_then(|buf| kernels.scale_f64([N], buf, 4.0))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("f64 chain sync");
 

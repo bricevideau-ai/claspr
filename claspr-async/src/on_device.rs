@@ -21,7 +21,7 @@
 //! ## Idiom: resolve devices from `ec`, not external captures
 //!
 //! ```ignore
-//! upload(input).and_then_with_context(|ec, buf|
+//! upload!(input).and_then_with_context(|ec, buf|
 //!     kernels.foo([N], buf).on_device(ec.device_at(1)))
 //! ```
 //!

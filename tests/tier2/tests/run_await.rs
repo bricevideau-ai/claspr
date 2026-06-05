@@ -26,9 +26,9 @@ fn await_simple_chain() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let chain = value(vec![0u32; N])
-        .and_then(upload)
+        .and_then(|x| upload!(x))
         .and_then(|buf| kernels.fill_u32([N], buf, 0x1234_5678))
-        .and_then(download);
+        .and_then(|buf| download!(buf));
 
     let result: Vec<u32> = block_on(chain.run(&ctx)).expect("await chain");
     assert_eq!(result.len(), N);
@@ -64,14 +64,14 @@ fn await_propagates_chain_error() {
     // removed, we construct the same error variant directly. The
     // test's intent (chain Err → terminal Err) is preserved; the
     // mechanism (where the error originates) is different.
-    let chain = value(vec![0u32; 16]).and_then(upload).and_then_host(
-        |view: &mut [u32]| -> claspr::Result<()> {
+    let chain = value(vec![0u32; 16])
+        .and_then(|x| upload!(x))
+        .and_then_host(|view: &mut [u32]| -> claspr::Result<()> {
             Err(claspr::Error::LengthMismatch {
                 src: view.len(),
                 dst: 8,
             })
-        },
-    );
+        });
 
     let err = block_on(chain.run(&ctx)).expect_err("chain should error");
     assert!(

@@ -42,9 +42,9 @@ fn vec_round_trips_between_two_contexts() {
     let kernels_b = kernels::kernels(&ctx_b).expect("load kernels on ctx_b");
 
     // Chain 1 on ctx_a: fill → download. Result is a host-owned Vec.
-    let intermediate: Vec<u32> = upload(vec![0u32; N])
+    let intermediate: Vec<u32> = upload!(vec![0u32; N])
         .and_then(|buf| kernels_a.fill_u32([N], buf, 7))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx_a)
         .expect("chain on ctx_a");
     assert!(intermediate.iter().all(|&v| v == 7));
@@ -52,9 +52,9 @@ fn vec_round_trips_between_two_contexts() {
     // Chain 2 on ctx_b: re-upload that Vec → scale → download.
     // The `cl_mem` allocated by `upload` here is a fresh one in
     // ctx_b's address space — proving the Vec is the only bridge.
-    let final_result: Vec<u32> = upload(intermediate)
+    let final_result: Vec<u32> = upload!(intermediate)
         .and_then(|buf| kernels_b.scale_u32([N], buf, 6))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx_b)
         .expect("chain on ctx_b");
     assert!(final_result.iter().all(|&v| v == 42));

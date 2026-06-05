@@ -143,7 +143,7 @@ fn tier2_mapped_slice_filled_threads_into_kernel() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     // mapped_slice_filled produces MappedSlice<u32>; scale by 2.
-    let buf = mapped_slice_filled(5u32, N)
+    let buf = mapped_slice_filled!(5u32, N)
         .and_then(|buf| kernels.scale_u32([N], buf, 2))
         .sync(&ctx)
         .expect("filled svm chain");
@@ -161,7 +161,7 @@ fn tier2_mapped_slice_upload_threads_into_kernel() {
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = mapped_slice_upload::<u32, _>(vec![1u32, 2, 3, 4, 5, 6, 7, 8])
+    let buf = mapped_slice_upload!(vec![1u32, 2, 3, 4, 5, 6, 7, 8])
         .and_then(|buf| kernels.scale_u32([8], buf, 3))
         .sync(&ctx)
         .expect("upload + scale");
@@ -172,7 +172,7 @@ fn tier2_mapped_slice_upload_threads_into_kernel() {
 
 #[test]
 fn macro_mapped_slice_repeat_arm() {
-    // `mapped_slice![v; N]` → mapped_slice_filled(v, N).
+    // `mapped_slice![v; N]` → mapped_slice_filled!(v, N).
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
@@ -186,7 +186,7 @@ fn macro_mapped_slice_repeat_arm() {
 
 #[test]
 fn macro_mapped_slice_literal_arm() {
-    // `mapped_slice![a, b, c]` → mapped_slice_upload(vec![a, b, c]).
+    // `mapped_slice![a, b, c]` → mapped_slice_upload!(vec![a, b, c]).
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
@@ -209,7 +209,7 @@ fn tier2_mapped_slice_filled_surfaces_svm_not_available() {
         eprintln!("SKIP: device supports SVM, can't test no-SVM path here");
         return;
     }
-    let err = mapped_slice_filled(0u32, N)
+    let err = mapped_slice_filled!(0u32, N)
         .sync(&ctx)
         .expect_err("expected SvmNotAvailable");
     assert!(matches!(err, claspr::Error::SvmNotAvailable), "got {err:?}",);

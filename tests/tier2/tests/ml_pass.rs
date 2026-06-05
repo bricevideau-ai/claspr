@@ -38,7 +38,7 @@ fn forward_pass_threads_buffer_through_three_stages() {
 
     let loss_cell = Arc::new(Mutex::new(0u32));
     let cell = Arc::clone(&loss_cell);
-    let _final_buf = upload(vec![1u32; N])
+    let _final_buf = upload!(vec![1u32; N])
         .and_then(|buf| kernels.scale_u32([N], buf, 2)) // layer1
         .and_then(|buf| kernels.scale_u32([N], buf, 3)) // layer2
         .and_then_host(move |slice: &mut [u32]| {
@@ -61,7 +61,7 @@ fn forward_pass_carries_scalar_state_via_value_tuple_repack() {
 
     let sum_cell = Arc::new(Mutex::new(0u32));
     let cell = Arc::clone(&sum_cell);
-    let (_final_buf, step) = upload(vec![10u32; N])
+    let (_final_buf, step) = upload!(vec![10u32; N])
         .and_then(|buf| {
             // Pack: device op output + an external scalar travel
             // together as a tuple. Tuple-repack at every stage is the
@@ -101,15 +101,15 @@ fn mpsc_three_producers_into_single_combine() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let producers = bundle!(
-        upload(vec![0u32; N]).and_then(|buf| kernels.fill_u32([N], buf, 3)),
-        upload(vec![0u32; N]).and_then(|buf| kernels.fill_u32([N], buf, 4)),
-        upload(vec![0u32; N]),
+        upload!(vec![0u32; N]).and_then(|buf| kernels.fill_u32([N], buf, 3)),
+        upload!(vec![0u32; N]).and_then(|buf| kernels.fill_u32([N], buf, 4)),
+        upload!(vec![0u32; N]),
     );
 
     let result: Vec<u32> = producers
         .and_then(|(a, b, out)| kernels.add_u32([N], a, b, out))
         .and_then(|(_a, _b, out)| kernels.scale_u32([N], out, 5))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("mpsc chain");
     // (3 + 4) * 5 = 35

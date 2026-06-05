@@ -65,7 +65,7 @@ fn error_after_some_device_work_still_propagates() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let result = upload(vec![0u32; N])
+    let result = upload!(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 5))
         .and_then_host(|_slice: &mut [u32]| {
             Err::<(), _>(Error::Build {

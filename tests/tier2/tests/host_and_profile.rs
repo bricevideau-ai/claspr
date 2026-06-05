@@ -36,7 +36,7 @@ fn and_then_host_sum_between_device_stages() {
     let sum_cell = Arc::new(Mutex::new(0u32));
     let cell = Arc::clone(&sum_cell);
     let _final_buf = value(vec![0u32; N])
-        .and_then(upload)
+        .and_then(|x| upload!(x))
         .and_then(|buf| kernels.fill_u32([N], buf, 3))
         .and_then_host(move |slice: &mut [u32]| {
             *cell.lock().unwrap() = slice.iter().sum();
@@ -78,7 +78,7 @@ fn profile_chain_fires_callback_when_profiling_on() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let (tx, rx) = std::sync::mpsc::channel();
     value(vec![0u32; N])
-        .and_then(upload)
+        .and_then(|x| upload!(x))
         .and_then(|buf| kernels.fill_u32([N], buf, 7))
         .profiled(move |info| {
             tx.send(info).expect("send profiling info");

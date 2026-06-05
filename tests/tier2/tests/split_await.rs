@@ -30,7 +30,7 @@ fn split_chain_with_host_decision_between() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     // First chain: upload + fill. Buffer flows out via .sync().
-    let buf = upload(vec![0u32; N])
+    let buf = upload!(vec![0u32; N])
         .and_then(|b| kernels.fill_u32([N], b, 5))
         .sync(&ctx)
         .expect("first half");
@@ -40,10 +40,10 @@ fn split_chain_with_host_decision_between() {
     let factor = if 5 < 10 { 4 } else { 2 };
 
     // Second chain: take the buffer back in, scale by the decided
-    // factor, download.
+    // factor.
     let result: Vec<u32> = kernels
         .scale_u32([N], buf, factor)
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("second half");
     assert!(result.iter().all(|&v| v == 20));
@@ -57,7 +57,7 @@ fn split_chain_then_reuse_buffer_for_independent_work() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = upload(vec![0u32; N])
+    let buf = upload!(vec![0u32; N])
         .and_then(|b| kernels.fill_u32([N], b, 1))
         .sync(&ctx)
         .expect("phase 1");
@@ -69,7 +69,7 @@ fn split_chain_then_reuse_buffer_for_independent_work() {
     // Pick the second half back up as a Tier 2 chain.
     let result: Vec<u32> = kernels
         .scale_u32([N], buf, 5)
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("phase 3");
     assert!(result.iter().all(|&v| v == 50));

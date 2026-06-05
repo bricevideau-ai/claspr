@@ -38,7 +38,7 @@ fn closure_receives_running_context() {
     let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let captured_c = Arc::clone(&captured);
 
-    let result: Vec<u32> = upload(vec![3u32; N])
+    let result: Vec<u32> = upload!(vec![3u32; N])
         .and_then(|buf| kernels.scale_u32([N], buf, 2))
         .and_then_host_with_context(move |context: &Context, _view: &mut [u32]| {
             let names: Vec<String> = context
@@ -49,7 +49,7 @@ fn closure_receives_running_context() {
             *captured_c.lock().unwrap() = names;
             Ok(())
         })
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("chain");
 
@@ -73,7 +73,7 @@ fn closure_can_mutate_view_and_use_context() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let result: Vec<u32> = upload(vec![0u32; N])
+    let result: Vec<u32> = upload!(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 10))
         .and_then_host_with_context(|context: &Context, view: &mut [u32]| {
             // Use context's device count as a per-element multiplier.
@@ -85,7 +85,7 @@ fn closure_can_mutate_view_and_use_context() {
             }
             Ok(())
         })
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(&ctx)
         .expect("chain");
 
@@ -101,7 +101,7 @@ fn closure_err_surfaces_rich_variant_via_host_error_slot() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let chain = upload(vec![1u32; N])
+    let chain = upload!(vec![1u32; N])
         .and_then(|buf| kernels.scale_u32([N], buf, 2))
         .and_then_host_with_context(|_ctx: &Context, _view: &mut [u32]| -> claspr::Result<()> {
             Err(Error::Build {

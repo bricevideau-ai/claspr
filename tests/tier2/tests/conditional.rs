@@ -57,7 +57,7 @@ fn dyn_op_wraps_value_chain() {
 fn dyn_op_wraps_upload_download() {
     // No kernel, just data transfer.
     let Some(ctx) = ctx() else { return };
-    let chain: DynOp<Vec<u32>> = DynOp::new(upload(vec![7u32; N]).and_then(download));
+    let chain: DynOp<Vec<u32>> = DynOp::new(upload!(vec![7u32; N]).and_then(|buf| download!(buf)));
     let v = chain.sync(&ctx).expect("sync");
     assert!(v.iter().all(|&x| x == 7));
 }
@@ -72,7 +72,7 @@ fn baseline_kernel_chain_without_dynop() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let sum_cell = Arc::new(Mutex::new(0u32));
     let cell = Arc::clone(&sum_cell);
-    let _final_buf = upload(vec![3u32; N])
+    let _final_buf = upload!(vec![3u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 9))
         .and_then_host(move |slice: &mut [u32]| {
             *cell.lock().unwrap() = slice.iter().sum();
@@ -85,7 +85,7 @@ fn baseline_kernel_chain_without_dynop() {
 
 #[test]
 fn dyn_op_wraps_bare_kernel_op() {
-    // Smallest DynOp+kernel chain: no upload/download, just construct
+    // Smallest DynOp+kernel chain: no upload/just construct
     // a buffer manually and wrap the kernel call. Tests whether
     // wrapping the per-kernel Op alone triggers the crash.
     let Some(ctx) = ctx() else { return };
@@ -111,7 +111,7 @@ fn dyn_op_minimal_kernel_chain() {
     let cell = Arc::clone(&sum_cell);
 
     let chain: DynOp<claspr::DeviceSlice<u32>> = DynOp::new(
-        upload(vec![3u32; N])
+        upload!(vec![3u32; N])
             .and_then(|buf| kernels.fill_u32([N], buf, 9))
             .and_then_host(move |slice: &mut [u32]| {
                 *cell.lock().unwrap() = slice.iter().sum();
@@ -136,7 +136,7 @@ fn dyn_op_picks_branch_with_or_without_kernel() {
         if use_kernel {
             let cell = Arc::clone(&sum_cell);
             DynOp::new(
-                upload(vec![3u32; N])
+                upload!(vec![3u32; N])
                     .and_then(move |buf| kernels_ref.fill_u32([N], buf, 9))
                     .and_then_host(move |slice: &mut [u32]| {
                         *cell.lock().unwrap() = slice.iter().sum();

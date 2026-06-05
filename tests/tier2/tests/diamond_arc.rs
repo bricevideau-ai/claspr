@@ -1,7 +1,7 @@
 //! Diamond fan-out + fan-in where the shared input is held by a
 //! single `cl_mem`, not duplicated per branch.
 //!
-//! `upload(vec).arc()` produces `Arc<DeviceSlice<T>>`; each branch
+//! `upload!(vec).arc()` produces `Arc<DeviceSlice<T>>`; each branch
 //! gets an `Arc::clone` of the same handle, and the typed launcher
 //! accepts it via the new `KernelSliceArg<T>` impl for
 //! `Arc<DeviceSlice<T>>`. One device allocation, one upload — N
@@ -15,7 +15,7 @@
 //! one-cl_mem-shared shape.
 
 use claspr::Context;
-use claspr_async::{DeviceOperation, bundle, device_slice_alloc, download, upload, value};
+use claspr_async::{DeviceOperation, bundle, device_slice_alloc_zero, download, upload, value};
 use claspr_test_kernels::kernels;
 use std::sync::Arc;
 
@@ -45,7 +45,7 @@ fn diamond_shares_single_cl_mem_via_arc_device_slice() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let result: Vec<u32> = upload(vec![5u32; N])
+    let result: Vec<u32> = upload!(vec![5u32; N])
         .arc()
         .and_then(move |shared: Arc<claspr::DeviceSlice<u32>>| {
             let s1 = Arc::clone(&shared);
@@ -55,7 +55,7 @@ fn diamond_shares_single_cl_mem_via_arc_device_slice() {
             // uploads; the output buffer is just a fresh alloc.
             bundle!(
                 // Branch A.
-                bundle!(upload(vec![10u32; N]), device_slice_alloc::<u32>(N)).and_then(
+                bundle!(upload!(vec![10u32; N]), device_slice_alloc_zero!(u32, N)).and_then(
                     move |(a_in, out)| {
                         kernels_ref
                             .add_u32([N], s1, a_in, out)
@@ -63,7 +63,7 @@ fn diamond_shares_single_cl_mem_via_arc_device_slice() {
                     }
                 ),
                 // Branch B.
-                bundle!(upload(vec![20u32; N]), device_slice_alloc::<u32>(N)).and_then(
+                bundle!(upload!(vec![20u32; N]), device_slice_alloc_zero!(u32, N)).and_then(
                     move |(b_in, out)| {
                         kernels_ref
                             .add_u32([N], s2, b_in, out)
@@ -74,7 +74,7 @@ fn diamond_shares_single_cl_mem_via_arc_device_slice() {
             .and_then(move |(a_out, b_out)| {
                 // Final combine: write a_out + b_out into a fresh
                 // alloc. add_u32 takes (a, b, out).
-                bundle!(value(a_out), value(b_out), device_slice_alloc::<u32>(N)).and_then(
+                bundle!(value(a_out), value(b_out), device_slice_alloc_zero!(u32, N)).and_then(
                     move |(a, b, out)| {
                         kernels_ref
                             .add_u32([N], a, b, out)
@@ -82,7 +82,7 @@ fn diamond_shares_single_cl_mem_via_arc_device_slice() {
                     },
                 )
             })
-            .and_then(download)
+            .and_then(|buf| download!(buf))
         })
         .sync(&ctx)
         .expect("diamond chain");
@@ -109,7 +109,7 @@ fn arc_device_slice_refcount_holds_until_last_branch_finishes() {
 
     // 4-way fan: same shared buffer feeds 4 branches. `b` needs
     // real data (kernel reads it); `out` just needs an alloc.
-    let result: Vec<u32> = upload(vec![7u32; N])
+    let result: Vec<u32> = upload!(vec![7u32; N])
         .arc()
         .and_then(move |shared: Arc<claspr::DeviceSlice<u32>>| {
             let s1 = Arc::clone(&shared);
@@ -117,28 +117,28 @@ fn arc_device_slice_refcount_holds_until_last_branch_finishes() {
             let s3 = Arc::clone(&shared);
             let s4 = Arc::clone(&shared);
             bundle!(
-                bundle!(upload(vec![0u32; N]), device_slice_alloc::<u32>(N)).and_then(
+                bundle!(upload!(vec![0u32; N]), device_slice_alloc_zero!(u32, N)).and_then(
                     move |(b, out)| kernels_ref
                         .add_u32([N], s1, b, out)
                         .and_then(|(_, _, out)| value(out))
                 ),
-                bundle!(upload(vec![0u32; N]), device_slice_alloc::<u32>(N)).and_then(
+                bundle!(upload!(vec![0u32; N]), device_slice_alloc_zero!(u32, N)).and_then(
                     move |(b, out)| kernels_ref
                         .add_u32([N], s2, b, out)
                         .and_then(|(_, _, out)| value(out))
                 ),
-                bundle!(upload(vec![0u32; N]), device_slice_alloc::<u32>(N)).and_then(
+                bundle!(upload!(vec![0u32; N]), device_slice_alloc_zero!(u32, N)).and_then(
                     move |(b, out)| kernels_ref
                         .add_u32([N], s3, b, out)
                         .and_then(|(_, _, out)| value(out))
                 ),
-                bundle!(upload(vec![0u32; N]), device_slice_alloc::<u32>(N)).and_then(
+                bundle!(upload!(vec![0u32; N]), device_slice_alloc_zero!(u32, N)).and_then(
                     move |(b, out)| kernels_ref
                         .add_u32([N], s4, b, out)
                         .and_then(|(_, _, out)| value(out))
                 ),
             )
-            .and_then(|(a, _b, _c, _d)| download(a))
+            .and_then(|(a, _b, _c, _d)| download!(a))
         })
         .sync(&ctx)
         .expect("4-way fan chain");

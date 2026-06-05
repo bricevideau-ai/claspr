@@ -120,10 +120,10 @@ fn scenario_1_linear_chain(ctx: &Context) -> claspr::Result<()> {
     println!("\n=== Scenario 1: linear chain (producer/consumer) ===");
     let kernels = gpu::kernels(ctx)?;
     let kernels_ref = &kernels;
-    let result: Vec<f32> = upload(vec![1.0f32; N])
+    let result: Vec<f32> = upload!(vec![1.0f32; N])
         .and_then(|buf| kernels_ref.scale([N], buf, 2.0))
         .and_then(|buf| kernels_ref.scale([N], buf, 0.5))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(ctx)?;
     println!("  result[0..4] = {:?}", &result[..4]);
     assert!((result[0] - 1.0).abs() < EPS, "1 * 2 * 0.5 = 1");
@@ -135,12 +135,12 @@ fn scenario_2_bundle_parallel(ctx: &Context) -> claspr::Result<()> {
     let kernels = gpu::kernels(ctx)?;
     let kernels_ref = &kernels;
     let (a, b): (Vec<f32>, Vec<f32>) = bundle!(
-        upload(vec![1.0f32; N])
+        upload!(vec![1.0f32; N])
             .and_then(|buf| kernels_ref.add_bias([N], buf, 1.0))
-            .and_then(download),
-        upload(vec![10.0f32; N])
+            .and_then(|buf| download!(buf)),
+        upload!(vec![10.0f32; N])
             .and_then(|buf| kernels_ref.add_bias([N], buf, -1.0))
-            .and_then(download),
+            .and_then(|buf| download!(buf)),
     )
     .sync(ctx)?;
     println!("  a[0]={} b[0]={}", a[0], b[0]);
@@ -177,10 +177,10 @@ fn scenario_3_diamond(ctx: &Context) -> claspr::Result<()> {
             // for "alloc, no fill"; the macro doesn't have a 0-arg
             // arm because it's not vec!-shaped.
             bundle!(
-                device_slice_alloc::<f32>(N).and_then(move |out| kernels_ref
+                device_slice_alloc_zero!(f32, N).and_then(move |out| kernels_ref
                     .add_shared_bias([N], out, s1, len, 100.0)
                     .and_then(|(out, _sh)| value(out))),
-                device_slice_alloc::<f32>(N).and_then(move |out| kernels_ref
+                device_slice_alloc_zero!(f32, N).and_then(move |out| kernels_ref
                     .add_shared_bias([N], out, s2, len, 200.0)
                     .and_then(|(out, _sh)| value(out))),
             )
@@ -189,7 +189,7 @@ fn scenario_3_diamond(ctx: &Context) -> claspr::Result<()> {
                     .add_inplace([N], a, b)
                     .and_then(|(out, _b)| value(out))
             })
-            .and_then(download)
+            .and_then(|buf| download!(buf))
         })
         .sync(ctx)?;
     println!("  combined[0..4] = {:?}", &result[..4]);
@@ -208,10 +208,10 @@ fn scenario_4_ml_forward_pass(ctx: &Context) -> claspr::Result<()> {
     let len = N as u32;
 
     let result: Vec<f32> = bundle!(
-        upload(vec![0.1f32; N]), // w0
-        upload(vec![0.2f32; N]), // w1
-        upload(vec![1.0f32; N]), // input (kept for symmetry)
-        upload(vec![0.0f32; N]), // hidden
+        upload!(vec![0.1f32; N]), // w0
+        upload!(vec![0.2f32; N]), // w1
+        upload!(vec![1.0f32; N]), // input (kept for symmetry)
+        upload!(vec![0.0f32; N]), // hidden
     )
     .and_then(move |(w0, w1, _input, hidden)| {
         // Stage 1: hidden = w0 + 0.0
@@ -221,13 +221,13 @@ fn scenario_4_ml_forward_pass(ctx: &Context) -> claspr::Result<()> {
     })
     .and_then(move |(_w0, w1, hidden)| {
         // Stage 2: output = w1 + 0.5 (using a fresh output buf)
-        upload(vec![0.0f32; N]).and_then(move |output_buf| {
+        upload!(vec![0.0f32; N]).and_then(move |output_buf| {
             kernels_ref
                 .add_shared_bias([N], output_buf, w1, len, 0.5)
                 .and_then(move |(out, _w1)| value((hidden, out)))
         })
     })
-    .and_then(|(_hidden, out)| download(out))
+    .and_then(|(_hidden, out)| download!(out))
     .sync(ctx)?;
     println!("  output[0..4] = {:?}", &result[..4]);
     // w1 was 0.2; add_shared_bias writes shared[i] + 0.5 = 0.7
@@ -239,11 +239,11 @@ fn scenario_5_in_place_mutation(ctx: &Context) -> claspr::Result<()> {
     println!("\n=== Scenario 5: in-place mutation chain ===");
     let kernels = gpu::kernels(ctx)?;
     let kernels_ref = &kernels;
-    let result: Vec<f32> = upload(vec![1.0f32; N])
+    let result: Vec<f32> = upload!(vec![1.0f32; N])
         .and_then(|buf| kernels_ref.scale([N], buf, 2.0))
         .and_then(|buf| kernels_ref.scale([N], buf, 2.0))
         .and_then(|buf| kernels_ref.scale([N], buf, 0.25))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(ctx)?;
     println!("  result[0..4] = {:?}", &result[..4]);
     assert!((result[0] - 1.0).abs() < EPS, "1 * 2 * 2 * 0.25 = 1");
@@ -263,9 +263,9 @@ fn scenario_6_n_ary_fan_out(ctx: &Context) -> claspr::Result<()> {
     let inputs: Vec<Vec<f32>> = (0..4).map(|_| vec![1.0f32; tiles_per]).collect();
 
     let tile_results: Vec<Vec<f32>> = fan_out(inputs, move |tile_input| {
-        upload(tile_input)
+        upload!(tile_input)
             .and_then(move |buf| kernels_ref.scale([tiles_per], buf, 2.0))
-            .and_then(download)
+            .and_then(|buf| download!(buf))
     })
     .sync(ctx)?;
 
@@ -281,16 +281,16 @@ fn scenario_7_multi_producer_single_consumer(ctx: &Context) -> claspr::Result<()
     let kernels = gpu::kernels(ctx)?;
     let kernels_ref = &kernels;
     let result: Vec<f32> = bundle!(
-        upload(vec![1.0f32; N]),
-        upload(vec![10.0f32; N]),
-        upload(vec![100.0f32; N]), // c — becomes mean3's `out` input
+        upload!(vec![1.0f32; N]),
+        upload!(vec![10.0f32; N]),
+        upload!(vec![100.0f32; N]), // c — becomes mean3's `out` input
     )
     .and_then(move |(a, b, out)| {
         kernels_ref
             .mean3([N], out, a, b)
             .and_then(|(out, _a, _b)| value(out))
     })
-    .and_then(download)
+    .and_then(|buf| download!(buf))
     .sync(ctx)?;
     println!("  fused[0..4] = {:?}", &result[..4]);
     assert!((result[0] - 37.0).abs() < 1e-3, "(1+10+100)/3 ~ 37");
@@ -302,14 +302,14 @@ fn scenario_8_split_await(ctx: &Context) -> claspr::Result<()> {
     let kernels = gpu::kernels(ctx)?;
     let kernels_ref = &kernels;
     // First half via .sync() — caller holds buf back.
-    let buf_a = upload(vec![1.0f32; N])
+    let buf_a = upload!(vec![1.0f32; N])
         .and_then(|buf| kernels_ref.scale([N], buf, 2.0))
         .sync(ctx)?;
     let host_factor = 3.0f32;
     // Second half resumes with the same buffer.
     let result: Vec<f32> = kernels_ref
         .scale([N], buf_a, host_factor)
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(ctx)?;
     println!("  result[0..4] = {:?}", &result[..4]);
     assert!((result[0] - 6.0).abs() < EPS, "1 * 2 * 3 = 6");
@@ -325,16 +325,16 @@ fn scenario_9_conditional_graph(ctx: &Context) -> claspr::Result<()> {
     let use_expensive = true;
     let chain: DynOp<Vec<f32>> = if use_expensive {
         DynOp::new(
-            upload(vec![1.0f32; N])
+            upload!(vec![1.0f32; N])
                 .and_then(|buf| kernels_ref.scale([N], buf, 2.0))
                 .and_then(|buf| kernels_ref.scale([N], buf, 2.0))
-                .and_then(download),
+                .and_then(|buf| download!(buf)),
         )
     } else {
         DynOp::new(
-            upload(vec![1.0f32; N])
+            upload!(vec![1.0f32; N])
                 .and_then(|buf| kernels_ref.scale([N], buf, 4.0))
-                .and_then(download),
+                .and_then(|buf| download!(buf)),
         )
     };
     let result = chain.sync(ctx)?;
@@ -355,13 +355,13 @@ fn scenario_10_error_propagation(ctx: &Context) -> claspr::Result<()> {
     // not run" closure technically still runs (it produces an op
     // eagerly during execute()), but the produced kernel command
     // never actually fires — its wait-list events are failed.
-    let result = upload(vec![1.0f32; N])
+    let result = upload!(vec![1.0f32; N])
         .and_then(|buf| kernels_ref.scale([N], buf, 2.0))
         .and_then_host(|_slice: &mut [f32]| -> claspr::Result<()> {
             Err(claspr::Error::InvalidArgument("simulated stage failure"))
         })
         .and_then(|buf| kernels_ref.scale([N], buf, 2.0))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(ctx);
     match result {
         Ok(_) => panic!("should have errored"),
@@ -374,12 +374,12 @@ fn scenario_11_buffer_round_trip(ctx: &Context) -> claspr::Result<()> {
     println!("\n=== Scenario 11: buffer round-trip (pass in, get back) ===");
     let kernels = gpu::kernels(ctx)?;
     let kernels_ref = &kernels;
-    let buf = upload(vec![1.0f32; N]).sync(ctx)?;
+    let buf = upload!(vec![1.0f32; N]).sync(ctx)?;
     let buf = kernels_ref
         .scale([N], buf, 2.0)
         .and_then(|buf| kernels_ref.scale([N], buf, 3.0))
         .sync(ctx)?;
-    let result: Vec<f32> = value(buf).and_then(download).sync(ctx)?;
+    let result: Vec<f32> = value(buf).and_then(|buf| download!(buf)).sync(ctx)?;
     println!("  result[0..4] = {:?}", &result[..4]);
     assert!((result[0] - 6.0).abs() < EPS, "1 * 2 * 3 = 6");
     Ok(())
@@ -390,13 +390,13 @@ fn scenario_12_profiling(ctx_profiling: &Context) -> claspr::Result<()> {
     let kernels = gpu::kernels(ctx_profiling)?;
     let kernels_ref = &kernels;
     let (tx, rx) = std::sync::mpsc::channel();
-    let _result: Vec<f32> = upload(vec![1.0f32; N])
+    let _result: Vec<f32> = upload!(vec![1.0f32; N])
         .and_then(|buf| kernels_ref.scale([N], buf, 2.0))
         .and_then(|buf| kernels_ref.scale([N], buf, 0.5))
         .profiled(move |info| {
             tx.send(info).expect("send profiling info");
         })
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(ctx_profiling)?;
     let info = rx
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -420,9 +420,9 @@ fn scenario_13_batch_parallelism(ctx: &Context) -> claspr::Result<()> {
     let results: Vec<Vec<f32>> = fan_out((0..3).collect::<Vec<i32>>(), move |batch_idx| {
         let w = Arc::clone(&weights);
         bundle!(
-            upload(vec![batch_idx as f32; N]),
-            upload(w),
-            upload(vec![0.0f32; N]),
+            upload!(vec![batch_idx as f32; N]),
+            upload!(w),
+            upload!(vec![0.0f32; N]),
         )
         .and_then(move |(input, w_buf, out)| {
             kernels_ref
@@ -433,7 +433,7 @@ fn scenario_13_batch_parallelism(ctx: &Context) -> claspr::Result<()> {
                         .and_then(|(out, _input)| value(out))
                 })
         })
-        .and_then(download)
+        .and_then(|buf| download!(buf))
     })
     .sync(ctx)?;
 
@@ -469,7 +469,7 @@ fn scenario_14_cross_device(ctx: &Context, devs: &[Device]) -> claspr::Result<()
     // not from external captures — the chain is portable across
     // contexts and doesn't assume "upload landed buf on devs[0]"
     // (upload lands on context.device(), which may be either).
-    let result: Vec<f32> = upload(vec![1.0f32; N])
+    let result: Vec<f32> = upload!(vec![1.0f32; N])
         .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(0)))
         .and_then_with_context(move |ec, buf| {
             kernels_ref.scale([N], buf, 2.0).on_device(ec.device_at(0))
@@ -481,7 +481,7 @@ fn scenario_14_cross_device(ctx: &Context, devs: &[Device]) -> claspr::Result<()
         // Migrate back before download (mirrors the original spike's
         // terminal transfer).
         .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(0)))
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(ctx)?;
     println!("  result[0..4] = {:?}", &result[..4]);
     assert!((result[0] - 20.0).abs() < EPS, "1 * 2 * 10 = 20");
@@ -503,7 +503,7 @@ fn scenario_15_and_then_host(ctx: &Context) -> claspr::Result<()> {
     // Pass host-computed state through device memory instead — i.e.
     // write it into the buffer itself, here just by tripling every
     // element in place.
-    let result: Vec<f32> = upload(vec![1.0f32; N])
+    let result: Vec<f32> = upload!(vec![1.0f32; N])
         .and_then(|buf| kernels_ref.scale([N], buf, 2.0)) // [2; N]
         .and_then_host(|slice: &mut [f32]| {
             // In-queue host work: triple every element in place.
@@ -513,7 +513,7 @@ fn scenario_15_and_then_host(ctx: &Context) -> claspr::Result<()> {
             eprintln!("  host modified slice[0] = {}", slice[0]);
             Ok(())
         })
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(ctx)?;
     println!("  result[0..4] = {:?}", &result[..4]);
     assert!((result[0] - 6.0).abs() < EPS, "1 * 2 * 3 = 6");
@@ -529,7 +529,7 @@ fn scenario_16_host_accessible(ctx: &Context) -> claspr::Result<()> {
     // on the `DeviceSlice` — the closure receives a mapped `&mut [T]`,
     // mutations are committed back on the next stage via the unmap
     // command that's already queued.
-    let result: Vec<f32> = upload(vec![1.0f32; N])
+    let result: Vec<f32> = upload!(vec![1.0f32; N])
         .and_then(|buf| kernels_ref.scale([N], buf, 2.0)) // [2; N]
         .and_then_host(|slice: &mut [f32]| {
             slice[0] += 100.0;
@@ -537,7 +537,7 @@ fn scenario_16_host_accessible(ctx: &Context) -> claspr::Result<()> {
             Ok(())
         })
         .and_then(|buf| kernels_ref.scale([N], buf, 0.5)) // GPU again
-        .and_then(download)
+        .and_then(|buf| download!(buf))
         .sync(ctx)?;
     println!("  result[0..4] = {:?}", &result[..4]);
     assert!((result[0] - 51.0).abs() < EPS, "(2 + 100) * 0.5 = 51");
