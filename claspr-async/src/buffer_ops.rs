@@ -41,8 +41,9 @@
 //!
 //! Each op enqueues a single Tier 1 op with the upstream `deps` as
 //! its wait-list, then returns the resulting Event as the only entry
-//! in the downstream `Deps` — the same shape as
-//! [`DeviceSliceFilled`](crate::DeviceSliceFilled) and friends. Copy
+//! in the downstream `Deps` — the same shape as the alloc-uninit-based
+//! [`FillUninit`](crate::FillUninit) /
+//! [`WriteUninit`](crate::WriteUninit) chain ops. Copy
 //! returns a single Event covering both buffers; the buffers' own
 //! `Drop` waits track the event independently for SVM buffers (via
 //! `last_use` registration inside [`SvmFillOp`] / [`SvmCopyOp`]
@@ -126,8 +127,8 @@ pub struct DeviceSliceWriteOp<T, M: MemMode> {
 /// Write `source` into an existing [`DeviceSlice<T, M>`] via a
 /// non-blocking `clEnqueueWriteBuffer`. The host source is kept alive
 /// by a `clSetEventCallback(CL_COMPLETE)` drop holder until the write
-/// finishes — same keep-alive trick [`Upload`](crate::Upload) uses.
-/// The buffer passes through as the op's output.
+/// finishes — same keep-alive trick the [`upload!`](crate::upload!)
+/// macro uses. The buffer passes through as the op's output.
 ///
 /// Bound `M: HostWritable` — excludes
 /// [`HostReadOnly`](claspr::HostReadOnly),

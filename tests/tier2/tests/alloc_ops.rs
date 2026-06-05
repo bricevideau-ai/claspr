@@ -17,7 +17,8 @@
 
 use claspr::{Buffer, Context, Error, MappedSlice, SvmLevel};
 use claspr_async::{
-    DeviceOperation, bundle, device_slice_alloc_zero, download, mapped_slice_alloc_zero, upload,
+    DeviceOperation, FillUninit, WriteUninit, bundle, device_slice_alloc_uninit,
+    device_slice_alloc_zero, download, mapped_slice_alloc_uninit, mapped_slice_alloc_zero, upload,
     value,
 };
 use claspr_test_kernels::kernels;
@@ -114,6 +115,54 @@ fn and_then_with_context_closure_returns_kernel_op_directly() {
         .expect("and_then_with_context chain");
     assert_eq!(result.len(), N);
     assert!(result.iter().all(|&v| v == 30));
+}
+
+// ── direct Uninit trait paths ──────────────────────────────────────
+//
+// The sugar macros (`device_slice_alloc_zero!`, `device_slice_filled!`,
+// `upload!`) expand to alloc_uninit + FillUninit::fill / WriteUninit::write.
+// These tests exercise the underlying trait verbs directly so the
+// macros aren't the only coverage for the compositional path.
+
+#[test]
+fn alloc_uninit_then_fill_via_trait_verb() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+    let result: Vec<u32> = device_slice_alloc_uninit!(u32, N)
+        .and_then(|u| u.fill(99u32))
+        .and_then(|buf| kernels.scale_u32([N], buf, 2))
+        .and_then(|buf| download!(buf))
+        .sync(&ctx)
+        .expect("alloc_uninit + fill chain");
+    assert_eq!(result.len(), N);
+    assert!(result.iter().all(|&v| v == 198));
+}
+
+#[test]
+fn alloc_uninit_then_write_via_trait_verb() {
+    let Some(ctx) = ctx() else { return };
+    let result: Vec<u32> = device_slice_alloc_uninit!(u32, N)
+        .and_then(|u| u.write((0u32..N as u32).collect::<Vec<_>>()))
+        .and_then(|buf| download!(buf))
+        .sync(&ctx)
+        .expect("alloc_uninit + write chain");
+    assert_eq!(result, (0u32..N as u32).collect::<Vec<_>>());
+}
+
+#[test]
+fn mapped_alloc_uninit_then_fill_via_trait_verb() {
+    let Some(ctx) = ctx() else { return };
+    if ctx.svm_capability() == SvmLevel::None {
+        eprintln!("SKIP: no SVM");
+        return;
+    }
+    let buf: MappedSlice<u32> = mapped_slice_alloc_uninit!(u32, N)
+        .and_then(|u| u.fill(7u32))
+        .sync(&ctx)
+        .expect("mapped alloc_uninit + fill");
+    assert_eq!(buf.len(), N);
+    let g = buf.map().wait(&ctx).expect("map");
+    assert!(g.iter().all(|&v| v == 7));
 }
 
 #[test]

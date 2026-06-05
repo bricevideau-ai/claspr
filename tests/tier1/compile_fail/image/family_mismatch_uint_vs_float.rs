@@ -2,7 +2,7 @@
 //! emits `T: KernelImage2DWriteArg<Uint>`. `R32Float` is in the
 //! `Float` family, so it does not impl `KernelImage2DWriteArg<Uint>`.
 
-use claspr::{image::format::R32Float, Context, WriteOnly};
+use claspr::{Context, WriteOnly, image::format::R32Float};
 
 fn main() {
     let ctx = Context::any().unwrap();

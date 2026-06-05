@@ -272,6 +272,67 @@ impl<T, M: MemMode> fmt::Debug for USMSliceUninit<T, M> {
     }
 }
 
+impl<T: Copy, M: MemMode> USMSliceUninit<T, M> {
+    /// Initialize every slot to `value` and transition to an
+    /// initialised [`USMSlice<T, M>`]. Pure host operation — USM
+    /// is host memory, no OpenCL enqueue needed. Synchronous.
+    ///
+    /// Used by the Tier 2 [`crate::USMSlice`]-aware `.fill()` trait
+    /// method (in `claspr-async`) to implement the compositional
+    /// `alloc_uninit + fill` pattern uniformly across buffer kinds.
+    pub fn fill_into(self, value: T) -> USMSlice<T, M> {
+        let mut data = self.data;
+        for slot in data.iter_mut() {
+            *slot = MaybeUninit::new(value);
+        }
+        // SAFETY: every slot just got written by the loop above.
+        // Reuse the same Vec storage (no realloc — SVM-stability
+        // contract preserved).
+        let ptr = data.as_mut_ptr() as *mut T;
+        let len = data.len();
+        let cap = data.capacity();
+        std::mem::forget(data);
+        let data_t: Vec<T> = unsafe { Vec::from_raw_parts(ptr, len, cap) };
+        USMSlice {
+            data: data_t,
+            ctx: self.ctx,
+            in_flight: Mutex::new(Vec::new()),
+            _mode: PhantomData,
+        }
+    }
+
+    /// Memcpy `src` into the uninitialised slots and transition to
+    /// [`USMSlice<T, M>`]. Length mismatch panics. Synchronous
+    /// host operation.
+    pub fn write_from(self, src: &[T]) -> Result<USMSlice<T, M>> {
+        let mut data = self.data;
+        if src.len() != data.len() {
+            return Err(Error::LengthMismatch {
+                src: src.len(),
+                dst: data.len(),
+            });
+        }
+        // SAFETY: src.as_ptr() and data.as_mut_ptr() are both valid
+        // for `len` Ts; MaybeUninit<T> has the same layout as T so
+        // a byte-copy into the MaybeUninit slots is sound and
+        // leaves every slot initialized.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), data.as_mut_ptr() as *mut T, src.len());
+        }
+        let ptr = data.as_mut_ptr() as *mut T;
+        let len = data.len();
+        let cap = data.capacity();
+        std::mem::forget(data);
+        let data_t: Vec<T> = unsafe { Vec::from_raw_parts(ptr, len, cap) };
+        Ok(USMSlice {
+            data: data_t,
+            ctx: self.ctx,
+            in_flight: Mutex::new(Vec::new()),
+            _mode: PhantomData,
+        })
+    }
+}
+
 impl<T, M: MemMode> Buffer<T> for USMSlice<T, M> {
     fn len(&self) -> usize {
         self.data.len()

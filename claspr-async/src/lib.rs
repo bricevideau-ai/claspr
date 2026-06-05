@@ -55,12 +55,11 @@ pub mod op;
 pub mod profile;
 pub mod transfer;
 pub mod transfer_to_device;
+pub mod uninit_ext;
 pub mod usm;
 
 pub use alloc::{
-    DeviceSliceAllocUninit, DeviceSliceAllocZero, DeviceSliceFilled, DeviceSliceFromSlice,
-    MappedSliceAllocUninit, MappedSliceAllocZero, MappedSliceFilled, MappedSliceFromSlice,
-    MappedSliceUpload,
+    DeviceSliceAllocUninit, DeviceSliceFromSlice, MappedSliceAllocUninit, MappedSliceFromSlice,
 };
 pub use and_then_host::{AndThenHost, AndThenHostWithContext, DeviceOperationHostExt};
 pub use arc::ArcSplit;
@@ -90,9 +89,10 @@ pub use op::{
     wrap_event,
 };
 pub use profile::{DeviceOperationProfileExt, Profiled};
-pub use transfer::{Download, Upload, UploadSource};
+pub use transfer::{Download, UploadSource};
 pub use transfer_to_device::{TransferToDevice, transfer_to_device};
-pub use usm::{UsmSliceAllocZero, UsmSliceOp};
+pub use uninit_ext::{FillFromUninitOp, FillUninit, WriteFromUninitOp, WriteUninit};
+pub use usm::{UsmSliceAllocUninit, UsmSliceOp};
 
 // ── Tier 2 entry macros ────────────────────────────────────────────
 //
@@ -104,15 +104,21 @@ pub use usm::{UsmSliceAllocZero, UsmSliceOp};
 // The struct method form is the canonical constructor; macros are
 // sugar to skip the type-position turbofish noise at chain entry.
 
-/// Lazy zero-init `DeviceSlice<T, M>` alloc. `device_slice_alloc_zero!(T, N)`
-/// for default marker, `device_slice_alloc_zero!(T, N; M)` for explicit.
+/// Lazy zero-init `DeviceSlice<T, M>` alloc — sugar for
+/// `device_slice_alloc_uninit!(T, N).and_then(|u| u.fill(T::default()))`.
+/// `device_slice_alloc_zero!(T, N)` for default marker,
+/// `device_slice_alloc_zero!(T, N; M)` for explicit.
 #[macro_export]
 macro_rules! device_slice_alloc_zero {
     ($t:ty, $n:expr) => {
-        $crate::DeviceSliceAllocZero::<$t>::new($n)
+        $crate::DeviceOperation::and_then($crate::DeviceSliceAllocUninit::<$t>::new($n), |u| {
+            $crate::FillUninit::fill(u, <$t as ::core::default::Default>::default())
+        })
     };
     ($t:ty, $n:expr; $m:ty) => {
-        $crate::DeviceSliceAllocZero::<$t, $m>::new($n)
+        $crate::DeviceOperation::and_then($crate::DeviceSliceAllocUninit::<$t, $m>::new($n), |u| {
+            $crate::FillUninit::fill(u, <$t as ::core::default::Default>::default())
+        })
     };
 }
 
@@ -129,16 +135,21 @@ macro_rules! device_slice_alloc_uninit {
     };
 }
 
-/// Lazy alloc + fill: `device_slice_filled!(value, N)` /
-/// `device_slice_filled!(value, N; M)`. Dispatches Runtime vs
-/// DeviceKernel fill via the marker's `FillStrategy`.
+/// Lazy alloc + fill — sugar for `device_slice_alloc_uninit!(_, N).and_then(|u| u.fill(value))`.
+/// `device_slice_filled!(value, N)` / `device_slice_filled!(value, N; M)`.
+/// Dispatches Runtime vs DeviceKernel fill via the marker's `FillStrategy`.
 #[macro_export]
 macro_rules! device_slice_filled {
     ($v:expr, $n:expr) => {
-        $crate::DeviceSliceFilled::<_>::new($v, $n)
+        $crate::DeviceOperation::and_then($crate::DeviceSliceAllocUninit::<_>::new($n), move |u| {
+            $crate::FillUninit::fill(u, $v)
+        })
     };
     ($v:expr, $n:expr; $m:ty) => {
-        $crate::DeviceSliceFilled::<_, $m>::new($v, $n)
+        $crate::DeviceOperation::and_then(
+            $crate::DeviceSliceAllocUninit::<_, $m>::new($n),
+            move |u| $crate::FillUninit::fill(u, $v),
+        )
     };
 }
 
@@ -155,16 +166,28 @@ macro_rules! device_slice_from_slice {
     };
 }
 
-/// Lazy alloc + non-blocking host-to-device write.
+/// Lazy alloc + non-blocking host-to-device write — sugar for
+/// `device_slice_alloc_uninit!(_, src.len()).and_then(|u| u.write(src))`.
 /// `upload!(src)` / `upload!(src; M)`. Bound `M: HostUploadable`.
+/// `src` must be `Vec<T>` / `Box<[T]>` / `Arc<[T]>` (anything with
+/// a `.len()` method that converts via `Into<UploadSource<T>>`).
 #[macro_export]
 macro_rules! upload {
-    ($src:expr) => {
-        $crate::Upload::<_>::new($src)
-    };
-    ($src:expr; $m:ty) => {
-        $crate::Upload::<_, $m>::new($src)
-    };
+    ($src:expr) => {{
+        let src = $src;
+        let n = src.len();
+        $crate::DeviceOperation::and_then($crate::DeviceSliceAllocUninit::<_>::new(n), move |u| {
+            $crate::WriteUninit::write(u, src)
+        })
+    }};
+    ($src:expr; $m:ty) => {{
+        let src = $src;
+        let n = src.len();
+        $crate::DeviceOperation::and_then(
+            $crate::DeviceSliceAllocUninit::<_, $m>::new(n),
+            move |u| $crate::WriteUninit::write(u, src),
+        )
+    }};
 }
 
 /// Lazy non-blocking device-to-host read. `download!(buf)`. Marker
@@ -176,14 +199,19 @@ macro_rules! download {
     };
 }
 
-/// SVM analog of `device_slice_alloc_zero!`.
+/// SVM analog of `device_slice_alloc_zero!` — sugar over
+/// `mapped_slice_alloc_uninit!(T, N).and_then(|u| u.fill(T::default()))`.
 #[macro_export]
 macro_rules! mapped_slice_alloc_zero {
     ($t:ty, $n:expr) => {
-        $crate::MappedSliceAllocZero::<$t>::new($n)
+        $crate::DeviceOperation::and_then($crate::MappedSliceAllocUninit::<$t>::new($n), |u| {
+            $crate::FillUninit::fill(u, <$t as ::core::default::Default>::default())
+        })
     };
     ($t:ty, $n:expr; $m:ty) => {
-        $crate::MappedSliceAllocZero::<$t, $m>::new($n)
+        $crate::DeviceOperation::and_then($crate::MappedSliceAllocUninit::<$t, $m>::new($n), |u| {
+            $crate::FillUninit::fill(u, <$t as ::core::default::Default>::default())
+        })
     };
 }
 
@@ -198,14 +226,20 @@ macro_rules! mapped_slice_alloc_uninit {
     };
 }
 
-/// SVM analog of `device_slice_filled!`.
+/// SVM analog of `device_slice_filled!` — sugar over
+/// `mapped_slice_alloc_uninit!(_, N).and_then(|u| u.fill(value))`.
 #[macro_export]
 macro_rules! mapped_slice_filled {
     ($v:expr, $n:expr) => {
-        $crate::MappedSliceFilled::<_>::new($v, $n)
+        $crate::DeviceOperation::and_then($crate::MappedSliceAllocUninit::<_>::new($n), move |u| {
+            $crate::FillUninit::fill(u, $v)
+        })
     };
     ($v:expr, $n:expr; $m:ty) => {
-        $crate::MappedSliceFilled::<_, $m>::new($v, $n)
+        $crate::DeviceOperation::and_then(
+            $crate::MappedSliceAllocUninit::<_, $m>::new($n),
+            move |u| $crate::FillUninit::fill(u, $v),
+        )
     };
 }
 
@@ -220,29 +254,56 @@ macro_rules! mapped_slice_from_slice {
     };
 }
 
-/// SVM analog of `upload!`.
+/// SVM analog of `upload!` — sugar over
+/// `mapped_slice_alloc_uninit!(_, src.len()).and_then(|u| u.write(src))`.
 #[macro_export]
 macro_rules! mapped_slice_upload {
-    ($src:expr) => {
-        $crate::MappedSliceUpload::<_>::new($src)
-    };
-    ($src:expr; $m:ty) => {
-        $crate::MappedSliceUpload::<_, $m>::new($src)
-    };
+    ($src:expr) => {{
+        let src = $src;
+        let n = src.len();
+        $crate::DeviceOperation::and_then($crate::MappedSliceAllocUninit::<_>::new(n), move |u| {
+            $crate::WriteUninit::write(u, src)
+        })
+    }};
+    ($src:expr; $m:ty) => {{
+        let src = $src;
+        let n = src.len();
+        $crate::DeviceOperation::and_then(
+            $crate::MappedSliceAllocUninit::<_, $m>::new(n),
+            move |u| $crate::WriteUninit::write(u, src),
+        )
+    }};
 }
 
 // Note: `usm_slice!` is defined further below to merge with the
 // existing `vec!`-shape convenience arms (`usm_slice![v; N]` and
 // `usm_slice![a, b, c]`).
 
-/// USM zero-init alloc.
+/// Lazy [`USMSliceUninit<T, M>`](claspr::USMSliceUninit) alloc.
+/// No marker bound (USM is host memory).
+#[macro_export]
+macro_rules! usm_slice_alloc_uninit {
+    ($t:ty, $n:expr) => {
+        $crate::UsmSliceAllocUninit::<$t>::new($n)
+    };
+    ($t:ty, $n:expr; $m:ty) => {
+        $crate::UsmSliceAllocUninit::<$t, $m>::new($n)
+    };
+}
+
+/// USM zero-init alloc — sugar over
+/// `usm_slice_alloc_uninit!(T, N).and_then(|u| u.fill(T::default()))`.
 #[macro_export]
 macro_rules! usm_slice_alloc_zero {
     ($t:ty, $n:expr) => {
-        $crate::UsmSliceAllocZero::<$t>::new($n)
+        $crate::DeviceOperation::and_then($crate::UsmSliceAllocUninit::<$t>::new($n), |u| {
+            $crate::FillUninit::fill(u, <$t as ::core::default::Default>::default())
+        })
     };
     ($t:ty, $n:expr; $m:ty) => {
-        $crate::UsmSliceAllocZero::<$t, $m>::new($n)
+        $crate::DeviceOperation::and_then($crate::UsmSliceAllocUninit::<$t, $m>::new($n), |u| {
+            $crate::FillUninit::fill(u, <$t as ::core::default::Default>::default())
+        })
     };
 }
 

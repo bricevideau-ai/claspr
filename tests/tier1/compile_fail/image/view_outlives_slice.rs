@@ -3,7 +3,7 @@
 //! be a borrow-checker error — otherwise the view's cl_mem ref
 //! would point at released storage at use time.
 
-use claspr::{image::format::R32Uint, Context, DeviceSlice, Image1DBufferView, ReadWrite};
+use claspr::{Context, DeviceSlice, Image1DBufferView, ReadWrite, image::format::R32Uint};
 
 fn main() {
     let ctx = Context::any().unwrap();

@@ -44,8 +44,7 @@
 
 use crate::exec_ctx::ExecutionContext;
 use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
-use claspr::{Buffer, DeviceSlice, MemMode, ReadWrite, Result, register_drop_callback};
-use std::marker::PhantomData;
+use claspr::{Buffer, DeviceSlice, MemMode, ReadWrite, Result};
 use std::sync::Arc;
 
 // ── UploadSource ────────────────────────────────────────────────────
@@ -101,71 +100,8 @@ impl<T> From<Arc<[T]>> for UploadSource<T> {
     }
 }
 
-// ── upload ──────────────────────────────────────────────────────────
-
-/// Allocate a [`DeviceSlice<T, M>`] of `source.len()` elements and
-/// write `source` into it. Built by the [`upload!`](crate::upload!)
-/// macro or directly via [`Self::new`].
-///
-/// Non-blocking: `clEnqueueWriteBuffer(CL_FALSE)` runs on the chain's
-/// OOO queue with `deps` as wait-list. The host buffer is kept alive
-/// by a `clSetEventCallback(CL_COMPLETE)` that drops the holder when
-/// the write finishes.
-///
-/// **Marker bound:** `M: HostUploadable` — excludes `HostReadOnly`,
-/// `Frozen`, `DeviceScratch`. For those markers, use the
-/// [`device_slice_from_slice!`](crate::device_slice_from_slice!)
-/// path (`CL_MEM_COPY_HOST_PTR`, no post-creation write).
-pub struct Upload<T, M: MemMode = ReadWrite> {
-    source: Option<UploadSource<T>>,
-    _phantom: PhantomData<fn() -> M>,
-}
-
-impl<T, M> Upload<T, M>
-where
-    T: Send + Sync + 'static,
-    M: MemMode + claspr::HostUploadable + claspr::Fillable + Send + 'static,
-{
-    pub fn new<S>(source: S) -> Self
-    where
-        S: Into<UploadSource<T>>,
-    {
-        Self {
-            source: Some(source.into()),
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<T, M> DeviceOperation for Upload<T, M>
-where
-    T: Send + Sync + 'static,
-    M: MemMode + claspr::HostUploadable + claspr::Fillable + Send + 'static,
-{
-    type Output = DeviceSlice<T, M>;
-
-    fn execute(
-        mut self,
-        ctx: &ExecutionContext<'_>,
-        deps: Deps,
-    ) -> Result<(DeviceSlice<T, M>, Deps)> {
-        let source = self
-            .source
-            .take()
-            .expect("Upload::execute called twice — internal claspr-async bug");
-        // SAFETY: write below covers every byte of the freshly-allocated
-        // buffer; downstream stages gate on the returned write event.
-        let mut buf = unsafe {
-            DeviceSlice::<T, M>::alloc_uninit(ctx.context(), source.len())?.assume_init()
-        };
-        let event = buf
-            .write(source.as_slice())
-            .after_all(deps_as_events(&deps))
-            .submit(ctx)?;
-        register_drop_callback(&event, Box::new(source))?;
-        Ok((buf, vec![wrap_event(event)]))
-    }
-}
+// Upload moved out: the `upload!` macro is now sugar over
+// `device_slice_alloc_uninit!` + `WriteUninit::write`. See lib.rs.
 
 // ── download ────────────────────────────────────────────────────────
 

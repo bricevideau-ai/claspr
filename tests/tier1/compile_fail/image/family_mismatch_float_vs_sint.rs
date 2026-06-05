@@ -2,7 +2,7 @@
 //! `KernelImage2DWriteArg<Float>`. `R32Sint` is in the `Sint`
 //! family; doesn't impl the Float variant.
 
-use claspr::{image::format::R32Sint, Context, WriteOnly};
+use claspr::{Context, WriteOnly, image::format::R32Sint};
 
 fn main() {
     let ctx = Context::any().unwrap();

@@ -2,7 +2,7 @@
 //! (`KernelImageBufferWriteArg<Uint>`). `Image2D` impls
 //! `KernelImage2D*Arg` only.
 
-use claspr::{image::format::R32Uint, Context, WriteOnly};
+use claspr::{Context, WriteOnly, image::format::R32Uint};
 
 fn main() {
     let ctx = Context::any().unwrap();

@@ -17,7 +17,7 @@
 //! and report a spurious test failure.
 
 use claspr::{Context, DeviceSlice};
-use claspr_async::{upload, DeviceOperation, DeviceOperationHostExt};
+use claspr_async::{DeviceOperation, DeviceOperationHostExt, upload};
 
 fn main() {
     let ctx = Context::any().unwrap();

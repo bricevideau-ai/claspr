@@ -3,7 +3,7 @@
 //! `Image2D<WriteOnly, _>` only impls the `Write` variant, so the
 //! Read bound should fail.
 
-use claspr::{image::format::R32Float, Context, DeviceSlice, WriteOnly};
+use claspr::{Context, DeviceSlice, WriteOnly, image::format::R32Float};
 
 fn main() {
     let ctx = Context::any().unwrap();

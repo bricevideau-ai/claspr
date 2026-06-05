@@ -3,7 +3,7 @@
 //! `KernelImage2DWriteArg<Uint>`. `Image2D<ReadOnly, _>` only impls
 //! the `Read` variant.
 
-use claspr::{image::format::R32Uint, Context, ReadOnly};
+use claspr::{Context, ReadOnly, image::format::R32Uint};
 
 fn main() {
     let ctx = Context::any().unwrap();

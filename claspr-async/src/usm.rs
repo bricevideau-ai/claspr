@@ -6,7 +6,7 @@
 
 use crate::exec_ctx::ExecutionContext;
 use crate::op::{Deps, DeviceOperation};
-use claspr::{MemMode, ReadWrite, Result, USMSlice};
+use claspr::{MemMode, ReadWrite, Result, USMSlice, USMSliceUninit};
 use std::marker::PhantomData;
 
 /// Wrap a host `Vec<T>` as a [`USMSlice<T, M>`] at chain execute
@@ -48,21 +48,26 @@ where
     }
 }
 
-/// Lazy [`USMSlice<T, M>`] alloc symmetric with
-/// [`DeviceSliceAllocZero`](crate::DeviceSliceAllocZero) /
-/// [`MappedSliceAllocZero`](crate::MappedSliceAllocZero). Built by
-/// the [`usm_slice_alloc_zero!`](crate::usm_slice_alloc_zero!) macro.
+/// Lazy [`USMSliceUninit<T, M>`] alloc symmetric with
+/// [`DeviceSliceAllocUninit`](crate::DeviceSliceAllocUninit) /
+/// [`MappedSliceAllocUninit`](crate::MappedSliceAllocUninit). Built
+/// by the [`usm_slice_alloc_uninit!`](crate::usm_slice_alloc_uninit!)
+/// macro.
 ///
-/// **No marker bound** — USM is host memory; `vec![T::default(); N]`
-/// works regardless of the kernel-side marker.
-pub struct UsmSliceAllocZero<T, M: MemMode = ReadWrite> {
+/// Higher-level fill / write paths (`usm_slice_alloc_zero!`,
+/// `usm_slice!(vec)`) are sugar on top of this op composed with
+/// [`crate::FillUninit::fill`] / [`crate::WriteUninit::write`].
+///
+/// **No marker bound** — USM is host memory; allocation works
+/// regardless of the kernel-side marker.
+pub struct UsmSliceAllocUninit<T, M: MemMode = ReadWrite> {
     len: usize,
     _phantom: PhantomData<fn() -> (T, M)>,
 }
 
-impl<T, M> UsmSliceAllocZero<T, M>
+impl<T, M> UsmSliceAllocUninit<T, M>
 where
-    T: Default + Copy + Send + 'static,
+    T: Send + 'static,
     M: MemMode + Send + 'static,
 {
     pub fn new(len: usize) -> Self {
@@ -73,15 +78,19 @@ where
     }
 }
 
-impl<T, M> DeviceOperation for UsmSliceAllocZero<T, M>
+impl<T, M> DeviceOperation for UsmSliceAllocUninit<T, M>
 where
-    T: Default + Copy + Send + 'static,
+    T: Send + 'static,
     M: MemMode + Send + 'static,
 {
-    type Output = USMSlice<T, M>;
+    type Output = USMSliceUninit<T, M>;
 
-    fn execute(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(USMSlice<T, M>, Deps)> {
-        let slice = USMSlice::<T, M>::alloc_zero(ec.context(), self.len)?;
-        Ok((slice, deps))
+    fn execute(
+        self,
+        ec: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> Result<(USMSliceUninit<T, M>, Deps)> {
+        let uninit = USMSlice::<T, M>::alloc_uninit(ec.context(), self.len)?;
+        Ok((uninit, deps))
     }
 }
