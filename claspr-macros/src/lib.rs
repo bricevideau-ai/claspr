@@ -750,6 +750,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 }
             }
 
+            // Sealed-trait witness, paired with the `KernelOp` impl
+            // below. `__seal::Sealed` is `#[doc(hidden)]` in claspr;
+            // its only public emission site is right here.
+            impl #gen_decl ::claspr::__seal::Sealed for Op #gen_use {}
+
             // Single enqueue body shared by `.submit` (Tier 1) and by
             // `claspr-async`'s blanket `DeviceOperation` impl (Tier 2).
             // `extra_deps` is the chain's upstream wait-list when called

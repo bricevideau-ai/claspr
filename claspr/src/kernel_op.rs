@@ -22,13 +22,41 @@
 use crate::queue::Launcher;
 use crate::{Event, Result, cl_event};
 
+/// Sealed-trait marker for [`KernelOp`]. The
+/// [`#[claspr::kernel]`](claspr_macros::kernel) proc-macro emits an
+/// `impl ::claspr::__seal::Sealed for Op {}` alongside the
+/// `KernelOp` impl on each generated Op struct; the supertrait
+/// reference on [`KernelOp`] is the seal.
+///
+/// This module is `#[doc(hidden)]` and is not part of the crate's
+/// stable surface. Code outside the proc-macro should not impl
+/// [`Sealed`][__seal::Sealed]; if a real external use case for
+/// extending [`KernelOp`] appears, open an issue so the invariants
+/// in [`enqueue_into`][KernelOp::enqueue_into] can be documented
+/// and the trait properly unsealed in the same release.
+#[doc(hidden)]
+pub mod __seal {
+    /// Sealed-trait witness. See module docs.
+    pub trait Sealed {}
+}
+
 /// Enqueue contract for proc-macro-generated kernel Ops.
 ///
-/// Implementations are emitted by `#[claspr::kernel]` on its hidden
-/// per-kernel `Op` struct. The two terminals on `Op` (`.submit`,
-/// `.wait`) and the blanket `DeviceOperation` impl in `claspr-async`
-/// both go through [`enqueue_into`][Self::enqueue_into], so there is
-/// exactly one enqueue body per kernel.
+/// **Sealed.** Implementations are emitted only by
+/// `#[claspr::kernel]` on its hidden per-kernel `Op` struct — adding
+/// a `KernelOp` impl from outside the proc-macro will fail because
+/// the [`__seal::Sealed`] supertrait is not implementable there.
+/// This is deliberate: a wrong `KernelOp` impl silently corrupts
+/// event-graph dependencies and `Arc<DeviceSlice>` Drop ordering
+/// (the `last_use` registration that gates `clEnqueueSVMFree` /
+/// `clReleaseMemObject` against in-flight enqueues), and the
+/// integration is one-place enough that hand-rolled impls aren't
+/// load-bearing today.
+///
+/// The two terminals on `Op` (`.submit`, `.wait`) and the blanket
+/// `DeviceOperation` impl in `claspr-async` both go through
+/// [`enqueue_into`][Self::enqueue_into], so there is exactly one
+/// enqueue body per kernel.
 ///
 /// `extra_deps` is a slice of raw `cl_event` handles that must be
 /// merged into the kernel launch's wait list **on top of** the deps
@@ -43,7 +71,28 @@ use crate::{Event, Result, cl_event};
 /// move Ops into futures and across executor threads; the trait
 /// itself does not require it, so Tier 1-only consumers aren't
 /// burdened.
-pub trait KernelOp: Send + Sized {
+///
+/// ## The seal in action
+///
+/// Trying to impl [`KernelOp`] from outside the proc-macro fails
+/// to compile because [`__seal::Sealed`] isn't satisfied:
+///
+/// ```compile_fail
+/// use claspr::{KernelOp, Launcher, Event, Result, cl_event};
+///
+/// struct MyOp;
+/// impl KernelOp for MyOp {
+///     type Output = ();
+///     fn enqueue_into<L: Launcher>(
+///         self,
+///         _launcher: &L,
+///         _extra_deps: &[cl_event],
+///     ) -> Result<((), Event)> {
+///         unimplemented!()
+///     }
+/// }
+/// ```
+pub trait KernelOp: __seal::Sealed + Send + Sized {
     /// Slice arg(s) the kernel touches — bare for one slice, tuple
     /// for many, `()` for none. Mirrors the macro's existing
     /// `Output` shape on `Op`.

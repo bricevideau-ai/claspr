@@ -103,6 +103,8 @@ pub use image::{
     KernelImage3DReadWriteArg, KernelImage3DWriteArg, KernelImageBufferReadArg,
     KernelImageBufferReadWriteArg, KernelImageBufferWriteArg, format,
 };
+#[doc(hidden)]
+pub use kernel_op::__seal;
 pub use kernel_op::KernelOp;
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, KernelSliceArg, KernelSliceReadArg,
