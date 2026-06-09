@@ -66,6 +66,82 @@ That's the whole thing. The kernel function lives once, in the `#[claspr::device
 
 The typed launcher (`kernels.collatz_kernel(...)`) takes the slice arg by value and returns it from `.wait(...)`, so you can keep using the buffer after the launch without unsafe-borrowing across the device/host boundary. The slice param is generic over `KernelSliceArg<T>` — `DeviceSlice<T>`, `MappedSlice<T>` (coarse-grain SVM), and `USMSlice<T>` (fine-grain-system SVM over a host `Vec<T>`) all flow through the same call.
 
+## Other modes: pre-compiled and external SPIR-V
+
+Single-source mode above is the headline, but `claspr::kernels!`
+decouples the typed host API from where the SPIR-V comes from.
+Two further entry points cover the cases where the kernel isn't
+authored next to its caller:
+
+### Pre-compiled SPIR-V from a separate kernel crate
+
+When the kernel lives in its own crate (e.g., a Rust GPU library
+you want to vendor, or a build that wants the SPIR-V cached
+separately from host changes), drive `claspr-build` from the host's
+`build.rs` and bind the resulting bytes at runtime:
+
+```rust
+// build.rs — compiles ./kernel/ to SPIR-V, writes SPV_BYTES + ENTRY_POINTS.
+fn main() {
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap())
+        .join("kernels.rs");
+    claspr_build::compile("kernel").opencl12().write_to(&out).unwrap();
+}
+```
+
+```rust
+// src/lib.rs — declare the host-side typed surface near the call site.
+mod generated { include!(concat!(env!("OUT_DIR"), "/kernels.rs")); }
+
+claspr::kernels! {
+    pub mod gpu {
+        fn fill_u32(
+            #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+            #[spirv(cross_workgroup)] data: &mut [u32],
+            value: u32,
+        );
+    }
+}
+
+let kernels = gpu::Kernels::load_from(&ctx, generated::SPV_BYTES)?;
+let buf = kernels.fill_u32([N], buf, 0xdead_beefu32).wait(&ctx)?;
+```
+
+See `tests/explicit-compile/` for the canonical reference shape
+(build script, `kernels!` declaration, three round-trip tests).
+
+### External SPIR-V (clang, downloaded blobs, runtime codegen)
+
+When the SPIR-V comes from outside the Rust ecosystem — clang's
+`-target spirv64`, a downloaded blob, or a runtime code-generator —
+skip `claspr-build` entirely. Declare the typed surface with
+`claspr::kernels!` and feed it the bytes (or a pre-built `Program`):
+
+```rust
+claspr::kernels! {
+    pub mod gpu {
+        fn fill_u32(
+            #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+            #[spirv(cross_workgroup)] data: &mut [u32],
+            value: u32,
+        );
+    }
+}
+
+let bytes = std::fs::read("kernels.spv")?;          // or clang, or HTTP fetch
+let kernels = gpu::Kernels::load_from(&ctx, &bytes)?;
+// Or, if you want to share the built program across surfaces:
+let program = ctx.build_program(&bytes)?;
+let kernels = gpu::Kernels::bind(program)?;
+```
+
+The trade-off vs single-source: `kernels!` signatures live in the
+host crate and must match the kernel's parameter list manually —
+no proc-macro discovery, no build-time kernel-arg-info validation
+against the source. In exchange you get to consume SPIR-V from any
+toolchain. `tests/explicit-compile/` exercises both `load_from` and
+`bind` end-to-end.
+
 ## Composing kernels: the Tier 2 async chain
 
 The same `kernels.foo(...)` method that returns a Tier 1 Op also implements `DeviceOperation`, so it composes into a lazy chain in `claspr-async`:
