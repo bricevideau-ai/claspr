@@ -26,10 +26,10 @@ fn tuple_form_sets_local_size_via_local_invocation_id() {
     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let buf = kernels
         .local_id_u32(([N], [L]), buf)
-        .wait(&ctx)
+        .wait()
         .expect("launch with local via tuple form");
     let mut out = vec![0u32; N];
-    buf.read(&mut out).wait(&ctx).expect("read");
+    buf.read(&mut out).wait().expect("read");
     for (i, &v) in out.iter().enumerate() {
         let expected = (i % L) as u32;
         assert_eq!(v, expected, "out[{i}] = {v}, expected {expected}");

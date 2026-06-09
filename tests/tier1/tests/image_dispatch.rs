@@ -58,9 +58,9 @@ fn fill_pattern_rgba8_uint() {
     let img = claspr::Image2D::<WriteOnly, R8G8B8A8Uint>::alloc(&ctx, W, H).unwrap();
     let img = kernels
         .fill_pattern([W as usize, H as usize], img, W, H)
-        .wait(&ctx)
+        .wait()
         .unwrap();
-    let bytes = img.read_bytes_alloc().wait(&ctx).unwrap();
+    let bytes = img.read_bytes_alloc().wait().unwrap();
     // Pixel (0,0) is value 0 → R=0; pixel (1,0) → R=1; pixel (0,1) → R=W (16).
     // Each pixel is 4 bytes (RGBA8); R channel is byte 0 of each pixel.
     assert_eq!(bytes[0], 0); // pixel (0,0) R
@@ -79,9 +79,9 @@ fn fill_pattern_r32_uint() {
     let img = claspr::Image2D::<WriteOnly, R32Uint>::alloc(&ctx, W, H).unwrap();
     let img = kernels
         .fill_pattern([W as usize, H as usize], img, W, H)
-        .wait(&ctx)
+        .wait()
         .unwrap();
-    let pixels: Vec<u32> = img.read_alloc().wait(&ctx).unwrap();
+    let pixels: Vec<u32> = img.read_alloc().wait().unwrap();
     // The kernel writes (x + y*W, 0, 0, 0xFFFF_FFFF) per pixel.
     // R32Uint is single-channel so only the .x part survives the
     // read-back — the other components are dropped by the hardware
@@ -106,9 +106,9 @@ fn fill_pattern_rgba32_uint() {
     let img = claspr::Image2D::<WriteOnly, R32G32B32A32Uint>::alloc(&ctx, W, H).unwrap();
     let img = kernels
         .fill_pattern([W as usize, H as usize], img, W, H)
-        .wait(&ctx)
+        .wait()
         .unwrap();
-    let pixels: Vec<[u32; 4]> = img.read_alloc().wait(&ctx).unwrap();
+    let pixels: Vec<[u32; 4]> = img.read_alloc().wait().unwrap();
     for y in 0..H {
         for x in 0..W {
             let got = pixels[(y * W + x) as usize];
@@ -129,9 +129,9 @@ fn fill_pattern_r32_float() {
     let img = claspr::Image2D::<WriteOnly, R32Float>::alloc(&ctx, W, H).unwrap();
     let img = kernels
         .fill_pattern([W as usize, H as usize], img, W, H)
-        .wait(&ctx)
+        .wait()
         .unwrap();
-    let pixels: Vec<f32> = img.read_alloc().wait(&ctx).unwrap();
+    let pixels: Vec<f32> = img.read_alloc().wait().unwrap();
     for y in 0..H {
         for x in 0..W {
             let got = pixels[(y * W + x) as usize];
@@ -151,9 +151,9 @@ fn fill_pattern_r32_sint() {
     let img = claspr::Image2D::<WriteOnly, R32Sint>::alloc(&ctx, W, H).unwrap();
     let img = kernels
         .fill_pattern([W as usize, H as usize], img, W, H)
-        .wait(&ctx)
+        .wait()
         .unwrap();
-    let pixels: Vec<i32> = img.read_alloc().wait(&ctx).unwrap();
+    let pixels: Vec<i32> = img.read_alloc().wait().unwrap();
     for y in 0..H {
         for x in 0..W {
             let got = pixels[(y * W + x) as usize];
@@ -180,7 +180,7 @@ fn read_only_float_image_to_buffer() {
             seed[(y * W + x) as usize] = (x as f32) + (y as f32) * 100.0;
         }
     }
-    img.write(&seed).wait(&ctx).unwrap();
+    img.write(&seed).wait().unwrap();
 
     // Seed with finite values so the `out[i] * 0.0` trick in the
     // kernel produces a clean zero (NaN otherwise).
@@ -189,10 +189,10 @@ fn read_only_float_image_to_buffer() {
 
     let (_img, out) = kernels
         .copy_to_buffer([W as usize, H as usize], img, out, W, H)
-        .wait(&ctx)
+        .wait()
         .unwrap();
     let mut result = vec![0.0f32; (W * H) as usize];
-    out.read(&mut result).wait(&ctx).unwrap();
+    out.read(&mut result).wait().unwrap();
     assert_eq!(result, seed, "kernel-read pixels should match host-seeded");
 }
 
@@ -210,17 +210,17 @@ fn read_only_sint_image_to_buffer() {
             seed[(y * W + x) as usize] = (x as i32) - (y as i32) * 10;
         }
     }
-    img.write(&seed).wait(&ctx).unwrap();
+    img.write(&seed).wait().unwrap();
 
     let zeros = vec![0i32; (W * H) as usize];
     let out = DeviceSlice::<i32>::from_slice(&ctx, &zeros).unwrap();
 
     let (_img, out) = kernels
         .copy_to_buffer([W as usize, H as usize], img, out, W, H)
-        .wait(&ctx)
+        .wait()
         .unwrap();
     let mut result = vec![0i32; (W * H) as usize];
-    out.read(&mut result).wait(&ctx).unwrap();
+    out.read(&mut result).wait().unwrap();
     assert_eq!(result, seed);
 }
 
@@ -234,11 +234,8 @@ fn dim1_fill_pattern_r32_uint() {
     let Some(ctx) = ctx() else { return };
     let kernels = claspr_test_image_kernels::dim1_uint::kernels(&ctx).unwrap();
     let img = Image1D::<WriteOnly, R32Uint>::alloc(&ctx, W).unwrap();
-    let img = kernels
-        .fill_pattern([W as usize], img, W)
-        .wait(&ctx)
-        .unwrap();
-    let pixels: Vec<u32> = img.read_alloc().wait(&ctx).unwrap();
+    let img = kernels.fill_pattern([W as usize], img, W).wait().unwrap();
+    let pixels: Vec<u32> = img.read_alloc().wait().unwrap();
     assert_eq!(pixels.len(), W as usize);
     for x in 0..W {
         assert_eq!(pixels[x as usize], x, "pixel {x}");
@@ -259,9 +256,9 @@ fn dim3_fill_pattern_r32_uint() {
     let img = Image3D::<WriteOnly, R32Uint>::alloc(&ctx, W, H, D).unwrap();
     let img = kernels
         .fill_pattern([W as usize, H as usize, D as usize], img, W, H, D)
-        .wait(&ctx)
+        .wait()
         .unwrap();
-    let pixels: Vec<u32> = img.read_alloc().wait(&ctx).unwrap();
+    let pixels: Vec<u32> = img.read_alloc().wait().unwrap();
     assert_eq!(pixels.len(), (W * H * D) as usize);
     for z in 0..D {
         for y in 0..H {
@@ -285,11 +282,8 @@ fn dim_buffer_fill_pattern_r32_uint() {
     let Some(ctx) = ctx() else { return };
     let kernels = claspr_test_image_kernels::dim_buffer_uint::kernels(&ctx).unwrap();
     let img = Image1DBuffer::<WriteOnly, R32Uint>::alloc(&ctx, N).unwrap();
-    let img = kernels
-        .fill_pattern([N as usize], img, N)
-        .wait(&ctx)
-        .unwrap();
-    let pixels: Vec<u32> = img.read_alloc().wait(&ctx).unwrap();
+    let img = kernels.fill_pattern([N as usize], img, N).wait().unwrap();
+    let pixels: Vec<u32> = img.read_alloc().wait().unwrap();
     assert_eq!(pixels.len(), N as usize);
     for x in 0..N {
         assert_eq!(pixels[x as usize], x.wrapping_mul(3));
@@ -323,11 +317,11 @@ fn dim_buffer_view_of_slice() {
     // Kernel reads the view (as `image1d_buffer_t`), writes to out.
     let (_view, out) = kernels
         .copy_to_buffer([N as usize], view, out, N)
-        .wait(&ctx)
+        .wait()
         .unwrap();
 
     let mut result = vec![0u32; N as usize];
-    out.read(&mut result).wait(&ctx).unwrap();
+    out.read(&mut result).wait().unwrap();
     assert_eq!(
         result, seed,
         "kernel-read pixels through view should match host-seeded slice"
@@ -361,17 +355,17 @@ fn dim_buffer_read_to_slice() {
 
     let mut img = Image1DBuffer::<ReadOnly, R32Uint>::alloc(&ctx, N).unwrap();
     let seed: Vec<u32> = (0..N).map(|x| x * 7 + 1).collect();
-    img.write(&seed).wait(&ctx).unwrap();
+    img.write(&seed).wait().unwrap();
 
     let zeros = vec![0u32; N as usize];
     let out = DeviceSlice::<u32>::from_slice(&ctx, &zeros).unwrap();
 
     let (_img, out) = kernels
         .copy_to_buffer([N as usize], img, out, N)
-        .wait(&ctx)
+        .wait()
         .unwrap();
     let mut result = vec![0u32; N as usize];
-    out.read(&mut result).wait(&ctx).unwrap();
+    out.read(&mut result).wait().unwrap();
     assert_eq!(result, seed);
 }
 
@@ -394,9 +388,9 @@ fn dim1_array_fill_pattern_r32_uint() {
     // as the layer index.
     let img = kernels
         .fill_pattern([WIDTH as usize, LAYERS as usize], img, WIDTH, LAYERS)
-        .wait(&ctx)
+        .wait()
         .unwrap();
-    let pixels: Vec<u32> = img.read_alloc().wait(&ctx).unwrap();
+    let pixels: Vec<u32> = img.read_alloc().wait().unwrap();
     assert_eq!(pixels.len(), (WIDTH * LAYERS) as usize);
     for layer in 0..LAYERS {
         for x in 0..WIDTH {
@@ -427,9 +421,9 @@ fn dim2_array_fill_pattern_r32_uint() {
             LH,
             LAYERS,
         )
-        .wait(&ctx)
+        .wait()
         .unwrap();
-    let pixels: Vec<u32> = img.read_alloc().wait(&ctx).unwrap();
+    let pixels: Vec<u32> = img.read_alloc().wait().unwrap();
     assert_eq!(pixels.len(), (LW * LH * LAYERS) as usize);
     for layer in 0..LAYERS {
         for y in 0..LH {

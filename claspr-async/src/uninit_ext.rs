@@ -93,7 +93,7 @@ where
         let event = buf
             .fill(value)
             .after_all(deps_as_events(&deps))
-            .submit(ec)?;
+            .submit_on(ec)?;
         Ok((buf, vec![wrap_event(event)]))
     }
 }
@@ -124,7 +124,7 @@ where
         let event = buf
             .fill(value)
             .after_all(deps_as_events(&deps))
-            .submit(ec)?;
+            .submit_on(ec)?;
         Ok((buf, vec![wrap_event(event)]))
     }
 }
@@ -214,7 +214,7 @@ where
         let event = buf
             .write(src.as_slice())
             .after_all(deps_as_events(&deps))
-            .submit(ec)?;
+            .submit_on(ec)?;
         // Keep-alive: drop the host source when CL_COMPLETE fires.
         register_drop_callback(&event, Box::new(src))?;
         Ok((buf, vec![wrap_event(event)]))
@@ -250,7 +250,7 @@ where
         let event = buf
             .write(src.as_slice())
             .after_all(deps_as_events(&deps))
-            .submit(ec)?;
+            .submit_on(ec)?;
         register_drop_callback(&event, Box::new(src))?;
         Ok((buf, vec![wrap_event(event)]))
     }

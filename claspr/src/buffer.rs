@@ -167,7 +167,7 @@ impl<T: Default + Copy, M: MemMode + Fillable> DeviceSlice<T, M> {
         // synchronous `fill` below before returning. No path from
         // here can observe the uninit bytes.
         let mut slice = unsafe { Self::alloc_uninit(ctx, len)?.assume_init() };
-        slice.fill(T::default()).wait(ctx)?;
+        slice.fill(T::default()).wait()?;
         Ok(slice)
     }
 }
@@ -296,6 +296,7 @@ impl<T, M: MemMode + HostWritable> DeviceSlice<T, M> {
     pub fn write<'a>(&'a mut self, data: &'a [T]) -> WriteOp<'a, T> {
         WriteOp {
             buffer: &mut self.buffer,
+            ctx: &self.ctx,
             dst_len: self.len,
             data,
             deps: Vec::new(),
@@ -337,6 +338,7 @@ impl<T, M: MemMode + HostReadable> DeviceSlice<T, M> {
     pub fn read<'a>(&'a self, dst: &'a mut [T]) -> ReadOp<'a, T> {
         ReadOp {
             buffer: &self.buffer,
+            ctx: &self.ctx,
             src_len: self.len,
             dst,
             deps: Vec::new(),
@@ -382,6 +384,7 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
         CopyOp {
             src: &self.buffer,
             dst: &mut dst.buffer,
+            ctx: &self.ctx,
             src_len: self.len,
             dst_len: dst.len,
             deps: Vec::new(),
@@ -411,6 +414,7 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
     pub fn migrate(&self) -> MigrateOp<'_, T> {
         MigrateOp {
             buffer: &self.buffer,
+            ctx: &self.ctx,
             deps: Vec::new(),
             profile_cb: None,
         }
@@ -517,6 +521,7 @@ impl<T: Copy, M: MemMode> DeviceSlice<T, M> {
 /// "alloc + write in one shot" convenience, see [`DeviceSlice::from_slice`].
 pub struct WriteOp<'a, T> {
     buffer: &'a mut ManuallyDrop<ClBuffer<T>>,
+    ctx: &'a Context,
     dst_len: usize,
     data: &'a [T],
     deps: Vec<cl_event>,
@@ -551,9 +556,19 @@ impl<'a, T> WriteOp<'a, T> {
         self
     }
 
-    /// Sync terminal — enqueue the write with `CL_TRUE` on `launcher`'s
+    /// Sync terminal — enqueue the write with `CL_TRUE` on the
+    /// carried buffer's context default queue. Shorthand for
+    /// [`wait_on`](Self::wait_on) with `&buf.ctx()`. The driver
+    /// blocks until the buffer has been written.
+    pub fn wait(self) -> Result<()> {
+        let ctx = self.ctx;
+        self.wait_on(ctx)
+    }
+
+    /// Sync terminal with an explicit launcher (for cross-queue
+    /// ordering). Enqueue the write with `CL_TRUE` on `launcher`'s
     /// queue; the driver blocks until the buffer has been written.
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         if self.data.len() != self.dst_len {
             return Err(Error::LengthMismatch {
                 src: self.data.len(),
@@ -578,9 +593,18 @@ impl<'a, T> WriteOp<'a, T> {
     }
 
     /// Non-blocking terminal — enqueue the write with `CL_FALSE` on
-    /// `launcher`'s queue, return the completion event. `data` must
-    /// outlive the event.
-    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+    /// the carried buffer's context default queue. Shorthand for
+    /// [`submit_on`](Self::submit_on) with `&buf.ctx()`. `data` must
+    /// outlive the returned event.
+    pub fn submit(self) -> Result<Event> {
+        let ctx = self.ctx;
+        self.submit_on(ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher. Enqueue the
+    /// write with `CL_FALSE` on `launcher`'s queue, return the
+    /// completion event. `data` must outlive the event.
+    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         if self.data.len() != self.dst_len {
             return Err(Error::LengthMismatch {
                 src: self.data.len(),
@@ -609,6 +633,7 @@ impl<'a, T> WriteOp<'a, T> {
 /// [`DeviceSlice::read`].
 pub struct ReadOp<'a, T> {
     buffer: &'a ClBuffer<T>,
+    ctx: &'a Context,
     src_len: usize,
     dst: &'a mut [T],
     deps: Vec<cl_event>,
@@ -638,9 +663,16 @@ impl<'a, T> ReadOp<'a, T> {
         self
     }
 
-    /// Sync terminal — enqueue the read with `CL_TRUE` on `launcher`'s
-    /// queue; the driver blocks until `dst` has been filled.
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+    /// Sync terminal — enqueue the read with `CL_TRUE` on the
+    /// carried buffer's context default queue.
+    pub fn wait(self) -> Result<()> {
+        let ctx = self.ctx;
+        self.wait_on(ctx)
+    }
+
+    /// Sync terminal with an explicit launcher. Enqueue the read
+    /// with `CL_TRUE`; the driver blocks until `dst` has been filled.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         if self.dst.len() != self.src_len {
             return Err(Error::LengthMismatch {
                 src: self.src_len,
@@ -665,10 +697,15 @@ impl<'a, T> ReadOp<'a, T> {
     }
 
     /// Non-blocking terminal — enqueue the read with `CL_FALSE` on
-    /// `launcher`'s queue, return the completion event. `dst` is only
-    /// valid after the event fires; the caller must keep `dst` alive
-    /// until then.
-    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+    /// the carried buffer's context default queue.
+    pub fn submit(self) -> Result<Event> {
+        let ctx = self.ctx;
+        self.submit_on(ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher. `dst` must
+    /// stay alive until the returned event fires.
+    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         if self.dst.len() != self.src_len {
             return Err(Error::LengthMismatch {
                 src: self.src_len,
@@ -700,6 +737,7 @@ impl<'a, T> ReadOp<'a, T> {
 pub struct CopyOp<'a, T> {
     src: &'a ClBuffer<T>,
     dst: &'a mut ClBuffer<T>,
+    ctx: &'a Context,
     src_len: usize,
     dst_len: usize,
     deps: Vec<cl_event>,
@@ -729,15 +767,29 @@ impl<'a, T> CopyOp<'a, T> {
         self
     }
 
-    /// Sync terminal — enqueue + wait on the resulting event.
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+    /// Sync terminal — enqueue + wait on the resulting event, using
+    /// the carried src buffer's context default queue.
+    pub fn wait(self) -> Result<()> {
+        let ctx = self.ctx;
+        self.wait_on(ctx)
+    }
+
+    /// Sync terminal with an explicit launcher.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
-    /// Non-blocking terminal — enqueue and return the completion event.
-    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+    /// Non-blocking terminal — enqueue and return the completion
+    /// event, on the carried src buffer's context default queue.
+    pub fn submit(self) -> Result<Event> {
+        let ctx = self.ctx;
+        self.submit_on(ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher.
+    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         self.into_event(launcher)
     }
 
@@ -776,6 +828,7 @@ impl<'a, T> CopyOp<'a, T> {
 /// as an opt-in modifier; for now the conservative default is right.
 pub struct MigrateOp<'a, T> {
     buffer: &'a ClBuffer<T>,
+    ctx: &'a Context,
     deps: Vec<cl_event>,
     profile_cb: Option<ProfileCb>,
 }
@@ -803,15 +856,29 @@ impl<'a, T> MigrateOp<'a, T> {
         self
     }
 
-    /// Sync terminal — enqueue the migrate and wait on its event.
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+    /// Sync terminal — enqueue the migrate and wait on its event,
+    /// on the carried buffer's context default queue.
+    pub fn wait(self) -> Result<()> {
+        let ctx = self.ctx;
+        self.wait_on(ctx)
+    }
+
+    /// Sync terminal with an explicit launcher.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
-    /// Non-blocking terminal — enqueue and return the completion event.
-    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+    /// Non-blocking terminal — enqueue and return the completion
+    /// event, on the carried buffer's context default queue.
+    pub fn submit(self) -> Result<Event> {
+        let ctx = self.ctx;
+        self.submit_on(ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher.
+    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         self.into_event(launcher)
     }
 
@@ -891,13 +958,29 @@ impl<'a, T: Copy, M: MemMode + Fillable> FillOp<'a, T, M> {
         self
     }
 
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+    /// Sync terminal — enqueue the fill on the carried buffer's
+    /// context default queue and block on the event.
+    pub fn wait(self) -> Result<()> {
+        let ctx = self.ctx;
+        self.wait_on(ctx)
+    }
+
+    /// Sync terminal with an explicit launcher.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
-    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+    /// Non-blocking terminal — enqueue on the carried buffer's
+    /// context default queue, return the completion event.
+    pub fn submit(self) -> Result<Event> {
+        let ctx = self.ctx;
+        self.submit_on(ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher.
+    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         self.into_event(launcher)
     }
 
@@ -1064,23 +1147,35 @@ pub struct DeviceMapOp<'a, T, M: MemMode> {
 
 impl<'a, T, M: MemMode + HostReadable> DeviceMapOp<'a, T, M> {
     /// Blocking terminal — enqueue
-    /// `clEnqueueMapBuffer(CL_TRUE, CL_MAP_READ)` on `launcher`'s
-    /// queue and return a [`DeviceMappedReadGuard`].
-    pub fn wait<L: Launcher>(self, launcher: &L) -> Result<DeviceMappedReadGuard<'a, T, M>> {
+    /// `clEnqueueMapBuffer(CL_TRUE, CL_MAP_READ)` on the owning
+    /// buffer's context default queue.
+    pub fn wait(self) -> Result<DeviceMappedReadGuard<'a, T, M>> {
+        let ctx = &self.owner.ctx;
+        self.wait_on(ctx)
+    }
+
+    /// Blocking terminal with an explicit launcher.
+    pub fn wait_on<L: Launcher>(self, launcher: &L) -> Result<DeviceMappedReadGuard<'a, T, M>> {
         let (guard, event) = DeviceMappedReadGuard::enqueue_map(self.owner, launcher, true)?;
         drop(event);
         Ok(guard)
     }
 
     /// Non-blocking terminal — enqueue
-    /// `clEnqueueMapBuffer(CL_FALSE, CL_MAP_READ)` on `launcher`'s
-    /// queue and return a [`DeviceMapReadPending`] carrying the map
-    /// event. Bytes are NOT spec-valid for host reads until the map
-    /// event completes; consume via
-    /// [`DeviceMapReadPending::wait`] to block on it and get the
-    /// guard, or use [`DeviceMapReadPending::event`] to thread the
-    /// map event into a cross-queue chain first.
-    pub fn submit<L: Launcher>(self, launcher: &L) -> Result<DeviceMapReadPending<'a, T, M>> {
+    /// `clEnqueueMapBuffer(CL_FALSE, CL_MAP_READ)` on the owning
+    /// buffer's context default queue.
+    pub fn submit(self) -> Result<DeviceMapReadPending<'a, T, M>> {
+        let ctx = &self.owner.ctx;
+        self.submit_on(ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher. Returns a
+    /// [`DeviceMapReadPending`] carrying the map event. Bytes are
+    /// NOT spec-valid for host reads until the map event completes;
+    /// consume via [`DeviceMapReadPending::wait`] for the guard, or
+    /// use [`DeviceMapReadPending::event`] to thread the map event
+    /// into a cross-queue chain first.
+    pub fn submit_on<L: Launcher>(self, launcher: &L) -> Result<DeviceMapReadPending<'a, T, M>> {
         let (guard, event) = DeviceMappedReadGuard::enqueue_map(self.owner, launcher, false)?;
         Ok(DeviceMapReadPending {
             guard: Some(guard),
@@ -1099,15 +1194,30 @@ pub struct DeviceMapMutOp<'a, T, M: MemMode> {
 impl<'a, T, M: MemMode + HostWritable + HostReadable> DeviceMapMutOp<'a, T, M> {
     /// Blocking terminal — enqueue
     /// `clEnqueueMapBuffer(CL_TRUE, CL_MAP_READ | CL_MAP_WRITE)` on
-    /// `launcher`'s queue and return a [`DeviceMappedWriteGuard`].
-    pub fn wait<L: Launcher>(self, launcher: &L) -> Result<DeviceMappedWriteGuard<'a, T, M>> {
+    /// the owning buffer's context default queue.
+    pub fn wait(self) -> Result<DeviceMappedWriteGuard<'a, T, M>> {
+        // Need to extract ctx before moving self — owner field is
+        // accessed mutably below via enqueue_map. Read the ctx ref
+        // directly (Context is Clone, Arc-internal).
+        let ctx = self.owner.ctx.clone();
+        self.wait_on(&ctx)
+    }
+
+    /// Blocking terminal with an explicit launcher.
+    pub fn wait_on<L: Launcher>(self, launcher: &L) -> Result<DeviceMappedWriteGuard<'a, T, M>> {
         let (guard, event) = DeviceMappedWriteGuard::enqueue_map(self.owner, launcher, true)?;
         drop(event);
         Ok(guard)
     }
 
     /// Non-blocking terminal — see [`DeviceMapOp::submit`].
-    pub fn submit<L: Launcher>(self, launcher: &L) -> Result<DeviceMapWritePending<'a, T, M>> {
+    pub fn submit(self) -> Result<DeviceMapWritePending<'a, T, M>> {
+        let ctx = self.owner.ctx.clone();
+        self.submit_on(&ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher.
+    pub fn submit_on<L: Launcher>(self, launcher: &L) -> Result<DeviceMapWritePending<'a, T, M>> {
         let (guard, event) = DeviceMappedWriteGuard::enqueue_map(self.owner, launcher, false)?;
         Ok(DeviceMapWritePending {
             guard: Some(guard),

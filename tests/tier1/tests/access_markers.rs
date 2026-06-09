@@ -33,11 +33,11 @@ fn readwrite_default_marker_exercises_full_surface() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let mut buf: DeviceSlice<u32> = DeviceSlice::alloc_zero(&ctx, N).expect("alloc");
-    buf.write(&[1u32; N]).wait(&ctx).expect("write");
-    buf.fill(7u32).wait(&ctx).expect("fill");
-    let buf = kernels.scale_u32([N], buf, 3).wait(&ctx).expect("kernel");
+    buf.write(&[1u32; N]).wait().expect("write");
+    buf.fill(7u32).wait().expect("fill");
+    let buf = kernels.scale_u32([N], buf, 3).wait().expect("kernel");
     let mut out = vec![0u32; N];
-    buf.read(&mut out).wait(&ctx).expect("read");
+    buf.read(&mut out).wait().expect("read");
     assert!(out.iter().all(|&v| v == 21), "7 * 3 = 21");
 }
 
@@ -57,21 +57,21 @@ fn read_only_kernel_constant_host_can_update_via_write() {
     let dst = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc dst");
     let (ro, dst) = kernels
         .copy_u32([N], ro, dst)
-        .wait(&ctx)
+        .wait()
         .expect("kernel with ReadOnly source");
     let mut out = vec![0u32; N];
-    dst.read(&mut out).wait(&ctx).expect("read dst");
+    dst.read(&mut out).wait().expect("read dst");
     assert!(out.iter().all(|&v| v == 2));
 
     // Host updates the ReadOnly buffer via write() — HostWritable.
     let mut ro = ro;
-    ro.write(&[9u32; N]).wait(&ctx).expect("host write");
+    ro.write(&[9u32; N]).wait().expect("host write");
     // Run again with the updated bytes.
     let (_ro, dst) = kernels
         .copy_u32([N], ro, dst)
-        .wait(&ctx)
+        .wait()
         .expect("kernel re-launch");
-    dst.read(&mut out).wait(&ctx).expect("read dst again");
+    dst.read(&mut out).wait().expect("read dst again");
     assert!(out.iter().all(|&v| v == 9));
 }
 
@@ -87,12 +87,9 @@ fn host_read_only_kernel_writes_host_inspects() {
         DeviceSlice::alloc_zero(&ctx, N).expect("HostReadOnly alloc");
     // Kernel writes to it (fill_u32 has `&mut [u32]` data param —
     // HostReadOnly satisfies KernelSliceReadWriteArg).
-    let hro = kernels
-        .fill_u32([N], hro, 11)
-        .wait(&ctx)
-        .expect("kernel fill");
+    let hro = kernels.fill_u32([N], hro, 11).wait().expect("kernel fill");
     let mut out = vec![0u32; N];
-    hro.read(&mut out).wait(&ctx).expect("host read");
+    hro.read(&mut out).wait().expect("host read");
     assert!(out.iter().all(|&v| v == 11));
     // Re-bind to silence the unused-warning for now.
     let _ = hro;
@@ -112,15 +109,15 @@ fn device_scratch_kernel_only_no_host_access() {
     // out into a ReadWrite buffer the host CAN read.
     let scratch = kernels
         .fill_u32([N], scratch, 13)
-        .wait(&ctx)
+        .wait()
         .expect("kernel fill scratch");
     let final_buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc out");
     let (_scratch, final_buf) = kernels
         .copy_u32([N], scratch, final_buf)
-        .wait(&ctx)
+        .wait()
         .expect("kernel copy out of scratch");
     let mut out = vec![0u32; N];
-    final_buf.read(&mut out).wait(&ctx).expect("read");
+    final_buf.read(&mut out).wait().expect("read");
     assert!(out.iter().all(|&v| v == 13));
 }
 
@@ -151,12 +148,9 @@ fn alloc_uninit_assume_init_kernel_write_only_pattern() {
         DeviceSlice::<u32, HostReadOnly>::alloc_uninit(&ctx, N).expect("HostReadOnly alloc_uninit");
     // SAFETY: fill_u32 kernel writes every slot before any read.
     let buf = unsafe { uninit.assume_init() };
-    let buf = kernels
-        .fill_u32([N], buf, 42)
-        .wait(&ctx)
-        .expect("kernel fill");
+    let buf = kernels.fill_u32([N], buf, 42).wait().expect("kernel fill");
     let mut out = vec![0u32; N];
-    buf.read(&mut out).wait(&ctx).expect("host read");
+    buf.read(&mut out).wait().expect("host read");
     assert!(out.iter().all(|&v| v == 42));
 }
 
@@ -172,10 +166,10 @@ fn host_read_only_fill_uses_device_kernel_path() {
     // SAFETY: fill below overwrites every byte before any read.
     let mut buf = unsafe { uninit.assume_init() };
     buf.fill(0xCAFE_BABEu32)
-        .wait(&ctx)
+        .wait()
         .expect("fill via device kernel");
     let mut out = vec![0u32; N];
-    buf.read(&mut out).wait(&ctx).expect("host read");
+    buf.read(&mut out).wait().expect("host read");
     assert!(out.iter().all(|&v| v == 0xCAFE_BABE));
 }
 
@@ -193,16 +187,16 @@ fn device_scratch_fill_uses_device_kernel_path() {
     let mut scratch = unsafe { uninit.assume_init() };
     scratch
         .fill(0xDEAD_F00Du32)
-        .wait(&ctx)
+        .wait()
         .expect("fill DeviceScratch via device kernel");
     // Copy out to a host-readable buffer for verification.
     let out_buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc out");
     let (_scratch, out_buf) = kernels
         .copy_u32([N], scratch, out_buf)
-        .wait(&ctx)
+        .wait()
         .expect("copy out of scratch");
     let mut out = vec![0u32; N];
-    out_buf.read(&mut out).wait(&ctx).expect("host read");
+    out_buf.read(&mut out).wait().expect("host read");
     assert!(out.iter().all(|&v| v == 0xDEAD_F00D));
 }
 
@@ -225,10 +219,10 @@ fn fill_byte_generic_kernel_for_size_12_pattern() {
     let mut buf = unsafe { uninit.assume_init() };
     let pattern: [u32; 3] = [7, 11, 13];
     buf.fill(pattern)
-        .wait(&ctx)
+        .wait()
         .expect("fill via byte-generic kernel (size=12)");
     let mut out = vec![[0u32; 3]; COUNT];
-    buf.read(&mut out).wait(&ctx).expect("host read");
+    buf.read(&mut out).wait().expect("host read");
     assert!(out.iter().all(|&v| v == pattern));
 }
 
@@ -249,11 +243,11 @@ fn frozen_threads_through_read_position_kernel_arg() {
     let dst = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc dst");
     let (_src, dst) = kernels
         .copy_u32([N], frozen, dst)
-        .wait(&ctx)
+        .wait()
         .expect("kernel with Frozen source");
 
     let mut host = vec![0u32; N];
-    dst.read(&mut host).wait(&ctx).expect("read");
+    dst.read(&mut host).wait().expect("read");
     assert!(host.iter().all(|&v| v == 6));
 }
 

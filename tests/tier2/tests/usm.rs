@@ -92,7 +92,7 @@ fn usm_slice_drop_waits_for_in_flight_kernel() {
 
     let buf = claspr::USMSlice::<u32>::new(&ctx, vec![3u32; N]).expect("USM new");
     // Tier 1 submit — non-blocking, returns Event.
-    let (buf, _evt) = kernels.scale_u32([N], buf, 4).submit(&ctx).expect("submit");
+    let (buf, _evt) = kernels.scale_u32([N], buf, 4).submit().expect("submit");
     // Drop immediately. The Vec must NOT free until the kernel
     // completes (which the Drop's wait loop ensures).
     drop(buf);
@@ -158,7 +158,7 @@ fn usm_slice_host_writes_visible_to_kernel_via_deref_mut() {
         *slot = i as u32;
     }
     // Kernel scales each element by 2.
-    let buf = kernels.scale_u32([N], buf, 2).wait(&ctx).expect("scale");
+    let buf = kernels.scale_u32([N], buf, 2).wait().expect("scale");
     // Host reads the scaled values back through Deref.
     for (i, &v) in buf.iter().enumerate() {
         assert_eq!(v, (i as u32) * 2, "element {i}");
@@ -182,10 +182,7 @@ fn usm_slice_uninit_returns_wrapper_assume_init_writes_via_kernel() {
     let _ = format!("{uninit:?}");
     // SAFETY: kernel fills every slot before any read below.
     let buf = unsafe { uninit.assume_init() };
-    let buf = kernels
-        .fill_u32([N], buf, 77)
-        .wait(&ctx)
-        .expect("kernel fill");
+    let buf = kernels.fill_u32([N], buf, 77).wait().expect("kernel fill");
     // Host reads kernel's writes directly via Deref (fine-grain SVM).
     assert!(buf.iter().all(|&v| v == 77));
 }

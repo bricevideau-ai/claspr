@@ -51,7 +51,7 @@ fn thousand_ooo_launches_on_one_sharedbuffer_drop_safely() {
     for value in 0..LAUNCHES {
         let (returned, _evt) = kernels
             .fill_u32([N], buf, value)
-            .submit(&ooo)
+            .submit_on(&ooo)
             .expect("submit");
         buf = returned;
     }

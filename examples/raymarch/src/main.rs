@@ -138,8 +138,8 @@ fn run() -> claspr::Result<bool> {
     let img = claspr::Image2DRgba8::alloc(&ctx, WIDTH, HEIGHT)?;
     let img = kernels
         .raymarch([WIDTH as usize, HEIGHT as usize], img, WIDTH, HEIGHT)
-        .wait(&ctx)?;
-    let pixels = img.read_bytes_alloc().wait(&ctx)?;
+        .wait()?;
+    let pixels = img.read_bytes_alloc().wait()?;
 
     // Host vs. device pixel comparison. Walking every pixel through
     // `pixel_color` on the CPU is doable but slow — we stride by `STEP`

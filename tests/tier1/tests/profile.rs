@@ -44,7 +44,7 @@ fn errors_when_queue_lacks_profiling() {
     let result = kernels
         .fill_u32([N], buf, 7)
         .profiled(|_info| panic!("callback must not fire when profiling is off"))
-        .wait(&ctx);
+        .wait();
     let err = match result {
         Ok(_) => panic!("expected ProfilingDisabled error"),
         Err(e) => e,
@@ -71,7 +71,7 @@ fn delivers_monotonic_timestamps_when_enabled() {
         .profiled(move |info| {
             tx.send(info).expect("send profiling info");
         })
-        .wait(&ctx)
+        .wait()
         .expect("wait");
 
     let info = rx
@@ -94,9 +94,9 @@ fn fill_then_download_round_trip() {
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
-    let buf = kernels.fill_u32([N], buf, 99).wait(&ctx).expect("fill_u32");
+    let buf = kernels.fill_u32([N], buf, 99).wait().expect("fill_u32");
 
     let mut out = vec![0u32; N];
-    buf.read(&mut out).wait(&ctx).expect("download");
+    buf.read(&mut out).wait().expect("download");
     assert!(out.iter().all(|&x| x == 99));
 }

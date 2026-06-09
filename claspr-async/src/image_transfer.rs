@@ -81,7 +81,7 @@ where
         let event = img
             .write_op(&pixels)
             .after_all(deps_as_events(&deps))
-            .submit(ctx)?;
+            .submit_on(ctx)?;
         // SAFETY mirror to `Upload`: the runtime is reading from
         // `pixels` until the write event fires. The drop callback
         // keeps it alive until then.
@@ -127,7 +127,7 @@ where
         let event = img
             .read_op(&mut pixels)?
             .after_all(deps_as_events(&deps))
-            .submit(ctx)?;
+            .submit_on(ctx)?;
         Ok((pixels, vec![wrap_event(event)]))
     }
 }

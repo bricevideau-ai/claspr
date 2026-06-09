@@ -43,11 +43,11 @@ fn image2d_copy_to_propagates_pixels() {
     let mut dst = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc dst");
 
     let pixels: Vec<u32> = (0..(W * H)).map(|i| 0xCAFE_0000 | i).collect();
-    src.write(&pixels).wait(&ctx).expect("write src");
+    src.write(&pixels).wait().expect("write src");
 
-    src.copy_to(&mut dst).wait(&ctx).expect("copy src→dst");
+    src.copy_to(&mut dst).wait().expect("copy src→dst");
 
-    let got: Vec<u32> = dst.read_alloc().wait(&ctx).expect("read dst");
+    let got: Vec<u32> = dst.read_alloc().wait().expect("read dst");
     assert_eq!(got, pixels, "copy_to should propagate every pixel");
 }
 
@@ -64,9 +64,9 @@ fn image2d_fill_writes_pattern_to_every_pixel() {
     let pattern: [u32; 4] = [10, 20, 30, 40];
 
     let mut img = Image2D::<ReadWrite, R32G32B32A32Uint>::alloc(&ctx, W, H).expect("alloc");
-    img.fill(pattern).wait(&ctx).expect("fill");
+    img.fill(pattern).wait().expect("fill");
 
-    let got: Vec<[u32; 4]> = img.read_alloc().wait(&ctx).expect("read");
+    let got: Vec<[u32; 4]> = img.read_alloc().wait().expect("read");
     assert_eq!(got.len(), (W as usize) * (H as usize));
     assert!(
         got.iter().all(|&px| px == pattern),
@@ -86,10 +86,10 @@ fn image2d_fill_float_format_round_trips() {
     let pattern: [f32; 4] = [1.5, 2.5, 3.5, 4.5];
 
     let mut img = Image2D::<ReadWrite, R32Float>::alloc(&ctx, W, H).expect("alloc");
-    img.fill(pattern).wait(&ctx).expect("fill");
+    img.fill(pattern).wait().expect("fill");
 
     // R32Float is single-channel — only the first component lands.
-    let got: Vec<f32> = img.read_alloc().wait(&ctx).expect("read");
+    let got: Vec<f32> = img.read_alloc().wait().expect("read");
     assert_eq!(got.len(), (W as usize) * (H as usize));
     assert!(
         got.iter().all(|&v| v == 1.5_f32),
@@ -108,13 +108,10 @@ fn image2d_read_into_caller_dst() {
 
     let mut img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let pixels: Vec<u32> = (0..(W * H)).map(|i| 0xBEEF_0000 | i).collect();
-    img.write(&pixels).wait(&ctx).expect("write");
+    img.write(&pixels).wait().expect("write");
 
     let mut got = vec![0u32; (W as usize) * (H as usize)];
-    img.read(&mut got)
-        .expect("read op")
-        .wait(&ctx)
-        .expect("wait");
+    img.read(&mut got).expect("read op").wait().expect("wait");
     assert_eq!(got, pixels);
 }
 
@@ -140,7 +137,7 @@ fn image2d_read_length_mismatch_errors() {
     );
 }
 
-/// `image.write(...).submit(&ctx)?` enqueues the write
+/// `image.write(...).submit()?` enqueues the write
 /// non-blocking and returns an `Event`. Waiting on the event
 /// surfaces completion; the data must be live until then (here,
 /// `pixels` outlives the event).
@@ -153,15 +150,15 @@ fn image2d_write_submit_returns_event() {
     let mut img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let pixels: Vec<u32> = (1..=(W * H)).collect();
     {
-        let event = img.write(&pixels).submit(&ctx).expect("submit write");
+        let event = img.write(&pixels).submit().expect("submit write");
         event.wait().expect("wait write");
     } // event dropped — runtime has released its retain by now.
 
-    let got: Vec<u32> = img.read_alloc().wait(&ctx).expect("read");
+    let got: Vec<u32> = img.read_alloc().wait().expect("read");
     assert_eq!(got, pixels);
 }
 
-/// Same shape for `read(...).submit(&ctx)?` — non-blocking
+/// Same shape for `read(...).submit()?` — non-blocking
 /// download path, caller waits on the event before reading the dst.
 #[test]
 fn image2d_read_submit_returns_event() {
@@ -171,12 +168,12 @@ fn image2d_read_submit_returns_event() {
 
     let mut img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let pixels: Vec<u32> = (100..(100 + W * H)).collect();
-    img.write(&pixels).wait(&ctx).expect("write");
+    img.write(&pixels).wait().expect("write");
 
     let mut got = vec![0u32; (W as usize) * (H as usize)];
     {
         let op = img.read(&mut got).expect("read op");
-        let event = op.submit(&ctx).expect("submit read");
+        let event = op.submit().expect("submit read");
         event.wait().expect("wait read");
     }
     assert_eq!(got, pixels);
@@ -195,9 +192,9 @@ fn image2d_write_bytes_and_read_bytes_round_trip() {
 
     let mut img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let raw: Vec<u8> = (0..byte_count as u8).collect();
-    img.write_bytes(&raw).wait(&ctx).expect("write bytes");
+    img.write_bytes(&raw).wait().expect("write bytes");
 
-    let got = img.read_bytes_alloc().wait(&ctx).expect("read bytes");
+    let got = img.read_bytes_alloc().wait().expect("read bytes");
     assert_eq!(got, raw);
 }
 
@@ -213,15 +210,15 @@ fn image2d_write_after_event() {
     let mut img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
 
     let first: Vec<u32> = vec![1u32; (W as usize) * (H as usize)];
-    let ev = img.write(&first).submit(&ctx).expect("first write");
+    let ev = img.write(&first).submit().expect("first write");
 
     let second: Vec<u32> = vec![2u32; (W as usize) * (H as usize)];
     img.write(&second)
         .after(&ev)
-        .wait(&ctx)
+        .wait()
         .expect("second write after first");
 
-    let got: Vec<u32> = img.read_alloc().wait(&ctx).expect("read");
+    let got: Vec<u32> = img.read_alloc().wait().expect("read");
     assert!(got.iter().all(|&v| v == 2), "second write should win");
 }
 
@@ -238,7 +235,7 @@ fn image2d_write_only_marker_still_writes() {
 
     let mut img = Image2D::<WriteOnly, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let pixels: Vec<u32> = vec![42u32; (W as usize) * (H as usize)];
-    img.write(&pixels).wait(&ctx).expect("write");
+    img.write(&pixels).wait().expect("write");
 
     // Reading back from a WriteOnly host marker: today the API
     // permits it (the marker gates kernel-side access, not
@@ -246,6 +243,6 @@ fn image2d_write_only_marker_still_writes() {
     // gating to image transfers, this test will start failing
     // and is the signal to either update the test or document
     // the new gating.
-    let got: Vec<u32> = img.read_alloc().wait(&ctx).expect("read");
+    let got: Vec<u32> = img.read_alloc().wait().expect("read");
     assert!(got.iter().all(|&v| v == 42));
 }

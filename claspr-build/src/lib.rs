@@ -430,6 +430,8 @@ fn generate_module_source(
     writeln!(s, "pub struct Kernels {{")?;
     writeln!(s, "    #[doc(hidden)]")?;
     writeln!(s, "    pub __claspr_program: ::claspr::Program,")?;
+    writeln!(s, "    #[doc(hidden)]")?;
+    writeln!(s, "    pub __claspr_ctx: ::claspr::Context,")?;
     writeln!(s, "}}\n")?;
     writeln!(s, "#[allow(dead_code)]")?;
 
@@ -464,13 +466,13 @@ fn generate_module_source(
     /// not `Clone` (it owns a refcounted `cl_program`). For the
     /// common "I have SPIR-V bytes, give me a Kernels" case, prefer
     /// [`load_from`](Self::load_from) or [`load`](Self::load).
-    pub fn bind(program: ::claspr::Program) -> ::claspr::Result<Self> {
+    pub fn bind(ctx: &::claspr::Context, program: ::claspr::Program) -> ::claspr::Result<Self> {
         // Validate by attempting one clCreateKernel per entry point;
         // each handle drops immediately after the check succeeds.
         for ep in ENTRY_POINTS {
             let _ = ::claspr::Kernel::create(&program, ep)?;
         }
-        Ok(Self { __claspr_program: program })
+        Ok(Self { __claspr_program: program, __claspr_ctx: ctx.clone() })
     }
 
     /// Build a program from `spv` and bind every entry point. Takes
@@ -478,7 +480,7 @@ fn generate_module_source(
     /// read at runtime, a downloaded blob, anything that can be
     /// borrowed as `&[u8]`.
     pub fn load_from(ctx: &::claspr::Context, spv: &[u8]) -> ::claspr::Result<Self> {
-        Self::bind(ctx.build_program(spv)?)
+        Self::bind(ctx, ctx.build_program(spv)?)
     }
 
     /// Build the program from the embedded SPIR-V (`SPV_BYTES`) and

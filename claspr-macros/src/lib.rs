@@ -346,6 +346,8 @@ fn expand_kernels(input: KernelsMacroInput) -> syn::Result<TokenStream2> {
             pub struct Kernels {
                 #[doc(hidden)]
                 pub __claspr_program: ::claspr::Program,
+                #[doc(hidden)]
+                pub __claspr_ctx: ::claspr::Context,
             }
 
             impl Kernels {
@@ -355,8 +357,13 @@ fn expand_kernels(input: KernelsMacroInput) -> syn::Result<TokenStream2> {
                 /// the program.
                 ///
                 /// Takes the program by value because opencl3's
-                /// `Program` is not `Clone`.
-                pub fn bind(program: ::claspr::Program) -> ::claspr::Result<Self> {
+                /// `Program` is not `Clone`. The `ctx` arg is stored
+                /// alongside so every launched Op carries it for the
+                /// no-arg `.wait()` / `.submit()` terminals.
+                pub fn bind(
+                    ctx: &::claspr::Context,
+                    program: ::claspr::Program,
+                ) -> ::claspr::Result<Self> {
                     // Validate every typed launcher's entry point by
                     // attempting one `clCreateKernel` per name. The
                     // names are the launcher idents, expanded at
@@ -364,7 +371,10 @@ fn expand_kernels(input: KernelsMacroInput) -> syn::Result<TokenStream2> {
                     for ep in Self::ENTRY_POINTS {
                         let _ = ::claspr::Kernel::create(&program, ep)?;
                     }
-                    ::core::result::Result::Ok(Self { __claspr_program: program })
+                    ::core::result::Result::Ok(Self {
+                        __claspr_program: program,
+                        __claspr_ctx: ::core::clone::Clone::clone(ctx),
+                    })
                 }
 
                 /// Build a program from `spv` and bind every entry
@@ -375,7 +385,7 @@ fn expand_kernels(input: KernelsMacroInput) -> syn::Result<TokenStream2> {
                     ctx: &::claspr::Context,
                     spv: &[u8],
                 ) -> ::claspr::Result<Self> {
-                    Self::bind(ctx.build_program(spv)?)
+                    Self::bind(ctx, ctx.build_program(spv)?)
                 }
 
                 /// Get a fresh `cl_kernel` handle for `name`. Panics
@@ -660,6 +670,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     args: #op_args_tuple_init,
                     deps: ::std::vec::Vec::new(),
                     profile_cb: ::core::option::Option::None,
+                    ctx: ::core::clone::Clone::clone(&self.__claspr_ctx),
                 }
             }
         }
@@ -682,6 +693,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 /// its source binding once the Op is moved.
                 pub deps: ::std::vec::Vec<::claspr::Event>,
                 pub profile_cb: ::core::option::Option<::claspr::ProfileCb>,
+                /// Carried `Context` so the no-arg `.wait()` /
+                /// `.submit()` terminals can submit on its default
+                /// in-order queue without taking an explicit
+                /// launcher. Cloned from `Kernels`'s context at
+                /// launcher-method emission time.
+                pub ctx: ::claspr::Context,
             }
 
             // Op is `Send` automatically — every field is Send. No
@@ -720,14 +737,25 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     self
                 }
 
-                /// Tier 1 non-blocking terminal — enqueue on `launcher`'s
-                /// queue and return `(Output, Event)` so the caller can
-                /// keep using the buffers and chain via `.after(event)`.
+                /// Tier 1 non-blocking terminal — enqueue on the
+                /// carried `Kernels`' context default queue and
+                /// return `(Output, Event)`.
+                pub fn submit(
+                    self,
+                ) -> ::claspr::Result<(#output_ty, ::claspr::Event)> {
+                    let ctx = ::core::clone::Clone::clone(&self.ctx);
+                    self.submit_on(&ctx)
+                }
+
+                /// Tier 1 non-blocking terminal with an explicit
+                /// launcher — enqueue on `launcher`'s queue and
+                /// return `(Output, Event)` so the caller can keep
+                /// using the buffers and chain via `.after(event)`.
                 ///
-                /// Panics if any caller-added dep event (from `.after()`
-                /// / `.after_all()`) was produced on a different
-                /// `Context` than `launcher`'s queue.
-                pub fn submit<L>(
+                /// Panics if any caller-added dep event (from
+                /// `.after()` / `.after_all()`) was produced on a
+                /// different `Context` than `launcher`'s queue.
+                pub fn submit_on<L>(
                     self,
                     launcher: &L,
                 ) -> ::claspr::Result<(#output_ty, ::claspr::Event)>
@@ -737,14 +765,21 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     <Self as ::claspr::KernelOp>::enqueue_into(self, launcher, &[])
                 }
 
-                /// Tier 1 blocking terminal — `submit` then `event.wait`.
-                /// Returns the slice arg(s) so the caller can keep using
-                /// them.
-                pub fn wait<L>(self, launcher: &L) -> ::claspr::Result<#output_ty>
+                /// Tier 1 blocking terminal — submit on the carried
+                /// `Kernels`' context default queue and wait on the
+                /// completion event. Returns the slice arg(s) so the
+                /// caller can keep using them.
+                pub fn wait(self) -> ::claspr::Result<#output_ty> {
+                    let ctx = ::core::clone::Clone::clone(&self.ctx);
+                    self.wait_on(&ctx)
+                }
+
+                /// Tier 1 blocking terminal with an explicit launcher.
+                pub fn wait_on<L>(self, launcher: &L) -> ::claspr::Result<#output_ty>
                 where
                     L: ::claspr::Launcher,
                 {
-                    let (out, event) = self.submit(launcher)?;
+                    let (out, event) = self.submit_on(launcher)?;
                     event.wait()?;
                     ::core::result::Result::Ok(out)
                 }
@@ -771,7 +806,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 where
                     L: ::claspr::Launcher,
                 {
-                    let Op { kernel, spec, args, deps, profile_cb } = self;
+                    let Op { kernel, spec, args, deps, profile_cb, ctx: _ } = self;
                     // Validate cross-context match for every caller-added
                     // dep. The launcher's context is known here; the
                     // check is two CL info queries + a pointer compare

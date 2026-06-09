@@ -66,7 +66,7 @@ fn run() -> claspr::Result<bool> {
             HEIGHT,
             MAX_ITER,
         )
-        .wait(&ctx)?;
+        .wait()?;
 
     // Stage 2: edge-detect `fractal` into `edges`.
     let (_fractal, edges) = sobel
@@ -77,9 +77,9 @@ fn run() -> claspr::Result<bool> {
             WIDTH,
             HEIGHT,
         )
-        .wait(&ctx)?;
+        .wait()?;
 
-    let pixels = edges.read_bytes_alloc().wait(&ctx)?;
+    let pixels = edges.read_bytes_alloc().wait()?;
     let ppm_path = "image-pipeline.ppm";
     write_ppm_rgba8(ppm_path, WIDTH, HEIGHT, &pixels)?;
     println!(

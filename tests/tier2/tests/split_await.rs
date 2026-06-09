@@ -64,7 +64,7 @@ fn split_chain_then_reuse_buffer_for_independent_work() {
     // Host-side: nothing to do, just hold the buffer.
     let buf = kernels
         .scale_u32([N], buf, 10)
-        .wait(&ctx)
+        .wait()
         .expect("phase 2 (Tier 1 in the middle)");
     // Pick the second half back up as a Tier 2 chain.
     let result: Vec<u32> = kernels

@@ -264,117 +264,56 @@ reproducibility improvement).
 
 ---
 
-## 4. Tier 1 scoped launcher — `ctx.scope(|s| { ... })` (priority: deferred)
+## 4. Tier 1 no-arg `.wait()` / `.submit()` (priority: SHIPPED)
 
-**Status:** design-only. Awaits real ergonomic pressure to justify
-the implementation cost.
+**Status:** done — different mechanism than the original sketch, no
+`scope` introduced.
 
-### The problem
+### What landed
 
-After the late-bind refactor, every Tier 1 op terminal takes `&ctx`:
+Every Tier 1 op carries a reference to its owning [`Context`]
+(buffer ops gained an `&'a Context` field; the kernel `Op` gained
+an owned `Context` field, cloned in cheaply since the type is
+`Arc`-internal). The op's two existing terminals were renamed
+`.wait` → `.wait_on(&L)` / `.submit` → `.submit_on(&L)`, and two
+new no-arg variants `.wait()` / `.submit()` were added that submit
+on the carried context's default in-order queue.
 
 ```rust
+// Before:
 let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, N)?;
 buf.write(&data).wait(&ctx)?;
 let buf = kernels.fill_u32([N], buf, 42).wait(&ctx)?;
 buf.read(&mut out).wait(&ctx)?;
+
+// After:
+let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, N)?;
+buf.write(&data).wait()?;                    // common case — uses carried ctx
+let buf = kernels.fill_u32([N], buf, 42).wait()?;
+buf.read(&mut out).wait()?;
+
+// Cross-queue case (rare) uses the renamed explicit form:
+buf.write(&data).wait_on(&other_queue)?;
 ```
 
-The shape is **consistent** now (good — same `&ctx` at every
-terminal, prerequisite for the next move), but the repetition is
-visible noise on any sequence longer than three steps. Tier 1
-tutorials and short utility scripts get `&ctx` as line-by-line
-boilerplate that obscures the actual work.
+### Why this shape instead of `ctx.scope(|s| { ... })`
 
-Purely an ergonomics improvement. Nothing is broken; nothing new is
-enabled.
+The original DESIGN-NOTES sketch proposed a SYCL-style scoped
+launcher resolving the launcher via TLS, closure-captured handles,
+or a renamed binding. All three had real costs (TLS silently
+miscompiles across `thread::spawn`; closure-captured-handle needed
+either pervasive lifetime params on buffer types or a per-op
+wrapping trait that didn't actually save characters vs. `.wait(s)`;
+the renamed-binding shape was cosmetic only).
 
-### The proposed shape
+Carrying the context inside the op is structurally simpler and
+gives the user the same one-character call shape (`.wait()`) with
+no implicit globals and no new wrapper type. The cost is one extra
+field per op struct and a one-time mechanical rename of 192 call
+sites from `.wait(&ctx)` → `.wait()` (most got SHORTER) and the
+rare 7 cross-queue sites from `.wait(&queue)` → `.wait_on(&queue)`.
 
-SYCL-inspired scoped launcher: borrow the context once, run a
-closure where `.wait()` finds the launcher implicitly.
-
-```rust
-ctx.scope(|s| {
-    let mut buf = DeviceSlice::alloc_zero(s, N)?;
-    buf.write(&data).wait()?;             // s implicit via scope
-    let buf = kernels.fill_u32([N], buf, 42).wait()?;
-    buf.read(&mut out).wait()?;
-    Ok(())
-})?;
-```
-
-### Open design questions
-
-**Q1 — How does `.wait()` find `s` without an explicit arg?**
-
-Three mechanisms, in order of magic-vs-mechanism trade-off:
-
-1. **Thread-local stash.** `s` registers itself in TLS for the
-   closure's lifetime. Clean syntax, invisible magic, silently
-   broken across spawned threads (the scope's TLS doesn't propagate
-   to a `std::thread::spawn` inside the closure).
-2. **Closure-captured handle.** `s` is a `Launcher` value the
-   closure captures; `.wait()` is a method on a wrapped `Op` type
-   tied to the scope's lifetime. No TLS, no spawn hazard. Cost:
-   every Op variant needs a `.wait()` overload that knows about the
-   scope — moderate proc-macro / type-level work.
-3. **Don't go implicit.** `.wait()` still takes a launcher, `s` is
-   just a shorter binding. Less ergonomic win, trivial change.
-
-**Lean: Option 2** for correctness. Option 1 silently miscompiles
-under spawned threads, which is the wrong default. Option 3 is
-honest but doesn't actually buy enough to justify the API addition.
-
-If Option 2 is too much work, **Option 3 is the safe fallback** —
-saves the `&` but keeps the explicit launcher visible.
-
-**Q2 — Single fixed launcher per scope, or per-call override?**
-
-SYCL's `handler` is one queue per scope. claspr has
-`InOrder`/`OutOfOrder` queues + multi-device — so even inside
-`scope`, explicit `.wait(L)` for non-default queues stays
-available. The scope is just a default.
-
-Suggested: `ctx.scope(|s| ...)` defaults to the in-order queue
-(matches Tier 1's existing default); `ctx.scope_on(&queue, |s| ...)`
-for explicit picks.
-
-**Q3 — Interaction with Tier 2**
-
-Inside `scope`, can users mix in `.sync(s)?` for a chain? Probably
-yes — `s` is a Launcher and Tier 2's `sync(&ctx)` already accepts
-any `Launcher`-shaped thing. Worth a test fixture to lock that in.
-
-**Q4 — Naming**
-
-`ctx.scope(|s| ...)` matches SYCL and reads as the right verb.
-Alternatives (`with_launcher`, `run`, `batch`) all have problems.
-Keep `scope`.
-
-### Why save this rather than do it now
-
-The late-bind refactor was the prerequisite. The next move is a
-separate, larger design exercise:
-
-- Touches every Tier 1 op's terminal signature again (or only the
-  convenience wrappers — design choice in itself).
-- Needs decisions on Q1 (implicit vs explicit) that benefit from at
-  least one real heavy Tier 1 use case to design against.
-
-The follow-up review explicitly endorsed deferring this — the
-late-bind shape is consistent, the proposed `scope` API has real
-design traps, and thread-local magic is correctly rejected.
-
-### When to revisit
-
-- A user (or doc reviewer) hits a Tier 1 multi-step sequence and
-  complains about the noise.
-- We want to write a tutorial that needs less ceremony than today.
-- We have a concrete multi-step example exercising 4+ buffer ops
-  where `&ctx` repetition is visible enough to motivate the cost.
-
-### Adjacent capability gaps — SHIPPED
+### Adjacent capability gaps — also SHIPPED
 
 Two real Tier 1 surface items the late-bind work surfaced —
 **resolved together** rather than separately, with a unified shape:

@@ -42,14 +42,14 @@ fn mapped_slice_threads_through_typed_launchers() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
-    let (buf, fill_evt) = kernels.fill_u32([N], buf, 6u32).submit(&ctx).expect("fill");
+    let (buf, fill_evt) = kernels.fill_u32([N], buf, 6u32).submit().expect("fill");
     let buf = kernels
         .scale_u32([N], buf, 7u32)
         .after(fill_evt)
-        .wait(&ctx)
+        .wait()
         .expect("scale");
 
-    let g = buf.map().wait(&ctx).expect("map");
+    let g = buf.map().wait().expect("map");
     let result_sum: u32 = g.iter().copied().sum();
     drop(g);
 
@@ -70,10 +70,7 @@ fn many_in_flight_svm_launches_drop_safely() {
     // block; each launch auto-registers via `KernelArg::register_completion`.
     // The typed launcher consumes + returns `buf` per call.
     for _ in 0..8 {
-        let (returned, _evt) = kernels
-            .scale_u32([N], buf, 1u32)
-            .submit(&ctx)
-            .expect("scale");
+        let (returned, _evt) = kernels.scale_u32([N], buf, 1u32).submit().expect("scale");
         buf = returned;
     }
     // Drop the SVM here — Drop drains the in-flight events Vec

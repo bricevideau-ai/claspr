@@ -279,6 +279,7 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
         let pixel_count = (self.width as usize) * (self.height as usize);
         image_read_op(
             &self.image,
+            &self.ctx,
             [self.width as usize, self.height as usize, 1],
             dst,
             pixel_count,
@@ -293,6 +294,7 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
         let expected = pixel_count * std::mem::size_of::<F::Pixel>();
         image_read_bytes_op(
             &self.image,
+            &self.ctx,
             [self.width as usize, self.height as usize, 1],
             dst,
             expected,
@@ -309,6 +311,7 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
     {
         ImageReadAlloc {
             image: &self.image,
+            ctx: &self.ctx,
             region: [self.width as usize, self.height as usize, 1],
             pixel_count: (self.width as usize) * (self.height as usize),
             _format: PhantomData::<F>,
@@ -319,6 +322,7 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
     pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
         ImageReadBytesAlloc {
             image: &self.image,
+            ctx: &self.ctx,
             region: [self.width as usize, self.height as usize, 1],
             byte_len: (self.width as usize)
                 * (self.height as usize)
@@ -334,6 +338,7 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
         let pixel_count = (self.width as usize) * (self.height as usize);
         image_write_op(
             &mut self.image,
+            &self.ctx,
             [self.width as usize, self.height as usize, 1],
             pixels,
             pixel_count,
@@ -348,6 +353,7 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
         let expected = pixel_count * std::mem::size_of::<F::Pixel>();
         image_write_bytes_op(
             &mut self.image,
+            &self.ctx,
             [self.width as usize, self.height as usize, 1],
             bytes,
             expected,
@@ -363,6 +369,7 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
         image_copy_op(
             &self.image,
             &mut dst.image,
+            &self.ctx,
             [self.width as usize, self.height as usize, 1],
         )
     }
@@ -375,6 +382,7 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
     pub fn fill<T: Copy>(&mut self, pattern: [T; 4]) -> ImageFillOp<'_, T> {
         image_fill_op(
             &mut self.image,
+            &self.ctx,
             [self.width as usize, self.height as usize, 1],
             pattern,
         )
@@ -475,6 +483,7 @@ fn alloc_image<A: KernelAccess, F: format::Format>(
 /// `image.write(...)` / `image.write_bytes(...)` on any image type.
 pub struct ImageWriteOp<'a, T> {
     image: &'a mut Image,
+    ctx: &'a Context,
     region: [usize; 3],
     data: *const T,
     /// Lifetime tag — the data pointer is borrowed for `'a`. The
@@ -522,10 +531,15 @@ impl<'a, T> ImageWriteOp<'a, T> {
         self
     }
 
-    /// Sync terminal — enqueue the write with `CL_TRUE` on
-    /// `launcher`'s queue; the driver blocks until the image has
-    /// been written.
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+    /// Sync terminal — enqueue the write with `CL_TRUE` on the
+    /// carried image's context default queue.
+    pub fn wait(self) -> Result<()> {
+        let ctx = self.ctx;
+        self.wait_on(ctx)
+    }
+
+    /// Sync terminal with an explicit launcher.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         let event = enqueue_image_write(self, launcher, CL_BLOCKING)?;
         // CL_BLOCKING already waited for the write at the driver
         // level; we just need to attach the profiling callback if
@@ -535,9 +549,15 @@ impl<'a, T> ImageWriteOp<'a, T> {
     }
 
     /// Non-blocking terminal — enqueue the write with `CL_FALSE`
-    /// on `launcher`'s queue, return the completion event. `data`
-    /// must outlive the event.
-    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+    /// on the carried image's context default queue.
+    pub fn submit(self) -> Result<Event> {
+        let ctx = self.ctx;
+        self.submit_on(ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher. `data` must
+    /// outlive the event.
+    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         enqueue_image_write(self, launcher, CL_NON_BLOCKING)
     }
 }
@@ -549,6 +569,7 @@ fn enqueue_image_write<'a, T, L: Launcher + ?Sized>(
 ) -> Result<Event> {
     let ImageWriteOp {
         image,
+        ctx: _,
         region,
         data,
         _borrow: _,
@@ -585,6 +606,7 @@ fn enqueue_image_write<'a, T, L: Launcher + ?Sized>(
 /// [`ImageWriteOp`].
 pub struct ImageReadOp<'a, T> {
     image: &'a Image,
+    ctx: &'a Context,
     region: [usize; 3],
     dst: *mut T,
     _borrow: PhantomData<&'a mut [T]>,
@@ -617,20 +639,28 @@ impl<'a, T> ImageReadOp<'a, T> {
         self
     }
 
-    /// Sync terminal — enqueue the read with `CL_TRUE` on
-    /// `launcher`'s queue; the driver blocks until `dst` has been
-    /// filled.
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+    /// Sync terminal on the carried image's context default queue.
+    pub fn wait(self) -> Result<()> {
+        let ctx = self.ctx;
+        self.wait_on(ctx)
+    }
+
+    /// Sync terminal with an explicit launcher.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         let event = enqueue_image_read(self, launcher, CL_BLOCKING)?;
         drop(event);
         Ok(())
     }
 
-    /// Non-blocking terminal — enqueue the read with `CL_FALSE`
-    /// on `launcher`'s queue, return the completion event. `dst`
-    /// is only valid after the event fires; the caller must keep
-    /// `dst` alive until then.
-    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+    /// Non-blocking terminal on the carried image's context default queue.
+    pub fn submit(self) -> Result<Event> {
+        let ctx = self.ctx;
+        self.submit_on(ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher. `dst` is
+    /// only valid after the event fires; keep it alive until then.
+    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         enqueue_image_read(self, launcher, CL_NON_BLOCKING)
     }
 }
@@ -642,6 +672,7 @@ fn enqueue_image_read<'a, T, L: Launcher + ?Sized>(
 ) -> Result<Event> {
     let ImageReadOp {
         image,
+        ctx: _,
         region,
         dst,
         _borrow: _,
@@ -679,6 +710,7 @@ fn enqueue_image_read<'a, T, L: Launcher + ?Sized>(
 /// Tier 2 `download(image)` combinator instead.
 pub struct ImageReadAlloc<'a, F: format::Format> {
     image: &'a Image,
+    ctx: &'a Context,
     region: [usize; 3],
     pixel_count: usize,
     _format: PhantomData<F>,
@@ -688,18 +720,26 @@ impl<'a, F: format::Format> ImageReadAlloc<'a, F>
 where
     F::Pixel: Default + Copy,
 {
-    /// Blocking — allocate the Vec, enqueue + wait, return it.
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Vec<F::Pixel>> {
+    /// Blocking — allocate the Vec, enqueue + wait on the carried
+    /// image's context default queue, return it.
+    pub fn wait(self) -> Result<Vec<F::Pixel>> {
+        let ctx = self.ctx;
+        self.wait_on(ctx)
+    }
+
+    /// Blocking with an explicit launcher.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Vec<F::Pixel>> {
         let mut pixels = vec![<F::Pixel as Default>::default(); self.pixel_count];
         let op = ImageReadOp {
             image: self.image,
+            ctx: self.ctx,
             region: self.region,
             dst: pixels.as_mut_ptr(),
             _borrow: PhantomData,
             deps: Vec::new(),
             profile_cb: None,
         };
-        op.wait(launcher)?;
+        op.wait_on(launcher)?;
         Ok(pixels)
     }
 }
@@ -709,24 +749,33 @@ where
 /// pixel-type round-trip.
 pub struct ImageReadBytesAlloc<'a, F: format::Format> {
     image: &'a Image,
+    ctx: &'a Context,
     region: [usize; 3],
     byte_len: usize,
     _format: PhantomData<F>,
 }
 
 impl<'a, F: format::Format> ImageReadBytesAlloc<'a, F> {
-    /// Blocking — allocate the Vec, enqueue + wait, return it.
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Vec<u8>> {
+    /// Blocking — allocate the Vec, enqueue + wait on the carried
+    /// image's context default queue, return it.
+    pub fn wait(self) -> Result<Vec<u8>> {
+        let ctx = self.ctx;
+        self.wait_on(ctx)
+    }
+
+    /// Blocking with an explicit launcher.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Vec<u8>> {
         let mut bytes = vec![0u8; self.byte_len];
         let op = ImageReadOp::<u8> {
             image: self.image,
+            ctx: self.ctx,
             region: self.region,
             dst: bytes.as_mut_ptr(),
             _borrow: PhantomData,
             deps: Vec::new(),
             profile_cb: None,
         };
-        op.wait(launcher)?;
+        op.wait_on(launcher)?;
         Ok(bytes)
     }
 }
@@ -739,6 +788,7 @@ impl<'a, F: format::Format> ImageReadBytesAlloc<'a, F> {
 pub struct ImageCopyOp<'a> {
     src: &'a Image,
     dst: &'a mut Image,
+    ctx: &'a Context,
     region: [usize; 3],
     deps: Vec<cl_event>,
     profile_cb: Option<ProfileCb>,
@@ -769,16 +819,30 @@ impl<'a> ImageCopyOp<'a> {
         self
     }
 
-    /// Sync terminal — `enqueue + event.wait`. `clEnqueueCopyImage`
-    /// has no blocking flag, so `.wait()` is enqueue + event.wait.
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+    /// Sync terminal — enqueue + event.wait on the carried src
+    /// image's context default queue. `clEnqueueCopyImage` has no
+    /// blocking flag.
+    pub fn wait(self) -> Result<()> {
+        let ctx = self.ctx;
+        self.wait_on(ctx)
+    }
+
+    /// Sync terminal with an explicit launcher.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
-    /// Non-blocking terminal — enqueue and return the event.
-    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+    /// Non-blocking terminal on the carried src image's context
+    /// default queue.
+    pub fn submit(self) -> Result<Event> {
+        let ctx = self.ctx;
+        self.submit_on(ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher.
+    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         self.into_event(launcher)
     }
 
@@ -817,6 +881,7 @@ impl<'a> ImageCopyOp<'a> {
 /// format's `SampledTypeFamily`.
 pub struct ImageFillOp<'a, T: Copy> {
     image: &'a mut Image,
+    ctx: &'a Context,
     region: [usize; 3],
     pattern: [T; 4],
     deps: Vec<cl_event>,
@@ -848,16 +913,28 @@ impl<'a, T: Copy> ImageFillOp<'a, T> {
         self
     }
 
-    /// Sync terminal — `enqueue + event.wait`. `clEnqueueFillImage`
-    /// has no blocking flag.
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+    /// Sync terminal on the carried image's context default queue.
+    /// `clEnqueueFillImage` has no blocking flag.
+    pub fn wait(self) -> Result<()> {
+        let ctx = self.ctx;
+        self.wait_on(ctx)
+    }
+
+    /// Sync terminal with an explicit launcher.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
-    /// Non-blocking terminal — enqueue and return the event.
-    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+    /// Non-blocking terminal on the carried image's context default queue.
+    pub fn submit(self) -> Result<Event> {
+        let ctx = self.ctx;
+        self.submit_on(ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher.
+    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         self.into_event(launcher)
     }
 
@@ -1047,6 +1124,7 @@ where
 
 fn image_write_op<'a, T>(
     image: &'a mut Image,
+    ctx: &'a Context,
     region: [usize; 3],
     pixels: &'a [T],
     expected_pixel_count: usize,
@@ -1061,6 +1139,7 @@ fn image_write_op<'a, T>(
     );
     ImageWriteOp {
         image,
+        ctx,
         region,
         data: pixels.as_ptr(),
         _borrow: PhantomData,
@@ -1071,6 +1150,7 @@ fn image_write_op<'a, T>(
 
 fn image_write_bytes_op<'a>(
     image: &'a mut Image,
+    ctx: &'a Context,
     region: [usize; 3],
     bytes: &'a [u8],
     expected_bytes: usize,
@@ -1085,6 +1165,7 @@ fn image_write_bytes_op<'a>(
     );
     ImageWriteOp {
         image,
+        ctx,
         region,
         data: bytes.as_ptr(),
         _borrow: PhantomData,
@@ -1095,6 +1176,7 @@ fn image_write_bytes_op<'a>(
 
 fn image_read_op<'a, T>(
     image: &'a Image,
+    ctx: &'a Context,
     region: [usize; 3],
     dst: &'a mut [T],
     expected_pixel_count: usize,
@@ -1108,6 +1190,7 @@ fn image_read_op<'a, T>(
     }
     Ok(ImageReadOp {
         image,
+        ctx,
         region,
         dst: dst.as_mut_ptr(),
         _borrow: PhantomData,
@@ -1118,6 +1201,7 @@ fn image_read_op<'a, T>(
 
 fn image_read_bytes_op<'a>(
     image: &'a Image,
+    ctx: &'a Context,
     region: [usize; 3],
     dst: &'a mut [u8],
     expected_bytes: usize,
@@ -1131,6 +1215,7 @@ fn image_read_bytes_op<'a>(
     }
     Ok(ImageReadOp {
         image,
+        ctx,
         region,
         dst: dst.as_mut_ptr(),
         _borrow: PhantomData,
@@ -1139,10 +1224,16 @@ fn image_read_bytes_op<'a>(
     })
 }
 
-fn image_copy_op<'a>(src: &'a Image, dst: &'a mut Image, region: [usize; 3]) -> ImageCopyOp<'a> {
+fn image_copy_op<'a>(
+    src: &'a Image,
+    dst: &'a mut Image,
+    ctx: &'a Context,
+    region: [usize; 3],
+) -> ImageCopyOp<'a> {
     ImageCopyOp {
         src,
         dst,
+        ctx,
         region,
         deps: Vec::new(),
         profile_cb: None,
@@ -1151,11 +1242,13 @@ fn image_copy_op<'a>(src: &'a Image, dst: &'a mut Image, region: [usize; 3]) -> 
 
 fn image_fill_op<'a, T: Copy>(
     image: &'a mut Image,
+    ctx: &'a Context,
     region: [usize; 3],
     pattern: [T; 4],
 ) -> ImageFillOp<'a, T> {
     ImageFillOp {
         image,
+        ctx,
         region,
         pattern,
         deps: Vec::new(),
@@ -1197,6 +1290,7 @@ impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
     pub fn read<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
         image_read_op(
             &self.image,
+            &self.ctx,
             [self.width as usize, 1, 1],
             dst,
             self.width as usize,
@@ -1209,6 +1303,7 @@ impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
         let expected = (self.width as usize) * std::mem::size_of::<F::Pixel>();
         image_read_bytes_op(
             &self.image,
+            &self.ctx,
             [self.width as usize, 1, 1],
             dst,
             expected,
@@ -1223,6 +1318,7 @@ impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
     {
         ImageReadAlloc {
             image: &self.image,
+            ctx: &self.ctx,
             region: [self.width as usize, 1, 1],
             pixel_count: self.width as usize,
             _format: PhantomData::<F>,
@@ -1233,6 +1329,7 @@ impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
     pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
         ImageReadBytesAlloc {
             image: &self.image,
+            ctx: &self.ctx,
             region: [self.width as usize, 1, 1],
             byte_len: (self.width as usize) * std::mem::size_of::<F::Pixel>(),
             _format: PhantomData::<F>,
@@ -1243,6 +1340,7 @@ impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
     pub fn write<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
         image_write_op(
             &mut self.image,
+            &self.ctx,
             [self.width as usize, 1, 1],
             pixels,
             self.width as usize,
@@ -1255,6 +1353,7 @@ impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
         let expected = (self.width as usize) * std::mem::size_of::<F::Pixel>();
         image_write_bytes_op(
             &mut self.image,
+            &self.ctx,
             [self.width as usize, 1, 1],
             bytes,
             expected,
@@ -1264,12 +1363,22 @@ impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
 
     /// See [`Image2D::copy_to`].
     pub fn copy_to<'a, A2: KernelAccess>(&'a self, dst: &'a mut Image1D<A2, F>) -> ImageCopyOp<'a> {
-        image_copy_op(&self.image, &mut dst.image, [self.width as usize, 1, 1])
+        image_copy_op(
+            &self.image,
+            &mut dst.image,
+            &self.ctx,
+            [self.width as usize, 1, 1],
+        )
     }
 
     /// See [`Image2D::fill`].
     pub fn fill<T: Copy>(&mut self, pattern: [T; 4]) -> ImageFillOp<'_, T> {
-        image_fill_op(&mut self.image, [self.width as usize, 1, 1], pattern)
+        image_fill_op(
+            &mut self.image,
+            &self.ctx,
+            [self.width as usize, 1, 1],
+            pattern,
+        )
     }
 
     /// Width in pixels.
@@ -1338,6 +1447,7 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
         let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
         image_read_op(
             &self.image,
+            &self.ctx,
             [
                 self.width as usize,
                 self.height as usize,
@@ -1355,6 +1465,7 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
         let expected = pixel_count * std::mem::size_of::<F::Pixel>();
         image_read_bytes_op(
             &self.image,
+            &self.ctx,
             [
                 self.width as usize,
                 self.height as usize,
@@ -1374,6 +1485,7 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
         let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
         ImageReadAlloc {
             image: &self.image,
+            ctx: &self.ctx,
             region: [
                 self.width as usize,
                 self.height as usize,
@@ -1389,6 +1501,7 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
         let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
         ImageReadBytesAlloc {
             image: &self.image,
+            ctx: &self.ctx,
             region: [
                 self.width as usize,
                 self.height as usize,
@@ -1404,6 +1517,7 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
         let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
         image_write_op(
             &mut self.image,
+            &self.ctx,
             [
                 self.width as usize,
                 self.height as usize,
@@ -1421,6 +1535,7 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
         let expected = pixel_count * std::mem::size_of::<F::Pixel>();
         image_write_bytes_op(
             &mut self.image,
+            &self.ctx,
             [
                 self.width as usize,
                 self.height as usize,
@@ -1437,6 +1552,7 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
         image_copy_op(
             &self.image,
             &mut dst.image,
+            &self.ctx,
             [
                 self.width as usize,
                 self.height as usize,
@@ -1449,6 +1565,7 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
     pub fn fill<T: Copy>(&mut self, pattern: [T; 4]) -> ImageFillOp<'_, T> {
         image_fill_op(
             &mut self.image,
+            &self.ctx,
             [
                 self.width as usize,
                 self.height as usize,
@@ -1862,6 +1979,7 @@ impl<A: KernelAccess, F: format::Format> Image1DArray<A, F> {
         let pixel_count = (self.width as usize) * (self.array_size as usize);
         image_read_op(
             &self.image,
+            &self.ctx,
             [self.width as usize, self.array_size as usize, 1],
             dst,
             pixel_count,
@@ -1875,6 +1993,7 @@ impl<A: KernelAccess, F: format::Format> Image1DArray<A, F> {
         let expected = pixel_count * std::mem::size_of::<F::Pixel>();
         image_read_bytes_op(
             &self.image,
+            &self.ctx,
             [self.width as usize, self.array_size as usize, 1],
             dst,
             expected,
@@ -1889,6 +2008,7 @@ impl<A: KernelAccess, F: format::Format> Image1DArray<A, F> {
     {
         ImageReadAlloc {
             image: &self.image,
+            ctx: &self.ctx,
             region: [self.width as usize, self.array_size as usize, 1],
             pixel_count: (self.width as usize) * (self.array_size as usize),
             _format: PhantomData::<F>,
@@ -1900,6 +2020,7 @@ impl<A: KernelAccess, F: format::Format> Image1DArray<A, F> {
         let pixel_count = (self.width as usize) * (self.array_size as usize);
         ImageReadBytesAlloc {
             image: &self.image,
+            ctx: &self.ctx,
             region: [self.width as usize, self.array_size as usize, 1],
             byte_len: pixel_count * std::mem::size_of::<F::Pixel>(),
             _format: PhantomData::<F>,
@@ -1911,6 +2032,7 @@ impl<A: KernelAccess, F: format::Format> Image1DArray<A, F> {
         let pixel_count = (self.width as usize) * (self.array_size as usize);
         image_write_op(
             &mut self.image,
+            &self.ctx,
             [self.width as usize, self.array_size as usize, 1],
             pixels,
             pixel_count,
@@ -1924,6 +2046,7 @@ impl<A: KernelAccess, F: format::Format> Image1DArray<A, F> {
         let expected = pixel_count * std::mem::size_of::<F::Pixel>();
         image_write_bytes_op(
             &mut self.image,
+            &self.ctx,
             [self.width as usize, self.array_size as usize, 1],
             bytes,
             expected,
@@ -1939,6 +2062,7 @@ impl<A: KernelAccess, F: format::Format> Image1DArray<A, F> {
         image_copy_op(
             &self.image,
             &mut dst.image,
+            &self.ctx,
             [self.width as usize, self.array_size as usize, 1],
         )
     }
@@ -1947,6 +2071,7 @@ impl<A: KernelAccess, F: format::Format> Image1DArray<A, F> {
     pub fn fill<T: Copy>(&mut self, pattern: [T; 4]) -> ImageFillOp<'_, T> {
         image_fill_op(
             &mut self.image,
+            &self.ctx,
             [self.width as usize, self.array_size as usize, 1],
             pattern,
         )
@@ -2058,6 +2183,7 @@ impl<A: KernelAccess, F: format::Format> Image2DArray<A, F> {
             (self.width as usize) * (self.height as usize) * (self.array_size as usize);
         image_read_op(
             &self.image,
+            &self.ctx,
             [
                 self.width as usize,
                 self.height as usize,
@@ -2076,6 +2202,7 @@ impl<A: KernelAccess, F: format::Format> Image2DArray<A, F> {
         let expected = pixel_count * std::mem::size_of::<F::Pixel>();
         image_read_bytes_op(
             &self.image,
+            &self.ctx,
             [
                 self.width as usize,
                 self.height as usize,
@@ -2096,6 +2223,7 @@ impl<A: KernelAccess, F: format::Format> Image2DArray<A, F> {
             (self.width as usize) * (self.height as usize) * (self.array_size as usize);
         ImageReadAlloc {
             image: &self.image,
+            ctx: &self.ctx,
             region: [
                 self.width as usize,
                 self.height as usize,
@@ -2112,6 +2240,7 @@ impl<A: KernelAccess, F: format::Format> Image2DArray<A, F> {
             (self.width as usize) * (self.height as usize) * (self.array_size as usize);
         ImageReadBytesAlloc {
             image: &self.image,
+            ctx: &self.ctx,
             region: [
                 self.width as usize,
                 self.height as usize,
@@ -2128,6 +2257,7 @@ impl<A: KernelAccess, F: format::Format> Image2DArray<A, F> {
             (self.width as usize) * (self.height as usize) * (self.array_size as usize);
         image_write_op(
             &mut self.image,
+            &self.ctx,
             [
                 self.width as usize,
                 self.height as usize,
@@ -2146,6 +2276,7 @@ impl<A: KernelAccess, F: format::Format> Image2DArray<A, F> {
         let expected = pixel_count * std::mem::size_of::<F::Pixel>();
         image_write_bytes_op(
             &mut self.image,
+            &self.ctx,
             [
                 self.width as usize,
                 self.height as usize,
@@ -2165,6 +2296,7 @@ impl<A: KernelAccess, F: format::Format> Image2DArray<A, F> {
         image_copy_op(
             &self.image,
             &mut dst.image,
+            &self.ctx,
             [
                 self.width as usize,
                 self.height as usize,
@@ -2177,6 +2309,7 @@ impl<A: KernelAccess, F: format::Format> Image2DArray<A, F> {
     pub fn fill<T: Copy>(&mut self, pattern: [T; 4]) -> ImageFillOp<'_, T> {
         image_fill_op(
             &mut self.image,
+            &self.ctx,
             [
                 self.width as usize,
                 self.height as usize,
@@ -2353,6 +2486,7 @@ impl<A: KernelAccess, F: format::Format> Image1DBuffer<A, F> {
     pub fn read<'a>(&'a self, dst: &'a mut [F::Pixel]) -> Result<ImageReadOp<'a, F::Pixel>> {
         image_read_op(
             &self.image,
+            &self.ctx,
             [self.width as usize, 1, 1],
             dst,
             self.width as usize,
@@ -2365,6 +2499,7 @@ impl<A: KernelAccess, F: format::Format> Image1DBuffer<A, F> {
         let expected = (self.width as usize) * std::mem::size_of::<F::Pixel>();
         image_read_bytes_op(
             &self.image,
+            &self.ctx,
             [self.width as usize, 1, 1],
             dst,
             expected,
@@ -2379,6 +2514,7 @@ impl<A: KernelAccess, F: format::Format> Image1DBuffer<A, F> {
     {
         ImageReadAlloc {
             image: &self.image,
+            ctx: &self.ctx,
             region: [self.width as usize, 1, 1],
             pixel_count: self.width as usize,
             _format: PhantomData::<F>,
@@ -2389,6 +2525,7 @@ impl<A: KernelAccess, F: format::Format> Image1DBuffer<A, F> {
     pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
         ImageReadBytesAlloc {
             image: &self.image,
+            ctx: &self.ctx,
             region: [self.width as usize, 1, 1],
             byte_len: (self.width as usize) * std::mem::size_of::<F::Pixel>(),
             _format: PhantomData::<F>,
@@ -2399,6 +2536,7 @@ impl<A: KernelAccess, F: format::Format> Image1DBuffer<A, F> {
     pub fn write<'a>(&'a mut self, pixels: &'a [F::Pixel]) -> ImageWriteOp<'a, F::Pixel> {
         image_write_op(
             &mut self.image,
+            &self.ctx,
             [self.width as usize, 1, 1],
             pixels,
             self.width as usize,
@@ -2411,6 +2549,7 @@ impl<A: KernelAccess, F: format::Format> Image1DBuffer<A, F> {
         let expected = (self.width as usize) * std::mem::size_of::<F::Pixel>();
         image_write_bytes_op(
             &mut self.image,
+            &self.ctx,
             [self.width as usize, 1, 1],
             bytes,
             expected,
@@ -2423,12 +2562,22 @@ impl<A: KernelAccess, F: format::Format> Image1DBuffer<A, F> {
         &'a self,
         dst: &'a mut Image1DBuffer<A2, F>,
     ) -> ImageCopyOp<'a> {
-        image_copy_op(&self.image, &mut dst.image, [self.width as usize, 1, 1])
+        image_copy_op(
+            &self.image,
+            &mut dst.image,
+            &self.ctx,
+            [self.width as usize, 1, 1],
+        )
     }
 
     /// See [`Image2D::fill`].
     pub fn fill<T: Copy>(&mut self, pattern: [T; 4]) -> ImageFillOp<'_, T> {
-        image_fill_op(&mut self.image, [self.width as usize, 1, 1], pattern)
+        image_fill_op(
+            &mut self.image,
+            &self.ctx,
+            [self.width as usize, 1, 1],
+            pattern,
+        )
     }
 
     /// Width in pixels.

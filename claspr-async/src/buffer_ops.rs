@@ -12,7 +12,7 @@
 //!    + the synchronous Tier 1 terminal:
 //!    ```ignore
 //!    .and_then_with_context(|ec, buf| {
-//!        buf.fill(0u32).wait(ec)?;
+//!        buf.fill(0u32).wait_on(ec)?;
 //!        Ok(buf)
 //!    })
 //!    ```
@@ -107,7 +107,7 @@ where
         let event = buf
             .fill(self.value)
             .after_all(deps_as_events(&deps))
-            .submit(ec)?;
+            .submit_on(ec)?;
         Ok((buf, vec![wrap_event(event)]))
     }
 }
@@ -165,7 +165,7 @@ where
         let event = buf
             .write(source.as_slice())
             .after_all(deps_as_events(&deps))
-            .submit(ec)?;
+            .submit_on(ec)?;
         // Move `source` into a Box, hand to OpenCL's user_data. The
         // thunk drops it when CL_COMPLETE fires — exactly when the
         // runtime is done reading from the host heap.
@@ -222,7 +222,7 @@ where
         let event = buf
             .fill(self.value)
             .after_all(deps_as_events(&deps))
-            .submit(ec)?;
+            .submit_on(ec)?;
         Ok((buf, vec![wrap_event(event)]))
     }
 }

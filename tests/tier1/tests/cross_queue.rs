@@ -37,16 +37,16 @@ fn after_event_orders_launch_on_second_queue() {
     // ordering between them.
     let (buf, fill_event) = kernels
         .fill_u32([N], buf, 6)
-        .submit(&q_producer)
+        .submit_on(&q_producer)
         .expect("submit fill on producer");
     let buf = kernels
         .scale_u32([N], buf, 7)
         .after(fill_event)
-        .wait(&q_consumer)
+        .wait_on(&q_consumer)
         .expect("scale after on consumer");
 
     let mut out = vec![0u32; N];
-    buf.read(&mut out).wait(&ctx).expect("read");
+    buf.read(&mut out).wait().expect("read");
     assert!(out.iter().all(|&v| v == 42));
 }
 
@@ -67,17 +67,17 @@ fn after_all_orders_launch_after_multiple_cross_queue_events() {
     let b = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc b");
     let out = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc out");
 
-    let (a, ev_a) = kernels.fill_u32([N], a, 10).submit(&q1).expect("fill a");
-    let (b, ev_b) = kernels.fill_u32([N], b, 32).submit(&q2).expect("fill b");
+    let (a, ev_a) = kernels.fill_u32([N], a, 10).submit_on(&q1).expect("fill a");
+    let (b, ev_b) = kernels.fill_u32([N], b, 32).submit_on(&q2).expect("fill b");
 
     let (_a, _b, out) = kernels
         .add_u32([N], a, b, out)
         .after_all([ev_a, ev_b])
-        .wait(&q_combine)
+        .wait_on(&q_combine)
         .expect("add after_all");
 
     let mut host = vec![0u32; N];
-    out.read(&mut host).wait(&ctx).expect("read");
+    out.read(&mut host).wait().expect("read");
     assert!(host.iter().all(|&v| v == 42));
 }
 
@@ -98,7 +98,7 @@ fn after_with_cross_context_event_panics_clearly() {
     let buf_a = DeviceSlice::<u32>::alloc_zero(&ctx_a, N).expect("alloc on ctx_a");
     let (_buf_a, event_from_a) = kernels_a
         .fill_u32([N], buf_a, 1)
-        .submit(&ctx_a)
+        .submit_on(&ctx_a)
         .expect("submit on ctx_a");
 
     // Try to use it as an after-dep on ctx_b — should panic.
@@ -108,7 +108,7 @@ fn after_with_cross_context_event_panics_clearly() {
         let _ = kernels_b
             .fill_u32([N], buf_b, 2)
             .after(event_from_a)
-            .wait(&ctx_b);
+            .wait_on(&ctx_b);
     }));
     assert!(
         result.is_err(),

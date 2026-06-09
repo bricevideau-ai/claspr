@@ -152,7 +152,7 @@ impl<T: Default + Copy, M: MemMode + Fillable> MappedSlice<T, M> {
         // SAFETY: synchronous fill below overwrites every byte
         // before returning, so no path can observe uninit data.
         let slice = unsafe { Self::alloc_uninit(ctx, len)?.assume_init() };
-        slice.fill(T::default()).wait(ctx)?;
+        slice.fill(T::default()).wait()?;
         Ok(slice)
     }
 }
@@ -496,13 +496,29 @@ impl<'a, T: Copy, M: MemMode + Fillable> SvmFillOp<'a, T, M> {
         self
     }
 
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+    /// Sync terminal — enqueue + wait, on the owning SVM buffer's
+    /// context default queue.
+    pub fn wait(self) -> Result<()> {
+        let ctx = self.owner.ctx.clone();
+        self.wait_on(&ctx)
+    }
+
+    /// Sync terminal with an explicit launcher.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
-    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+    /// Non-blocking terminal — enqueue on the owning buffer's
+    /// context default queue.
+    pub fn submit(self) -> Result<Event> {
+        let ctx = self.owner.ctx.clone();
+        self.submit_on(&ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher.
+    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         self.into_event(launcher)
     }
 
@@ -664,17 +680,29 @@ impl<'a, T, M: MemMode> SvmWriteOp<'a, T, M> {
         self
     }
 
-    /// Sync terminal — enqueue + wait on the resulting event. Safe to
-    /// drop `data` immediately after this returns.
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+    /// Sync terminal — enqueue + wait on the owning SVM buffer's
+    /// context default queue. Safe to drop `data` immediately after.
+    pub fn wait(self) -> Result<()> {
+        let ctx = self.owner.ctx.clone();
+        self.wait_on(&ctx)
+    }
+
+    /// Sync terminal with an explicit launcher.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
-    /// Non-blocking terminal — enqueue and return the completion
-    /// event. `data` must outlive the event.
-    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+    /// Non-blocking terminal — enqueue on the owning buffer's
+    /// context default queue. `data` must outlive the event.
+    pub fn submit(self) -> Result<Event> {
+        let ctx = self.owner.ctx.clone();
+        self.submit_on(&ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher.
+    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         self.into_event(launcher)
     }
 
@@ -750,13 +778,29 @@ impl<'a, T, M1: MemMode, M2: MemMode> SvmCopyOp<'a, T, M1, M2> {
         self
     }
 
-    pub fn wait<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
+    /// Sync terminal — enqueue + wait on the src buffer's context
+    /// default queue.
+    pub fn wait(self) -> Result<()> {
+        let ctx = self.src.ctx.clone();
+        self.wait_on(&ctx)
+    }
+
+    /// Sync terminal with an explicit launcher.
+    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
         let event = self.into_event(launcher)?;
         event.wait()?;
         Ok(())
     }
 
-    pub fn submit<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
+    /// Non-blocking terminal — enqueue on the src buffer's context
+    /// default queue.
+    pub fn submit(self) -> Result<Event> {
+        let ctx = self.src.ctx.clone();
+        self.submit_on(&ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher.
+    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
         self.into_event(launcher)
     }
 
@@ -902,10 +946,16 @@ pub struct MapOp<'a, T, M: MemMode> {
 }
 
 impl<'a, T, M: MemMode + HostReadable> MapOp<'a, T, M> {
-    /// Blocking terminal — enqueue `clEnqueueSVMMap(CL_TRUE, CL_MAP_READ)`
-    /// on `launcher`'s queue and return a RAII guard that derefs to
-    /// `&[T]` and unmaps on Drop.
-    pub fn wait<L: Launcher>(self, launcher: &L) -> Result<MappedReadGuard<'a, T, M>> {
+    /// Blocking terminal on the owning buffer's context default queue.
+    pub fn wait(self) -> Result<MappedReadGuard<'a, T, M>> {
+        let ctx = self.owner.ctx.clone();
+        self.wait_on(&ctx)
+    }
+
+    /// Blocking terminal with an explicit launcher. Enqueues
+    /// `clEnqueueSVMMap(CL_TRUE, CL_MAP_READ)`; returns a RAII guard
+    /// that derefs to `&[T]` and unmaps on Drop.
+    pub fn wait_on<L: Launcher>(self, launcher: &L) -> Result<MappedReadGuard<'a, T, M>> {
         let (guard, event) = MappedReadGuard::enqueue_map(self.owner, launcher, true)?;
         // Blocking map already complete; event has nothing to wait on,
         // drop it (the cl_event refcount releases here).
@@ -913,13 +963,19 @@ impl<'a, T, M: MemMode + HostReadable> MapOp<'a, T, M> {
         Ok(guard)
     }
 
-    /// Non-blocking terminal — enqueue
-    /// `clEnqueueSVMMap(CL_FALSE, CL_MAP_READ)` on `launcher`'s queue
-    /// and return a [`MappedReadPending`] carrying the map event.
-    /// Consume via [`MappedReadPending::wait`] to get the guard; use
+    /// Non-blocking terminal on the owning buffer's context default queue.
+    pub fn submit(self) -> Result<MappedReadPending<'a, T, M>> {
+        let ctx = self.owner.ctx.clone();
+        self.submit_on(&ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher. Enqueues
+    /// `clEnqueueSVMMap(CL_FALSE, CL_MAP_READ)` and returns a
+    /// [`MappedReadPending`] carrying the map event. Consume via
+    /// [`MappedReadPending::wait`] to get the guard; use
     /// [`MappedReadPending::event`] to thread the map event into
     /// cross-queue chain ordering before then.
-    pub fn submit<L: Launcher>(self, launcher: &L) -> Result<MappedReadPending<'a, T, M>> {
+    pub fn submit_on<L: Launcher>(self, launcher: &L) -> Result<MappedReadPending<'a, T, M>> {
         let (guard, event) = MappedReadGuard::enqueue_map(self.owner, launcher, false)?;
         Ok(MappedReadPending {
             guard: Some(guard),
@@ -936,22 +992,31 @@ pub struct MapMutOp<'a, T, M: MemMode> {
 }
 
 impl<'a, T, M: MemMode + HostWritable + HostReadable> MapMutOp<'a, T, M> {
-    /// Blocking terminal — enqueue
-    /// `clEnqueueSVMMap(CL_TRUE, CL_MAP_READ | CL_MAP_WRITE)` on
-    /// `launcher`'s queue and return a RAII guard that derefs to
-    /// `&mut [T]` and unmaps on Drop.
-    pub fn wait<L: Launcher>(self, launcher: &L) -> Result<MappedWriteGuard<'a, T, M>> {
+    /// Blocking terminal on the owning buffer's context default queue.
+    pub fn wait(self) -> Result<MappedWriteGuard<'a, T, M>> {
+        let ctx = self.owner.ctx.clone();
+        self.wait_on(&ctx)
+    }
+
+    /// Blocking terminal with an explicit launcher. Enqueues
+    /// `clEnqueueSVMMap(CL_TRUE, CL_MAP_READ | CL_MAP_WRITE)` and
+    /// returns a RAII guard that derefs to `&mut [T]` and unmaps on Drop.
+    pub fn wait_on<L: Launcher>(self, launcher: &L) -> Result<MappedWriteGuard<'a, T, M>> {
         let (guard, event) = MappedWriteGuard::enqueue_map(self.owner, launcher, true)?;
         drop(event);
         Ok(guard)
     }
 
-    /// Non-blocking terminal — enqueue
-    /// `clEnqueueSVMMap(CL_FALSE, CL_MAP_READ | CL_MAP_WRITE)` on
-    /// `launcher`'s queue and return a [`MappedWritePending`] carrying
-    /// the map event. Consume via [`MappedWritePending::wait`] to get
-    /// the guard.
-    pub fn submit<L: Launcher>(self, launcher: &L) -> Result<MappedWritePending<'a, T, M>> {
+    /// Non-blocking terminal on the owning buffer's context default queue.
+    pub fn submit(self) -> Result<MappedWritePending<'a, T, M>> {
+        let ctx = self.owner.ctx.clone();
+        self.submit_on(&ctx)
+    }
+
+    /// Non-blocking terminal with an explicit launcher. Enqueues
+    /// `clEnqueueSVMMap(CL_FALSE, CL_MAP_READ | CL_MAP_WRITE)` and
+    /// returns a [`MappedWritePending`] carrying the map event.
+    pub fn submit_on<L: Launcher>(self, launcher: &L) -> Result<MappedWritePending<'a, T, M>> {
         let (guard, event) = MappedWriteGuard::enqueue_map(self.owner, launcher, false)?;
         Ok(MappedWritePending {
             guard: Some(guard),

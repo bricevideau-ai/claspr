@@ -111,13 +111,13 @@ fn launch_runs_on_each_device_via_proc_macro_launcher() {
     // Two independent buffers, one launch per device.
     let buf_a = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc a");
     let buf_b = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc b");
-    let buf_a = kernels.fill_u32([N], buf_a, 7).wait(&q_a).expect("a");
-    let buf_b = kernels.fill_u32([N], buf_b, 9).wait(&q_b).expect("b");
+    let buf_a = kernels.fill_u32([N], buf_a, 7).wait_on(&q_a).expect("a");
+    let buf_b = kernels.fill_u32([N], buf_b, 9).wait_on(&q_b).expect("b");
 
     let mut host_a = vec![0u32; N];
     let mut host_b = vec![0u32; N];
-    buf_a.read(&mut host_a).wait(&q_a).expect("read a");
-    buf_b.read(&mut host_b).wait(&q_b).expect("read b");
+    buf_a.read(&mut host_a).wait_on(&q_a).expect("read a");
+    buf_b.read(&mut host_b).wait_on(&q_b).expect("read b");
     assert!(host_a.iter().all(|&v| v == 7));
     assert!(host_b.iter().all(|&v| v == 9));
 }

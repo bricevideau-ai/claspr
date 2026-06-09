@@ -88,7 +88,7 @@ where
         let event = buf
             .migrate()
             .after_all(deps_as_events(&deps))
-            .submit(&*target_q)?;
+            .submit_on(&*target_q)?;
         Ok((buf, vec![wrap_event(event)]))
     }
 }

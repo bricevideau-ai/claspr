@@ -8,7 +8,7 @@
 //! 1. `fill_f64` writes the scalar to every slot.
 //! 2. `scale_f64` multiplies every slot by the scalar.
 //! 3. The two compose in a fill → scale pipeline through the typed
-//!    launcher (`.wait(&ctx)`).
+//!    launcher (`.wait()`).
 //!
 //! Each test skips when the device doesn't advertise the `Float64`
 //! capability (most GPUs do, llvmpipe needs `RUSTICL_FEATURES=fp64`
@@ -52,13 +52,10 @@ fn fill_f64_writes_value_to_every_element() {
     let initial = vec![0.0f64; N];
     let mut readback = vec![-1.0f64; N];
     let mut buf = DeviceSlice::<f64>::alloc_zero(&ctx, N).expect("alloc");
-    buf.write(&initial).wait(&ctx).expect("write zeros");
+    buf.write(&initial).wait().expect("write zeros");
 
-    let buf = kernels
-        .fill_f64([N], buf, 1.5)
-        .wait(&ctx)
-        .expect("fill_f64");
-    buf.read(&mut readback).wait(&ctx).expect("read");
+    let buf = kernels.fill_f64([N], buf, 1.5).wait().expect("fill_f64");
+    buf.read(&mut readback).wait().expect("read");
 
     for (i, &v) in readback.iter().enumerate() {
         assert_eq!(v, 1.5, "element {i} mismatch");
@@ -73,13 +70,10 @@ fn scale_f64_multiplies_each_element() {
     let initial = vec![2.0f64; N];
     let mut readback = vec![-1.0f64; N];
     let mut buf = DeviceSlice::<f64>::alloc_zero(&ctx, N).expect("alloc");
-    buf.write(&initial).wait(&ctx).expect("write 2.0s");
+    buf.write(&initial).wait().expect("write 2.0s");
 
-    let buf = kernels
-        .scale_f64([N], buf, 3.0)
-        .wait(&ctx)
-        .expect("scale_f64");
-    buf.read(&mut readback).wait(&ctx).expect("read");
+    let buf = kernels.scale_f64([N], buf, 3.0).wait().expect("scale_f64");
+    buf.read(&mut readback).wait().expect("read");
 
     for (i, &v) in readback.iter().enumerate() {
         assert_eq!(v, 6.0, "element {i} mismatch");
@@ -94,17 +88,11 @@ fn fill_then_scale_pipeline_via_typed_launchers() {
     let initial = vec![0.0f64; N];
     let mut readback = vec![-1.0f64; N];
     let mut buf = DeviceSlice::<f64>::alloc_zero(&ctx, N).expect("alloc");
-    buf.write(&initial).wait(&ctx).expect("write zeros");
+    buf.write(&initial).wait().expect("write zeros");
 
-    let buf = kernels
-        .fill_f64([N], buf, 0.25)
-        .wait(&ctx)
-        .expect("fill_f64");
-    let buf = kernels
-        .scale_f64([N], buf, 8.0)
-        .wait(&ctx)
-        .expect("scale_f64");
-    buf.read(&mut readback).wait(&ctx).expect("read");
+    let buf = kernels.fill_f64([N], buf, 0.25).wait().expect("fill_f64");
+    let buf = kernels.scale_f64([N], buf, 8.0).wait().expect("scale_f64");
+    buf.read(&mut readback).wait().expect("read");
 
     for (i, &v) in readback.iter().enumerate() {
         assert_eq!(v, 2.0, "element {i} mismatch");

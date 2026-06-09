@@ -28,11 +28,11 @@ fn fill_kernel_writes_value_to_every_element() {
     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let buf = kernels
         .fill_u32([N], buf, 0xfeed_cafe)
-        .wait(&ctx)
+        .wait()
         .expect("launch");
 
     let mut out = vec![0u32; N];
-    buf.read(&mut out).wait(&ctx).expect("read");
+    buf.read(&mut out).wait().expect("read");
     assert!(out.iter().all(|&v| v == 0xfeed_cafe));
 }
 
@@ -43,13 +43,13 @@ fn write_kernel_read_round_trip() {
 
     let initial: Vec<u32> = (0..N as u32).collect();
     let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
-    buf.write(&initial).wait(&ctx).expect("write");
+    buf.write(&initial).wait().expect("write");
 
     // Scale by 3, then read back.
-    let buf = kernels.scale_u32([N], buf, 3).wait(&ctx).expect("scale");
+    let buf = kernels.scale_u32([N], buf, 3).wait().expect("scale");
 
     let mut out = vec![0u32; N];
-    buf.read(&mut out).wait(&ctx).expect("read");
+    buf.read(&mut out).wait().expect("read");
     for (i, &v) in out.iter().enumerate() {
         assert_eq!(v, (i as u32).wrapping_mul(3), "elem {i}");
     }
@@ -67,13 +67,13 @@ fn multi_buffer_kernel_combines_inputs() {
 
     let host_a: Vec<u32> = vec![10; N];
     let host_b: Vec<u32> = vec![32; N];
-    a.write(&host_a).wait(&ctx).expect("write a");
-    b.write(&host_b).wait(&ctx).expect("write b");
+    a.write(&host_a).wait().expect("write a");
+    b.write(&host_b).wait().expect("write b");
 
-    let (_a, _b, out) = kernels.add_u32([N], a, b, out).wait(&ctx).expect("add");
+    let (_a, _b, out) = kernels.add_u32([N], a, b, out).wait().expect("add");
 
     let mut host_out = vec![0u32; N];
-    out.read(&mut host_out).wait(&ctx).expect("read");
+    out.read(&mut host_out).wait().expect("read");
     assert!(host_out.iter().all(|&v| v == 42));
 }
 
@@ -86,17 +86,14 @@ fn submit_returns_event_for_cross_queue_chaining() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
-    let (buf, fill_event) = kernels
-        .fill_u32([N], buf, 7)
-        .submit(&ctx)
-        .expect("submit fill");
+    let (buf, fill_event) = kernels.fill_u32([N], buf, 7).submit().expect("submit fill");
     let buf = kernels
         .scale_u32([N], buf, 6)
         .after(fill_event)
-        .wait(&ctx)
+        .wait()
         .expect("scale after");
 
     let mut out = vec![0u32; N];
-    buf.read(&mut out).wait(&ctx).expect("read");
+    buf.read(&mut out).wait().expect("read");
     assert!(out.iter().all(|&v| v == 42));
 }

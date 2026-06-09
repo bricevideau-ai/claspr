@@ -176,7 +176,7 @@ fn mapped_slice_fill_in_place() {
         .sync(&ctx)
         .expect("alloc + fill");
     assert_eq!(buf.len(), N);
-    let g = buf.map().wait(&ctx).expect("map for read-back");
+    let g = buf.map().wait().expect("map for read-back");
     assert!(g.iter().all(|&v| v == 7));
 }
 
@@ -194,7 +194,7 @@ fn mapped_slice_copy_propagates_src_to_dst() {
     .and_then(|(src, dst)| src.copy_to(dst))
     .sync(&ctx)
     .expect("upload + alloc + copy");
-    let g = dst.map().wait(&ctx).expect("map dst for read-back");
+    let g = dst.map().wait().expect("map dst for read-back");
     assert_eq!(&*g, src_data.as_slice());
 }
 
@@ -231,7 +231,7 @@ fn copy_to_mapped_slice_uninit_propagates_and_transitions_to_init() {
     .and_then(|(src, uninit_dst)| src.copy_to(uninit_dst))
     .sync(&ctx)
     .expect("svm upload + alloc_uninit + copy_to");
-    let g = dst.map().wait(&ctx).expect("map dst");
+    let g = dst.map().wait().expect("map dst");
     assert_eq!(&*g, src_data.as_slice());
 }
 

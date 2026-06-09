@@ -32,13 +32,13 @@ fn map_mut_then_map_round_trip() {
 
     let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     {
-        let mut view = buf.map_mut().wait(&ctx).expect("map_mut");
+        let mut view = buf.map_mut().wait().expect("map_mut");
         for (i, slot) in view.iter_mut().enumerate() {
             *slot = i as u32;
         }
     } // unmap on Drop
 
-    let view = buf.map().wait(&ctx).expect("map");
+    let view = buf.map().wait().expect("map");
     for (i, &v) in view.iter().enumerate() {
         assert_eq!(v, i as u32);
     }
@@ -63,7 +63,7 @@ fn drop_orders_after_cross_queue_unmap_via_last_use() {
     let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     // Write something so the unmap has data to flush.
     {
-        let mut view = buf.map_mut().wait(&other_queue).expect("map_mut on aux");
+        let mut view = buf.map_mut().wait_on(&other_queue).expect("map_mut on aux");
         for slot in view.iter_mut() {
             *slot = 99;
         }
@@ -135,7 +135,7 @@ fn kernel_launches_on_ooo_queue_register_themselves_for_drop() {
     for value in 0..4u32 {
         let (returned, event) = kernels
             .fill_u32([N], buf, value)
-            .submit(&ooo)
+            .submit_on(&ooo)
             .expect("submit");
         buf = returned;
         // Hold each Event briefly; auto-register has already happened
@@ -173,14 +173,14 @@ fn read_only_map_via_map_guard() {
     let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     {
         // Populate via map_mut...
-        let mut g = buf.map_mut().wait(&ctx).expect("map_mut");
+        let mut g = buf.map_mut().wait().expect("map_mut");
         for (i, slot) in g.iter_mut().enumerate() {
             *slot = (i as u32).wrapping_mul(7);
         }
     } // unmap
 
     // ...then read back via read-only map.
-    let g = buf.map().wait(&ctx).expect("map");
+    let g = buf.map().wait().expect("map");
     for (i, &v) in g.iter().enumerate() {
         assert_eq!(v, (i as u32).wrapping_mul(7));
     }
@@ -208,18 +208,18 @@ fn multi_kernel_svm_pipeline_via_typed_launchers() {
     // Stage 1: fill_u32 with 4.
     let (buf, fill_event) = kernels
         .fill_u32([N], buf, 4u32)
-        .submit(&ooo)
+        .submit_on(&ooo)
         .expect("submit fill");
 
     // Stage 2: scale_u32 by 5, ordered after fill via `.after`.
     let buf = kernels
         .scale_u32([N], buf, 5u32)
         .after(fill_event)
-        .wait(&ooo)
+        .wait_on(&ooo)
         .expect("scale after fill");
 
     // Read result via map: every slot is 4 * 5 = 20.
-    let g = buf.map().wait(&ctx).expect("map");
+    let g = buf.map().wait().expect("map");
     assert!(g.iter().all(|&v| v == 20));
 }
 
@@ -233,14 +233,14 @@ fn submit_returns_pending_then_wait_yields_guard() {
     let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     // Seed via blocking map.
     {
-        let mut g = buf.map_mut().wait(&ctx).expect("seed map");
+        let mut g = buf.map_mut().wait().expect("seed map");
         for (i, slot) in g.iter_mut().enumerate() {
             *slot = i as u32;
         }
     }
 
     // Non-blocking read map.
-    let pending = buf.map().submit(&ctx).expect("submit");
+    let pending = buf.map().submit().expect("submit");
     // Event handle is exposed for chain ordering before .wait.
     let _evt_borrow = pending.event();
     let g = pending.wait().expect("pending.wait");
@@ -254,14 +254,14 @@ fn submit_mut_returns_pending_with_derefmut_after_wait() {
     let Some(ctx) = ctx_with_svm() else { return };
 
     let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
-    let pending = buf.map_mut().submit(&ctx).expect("submit mut");
+    let pending = buf.map_mut().submit().expect("submit mut");
     let mut g = pending.wait().expect("pending.wait");
     for (i, slot) in g.iter_mut().enumerate() {
         *slot = (i as u32).wrapping_mul(11);
     }
     drop(g);
 
-    let g = buf.map().wait(&ctx).expect("read-back map");
+    let g = buf.map().wait().expect("read-back map");
     for (i, &v) in g.iter().enumerate() {
         assert_eq!(v, (i as u32).wrapping_mul(11));
     }

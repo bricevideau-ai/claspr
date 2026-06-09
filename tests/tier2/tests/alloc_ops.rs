@@ -161,7 +161,7 @@ fn mapped_alloc_uninit_then_fill_via_trait_verb() {
         .sync(&ctx)
         .expect("mapped alloc_uninit + fill");
     assert_eq!(buf.len(), N);
-    let g = buf.map().wait(&ctx).expect("map");
+    let g = buf.map().wait().expect("map");
     assert!(g.iter().all(|&v| v == 7));
 }
 

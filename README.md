@@ -38,10 +38,9 @@ fn main() -> claspr::Result<()> {
     let kernels = gpu::kernels(&ctx)?;
 
     let mut data: Vec<u32> = (1..=1024).collect();
-    let mut buf = DeviceSlice::alloc(&ctx, data.len())?;
-    buf.write(&ctx, &data).wait()?;
-    let buf = kernels.collatz_kernel([data.len()], buf).wait(&ctx)?;
-    buf.read(&ctx, &mut data).wait()?;
+    let buf = DeviceSlice::from_slice(&ctx, &data)?;
+    let buf = kernels.collatz_kernel([data.len()], buf).wait()?;
+    buf.read(&mut data).wait()?;
 
     // Validate every element against the host implementation —
     // same `collatz` definition, two callers.
@@ -104,7 +103,7 @@ claspr::kernels! {
 }
 
 let kernels = gpu::Kernels::load_from(&ctx, generated::SPV_BYTES)?;
-let buf = kernels.fill_u32([N], buf, 0xdead_beefu32).wait(&ctx)?;
+let buf = kernels.fill_u32([N], buf, 0xdead_beefu32).wait()?;
 ```
 
 See `tests/explicit-compile/` for the canonical reference shape
@@ -149,15 +148,15 @@ The same `kernels.foo(...)` method that returns a Tier 1 Op also implements `Dev
 ```rust
 use claspr_async::{DeviceOperation, download, upload};
 
-let result: Vec<u32> = upload(input)
+let result: Vec<u32> = upload!(input)
     .and_then(|buf| kernels.linear([N], buf, W1, B1))
     .and_then(|buf| kernels.relu_threshold([N], buf, THRESHOLD))
     .and_then(|buf| kernels.linear([N], buf, W2, B2))
-    .and_then(download)
+    .and_then(|buf| download!(buf))
     .sync(&ctx)?;
 ```
 
-`.sync(&ctx)` enqueues the whole chain on the per-device out-of-order queue, the OpenCL runtime overlaps stages, and host-side work (via `.and_then_host` / `.and_then_host_with_context`) slots in without serialising through the submitting thread. `.run(&ctx)` returns a `Future` for the same chain. Other combinators: `bundle!(a, b, c)` for heterogeneous parallel composition, `items.fan_out(|i| op)` for N-way homogeneous parallelism, `DynOp<T>` for type-erased branches, `.and_then_with_context(|ec, prev| op)` when the next step needs the running context, `.on_device(&dev)` / `transfer_to_device(buf, &dev)` for non-blocking cross-device pipelines, and lazy `device_slice_alloc::<T>(N)` / `mapped_slice_alloc::<T>(N)` / `usm_slice(vec)` so temp buffers materialize at execute time. See `examples/async-pipeline` and `examples/batch-inference`.
+`.sync(&ctx)` enqueues the whole chain on the per-device out-of-order queue, the OpenCL runtime overlaps stages, and host-side work (via `.and_then_host` / `.and_then_host_with_context`) slots in without serialising through the submitting thread. `.run(&ctx)` returns a `Future` for the same chain. Other combinators: `bundle!(a, b, c)` for heterogeneous parallel composition, `items.fan_out(|i| op)` for N-way homogeneous parallelism, `DynOp<T>` for type-erased branches, `.and_then_with_context(|ec, prev| op)` when the next step needs the running context, `.on_device(&dev)` / `transfer_to_device(buf, &dev)` for non-blocking cross-device pipelines, and lazy `device_slice_alloc_zero!(T, N)` / `mapped_slice_alloc_zero!(T, N)` / `usm_slice!(vec)` so temp buffers materialize at execute time. See `examples/async-pipeline` and `examples/batch-inference`.
 
 ## Workspace layout
 

@@ -139,7 +139,7 @@ where
         let event = buf
             .read(&mut out)
             .after_all(deps_as_events(&deps))
-            .submit(ctx)?;
+            .submit_on(ctx)?;
         Ok((out, vec![wrap_event(event)]))
     }
 }

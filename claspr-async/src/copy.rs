@@ -114,7 +114,7 @@ where
         let (src, mut dst) = self.take();
         let event = DeviceSlice::copy_to(&src, &mut dst)
             .after_all(deps_as_events(&deps))
-            .submit(ec)?;
+            .submit_on(ec)?;
         Ok(((src, dst), vec![wrap_event(event)]))
     }
 }
@@ -151,7 +151,7 @@ where
         let mut dst = unsafe { uninit_dst.assume_init() };
         let event = DeviceSlice::copy_to(&src, &mut dst)
             .after_all(deps_as_events(&deps))
-            .submit(ec)?;
+            .submit_on(ec)?;
         Ok(((src, dst), vec![wrap_event(event)]))
     }
 }
@@ -182,7 +182,7 @@ where
         let (src, dst) = self.take();
         let event = MappedSlice::copy_to(&src, &dst)
             .after_all(deps_as_events(&deps))
-            .submit(ec)?;
+            .submit_on(ec)?;
         Ok(((src, dst), vec![wrap_event(event)]))
     }
 }
@@ -215,7 +215,7 @@ where
         let dst = unsafe { uninit_dst.assume_init() };
         let event = MappedSlice::copy_to(&src, &dst)
             .after_all(deps_as_events(&deps))
-            .submit(ec)?;
+            .submit_on(ec)?;
         Ok(((src, dst), vec![wrap_event(event)]))
     }
 }
