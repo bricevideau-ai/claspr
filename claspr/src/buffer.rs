@@ -304,6 +304,25 @@ impl<T, M: MemMode + HostWritable> DeviceSlice<T, M> {
     }
 }
 
+impl<T, M: MemMode + HostWritable + HostReadable> DeviceSlice<T, M> {
+    /// Begin a host read+write map of this buffer (zero-copy
+    /// alternative to a write-then-read round trip). Returns a lazy
+    /// [`DeviceMapMutOp`] builder — terminals match
+    /// [`DeviceSlice::map`] but the resulting guard is
+    /// [`DeviceMappedWriteGuard`] (`DerefMut<Target = [T]>`).
+    ///
+    /// `&mut self` provides the borrow-checker exclusivity that
+    /// `DerefMut` needs.
+    ///
+    /// **Marker constraint:** `M: HostWritable + HostReadable` —
+    /// the underlying `clEnqueueMapBuffer(CL_MAP_READ | CL_MAP_WRITE)`
+    /// requires both. Same shape as
+    /// [`MappedSlice::map_mut`](crate::MappedSlice::map_mut).
+    pub fn map_mut(&mut self) -> DeviceMapMutOp<'_, T, M> {
+        DeviceMapMutOp { owner: self }
+    }
+}
+
 impl<T, M: MemMode + HostReadable> DeviceSlice<T, M> {
     /// Begin reading the buffer into `dst`. Returns a lazy [`ReadOp`]
     /// builder — call [`wait`](ReadOp::wait), [`submit`](ReadOp::submit),
@@ -323,6 +342,25 @@ impl<T, M: MemMode + HostReadable> DeviceSlice<T, M> {
             deps: Vec::new(),
             profile_cb: None,
         }
+    }
+
+    /// Begin a host read map of this buffer (zero-copy alternative to
+    /// [`read`](Self::read)). Returns a lazy [`DeviceMapOp`] builder
+    /// — pick a terminal:
+    ///
+    /// - [`wait`](DeviceMapOp::wait): blocking
+    ///   `clEnqueueMapBuffer(CL_TRUE, CL_MAP_READ)`, returns a
+    ///   [`DeviceMappedReadGuard`] (`Deref<Target = [T]>`,
+    ///   unmaps on Drop).
+    /// - [`submit`](DeviceMapOp::submit): non-blocking
+    ///   `clEnqueueMapBuffer(CL_FALSE, CL_MAP_READ)`, returns a
+    ///   [`DeviceMapReadPending`] carrying the map event; consume via
+    ///   [`DeviceMapReadPending::wait`] for the guard.
+    ///
+    /// **Marker constraint:** `M: HostReadable`. SVM analog:
+    /// [`MappedSlice::map`](crate::MappedSlice::map).
+    pub fn map(&self) -> DeviceMapOp<'_, T, M> {
+        DeviceMapOp { owner: self }
     }
 }
 
@@ -998,3 +1036,325 @@ impl<T, M: MemMode> Buffer<T> for DeviceSlice<T, M> {
 // Use [`USMSlice`](crate::USMSlice) (fine-grain system SVM) for
 // that role on supporting devices, or [`MappedSlice`](crate::MappedSlice)
 // with the map-guard pattern for coarse-grain SVM.
+
+// ── Map builders + guards (cl_mem path) ─────────────────────────────
+//
+// Mirrors the SVM map surface in `crate::mapped`. Two terminals on
+// each builder (`wait` blocking, `submit` non-blocking returning a
+// pending); guards Deref / DerefMut to `[T]` and unmap on Drop.
+//
+// `cl_mem` retains internally for every enqueued op, so
+// `clReleaseMemObject` in `DeviceSlice::Drop` doesn't need a
+// `last_use`-style wait-list — the runtime gates the release on
+// in-flight uses. For users who want to thread the unmap event into
+// a cross-queue chain, `release(self) -> Result<Event>` consumes the
+// guard and returns the unmap event explicitly instead of dropping it.
+
+use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE};
+use std::ops::{Deref, DerefMut};
+
+use crate::map_primitive;
+
+/// Lazy builder for [`DeviceSlice::map`]. Borrows the source buffer;
+/// pick a terminal — [`wait`](DeviceMapOp::wait) (blocking) or
+/// [`submit`](DeviceMapOp::submit) (non-blocking).
+pub struct DeviceMapOp<'a, T, M: MemMode> {
+    owner: &'a DeviceSlice<T, M>,
+}
+
+impl<'a, T, M: MemMode + HostReadable> DeviceMapOp<'a, T, M> {
+    /// Blocking terminal — enqueue
+    /// `clEnqueueMapBuffer(CL_TRUE, CL_MAP_READ)` on `launcher`'s
+    /// queue and return a [`DeviceMappedReadGuard`].
+    pub fn wait<L: Launcher>(self, launcher: &L) -> Result<DeviceMappedReadGuard<'a, T, M>> {
+        let (guard, event) = DeviceMappedReadGuard::enqueue_map(self.owner, launcher, true)?;
+        drop(event);
+        Ok(guard)
+    }
+
+    /// Non-blocking terminal — enqueue
+    /// `clEnqueueMapBuffer(CL_FALSE, CL_MAP_READ)` on `launcher`'s
+    /// queue and return a [`DeviceMapReadPending`] carrying the map
+    /// event. Bytes are NOT spec-valid for host reads until the map
+    /// event completes; consume via
+    /// [`DeviceMapReadPending::wait`] to block on it and get the
+    /// guard, or use [`DeviceMapReadPending::event`] to thread the
+    /// map event into a cross-queue chain first.
+    pub fn submit<L: Launcher>(self, launcher: &L) -> Result<DeviceMapReadPending<'a, T, M>> {
+        let (guard, event) = DeviceMappedReadGuard::enqueue_map(self.owner, launcher, false)?;
+        Ok(DeviceMapReadPending {
+            guard: Some(guard),
+            event,
+        })
+    }
+}
+
+/// Lazy builder for [`DeviceSlice::map_mut`]. Same shape as
+/// [`DeviceMapOp`] but the resulting guard is
+/// [`DeviceMappedWriteGuard`] (DerefMut to `&mut [T]`).
+pub struct DeviceMapMutOp<'a, T, M: MemMode> {
+    owner: &'a mut DeviceSlice<T, M>,
+}
+
+impl<'a, T, M: MemMode + HostWritable + HostReadable> DeviceMapMutOp<'a, T, M> {
+    /// Blocking terminal — enqueue
+    /// `clEnqueueMapBuffer(CL_TRUE, CL_MAP_READ | CL_MAP_WRITE)` on
+    /// `launcher`'s queue and return a [`DeviceMappedWriteGuard`].
+    pub fn wait<L: Launcher>(self, launcher: &L) -> Result<DeviceMappedWriteGuard<'a, T, M>> {
+        let (guard, event) = DeviceMappedWriteGuard::enqueue_map(self.owner, launcher, true)?;
+        drop(event);
+        Ok(guard)
+    }
+
+    /// Non-blocking terminal — see [`DeviceMapOp::submit`].
+    pub fn submit<L: Launcher>(self, launcher: &L) -> Result<DeviceMapWritePending<'a, T, M>> {
+        let (guard, event) = DeviceMappedWriteGuard::enqueue_map(self.owner, launcher, false)?;
+        Ok(DeviceMapWritePending {
+            guard: Some(guard),
+            event,
+        })
+    }
+}
+
+/// Result of [`DeviceMapOp::submit`] — a non-blocking
+/// `clEnqueueMapBuffer` in flight. The pointer was set synchronously
+/// inside the call but the bytes are NOT spec-valid for host reads
+/// until the map event completes.
+pub struct DeviceMapReadPending<'a, T, M: MemMode> {
+    guard: Option<DeviceMappedReadGuard<'a, T, M>>,
+    event: Event,
+}
+
+impl<'a, T, M: MemMode> DeviceMapReadPending<'a, T, M> {
+    /// Borrow the map [`Event`] for cross-queue chain ordering before
+    /// consuming the pending.
+    pub fn event(&self) -> &Event {
+        &self.event
+    }
+
+    /// Block on the map event and return the
+    /// [`DeviceMappedReadGuard`]. After Ok return the guard's
+    /// `Deref<Target = [T]>` is safe to read.
+    pub fn wait(mut self) -> Result<DeviceMappedReadGuard<'a, T, M>> {
+        self.event.wait()?;
+        Ok(self
+            .guard
+            .take()
+            .expect("DeviceMapReadPending::wait called twice"))
+    }
+}
+
+/// Result of [`DeviceMapMutOp::submit`] — same shape as
+/// [`DeviceMapReadPending`] but yields a [`DeviceMappedWriteGuard`].
+pub struct DeviceMapWritePending<'a, T, M: MemMode> {
+    guard: Option<DeviceMappedWriteGuard<'a, T, M>>,
+    event: Event,
+}
+
+impl<'a, T, M: MemMode> DeviceMapWritePending<'a, T, M> {
+    pub fn event(&self) -> &Event {
+        &self.event
+    }
+    pub fn wait(mut self) -> Result<DeviceMappedWriteGuard<'a, T, M>> {
+        self.event.wait()?;
+        Ok(self
+            .guard
+            .take()
+            .expect("DeviceMapWritePending::wait called twice"))
+    }
+}
+
+/// RAII guard for a `cl_mem` read map. Drop issues
+/// `clEnqueueUnmapMemObject` and discards the unmap event (OpenCL
+/// retains the cl_mem internally, so the release in [`DeviceSlice`]'s
+/// `Drop` impl gates correctly without an explicit last-use list).
+///
+/// Users who need the unmap event for cross-queue chain ordering can
+/// call [`release`](Self::release) instead of letting Drop fire — it
+/// consumes the guard and returns the unmap event.
+pub struct DeviceMappedReadGuard<'a, T, M: MemMode> {
+    buf: &'a DeviceSlice<T, M>,
+    host_ptr: *mut T,
+    queue: crate::util::RetainedQueue,
+    released: bool,
+}
+
+// SAFETY: host_ptr is a mapped pointer accessed serially via
+// Deref/Drop on this thread. The buffer's Send-ness is inherited
+// through the borrow.
+unsafe impl<T: Send, M: MemMode> Send for DeviceMappedReadGuard<'_, T, M> {}
+
+impl<'a, T, M: MemMode> DeviceMappedReadGuard<'a, T, M> {
+    fn enqueue_map<L: Launcher>(
+        buf: &'a DeviceSlice<T, M>,
+        launcher: &L,
+        blocking: bool,
+    ) -> Result<(Self, Event)> {
+        let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
+        let size = buf.len * std::mem::size_of::<T>();
+        // SAFETY: buf.buffer is live (we hold the borrow); queue is
+        // live (RetainedQueue); size matches the allocation.
+        let (host_ptr_raw, event) = unsafe {
+            map_primitive::map_buffer(
+                queue.raw(),
+                buf.buffer.get(),
+                blocking,
+                CL_MAP_READ,
+                0,
+                size,
+                &[],
+            )?
+        };
+        Ok((
+            DeviceMappedReadGuard {
+                buf,
+                host_ptr: host_ptr_raw.cast::<T>(),
+                queue,
+                released: false,
+            },
+            event,
+        ))
+    }
+
+    /// Consume the guard, enqueue the unmap, and return the unmap
+    /// [`Event`] for cross-queue chain ordering. Mirrors `Drop`'s
+    /// unmap but lets the caller thread the resulting event into
+    /// downstream enqueues on different queues. After this returns,
+    /// the guard's `Drop` is suppressed.
+    pub fn release(mut self) -> Result<Event> {
+        // SAFETY: host_ptr was returned by our own map_buffer call;
+        // unmap exactly once.
+        let event = unsafe {
+            map_primitive::unmap_mem_object(
+                self.queue.raw(),
+                self.buf.buffer.get(),
+                self.host_ptr.cast(),
+                &[],
+            )?
+        };
+        self.released = true;
+        Ok(event)
+    }
+}
+
+impl<T, M: MemMode> Deref for DeviceMappedReadGuard<'_, T, M> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        // SAFETY: host_ptr is mapped + readable for this guard's
+        // lifetime.
+        unsafe { crate::util::mapped_slice(self.host_ptr, self.buf.len) }
+    }
+}
+
+impl<T, M: MemMode> Drop for DeviceMappedReadGuard<'_, T, M> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        // SAFETY: host_ptr was mapped via `enqueue_map`; unmap once.
+        match unsafe {
+            map_primitive::unmap_mem_object(
+                self.queue.raw(),
+                self.buf.buffer.get(),
+                self.host_ptr.cast(),
+                &[],
+            )
+        } {
+            Ok(_evt) => {} // _evt drops here (OpenCL holds the cl_mem internally)
+            Err(_) => self.buf.ctx.record_err(),
+        }
+    }
+}
+
+/// RAII guard for a `cl_mem` read+write map. Same shape as
+/// [`DeviceMappedReadGuard`] with `DerefMut<Target = [T]>` added.
+pub struct DeviceMappedWriteGuard<'a, T, M: MemMode> {
+    buf: &'a mut DeviceSlice<T, M>,
+    host_ptr: *mut T,
+    queue: crate::util::RetainedQueue,
+    released: bool,
+}
+
+unsafe impl<T: Send, M: MemMode> Send for DeviceMappedWriteGuard<'_, T, M> {}
+
+impl<'a, T, M: MemMode> DeviceMappedWriteGuard<'a, T, M> {
+    fn enqueue_map<L: Launcher>(
+        buf: &'a mut DeviceSlice<T, M>,
+        launcher: &L,
+        blocking: bool,
+    ) -> Result<(Self, Event)> {
+        let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
+        let size = buf.len * std::mem::size_of::<T>();
+        let cl_mem = buf.buffer.get();
+        // SAFETY: see DeviceMappedReadGuard::enqueue_map.
+        let (host_ptr_raw, event) = unsafe {
+            map_primitive::map_buffer(
+                queue.raw(),
+                cl_mem,
+                blocking,
+                CL_MAP_READ | CL_MAP_WRITE,
+                0,
+                size,
+                &[],
+            )?
+        };
+        Ok((
+            DeviceMappedWriteGuard {
+                buf,
+                host_ptr: host_ptr_raw.cast::<T>(),
+                queue,
+                released: false,
+            },
+            event,
+        ))
+    }
+
+    /// See [`DeviceMappedReadGuard::release`].
+    pub fn release(mut self) -> Result<Event> {
+        let event = unsafe {
+            map_primitive::unmap_mem_object(
+                self.queue.raw(),
+                self.buf.buffer.get(),
+                self.host_ptr.cast(),
+                &[],
+            )?
+        };
+        self.released = true;
+        Ok(event)
+    }
+}
+
+impl<T, M: MemMode> Deref for DeviceMappedWriteGuard<'_, T, M> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        // SAFETY: see DeviceMappedReadGuard::deref.
+        unsafe { crate::util::mapped_slice(self.host_ptr, self.buf.len) }
+    }
+}
+
+impl<T, M: MemMode> DerefMut for DeviceMappedWriteGuard<'_, T, M> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: `&mut self` upgrades to a unique mutable slice;
+        // mapped read+write for the guard's lifetime.
+        unsafe { crate::util::mapped_slice_mut(self.host_ptr, self.buf.len) }
+    }
+}
+
+impl<T, M: MemMode> Drop for DeviceMappedWriteGuard<'_, T, M> {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        match unsafe {
+            map_primitive::unmap_mem_object(
+                self.queue.raw(),
+                self.buf.buffer.get(),
+                self.host_ptr.cast(),
+                &[],
+            )
+        } {
+            Ok(_evt) => {}
+            Err(_) => self.buf.ctx.record_err(),
+        }
+    }
+}

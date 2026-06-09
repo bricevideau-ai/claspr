@@ -87,7 +87,9 @@ pub use access::{
     ReadWrite, RuntimeFillable, WriteOnly,
 };
 pub use buffer::{
-    Buffer, CopyOp, DeviceSlice, DeviceSliceUninit, FillOp, MigrateOp, ReadOp, WriteOp,
+    Buffer, CopyOp, DeviceMapMutOp, DeviceMapOp, DeviceMapReadPending, DeviceMapWritePending,
+    DeviceMappedReadGuard, DeviceMappedWriteGuard, DeviceSlice, DeviceSliceUninit, FillOp,
+    MigrateOp, ReadOp, WriteOp,
 };
 pub use context::{Context, SvmLevel};
 pub use device::{Device, DeviceType, Platform};
@@ -120,8 +122,8 @@ pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 #[cfg(feature = "async-events")]
 pub use future::{EventFuture, EventFutureExt, LaunchFuture};
 pub use mapped::{
-    MappedReadGuard, MappedSlice, MappedSliceUninit, MappedWriteGuard, SvmCopyOp, SvmFillOp,
-    SvmWriteOp,
+    MapMutOp, MapOp, MappedReadGuard, MappedReadPending, MappedSlice, MappedSliceUninit,
+    MappedWriteGuard, MappedWritePending, SvmCopyOp, SvmFillOp, SvmWriteOp,
 };
 pub use usm::{USMSlice, USMSliceUninit};
 

@@ -222,3 +222,47 @@ fn multi_kernel_svm_pipeline_via_typed_launchers() {
     let g = buf.map().wait(&ctx).expect("map");
     assert!(g.iter().all(|&v| v == 20));
 }
+
+#[test]
+fn submit_returns_pending_then_wait_yields_guard() {
+    // Non-blocking SVM map terminal: `.submit()` returns a pending
+    // (no Deref), `.wait()` blocks on the map event and consumes
+    // into the guard.
+    let Some(ctx) = ctx_with_svm() else { return };
+
+    let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
+    // Seed via blocking map.
+    {
+        let mut g = buf.map_mut().wait(&ctx).expect("seed map");
+        for (i, slot) in g.iter_mut().enumerate() {
+            *slot = i as u32;
+        }
+    }
+
+    // Non-blocking read map.
+    let pending = buf.map().submit(&ctx).expect("submit");
+    // Event handle is exposed for chain ordering before .wait.
+    let _evt_borrow = pending.event();
+    let g = pending.wait().expect("pending.wait");
+    for (i, &v) in g.iter().enumerate() {
+        assert_eq!(v, i as u32);
+    }
+}
+
+#[test]
+fn submit_mut_returns_pending_with_derefmut_after_wait() {
+    let Some(ctx) = ctx_with_svm() else { return };
+
+    let mut buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
+    let pending = buf.map_mut().submit(&ctx).expect("submit mut");
+    let mut g = pending.wait().expect("pending.wait");
+    for (i, slot) in g.iter_mut().enumerate() {
+        *slot = (i as u32).wrapping_mul(11);
+    }
+    drop(g);
+
+    let g = buf.map().wait(&ctx).expect("read-back map");
+    for (i, &v) in g.iter().enumerate() {
+        assert_eq!(v, (i as u32).wrapping_mul(11));
+    }
+}

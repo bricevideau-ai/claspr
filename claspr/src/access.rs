@@ -108,6 +108,38 @@
 //! let _read_op = frozen.acquire_host_view_read();  // ✓ compiles
 //! ```
 //!
+//! Frozen → `.map_mut()`: rejected because Frozen doesn't impl
+//! [`HostWritable`] (only Read).
+//!
+//! ```compile_fail
+//! use claspr::{Context, DeviceSlice, Frozen};
+//! let ctx = Context::any().unwrap();
+//! let mut frozen: DeviceSlice<u32, Frozen> =
+//!     DeviceSlice::from_slice(&ctx, &[0u32; 16]).unwrap();
+//! let _ = frozen.map_mut();  // ← HostWritable: ERROR
+//! ```
+//!
+//! HostReadOnly → `.map_mut()`: rejected (kernel-RW, host-RO).
+//!
+//! ```compile_fail
+//! use claspr::{Context, DeviceSlice, HostReadOnly};
+//! let ctx = Context::any().unwrap();
+//! let mut buf: DeviceSlice<u32, HostReadOnly> =
+//!     DeviceSlice::from_slice(&ctx, &[0u32; 16]).unwrap();
+//! let _ = buf.map_mut();  // ← HostWritable: ERROR
+//! ```
+//!
+//! DeviceScratch → `.map()`: rejected — `CL_MEM_HOST_NO_ACCESS`
+//! means host can't touch the bytes at all.
+//!
+//! ```compile_fail
+//! use claspr::{Context, DeviceSlice, DeviceScratch};
+//! let ctx = Context::any().unwrap();
+//! let buf: DeviceSlice<u32, DeviceScratch> =
+//!     DeviceSlice::alloc_zero(&ctx, 16).unwrap();
+//! let _ = buf.map();  // ← HostReadable: ERROR
+//! ```
+//!
 //! [`DeviceSlice`]: crate::DeviceSlice
 //! [`Image2D`]: crate::Image2D
 

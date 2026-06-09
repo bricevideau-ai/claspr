@@ -878,20 +878,25 @@ impl<T, M: MemMode> KernelArg for MappedSlice<T, M> {
 // ── Map builders (Op shape, late-bind launcher) ────────────────────
 //
 // Construction is `buf.map()` / `buf.map_mut()` — no launcher yet,
-// just borrows `buf`. The terminal `.wait(&launcher)?` issues the
-// `clEnqueueSVMMap` and returns the matching guard. Matches the
-// post-`f19457d` Op pattern (`buf.write(&data).wait(&ctx)?`,
-// `kernels.foo([N], buf).wait(&ctx)?`).
+// just borrows `buf`. Two terminals (mirroring every other Tier 1 op):
 //
-// `.submit(&launcher)` (non-blocking) is intentionally not provided
-// yet — the design question for it is bigger than just adding the
-// terminal (see [[claspr-scope-launcher-followup]] for the
-// SVM-vs-cl_mem split). Today's chain users go through
-// `claspr-async`'s `host_view` combinator instead.
+//   .wait(&launcher)?    blocking — enqueue with CL_TRUE, return guard
+//   .submit(&launcher)?  non-blocking — enqueue with CL_FALSE, return
+//                        a `MappedReadPending` / `MappedWritePending`
+//                        carrying the map event; consume via `.wait()`
+//                        on the pending to get the guard once the map
+//                        completes (or `.event()` for chain ordering
+//                        before then).
+//
+// Drop on the guards enqueues `clEnqueueSVMUnmap` AND registers the
+// unmap event on the buffer's `last_use` list — so `clEnqueueSVMFree`
+// in `MappedSlice::Drop` waits on it even when the map/unmap queue
+// is not the context's default in-order queue (closes a latent
+// cross-queue race that the old blocking-only path had too).
 
 /// Lazy builder for [`MappedSlice::map`]. Borrows the source buffer;
-/// the terminal `.wait(&launcher)?` issues the blocking SVM map and
-/// returns a [`MappedReadGuard`].
+/// pick a terminal — [`wait`](MapOp::wait) (blocking) or
+/// [`submit`](MapOp::submit) (non-blocking).
 pub struct MapOp<'a, T, M: MemMode> {
     owner: &'a MappedSlice<T, M>,
 }
@@ -901,13 +906,31 @@ impl<'a, T, M: MemMode + HostReadable> MapOp<'a, T, M> {
     /// on `launcher`'s queue and return a RAII guard that derefs to
     /// `&[T]` and unmaps on Drop.
     pub fn wait<L: Launcher>(self, launcher: &L) -> Result<MappedReadGuard<'a, T, M>> {
-        MappedReadGuard::new(self.owner, launcher)
+        let (guard, event) = MappedReadGuard::enqueue_map(self.owner, launcher, true)?;
+        // Blocking map already complete; event has nothing to wait on,
+        // drop it (the cl_event refcount releases here).
+        drop(event);
+        Ok(guard)
+    }
+
+    /// Non-blocking terminal — enqueue
+    /// `clEnqueueSVMMap(CL_FALSE, CL_MAP_READ)` on `launcher`'s queue
+    /// and return a [`MappedReadPending`] carrying the map event.
+    /// Consume via [`MappedReadPending::wait`] to get the guard; use
+    /// [`MappedReadPending::event`] to thread the map event into
+    /// cross-queue chain ordering before then.
+    pub fn submit<L: Launcher>(self, launcher: &L) -> Result<MappedReadPending<'a, T, M>> {
+        let (guard, event) = MappedReadGuard::enqueue_map(self.owner, launcher, false)?;
+        Ok(MappedReadPending {
+            guard: Some(guard),
+            event,
+        })
     }
 }
 
 /// Lazy builder for [`MappedSlice::map_mut`]. Borrows the source
-/// buffer mutably; the terminal `.wait(&launcher)?` issues the
-/// blocking SVM map and returns a [`MappedWriteGuard`].
+/// buffer mutably; pick a terminal — [`wait`](MapMutOp::wait)
+/// (blocking) or [`submit`](MapMutOp::submit) (non-blocking).
 pub struct MapMutOp<'a, T, M: MemMode> {
     owner: &'a mut MappedSlice<T, M>,
 }
@@ -918,35 +941,135 @@ impl<'a, T, M: MemMode + HostWritable + HostReadable> MapMutOp<'a, T, M> {
     /// `launcher`'s queue and return a RAII guard that derefs to
     /// `&mut [T]` and unmaps on Drop.
     pub fn wait<L: Launcher>(self, launcher: &L) -> Result<MappedWriteGuard<'a, T, M>> {
-        MappedWriteGuard::new(self.owner, launcher)
+        let (guard, event) = MappedWriteGuard::enqueue_map(self.owner, launcher, true)?;
+        drop(event);
+        Ok(guard)
+    }
+
+    /// Non-blocking terminal — enqueue
+    /// `clEnqueueSVMMap(CL_FALSE, CL_MAP_READ | CL_MAP_WRITE)` on
+    /// `launcher`'s queue and return a [`MappedWritePending`] carrying
+    /// the map event. Consume via [`MappedWritePending::wait`] to get
+    /// the guard.
+    pub fn submit<L: Launcher>(self, launcher: &L) -> Result<MappedWritePending<'a, T, M>> {
+        let (guard, event) = MappedWriteGuard::enqueue_map(self.owner, launcher, false)?;
+        Ok(MappedWritePending {
+            guard: Some(guard),
+            event,
+        })
+    }
+}
+
+// ── Map pendings (non-blocking submit results) ─────────────────────
+
+/// Result of [`MapOp::submit`] — a non-blocking SVM read map in
+/// flight. The map enqueue has returned; the bytes are NOT
+/// spec-valid for host reads until the map event completes.
+///
+/// Consume via [`wait`](Self::wait) to block on the event and get
+/// the [`MappedReadGuard`]; use [`event`](Self::event) before that
+/// if you need to thread the map event into a cross-queue chain.
+pub struct MappedReadPending<'a, T, M: MemMode> {
+    guard: Option<MappedReadGuard<'a, T, M>>,
+    event: Event,
+}
+
+impl<'a, T, M: MemMode> MappedReadPending<'a, T, M> {
+    /// Borrow the map [`Event`] — for `.after(&evt)` chaining on a
+    /// dependent enqueue without blocking the host. Calling this
+    /// does not consume the pending; the guard is still produced by
+    /// [`wait`](Self::wait).
+    pub fn event(&self) -> &Event {
+        &self.event
+    }
+
+    /// Block on the map event and return the [`MappedReadGuard`].
+    /// After this returns Ok, the guard's `Deref<Target=[T]>` is
+    /// safe to read.
+    pub fn wait(mut self) -> Result<MappedReadGuard<'a, T, M>> {
+        self.event.wait()?;
+        Ok(self
+            .guard
+            .take()
+            .expect("MappedReadPending::wait called twice"))
+    }
+}
+
+impl<T, M: MemMode> Drop for MappedReadPending<'_, T, M> {
+    fn drop(&mut self) {
+        // If the user dropped the pending without calling .wait(),
+        // the embedded guard still drops below — which enqueues the
+        // unmap. That's correct: the map enqueued, the unmap follows
+        // on the same queue (in-order semantics on that queue
+        // serialise them), and the unmap event is registered on
+        // last_use so SVMFree waits on it.
+    }
+}
+
+/// Result of [`MapMutOp::submit`] — a non-blocking SVM read+write
+/// map in flight. Same shape as [`MappedReadPending`] but the
+/// resulting guard is [`MappedWriteGuard`] (DerefMut to `&mut [T]`).
+pub struct MappedWritePending<'a, T, M: MemMode> {
+    guard: Option<MappedWriteGuard<'a, T, M>>,
+    event: Event,
+}
+
+impl<'a, T, M: MemMode> MappedWritePending<'a, T, M> {
+    /// See [`MappedReadPending::event`].
+    pub fn event(&self) -> &Event {
+        &self.event
+    }
+
+    /// See [`MappedReadPending::wait`].
+    pub fn wait(mut self) -> Result<MappedWriteGuard<'a, T, M>> {
+        self.event.wait()?;
+        Ok(self
+            .guard
+            .take()
+            .expect("MappedWritePending::wait called twice"))
+    }
+}
+
+impl<T, M: MemMode> Drop for MappedWritePending<'_, T, M> {
+    fn drop(&mut self) {
+        // See MappedReadPending::drop.
     }
 }
 
 // ── Map guards ──────────────────────────────────────────────────────
 
 /// RAII guard for a SVM read map. Drop issues `clEnqueueSVMUnmap`
-/// and the inner `RetainedQueue` releases the queue handle.
+/// and registers the unmap event on the buffer's `last_use` so
+/// [`MappedSlice`]'s `Drop` impl's `clEnqueueSVMFree` waits on it.
 pub struct MappedReadGuard<'a, T, M: MemMode> {
     buf: &'a MappedSlice<T, M>,
     queue: crate::util::RetainedQueue,
 }
 
 impl<'a, T, M: MemMode> MappedReadGuard<'a, T, M> {
-    fn new<L: Launcher>(buf: &'a MappedSlice<T, M>, launcher: &L) -> Result<Self> {
+    /// Internal: enqueue the SVM map (blocking or not), return the
+    /// guard + the map event. The map event's host-meaning differs
+    /// per blocking flag — blocking callers drop it; non-blocking
+    /// callers thread it through a `MappedReadPending`.
+    fn enqueue_map<L: Launcher>(
+        buf: &'a MappedSlice<T, M>,
+        launcher: &L,
+        blocking: bool,
+    ) -> Result<(Self, Event)> {
         let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
-        // SAFETY: blocking map for read; queue is alive (RetainedQueue).
-        // `_evt` drops at end of statement and releases the cl_event.
-        let _evt = unsafe {
+        // SAFETY: queue is alive (RetainedQueue); buf.ptr is the live
+        // SVM allocation; map_size matches the allocation's byte length.
+        let event = unsafe {
             map_primitive::svm_map(
                 queue.raw(),
-                true,
+                blocking,
                 CL_MAP_READ,
                 buf.ptr.cast(),
                 buf.len * std::mem::size_of::<T>(),
                 &[],
             )?
         };
-        Ok(MappedReadGuard { buf, queue })
+        Ok((MappedReadGuard { buf, queue }, event))
     }
 }
 
@@ -961,41 +1084,49 @@ impl<T, M: MemMode> Deref for MappedReadGuard<'_, T, M> {
 
 impl<T, M: MemMode> Drop for MappedReadGuard<'_, T, M> {
     fn drop(&mut self) {
-        // SAFETY: ptr was mapped in `new`; unmap exactly once now.
-        // The `queue: RetainedQueue` field drops after this body
-        // returns, releasing the queue handle.
+        // SAFETY: ptr was mapped in `enqueue_map`; unmap exactly once.
+        // The unmap event is registered on the buffer's last_use so
+        // MappedSlice::Drop's clEnqueueSVMFree waits on it — closes
+        // the cross-queue Drop race (map/unmap on launcher queue,
+        // SVMFree on ctx default queue).
         match unsafe { map_primitive::svm_unmap(self.queue.raw(), self.buf.ptr.cast(), &[]) } {
-            Ok(_evt) => {} // _evt drops here, releasing the cl_event
+            Ok(evt) => self.buf.register_use(Arc::new(evt)),
             Err(_) => self.buf.ctx.record_err(),
         }
+        // `queue: RetainedQueue` drops after this body returns,
+        // releasing the queue handle.
     }
 }
 
 /// RAII guard for a SVM write map. Drop issues `clEnqueueSVMUnmap`
-/// and the inner `RetainedQueue` releases the queue handle.
+/// and registers the unmap event on the buffer's `last_use` — same
+/// shape as [`MappedReadGuard`].
 pub struct MappedWriteGuard<'a, T, M: MemMode> {
     buf: &'a mut MappedSlice<T, M>,
     queue: crate::util::RetainedQueue,
 }
 
 impl<'a, T, M: MemMode> MappedWriteGuard<'a, T, M> {
-    fn new<L: Launcher>(buf: &'a mut MappedSlice<T, M>, launcher: &L) -> Result<Self> {
+    fn enqueue_map<L: Launcher>(
+        buf: &'a mut MappedSlice<T, M>,
+        launcher: &L,
+        blocking: bool,
+    ) -> Result<(Self, Event)> {
         let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
         let ptr = buf.ptr;
         let len = buf.len;
-        // SAFETY: blocking map for read+write.
-        // `_evt` drops at end of statement and releases the cl_event.
-        let _evt = unsafe {
+        // SAFETY: see MappedReadGuard::enqueue_map.
+        let event = unsafe {
             map_primitive::svm_map(
                 queue.raw(),
-                true,
+                blocking,
                 CL_MAP_READ | CL_MAP_WRITE,
                 ptr.cast(),
                 len * std::mem::size_of::<T>(),
                 &[],
             )?
         };
-        Ok(MappedWriteGuard { buf, queue })
+        Ok((MappedWriteGuard { buf, queue }, event))
     }
 }
 
@@ -1017,8 +1148,10 @@ impl<T, M: MemMode> DerefMut for MappedWriteGuard<'_, T, M> {
 
 impl<T, M: MemMode> Drop for MappedWriteGuard<'_, T, M> {
     fn drop(&mut self) {
+        // See MappedReadGuard::drop for the last_use registration
+        // rationale.
         match unsafe { map_primitive::svm_unmap(self.queue.raw(), self.buf.ptr.cast(), &[]) } {
-            Ok(_evt) => {} // _evt drops here, releasing the cl_event
+            Ok(evt) => self.buf.register_use(Arc::new(evt)),
             Err(_) => self.buf.ctx.record_err(),
         }
     }

@@ -374,33 +374,48 @@ design traps, and thread-local magic is correctly rejected.
 - We have a concrete multi-step example exercising 4+ buffer ops
   where `&ctx` repetition is visible enough to motivate the cost.
 
-### Adjacent capability gaps (deferred separately)
+### Adjacent capability gaps — SHIPPED
 
-Two real Tier 1 surface items the late-bind work surfaced but
-didn't ship:
+Two real Tier 1 surface items the late-bind work surfaced —
+**resolved together** rather than separately, with a unified shape:
 
-1. **`DeviceSlice::map` Tier 1.** Today `DeviceSlice` has no Tier 1
-   zero-copy host access — only `.read()` (copies) and the Tier 2
-   `host_view` chain. A builder + RAII guard for
-   `clEnqueueMapBuffer` would parallel `MappedSlice::map`. Real new
-   capability.
+1. **`DeviceSlice::map` Tier 1** ✅. Mirrors the existing
+   `MappedSlice::map` / `map_mut` shape: lazy builder, `.wait()`
+   blocking terminal returning a `DeviceMappedRead/WriteGuard`
+   (Deref / DerefMut, unmap on Drop), `.submit()` non-blocking
+   terminal returning a `DeviceMapRead/WritePending` (carries the
+   map event for chain ordering; `.wait()` consumes into the guard).
 
-2. **Non-blocking `MappedSlice::map`.** `MappedSlice::map(&ctx)` is
-   blocking-only (`CL_TRUE`). A `.submit(&ctx)?` non-blocking
-   variant returning `(Guard, Event)` would let Tier 1 callers
-   thread the map event through cross-queue ordering.
+2. **Non-blocking `MappedSlice::map`** ✅. Same `.submit()`
+   terminal added to the existing builder; returns
+   `MappedRead/WritePending` with the same pending-to-guard shape.
 
-For both, the SVM and `cl_mem` cases diverge on what the
-non-blocking shape returns. `clEnqueueSVMMap` returns only an event
-(pointer is owned by the allocation) — guard can deref immediately
-with caller responsible for waiting. `clEnqueueMapBuffer` returns
-pointer + event in one call; pointer is set sync but bytes are
-only valid after the event — needs a `MapHandle` (no Deref) that
-`.into_view()` converts to Deref-able guard after wait.
+**The "two shapes" framing was wrong.** The original DESIGN-NOTES
+text claimed the SVM pending could just Deref immediately with
+caller-responsible-for-wait. That's an unsafe-by-default API hiding
+behind a comment — `Deref<Target=[T]>` implies "safe to read",
+while the OpenCL spec on `clEnqueueSVMMap(blocking=CL_FALSE)`
+says bytes are only valid after the map event completes.
+Structurally, SVM and cl_mem are identical: in both, the pointer
+is known at submit time but bytes are only spec-valid after the
+event. The honest sound shape is the same for both — a non-Deref
+pending that you `.wait()` into a Deref guard.
 
-The honest API has **two shapes**, not one. Forcing them into one
-type either gives SVM a pointless `into_view()` step or makes
-`cl_mem` Deref unsafe-by-default.
+**Bug fix landed alongside.** The blocking-only path for
+`MappedReadGuard::drop` / `MappedWriteGuard::drop` was discarding
+the unmap event. When map/unmap happened on a non-default queue,
+`MappedSlice::drop`'s `clEnqueueSVMFree` (on the context default
+queue, with `last_use` as its wait-list) didn't include the unmap
+event, opening a latent cross-queue race. The guard's Drop now
+registers the unmap event via `register_use` — fixes both the new
+non-blocking case and the pre-existing blocking case.
+
+**For cl_mem (DeviceSlice) guards.** No `last_use` analog — OpenCL
+refcounts `cl_mem` internally during enqueue, so
+`clReleaseMemObject` in `DeviceSlice::drop` waits without explicit
+help. The guards expose `release(self) -> Result<Event>` for users
+who want the unmap event for explicit cross-queue chain ordering
+(consumes the guard, returns the event, suppresses the Drop unmap).
 
 ---
 

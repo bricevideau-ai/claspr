@@ -7,13 +7,13 @@ error[E0277]: the trait bound `HostReadOnly: HostWritable` is not satisfied
    |             required by a bound introduced by this call
    |
 help: the following other types implement trait `HostWritable`
-  --> claspr/src/access.rs:215:0
+  --> claspr/src/access.rs:247:0
    |
    = note: `ReadWrite`
-  ::: claspr/src/access.rs:217:0
+  ::: claspr/src/access.rs:249:0
    |
    = note: `ReadOnly`
-  ::: claspr/src/access.rs:219:0
+  ::: claspr/src/access.rs:251:0
    |
    = note: `WriteOnly`
 note: required by a bound in `device_slice_write`
