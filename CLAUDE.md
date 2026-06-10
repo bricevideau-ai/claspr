@@ -104,7 +104,6 @@ On macOS the system OpenCL framework picks up automatically; no `OCL_ICD_VENDORS
 - **Cargo-features-driven `auto()` build.rs** — move OpenCL version + remaining capability flags to Cargo features so the build.rs collapses to `claspr_build::auto()`.
 - **`#[path = "..."]` attribute support in multi-file resolution** — currently errors with a clear message.
 - **`cargo:warning=` for missing `proc_macro_hygiene` feature gate** — claspr-build could detect file modules in device-module bodies and check if the crate's inner attrs include the gate; warn at build time before the rustc error fires.
-- **Inherit `spirv-std` / `glam` dep specs from the host workspace** rather than hardcoding the bricevideau-ai/rust-gpu branch in the generated `Cargo.toml`.
 - **More samples through single-source**: subgroup ops + workgroup memory (reduce sample), f64 (nbody), printf, sampler-based image reads. Each will likely surface a small claspr-build / proc-macro extension.
 - **`cargo claspr` subcommand** to eliminate build.rs entirely (NVlabs/cuda-oxide-style). Doesn't port cleanly because rust-gpu is a whole-crate codegen backend (no per-item dispatch); workflow friction (plain cargo stops working, IDE tooling breaks) likely makes it not worth it.
 
@@ -112,3 +111,15 @@ On macOS the system OpenCL framework picks up automatically; no `OCL_ICD_VENDORS
 
 - `bricevideau-ai/rust-gpu` (`opencl-kernel-support` branch) — the rust-gpu fork with the kernel target. claspr-build's generated kernel `Cargo.toml` pins this.
 - `bricevideau-ai/rust-gpu-opencl-samples` — the standalone-kernel-crate samples. Most patterns claspr generalises came from there.
+
+## Inter-session notes
+
+`NOTES.md` is the single rolling doc for active work, deferred items, and unresolved concerns across sessions. **Do not spawn new planning docs** (no `IMPLEMENTATION-PLAN.md`, `REVIEW-2026-XX.md`, `DESIGN-NOTES.md` etc.) — append to the matching section of `NOTES.md` instead and prune as items resolve. If a section grows past ~30 lines, that's a signal to either ship the work or summarize.
+
+Three lanes:
+
+- **Ongoing work** (active / deferred / concerns) → `NOTES.md`.
+- **Point-in-time snapshots** (a specific deep review, a one-off audit, the rationale behind a particular change) → commit message of whatever ships as a result. Git log is the canonical history.
+- **Persistent rules / cross-session preferences** (the user's lint cadence, naming conventions, workflow quirks) → auto-memory (`~/.claude/projects/-home-claudecode-projects/memory/`), not here.
+
+The `Backlog (deferred)` section above is the long-horizon "someday" list that's stable across sessions; `NOTES.md` is for things actively in flight or recently deferred with a revisit-trigger.
