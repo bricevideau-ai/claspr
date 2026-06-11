@@ -62,7 +62,7 @@ A claspr kernel can be packaged as its own library crate (`pub mod gpu`, build.r
 
 ## Conventions
 
-- **Toolchain**: pinned at `nightly-2026-04-11` (rust-gpu's pinned nightly) via `rust-toolchain.toml`. Same channel as `bricevideau-ai/rust-gpu opencl-kernel-support` and `rust-gpu-opencl-samples`. Bump in lockstep with rust-gpu.
+- **Toolchain**: pinned at `nightly-2026-05-22` (rust-gpu's pinned nightly) via `rust-toolchain.toml`. Same channel as `bricevideau-ai/rust-gpu opencl-kernel-support` and `rust-gpu-opencl-samples`. Bump in lockstep with rust-gpu.
 - **License**: BSD-3-Clause, copyright `Brice Videau, Argonne National Laboratory`. One `LICENSE` file at root, no per-file headers.
 - **Lint before push**: `cargo fmt --all` + `cargo clippy --all-targets -- -D warnings` + `cargo doc --no-deps --workspace` with `RUSTDOCFLAGS=-D warnings`. CI (`.github/workflows/ci.yaml`) runs the same checks plus rustfmt on `tests/*/compile_fail/*.rs` (which `cargo fmt --all` skips) and the integration test suites on rusticl/llvmpipe.
 - **No CHANGELOG / release notes** — too early.
