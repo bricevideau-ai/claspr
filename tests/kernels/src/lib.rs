@@ -33,7 +33,7 @@ pub mod kernels {
     /// Replace every element with `value`.
     #[claspr::kernel]
     pub fn fill_u32(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [u32],
         value: u32,
     ) {
@@ -44,7 +44,7 @@ pub mod kernels {
     /// Element-wise `out[i] = a[i] + b[i]`.
     #[claspr::kernel]
     pub fn add_u32(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] a: &[u32],
         #[spirv(cross_workgroup)] b: &[u32],
         #[spirv(cross_workgroup)] out: &mut [u32],
@@ -56,7 +56,7 @@ pub mod kernels {
     /// Multiply every element by `factor` in place.
     #[claspr::kernel]
     pub fn scale_u32(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [u32],
         factor: u32,
     ) {
@@ -67,7 +67,7 @@ pub mod kernels {
     /// `dst[i] = src[i]`.
     #[claspr::kernel]
     pub fn copy_u32(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] src: &[u32],
         #[spirv(cross_workgroup)] dst: &mut [u32],
     ) {
@@ -81,8 +81,8 @@ pub mod kernels {
     /// once per workgroup.
     #[claspr::kernel]
     pub fn local_id_u32(
-        #[spirv(global_invocation_id)] gid: ::glam::USizeVec3,
-        #[spirv(local_invocation_id)] lid: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] gid: spirv_std::glam::USizeVec3,
+        #[spirv(local_invocation_id)] lid: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [u32],
     ) {
         data[gid.x] = lid.x as u32;
@@ -95,7 +95,7 @@ pub mod kernels {
     /// at the same indices.
     #[claspr::kernel]
     pub fn global_id_u32(
-        #[spirv(global_invocation_id)] gid: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] gid: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [u32],
     ) {
         data[gid.x] = gid.x as u32;
@@ -108,7 +108,7 @@ pub mod kernels_f64 {
     /// `fill_u32`.
     #[claspr::kernel]
     pub fn fill_f64(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [f64],
         value: f64,
     ) {
@@ -120,7 +120,7 @@ pub mod kernels_f64 {
     /// analogue of `scale_u32`.
     #[claspr::kernel]
     pub fn scale_f64(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [f64],
         factor: f64,
     ) {

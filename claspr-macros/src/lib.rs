@@ -214,10 +214,10 @@ pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```ignore
 /// claspr::kernels! {
 ///     pub mod gpu {
-///         fn fill(#[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+///         fn fill(#[spirv(global_invocation_id)] _id: spirv_std::glam::USizeVec3,
 ///                 #[spirv(cross_workgroup)] data: &mut [u32],
 ///                 value: u32);
-///         fn scale(#[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+///         fn scale(#[spirv(global_invocation_id)] _id: spirv_std::glam::USizeVec3,
 ///                  #[spirv(cross_workgroup)] data: &mut [u32],
 ///                  factor: u32);
 ///     }

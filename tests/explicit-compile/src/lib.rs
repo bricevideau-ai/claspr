@@ -44,7 +44,7 @@ mod generated {
 claspr::kernels! {
     pub mod gpu {
         fn fill_u32(
-            #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+            #[spirv(global_invocation_id)] _id: spirv_std::glam::USizeVec3,
             #[spirv(cross_workgroup)] data: &mut [u32],
             value: u32,
         );

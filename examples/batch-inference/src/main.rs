@@ -59,7 +59,7 @@ pub mod gpu {
     /// Elementwise multiply: `out[i] = a[i] * b[i]`.
     #[claspr::kernel]
     pub fn elem_mul(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] a: &mut [u32],
         #[spirv(cross_workgroup)] b: &[u32],
     ) {
@@ -70,7 +70,7 @@ pub mod gpu {
     /// Scalar bias add: `data[i] += bias`.
     #[claspr::kernel]
     pub fn add_bias(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [u32],
         bias: u32,
     ) {

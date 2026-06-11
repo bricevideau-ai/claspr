@@ -19,24 +19,28 @@ landings below.)*
 ### Inherit generated kernel deps from host workspace
 
 `claspr-build`'s generated kernel `Cargo.toml`
-(`claspr-build/src/lib.rs:897`, `write_generated_cargo_toml`)
-hardcodes the spirv-std / glam / num-complex deps to floating branch
-refs. The host workspace pins them via `Cargo.lock`, but new
-consumers without a workspace lockfile drift unpredictably. The
-existing `seed_lockfile_from_host` (`claspr-build/src/lib.rs:883`)
-is a mitigation, not a fix.
+(`claspr-build/src/lib.rs`, `write_generated_cargo_toml`) still
+hardcodes `spirv-std` and `num-complex` to floating refs. The host
+workspace pins them via `Cargo.lock` and `seed_lockfile_from_host`
+copies that lock into the kernel sub-crate at build time, so the
+current setup is correct *for consumers built inside the claspr
+workspace* — but a kernel crate built fresh in some other workspace
+would re-resolve against the floating branch ref.
 
 Approach (sketched): walk up from `OUT_DIR` to find the host
-`Cargo.lock`, extract the pinned `rev` for spirv-std/glam/num-complex,
+`Cargo.lock`, extract the pinned `rev` for spirv-std/num-complex,
 write those into the generated TOML. Fallback to today's hardcoded
 branch refs if no lockfile found.
 
-**Why deferred:** rust-gpu upstream landed a workaround for the same
-class of glam/dep issue and it broke their CI. Anything we ship
-here is likely incompatible with whatever shape they converge on.
-Check rust-gpu's CI / recent merges / glam-workaround thread before
-re-picking. Until then, the README "Limitations" bullet about the
-hardcoded branch ref stays accurate.
+**Status (2026-06-11):** the original blocker (rust-gpu's glam
+reshuffle) cleared with upstream's `ce16d0bb680` → `762e9d61272`
+saga (finalised 2026-06-08); the rebase brought it in via
+`4de1a13`. Glam itself is no longer in the generated TOML at all —
+spirv-std re-exports it via `pub use glam;` and its default
+`glam_0_33` feature enables exactly the type families kernel code
+uses (u32/i32/f64/usize/u64 + libm). Kernel code now writes
+`spirv_std::glam::USizeVec3` instead of `::glam::USizeVec3`.
+Remaining unstarted work: lockfile-walking for spirv-std + num-complex.
 
 ### Tier 1 scoped launcher (`ctx.scope(|s| {...})`)
 

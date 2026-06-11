@@ -39,7 +39,7 @@ pub mod gpu {
     /// Linear stage: `data[i] = data[i] * weight + bias`.
     #[claspr::kernel]
     pub fn linear(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [u32],
         weight: u32,
         bias: u32,
@@ -51,7 +51,7 @@ pub mod gpu {
     /// Activation: zero out any element below `threshold`.
     #[claspr::kernel]
     pub fn relu_threshold(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [u32],
         threshold: u32,
     ) {

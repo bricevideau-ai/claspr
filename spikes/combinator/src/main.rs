@@ -50,7 +50,7 @@ pub mod gpu {
     /// In-place elementwise multiply: `data[i] *= factor`.
     #[claspr::kernel]
     pub fn scale(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [f32],
         factor: f32,
     ) {
@@ -61,7 +61,7 @@ pub mod gpu {
     /// In-place scalar add: `data[i] += bias`.
     #[claspr::kernel]
     pub fn add_bias(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [f32],
         bias: f32,
     ) {
@@ -72,7 +72,7 @@ pub mod gpu {
     /// Elementwise add: `out[i] += b[i]`.
     #[claspr::kernel]
     pub fn add_inplace(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] out: &mut [f32],
         #[spirv(cross_workgroup)] b: &[f32],
     ) {
@@ -85,7 +85,7 @@ pub mod gpu {
     /// kernel folds in `a` and `b`. Used by scenario 7.
     #[claspr::kernel]
     pub fn mean3(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] out: &mut [f32],
         #[spirv(cross_workgroup)] a: &[f32],
         #[spirv(cross_workgroup)] b: &[f32],
@@ -99,7 +99,7 @@ pub mod gpu {
     /// pass).
     #[claspr::kernel]
     pub fn add_shared_bias(
-        #[spirv(global_invocation_id)] id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] out: &mut [f32],
         #[spirv(cross_workgroup)] shared: &[f32],
         shared_len: u32,

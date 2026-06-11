@@ -49,7 +49,7 @@
 //!
 //!     #[claspr::kernel]
 //!     pub fn collatz_kernel(
-//!         #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+//!         #[spirv(global_invocation_id)] _id: spirv_std::glam::USizeVec3,
 //!         #[spirv(cross_workgroup)] data: &mut [u32],
 //!     ) { /* ... */ }
 //! }
@@ -87,7 +87,7 @@
 //! claspr::kernels! {
 //!     pub mod gpu {
 //!         fn collatz_kernel(
-//!             #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+//!             #[spirv(global_invocation_id)] _id: spirv_std::glam::USizeVec3,
 //!             #[spirv(cross_workgroup)] data: &mut [u32],
 //!         );
 //!     }
@@ -111,7 +111,7 @@
 //! claspr::kernels! {
 //!     pub mod gpu {
 //!         fn dot_product(
-//!             #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+//!             #[spirv(global_invocation_id)] _id: spirv_std::glam::USizeVec3,
 //!             #[spirv(cross_workgroup)] a: &[f32],
 //!             #[spirv(cross_workgroup)] b: &[f32],
 //!             #[spirv(cross_workgroup)] out: &mut [f32],
@@ -733,15 +733,14 @@ impl HostBuilder {
         write_generated_cargo_toml(&crate_dir)?;
         write_generated_lib_rs(&crate_dir, &lifted_file)?;
         // Seed the sub-crate with the host workspace's Cargo.lock so
-        // shared transitive deps (notably `glam`) resolve to the same
-        // versions the host built against. Without this, the sub-crate
-        // is its own independent workspace and would re-resolve fresh
-        // against crates.io. That can pick up new releases that gate
-        // previously-always-available items behind features — e.g.
-        // glam 0.33 moved `UVec2/UVec3/UVec4/IVec*` behind the
-        // `integer-types` feature, which `spirv-std`'s
-        // `opencl-kernel-support` branch doesn't request, breaking
-        // its build.
+        // spirv-std (and everything it pulls in transitively — glam,
+        // num-traits, libm, …) resolves to the exact revs the host
+        // built against. Without this, the sub-crate is its own
+        // independent workspace and would re-resolve fresh against the
+        // floating branch ref in the generated TOML — drifting toward
+        // newer commits that may gate previously-available items
+        // behind new features (e.g. the glam 0.33 type-family
+        // reshuffle on rust-gpu in 2026-05).
         seed_lockfile_from_host(src_dir, &crate_dir);
 
         // Compile via spirv-builder.
@@ -904,6 +903,13 @@ fn write_generated_cargo_toml(crate_dir: &Path) -> Result<()> {
     // Empty `[workspace]` table makes this a standalone workspace —
     // it lives under the host's `target/` so cargo would otherwise
     // try to associate it with the host workspace and fail.
+    //
+    // glam is intentionally NOT a direct dep: spirv-std re-exports it
+    // via `pub use glam;`, and its default feature `glam_0_33` enables
+    // exactly the vector type families kernel code uses (u32/i32/f64/
+    // usize/u64 + libm). Kernel code should write
+    // `spirv_std::glam::USizeVec3` rather than `::glam::USizeVec3` so
+    // the path resolves through the re-export.
     let cargo_toml = r#"[package]
 name = "claspr_generated_kernels"
 version = "0.0.0"
@@ -916,15 +922,6 @@ crate-type = ["dylib"]
 
 [dependencies]
 spirv-std = { git = "https://github.com/bricevideau-ai/rust-gpu.git", branch = "opencl-kernel-support" }
-# Pinned to 0.33.x with the same feature set that `spirv-std`'s
-# `glam_0_33` feature selects on the rust-gpu fork (libm + u32/i32/f64/
-# usize/u64 vector type families). 0.33 gates each vector type family
-# behind opt-in features (UVec*/IVec*/USizeVec*/U64Vec* etc.); without
-# explicit features here, kernel code that writes `::glam::USizeVec3`
-# fails to resolve. `libm` is the math backend — glam 0.33+ refuses to
-# compile without one of `std`/`libm`/`nostd-libm`, and the spirv target
-# is no_std, so libm is the choice.
-glam = { version = "0.33.0", default-features = false, features = ["libm", "u32", "i32", "f64", "usize", "u64"] }
 # Always-available extras for kernel code: `num-complex` for Complex
 # arithmetic. Tiny no_std crate; pulling it unconditionally beats
 # requiring every user to extend the generated Cargo.toml just to
