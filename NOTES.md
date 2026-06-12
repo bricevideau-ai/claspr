@@ -9,8 +9,188 @@ items resolve.
 
 ## Active
 
-*(nothing scoped — `git log` for what just shipped, or check Recent
-landings below.)*
+### Command-buffer-backed graphs (design, 2026-06-12 exploratory)
+
+Design converged in an exploratory session 2026-06-12. No code yet;
+this section captures the agreed shape before we start implementing.
+
+**Goal.** When the target platform supports `cl_khr_command_buffer`,
+record a claspr Tier 2 graph (or recordable sub-graph) into a
+finalised CB and replay it via a single `clEnqueueCommandBufferKHR`
+instead of N independent enqueues per submission. Wins on submission
+overhead (one driver entry instead of many) and unlocks
+record-once-replay-many for iterative workloads.
+
+**Strategic framing — why this is the priority.** CB-cached replay is
+what makes Tier 2 *reusable graphs* an idiom users actually reach for.
+Today there's no incentive to factor a compute pipeline into a
+returnable `Graph<I, O>` value, since each call would re-walk the
+DAG. With caching, `pub fn gemm(...) -> Graph<(...), (...)>` becomes
+shaped exactly like a cuFFT/cuDNN/oneMKL "planned operator" —
+typed, composable, cheap to invoke repeatedly. That's the abstraction
+unlock: library authors can ship pipelines the way they ship
+kernels, and consumers can compose those pipelines via `and_then`
+across crate boundaries. The implementation decisions below flow
+from that — `Graph<I, O>` is a first-class exported type, the trait
+surface must not leak generics that block cross-library composition,
+and the Arc-shared cache must survive composition (so a meta-kernel
+containing two sub-graphs keeps both sub-caches warm across the
+composite's invocations).
+
+**Transparency is a hard constraint.** The API is `graph.call(a, b, c)`
+— there is NO separate `submit_as_command_buffer` verb. The runtime
+picks: CB-replay if the platform supports `cl_khr_command_buffer`
+AND the graph is fully recordable AND the call's handles match the
+recorded ones; otherwise walk the DAG and re-enqueue (today's Tier 2
+path). User code is identical on every platform; the optimization is
+silent. The only observable asymmetry is the immutable-CB
+handle-mismatch case — see "Cache invariants" below — surfaced as an
+explicit error with an actionable message, not as a silent rebuild.
+
+**Implementation surface.**
+- `cl3 = 0.13.1` already exposes the full FFI in `cl3::ext::*`
+  (`create_/finalize_/enqueue_command_buffer_khr`,
+  `command_nd_range_kernel_khr`, `command_copy_buffer_khr`,
+  `command_svm_memcpy_khr`, `command_fill_buffer_khr`,
+  `command_svm_mem_fill_khr`, image variants,
+  `command_barrier_with_wait_list_khr`,
+  `get_command_buffer_mutable_dispatch_data`).
+- `opencl3 = 0.12.3` ships a safe `CommandBuffer` wrapper at
+  `opencl3-0.12.3/src/command_buffer.rs`, gated behind
+  `feature = "cl_khr_command_buffer"` (or `"dynamic"`). Claspr's
+  workspace dep currently sets no features — would need to enable.
+
+**Recordable surface (what fits in a CB).**
+- Recordable: kernel dispatches, fills, D2D copies, image copies,
+  barriers. Sync edges via `cl_sync_point_khr`.
+- NOT recordable: uploads, downloads, map/unmap (host-visible), and
+  any host-decided `conditional`. Those must bracket the CB (or
+  split the graph at host cuts).
+
+**Recordability tracking.** Carry a `recordable: bool` on every
+`DeviceOperation` at construction time; combinators compose the bit
+(`bundle(a, b).recordable = a.recordable && b.recordable`, leaf
+kernel/fill/D2D = true, upload/download/map = false). O(1) check at
+submit time, no graph re-walk. Subgraph partitioning (find maximal
+recordable subtrees + host cut points) is a strict superset for
+later; v1 requires `root.recordable == true`.
+
+**Graph-as-typed-callable.** The graph value (not the terminal) is
+the cache holder AND a typed callable: `Graph<Inputs, Outputs>` with
+a `.call(a, b, c) -> Op<Outputs>` method. Move-semantic Tier 2 flow
+stays the same above the line — the cached CB is implementation
+detail. Per-arity variadic typing via the `KernelArgs`
+macro-emitted-tuple-impls pattern already in `claspr/src/launch.rs`
+(prior art). Type-level `Op<Recordable>` witness is a documented
+upgrade path; runtime bit gets ~95% of the value without threading a
+generic through every op type / combinator / macro.
+
+**Two call verbs, intent-at-call-site.** Mutability is expressed
+per-call, not at graph construction — eliminates the
+"opt-in-at-build-time" footgun.
+
+| Method | CB + `mutable_dispatch` | CB only | No CB |
+|---|---|---|---|
+| `.call(a, b, c)` | replay cached CB; error on handle mismatch | replay cached CB; error on handle mismatch | walk DAG, enqueue |
+| `.mutate_call(a, b, c)` | `clUpdateMutableCommandsKHR` + replay | **fall back** to walk DAG, enqueue | walk DAG, enqueue |
+
+The fallback row is what makes `.mutate_call()` portable: works
+*correctly* on every platform, gets the CB optimisation only where
+the extension earns it. Users never have to check
+`device.has_extension(...)`.
+
+**Recording mode is decided at first touch.** First `.mutate_call()`
+on a fresh graph records the CB with commands marked mutable; first
+`.call()` records immutable. If a `.call()`-first graph later sees
+`.mutate_call()`, the CB is rebuilt once as mutable; both methods
+work on the mutable CB thereafter. (Mutable-mode CBs accept stable
+args too — `.call()` after `.mutate_call()` is fine.)
+
+**Cache invariants (CB-capable path).**
+- Graph holds `Mutex<Option<CachedCB>>` (atomic replace, not just
+  once-init — `OnceLock` won't work). Cache stores the recorded CB,
+  its mutability mode, the canonical `cl_mem`/SVM handles it was
+  recorded against, and the queue handle.
+- `.call(a, b, c)`:
+  - Cache empty: record immutably for this `&ctx`, store, enqueue.
+  - Cache hit (same handles + same queue, no outstanding Op): replay.
+  - Handle mismatch: **error** — "graph called with different
+    buffers than recorded — pass the same buffers, use
+    `.mutate_call(...)`, or build a fresh graph per call shape."
+    NOT a silent rebuild: hides the perf model.
+- `.mutate_call(a, b, c)`:
+  - Cache empty + `mutable_dispatch` available: record mutably,
+    enqueue.
+  - Cache empty + no `mutable_dispatch`: skip CB, walk DAG, enqueue
+    (transparent fallback).
+  - Cache hit (mutable, same queue, no outstanding Op): swap args
+    via `clUpdateMutableCommandsKHR`, enqueue.
+  - Cache hit (immutable, same queue, no outstanding Op): rebuild
+    as mutable (one-time cost), enqueue.
+- Common rules:
+  - Different queue: **only legal if the previous Op has been
+    awaited/dropped**; then release old CB, re-record for new queue.
+  - Outstanding Op still alive (any queue): **error**.
+
+**Cache behaviour (CB-incapable path).** Without
+`cl_khr_command_buffer` (or with a not-fully-recordable graph),
+both `.call()` and `.mutate_call()` walk the DAG and enqueue each
+op with its event dependencies — exactly today's Tier 2 path.
+There's no recorded state to invalidate; arbitrary call counts and
+handle changes are fine. The "one in-flight per graph" invariant
+still holds (it's a data-race protection, independent of CB).
+Result: the same user code is correct on every platform, faster
+where the extension is available.
+
+**One in-flight per graph.** OOO queues mean even same-queue
+concurrent replays would race on the buffers the CB references; the
+invariant is "at most one outstanding `.call(...)` per graph,
+period." Driver-side refcount keeps in-flight CBs alive after host
+release, so the safety story is sound, but we forbid the case
+*intentionally* — silently allowing it would hide a data race.
+
+**Composition consequence: `and_then`-reuse becomes first-class.**
+The "one in-flight" rule doesn't lose expressiveness because
+`G.and_then(|_| G).and_then(|_| G)` records into one CB with
+internal sync-point edges connecting iteration k's tail to k+1's
+head. Single `clEnqueueCommandBufferKHR`, three iterations,
+OOO scheduler still overlaps *within* each iteration. This is a
+new composition pattern only really expressible with CB-backed
+graphs (today you'd have to physically rebuild the underlying ops).
+Implies graphs must be cheaply re-usable as sub-graphs — `Clone`
+via `Arc<Inner>`, cache slot lives in the `Arc`'d inner so clones
+share it.
+
+**Test/runtime target.**
+- Native: pocl 7.2-pre (`~/local/pocl`) carries
+  `cl_khr_command_buffer` 0.9.6 + `mutable_dispatch` + `multi_device`
+  + pocl-specific SVM/host-buffer extras. Distro pocl 6.0 has the
+  base extension at 0.9.4 + `multi_device`, no `mutable_dispatch`.
+- Emulation: [bashbaug/SimpleOpenCLSamples
+  `layers/10_cmdbufemu/`](https://github.com/bashbaug/SimpleOpenCLSamples/tree/main/layers/10_cmdbufemu)
+  — Apache-2.0, `OPENCL_LAYERS`-style ICD-loader layer. Implements
+  `cl_khr_command_buffer` v0.9.8 + `mutable_dispatch` v0.9.5. No
+  `multi_device`. Stacks transparently over rusticl + NEO legacy
+  (both OpenCL 2.1+, which the layer requires for `clCloneKernel`).
+  Proof-of-concept quality (thread-safety, `FINALIZED_KHR` state,
+  some error checks not perfect) — use for semantic coverage, not
+  perf. Iris Plus via NEO legacy and rusticl/llvmpipe lack the
+  extension natively; emulation gets them in.
+
+**What's left to scope before coding.**
+- Concrete `Graph` trait shape + `Inputs`/`Outputs` associated types
+  + how `and_then` / `bundle` / `fan_out` compose them.
+- Final names for the two call verbs (`.call()` / `.mutate_call()`
+  is the working draft — `.call_mut()` reads as "mutates the
+  receiver" which is wrong here, `.call_with()` is vague; settle at
+  implementation time).
+- Whether per-op profiling needs a different surface inside a CB
+  (the extension only exposes whole-CB timestamps, not per-command).
+- CI plumbing: enabling `opencl3 features = ["cl_khr_command_buffer"]`
+  on the workspace dep, picking up the cmdbufemu .so build, and
+  fitting it into the existing rusticl/llvmpipe matrix entry. Likely
+  paired with the deferred pocl-7.2 ICD work — see `claspr CI
+  deferred` in auto-memory.
 
 ---
 
