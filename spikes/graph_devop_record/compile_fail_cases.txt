@@ -1,0 +1,129 @@
+Compile-fail test cases — actual rustc diagnostics captured 2026-06-12
+with nightly-2026-05-22 from the spike workspace.
+
+Each case was reproduced by temporarily adding the offending lines to
+opt_outs.rs::type_assertion_works_for_recordable_chains, running
+`cargo check --tests`, capturing the output, and reverting.
+
+These prove the `RecordableOp: DeviceOperation` sub-trait correctly
+propagates non-recordability at the chain root — a user who
+accidentally puts a non-recordable op anywhere in their pipeline gets
+a clean compile error with the offending type named and the available
+RecordableOp impls suggested.
+
+══════════════════════════════════════════════════════════════════════
+Case 1: AndThen<Upload, ..> can't be recorded
+══════════════════════════════════════════════════════════════════════
+
+Source addition:
+
+    let with_upload = AndThen {
+        source: crate::leaves::Upload { data: vec![1, 2, 3], allocated_buf_id: 1 },
+        f: |b| FillKernel { n: 3, buf_id: b, value: 99 },
+    };
+    assert_recordable(with_upload);
+
+Captured rustc diagnostic:
+
+    error[E0277]: the trait bound `Upload: device_op::RecordableOp` is not satisfied
+       --> src/opt_outs.rs:202:27
+        |
+    202 |         assert_recordable(with_upload);
+        |         ----------------- ^^^^^^^^^^^ unsatisfied trait bound
+        |         |
+        |         required by a bound introduced by this call
+        |
+    help: the trait `device_op::RecordableOp` is not implemented for `Upload`
+       --> src/leaves.rs:120:1
+        |
+    120 | pub struct Upload {
+        | ^^^^^^^^^^^^^^^^^
+
+Note: the diagnostic points at `Upload`, not `AndThen<Upload, ...>` —
+the recursive `where U: RecordableOp` bound on AndThen's RecordableOp
+impl bubbles up to identify the root cause.
+
+══════════════════════════════════════════════════════════════════════
+Case 2: OnDevice wrapping a recordable leaf can't be recorded
+══════════════════════════════════════════════════════════════════════
+
+Source addition:
+
+    let on_dev = OnDevice {
+        source: BufferFill { buf_id: 1, pattern: 0, len: 100 },
+        device_id: 1,
+    };
+    assert_recordable(on_dev);
+
+Captured rustc diagnostic:
+
+    error[E0277]: the trait bound `opt_outs::OnDevice<BufferFill>: device_op::RecordableOp`
+        is not satisfied
+       --> src/opt_outs.rs:202:27
+        |
+    202 |         assert_recordable(on_dev);
+        |         ----------------- ^^^^^^ unsatisfied trait bound
+        |         |
+        |         required by a bound introduced by this call
+        |
+    help: the trait `device_op::RecordableOp` is not implemented for
+        `opt_outs::OnDevice<BufferFill>`
+       --> src/opt_outs.rs:30:1
+        |
+     30 | pub struct OnDevice<S> {
+        | ^^^^^^^^^^^^^^^^^^^^^^
+
+══════════════════════════════════════════════════════════════════════
+Case 3: AndThenHost (host closure between device stages) can't be recorded
+══════════════════════════════════════════════════════════════════════
+
+Source addition:
+
+    let with_host = AndThenHost {
+        source: BufferFill { buf_id: 1, pattern: 0, len: 100 },
+        f: |b| FillKernel { n: 100, buf_id: b, value: 99 },
+    };
+    assert_recordable(with_host);
+
+Captured rustc diagnostic:
+
+    error[E0277]: the trait bound `AndThenHost<BufferFill, {closure@opt_outs.rs:200:16}>:
+        RecordableOp` is not satisfied
+       --> src/opt_outs.rs:202:27
+        |
+    202 |         assert_recordable(with_host);
+        |         ----------------- ^^^^^^^^^ unsatisfied trait bound
+        |         |
+        |         required by a bound introduced by this call
+        |
+    help: the trait `device_op::RecordableOp` is not implemented for
+        `opt_outs::AndThenHost<BufferFill, {closure@src/opt_outs.rs:200:16: 200:19}>`
+       --> src/opt_outs.rs:50:1
+        |
+     50 | pub struct AndThenHost<S, F> {
+        | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        = help: the following other types implement trait `device_op::RecordableOp`:
+                  BufferCopy
+                  BufferFill
+                  ...
+
+Note the bonus "following other types implement trait" hint — rustc
+helpfully lists the recordable alternatives, which makes the fix
+discoverable.
+
+══════════════════════════════════════════════════════════════════════
+Assessment
+══════════════════════════════════════════════════════════════════════
+
+All three negative cases produce diagnostics that:
+
+1. Point at the .record() / Graph::call() call site that asked for
+   RecordableOp.
+2. Name the specific non-recordable type (Upload, OnDevice<...>,
+   AndThenHost<...>) — including through generic wrappers, so the
+   user can find the offending leaf op in their chain.
+3. Point at the source location of the offending struct.
+4. (For some cases) suggest the available alternatives.
+
+This is high-quality user-facing error reporting — better than a
+runtime "this chain isn't recordable" string error would be.

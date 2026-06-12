@@ -85,52 +85,126 @@ macro-emitted-tuple-impls pattern already in `claspr/src/launch.rs`
 upgrade path; runtime bit gets ~95% of the value without threading a
 generic through every op type / combinator / macro.
 
-**Two call verbs, intent-at-call-site.** Mutability is expressed
-per-call, not at graph construction — eliminates the
-"opt-in-at-build-time" footgun.
+**Two-tier capability model (clarified 2026-06-12 from spec).**
+`cl_khr_command_buffer_mutable_dispatch` gates BOTH the `MUTABLE_KHR`
+and `SIMULTANEOUS_USE_KHR` per-CB-creation flags. So the platform
+side collapses to two tiers:
 
-| Method | CB + `mutable_dispatch` | CB only | No CB |
-|---|---|---|---|
-| `.call(a, b, c)` | replay cached CB; error on handle mismatch | replay cached CB; error on handle mismatch | walk DAG, enqueue |
-| `.mutate_call(a, b, c)` | `clUpdateMutableCommandsKHR` + replay | **fall back** to walk DAG, enqueue | walk DAG, enqueue |
+- **Tier 0**: `cl_khr_command_buffer` only. `.call()` works cached,
+  immutable, one in-flight per graph.
+- **Tier 1**: `cl_khr_command_buffer` + `cl_khr_command_buffer_mutable_dispatch`.
+  All of Tier 0 plus opt-in flags at CB creation time (`MUTABLE_KHR`
+  for `.mutate_call`, `SIMULTANEOUS_USE_KHR` for concurrent replay).
 
-The fallback row is what makes `.mutate_call()` portable: works
-*correctly* on every platform, gets the CB optimisation only where
-the extension earns it. Users never have to check
+**Per-graph opt-ins via builder.** Mutability and simultaneous-use
+are expressed at construction time (per spec: the flags are set at
+CB creation), not per-call. Builder methods:
+
+```rust
+let g = Graph::new(factory)
+    .with_mutable()       // enables .mutate_call()
+    .with_simultaneous()  // enables concurrent .call() / fan_out
+    .build(&ctx);
+```
+
+**`.call(args)` and `.mutate_call(args)` live on `DeviceOperation`
+itself, not on a separate wrapper.** Every operation in the chain
+(a leaf, an `AndThen`, a `Bundle`, a whole user-built composite)
+has them. They return a `CallOp` (itself a `DeviceOperation`)
+composable via `.and_then(...)`, runnable via `.sync(&ctx)` /
+`.run(&ctx).await`, embeddable in `fan_out(...)`. No `Graph`,
+`Cached`, `Pipeline`, or `EagerPipeline` wrapper types — they
+were a design dead-end from an earlier pass; everything they did
+should live on `DeviceOperation` directly.
+
+**Args are check/update only (option 1).** The closures' captures
+are the source of truth for execution; `.call(args)` verifies the
+args match what was captured (strict mode), `.mutate_call(args)`
+accepts compatible-different args (relaxed mode, with
+`clUpdateMutableCommandsKHR` swap on recordable+mutable chains).
+The chain isn't reparameterized — the args inform check/update,
+not substitution. (Option 2 — true slot substitution via explicit
+placeholders or proc-macro closure rewriting — is deferred until
+we see a need.)
+
+**`.call()` is composition syntax, NOT a CB-enqueue verb.** The
+spec forbids nested CB enqueues (a recorded CB can't `enqueue`
+another CB). So `.call()` has to flexibly:
+- **Eagerly run the chain** (sync/run terminals on non-cached
+  composites or non-recordable chains).
+- **Enqueue a cached CB** when the chain has one cached and we're
+  outside any outer recording context.
+- **Inline the chain's commands into the outer CB recording**
+  when we're recording a parent CB that contains this `.call`.
+The runtime picks the right path based on context; the user just
+writes `op.call(args).and_then(...)`.
+
+| Method | Required opt-in | CB + mutable_dispatch | CB only (no MD) | No CB |
+|---|---|---|---|---|
+| `.call(a, b, c)` (stable, single in-flight) | none | replay cached CB; error on handle mismatch | replay cached CB; error on handle mismatch | walk DAG, enqueue |
+| `.call(a, b, c)` (concurrent, e.g. fan_out) | `.with_simultaneous()` | replay cached CB concurrently | **fall back** to walk DAG | walk DAG |
+| `.mutate_call(a, b, c)` | `.with_mutable()` | `clUpdateMutableCommandsKHR` + replay | **fall back** to walk DAG | walk DAG |
+| `fan_out(.., \|i\| g.mutate_call(i))` (cached batch) | `.with_mutable().with_simultaneous()` | same CB, per-call updates, concurrent | **fall back** to walk DAG | walk DAG |
+
+The fallback row makes opt-ins *portable*: a graph built with
+`.with_mutable().with_simultaneous()` works correctly on every
+platform — it just only gets the cached-CB optimization where the
+extensions are available. Users never have to check
 `device.has_extension(...)`.
 
-**Recording mode is decided at first touch.** First `.mutate_call()`
-on a fresh graph records the CB with commands marked mutable; first
-`.call()` records immutable. If a `.call()`-first graph later sees
-`.mutate_call()`, the CB is rebuilt once as mutable; both methods
-work on the mutable CB thereafter. (Mutable-mode CBs accept stable
-args too — `.call()` after `.mutate_call()` is fine.)
+**Where simultaneous-use comes in.** Without `.with_simultaneous()`,
+N concurrent fan_out branches calling `.mutate_call(...)` on the same
+graph would race on the cached CB's destination buffers. The spec
+makes this explicit and opt-in (with non-trivial per-submission
+overhead — that's why it's not the default). With the opt-in, the
+user is asserting their per-call arg updates make destinations
+independent, and the spec guarantees concurrent enqueue is well-
+defined. The `spikes/graph_devop_record/src/batch_example.rs::cached_simultaneous_fan_out_batch_pattern`
+test demonstrates the protocol end-to-end:
+`record_count = 1`, `replay_count = BATCHES`,
+`update_mutable_count = BATCHES - 1`.
+
+**Recording mode is decided at construction (revised 2026-06-12).**
+Earlier the design said "first-touch decides mode" — but the spec
+puts `MUTABLE_KHR` and `SIMULTANEOUS_USE_KHR` at CB *creation* time,
+not at command-record time. So the cleaner mapping is: opt-ins
+(via a method like `.cb_record_mutable()` / `.cb_record_simultaneous()`
+or similar — bikeshed TBD) set flags on a `DeviceOperation` before
+the first run.
+
+**Future option: heuristic auto-CB.** The runtime already has the
+data it needs (`recordable: bool` from the type system + call_count
++ chain length) to decide automatically when materializing a CB is
+worth it: recordable AND called > N times with same handles AND
+chain bigger than threshold M ops. Could ship the auto-heuristic
+as the default and keep the explicit opt-ins for (a) users who want
+guaranteed caching from first call, (b) users who need mutable or
+simultaneous (those have non-trivial recording overhead so opt-in
+makes sense), (c) predictable benchmarking. Auto + opt-in coexist.
 
 **Cache invariants (CB-capable path).**
-- Graph holds `Mutex<Option<CachedCB>>` (atomic replace, not just
-  once-init — `OnceLock` won't work). Cache stores the recorded CB,
-  its mutability mode, the canonical `cl_mem`/SVM handles it was
-  recorded against, and the queue handle.
-- `.call(a, b, c)`:
+- Graph holds `Mutex<Option<CachedCB>>`. Cache stores the recorded
+  CB, its mode (from the construction-time opt-ins), the canonical
+  `cl_mem`/SVM handles it was recorded against, and the queue
+  handle.
+- `.call(a, b, c)` (graph built without `.with_mutable()`):
   - Cache empty: record immutably for this `&ctx`, store, enqueue.
-  - Cache hit (same handles + same queue, no outstanding Op): replay.
+  - Cache hit (same handles + same queue): replay.
+    - If `.with_simultaneous()` opted in: concurrent replays OK.
+    - Otherwise: error if a prior Op is still in flight.
   - Handle mismatch: **error** — "graph called with different
-    buffers than recorded — pass the same buffers, use
-    `.mutate_call(...)`, or build a fresh graph per call shape."
-    NOT a silent rebuild: hides the perf model.
-- `.mutate_call(a, b, c)`:
-  - Cache empty + `mutable_dispatch` available: record mutably,
+    buffers than recorded — pass the same buffers, switch to
+    `.mutate_call(...)` (requires `.with_mutable()` at construction),
+    or build a fresh graph per call shape." NOT a silent rebuild.
+- `.mutate_call(a, b, c)` (graph built with `.with_mutable()`):
+  - Cache empty: record mutably, enqueue.
+  - Cache hit, same args: replay.
+  - Cache hit, different args: `clUpdateMutableCommandsKHR` swap,
     enqueue.
-  - Cache empty + no `mutable_dispatch`: skip CB, walk DAG, enqueue
-    (transparent fallback).
-  - Cache hit (mutable, same queue, no outstanding Op): swap args
-    via `clUpdateMutableCommandsKHR`, enqueue.
-  - Cache hit (immutable, same queue, no outstanding Op): rebuild
-    as mutable (one-time cost), enqueue.
+  - Concurrent: gated on `.with_simultaneous()` (same as `.call`).
 - Common rules:
   - Different queue: **only legal if the previous Op has been
     awaited/dropped**; then release old CB, re-record for new queue.
-  - Outstanding Op still alive (any queue): **error**.
 
 **Cache behaviour (CB-incapable path).** Without
 `cl_khr_command_buffer` (or with a not-fully-recordable graph),
@@ -142,12 +216,17 @@ still holds (it's a data-race protection, independent of CB).
 Result: the same user code is correct on every platform, faster
 where the extension is available.
 
-**One in-flight per graph.** OOO queues mean even same-queue
-concurrent replays would race on the buffers the CB references; the
-invariant is "at most one outstanding `.call(...)` per graph,
-period." Driver-side refcount keeps in-flight CBs alive after host
-release, so the safety story is sound, but we forbid the case
-*intentionally* — silently allowing it would hide a data race.
+**One in-flight per graph — conditional on opt-in.** OOO queues mean
+naive concurrent replays of a cached CB would race on its buffers.
+The spec's resolution: opt into `CL_COMMAND_BUFFER_SIMULTANEOUS_USE_KHR`
+at CB creation (gated on `cl_khr_command_buffer_mutable_dispatch`).
+Without the opt-in: invariant is "at most one outstanding
+`.call(...)` per graph" — silently allowing concurrent replay would
+hide a data race. With `.with_simultaneous()` at construction:
+unlimited concurrent replay is permitted; the user is asserting
+that their per-call arg updates make destinations independent. This
+is exactly the cached-fan_out batch-inference pattern (see "Two-tier
+capability model" below).
 
 **Composition consequence: `and_then`-reuse becomes first-class.**
 The "one in-flight" rule doesn't lose expressiveness because
