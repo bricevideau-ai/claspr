@@ -1,0 +1,16 @@
+[package]
+name = "claspr-graph-cb-spike"
+version = "0.0.0"
+edition = "2024"
+
+# Standalone workspace — not part of the main claspr workspace
+# (matches spikes/combinator/ convention). No claspr deps: the
+# point of this spike is to validate the `Graph<I, O>` trait
+# system in isolation, before we wire it to real Tier 2 ops + CB
+# FFI.
+[workspace]
+
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(target_arch, values("spirv"))'] }

@@ -178,8 +178,9 @@ share it.
   extension natively; emulation gets them in.
 
 **What's left to scope before coding.**
-- Concrete `Graph` trait shape + `Inputs`/`Outputs` associated types
-  + how `and_then` / `bundle` / `fan_out` compose them.
+- ~~Concrete `Graph` trait shape + `Inputs`/`Outputs` associated
+  types + how `and_then` / `bundle` / `fan_out` compose them.~~
+  Resolved 2026-06-12 via `spikes/graph_cb/` — see findings below.
 - Final names for the two call verbs (`.call()` / `.mutate_call()`
   is the working draft — `.call_mut()` reads as "mutates the
   receiver" which is wrong here, `.call_with()` is vague; settle at
@@ -191,6 +192,42 @@ share it.
   fitting it into the existing rusticl/llvmpipe matrix entry. Likely
   paired with the deferred pocl-7.2 ICD work — see `claspr CI
   deferred` in auto-memory.
+
+**Spike findings (2026-06-12, `spikes/graph_cb/`).** Trait system is
+NOT a blocker. Validated shape:
+
+- **Single struct `Graph<I, O>` (no trait hierarchy).** Library
+  authors can name the type directly in `pub fn` signatures, every
+  combinator returns the same `Graph<I, O>` (just with new type
+  params), no `AndThen<Bundle<..>, ..>` type-name explosion. DAG /
+  IR is type-erased inside `Arc<GraphInner>` (cheap clone, future
+  home for the cached CB slot + recordability bit).
+- **`PhantomData<fn(I) -> O>`** carries the type params with the
+  right variance (contravariant in I, covariant in O) and clean
+  auto-trait behaviour.
+- **Per-arity `.call(a, b, c)` via inherent-impl macro** (1..=8,
+  same shape as `KernelArgs` in `claspr/src/launch.rs`). Wrong arity
+  is a crisp `E0061: this method takes N arguments but M were
+  supplied` with a "consider adding" hint.
+- **`and_then` as a single generic method**: `fn and_then<O2>(self,
+  next: Graph<O, O2>) -> Graph<I, O2>`. Type mismatch is a clean
+  `E0308: mismatched types — expected Graph<(BufU32,), _>, found
+  Graph<(BufU32, ScalarU32), (BufU32,)>` pointing at the call site
+  and naming both expected (self's Outputs) and found (next's
+  Inputs) tuple shapes.
+- **Library-boundary export works**: a function in a sibling module
+  returns `Graph<(BufU32,), (BufU32,)>` and the caller composes it
+  via `and_then` with a local graph — no impl-trait, no boxed dyn,
+  no leaking implementation generics. This is the meta-kernel
+  pattern working end-to-end.
+- **`Clone` via `Arc<Inner>`** enables `G.and_then(G.clone())`
+  reuse cheaply, as required for the in-CB iteration pattern.
+
+Compile-fail diagnostics captured inline in `spikes/graph_cb/src/main.rs`
+(commented; will migrate to a real `ui_test` harness when the design
+graduates from spike status). Next phase: wire the `Graph` to real
+claspr `DeviceOperation` IR and start on the `cl_khr_command_buffer`
+FFI side.
 
 ---
 
