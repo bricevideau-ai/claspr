@@ -40,13 +40,16 @@
 //! ## Carry-forward
 //!
 //! The traits + combinator-propagation pattern here is what real
-//! claspr's `claspr-async` crate would adopt. The wrapper-on-top
-//! is a separate piece of work (see `.claude/plans/declarative-hopping-parrot.md`
-//! for the next-slice plan).
+//! claspr's `claspr-async` crate would adopt. The user-facing
+//! surface on top (`.call()` / `.mutate_call()`, opt-ins, cache
+//! protocol) is a separate piece of work — see `NOTES.md`
+//! → "Command-buffer-backed graphs" for the agreed design and the
+//! next-slice plan.
 
 mod combinators;
 mod composition;
 mod device_op;
+mod erasure;
 mod leaves;
 mod opt_outs;
 

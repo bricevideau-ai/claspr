@@ -112,6 +112,39 @@ helpfully lists the recordable alternatives, which makes the fix
 discoverable.
 
 ══════════════════════════════════════════════════════════════════════
+Case 4: ErasedGraph::recordable() rejects a non-recordable factory
+══════════════════════════════════════════════════════════════════════
+
+This is the erasure-boundary guarantee (erasure.rs). `recordable()`
+requires the factory's chain to be `RecordableOp` — so the static
+opt-out survives right up to the point where the type is erased.
+
+Source addition (in erasure.rs tests):
+
+    let _g: ErasedGraph<u64> = ErasedGraph::recordable(|| AndThen {
+        source: Upload { data: vec![1, 2, 3], allocated_buf_id: 1 },
+        f: |b| FillKernel { n: 3, buf_id: b, value: 1 },
+    });
+
+Captured rustc diagnostic (nightly-2026-05-22):
+
+    error[E0277]: the trait bound `Upload: device_op::RecordableOp`
+        is not satisfied
+       --> src/erasure.rs:309:36
+        |
+    309 |   let _g: ErasedGraph<u64> = ErasedGraph::recordable(|| AndThen {
+        |  ____________________________________^
+    310 | |     source: Upload { ... },
+        ... |
+    319 | | });
+        | |__^ unsatisfied trait bound
+
+The error points at the `recordable()` construction call — the
+erasure boundary. Such a chain must use `ErasedGraph::eager_only`
+instead (execute-only, no record capability), which is the explicit
+"no caching for this one" path.
+
+══════════════════════════════════════════════════════════════════════
 Assessment
 ══════════════════════════════════════════════════════════════════════
 

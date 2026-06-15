@@ -232,26 +232,19 @@ mod tests {
         assert!(cb.recorded_commands[2].starts_with("barrier"));
     }
 
-    /// Key compile-time guarantee: a chain containing an Upload
-    /// cannot have `.record()` called on it. This test exists by
-    /// failing-to-compile rather than passing — it's commented out
-    /// because uncommenting would break the build (as desired).
+    /// Positive case: an `Upload`-containing chain works fine in
+    /// eager mode because `Upload` only needs `DeviceOperation`, not
+    /// `RecordableOp`.
     ///
-    /// ```compile_fail
-    /// let chain = AndThen {
-    ///     source: Upload { data: vec![1, 2, 3], allocated_buf_id: 1 },
-    ///     f: |buf| FillKernel { n: 3, buf_id: buf, value: 42 },
-    /// };
-    /// let mut cb = FakeCommandBuffer::default();
-    /// let mut rec = RecordContext { command_buffer: &mut cb };
-    /// chain.record(&mut rec, vec![]); // ERROR: Upload: RecordableOp not satisfied
-    /// ```
+    /// The matching NEGATIVE case (calling `.record()` on this chain
+    /// fails to compile) is verified out-of-band in
+    /// `compile_fail_cases.txt` — this is a bin-only crate, so a
+    /// `compile_fail` doctest fence here would never be collected by
+    /// `cargo test`. If/when this graduates, move the negative cases
+    /// to a real `ui_test` harness (cf. claspr's
+    /// `reference_ui_test_for_compile_fail` convention).
     #[test]
     fn upload_chain_still_executes_eagerly() {
-        // Negative case verified at compile-time (see doc-comment
-        // above). Positive case: the same chain works fine in eager
-        // mode because Upload only needs `DeviceOperation`, not
-        // `RecordableOp`.
         let chain = AndThen {
             source: Upload {
                 data: vec![1, 2, 3, 4],

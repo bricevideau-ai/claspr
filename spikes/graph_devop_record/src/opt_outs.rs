@@ -106,7 +106,7 @@ mod tests {
     /// Wrapping a chain in OnDevice means the whole chain can't be
     /// recorded. The trait propagation does the work: trying to call
     /// `.record()` on this is a compile error (verified manually;
-    /// `compile_fail/` directory has the .stderr capture).
+    /// captured in `compile_fail_cases.txt`).
     #[test]
     fn on_device_chain_works_in_eager_mode() {
         let chain = OnDevice {
