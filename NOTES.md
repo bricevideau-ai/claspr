@@ -73,6 +73,26 @@ terminal wait in `sync`. `Input<T> = Concrete|Pipe` is the unified edge.
     reachable terminal case); add `EagerOp` impl (resolve Inputs from pipes,
     enqueue via `LaunchOp`, deposit in output pipe). Scalars unchanged.
     `ToInput` DONE + committed (`332418d`), green.
+  - **UNIFIED-TERMINAL DESIGN (Brice's original intent, corrected course):**
+    ONE Op structure with the **output `Pipe` as the single source of truth**.
+    `EagerOp::execute` is the ONLY enqueue body (resolve `Input`s → set args →
+    `LaunchOp` enqueue → deposit buffers+event in the output pipe). `wait()` /
+    `submit()` (Tier-1) are thin terminals OVER that: run `execute`, take from
+    the pipe, block on its deps, return the buffer(s) (the move-out contract —
+    `kernels.foo(buf).wait()? -> buf` — is just "take the Output from the
+    terminal pipe", verified faithful).
+    **Terminal opt-in optimizations (Brice):** `wait()` can pass an execution
+    hint into `execute` to opt into BLOCKING memory transfers (blocking
+    read/write) instead of the eager path's non-blocking-enqueue + event-wait —
+    when the terminal blocks anyway, the blocking transfer skips an event+wait
+    round-trip. So `EagerOp::execute` should carry an exec-mode/hint param
+    (default = non-blocking/pipelined for graph use; `wait()` may request
+    blocking). Design the trait sig for this. So NO separate `KernelOp::enqueue_into`
+    path and NO Tier-1/eager fork — kernels drop the `KernelOp`→old-blanket
+    entirely and impl `EagerOp` only; Tier-1 terminals become inherent methods
+    that drive `execute`. Simpler than dual-impl. (This supersedes the "Op impls
+    both traits" idea from `332418d`'s message — that was a transition crutch;
+    the unified-terminal shape is the real target.)
   - **CORRECTION: the cutover IS incremental** (my "atomic" claim was wrong —
     re-spiked). The E0034 `.and_then` ambiguity only fires when a single file
     imports BOTH `DeviceOperation` and `EagerOpExt` AND calls `.and_then` on a
