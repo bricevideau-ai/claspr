@@ -46,6 +46,23 @@ works. TODO to reach parity:
 LESSON (Brice): should've ported the suite directly (all-fail-then-fix) to see
 this shape set at once instead of piecemeal.
 
+**⚠ KNOWN GAP — `and_then_with_context` dep edge (fix during suite port).**
+The eager `and_then_with_context(|ec, value| …)` closure receives the upstream
+VALUE, so the downstream op takes it as `Input::Concrete` (EMPTY deps) → no
+event edge to the source's command. The impl merges source deps into the
+downstream's OUTPUT deps (terminal completion correct), but on a strict
+out-of-order queue the downstream command has no enqueue wait on the source →
+potential data race (pocl happens to order it, so the test passes). Contrast:
+regular eager `and_then(|pipe| …)` passes a PIPE → downstream resolves it →
+deps reach the enqueue → correct. FIX: make `and_then_with_context`'s closure
+receive `Self::Handle` (the pipe), matching `and_then`, so the downstream
+threads deps. The real call sites (device routing: `|ec, buf| kernel(buf)
+.on_device(...)`) feed `buf` into a kernel which takes `impl ToInput` (accepts a
+pipe), so pipe-passing should typecheck — VERIFY when porting those tests
+(don't guess the signature without the call sites — the lesson). on_device +
+and_then_host do NOT have this gap (on_device re-points ec; host seam drains
+deps before the host read).
+
 **EXECUTE-TIME CLOSURE NODES (spiked green) — and_then_with_context / on_device
 / and_then_host.** These 3 combinators are NOT eager builders (their closure
 needs the live `ec` / runtime mapped data, absent at build). They're

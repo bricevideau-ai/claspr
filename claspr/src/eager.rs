@@ -297,6 +297,81 @@ pub trait EagerOpExt: EagerOp + Sized {
         AndThen { source: self, next }
     }
 
+    /// Sequential composition whose builder runs at **execute** with the live
+    /// [`ExecutionContext`] in scope (not at construction like
+    /// [`and_then`](Self::and_then)). The closure receives `&ExecutionContext`
+    /// together with the upstream's runtime value, so it can read `ec.device()`
+    /// / `ec.context()` or route via [`on_device`](Self::on_device) while
+    /// building the downstream op. See [`AndThenWithContext`].
+    fn and_then_with_context<U, F>(self, f: F) -> AndThenWithContext<Self, U, F>
+    where
+        U: EagerOp,
+        F: for<'a> FnOnce(&ExecutionContext<'a>, Self::Output) -> U + Send,
+    {
+        let src_pipe = self.output_pipe();
+        AndThenWithContext {
+            source: self,
+            src_pipe,
+            f: Some(f),
+            out: Pipe::new(),
+        }
+    }
+
+    /// Route this op's `execute` to `device`'s default out-of-order queue
+    /// instead of the chain's primary queue. Downstream stages resume on the
+    /// parent's queue; the routed op's events are valid across both via
+    /// OpenCL's shared-context event semantics. See [`OnDevice`].
+    fn on_device(self, device: &crate::Device) -> OnDevice<Self> {
+        let src_pipe = self.output_pipe();
+        OnDevice {
+            source: self,
+            device: device.clone(),
+            src_pipe,
+            out: Pipe::new(),
+        }
+    }
+
+    /// Run a host closure on a borrowed [`Mappable::View`] of this op's output,
+    /// in chain order. The seam drains the upstream events (so the data is
+    /// host-valid), maps the value, runs the closure (mutations persist via the
+    /// unmap), then forwards the same value downstream. Errors from the closure
+    /// propagate directly. See [`AndThenHost`].
+    fn and_then_host<F>(self, f: F) -> AndThenHost<Self, F>
+    where
+        Self::Output: crate::mappable::Mappable,
+        F: for<'a> FnOnce(<Self::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
+            + Send,
+    {
+        let src_pipe = self.output_pipe();
+        AndThenHost {
+            source: self,
+            src_pipe,
+            f: Some(f),
+            out: Pipe::new(),
+        }
+    }
+
+    /// Like [`and_then_host`](Self::and_then_host) but the closure also receives
+    /// the running [`Context`] (e.g. to read device props). See
+    /// [`AndThenHostWithContext`].
+    fn and_then_host_with_context<F>(self, f: F) -> AndThenHostWithContext<Self, F>
+    where
+        Self::Output: crate::mappable::Mappable,
+        F: for<'a> FnOnce(
+                &Context,
+                <Self::Output as crate::mappable::Mappable>::View<'a>,
+            ) -> Result<()>
+            + Send,
+    {
+        let src_pipe = self.output_pipe();
+        AndThenHostWithContext {
+            source: self,
+            src_pipe,
+            f: Some(f),
+            out: Pipe::new(),
+        }
+    }
+
     /// Run `self` to completion on `context` (forward path; no replay). Blocks
     /// once, here, on the terminal op's events — the only wait in the graph.
     fn sync(self, context: &Context) -> Result<Self::Output> {
@@ -2070,5 +2145,311 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("copy_to".into());
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Execute-time closure nodes — the ONE place closures legitimately survive in
+// the eager model (NOTES → "EXECUTE-TIME CLOSURE NODES"). Unlike eager
+// `and_then` (its builder runs at BUILD with a `Pipe` handle), these three run
+// their closure at EXECUTE because it needs the live `ec` / mapped host data,
+// neither of which exists at build. Shape: hold `source` + `src_pipe` (captured
+// at build) + `f: Option<F>` + `out`; `execute` runs the source, takes the
+// upstream runtime value, runs the closure NOW to build the downstream op,
+// grabs the downstream's out-pipe BEFORE consuming it (move-once), runs it, and
+// moves the result into `out` (merging the source's deps so the terminal waits
+// on the whole chain).
+// ════════════════════════════════════════════════════════════════════════
+
+// ── AndThenWithContext: closure gets the live ExecutionContext at execute ──
+
+/// Sequential composition whose builder runs at **execute** with the live
+/// [`ExecutionContext`] in scope — built by
+/// [`and_then_with_context`](EagerOpExt::and_then_with_context).
+///
+/// Unlike [`AndThen`] (builder at construction, `Pipe` handle), the closure
+/// here receives `&ExecutionContext` + the upstream's **runtime value**, so it
+/// can read `ec.device()` / `ec.context()` / route via [`on_device`] while
+/// building the downstream op. The downstream op is therefore built — and run —
+/// at execute time.
+pub struct AndThenWithContext<S: EagerOp, U: EagerOp, F> {
+    source: S,
+    src_pipe: Pipe<S::Output>,
+    f: Option<F>,
+    out: Pipe<U::Output>,
+}
+
+impl<S, U, F> EagerOp for AndThenWithContext<S, U, F>
+where
+    S: EagerOp,
+    U: EagerOp,
+    F: for<'a> FnOnce(&ExecutionContext<'a>, S::Output) -> U + Send,
+{
+    type Output = U::Output;
+
+    fn output_pipe(&self) -> Pipe<U::Output> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // Source is upstream — always pipeline it; its value + events feed the
+        // downstream op the closure builds.
+        self.source.execute(ec, ExecMode::Pipelined)?;
+        let (value, src_deps) = self.src_pipe.take().ok_or(Error::NotSupported(
+            "eager and_then_with_context: source produced no output",
+        ))?;
+        let f = self.f.take().expect(
+            "AndThenWithContext::execute called twice — internal eager bug",
+        );
+        // Closure runs NOW, at execute, with the live ec + runtime value.
+        let downstream = f(ec, value);
+        // Grab the downstream's out-pipe BEFORE consuming it (move-once).
+        let down_pipe = downstream.output_pipe();
+        downstream.execute(ec, mode)?;
+        let (out_value, mut out_deps) = down_pipe.take().ok_or(Error::NotSupported(
+            "eager and_then_with_context: downstream produced no output",
+        ))?;
+        // Thread the source's events through: merge them with the downstream's
+        // so the terminal waits on the whole chain (the downstream consumed the
+        // value concretely, so its enqueue carries no upstream wait-list —
+        // forwarding the source deps keeps the chain's events live).
+        out_deps.extend(src_deps);
+        self.out.put(out_value, out_deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        self.source.describe(out);
+        out.push("and_then_with_context".into());
+    }
+}
+
+// ── OnDevice: re-point the op at a different device's queue at execute ──
+
+/// Route `source`'s `execute` to a **different** device's default
+/// out-of-order queue — built by [`on_device`](EagerOpExt::on_device).
+///
+/// No user closure: at execute it resolves the target device's queue from the
+/// running context, builds a sibling [`ExecutionContext`] (same context + same
+/// host-error slot, different device + queue), and runs `source` against it.
+/// The source's events are valid across queues of the same context, so
+/// downstream stages on the parent's queue can wait on them cross-device.
+pub struct OnDevice<S: EagerOp> {
+    source: S,
+    device: crate::Device,
+    src_pipe: Pipe<S::Output>,
+    out: Pipe<S::Output>,
+}
+
+impl<S, S2> EagerOp for OnDevice<S>
+where
+    S: EagerOp<Output = S2>,
+    S2: Send,
+{
+    type Output = S::Output;
+
+    fn output_pipe(&self) -> Pipe<S::Output> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, parent: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // Resolve the target queue from the running context (cached, so the
+        // terminal's flush_all_outoforder_queues picks it up).
+        let target_q = parent
+            .context()
+            .default_outoforder_queue(&self.device)?;
+        // Sibling EC: same context + same host-error slot, different device +
+        // queue. `target_q` lives on this frame; its `.raw()` borrows for the
+        // inner execute().
+        let child = ExecutionContext::with_host_error_slot(
+            parent.context(),
+            self.device.clone(),
+            target_q.raw(),
+            parent.host_error_slot(),
+        );
+        // Run the source against the child EC — it deposits into `src_pipe`.
+        self.source.execute(&child, mode)?;
+        let (value, deps) = self.src_pipe.take().ok_or(Error::NotSupported(
+            "eager on_device: source produced no output",
+        ))?;
+        self.out.put(value, deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        self.source.describe(out);
+        out.push("on_device".into());
+    }
+}
+
+// ── AndThenHost / AndThenHostWithContext: the host seam ──
+
+/// Run a host closure on a borrowed [`Mappable::View`] of the upstream output,
+/// in chain order — built by [`and_then_host`](EagerOpExt::and_then_host).
+///
+/// At execute: run the source, take its `(value, deps)`, **drain the deps
+/// (blocking wait)** so the data is host-valid, map the value, run the closure
+/// on its view (mutations persist via the unmap), then forward the **same**
+/// value downstream (`Output = S::Output`).
+///
+/// ## Synchronous, not spawned (eager port simplification)
+///
+/// The old closure-layer `and_then_host` spawned a worker thread (plus a user
+/// event and a host-error slot) so a host stage could sit *in-queue* with
+/// pipelined device work. The eager node runs the host call **synchronously at
+/// execute**: it drains the upstream deps, does a (non-blocking) map then waits
+/// its event, runs the closure, enqueues the unmap then waits its event, then
+/// forwards. This is correct and simpler: errors propagate directly via
+/// `?`/`return Err` (no user-event stash needed), panics are not caught (they
+/// unwind the caller), and mutations commit through the unmap. The cost is that
+/// the host stage no longer overlaps downstream device work; for a host seam (a
+/// scheduling / host-touch concern) that serialization is acceptable and
+/// matches the pre-async synchronous shape the module docs describe.
+pub struct AndThenHost<S: EagerOp, F>
+where
+    S::Output: crate::mappable::Mappable,
+{
+    source: S,
+    src_pipe: Pipe<S::Output>,
+    f: Option<F>,
+    out: Pipe<S::Output>,
+}
+
+/// Like [`AndThenHost`] but the closure also receives `&Context` — built by
+/// [`and_then_host_with_context`](EagerOpExt::and_then_host_with_context).
+pub struct AndThenHostWithContext<S: EagerOp, F>
+where
+    S::Output: crate::mappable::Mappable,
+{
+    source: S,
+    src_pipe: Pipe<S::Output>,
+    f: Option<F>,
+    out: Pipe<S::Output>,
+}
+
+/// Shared body: run source, drain its deps host-side, map, run `host_call` on
+/// the view, unmap, and forward the value with the unmap event as deps.
+fn run_host_seam<O>(
+    source_value: O,
+    source_deps: Deps,
+    ec: &ExecutionContext<'_>,
+    host_call: impl FnOnce(<O as crate::mappable::Mappable>::View<'_>) -> Result<()>,
+) -> Result<(O, Deps)>
+where
+    O: crate::mappable::Mappable,
+{
+    use crate::Launcher;
+    use crate::mappable::Mappable;
+    // Drain upstream events so the mapped memory is host-valid before the
+    // closure reads it (the host seam's defining wait).
+    for d in &source_deps {
+        d.as_ref().wait().map_err(Error::OpenCl)?;
+    }
+    let q = ec.cl_queue();
+    // Non-blocking map (deps already drained → empty wait-list), then wait its
+    // event synchronously so the view is coherent.
+    let (mut handle, map_events) = source_value.map(q, &[])?;
+    for ev in &map_events {
+        ev.wait().map_err(Error::OpenCl)?;
+    }
+    // Run the host closure on the borrowed view. On Err, the handle's `Drop`
+    // issues the defensive blocking unmap (unmap_enqueued still false), so the
+    // buffer is left clean.
+    {
+        let view = <O as Mappable>::view(&mut handle);
+        host_call(view)?;
+    }
+    // Commit mutations: enqueue the unmap (no waiter) and wait its event.
+    let unmap_events = <O as Mappable>::enqueue_unmap(&mut handle, q, &[])?;
+    let unmap_deps: Deps = unmap_events.into_iter().map(wrap_event).collect();
+    for d in &unmap_deps {
+        d.as_ref().wait().map_err(Error::OpenCl)?;
+    }
+    // `handle` drops here — `unmap_enqueued` is true, so no second unmap.
+    drop(handle);
+    Ok((source_value, unmap_deps))
+}
+
+impl<S, F> EagerOp for AndThenHost<S, F>
+where
+    S: EagerOp,
+    S::Output: crate::mappable::Mappable,
+    F: for<'a> FnOnce(<S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()> + Send,
+{
+    type Output = S::Output;
+
+    fn output_pipe(&self) -> Pipe<S::Output> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        self.source.execute(ec, ExecMode::Pipelined)?;
+        let (value, deps) = self.src_pipe.take().ok_or(Error::NotSupported(
+            "eager and_then_host: source produced no output",
+        ))?;
+        let f = self
+            .f
+            .take()
+            .expect("AndThenHost::execute called twice — internal eager bug");
+        let (out_value, out_deps) = run_host_seam::<S::Output>(value, deps, ec, f)?;
+        self.out.put(out_value, out_deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        self.source.describe(out);
+        out.push("and_then_host".into());
+    }
+}
+
+impl<S, F> EagerOp for AndThenHostWithContext<S, F>
+where
+    S: EagerOp,
+    S::Output: crate::mappable::Mappable,
+    F: for<'a> FnOnce(&Context, <S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
+        + Send,
+{
+    type Output = S::Output;
+
+    fn output_pipe(&self) -> Pipe<S::Output> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        self.source.execute(ec, ExecMode::Pipelined)?;
+        let (value, deps) = self.src_pipe.take().ok_or(Error::NotSupported(
+            "eager and_then_host_with_context: source produced no output",
+        ))?;
+        let f = self.f.take().expect(
+            "AndThenHostWithContext::execute called twice — internal eager bug",
+        );
+        // Bind the context up front so the `host_call` closure borrows it
+        // (cheap Arc-backed handle); the view borrow is supplied by the seam.
+        let context = ec.context().clone();
+        let (out_value, out_deps) =
+            run_host_seam::<S::Output>(value, deps, ec, move |view| f(&context, view))?;
+        self.out.put(out_value, out_deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        self.source.describe(out);
+        out.push("and_then_host_with_context".into());
     }
 }

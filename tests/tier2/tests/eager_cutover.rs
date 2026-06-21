@@ -367,3 +367,142 @@ fn device_copy_eager() {
         &result[..8]
     );
 }
+
+// ── Execute-time closure nodes ─────────────────────────────────────────
+
+/// `and_then_with_context`: the builder runs at EXECUTE with the live `ec`.
+/// The closure reads `ec.device()` (proving the EC is in scope) then builds the
+/// downstream `fill` over the upstream buffer. upload([1;N]) →
+/// with_context(fill 9) → download = 9.
+#[test]
+fn eager_and_then_with_context() {
+    let Some(ctx) = ctx() else { return };
+
+    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+        .and_then_with_context(|ec, buf| {
+            // Touch the live ExecutionContext to prove it's in scope at execute.
+            let _dev = ec.device();
+            fill(buf, 9u32)
+        })
+        .and_then(|b| download(b))
+        .sync(&ctx)
+        .expect("sync");
+
+    assert_eq!(out.len(), N);
+    assert!(
+        out.iter().all(|&v| v == 9),
+        "and_then_with_context fill via live ec; got {:?}",
+        &out[..8]
+    );
+}
+
+/// `and_then_host`: the host seam. upload([1;N]) → host closure (`+= 1` over a
+/// `&mut [u32]` view) → download. Proves the host saw the real data, mutations
+/// persisted through the unmap, and the buffer forwards downstream unchanged in
+/// identity. DeviceSlice's `Mappable::View` is `&mut [u32]` (read-write map).
+#[test]
+fn eager_and_then_host() {
+    let Some(ctx) = ctx() else { return };
+
+    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+        .and_then_host(|slice: &mut [u32]| {
+            for x in slice.iter_mut() {
+                *x += 1;
+            }
+            Ok(())
+        })
+        .and_then(|b| download(b))
+        .sync(&ctx)
+        .expect("sync");
+
+    assert_eq!(out.len(), N);
+    assert!(
+        out.iter().all(|&v| v == 2),
+        "and_then_host mutation (1 + 1) persisted; got {:?}",
+        &out[..8]
+    );
+}
+
+/// `and_then_host` error propagation: the closure returns `Err`, which must
+/// surface at the terminal as that error (no silent success).
+#[test]
+fn eager_and_then_host_error_propagates() {
+    let Some(ctx) = ctx() else { return };
+
+    let res = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+        .and_then_host(|_slice: &mut [u32]| Err(claspr::Error::SvmNotAvailable))
+        .and_then(|b| download(b))
+        .sync(&ctx);
+
+    assert!(
+        matches!(res, Err(claspr::Error::SvmNotAvailable)),
+        "host closure Err must surface at the terminal; got {res:?}"
+    );
+}
+
+/// `on_device`: route an op to a different device's queue. Only runs with a
+/// two-device context (real multi-device or sub-device partition); single-device
+/// runners skip it — there is no second queue to route to.
+#[test]
+fn eager_on_device() {
+    use claspr::device::Platform;
+    use claspr::Device;
+
+    // Discover a two-device context: real multi-device → sub-device partition →
+    // skip. Mirrors tests/tier2/tests/on_device.rs.
+    fn ctx_two_devices() -> Option<Context> {
+        if let Ok(platforms) = Platform::all() {
+            for p in platforms {
+                if let Ok(devs) = p.devices()
+                    && devs.len() >= 2
+                {
+                    return Context::builder()
+                        .devices(&[devs[0].clone(), devs[1].clone()])
+                        .build()
+                        .ok();
+                }
+            }
+        }
+        if let Ok(devs) = Device::all() {
+            for parent in devs {
+                if parent.partition_max_sub_devices().unwrap_or(0) < 2 {
+                    continue;
+                }
+                let cu = parent.max_compute_units().unwrap_or(0);
+                if cu < 2 {
+                    continue;
+                }
+                let Ok(subs) = parent.partition_equally(cu / 2) else {
+                    continue;
+                };
+                if subs.len() < 2 {
+                    continue;
+                }
+                return Context::builder()
+                    .devices(&[subs[0].clone(), subs[1].clone()])
+                    .build()
+                    .ok();
+            }
+        }
+        eprintln!("SKIP: no two-device context for eager_on_device");
+        None
+    }
+
+    let Some(ctx) = ctx_two_devices() else { return };
+
+    // Two fill stages, each routed to a distinct device from the context, then
+    // download. Device identity resolved from `ec` each stage (portable idiom).
+    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+        .and_then_with_context(|ec, buf| fill(buf, 3u32).on_device(ec.device_at(0)))
+        .and_then_with_context(|ec, buf| fill(buf, 7u32).on_device(ec.device_at(1)))
+        .and_then(|b| download(b))
+        .sync(&ctx)
+        .expect("on_device chain");
+
+    assert_eq!(out.len(), N);
+    assert!(
+        out.iter().all(|&v| v == 7),
+        "last routed fill wins; got {:?}",
+        &out[..8]
+    );
+}
