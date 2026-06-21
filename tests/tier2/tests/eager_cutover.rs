@@ -215,3 +215,68 @@ fn fan_out_device_work() {
     assert!(outs[1].iter().all(|&v| v == 2));
     assert!(outs[2].iter().all(|&v| v == 3));
 }
+
+/// **The keystone: a MULTI-OUTPUT kernel composes in an eager graph.**
+/// `add_u32(a, b, out)` has `Output = (DeviceSlice, DeviceSlice, DeviceSlice)`,
+/// so its `Handle` is a TUPLE OF PIPES `(Pipe<a>, Pipe<b>, Pipe<out>)`. The
+/// downstream `and_then(|(_a, _b, out)| download(out))` selects the `out` pipe
+/// and drops the other two (move-once: the dropped element pipes are never
+/// `take`n). Proves both halves of the contract: per-element selection in
+/// `and_then` AND terminal reconstruct via the overridden `into_output`.
+#[test]
+fn multi_output_kernel_element_select() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("kernels");
+
+    // Concrete buffers as the kernel's chain head (ToInput accepts concrete in
+    // eager too). `a = 3`, `b = 4` → `out = 7` element-wise.
+    let a = upload::<u32, claspr::ReadWrite, _>(vec![3u32; N])
+        .sync(&ctx)
+        .expect("upload a");
+    let b = upload::<u32, claspr::ReadWrite, _>(vec![4u32; N])
+        .sync(&ctx)
+        .expect("upload b");
+    let out = alloc_zero::<u32, claspr::ReadWrite>(N)
+        .sync(&ctx)
+        .expect("alloc out");
+
+    let result: Vec<u32> = ks
+        .add_u32([N], a, b, out)
+        .and_then(|(_a, _b, out)| download(out))
+        .sync(&ctx)
+        .expect("sync");
+    assert!(
+        result.iter().all(|&v| v == 7),
+        "multi-output add_u32 (3+4); got {:?}",
+        &result[..8]
+    );
+}
+
+/// Multi-output kernel as a TERMINAL: `.sync()` reconstructs the full
+/// `(a, b, out)` tuple by draining all three element pipes (the
+/// `into_output` override), proving the Tier-1 whole-tuple contract.
+#[test]
+fn multi_output_kernel_terminal_tuple() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("kernels");
+
+    let a = upload::<u32, claspr::ReadWrite, _>(vec![5u32; N])
+        .sync(&ctx)
+        .expect("upload a");
+    let b = upload::<u32, claspr::ReadWrite, _>(vec![6u32; N])
+        .sync(&ctx)
+        .expect("upload b");
+    let out = alloc_zero::<u32, claspr::ReadWrite>(N)
+        .sync(&ctx)
+        .expect("alloc out");
+
+    // No downstream and_then — the kernel itself is the terminal; sync must
+    // reconstruct the (a, b, out) tuple.
+    let (_a, _b, out) = ks.add_u32([N], a, b, out).sync(&ctx).expect("sync tuple");
+    let result = download(out).sync(&ctx).expect("download");
+    assert!(
+        result.iter().all(|&v| v == 11),
+        "multi-output terminal tuple (5+6); got {:?}",
+        &result[..8]
+    );
+}

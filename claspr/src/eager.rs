@@ -253,6 +253,32 @@ pub trait EagerOp: Send {
     /// ignores `mode`.
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()>;
 
+    /// Run this op as the **chain terminal** and yield its [`Output`](Self::Output),
+    /// having waited on its completion events per `mode`.
+    ///
+    /// Default (single-output ops): `execute` deposits the value into
+    /// [`output_pipe`](Self::output_pipe); this drains it and waits on the
+    /// carried [`Deps`]. Multi-output ops (whose storage is per-element pipes,
+    /// not a single output pipe) override this to scatter-then-reconstruct the
+    /// tuple by draining every element pipe and gathering their deps.
+    ///
+    /// This is the trait seam that lets [`sync`](EagerOpExt::sync) be uniform
+    /// across single- and multi-output ops: it always calls `into_output`.
+    fn into_output(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
+    where
+        Self: Sized,
+    {
+        let out = self.output_pipe();
+        self.execute(ec, mode)?;
+        let (value, deps) = out
+            .take()
+            .ok_or(Error::NotSupported("eager graph: terminal op produced no output"))?;
+        for d in &deps {
+            d.as_ref().wait().map_err(Error::OpenCl)?;
+        }
+        Ok(value)
+    }
+
     /// Structural description — node names in execution order, NO execution.
     fn describe(&self, out: &mut Vec<String>);
 }
@@ -273,21 +299,14 @@ pub trait EagerOpExt: EagerOp + Sized {
     /// Run `self` to completion on `context` (forward path; no replay). Blocks
     /// once, here, on the terminal op's events — the only wait in the graph.
     fn sync(self, context: &Context) -> Result<Self::Output> {
-        let out = self.output_pipe();
         let device = context.device().clone();
         let queue = context.default_outoforder_queue(&device)?;
         let ec = ExecutionContext::new(context, device, queue.raw());
-        // Terminal op may use a native blocking enqueue (no event); upstream
-        // ops pipeline. If the terminal blocked, `deps` is empty and the wait
-        // loop is a no-op; otherwise we block on its event here.
-        self.execute(&ec, ExecMode::Blocking)?;
-        let (value, deps) = out
-            .take()
-            .ok_or(Error::NotSupported("eager graph: terminal op produced no output"))?;
-        for d in &deps {
-            d.as_ref().wait().map_err(Error::OpenCl)?;
-        }
-        Ok(value)
+        // The terminal op yields its Output and waits on its own completion
+        // events (Blocking); upstream ops pipeline. Single-output ops use the
+        // default `into_output` (drain output pipe + wait); multi-output ops
+        // override it to scatter-then-reconstruct the tuple.
+        self.into_output(&ec, ExecMode::Blocking)
     }
 
     /// Describe the whole graph structurally without running it.
