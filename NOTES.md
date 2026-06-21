@@ -46,6 +46,31 @@ works. TODO to reach parity:
 LESSON (Brice): should've ported the suite directly (all-fail-then-fix) to see
 this shape set at once instead of piecemeal.
 
+**MOVE-ONCE RESOLUTION (spiked green /tmp/inferspike) — implementation shape.**
+The tension: a multi-output kernel's buffers can't be moved BOTH into a single
+`Pipe<(A,B,C)>` (terminal) AND into per-element pipes (downstream) — DeviceSlice
+is not Clone. Resolution: **the per-element pipes ARE the storage** (no single
+output-tuple pipe for multi-output ops). `execute` scatters each buffer into its
+element pipe (move-once). Two consumers, mutually exclusive by build-time wiring:
+  - downstream `and_then`: `Handle = (Pipe<A>,Pipe<B>,Pipe<C>)`; closure
+    `|(_a,_b,out)|` takes the pipes it wants, drops the rest (move-once OK — the
+    dropped element pipes are simply never `take`n).
+  - terminal `sync`/Tier-1 `wait`: RECONSTRUCTS the `Output` tuple by draining
+    all element pipes (`(pa.take, pb.take, pc.take)`).
+⇒ This is a TRAIT-CONTRACT change, not just a macro addition: `sync`/the terminal
+must drain element-pipes-and-reconstruct for multi-output ops, while single-output
+ops keep the `output_pipe().take()` path. Cleanest uniform shape to design next
+session: either (a) `output_pipe()` for multi-output returns a pipe that
+`execute` fills by reconstructing-after-scatter (defeats move-once — NO), or
+(b) make the terminal call a new `EagerOp::into_output(self, ec, mode) ->
+Result<Output>` that each op implements (single: take its pipe; multi: scatter
+then reconstruct), and `and_then` keeps using `handle()`. (b) is the clean one —
+unifies single+multi, no double-move. INVASIVE (trait + macro + bundle + sync
+together) → do as one focused green-at-end change with the direct-suite-port
+driving it. Event note: the single enqueue event is one `Dep`; put a clone
+(Event is Arc) on each element pipe, or carry it on element-0 and have
+reconstruct gather — decide at impl.
+
 **~~LIMIT~~ MISDIAGNOSIS, CORRECTED (Brice caught it).** I claimed a bundle's
 tuple output couldn't be split into per-branch pipes downstream. WRONG — that
 was self-inflicted: I hardcoded `and_then`'s closure to receive
