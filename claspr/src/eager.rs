@@ -475,6 +475,61 @@ impl<T: Send + 'static> EagerOp for Value<T> {
     }
 }
 
+// ── Forward: select/identity — make one upstream Pipe a single-output op ──
+
+/// Forward a single upstream value (a `Pipe<T>`) onward as a single-output
+/// [`EagerOp`]. The identity op: it resolves its input and re-deposits it
+/// (threading the deps), changing nothing. Its purpose is **shape**, not work —
+/// it lets you pick ONE element out of a multi-output op's handle (e.g. a
+/// kernel's `(Pipe<a>, Pipe<b>, Pipe<out>)`, or a bundle's per-branch pipes) and
+/// continue on-device with that single value, instead of dropping to the host
+/// or inserting a no-op kernel. The selected pipe becomes a normal
+/// `EagerOp<Output = T>` that composes via `and_then` / `bundle` like any leaf.
+///
+/// ```ignore
+/// // pick `out` from add_u32's 3-tuple handle and keep going on-device:
+/// ks.add_u32([N], a, b, out).and_then(|(_a, _b, out)| forward(out))
+/// ```
+pub struct Forward<T: Send> {
+    input: Input<T>,
+    out: Pipe<T>,
+}
+
+/// Forward an upstream value onward unchanged (identity op; see [`Forward`]).
+/// Takes a [`Pipe<T>`] directly (the selected element of a multi-output handle)
+/// — `Pipe` rather than `impl Into<Input>` so `T` infers cleanly from the
+/// selected element without an annotation.
+pub fn forward<T: Send + 'static>(pipe: Pipe<T>) -> Forward<T> {
+    Forward {
+        input: Input::Pipe(pipe),
+        out: Pipe::new(),
+    }
+}
+
+impl<T: Send + 'static> EagerOp for Forward<T> {
+    type Output = T;
+
+    fn output_pipe(&self) -> Pipe<T> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // Resolve the upstream value + its events and re-deposit unchanged — no
+        // device work; deps threaded through so ordering/termination is intact.
+        let (v, deps) = self.input.resolve()?;
+        self.out.put(v, deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("forward".into());
+    }
+}
+
 // ── Arced: wrap the output in Arc<T> ───────────────────────────────────
 
 /// Wrap an upstream op's output in [`Arc`] for shared fan-out. Passes events
