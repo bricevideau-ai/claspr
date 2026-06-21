@@ -254,26 +254,45 @@ pub trait EagerOp: Send {
     /// ignores `mode`.
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()>;
 
-    /// Run this op as the **chain terminal** and yield its [`Output`](Self::Output),
-    /// having waited on its completion events per `mode`.
+    /// Run this op as a **(sub)terminal** and yield `(Output, Deps)` **without
+    /// waiting** on the completion events.
     ///
-    /// Default (single-output ops): `execute` deposits the value into
-    /// [`output_pipe`](Self::output_pipe); this drains it and waits on the
-    /// carried [`Deps`]. Multi-output ops (whose storage is per-element pipes,
-    /// not a single output pipe) override this to scatter-then-reconstruct the
-    /// tuple by draining every element pipe and gathering their deps.
+    /// This is the uniform gather seam. Default (single-output ops): `execute`
+    /// deposits the value into [`output_pipe`](Self::output_pipe); this drains
+    /// it and returns the value together with its carried [`Deps`]. Multi-output
+    /// ops (whose storage is per-element pipes, not a single output pipe)
+    /// override this to scatter-then-reconstruct the tuple by draining every
+    /// element pipe and gathering their deps.
     ///
-    /// This is the trait seam that lets [`sync`](EagerOpExt::sync) be uniform
-    /// across single- and multi-output ops: it always calls `into_output`.
-    fn into_output(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
+    /// Two callers depend on the non-blocking contract:
+    /// - **Composites** (`bundle*`, `fan_out`) call `collect` on each *branch*
+    ///   so a branch that is itself multi-output runs its own override instead
+    ///   of being drained from an empty single pipe (the alternative —
+    ///   `output_pipe().take()` — is exactly the nested-multi-output bug).
+    /// - The terminals [`into_output`](Self::into_output) (blocking) and the
+    ///   async `run` wrap `collect` and decide *when* to wait.
+    fn collect(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
     where
         Self: Sized,
     {
         let out = self.output_pipe();
         self.execute(ec, mode)?;
-        let (value, deps) = out
-            .take()
-            .ok_or(Error::NotSupported("eager graph: terminal op produced no output"))?;
+        out.take()
+            .ok_or(Error::NotSupported("eager graph: op produced no output"))
+    }
+
+    /// Run this op as the **chain terminal** and yield its [`Output`](Self::Output),
+    /// having waited on its completion events per `mode`.
+    ///
+    /// Uniform across single- and multi-output ops: it [`collect`](Self::collect)s
+    /// (which dispatches to the right per-op gather) then waits once on the
+    /// returned deps. This is the seam that lets [`sync`](EagerOpExt::sync) be
+    /// arity-agnostic. Ops never override this — they override `collect`.
+    fn into_output(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
+    where
+        Self: Sized,
+    {
+        let (value, deps) = self.collect(ec, mode)?;
         for d in &deps {
             d.as_ref().wait().map_err(Error::OpenCl)?;
         }
@@ -406,16 +425,10 @@ pub trait EagerOpExt: EagerOp + Sized {
     /// returns [`EagerChainFuture::Errored`] right here — there is no
     /// host-error slot to drain at poll time.
     ///
-    /// **v1 scope: single-output ops only.** `run` drains the single
-    /// [`output_pipe`](EagerOp::output_pipe) (the default `Handle =
-    /// Pipe<Output>` case: leaves, kernels, `and_then`-terminated chains).
-    /// Multi-output ops (`arc_split`, `bundle*`, the `CopyTo` pair) store
-    /// their results in per-element pipes and override
-    /// [`into_output`](EagerOp::into_output) — their `output_pipe` is never
-    /// filled, so `run` would return the "terminal op produced no output"
-    /// error. Async `.run().await` over multi-output ops is deferred; use
-    /// [`sync`](Self::sync) for those, or terminate the chain with a
-    /// single-output `and_then` (e.g. `download`) first.
+    /// Arity-agnostic: like [`sync`](Self::sync), `run` gathers via
+    /// [`collect`](EagerOp::collect), so multi-output terminals (`arc_split`,
+    /// `bundle*`, the `CopyTo` pair) reconstruct their tuple/array the same way
+    /// the blocking terminal does — the future then resolves to that value.
     #[cfg(feature = "async-events")]
     fn run(self, context: &Context) -> EagerChainFuture<Self::Output>
     where
@@ -464,6 +477,19 @@ where
         // Only the tail inherits the caller's `mode` (Blocking iff terminal).
         self.source.execute(ec, ExecMode::Pipelined)?;
         self.next.execute(ec, mode)
+    }
+
+    fn collect(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(U::Output, Deps)>
+    where
+        Self: Sized,
+    {
+        // Delegate the gather to the tail op so a multi-output `next` (bundle*,
+        // arc_split, CopyTo pair) runs its *overridden* `collect`
+        // (scatter-then-reconstruct over its per-element pipes) rather than the
+        // default single-pipe drain — whose `output_pipe` it never fills. The
+        // source pipelines; only the tail observes the terminal `mode`.
+        self.source.execute(ec, ExecMode::Pipelined)?;
+        self.next.collect(ec, mode)
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -706,13 +732,13 @@ where
         Ok(())
     }
 
-    fn into_output(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
+    fn collect(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
     where
         Self: Sized,
     {
         // Grab the element pipes before consuming `self`, scatter via `execute`,
         // then drain all N to reconstruct the `[clone; N]` array, gathering
-        // every branch's deps and waiting on them.
+        // every branch's deps (the terminal `into_output` waits on them once).
         let outs = self.outs.clone();
         self.execute(ec, mode)?;
         let mut all_deps: Deps = Deps::new();
@@ -724,14 +750,12 @@ where
             vals.push(v);
             all_deps.extend(d);
         }
-        for d in &all_deps {
-            d.as_ref().wait().map_err(Error::OpenCl)?;
-        }
         // `vals` has exactly N elements (one per element pipe) — the conversion
         // cannot fail.
-        Ok(vals
+        let arr = vals
             .try_into()
-            .unwrap_or_else(|_| unreachable!("arc_split drained exactly N branch pipes")))
+            .unwrap_or_else(|_| unreachable!("arc_split drained exactly N branch pipes"));
+        Ok((arr, all_deps))
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -801,20 +825,31 @@ macro_rules! impl_eager_bundle {
             }
 
             fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-                // Each branch pipelines (independent). Running a branch fills its
-                // own `$pf` pipe; downstream consumers (a multi-arg op via
-                // `handle()`, or `into_output` for the terminal case) drain them.
-                $(self.$field.execute(ec, ExecMode::Pipelined)?;)+
+                // Each branch pipelines (independent). We `collect` the branch —
+                // NOT `branch.execute` — so a branch that is *itself* multi-output
+                // (a nested bundle, arc_split, the copy pair) runs its own gather
+                // and yields a single reconstructed value; we then deposit that
+                // value into the branch's `$pf` pipe. This keeps `$pf` filled
+                // uniformly for both consumers of a bundle: the mid-graph
+                // `handle()` (a downstream `and_then` reading `$pf`) and the
+                // terminal `collect` below. (For a single-output branch, `$pf`
+                // is the branch's own output pipe; `collect` drains it and we put
+                // it straight back — a cheap round-trip.)
+                $(
+                    let (v, d) = self.$field.collect(ec, ExecMode::Pipelined)?;
+                    self.$pf.put(v, d);
+                )+
                 Ok(())
             }
 
-            fn into_output(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
+            fn collect(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
             where
                 Self: Sized,
             {
                 // Grab the branch pipes before consuming `self`, scatter via
-                // `execute`, then drain each to reconstruct the tuple, join the
-                // branch wait-lists into one marker, and wait on it.
+                // `execute` (which fills each `$pf` via the branch's own gather),
+                // then drain each to reconstruct the tuple, joining the branch
+                // wait-lists into one marker. The terminal `into_output` waits.
                 $(let $pf = self.$pf.clone();)+
                 self.execute(ec, mode)?;
                 let mut branch_deps: Vec<Deps> = Vec::new();
@@ -825,10 +860,7 @@ macro_rules! impl_eager_bundle {
                     v
                 },)+ );
                 let joined = join_marker(ec, &branch_deps)?;
-                for d in &joined {
-                    d.as_ref().wait().map_err(Error::OpenCl)?;
-                }
-                Ok(outputs)
+                Ok((outputs, joined))
             }
 
             fn describe(&self, out: &mut Vec<String>) {
@@ -843,6 +875,81 @@ macro_rules! impl_eager_bundle {
 impl_eager_bundle!(Bundle2, bundle2, a: A: pa, b: B: pb);
 impl_eager_bundle!(Bundle3, bundle3, a: A: pa, b: B: pb, c: C: pc);
 impl_eager_bundle!(Bundle4, bundle4, a: A: pa, b: B: pb, c: C: pc, d: D: pd);
+impl_eager_bundle!(Bundle5, bundle5, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe);
+impl_eager_bundle!(Bundle6, bundle6, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf);
+impl_eager_bundle!(Bundle7, bundle7, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf, g: G: pg);
+impl_eager_bundle!(Bundle8, bundle8, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf, g: G: pg, h: H: ph);
+impl_eager_bundle!(Bundle9, bundle9, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf, g: G: pg, h: H: ph, i: I: pi);
+impl_eager_bundle!(Bundle10, bundle10, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf, g: G: pg, h: H: ph, i: I: pi, j: J: pj);
+impl_eager_bundle!(Bundle11, bundle11, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf, g: G: pg, h: H: ph, i: I: pi, j: J: pj, k: K: pk);
+impl_eager_bundle!(Bundle12, bundle12, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf, g: G: pg, h: H: ph, i: I: pi, j: J: pj, k: K: pk, l: L: pl);
+impl_eager_bundle!(Bundle13, bundle13, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf, g: G: pg, h: H: ph, i: I: pi, j: J: pj, k: K: pk, l: L: pl, m: M: pm);
+impl_eager_bundle!(Bundle14, bundle14, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf, g: G: pg, h: H: ph, i: I: pi, j: J: pj, k: K: pk, l: L: pl, m: M: pm, n: N: pn);
+impl_eager_bundle!(Bundle15, bundle15, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf, g: G: pg, h: H: ph, i: I: pi, j: J: pj, k: K: pk, l: L: pl, m: M: pm, n: N: pn, o: O: po);
+impl_eager_bundle!(Bundle16, bundle16, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf, g: G: pg, h: H: ph, i: I: pi, j: J: pj, k: K: pk, l: L: pl, m: M: pm, n: N: pn, o: O: po, p: P: pp);
+
+/// Variadic constructor for the eager [`Bundle2`] through [`Bundle16`] — picks
+/// the right `bundleN` based on the number of arguments.
+///
+/// The eager analog of the legacy [`bundle!`](crate::bundle) macro (which still
+/// targets the closure layer during the cutover). Renamed to `bundle!` once the
+/// old layer is removed.
+///
+/// ```ignore
+/// let (a, b) = eager_bundle!(op_a, op_b).sync(&ctx)?;
+/// let (a, b, c) = eager_bundle!(op_a, op_b, op_c).sync(&ctx)?;
+/// // ... up to 16 children
+/// ```
+#[macro_export]
+macro_rules! eager_bundle {
+    ($a:expr, $b:expr $(,)?) => {
+        $crate::eager::bundle2($a, $b)
+    };
+    ($a:expr, $b:expr, $c:expr $(,)?) => {
+        $crate::eager::bundle3($a, $b, $c)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr $(,)?) => {
+        $crate::eager::bundle4($a, $b, $c, $d)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr $(,)?) => {
+        $crate::eager::bundle5($a, $b, $c, $d, $e)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr $(,)?) => {
+        $crate::eager::bundle6($a, $b, $c, $d, $e, $f)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr $(,)?) => {
+        $crate::eager::bundle7($a, $b, $c, $d, $e, $f, $g)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr $(,)?) => {
+        $crate::eager::bundle8($a, $b, $c, $d, $e, $f, $g, $h)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr $(,)?) => {
+        $crate::eager::bundle9($a, $b, $c, $d, $e, $f, $g, $h, $i)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr $(,)?) => {
+        $crate::eager::bundle10($a, $b, $c, $d, $e, $f, $g, $h, $i, $j)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr, $k:expr $(,)?) => {
+        $crate::eager::bundle11($a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr, $k:expr, $l:expr $(,)?) => {
+        $crate::eager::bundle12($a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k, $l)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr, $k:expr, $l:expr, $m:expr $(,)?) => {
+        $crate::eager::bundle13($a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k, $l, $m)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr, $k:expr, $l:expr, $m:expr, $n:expr $(,)?) => {
+        $crate::eager::bundle14($a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k, $l, $m, $n)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr, $k:expr, $l:expr, $m:expr, $n:expr, $o:expr $(,)?) => {
+        $crate::eager::bundle15($a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k, $l, $m, $n, $o)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr, $k:expr, $l:expr, $m:expr, $n:expr, $o:expr, $p:expr $(,)?) => {
+        $crate::eager::bundle16(
+            $a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k, $l, $m, $n, $o, $p,
+        )
+    };
+}
 
 // ── FanOut: a homogeneous Vec of branches, joined by a marker ──────────
 
@@ -907,15 +1014,16 @@ impl<U: EagerOp> EagerOp for FanOut<U> {
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // `collect` each branch op (not `execute`) so a multi-output branch runs
+        // its own gather and yields one reconstructed value + deps — `self.pipes`
+        // (captured single output pipes) are empty for such branches. The pipes
+        // field is now unused for gathering; we read values straight from
+        // `collect`.
+        let n = self.ops.len();
+        let mut branch_deps: Vec<Deps> = Vec::with_capacity(n);
+        let mut outputs: Vec<U::Output> = Vec::with_capacity(n);
         for op in self.ops {
-            op.execute(ec, ExecMode::Pipelined)?;
-        }
-        let mut branch_deps: Vec<Deps> = Vec::with_capacity(self.pipes.len());
-        let mut outputs: Vec<U::Output> = Vec::with_capacity(self.pipes.len());
-        for p in &self.pipes {
-            let (v, d) = p.take().ok_or(Error::NotSupported(
-                "eager fan_out: a branch produced no output",
-            ))?;
+            let (v, d) = op.collect(ec, ExecMode::Pipelined)?;
             outputs.push(v);
             branch_deps.push(d);
         }
@@ -925,7 +1033,7 @@ impl<U: EagerOp> EagerOp for FanOut<U> {
     }
 
     fn describe(&self, out: &mut Vec<String>) {
-        out.push(format!("fan_out[{}]", self.ops.len()));
+        out.push(format!("fan_out[{}]", self.pipes.len()));
     }
 }
 
@@ -2358,13 +2466,13 @@ where
         Ok(())
     }
 
-    fn into_output(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
+    fn collect(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
     where
         Self: Sized,
     {
         // Grab the element pipes before consuming `self`, then scatter via
         // `execute`, then drain + reconstruct the `(src, dst)` tuple, gathering
-        // both pipes' deps and waiting on them.
+        // both pipes' deps (the terminal `into_output` waits on them once).
         let src_pipe = self.src_pipe.clone();
         let dst_pipe = self.dst_pipe.clone();
         self.execute(ec, mode)?;
@@ -2375,10 +2483,7 @@ where
             "eager graph: terminal copy produced no output",
         ))?;
         deps.extend(dst_deps);
-        for d in &deps {
-            d.as_ref().wait().map_err(Error::OpenCl)?;
-        }
-        Ok((out_src, out_dst))
+        Ok(((out_src, out_dst), deps))
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -2893,29 +2998,19 @@ where
     };
     let ec = ExecutionContext::new(context, device.clone(), queue.raw());
 
-    // 2. Run the chain non-blocking. The eager host seam executes its closure
-    //    here and returns any `Err` synchronously (no worker-thread stash), so
-    //    a host failure becomes `Errored` directly.
-    let out_pipe = chain.output_pipe();
-    if let Err(e) = chain.execute(&ec, ExecMode::Pipelined) {
-        drop(queue);
-        context.invalidate_default_outoforder_queue(&device);
-        return EagerChainFuture::Errored(Some(e));
-    }
-
-    // 3. Drain the (single) output pipe — value + the events the chain
-    //    produced. Multi-output ops don't fill this pipe (they override
-    //    `into_output` with per-element pipes); for them this is the documented
-    //    "produced no output" path — use `sync` instead.
-    let (output, deps) = match out_pipe.take() {
-        Some(p) => p,
-        None => {
+    // 2-3. Run the chain non-blocking and gather its result via `collect` —
+    //    the uniform gather seam. `collect` dispatches to the right per-op
+    //    reconstruction (single OR multi-output: bundle*, arc_split, the copy
+    //    pair all yield their reconstructed value + joined deps), so the async
+    //    terminal supports every arity the blocking `sync` does. The eager host
+    //    seam executes its closure here and returns any `Err` synchronously (no
+    //    worker-thread stash), so a host failure becomes `Errored` directly.
+    let (output, deps) = match chain.collect(&ec, ExecMode::Pipelined) {
+        Ok(pair) => pair,
+        Err(e) => {
             drop(queue);
             context.invalidate_default_outoforder_queue(&device);
-            return EagerChainFuture::Errored(Some(Error::NotSupported(
-                "eager run: terminal op produced no output (multi-output ops are \
-                 not supported by the async `.run()` terminal — use `.sync()`)",
-            )));
+            return EagerChainFuture::Errored(Some(e));
         }
     };
 

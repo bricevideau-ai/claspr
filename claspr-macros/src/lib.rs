@@ -838,13 +838,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     ::core::result::Result::Ok(())
                 }
 
-                fn into_output(
+                fn collect(
                     self,
                     ec: &::claspr::ExecutionContext<'_>,
                     mode: ::claspr::ExecMode,
-                ) -> ::claspr::Result<Self::Output> {
+                ) -> ::claspr::Result<(Self::Output, ::claspr::Deps)> {
                     // Grab the element pipes before consuming `self`, then
-                    // scatter via `execute`, then drain + reconstruct the tuple.
+                    // scatter via `execute`, then drain + reconstruct the tuple,
+                    // gathering deps (the terminal `into_output` waits on them).
                     #(
                         let #op_pipe_fields = ::core::clone::Clone::clone(&self.#op_pipe_fields);
                     )*
@@ -858,10 +859,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                             ))?;
                         __claspr_deps.extend(__claspr_d);
                     )*
-                    for d in &__claspr_deps {
-                        d.as_ref().wait().map_err(::claspr::Error::OpenCl)?;
-                    }
-                    ::core::result::Result::Ok(( #(#output_names),* ))
+                    ::core::result::Result::Ok((( #(#output_names),* ), __claspr_deps))
                 }
 
                 fn describe(&self, out: &mut ::std::vec::Vec<::std::string::String>) {

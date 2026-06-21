@@ -90,3 +90,18 @@ fn await_propagates_chain_error() {
     let err = block_on(chain.run(&ctx)).expect_err("chain should error");
     assert!(matches!(err, Error::LengthMismatch { .. }), "got {err:?}");
 }
+
+/// Multi-output terminal via `.run().await`. Previously `run` was single-output
+/// only (it drained `output_pipe`, which multi-output ops never fill, so a
+/// bundle terminal returned `NotSupported`). Now `run` gathers via `collect`,
+/// the same arity-agnostic seam `sync` uses, so a bundle resolves to its
+/// reconstructed tuple over the async terminal too.
+#[test]
+fn await_multi_output_bundle() {
+    use claspr::eager::bundle2;
+    let Some(ctx) = ctx() else { return };
+
+    let (a, b): (u32, u32) =
+        block_on(bundle2(value(11u32), value(22u32)).run(&ctx)).expect("await bundle");
+    assert_eq!((a, b), (11, 22));
+}
