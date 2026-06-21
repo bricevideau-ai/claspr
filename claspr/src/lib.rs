@@ -1,3 +1,6 @@
+// `associated_type_defaults`: `EagerOp::Handle` defaults to `Pipe<Output>`
+// (the common case); multi-output combinators override it. See `eager`.
+#![feature(associated_type_defaults)]
 //! claspr — single-source OpenCL with rust-gpu.
 //!
 //! This crate is the **runtime helper layer**: typed `Context`,

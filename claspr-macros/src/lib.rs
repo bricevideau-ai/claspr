@@ -931,6 +931,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     ::core::clone::Clone::clone(&self.__claspr_out)
                 }
 
+                // Default `Handle = Pipe<Output>`: a kernel's downstream handle
+                // is its single output pipe (the Output may itself be a tuple of
+                // buffers, carried atomically — see the tuple-handle work for
+                // per-element splitting).
+                fn handle(&self) -> ::claspr::Pipe<#output_ty> {
+                    ::core::clone::Clone::clone(&self.__claspr_out)
+                }
+
                 fn execute(
                     self,
                     ec: &::claspr::ExecutionContext<'_>,

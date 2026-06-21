@@ -219,8 +219,23 @@ pub trait EagerOp: Send {
     /// What this op produces at run time.
     type Output: Send;
 
-    /// The build-time output handle other ops wire to.
+    /// The **build-time, downstream-facing handle** — what a downstream
+    /// `and_then` closure receives. Defaults to a single [`Pipe<Output>`]
+    /// (the common case: leaves, kernels). A multi-output combinator overrides
+    /// it to expose its parts individually at build time — e.g. a 2-branch
+    /// bundle sets `Handle = (A::Handle, B::Handle)` so the closure gets two
+    /// pipes (`|(pa, pb)| …`) rather than one `Pipe<(A,B)>`. `Clone` so it can
+    /// be handed to the closure while the op keeps its own copy.
+    type Handle: Clone = Pipe<Self::Output>;
+
+    /// The output value pipe — where `execute` deposits the result; what the
+    /// terminal (`sync`) drains. Always a single `Pipe<Output>` regardless of
+    /// [`Handle`](Self::Handle).
     fn output_pipe(&self) -> Pipe<Self::Output>;
+
+    /// The downstream-facing [`Handle`](Self::Handle). Default: the output pipe
+    /// (so a downstream closure gets `Pipe<Output>`). Combinators override.
+    fn handle(&self) -> Self::Handle;
 
     /// Run the op: resolve inputs, enqueue, **move** the result + its events
     /// into the output pipe. Returns `()` — the value lives in the pipe.
@@ -242,9 +257,9 @@ pub trait EagerOpExt: EagerOp + Sized {
     fn and_then<U, F>(self, f: F) -> AndThen<Self, U>
     where
         U: EagerOp,
-        F: FnOnce(Pipe<Self::Output>) -> U,
+        F: FnOnce(Self::Handle) -> U,
     {
-        let next = f(self.output_pipe());
+        let next = f(self.handle());
         AndThen { source: self, next }
     }
 
@@ -292,9 +307,15 @@ where
     U: EagerOp,
 {
     type Output = U::Output;
+    // The chain's downstream handle is the tail op's handle.
+    type Handle = U::Handle;
 
     fn output_pipe(&self) -> Pipe<U::Output> {
         self.next.output_pipe()
+    }
+
+    fn handle(&self) -> U::Handle {
+        self.next.handle()
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -331,6 +352,10 @@ impl<T: Send + 'static> EagerOp for Value<T> {
     type Output = T;
 
     fn output_pipe(&self) -> Pipe<T> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
         self.out.clone()
     }
 
@@ -379,6 +404,10 @@ where
     type Output = Arc<S::Output>;
 
     fn output_pipe(&self) -> Pipe<Arc<S::Output>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
         self.out.clone()
     }
 
@@ -440,6 +469,10 @@ macro_rules! impl_eager_bundle {
             type Output = ( $(<$ty as EagerOp>::Output,)+ );
 
             fn output_pipe(&self) -> Pipe<Self::Output> {
+                self.out.clone()
+            }
+
+            fn handle(&self) -> Self::Handle {
                 self.out.clone()
             }
 
@@ -505,6 +538,10 @@ impl<U: EagerOp> EagerOp for FanOut<U> {
         self.out.clone()
     }
 
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         for op in self.ops {
             op.execute(ec, ExecMode::Pipelined)?;
@@ -561,6 +598,10 @@ where
         self.out.clone()
     }
 
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // alloc_zero is synchronous internally; no in-flight event, mode N/A.
         let buf = DeviceSlice::<T, M>::alloc_zero(ec.context(), self.len)?;
@@ -604,6 +645,10 @@ where
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
         self.out.clone()
     }
 
@@ -670,6 +715,10 @@ where
         self.out.clone()
     }
 
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
     fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // from_slice (CL_MEM_COPY_HOST_PTR) is a synchronous create — no
         // in-flight event, mode N/A.
@@ -716,6 +765,10 @@ where
     type Output = Vec<T>;
 
     fn output_pipe(&self) -> Pipe<Vec<T>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
         self.out.clone()
     }
 

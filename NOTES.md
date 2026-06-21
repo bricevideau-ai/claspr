@@ -23,18 +23,20 @@ closure-bearing node — the host seam — by design, not as a limitation. No
 blocker. host_view acquire/release leaves are mechanical ports; and_then_host
 stays a closure boundary (its closure runs at execute, segmenting the graph).
 
-**⚠ FIRST REAL EXPRESSIVENESS LIMIT FOUND (combinators):** in the eager model a
-multi-output combinator (`bundle`'s tuple `Pipe<(A,B)>`) **can't be
-destructured into per-element pipes** in a downstream `and_then` — the pipe is
-ATOMIC. `bundle(a,b).and_then(|(a,b)| …)` (which the closure model allowed)
-does not work; the closure now gets one `Pipe<(A,B)>`, not two pipes. Workarounds
-that DO work: push per-branch downstream work INSIDE each branch before the
-bundle, or consume the tuple after `sync`. This is the closure-vs-struct
-tradeoff surfacing — a closure could split a runtime tuple; a build-time pipe
-can't be split without a `split`-style combinator (a `Pipe<(A,B)>` → `(Pipe<A>,
-Pipe<B>)` op, deferred — would restore it). Not a blocker, but the first place
-the eager paradigm is strictly less expressive than closures. (Brice wanted
-these surfaced.)
+**~~LIMIT~~ MISDIAGNOSIS, CORRECTED (Brice caught it).** I claimed a bundle's
+tuple output couldn't be split into per-branch pipes downstream. WRONG — that
+was self-inflicted: I hardcoded `and_then`'s closure to receive
+`Pipe<Self::Output>` (always ONE pipe). A bundle actually HOLDS `pa: Pipe<A>` +
+`pb: Pipe<B>` separately, so it can hand the closure `(Pipe<A>, Pipe<B>)`.
+**Fix (spiked green, incl. nesting):** give `EagerOp` an associated
+`type Handle: Clone` = "the build-time downstream-facing shape", default
+`Pipe<Output>`; `and_then`'s closure receives `Self::Handle`. A bundle overrides
+`Handle = (A::Handle, B::Handle)` → `bundle(a,b).and_then(|(pa,pb)| …)` works,
+and nests (`(Pipe<u8>, (Pipe<i8>, Pipe<i16>))`). This makes bundle MORE
+expressive than the closure model (branches exposed individually at BUILD time,
+not just as a destructured runtime tuple). TODO: implement the `Handle` assoc
+type (currently `and_then` hardcodes `Pipe<Output>`; leaves/kernels keep the
+default, bundles override). No expressiveness loss after all.
 
 Converting the closure-based `DeviceOperation` layer to the proven closure-free
 eager model (see `closure-free-graph` branch for the probe + design + 3-step
