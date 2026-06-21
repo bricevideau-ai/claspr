@@ -46,6 +46,22 @@ works. TODO to reach parity:
 LESSON (Brice): should've ported the suite directly (all-fail-then-fix) to see
 this shape set at once instead of piecemeal.
 
+**⚠ TWO GAPS FOUND porting chain.rs (eager_chain.rs proof, 5/5 green):**
+1. **`bundle(...).and_then(|(a,b,out)| kernel(a,b,out))` — bundle Handle is one
+   `Pipe<(A,B,C)>`, not per-branch pipes.** So a bundle can't feed a multi-arg
+   kernel directly (the workhorse shape; diamond_arc uses it heavily). FIX: apply
+   the SAME multi-output treatment bundle's siblings already have (CopyTo2 / the
+   multi-output kernel macro): bundle stores per-branch pipes (it already does),
+   override `type Handle = (A::Handle, B::Handle, …)` + `handle()` returns them +
+   `into_output` reconstructs the tuple for the terminal (move-once: branch pipes
+   are the storage, NOT drained into a single `out`). REAL, fixable, contained.
+2. **`value(x).and_then(|n| value(n+1))` — host-scalar transform mid-graph.**
+   `and_then` hands a `Pipe<u32>`, not the scalar; `and_then_host` is for device
+   `&mut [T]` views, not host scalars. Arguably a non-shape (`value(42)
+   .and_then(|n| value(n+1))` IS `value(43)` — no device work), but a host-value
+   `map` seam is trivial if wanted. LOW priority; the test rewrote to up-front
+   compute.
+
 **⚠ KNOWN GAP — `and_then_with_context` dep edge (fix during suite port).**
 The eager `and_then_with_context(|ec, value| …)` closure receives the upstream
 VALUE, so the downstream op takes it as `Input::Concrete` (EMPTY deps) → no
