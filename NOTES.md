@@ -11,6 +11,19 @@ items resolve.
 
 ### Eager struct-graph cutover (branch `eager-cutover`, from main, 2026-06-18)
 
+**⚠ FIRST REAL EXPRESSIVENESS LIMIT FOUND (combinators):** in the eager model a
+multi-output combinator (`bundle`'s tuple `Pipe<(A,B)>`) **can't be
+destructured into per-element pipes** in a downstream `and_then` — the pipe is
+ATOMIC. `bundle(a,b).and_then(|(a,b)| …)` (which the closure model allowed)
+does not work; the closure now gets one `Pipe<(A,B)>`, not two pipes. Workarounds
+that DO work: push per-branch downstream work INSIDE each branch before the
+bundle, or consume the tuple after `sync`. This is the closure-vs-struct
+tradeoff surfacing — a closure could split a runtime tuple; a build-time pipe
+can't be split without a `split`-style combinator (a `Pipe<(A,B)>` → `(Pipe<A>,
+Pipe<B>)` op, deferred — would restore it). Not a blocker, but the first place
+the eager paradigm is strictly less expressive than closures. (Brice wanted
+these surfaced.)
+
 Converting the closure-based `DeviceOperation` layer to the proven closure-free
 eager model (see `closure-free-graph` branch for the probe + design + 3-step
 validation). Branched from **main** (clean two-crate baseline; the cb-graphs

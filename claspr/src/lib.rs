@@ -177,7 +177,11 @@ pub use dyn_op::DynOp;
 // The eager graph types are reached via the `claspr::eager::` module path
 // (`eager::{EagerOp, EagerOpExt, Pipe, Input, …}`) to avoid name clashes with
 // the legacy `Download`/`upload` surface during the cutover.
-pub use eager::{EagerOp, EagerOpExt, ExecMode, Input, Pipe, ToInput};
+pub use eager::{
+    EagerOp, EagerOpExt, ExecMode, Input, Pipe, ToInput,
+    arced as eager_arced, bundle2 as eager_bundle2, bundle3 as eager_bundle3,
+    bundle4 as eager_bundle4, fan_out as eager_fan_out, value as eager_value,
+};
 pub use exec_ctx::ExecutionContext;
 pub use fan_out::{FanOut, FanOutExt, fan_out};
 pub use host_view::{

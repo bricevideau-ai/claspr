@@ -4,7 +4,9 @@
 //! claspr-async `ExecutionContext`/queue before the macro change (step 1b).
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, alloc_zero, download, fill, upload};
+use claspr::eager::{
+    EagerOpExt, alloc_zero, arced, bundle2, bundle3, download, fan_out, fill, upload, value,
+};
 use claspr_test_kernels::kernels;
 
 const N: usize = 256;
@@ -140,4 +142,76 @@ fn chained_fills_order_via_events() {
         "last fill wins via event ordering; got {:?}",
         &host[..8]
     );
+}
+
+/// `value` lifts a host value; `arced` wraps an output in `Arc` for sharing.
+#[test]
+fn value_and_arced() {
+    let Some(ctx) = ctx() else { return };
+
+    // value: pure host value through the graph.
+    let n: u32 = value(42u32).sync(&ctx).expect("value");
+    assert_eq!(n, 42);
+
+    // arced: wrap an uploaded buffer in Arc.
+    let shared = arced(upload::<u32, claspr::ReadWrite, _>(vec![5u32; N]))
+        .sync(&ctx)
+        .expect("arced");
+    let mut host = vec![0u32; N];
+    shared.read(&mut host).wait().expect("read");
+    assert!(host.iter().all(|&v| v == 5), "arced buffer; got {:?}", &host[..8]);
+}
+
+/// `bundle2`/`bundle3`: independent branches run and join; outputs tuple.
+#[test]
+fn bundles_join_branches() {
+    let Some(ctx) = ctx() else { return };
+
+    // Two independent download branches join into a tuple of Vecs.
+    let (a, b) = bundle2(
+        upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+            .and_then(|x| fill(x, 11u32))
+            .and_then(|x| download(x)),
+        upload::<u32, claspr::ReadWrite, _>(vec![2u32; N])
+            .and_then(|x| fill(x, 22u32))
+            .and_then(|x| download(x)),
+    )
+    .sync(&ctx)
+    .expect("bundle2");
+    assert!(a.iter().all(|&v| v == 11), "branch a; got {:?}", &a[..8]);
+    assert!(b.iter().all(|&v| v == 22), "branch b; got {:?}", &b[..8]);
+
+    let (x, y, z) = bundle3(value(1u32), value(2u32), value(3u32))
+        .sync(&ctx)
+        .expect("bundle3");
+    assert_eq!((x, y, z), (1, 2, 3));
+}
+
+/// `fan_out`: one op per input (builder runs eagerly over the inputs), joined.
+#[test]
+fn fan_out_homogeneous() {
+    let Some(ctx) = ctx() else { return };
+
+    let vals: Vec<u32> = fan_out(vec![10u32, 20, 30], |v| value(v))
+        .sync(&ctx)
+        .expect("fan_out");
+    assert_eq!(vals, vec![10, 20, 30]);
+}
+
+/// fan_out of real device work: fill N buffers to distinct values, download all.
+#[test]
+fn fan_out_device_work() {
+    let Some(ctx) = ctx() else { return };
+
+    let outs: Vec<Vec<u32>> = fan_out(vec![1u32, 2u32, 3u32], |v| {
+        upload::<u32, claspr::ReadWrite, _>(vec![0u32; 8])
+            .and_then(move |b| fill(b, v))
+            .and_then(|b| download(b))
+    })
+    .sync(&ctx)
+    .expect("fan_out device");
+    assert_eq!(outs.len(), 3);
+    assert!(outs[0].iter().all(|&v| v == 1));
+    assert!(outs[1].iter().all(|&v| v == 2));
+    assert!(outs[2].iter().all(|&v| v == 3));
 }

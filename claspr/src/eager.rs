@@ -310,7 +310,223 @@ where
     }
 }
 
-// ── Leaf: zero-init alloc (eager port of DeviceSliceAllocUninit+fill) ───
+// ── Value: lift a host value into the graph ────────────────────────────
+
+/// A host value lifted into the graph — produces it with no device work and no
+/// events. Useful as a chain head or to thread a host value alongside buffers.
+pub struct Value<T: Send> {
+    v: Option<T>,
+    out: Pipe<T>,
+}
+
+/// Lift `v` into the graph.
+pub fn value<T: Send + 'static>(v: T) -> Value<T> {
+    Value {
+        v: Some(v),
+        out: Pipe::new(),
+    }
+}
+
+impl<T: Send + 'static> EagerOp for Value<T> {
+    type Output = T;
+
+    fn output_pipe(&self) -> Pipe<T> {
+        self.out.clone()
+    }
+
+    fn execute(mut self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        let v = self
+            .v
+            .take()
+            .expect("Value::execute called twice — internal eager bug");
+        self.out.put(v, Deps::new());
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("value".into());
+    }
+}
+
+// ── Arced: wrap the output in Arc<T> ───────────────────────────────────
+
+/// Wrap an upstream op's output in [`Arc`] for shared fan-out. Passes events
+/// through unchanged.
+pub struct Arced<S: EagerOp> {
+    source: S,
+    src_pipe: Pipe<S::Output>,
+    out: Pipe<Arc<S::Output>>,
+}
+
+/// Wrap `source`'s output in `Arc`.
+pub fn arced<S: EagerOp>(source: S) -> Arced<S>
+where
+    S::Output: Sync,
+{
+    let src_pipe = source.output_pipe();
+    Arced {
+        source,
+        src_pipe,
+        out: Pipe::new(),
+    }
+}
+
+impl<S> EagerOp for Arced<S>
+where
+    S: EagerOp,
+    S::Output: Sync,
+{
+    type Output = Arc<S::Output>;
+
+    fn output_pipe(&self) -> Pipe<Arc<S::Output>> {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // Source pipelines (its value feeds us); we add no device work, so the
+        // terminal `mode` is irrelevant — pass it through for symmetry.
+        self.source.execute(ec, mode)?;
+        let (v, deps) = self
+            .src_pipe
+            .take()
+            .ok_or(Error::NotSupported("eager arced: source produced no output"))?;
+        self.out.put(Arc::new(v), deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        self.source.describe(out);
+        out.push("arced".into());
+    }
+}
+
+// ── Bundle: N independent branches, joined by a marker ─────────────────
+
+/// Join `n` branch wait-lists into one marker event on `ec`'s queue.
+fn join_marker(ec: &ExecutionContext<'_>, branch_deps: &[Deps]) -> Result<Deps> {
+    use crate::Launcher;
+    let all: Vec<crate::cl_event> = branch_deps
+        .iter()
+        .flat_map(|d| d.iter().map(|e| e.as_ref().get()))
+        .collect();
+    // SAFETY: cl_event handles are valid — held by the branch `Deps` Arcs
+    // until this call returns.
+    let marker = unsafe { ec.cl_queue().enqueue_marker_with_wait_list(&all) }
+        .map_err(Error::OpenCl)?;
+    Ok(vec![wrap_event(marker)])
+}
+
+macro_rules! impl_eager_bundle {
+    ($name:ident, $ctor:ident, $($field:ident : $ty:ident : $pf:ident),+) => {
+        #[doc = concat!("Eager bundle of independent branches (arity ",
+            stringify!($name), "). Built by [`", stringify!($ctor),
+            "`]; branches run with no inter-ordering, joined by a marker.")]
+        pub struct $name<$($ty: EagerOp),+> {
+            $($field: $ty,)+
+            // Each branch's output pipe, captured at build so `execute` can
+            // drain the branch values + their event deps.
+            $($pf: Pipe<<$ty as EagerOp>::Output>,)+
+            out: Pipe<( $(<$ty as EagerOp>::Output,)+ )>,
+        }
+
+        #[doc = concat!("Construct an eager [`", stringify!($name), "`].")]
+        #[allow(clippy::too_many_arguments)]
+        pub fn $ctor<$($ty: EagerOp),+>($($field: $ty),+) -> $name<$($ty),+> {
+            $(let $pf = $field.output_pipe();)+
+            $name { $($field,)+ $($pf,)+ out: Pipe::new() }
+        }
+
+        impl<$($ty: EagerOp),+> EagerOp for $name<$($ty),+> {
+            type Output = ( $(<$ty as EagerOp>::Output,)+ );
+
+            fn output_pipe(&self) -> Pipe<Self::Output> {
+                self.out.clone()
+            }
+
+            fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+                // Each branch pipelines (independent; the join marker is the
+                // terminal event). Run all, then drain values + deps.
+                $(self.$field.execute(ec, ExecMode::Pipelined)?;)+
+                let mut branch_deps: Vec<Deps> = Vec::new();
+                let outputs = ( $({
+                    let (v, d) = self.$pf.take().ok_or(Error::NotSupported(
+                        "eager bundle: a branch produced no output"))?;
+                    branch_deps.push(d);
+                    v
+                },)+ );
+                let joined = join_marker(ec, &branch_deps)?;
+                self.out.put(outputs, joined);
+                Ok(())
+            }
+
+            fn describe(&self, out: &mut Vec<String>) {
+                out.push(concat!(stringify!($name), "{").into());
+                $(self.$field.describe(out);)+
+                out.push("}".into());
+            }
+        }
+    };
+}
+
+impl_eager_bundle!(Bundle2, bundle2, a: A: pa, b: B: pb);
+impl_eager_bundle!(Bundle3, bundle3, a: A: pa, b: B: pb, c: C: pc);
+impl_eager_bundle!(Bundle4, bundle4, a: A: pa, b: B: pb, c: C: pc, d: D: pd);
+
+// ── FanOut: a homogeneous Vec of branches, joined by a marker ──────────
+
+/// Eager fan-out: build one op per input (the builder `f` runs at construction
+/// — eager — over the known input list), run them independently, join via a
+/// marker. Output is `Vec<U::Output>`.
+pub struct FanOut<U: EagerOp> {
+    ops: Vec<U>,
+    pipes: Vec<Pipe<U::Output>>,
+    out: Pipe<Vec<U::Output>>,
+}
+
+/// Build a fan-out: `f` is called now for each input, producing the branch ops.
+pub fn fan_out<I, F, U>(inputs: Vec<I>, mut f: F) -> FanOut<U>
+where
+    F: FnMut(I) -> U,
+    U: EagerOp,
+{
+    let ops: Vec<U> = inputs.into_iter().map(&mut f).collect();
+    let pipes: Vec<Pipe<U::Output>> = ops.iter().map(|o| o.output_pipe()).collect();
+    FanOut {
+        ops,
+        pipes,
+        out: Pipe::new(),
+    }
+}
+
+impl<U: EagerOp> EagerOp for FanOut<U> {
+    type Output = Vec<U::Output>;
+
+    fn output_pipe(&self) -> Pipe<Vec<U::Output>> {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        for op in self.ops {
+            op.execute(ec, ExecMode::Pipelined)?;
+        }
+        let mut branch_deps: Vec<Deps> = Vec::with_capacity(self.pipes.len());
+        let mut outputs: Vec<U::Output> = Vec::with_capacity(self.pipes.len());
+        for p in &self.pipes {
+            let (v, d) = p.take().ok_or(Error::NotSupported(
+                "eager fan_out: a branch produced no output",
+            ))?;
+            outputs.push(v);
+            branch_deps.push(d);
+        }
+        let joined = join_marker(ec, &branch_deps)?;
+        self.out.put(outputs, joined);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push(format!("fan_out[{}]", self.ops.len()));
+    }
+}
 
 /// Allocate a zero-initialised `DeviceSlice<T, M>` of `len` elements. Eager
 /// leaf: produces a usable buffer, no upstream input. (`alloc_zero` is
