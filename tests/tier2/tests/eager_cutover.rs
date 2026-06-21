@@ -5,8 +5,8 @@
 
 use claspr::Context;
 use claspr::eager::{
-    EagerOpExt, alloc_zero, arced, bundle2, bundle3, download, eager_copy_to, fan_out, fill, upload,
-    value,
+    EagerOpExt, alloc_zero, arc_split, arced, bundle2, bundle3, download, eager_copy_to, fan_out,
+    fill, upload, value,
 };
 use claspr_test_kernels::kernels;
 
@@ -280,6 +280,64 @@ fn multi_output_kernel_terminal_tuple() {
         "multi-output terminal tuple (5+6); got {:?}",
         &result[..8]
     );
+}
+
+/// **Arc fan-out: one shared buffer, N read-only consumers.** `arced` an
+/// uploaded buffer, then `arc_split::<2>` fans it to two branches. Each branch
+/// gets its OWN `Arc::clone` of the same device buffer (a cheap refcount bump)
+/// via a `Pipe<Arc<DeviceSlice>>`, feeds it as the read-only source to a
+/// `copy_u32` kernel into its own fresh destination, and downloads. Both
+/// branches must observe the identical shared input — proving N consumers each
+/// receive a usable clone of one producer's output. Mirrors the closure layer's
+/// `value(v).arc().and_then(|a| { let [a,b] = a.split::<2>(); … })`.
+#[test]
+fn arc_split_read_only_fan_out() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("kernels");
+
+    // Shared, read-only input: 0,1,2,…,N-1.
+    let src: Vec<u32> = (0..N as u32).collect();
+
+    let (out_a, out_b) = arc_split::<2, _>(arced(upload::<u32, claspr::ReadWrite, _>(src.clone())))
+        .and_then(|[a, b]| {
+            // Each branch owns one Arc clone of the SAME device buffer and reads
+            // it (read-only kernel arg) into its own private destination.
+            let ks = &ks;
+            bundle2(
+                alloc_zero::<u32, claspr::ReadWrite>(N)
+                    .and_then(move |dst| ks.copy_u32([N], a, dst))
+                    .and_then(|(_src, dst)| download(dst)),
+                alloc_zero::<u32, claspr::ReadWrite>(N)
+                    .and_then(move |dst| ks.copy_u32([N], b, dst))
+                    .and_then(|(_src, dst)| download(dst)),
+            )
+        })
+        .sync(&ctx)
+        .expect("arc_split fan-out");
+
+    assert_eq!(out_a, src, "branch a saw the shared input");
+    assert_eq!(out_b, src, "branch b saw the shared input");
+}
+
+/// `arc_split` as the TERMINAL: with no downstream `and_then`, `.sync()`
+/// reconstructs the `[Arc<T>; N]` array (the `into_output` override drains all
+/// N element pipes). Each array element is a clone of the same producer output;
+/// `Arc::ptr_eq` confirms they point at one shared allocation, not copies.
+#[test]
+fn arc_split_terminal_array() {
+    let Some(ctx) = ctx() else { return };
+
+    let [a, b, c] = arc_split::<3, _>(arced(upload::<u32, claspr::ReadWrite, _>(vec![9u32; N])))
+        .sync(&ctx)
+        .expect("arc_split terminal");
+
+    // All three are clones of the one Arc the source produced.
+    assert!(std::sync::Arc::ptr_eq(&a, &b), "a and b share one allocation");
+    assert!(std::sync::Arc::ptr_eq(&a, &c), "a and c share one allocation");
+
+    let mut host = vec![0u32; N];
+    a.read(&mut host).wait().expect("read shared buffer");
+    assert!(host.iter().all(|&v| v == 9), "shared buffer contents; got {:?}", &host[..8]);
 }
 
 /// Eager `copy_to` is a TWO-output op: `eager_copy_to(src, dst)` has

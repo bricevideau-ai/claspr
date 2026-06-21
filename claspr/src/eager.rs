@@ -456,6 +456,121 @@ where
     }
 }
 
+// ── ArcSplit: fan one Arc output to N read-only branches ───────────────
+
+/// Fan a single `Arc<T>` upstream output out to `N` independent downstream
+/// branches, each receiving its own cheap `Arc::clone`. Mirrors the closure
+/// layer's `.arc().and_then(|arc| { let [a, b, c] = arc.split::<3>(); … })`:
+/// one producer, `N` read-only consumers.
+///
+/// `Handle = [Pipe<S::Output>; N]` — the downstream `and_then` closure
+/// destructures the array (`let [a, b, c] = handle`) and each element is a
+/// `Pipe<Arc<T>>` that flows into a branch op (e.g. a read-only kernel, or a
+/// download). `execute` runs the source once, then scatters `Arc::clone(&arc)`
+/// (plus a clone of the producer's wait-list) into each of the `N` element
+/// pipes — every branch sees the same value and waits on the same producer
+/// event. `Output = [S::Output; N]` (the `N` clones) for the terminal case.
+///
+/// Use [`arc_split`] to build one — it follows an [`arced`] source.
+pub struct ArcSplit<S: EagerOp, const N: usize>
+where
+    S::Output: Clone,
+{
+    source: S,
+    src_pipe: Pipe<S::Output>,
+    // One element pipe per branch (move-once storage); each gets an
+    // `Arc::clone` of the source value in `execute`.
+    outs: [Pipe<S::Output>; N],
+}
+
+/// Build an [`ArcSplit`]: fan `source`'s `Arc<T>` output to `N` read-only
+/// branches. `source` is typically an [`arced`] op (`Output = Arc<T>`), so the
+/// per-branch clone is a cheap refcount bump. Pick `N` via turbofish to match
+/// the destructure arity: `arc_split::<3, _>(arced(upload(…)))`.
+pub fn arc_split<const N: usize, S: EagerOp>(source: S) -> ArcSplit<S, N>
+where
+    S::Output: Clone,
+{
+    let src_pipe = source.output_pipe();
+    ArcSplit {
+        source,
+        src_pipe,
+        outs: std::array::from_fn(|_| Pipe::new()),
+    }
+}
+
+impl<S, const N: usize> EagerOp for ArcSplit<S, N>
+where
+    S: EagerOp,
+    S::Output: Clone,
+{
+    type Output = [S::Output; N];
+    // An array of N element pipes; the downstream closure does
+    // `let [a, b, c] = handle` and routes each pipe into its own branch.
+    type Handle = [Pipe<S::Output>; N];
+
+    fn output_pipe(&self) -> Pipe<Self::Output> {
+        // Multi-output storage is the per-element pipes; this single pipe is
+        // never filled or drained (the default `into_output` is overridden, and
+        // `and_then` uses `handle()`). Return a fresh empty pipe — well-typed,
+        // never read.
+        Pipe::new()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.outs.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // The source feeds us; we add no device work. Pipeline it, then take its
+        // value + completion events and scatter a clone of each into every
+        // branch pipe (Arc::clone is a cheap refcount bump; Deps clone shares
+        // the same producer events).
+        self.source.execute(ec, ExecMode::Pipelined)?;
+        let (v, deps) = self
+            .src_pipe
+            .take()
+            .ok_or(Error::NotSupported("eager arc_split: source produced no output"))?;
+        for out in &self.outs {
+            out.put(v.clone(), deps.clone());
+        }
+        Ok(())
+    }
+
+    fn into_output(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
+    where
+        Self: Sized,
+    {
+        // Grab the element pipes before consuming `self`, scatter via `execute`,
+        // then drain all N to reconstruct the `[clone; N]` array, gathering
+        // every branch's deps and waiting on them.
+        let outs = self.outs.clone();
+        self.execute(ec, mode)?;
+        let mut all_deps: Deps = Deps::new();
+        let mut vals: Vec<S::Output> = Vec::with_capacity(N);
+        for p in &outs {
+            let (v, d) = p.take().ok_or(Error::NotSupported(
+                "eager arc_split: a branch produced no output",
+            ))?;
+            vals.push(v);
+            all_deps.extend(d);
+        }
+        for d in &all_deps {
+            d.as_ref().wait().map_err(Error::OpenCl)?;
+        }
+        // `vals` has exactly N elements (one per element pipe) — the conversion
+        // cannot fail.
+        Ok(vals
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("arc_split drained exactly N branch pipes")))
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        self.source.describe(out);
+        out.push(format!("arc_split[{N}]"));
+    }
+}
+
 // ── Bundle: N independent branches, joined by a marker ─────────────────
 
 /// Join `n` branch wait-lists into one marker event on `ec`'s queue.
