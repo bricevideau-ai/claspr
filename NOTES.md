@@ -46,11 +46,23 @@ terminal wait in `sync`. `Input<T> = Concrete|Pipe` is the unified edge.
     `.wait()`/`.submit()`/`KernelOp`), pipe → `PipedKernelOp` (EagerOp only, no
     `.wait()`). One method serves both tiers; `.wait()` exists ONLY on the
     concrete variant. SPIKED working.
+  - **Multi-arg `.wait()` finding + resolution (Brice):** with N buffer args
+    each independently concrete-or-pipe, `.wait()` can't be compile-gated
+    per-arg (concrete-ness is per-`Input` runtime). BUT **users cannot
+    construct a `Pipe`** — pipes only exist as `and_then`'s closure parameter.
+    So "holding a pipe and calling `.wait()`" is unreachable (if you have a
+    pipe you're mid-graph-build, not calling a terminal). ⇒ a **unified single
+    method** taking `Input` args, returning an eager Op that also carries
+    `.wait()` (resolves Inputs; the all-concrete case is the only reachable
+    one), is safe. No two-method split needed. Spiked: uniform `Input<D>`
+    multi-arg infers for all-concrete AND mixed, no turbofish.
   - **Scope/risk:** this is the deepest single change — rewrites the macro's
     Op emission (arg classification ~497, Op struct ~683, KernelOp impl ~798)
-    while keeping the existing Tier-1 surface intact for ~17 kernel-chaining
-    tier2 tests + all Tier-1 use. Pending. Element type `E` is fixed per kernel
-    (from the sig), so the macro hardcodes it — only the buffer generic varies.
+    while keeping the existing Tier-1 surface working for ~17 kernel-chaining
+    tier2 tests + all Tier-1 use. Element type `E` is fixed per kernel (from the
+    sig), so the macro hardcodes it; only the buffer generic varies. The eager
+    kernel leaf reuses `LaunchOp` (the same enqueue path `KernelOp` uses).
+    Pending — the capstone.
 
 **Then (per CONVERSION PLAN, carried mentally):** port remaining leaves
 (transfer/copy/uninit/usm/image_transfer/host_view), host seams (and_then_host /
