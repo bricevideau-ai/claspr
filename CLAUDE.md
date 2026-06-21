@@ -69,7 +69,12 @@ A claspr kernel can be packaged as its own library crate (`pub mod gpu`, build.r
 
 ## Build / test / run
 
-All examples need an OpenCL runtime. On this machine, pocl is at `~/.local`:
+All examples need an OpenCL runtime. pocl's prefix is per-machine: the
+Mac/Linux laptop installs to `~/.local` (paths below); the **Intel Linux box
+installs to `~/local`** (so use `OCL_ICD_VENDORS=$HOME/local/pocl/etc/OpenCL/vendors`
+there). On that box, leaving the `~/.local` path set silently falls back to the
+system ICDs in `/etc/OpenCL/vendors` (which run but can flakily SIGABRT in
+driver teardown) — point at `~/local/pocl` instead:
 
 ```bash
 # Whole-workspace check
