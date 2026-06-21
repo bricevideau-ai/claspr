@@ -47,18 +47,22 @@ LESSON (Brice): should've ported the suite directly (all-fail-then-fix) to see
 this shape set at once instead of piecemeal.
 
 **⚠ GAPS FOUND porting the full suite (systematic, sub-agent clusters) — the
-parity backlog. None block the model; each needs a primitive or is a non-shape.**
-- **transfer_to_device — NO eager cross-device migrate op.** `on_device` only
-  ROUTES an op's enqueue to a device queue; it doesn't MOVE a resident buffer.
-  Needs an eager `transfer_to_device(buf/pipe, device) -> EagerOp` primitive.
-  (blocks transfer_to_device.rs 2 tests)
-- **DynOp — NO eager type-erased op.** `EagerOp` isn't object-safe (assoc
-  `Handle` + `into_output(self)`), and there's no boxing ctor. Blocks the
+parity backlog. MOSTLY CLOSED 2026-06-21 — 6/8 gaps done + a root-cause
+multi-output bug fixed (commits 4811c5b small gaps, c130145 transfer+async,
+d756e0d bundle gather + arity 2..=16 + eager_bundle!). Only the two DESIGN-heavy
+gaps remain (DynOp, host-value seam).**
+- ✅ **transfer_to_device** — DONE (c130145). Eager leaf `transfer_to_device(buf,
+  device)` wrapping clEnqueueMigrateMemObjects on the target OOO queue;
+  re-export `eager_transfer_to_device`; composes with `.on_device`.
+- ⚠ **DynOp — NO eager type-erased op. STILL OPEN (needs DESIGN).** `EagerOp`
+  isn't object-safe (assoc `Handle` + `into_output(self)`/`collect(self)`), and
+  there's no boxing ctor. Blocks the
   if/else-arms-of-different-op-types shape (a REAL public-API pattern — `DynOp`
   is in dyn_op.rs, not test-only). Needs a `dyn`-safe erasure boundary (e.g.
-  erase to `Box<dyn ErasedEagerOp>` with a monomorphic execute+output_pipe).
-  Biggest gap; needs DESIGN. (blocks 7/8 conditional.rs)
-- **Host-value passthrough / host reduction mid-graph.** eager `and_then` hands
+  erase to `Box<dyn ErasedEagerOp>` with monomorphic execute+output_pipe+collect).
+  Biggest gap. (blocks 7/8 conditional.rs)
+- ⚠ **Host-value passthrough / host reduction mid-graph. STILL OPEN (needs
+  DESIGN).** eager `and_then` hands
   a Pipe, not the host VALUE; `and_then_host` is for device `&mut [T]` views,
   not host scalars/Arc<Vec>. So: host reductions over an `arc_split` of a lifted
   host `value(vec)` (sum/len), and `value((buf, step))` scalar-state repack, have
@@ -66,18 +70,29 @@ parity backlog. None block the model; each needs a primitive or is a non-shape.*
   Mappable. (blocks all 3 arc_split.rs + 1 ml_pass.rs). Same class as chain.rs
   gap 2. NOTE: arc_split of a DEVICE buffer (the diamond) works fine — this is
   only the HOST-side reduction variant.
-- **FanOutExt method form** (`vec.fan_out(op)`) — trivial alias; eager has only
-  the free `fan_out(vec, op)`. (blocks 1 fan_out.rs equivalence test)
-- **No async terminal `.run().await`.** eager has only `.sync()`; no
-  ChainFuture/poll. Needs an eager async terminal over the chain. (blocks all
-  run_await.rs + 1 error_fidelity async test)
-- **No eager `.profiled(cb)`.** Closure layer's `DeviceOperationProfileExt`
-  (per-op completion-timestamp callback + ProfilingDisabled surfacing) has no
-  EagerOpExt analogue. (blocks 2 host_and_profile.rs)
-- **No `catch_unwind` in the host seam.** eager `and_then_host` lets a closure
-  panic UNWIND (no `Error::HostPanic` conversion the old layer did). (blocks 1
-  error_fidelity panic test). Minor — add catch_unwind to the host seam if
-  HostPanic parity is wanted.
+- ✅ **FanOutExt method form** (`vec.fan_out(op)`) — DONE (4811c5b). `EagerFanOutExt`.
+- ✅ **async terminal `.run().await`** — DONE (c130145, extended d756e0d).
+  `EagerChainFuture` + `EagerOpExt::run` (async-events feature); arity-agnostic —
+  multi-output works via the `collect` seam (single-output limitation lifted).
+- ✅ **eager `.profiled(cb)`** — DONE (4811c5b). `Profiled` + `EagerProfileExt`.
+- ✅ **`catch_unwind` in the host seam** — DONE (4811c5b). `run_host_seam` wraps
+  the closure; panic → `Error::HostPanic`.
+
+**✅ ROOT-CAUSE BUG FIXED (d756e0d) — nested multi-output gather.** Composites
+(bundle*, fan_out) drained each branch's single `output_pipe().take()`; a branch
+that is itself multi-output (nested bundle, arc_split, copy pair, multi-output
+kernel) never fills that pipe → `NotSupported("a branch produced no output")`.
+Failed at HEAD: eager_diamond (nested bundle-of-bundles), eager_cutover arc_split
+fan-out. (Believed-green earlier — nested shapes weren't run serially on the
+correct ICD; see [[pocl-icd-path-per-machine]].) FIX: non-blocking gather seam
+`EagerOp::collect(ec,mode)->(Output,Deps)` (default single-pipe drain; multi-output
+ops override it instead of `into_output`). `into_output` = `collect` + wait once;
+composites call `branch.collect(Pipelined)`; `run` uses `collect` too. Net: N
+`into_output` overrides → N `collect` overrides + ONE wait. Also restored
+`Bundle2..=16` + variadic `eager_bundle!` (the suite port had only 2/3/4, nesting
+bundle2 for wider — which is what surfaced the bug). The two `chain.rs` gaps below
+(bundle multi-arg Handle, host-scalar transform) are subsumed: bundle Handle is
+already per-branch pipes, and the multi-output gather now composes through nesting.
 
 **⚠ TWO GAPS FOUND porting chain.rs (eager_chain.rs proof, 5/5 green):**
 1. **`bundle(...).and_then(|(a,b,out)| kernel(a,b,out))` — bundle Handle is one
