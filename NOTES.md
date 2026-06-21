@@ -9,6 +9,42 @@ items resolve.
 
 ## Active
 
+### Eager struct-graph cutover (branch `eager-cutover`, from main, 2026-06-18)
+
+Converting the closure-based `DeviceOperation` layer to the proven closure-free
+eager model (see `closure-free-graph` branch for the probe + design + 3-step
+validation). Branched from **main** (clean two-crate baseline; the cb-graphs
+accumulation is NOT carried — no Slots/Pick/SlotKernelCall/record cruft).
+
+**The model:** a graph is a closure-free nested struct of `EagerOp`s; `.and_then(f)`
+runs `f` at construction with a `Pipe<T>` handle (carrying `(value, Deps)`),
+storing the returned op. Non-blocking enqueue threads events through pipes; one
+terminal wait in `sync`. `Input<T> = Concrete|Pipe` is the unified edge.
+
+**Progress (each step green + committed):**
+- **1a DONE** (`4079a6b`): `claspr/src/eager.rs` (was claspr-async) — `EagerOp`/
+  `Pipe`/`Input`/`AndThen`/`sync` + real `alloc_zero`/`fill` leaves. 3/3 hw green.
+- **FOLD DONE** (`fce9bfd`): claspr-async folded into claspr. WHY: the macro emits
+  `::claspr::` paths and claspr can't depend on claspr-async (circular), so for
+  kernel ops to take `Input<T>` the eager core must live in claspr. (This
+  reversed my initial "keep two crates" call — flagged to Brice, he said fold.)
+  Cleaner than the cb-graphs merge: only opencl3 extra dep, no record/cl3. claspr
+  -async = re-export shim. Whole workspace builds; existing tier2 suites green
+  through the shim (no regression).
+- **1b NEXT** (the chosen snag fix): macro-emitted kernel ops take `Input<T>`
+  for buffer args → `kernels.foo([N], pipe)` typechecks + composes as an EagerOp
+  leaf, keeping concrete Tier-1 `.wait`/`.submit`. Macro arg classification is
+  at claspr-macros lib.rs ~497 (`classify_param` → Slice/Image/Scalar); buffer
+  args currently become a generic `__claspr_D{n}: KernelSliceArg`. Plan: slice
+  args become `Input`-wrapped, Op gets a persistent output `Pipe`, eager execute.
+
+**Then (per CONVERSION PLAN, carried mentally):** port remaining leaves
+(transfer/copy/uninit/usm/image_transfer/host_view), host seams (and_then_host /
+and_then_with_context as execute-time boundary nodes), fan_out/bundle marker-join,
+slots/bind/call, delete old closure trait. **Observe what (if anything) the new
+paradigm CANNOT express** — Brice's explicit interest; surface it when hit, don't
+presume.
+
 ### Command-buffer-backed graphs (design + spikes, 2026-06-12..15)
 
 **Goal.** When the platform supports `cl_khr_command_buffer`, record a
