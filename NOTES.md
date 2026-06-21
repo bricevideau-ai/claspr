@@ -23,6 +23,29 @@ closure-bearing node — the host seam — by design, not as a limitation. No
 blocker. host_view acquire/release leaves are mechanical ports; and_then_host
 stays a closure boundary (its closure runs at execute, segmenting the graph).
 
+**RESOLUTION for multi-output shapes (spiked green) — the parity recipe.**
+The suite survey shows the hard shapes are: multi-output kernels (`add_u32` →
+`(a,b,out)`), element-selection (`|(_a,_b,out)| download(out)`), bundle tuple
+destructure (`|(a,b,out)|`), Arc fan-out (`arc_split::<N>`, `.arc()`+clone).
+All reduce to ONE mechanism: **a multi-output op's `Handle` is a TUPLE OF PIPES
+(one per element), and `execute` SCATTERS its runtime tuple into them.** Then a
+downstream `|(_a, _b, out)| …` closure receives `(Pipe<A>, Pipe<B>, Pipe<Out>)`
+— selection is just dropping the unused pipes; no runtime-tuple-destructure
+needed. Spiked: `Kernel3{Output=(A,B,C), Handle=(Pipe<A>,Pipe<B>,Pipe<C>)}`,
+`handle()` returns the three, `execute` puts each — `|(_a,_b,out)| sink(out)`
+works. TODO to reach parity:
+  - kernel macro: when Output is a tuple, emit `Handle = (Pipe<..>, …)` + per-
+    element output pipes + scatter in execute (currently one `Pipe<Output>`).
+  - bundle: override `Handle = (A::Handle, …)` (branch pipes already held).
+  - Arc fan-out: a `split::<N>`/clone-at-execute combinator — `Arc<T>` is `Clone`
+    so the consumer pipes each get a clone (N readers); the producer scatters
+    N clones. arc_split is this with a fixed N.
+  - stateful `(buf, step)`: falls out of tuple-of-pipes (step is just a
+    `Pipe<u32>` element).
+  - host seams (`and_then_host`/`_with_context`): stay closure-at-execute nodes.
+LESSON (Brice): should've ported the suite directly (all-fail-then-fix) to see
+this shape set at once instead of piecemeal.
+
 **~~LIMIT~~ MISDIAGNOSIS, CORRECTED (Brice caught it).** I claimed a bundle's
 tuple output couldn't be split into per-branch pipes downstream. WRONG — that
 was self-inflicted: I hardcoded `and_then`'s closure to receive
