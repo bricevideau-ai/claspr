@@ -171,6 +171,8 @@ pub use bundle::{
 };
 #[cfg(feature = "async-events")]
 pub use chain_future::ChainFuture;
+#[cfg(feature = "async-events")]
+pub use eager::EagerChainFuture;
 pub use copy::{CopyTo, CopyToOp};
 pub use device_op::{
     AndThen, AndThenWithContext, Arced, Dep, Deps, DeviceOperation, Value, deps_as_events, value,
@@ -184,7 +186,7 @@ pub use eager::{
     EagerFanOutExt, EagerOp, EagerOpExt, EagerProfileExt, ExecMode, Input, Pipe, ToInput,
     arced as eager_arced, bundle2 as eager_bundle2, bundle3 as eager_bundle3,
     bundle4 as eager_bundle4, fan_out as eager_fan_out, forward as eager_forward,
-    value as eager_value,
+    transfer_to_device as eager_transfer_to_device, value as eager_value,
 };
 pub use exec_ctx::ExecutionContext;
 pub use fan_out::{FanOut, FanOutExt, fan_out};

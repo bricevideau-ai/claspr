@@ -385,6 +385,45 @@ pub trait EagerOpExt: EagerOp + Sized {
         self.into_output(&ec, ExecMode::Blocking)
     }
 
+    /// Async terminal — run `self` on `context` and return a future that
+    /// resolves to its [`Output`](EagerOp::Output) once every command the
+    /// chain enqueued has completed on the device.
+    ///
+    /// The non-blocking analog of [`sync`](Self::sync): instead of draining
+    /// the output pipe and *blocking* on its [`Deps`], `run` runs `execute`
+    /// in [`ExecMode::Pipelined`], drains the output pipe, then enqueues an
+    /// `clEnqueueMarkerWithWaitList` over the chain's deps on the same OOO
+    /// queue and wraps it in an [`EventFuture`](crate::EventFuture) — the
+    /// Tier-1 `clSetEventCallback` + `AtomicWaker` machinery wakes the
+    /// future when the marker fires. Mirrors the structure of the old
+    /// `chain_future::run_chain` terminal.
+    ///
+    /// **Host errors surface synchronously.** Unlike the old closure layer
+    /// (where `and_then_host` workers ran on their own threads and stashed
+    /// into an `Arc<Mutex<Option<Error>>>` slot read at poll time), the
+    /// eager host seam runs its closure *inside* `execute` and returns the
+    /// closure's `Err` directly (see `run_host_seam`). So a failing chain
+    /// returns [`EagerChainFuture::Errored`] right here — there is no
+    /// host-error slot to drain at poll time.
+    ///
+    /// **v1 scope: single-output ops only.** `run` drains the single
+    /// [`output_pipe`](EagerOp::output_pipe) (the default `Handle =
+    /// Pipe<Output>` case: leaves, kernels, `and_then`-terminated chains).
+    /// Multi-output ops (`arc_split`, `bundle*`, the `CopyTo` pair) store
+    /// their results in per-element pipes and override
+    /// [`into_output`](EagerOp::into_output) — their `output_pipe` is never
+    /// filled, so `run` would return the "terminal op produced no output"
+    /// error. Async `.run().await` over multi-output ops is deferred; use
+    /// [`sync`](Self::sync) for those, or terminate the chain with a
+    /// single-output `and_then` (e.g. `download`) first.
+    #[cfg(feature = "async-events")]
+    fn run(self, context: &Context) -> EagerChainFuture<Self::Output>
+    where
+        Self::Output: Unpin,
+    {
+        run_eager_chain(self, context)
+    }
+
     /// Describe the whole graph structurally without running it.
     fn description(&self) -> Vec<String> {
         let mut v = Vec::new();
@@ -1124,6 +1163,97 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("download".into());
+    }
+}
+
+// ── Leaf: migrate a DeviceSlice to another device (eager TransferToDevice) ──
+
+/// Eager port of the closure-layer `transfer_to_device(buf, &dev)`. Enqueues a
+/// `clEnqueueMigrateMemObjects` for the buffer on `device`'s default OOO queue,
+/// yielding the (now-migrated) buffer. The matching per-op routing combinator
+/// kernels need after the buffer is migrated is [`on_device`](EagerOpExt::on_device).
+///
+/// ## Shape: a leaf, not a wrapping method
+///
+/// Unlike [`on_device`](EagerOpExt::on_device) (which *routes* an upstream op's
+/// own enqueue to another queue without touching its value), `transfer_to_device`
+/// is a buffer-*consuming* leaf: it resolves the upstream `DeviceSlice` value,
+/// reads its `cl_mem`, and enqueues a migrate. That puts it in the same family as
+/// [`download`] / [`fill`] / [`copy_to`](crate::eager::copy_to) — every member
+/// takes `impl Into<Input<DeviceSlice<…>>>` as its dataflow input — and mirrors
+/// the old free-fn signature `transfer_to_device(buf, dev)` 1:1. A method form
+/// would have to pin `S::Output = DeviceSlice<T>` (like [`OnDevice`]) yet still
+/// resolve the value (unlike `OnDevice`), fighting both patterns; the leaf form
+/// composes cleanly via `.and_then(|p| transfer_to_device(p, dev))`.
+///
+/// ## What the migrate actually does
+///
+/// For two devices sharing one `cl_context`, the runtime may or may not move
+/// bytes (shared-memory topologies / sub-devices: typically a no-op; two dGPUs:
+/// real migration). Either way the migrate is a queue command (non-blocking) so
+/// the graph stays pipelined; downstream stages wait on the migrate event via
+/// the carried [`Deps`]. Cross-*context* transfer is **not** this op — that goes
+/// through host bounce ([`download`] → [`upload`]).
+pub struct TransferToDevice<T, M: MemMode = ReadWrite> {
+    buf: Input<DeviceSlice<T, M>>,
+    device: crate::Device,
+    out: Pipe<DeviceSlice<T, M>>,
+}
+
+/// Build a transfer-to-device leaf: migrate `buf` onto `device`'s default OOO
+/// queue, yielding the migrated buffer. See [`TransferToDevice`] for semantics
+/// and the rationale for the leaf (free-fn) shape over a wrapping method.
+pub fn transfer_to_device<T, M>(
+    buf: impl Into<Input<DeviceSlice<T, M>>>,
+    device: &crate::Device,
+) -> TransferToDevice<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + Send + 'static,
+{
+    TransferToDevice {
+        buf: buf.into(),
+        device: device.clone(),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for TransferToDevice<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + Send + 'static,
+{
+    type Output = DeviceSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        let (buf, deps) = self.buf.resolve()?;
+        // Resolve the target device's default OOO queue (cached on the Context,
+        // so the terminal's flush_all_outoforder_queues pushes it). Same path
+        // OnDevice uses to reach a non-primary device's queue.
+        let target_q = ec.context().default_outoforder_queue(&self.device)?;
+        // Enqueue the migrate with the upstream events as the wait-list, on the
+        // target queue (`&*target_q` is the `Queue: Launcher`). Non-blocking —
+        // mode is ignored; the chain terminal's `into_output` does the final
+        // wait. The migrate body mirrors the closure layer's
+        // `transfer_to_device.rs` exactly.
+        let event = buf
+            .migrate()
+            .after_all(deps.iter().map(|d| d.as_ref()))
+            .submit_on(&*target_q)?;
+        self.out.put(buf, vec![wrap_event(event)]);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("transfer_to_device".into());
     }
 }
 
@@ -2678,5 +2808,147 @@ where
     fn describe(&self, out: &mut Vec<String>) {
         self.source.describe(out);
         out.push("profiled".into());
+    }
+}
+
+// ── EagerChainFuture: the async `.run().await` terminal ────────────────
+
+/// Future returned by [`EagerOpExt::run`]. Resolves to `Result<T>` once the
+/// chain's commands have all completed on the device (or immediately, with an
+/// error, if the chain failed to submit or any host seam returned `Err`).
+///
+/// The eager analog of `chain_future::ChainFuture`. The key simplification
+/// versus the old layer: the eager host seam (`run_host_seam`) runs its closure
+/// synchronously inside `execute` and returns `Err` directly, rather than
+/// stashing into a shared `Arc<Mutex<Option<Error>>>` from a worker thread. So a
+/// host-side failure is already captured as a synchronous `Err` from `execute`
+/// and becomes [`Errored`](Self::Errored) — there is no poll-time host-error
+/// slot to reconcile.
+#[cfg(feature = "async-events")]
+pub enum EagerChainFuture<T> {
+    /// Chain failed during setup, `execute` (including a host-seam closure
+    /// `Err`/panic), or marker enqueue. The error surfaces on the first `poll`.
+    Errored(Option<Error>),
+    /// Chain submitted successfully; waiting for the trailing marker event to
+    /// complete. The host-side `Output` is already materialised (drained from
+    /// the output pipe at `run` time); the future just gates *when* the caller
+    /// sees it on whether the queue work is done.
+    Running {
+        output: Option<T>,
+        event_future: crate::EventFuture,
+    },
+}
+
+// `T: Unpin` covers every realistic chain output (`Vec<u8>`, `DeviceSlice<T>`,
+// `Arc<T>`, tuples of those, ...) and lets us pin-project via the cheap
+// `Pin::get_mut`. Mirrors `ChainFuture`'s bound.
+#[cfg(feature = "async-events")]
+impl<T: Unpin> std::future::Future for EagerChainFuture<T> {
+    type Output = Result<T>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        use std::task::Poll;
+        let this = self.as_mut().get_mut();
+        match this {
+            EagerChainFuture::Errored(slot) => Poll::Ready(Err(slot
+                .take()
+                .expect("EagerChainFuture polled after Ready (Errored)"))),
+            EagerChainFuture::Running {
+                output,
+                event_future,
+            } => match std::pin::Pin::new(event_future).poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(output
+                    .take()
+                    .expect("EagerChainFuture polled after Ready (Running)"))),
+            },
+        }
+    }
+}
+
+/// Crate-internal worker behind [`EagerOpExt::run`]: build the
+/// [`ExecutionContext`] (default OOO queue, like `sync`), run `execute` in
+/// [`ExecMode::Pipelined`], drain the single output pipe, enqueue a marker over
+/// the chain's deps, and wrap it in an [`EventFuture`](crate::EventFuture).
+///
+/// Synchronous-error paths invalidate the context's cached OOO queue, mirroring
+/// `chain_future::run_chain`'s contract.
+#[cfg(feature = "async-events")]
+fn run_eager_chain<Op>(chain: Op, context: &Context) -> EagerChainFuture<Op::Output>
+where
+    Op: EagerOp,
+    Op::Output: Unpin,
+{
+    use crate::EventFutureExt;
+
+    // 1. Pick the per-device default OOO queue (same as `sync`).
+    let device = context.device().clone();
+    let queue = match context.default_outoforder_queue(&device) {
+        Ok(q) => q,
+        Err(e) => return EagerChainFuture::Errored(Some(e)),
+    };
+    let ec = ExecutionContext::new(context, device.clone(), queue.raw());
+
+    // 2. Run the chain non-blocking. The eager host seam executes its closure
+    //    here and returns any `Err` synchronously (no worker-thread stash), so
+    //    a host failure becomes `Errored` directly.
+    let out_pipe = chain.output_pipe();
+    if let Err(e) = chain.execute(&ec, ExecMode::Pipelined) {
+        drop(queue);
+        context.invalidate_default_outoforder_queue(&device);
+        return EagerChainFuture::Errored(Some(e));
+    }
+
+    // 3. Drain the (single) output pipe — value + the events the chain
+    //    produced. Multi-output ops don't fill this pipe (they override
+    //    `into_output` with per-element pipes); for them this is the documented
+    //    "produced no output" path — use `sync` instead.
+    let (output, deps) = match out_pipe.take() {
+        Some(p) => p,
+        None => {
+            drop(queue);
+            context.invalidate_default_outoforder_queue(&device);
+            return EagerChainFuture::Errored(Some(Error::NotSupported(
+                "eager run: terminal op produced no output (multi-output ops are \
+                 not supported by the async `.run()` terminal — use `.sync()`)",
+            )));
+        }
+    };
+
+    // 4. Enqueue a marker over every event the chain produced. Precise
+    //    wait-list — we don't penalise other work sharing this OOO queue.
+    //    SAFETY: each `cl_event` is held alive by the `deps` Arc wrappers for
+    //    the duration of this call; the marker enqueue retains them internally.
+    let wait_list: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+    let marker = match unsafe { queue.raw().enqueue_marker_with_wait_list(&wait_list) } {
+        Ok(ev) => ev,
+        Err(code) => {
+            drop(deps);
+            drop(queue);
+            context.invalidate_default_outoforder_queue(&device);
+            return EagerChainFuture::Errored(Some(Error::OpenCl(code)));
+        }
+    };
+    drop(deps);
+
+    // 4a. clFlush — push every queue the chain touched without blocking.
+    //     rusticl is spec-strict and keeps commands `CL_QUEUED` until an
+    //     explicit flush, so the marker's `CL_COMPLETE` callback would never
+    //     fire and the future would deadlock. flush_all also covers
+    //     `.on_device(&dev_b)` chains whose commands land on non-primary queues.
+    if let Err(e) = context.flush_all_outoforder_queues() {
+        drop(queue);
+        context.invalidate_default_outoforder_queue(&device);
+        return EagerChainFuture::Errored(Some(e));
+    }
+
+    // 5. Wrap the marker in the EventFuture machinery (clSetEventCallback).
+    EagerChainFuture::Running {
+        output: Some(output),
+        event_future: marker.into_future(),
     }
 }
