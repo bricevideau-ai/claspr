@@ -63,6 +63,17 @@ terminal wait in `sync`. `Input<T> = Concrete|Pipe` is the unified edge.
     sig), so the macro hardcodes it; only the buffer generic varies. The eager
     kernel leaf reuses `LaunchOp` (the same enqueue path `KernelOp` uses).
     Pending — the capstone.
+  - **Exact emission shape VALIDATED** (/tmp/inferspike, green): per buffer arg
+    emit TWO generics — `__D{n}: KernelSliceArg<elem>` (the buffer) +
+    `__I{n}: ToInput<elem, Buf=__D{n}>` (the arg, concrete-or-pipe). Method takes
+    `__I{n}`, stores `Input<__D{n}>` in the Op. `ToInput<E>` is a new claspr
+    trait (per-family impls for DeviceSlice/MappedSlice/USMSlice + `Pipe<D>`).
+    Op is generic over `__D{n}` only; Output flows the `__D{n}` buffers. Tier-1
+    methods + `KernelOp` stay (resolve Inputs — all-concrete is the only
+    reachable terminal case); add `EagerOp` impl (resolve Inputs from pipes,
+    enqueue via `LaunchOp`, deposit in output pipe). Scalars unchanged.
+    RESUME HERE: implement `ToInput` in claspr, then rewrite the macro arg loop
+    (~504-534) + Op struct/impls (~683-846) to this shape.
 
 **Then (per CONVERSION PLAN, carried mentally):** port remaining leaves
 (transfer/copy/uninit/usm/image_transfer/host_view), host seams (and_then_host /
