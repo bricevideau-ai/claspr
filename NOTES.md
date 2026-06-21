@@ -46,6 +46,29 @@ works. TODO to reach parity:
 LESSON (Brice): should've ported the suite directly (all-fail-then-fix) to see
 this shape set at once instead of piecemeal.
 
+**⚠ GAPS FOUND porting the full suite (systematic, sub-agent clusters) — the
+parity backlog. None block the model; each needs a primitive or is a non-shape.**
+- **transfer_to_device — NO eager cross-device migrate op.** `on_device` only
+  ROUTES an op's enqueue to a device queue; it doesn't MOVE a resident buffer.
+  Needs an eager `transfer_to_device(buf/pipe, device) -> EagerOp` primitive.
+  (blocks transfer_to_device.rs 2 tests)
+- **DynOp — NO eager type-erased op.** `EagerOp` isn't object-safe (assoc
+  `Handle` + `into_output(self)`), and there's no boxing ctor. Blocks the
+  if/else-arms-of-different-op-types shape (a REAL public-API pattern — `DynOp`
+  is in dyn_op.rs, not test-only). Needs a `dyn`-safe erasure boundary (e.g.
+  erase to `Box<dyn ErasedEagerOp>` with a monomorphic execute+output_pipe).
+  Biggest gap; needs DESIGN. (blocks 7/8 conditional.rs)
+- **Host-value passthrough / host reduction mid-graph.** eager `and_then` hands
+  a Pipe, not the host VALUE; `and_then_host` is for device `&mut [T]` views,
+  not host scalars/Arc<Vec>. So: host reductions over an `arc_split` of a lifted
+  host `value(vec)` (sum/len), and `value((buf, step))` scalar-state repack, have
+  no seam. Needs an `and_then_host_value`-style seam OR make host wrappers
+  Mappable. (blocks all 3 arc_split.rs + 1 ml_pass.rs). Same class as chain.rs
+  gap 2. NOTE: arc_split of a DEVICE buffer (the diamond) works fine — this is
+  only the HOST-side reduction variant.
+- **FanOutExt method form** (`vec.fan_out(op)`) — trivial alias; eager has only
+  the free `fan_out(vec, op)`. (blocks 1 fan_out.rs equivalence test)
+
 **⚠ TWO GAPS FOUND porting chain.rs (eager_chain.rs proof, 5/5 green):**
 1. **`bundle(...).and_then(|(a,b,out)| kernel(a,b,out))` — bundle Handle is one
    `Pipe<(A,B,C)>`, not per-branch pipes.** So a bundle can't feed a multi-arg
