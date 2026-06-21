@@ -189,6 +189,27 @@ where
     }
 }
 
+// ── ExecMode: terminal-blocking opt-in ─────────────────────────────────
+
+/// How an op should enqueue, threaded through [`execute`](EagerOp::execute).
+///
+/// Only the **terminal** op of a chain (the outermost one a `sync`/`wait`
+/// terminal calls) ever sees [`Blocking`](ExecMode::Blocking); every upstream
+/// op gets [`Pipelined`](ExecMode::Pipelined) (propagated by
+/// [`AndThen::execute`]). A blocking-capable leaf (read/write/fill/copy) given
+/// `Blocking` uses its native `CL_BLOCKING` enqueue — no event allocated, no
+/// wait round-trip — exactly what Tier-1 `wait_on` does. Given `Pipelined` (or
+/// for ops with no native blocking mode, e.g. kernels) it uses the non-blocking
+/// `submit_on` + event path so downstream work can pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecMode {
+    /// Non-blocking enqueue; carry a completion event forward in the pipe.
+    Pipelined,
+    /// This op is the chain terminal — use a native blocking enqueue if the op
+    /// supports one (skips the event + wait).
+    Blocking,
+}
+
 // ── EagerOp: the closure-free graph node ───────────────────────────────
 
 /// A node in the eager graph. `execute` runs it against the context, moving its
@@ -201,10 +222,14 @@ pub trait EagerOp: Send {
     /// The build-time output handle other ops wire to.
     fn output_pipe(&self) -> Pipe<Self::Output>;
 
-    /// Run the op: resolve inputs, enqueue (non-blocking), **move** the result
-    /// + its events into the output pipe. Returns `()` — the value lives in the
-    /// pipe.
-    fn execute(self, ec: &ExecutionContext<'_>) -> Result<()>;
+    /// Run the op: resolve inputs, enqueue, **move** the result + its events
+    /// into the output pipe. Returns `()` — the value lives in the pipe.
+    ///
+    /// `mode` is [`ExecMode::Blocking`] only when this op is the chain terminal
+    /// (see [`ExecMode`]); composite ops forward `Pipelined` to their upstream
+    /// children and `mode` to the tail. A leaf with no native blocking enqueue
+    /// ignores `mode`.
+    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()>;
 
     /// Structural description — node names in execution order, NO execution.
     fn describe(&self, out: &mut Vec<String>);
@@ -230,7 +255,10 @@ pub trait EagerOpExt: EagerOp + Sized {
         let device = context.device().clone();
         let queue = context.default_outoforder_queue(&device)?;
         let ec = ExecutionContext::new(context, device, queue.raw());
-        self.execute(&ec)?;
+        // Terminal op may use a native blocking enqueue (no event); upstream
+        // ops pipeline. If the terminal blocked, `deps` is empty and the wait
+        // loop is a no-op; otherwise we block on its event here.
+        self.execute(&ec, ExecMode::Blocking)?;
         let (value, deps) = out
             .take()
             .ok_or(Error::NotSupported("eager graph: terminal op produced no output"))?;
@@ -269,9 +297,11 @@ where
         self.next.output_pipe()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>) -> Result<()> {
-        self.source.execute(ec)?;
-        self.next.execute(ec)
+    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // Source is always upstream → must pipeline (its output feeds `next`).
+        // Only the tail inherits the caller's `mode` (Blocking iff terminal).
+        self.source.execute(ec, ExecMode::Pipelined)?;
+        self.next.execute(ec, mode)
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -315,7 +345,8 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>) -> Result<()> {
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // alloc_zero is synchronous internally; no in-flight event, mode N/A.
         let buf = DeviceSlice::<T, M>::alloc_zero(ec.context(), self.len)?;
         self.out.put(buf, Deps::new());
         Ok(())
@@ -360,13 +391,26 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>) -> Result<()> {
+    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (mut buf, deps) = self.buf.resolve()?;
-        let event = buf
-            .fill(self.value)
-            .after_all(deps.iter().map(|d| d.as_ref()))
-            .submit_on(ec)?;
-        self.out.put(buf, vec![wrap_event(event)]);
+        match mode {
+            // Terminal: native blocking fill (CL_BLOCKING) — no event, the
+            // driver waits. Empty deps forward (nothing left to await).
+            ExecMode::Blocking => {
+                buf.fill(self.value)
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .wait_on(ec)?;
+                self.out.put(buf, Deps::new());
+            }
+            // Pipelined: non-blocking; carry the event for downstream ordering.
+            ExecMode::Pipelined => {
+                let event = buf
+                    .fill(self.value)
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .submit_on(ec)?;
+                self.out.put(buf, vec![wrap_event(event)]);
+            }
+        }
         Ok(())
     }
 
@@ -410,7 +454,9 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>) -> Result<()> {
+    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // from_slice (CL_MEM_COPY_HOST_PTR) is a synchronous create — no
+        // in-flight event, mode N/A.
         let src = self
             .src
             .take()
@@ -457,16 +503,28 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>) -> Result<()> {
+    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve()?;
         let mut host = vec![T::default(); buf.len()];
-        let event = buf
-            .read(&mut host)
-            .after_all(deps.iter().map(|d| d.as_ref()))
-            .submit_on(ec)?;
-        // The read is non-blocking; its event gates the host Vec being valid.
-        // Carry it forward so the terminal wait covers it.
-        self.out.put(host, vec![wrap_event(event)]);
+        match mode {
+            // Terminal: native blocking read (CL_BLOCKING) — the driver waits,
+            // the host Vec is valid on return, no event. Matches Tier-1
+            // `ReadOp::wait_on`; restores parity for `…download().sync()`.
+            ExecMode::Blocking => {
+                buf.read(&mut host)
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .wait_on(ec)?;
+                self.out.put(host, Deps::new());
+            }
+            // Pipelined: non-blocking; the event gates the Vec being valid.
+            ExecMode::Pipelined => {
+                let event = buf
+                    .read(&mut host)
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .submit_on(ec)?;
+                self.out.put(host, vec![wrap_event(event)]);
+            }
+        }
         Ok(())
     }
 

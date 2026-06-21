@@ -81,13 +81,21 @@ terminal wait in `sync`. `Input<T> = Concrete|Pipe` is the unified edge.
     the pipe, block on its deps, return the buffer(s) (the move-out contract —
     `kernels.foo(buf).wait()? -> buf` — is just "take the Output from the
     terminal pipe", verified faithful).
-    **Terminal opt-in optimizations (Brice):** `wait()` can pass an execution
-    hint into `execute` to opt into BLOCKING memory transfers (blocking
-    read/write) instead of the eager path's non-blocking-enqueue + event-wait —
-    when the terminal blocks anyway, the blocking transfer skips an event+wait
-    round-trip. So `EagerOp::execute` should carry an exec-mode/hint param
-    (default = non-blocking/pipelined for graph use; `wait()` may request
-    blocking). Design the trait sig for this. So NO separate `KernelOp::enqueue_into`
+    **Terminal opt-in optimizations (Brice) — grounded in existing code.**
+    Tier-1 ALREADY does this: `WriteOp/ReadOp::wait_on` enqueue with `CL_BLOCKING`
+    (native blocking, NO event allocated), while `submit_on` uses `CL_FALSE` +
+    event (buffer.rs ~571/607, ~ReadOp same). My eager `download` REGRESSED this
+    — it uses `submit_on`+event even at a `.sync()` terminal (eager.rs Download),
+    doing the event round-trip Tier-1's blocking read avoids. So `EagerOp::execute`
+    takes an `ExecMode` param with propagation rule: the TERMINAL op (outermost,
+    called by `sync`/`wait`) gets `ExecMode::Blocking`; everything upstream gets
+    `Pipelined`. `AndThen::execute` passes `Pipelined` to `source`, forwards the
+    caller's `mode` to `next` — so blocking is used ONLY at the tail. A
+    blocking-capable op (read/write/fill/copy) given `Blocking` calls its
+    `wait_on` (CL_BLOCKING, no event); given `Pipelined` it uses `submit_on`+event.
+    Ops with no native blocking mode (kernels) ignore the hint. This is a real
+    perf win (one fewer event+wait per chain) AND restores Tier-1 parity for the
+    `…download().sync()` shape. So NO separate `KernelOp::enqueue_into`
     path and NO Tier-1/eager fork — kernels drop the `KernelOp`→old-blanket
     entirely and impl `EagerOp` only; Tier-1 terminals become inherent methods
     that drive `execute`. Simpler than dual-impl. (This supersedes the "Op impls
