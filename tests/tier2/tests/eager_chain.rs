@@ -17,7 +17,7 @@
 //!     value_passthrough below).
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, alloc_zero, download, upload, value};
+use claspr::eager::{EagerOpExt, alloc_zero, bundle3, download, upload, value};
 use claspr_test_kernels::kernels;
 use std::sync::Arc;
 
@@ -84,6 +84,29 @@ fn three_slice_kernel_op_threads_tuple_output() {
         .sync(&ctx)
         .expect("add chain");
     assert!(result.iter().all(|&v| v == 7));
+}
+
+/// The shape `three_slice_kernel_op_threads_tuple_output` had to AVOID, now
+/// directly expressible: a `bundle3` feeds its three branches into a downstream
+/// multi-arg kernel. The bundle's `Handle` is now a tuple of per-branch output
+/// pipes `(Pipe<a>, Pipe<b>, Pipe<out>)`, so `.and_then(|(a, b, out)| ...)`
+/// projects each branch into a separate kernel buffer input. Same 3+4→7.
+#[test]
+fn bundle_feeds_multi_arg_kernel() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = kernels::kernels(&ctx).expect("kernels load");
+
+    let result: Vec<u32> = bundle3(
+        upload::<u32, claspr::ReadWrite, _>(vec![3u32; N]),
+        upload::<u32, claspr::ReadWrite, _>(vec![4u32; N]),
+        alloc_zero::<u32, claspr::ReadWrite>(N),
+    )
+    .and_then(|(a, b, out)| kernels.add_u32([N], a, b, out))
+    .and_then(|(_a, _b, out)| download(out))
+    .sync(&ctx)
+    .expect("bundle → add chain");
+
+    assert!(result.iter().all(|&v| v == 7), "3+4=7; got {:?}", &result[..8]);
 }
 
 /// chain.rs::kernel_op_chains_two_kernels — upload → fill_u32 → scale_u32 → download.

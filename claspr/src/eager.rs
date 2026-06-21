@@ -669,44 +669,72 @@ macro_rules! impl_eager_bundle {
             "`]; branches run with no inter-ordering, joined by a marker.")]
         pub struct $name<$($ty: EagerOp),+> {
             $($field: $ty,)+
-            // Each branch's output pipe, captured at build so `execute` can
-            // drain the branch values + their event deps.
+            // Each branch's output pipe, captured at build. These are the
+            // move-once storage (like `CopyTo2`'s element pipes): the branch
+            // fills its own pipe at `execute`; `handle()` exposes clones so a
+            // downstream multi-arg op (e.g. a kernel) can pull each branch as a
+            // separate `Pipe<buffer>` input; `into_output` drains them for the
+            // terminal-tuple case.
             $($pf: Pipe<<$ty as EagerOp>::Output>,)+
-            out: Pipe<( $(<$ty as EagerOp>::Output,)+ )>,
         }
 
         #[doc = concat!("Construct an eager [`", stringify!($name), "`].")]
         #[allow(clippy::too_many_arguments)]
         pub fn $ctor<$($ty: EagerOp),+>($($field: $ty),+) -> $name<$($ty),+> {
             $(let $pf = $field.output_pipe();)+
-            $name { $($field,)+ $($pf,)+ out: Pipe::new() }
+            $name { $($field,)+ $($pf,)+ }
         }
 
         impl<$($ty: EagerOp),+> EagerOp for $name<$($ty),+> {
             type Output = ( $(<$ty as EagerOp>::Output,)+ );
+            // A tuple of each branch's OWN output pipe. The downstream closure
+            // gets `(pa, pb, …)` — one `Pipe<branch output>` per branch — so a
+            // multi-arg op can consume them as separate inputs (each is a
+            // `Pipe<buffer>`, i.e. `ToInput`). Mirrors `CopyTo2`/the
+            // macro-emitted multi-output kernel.
+            type Handle = ( $(Pipe<<$ty as EagerOp>::Output>,)+ );
 
             fn output_pipe(&self) -> Pipe<Self::Output> {
-                self.out.clone()
+                // Multi-output storage is the per-branch pipes; this single pipe
+                // is never filled or drained (the default `into_output` is
+                // overridden, and `and_then` uses `handle()`). Return a fresh
+                // empty pipe — well-typed, never read.
+                Pipe::new()
             }
 
             fn handle(&self) -> Self::Handle {
-                self.out.clone()
+                ( $(self.$pf.clone(),)+ )
             }
 
             fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-                // Each branch pipelines (independent; the join marker is the
-                // terminal event). Run all, then drain values + deps.
+                // Each branch pipelines (independent). Running a branch fills its
+                // own `$pf` pipe; downstream consumers (a multi-arg op via
+                // `handle()`, or `into_output` for the terminal case) drain them.
                 $(self.$field.execute(ec, ExecMode::Pipelined)?;)+
+                Ok(())
+            }
+
+            fn into_output(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
+            where
+                Self: Sized,
+            {
+                // Grab the branch pipes before consuming `self`, scatter via
+                // `execute`, then drain each to reconstruct the tuple, join the
+                // branch wait-lists into one marker, and wait on it.
+                $(let $pf = self.$pf.clone();)+
+                self.execute(ec, mode)?;
                 let mut branch_deps: Vec<Deps> = Vec::new();
                 let outputs = ( $({
-                    let (v, d) = self.$pf.take().ok_or(Error::NotSupported(
+                    let (v, d) = $pf.take().ok_or(Error::NotSupported(
                         "eager bundle: a branch produced no output"))?;
                     branch_deps.push(d);
                     v
                 },)+ );
                 let joined = join_marker(ec, &branch_deps)?;
-                self.out.put(outputs, joined);
-                Ok(())
+                for d in &joined {
+                    d.as_ref().wait().map_err(Error::OpenCl)?;
+                }
+                Ok(outputs)
             }
 
             fn describe(&self, out: &mut Vec<String>) {
