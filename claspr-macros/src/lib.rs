@@ -486,6 +486,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // slice's `Input<__D>` to a concrete buffer (`.resolve_concrete()?`). A pipe
     // here is unreachable on the Tier-1 path (errors clearly if it ever isn't).
     let mut input_resolve: Vec<TokenStream2> = Vec::new();
+    // Eager path: rebind each slice's `Input<__D>` to `(buffer, deps)` via
+    // `Input::resolve` (a pipe IS expected here — it's the upstream output).
+    // `#pname` becomes the buffer; `#pname __claspr_deps` its wait-list events.
+    let mut input_resolve_eager: Vec<TokenStream2> = Vec::new();
+    // The per-slice deps idents, merged into the kernel's wait-list at execute.
+    let mut input_deps_idents: Vec<TokenStream2> = Vec::new();
     // Extra generics that live ONLY on the kernel METHOD signature, not on the
     // Op struct/impls: the per-slice `__claspr_S{n}: ToInput<elem, Buf=__D{n}>`
     // input generics. The Op is generic over `__D{n}` only (it stores
@@ -555,6 +561,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 input_resolve.push(quote! {
                     let #pname = ::claspr::Input::resolve_concrete(#pname)?;
                 });
+                // Eager path: resolve to (buffer, deps); collect the deps ident
+                // (named by the slice index so it's a valid, unique ident).
+                let deps_ident = quote::format_ident!("__claspr_deps{}", slice_gen_idx - 1);
+                input_resolve_eager.push(quote! {
+                    let (#pname, #deps_ident) = ::claspr::Input::resolve(#pname)?;
+                });
+                input_deps_idents.push(quote! { #deps_ident });
                 op_arg_pass.push(quote! { &#pname });
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
@@ -721,6 +734,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     deps: ::std::vec::Vec::new(),
                     profile_cb: ::core::option::Option::None,
                     ctx: ::core::clone::Clone::clone(&self.__claspr_ctx),
+                    __claspr_out: ::claspr::Pipe::new(),
                 }
             }
         }
@@ -749,6 +763,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 /// launcher. Cloned from `Kernels`'s context at
                 /// launcher-method emission time.
                 pub ctx: ::claspr::Context,
+                /// Eager-graph output pipe: `EagerOp::execute` deposits the
+                /// output buffer(s) + completion event here; downstream ops
+                /// grab a clone via `output_pipe()` at build time. Unused by
+                /// the Tier-1 terminals.
+                pub __claspr_out: ::claspr::Pipe<#output_ty>,
             }
 
             // Op is `Send` automatically — every field is Send. No
@@ -856,7 +875,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 where
                     L: ::claspr::Launcher,
                 {
-                    let Op { kernel, spec, args, deps, profile_cb, ctx: _ } = self;
+                    let Op { kernel, spec, args, deps, profile_cb, ctx: _, __claspr_out: _ } = self;
                     // Validate cross-context match for every caller-added
                     // dep. The launcher's context is known here; the
                     // check is two CL info queries + a pointer compare
@@ -895,6 +914,63 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     ::core::mem::drop(deps);
                     ::core::mem::drop(kernel);
                     ::core::result::Result::Ok((#output_expr, event))
+                }
+            }
+
+            // ── Tier 2 (eager graph): EagerOp ───────────────────────────
+            // The Op is a first-class eager graph node. `execute` resolves each
+            // buffer `Input` (concrete or upstream pipe) to `(buffer, deps)`,
+            // merges all inputs' events + caller deps into the kernel's
+            // wait-list, enqueues NON-BLOCKING via `LaunchOp` (a kernel has no
+            // native blocking enqueue, so `ExecMode` is ignored), and deposits
+            // the output buffer(s) + completion event into the output pipe.
+            impl #gen_decl ::claspr::EagerOp for Op #gen_use {
+                type Output = #output_ty;
+
+                fn output_pipe(&self) -> ::claspr::Pipe<#output_ty> {
+                    ::core::clone::Clone::clone(&self.__claspr_out)
+                }
+
+                fn execute(
+                    self,
+                    ec: &::claspr::ExecutionContext<'_>,
+                    _mode: ::claspr::ExecMode,
+                ) -> ::claspr::Result<()> {
+                    let Op {
+                        kernel, spec, args, deps, profile_cb, ctx: _, __claspr_out,
+                    } = self;
+                    // Resolve each slice Input → (buffer, upstream Deps); a pipe
+                    // here is expected (it's an upstream op's output). Scalars
+                    // pass through unchanged.
+                    let #op_args_tuple_pat = args;
+                    #(#input_resolve_eager)*
+                    // Wait-list = caller-added deps + every input's events.
+                    let mut raw_deps: ::std::vec::Vec<::claspr::cl_event> =
+                        deps.iter().map(|e| e.get()).collect();
+                    #(
+                        raw_deps.extend(#input_deps_idents.iter().map(|d| d.as_ref().get()));
+                    )*
+                    let event = ::claspr::LaunchOp::new(
+                        ec,
+                        &kernel,
+                        spec,
+                        #op_launch_args_tuple,
+                    )
+                    .with_state(raw_deps, profile_cb)
+                    .submit()?;
+                    ::core::mem::drop(deps);
+                    ::core::mem::drop(kernel);
+                    // Move the output buffer(s) into the pipe with this op's
+                    // completion event as the downstream wait-list.
+                    __claspr_out.put(
+                        #output_expr,
+                        ::std::vec![::claspr::wrap_event(event)],
+                    );
+                    ::core::result::Result::Ok(())
+                }
+
+                fn describe(&self, out: &mut ::std::vec::Vec<::std::string::String>) {
+                    out.push(::std::string::ToString::to_string(#kernel_name_lit));
                 }
             }
         }

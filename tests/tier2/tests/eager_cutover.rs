@@ -5,6 +5,7 @@
 
 use claspr::Context;
 use claspr::eager::{EagerOpExt, alloc_zero, download, fill, upload};
+use claspr_test_kernels::kernels;
 
 const N: usize = 256;
 
@@ -63,6 +64,45 @@ fn upload_fill_download_roundtrip() {
 
     assert_eq!(out.len(), N);
     assert!(out.iter().all(|&v| v == 9), "fill then download; got {:?}", &out[..8]);
+}
+
+/// **The headline: a KERNEL composes in an eager graph.** `kernels.fill_u32`
+/// is now an `EagerOp` — its buffer arg accepts the upstream `Pipe`, and it
+/// deposits the buffer into its output pipe for the next stage. upload → kernel
+/// (fill_u32 = 7) → kernel (scale_u32 ×3) → download = 21.
+#[test]
+fn kernel_composes_in_eager_graph() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("kernels");
+
+    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+        .and_then(|b| ks.fill_u32([N], b, 7u32))
+        .and_then(|b| ks.scale_u32([N], b, 3u32))
+        .and_then(|b| download(b))
+        .sync(&ctx)
+        .expect("sync");
+
+    assert!(
+        out.iter().all(|&v| v == 21),
+        "fill 7 then ×3 = 21 via eager kernel chain; got {:?}",
+        &out[..8]
+    );
+}
+
+/// All-concrete eager kernel: pass a real buffer (not a pipe) straight into a
+/// kernel as the chain head, proving `ToInput` accepts concrete in eager too.
+#[test]
+fn eager_kernel_concrete_head() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("kernels");
+    let buf = claspr::DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("buf");
+
+    let out: Vec<u32> = ks
+        .fill_u32([N], buf, 5u32)
+        .and_then(|b| download(b))
+        .sync(&ctx)
+        .expect("sync");
+    assert!(out.iter().all(|&v| v == 5), "concrete-head kernel; got {:?}", &out[..8]);
 }
 
 /// Upload host data and read it straight back (no transform) — the upload
