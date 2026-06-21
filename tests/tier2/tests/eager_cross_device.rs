@@ -1,0 +1,128 @@
+//! Eager port of `cross_device.rs`: cross-device pipeline within a single
+//! multi-device Context, expressed through the eager graph API. The shared
+//! `cl_context` makes a `DeviceSlice<T>` valid on either device's queue, so the
+//! chain spans devices via `.on_device(ec.device_at(i))` inside
+//! `.and_then_with_context` closures.
+//!
+//! Old → new mapping:
+//!   `upload!(v)`                  → `upload::<u32, claspr::ReadWrite, _>(v)`
+//!   `download!(buf)`              → `download`
+//!   `.and_then_with_context(...)` → same name on `EagerOpExt`
+//!   `kernel(...).on_device(dev)`  → same `.on_device(...)` on the eager kernel op
+//!
+//! NOTE (known eager seam): `and_then_with_context` passes the upstream VALUE,
+//! not a pipe, so a routed downstream enqueues without an explicit event edge to
+//! the source — terminal completion is correct; mid-chain OOO ordering relies on
+//! the driver. Neither test asserts cross-device event ORDERING (they assert
+//! final values and the download→reupload ownership lifecycle), so the port is
+//! faithful.
+//!
+//! Skips when only one device is available (no real multi-device platform AND no
+//! sub-device partition support). Guard copied verbatim from cross_device.rs.
+
+use claspr::device::Platform;
+use claspr::eager::{EagerOpExt, download, upload};
+use claspr::{Context, Device};
+use claspr_test_kernels::kernels;
+
+const N: usize = 64;
+
+/// Three-stage discovery: real multi-device → sub-device partition → skip.
+fn ctx_two_devices() -> Option<(Context, Device, Device)> {
+    if let Ok(platforms) = Platform::all() {
+        for p in platforms {
+            if let Ok(devs) = p.devices()
+                && devs.len() >= 2
+            {
+                let dev_a = devs[0].clone();
+                let dev_b = devs[1].clone();
+                let ctx = Context::builder()
+                    .devices(&[dev_a.clone(), dev_b.clone()])
+                    .build()
+                    .ok()?;
+                return Some((ctx, dev_a, dev_b));
+            }
+        }
+    }
+    if let Ok(devs) = Device::all() {
+        for parent in devs {
+            if parent.partition_max_sub_devices().unwrap_or(0) < 2 {
+                continue;
+            }
+            let cu = parent.max_compute_units().unwrap_or(0);
+            if cu < 2 {
+                continue;
+            }
+            // partition_equally takes CUs-per-sub-device, not number of
+            // sub-devices — see its rustdoc. cu/2 yields 2 sub-devices.
+            let Ok(subs) = parent.partition_equally(cu / 2) else {
+                continue;
+            };
+            if subs.len() < 2 {
+                continue;
+            }
+            let dev_a = subs[0].clone();
+            let dev_b = subs[1].clone();
+            let ctx = Context::builder()
+                .devices(&[dev_a.clone(), dev_b.clone()])
+                .build()
+                .ok()?;
+            return Some((ctx, dev_a, dev_b));
+        }
+    }
+    eprintln!(
+        "SKIP: no platform with ≥2 devices and no partitionable device \
+         (CL_DEVICE_PARTITION_EQUALLY with max_sub_devices ≥ 2)",
+    );
+    None
+}
+
+/// cross_device.rs::pipeline_spans_two_devices_via_mapped_slice — stage 1
+/// (fill 3) on device 0, stage 2 (scale 4) on device 1, then download. 3×4 = 12.
+#[test]
+fn pipeline_spans_two_devices_via_mapped_slice() {
+    let Some((ctx, _dev_a, _dev_b)) = ctx_two_devices() else {
+        return;
+    };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+    let kernels_ref = &kernels;
+
+    let result: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+        .and_then_with_context(move |ec, buf| {
+            kernels_ref.fill_u32([N], buf, 3).on_device(ec.device_at(0))
+        })
+        .and_then_with_context(move |ec, buf| {
+            kernels_ref
+                .scale_u32([N], buf, 4)
+                .on_device(ec.device_at(1))
+        })
+        .and_then(download)
+        .sync(&ctx)
+        .expect("cross-device chain");
+    assert!(result.iter().all(|&v| v == 12));
+}
+
+/// cross_device.rs::downloaded_vec_can_be_reuploaded_into_a_fresh_chain —
+/// chain 1 ends with download (host-owned Vec); chain 2 re-uploads that Vec.
+/// Both run on the chain's default queue (no per-op routing here). 5×6 = 30.
+#[test]
+fn downloaded_vec_can_be_reuploaded_into_a_fresh_chain() {
+    let Some((ctx, _dev_a, _dev_b)) = ctx_two_devices() else {
+        return;
+    };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let intermediate: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+        .and_then(|buf| kernels.fill_u32([N], buf, 5))
+        .and_then(download)
+        .sync(&ctx)
+        .expect("chain 1");
+    assert!(intermediate.iter().all(|&v| v == 5));
+
+    let final_result: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(intermediate)
+        .and_then(|buf| kernels.scale_u32([N], buf, 6))
+        .and_then(download)
+        .sync(&ctx)
+        .expect("chain 2");
+    assert!(final_result.iter().all(|&v| v == 30));
+}
