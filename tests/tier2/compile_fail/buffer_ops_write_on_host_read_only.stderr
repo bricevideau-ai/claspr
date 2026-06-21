@@ -17,7 +17,7 @@ help: the following other types implement trait `HostWritable`
    |
    = note: `WriteOnly`
 note: required by a bound in `device_slice_write`
-  --> claspr-async/src/buffer_ops.rs:138:0
+  --> claspr/src/buffer_ops.rs:138:0
 
 error: aborting due to 1 previous error
 

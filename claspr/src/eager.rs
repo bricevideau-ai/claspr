@@ -100,6 +100,20 @@ impl<T> Input<T> {
             )),
         }
     }
+
+    /// Resolve to a concrete value, erroring if this is a pipe. Used by the
+    /// Tier-1 / `KernelOp` enqueue path, where a pipe is unreachable (a pipe
+    /// only exists inside an eager `and_then` closure — a context that never
+    /// calls the Tier-1 terminals). The `(value, Deps)` form is the eager path.
+    pub fn resolve_concrete(self) -> Result<T> {
+        match self {
+            Input::Concrete(v) => Ok(v),
+            Input::Pipe(_) => Err(Error::NotSupported(
+                "kernel: a pipe input reached the Tier-1 path — use the eager \
+                 `.and_then`/`.sync` terminals for piped (graph) inputs",
+            )),
+        }
+    }
 }
 
 impl<T> From<T> for Input<T> {
@@ -126,14 +140,17 @@ impl<T> From<Pipe<T>> for Input<T> {
 // `E` is the slice element type, fixed per kernel by its signature; the macro
 // hardcodes it, so only `Buf` varies.
 pub trait ToInput<E> {
-    /// The concrete buffer type this arg resolves to.
-    type Buf: crate::KernelSliceArg<E>;
+    /// The concrete buffer type this arg resolves to. The macro pins it via
+    /// `Buf = __D{n}` and bounds `__D{n}` with the right per-arg slice trait
+    /// (`KernelSliceReadArg` / `…ReadWriteArg`), so no bound is needed here.
+    type Buf;
     /// Wrap as a concrete or piped [`Input`].
     fn to_input(self) -> Input<Self::Buf>;
 }
 
-// A pipe of any buffer type → a deferred input.
-impl<E, D: crate::KernelSliceArg<E>> ToInput<E> for Pipe<D> {
+// A pipe of any buffer type → a deferred input. `E` is unconstrained on the
+// pipe itself; the macro's `Buf = __D` + `__D: KernelSlice*Arg<E>` ties it.
+impl<E, D> ToInput<E> for Pipe<D> {
     type Buf = D;
     fn to_input(self) -> Input<D> {
         Input::Pipe(self)
@@ -141,14 +158,12 @@ impl<E, D: crate::KernelSliceArg<E>> ToInput<E> for Pipe<D> {
 }
 
 /// Implement [`ToInput`] for a concrete buffer family. Per-family (not a
-/// blanket over `KernelSliceArg`) so it stays disjoint from the `Pipe<D>` impl.
+/// blanket) so it stays disjoint from the `Pipe<D>` impl.
 macro_rules! impl_to_input_concrete {
     ($buf:ident) => {
         impl<E, M> ToInput<E> for $crate::$buf<E, M>
         where
-            E: Send + 'static,
             M: $crate::MemMode,
-            $crate::$buf<E, M>: $crate::KernelSliceArg<E>,
         {
             type Buf = $crate::$buf<E, M>;
             fn to_input(self) -> Input<$crate::$buf<E, M>> {
@@ -160,6 +175,19 @@ macro_rules! impl_to_input_concrete {
 impl_to_input_concrete!(DeviceSlice);
 impl_to_input_concrete!(MappedSlice);
 impl_to_input_concrete!(USMSlice);
+
+// `Arc<DeviceSlice<E, M>>` — the shared-buffer kernel arg (read-only fan-out;
+// impls `KernelSliceReadArg`). Separate impl since it's a distinct nominal type
+// from the bare families above; still disjoint from `Pipe<D>`.
+impl<E, M> ToInput<E> for std::sync::Arc<DeviceSlice<E, M>>
+where
+    M: MemMode,
+{
+    type Buf = std::sync::Arc<DeviceSlice<E, M>>;
+    fn to_input(self) -> Input<std::sync::Arc<DeviceSlice<E, M>>> {
+        Input::Concrete(self)
+    }
+}
 
 // ── EagerOp: the closure-free graph node ───────────────────────────────
 

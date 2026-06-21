@@ -73,22 +73,18 @@ terminal wait in `sync`. `Input<T> = Concrete|Pipe` is the unified edge.
     reachable terminal case); add `EagerOp` impl (resolve Inputs from pipes,
     enqueue via `LaunchOp`, deposit in output pipe). Scalars unchanged.
     `ToInput` DONE + committed (`332418d`), green.
-  - **⚠ KEY FINDING — the cutover is ATOMIC, not incremental.** An Op cannot
-    impl BOTH old `DeviceOperation` and new `EagerOp`: both define `.and_then`,
-    so a direct `kernels.foo(...).and_then(...)` (examples/batch-inference:137,
-    and the receiver-chain shape generally) is E0034 ambiguous (spiked). And a
-    chain's vocabulary is ONE trait: across the 17 tests, kernel ops appear as
-    `and_then` closure RETURNS (50×), so the closure's op and the chain's
-    `and_then` must be the same world. ⇒ there is NO parallel/incremental path
-    for the kernel surface: the macro flip to `EagerOp`-only forces converting
-    EVERY leaf + combinator (`and_then_host`/`bundle`/`fan_out`/`arc`/`on_device`
-    /`value` + copy/uninit/usm/host_view) AND migrating all 29 test files +
-    examples in ONE atomic change (broken tree until complete). The eager core +
-    transfer leaves + `ToInput` (all green, committed) are the foundation; the
-    atomic flip is the remaining work — too large for one green step in a single
-    session, scoped as the explicit next unit. The non-kernel eager leaves
-    (alloc/fill/upload/download) already PROVE the leaf-port pattern; the flip is
-    mechanical-but-wide + must land all-at-once.
+  - **CORRECTION: the cutover IS incremental** (my "atomic" claim was wrong —
+    re-spiked). The E0034 `.and_then` ambiguity only fires when a single file
+    imports BOTH `DeviceOperation` and `EagerOpExt` AND calls `.and_then` on a
+    bare kernel op. A kernel Op can impl BOTH traits fine; consumers that import
+    only one have no ambiguity (spiked: both-traits-on-Op + one-import = OK). And
+    kernel ops used as `and_then` closure RETURNS are consumed as the *upstream*
+    op's trait — the kernel op's own trait set is irrelevant there. ⇒ the macro
+    op impls `EagerOp` NATIVELY *in addition to* the existing `KernelOp`→old-
+    `DeviceOperation` blanket; old chains/tests keep working (import
+    `DeviceOperation`), new eager tests import `EagerOpExt`. The one direct-
+    `.and_then`-on-bare-kernel site (examples/batch-inference:137) just needs its
+    file to import one trait. Incremental, green-at-each-step after all.
 
 **Then (per CONVERSION PLAN, carried mentally):** port remaining leaves
 (transfer/copy/uninit/usm/image_transfer/host_view), host seams (and_then_host /

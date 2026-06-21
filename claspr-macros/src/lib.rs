@@ -478,6 +478,19 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // and the wrapper flows the user's concrete type through to
     // Output without coercion.
     let mut host_names: Vec<TokenStream2> = Vec::new();
+    // How each arg is stored into the Op's `args` field at construction:
+    // slices wrap via `ToInput::to_input()` (→ `Input<__D>`), scalars verbatim.
+    // Distinct from `host_names` (the destructure pattern at enqueue).
+    let mut op_field_init: Vec<TokenStream2> = Vec::new();
+    // Per-slice resolution stmts run after the enqueue destructure: rebind each
+    // slice's `Input<__D>` to a concrete buffer (`.resolve_concrete()?`). A pipe
+    // here is unreachable on the Tier-1 path (errors clearly if it ever isn't).
+    let mut input_resolve: Vec<TokenStream2> = Vec::new();
+    // Extra generics that live ONLY on the kernel METHOD signature, not on the
+    // Op struct/impls: the per-slice `__claspr_S{n}: ToInput<elem, Buf=__D{n}>`
+    // input generics. The Op is generic over `__D{n}` only (it stores
+    // `Input<__D>`), so these would be "unused type parameter" errors there.
+    let mut method_only_generics: Vec<(TokenStream2, TokenStream2)> = Vec::new();
     let mut method_params: Vec<TokenStream2> = Vec::new();
     let mut arg_types: Vec<TokenStream2> = Vec::new();
     let mut op_arg_pass: Vec<TokenStream2> = Vec::new();
@@ -508,26 +521,40 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 elem,
                 mutable,
             } => {
-                // Allocate a fresh generic per slice.
+                // Two generics per slice:
+                //   __claspr_D{n} — the concrete BUFFER type (flows to Output,
+                //     bounded by the read/read-write slice trait).
+                //   __claspr_I{n} — the METHOD ARG, `ToInput<elem, Buf=__D>`,
+                //     so it accepts a concrete buffer OR a `Pipe` of one with
+                //     __D inferred (no turbofish). The Op stores `Input<__D>`.
                 let gid = quote::format_ident!("__claspr_D{}", slice_gen_idx);
+                let sid = quote::format_ident!("__claspr_S{}", slice_gen_idx);
                 slice_gen_idx += 1;
                 let gid_tt: TokenStream2 = quote! { #gid };
-                // Pick the appropriate bound based on slice mutability.
-                // Kernel `&[T]` → KernelSliceReadArg<T> (any buffer whose
-                // marker impls KernelReadable). Kernel `&mut [T]` →
-                // KernelSliceReadWriteArg<T> (additionally requires
-                // KernelWritable — excludes ReadOnly / Frozen at the
-                // type level rather than the runtime).
-                let bound: TokenStream2 = if mutable {
+                let iid_tt: TokenStream2 = quote! { #sid };
+                // Buffer bound by mutability: `&[T]` → KernelSliceReadArg<T>;
+                // `&mut [T]` → KernelSliceReadWriteArg<T> (also KernelWritable,
+                // excluding ReadOnly / Frozen at the type level).
+                let dbound: TokenStream2 = if mutable {
                     quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> }
                 } else {
                     quote! { #gid: ::claspr::KernelSliceReadArg<#elem> }
                 };
-                generics.push((gid_tt.clone(), bound));
+                let ibound: TokenStream2 =
+                    quote! { #sid: ::claspr::ToInput<#elem, Buf = #gid> };
+                generics.push((gid_tt.clone(), dbound));
+                method_only_generics.push((iid_tt.clone(), ibound));
 
                 host_names.push(pname.clone());
-                method_params.push(quote! { #pname: #gid_tt });
-                arg_types.push(gid_tt.clone());
+                // Method takes the `ToInput` arg; the Op stores `Input<__D>`.
+                method_params.push(quote! { #pname: #iid_tt });
+                arg_types.push(quote! { ::claspr::Input<#gid_tt> });
+                op_field_init.push(quote! { ::claspr::ToInput::to_input(#pname) });
+                // Tier-1 enqueue: resolve the `Input` to a concrete buffer,
+                // then pass it by ref to LaunchOp (same as before).
+                input_resolve.push(quote! {
+                    let #pname = ::claspr::Input::resolve_concrete(#pname)?;
+                });
                 op_arg_pass.push(quote! { &#pname });
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
@@ -563,6 +590,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 host_names.push(pname.clone());
                 method_params.push(quote! { #pname: #iid_tt });
                 arg_types.push(iid_tt.clone());
+                op_field_init.push(quote! { #pname });
                 op_arg_pass.push(quote! { &#pname });
                 output_names.push(pname.clone());
                 output_types.push(iid_tt);
@@ -571,6 +599,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 host_names.push(pname.clone());
                 method_params.push(quote! { #pname: #ty });
                 arg_types.push(ty);
+                op_field_init.push(quote! { #pname });
                 op_arg_pass.push(quote! { #pname });
             }
         }
@@ -596,9 +625,30 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         quote! { < #( #ids ),* > }
     };
 
+    // The kernel METHOD's generic decl = Op generics (`__D{n}`) PLUS the
+    // method-only input generics (`__S{n}: ToInput<…>`). The Op struct/impls
+    // use only `gen_decl`/`gen_use` (the `__D`s); the `__S`s appear solely in
+    // the method signature, where they constrain the args and pin each
+    // `__D{n}` via `Buf = __D{n}`.
+    let method_gen_decl: TokenStream2 = {
+        let all: Vec<&TokenStream2> = generics
+            .iter()
+            .map(|(_, b)| b)
+            .chain(method_only_generics.iter().map(|(_, b)| b))
+            .collect();
+        if all.is_empty() {
+            quote! {}
+        } else {
+            quote! { < #( #all ),* > }
+        }
+    };
+
     // Single-element tuples need a trailing comma.
     let op_args_tuple_ty = single_or_tuple(&arg_types);
-    let op_args_tuple_init = single_or_tuple(&host_names);
+    // `op_args_tuple_init` = construction (slices wrapped via to_input).
+    // `op_args_tuple_pat` = destructure pattern at enqueue (plain names).
+    let op_args_tuple_init = single_or_tuple(&op_field_init);
+    let op_args_tuple_pat = single_or_tuple(&host_names);
     let op_launch_args_tuple = single_or_tuple(&op_arg_pass);
 
     // Output type / expression — bare for a single slice, tuple for
@@ -659,7 +709,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     Ok(quote! {
         impl #kernels_path {
             #[allow(clippy::too_many_arguments)]
-            #vis fn #name #gen_decl (
+            #vis fn #name #method_gen_decl (
                 &self,
                 grid: impl ::claspr::IntoLaunchSpec,
                 #(#method_params),*
@@ -830,7 +880,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         ::std::vec::Vec::with_capacity(deps.len() + extra_deps.len());
                     raw_deps.extend(deps.iter().map(|e| e.get()));
                     raw_deps.extend_from_slice(extra_deps);
-                    let #op_args_tuple_init = args;
+                    let #op_args_tuple_pat = args;
+                    // Resolve each slice `Input<__D>` → concrete buffer (Tier-1
+                    // path; a pipe here errors). Scalars need no resolution.
+                    #(#input_resolve)*
                     let event = ::claspr::LaunchOp::new(
                         launcher,
                         &kernel,
