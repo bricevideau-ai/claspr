@@ -13,13 +13,13 @@
 //! })
 //! ```
 //!
-//! [`DeviceOperation`]: crate::op::DeviceOperation
-//! [`Context`]: claspr::Context
-//! [`Device`]: claspr::Device
+//! [`DeviceOperation`]: crate::device_op::DeviceOperation
+//! [`Context`]: crate::Context
+//! [`Device`]: crate::Device
 //! [`CommandQueue`]: opencl3::command_queue::CommandQueue
-//! [`Launcher`]: claspr::Launcher
+//! [`Launcher`]: crate::Launcher
 
-use claspr::{CommandQueue, Context, Device, Error, Launcher};
+use crate::{CommandQueue, Context, Device, Error, Launcher};
 use std::sync::{Arc, Mutex};
 
 /// Execution-time environment for a [`DeviceOperation`].
@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 /// `'ctx` lifetime is the lifetime of the borrow into the parent
 /// [`Context`] and its per-device default OOO queue.
 ///
-/// [`DeviceOperation`]: crate::op::DeviceOperation
-/// [`DeviceOperation::sync`]: crate::op::DeviceOperation::sync
+/// [`DeviceOperation`]: crate::device_op::DeviceOperation
+/// [`DeviceOperation::sync`]: crate::device_op::DeviceOperation::sync
 pub struct ExecutionContext<'ctx> {
     context: &'ctx Context,
     device: Device,
@@ -48,7 +48,7 @@ pub struct ExecutionContext<'ctx> {
 impl<'ctx> ExecutionContext<'ctx> {
     /// Construct an `ExecutionContext` bound to `device`'s default
     /// out-of-order queue from `context`. Crate-internal — terminals
-    /// in [`crate::op`] call this.
+    /// in [`crate::device_op`] call this.
     pub(crate) fn new(
         context: &'ctx Context,
         device: Device,

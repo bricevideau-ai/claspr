@@ -4,7 +4,7 @@
 //! claspr-async `ExecutionContext`/queue before the macro change (step 1b).
 
 use claspr::Context;
-use claspr_async::eager::{EagerOpExt, alloc_zero, fill};
+use claspr::eager::{EagerOpExt, alloc_zero, fill};
 
 const N: usize = 256;
 

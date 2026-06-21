@@ -8,10 +8,12 @@ authors.workspace = true
 description = "Single-source OpenCL with rust-gpu — runtime helpers, build-time codegen, and a proc-macro frontend"
 
 [features]
-default = []
-# `Event::into_future()` (Future + AtomicWaker bridge over
-# clSetEventCallback). Opt-in so users who don't want an async
-# runtime don't pull `futures` as a transitive dep.
+# `async-events` on by default: the Tier 2 combinator layer (folded in from
+# the former `claspr-async` crate) builds its `.run()` terminal on
+# `Event::into_future()`. Disable to drop the `futures` dep if you only use
+# the `.wait()` / `.sync()` terminals.
+default = ["async-events"]
+# `Event::into_future()` (Future + AtomicWaker bridge over clSetEventCallback).
 async-events = ["dep:futures"]
 
 [dependencies]

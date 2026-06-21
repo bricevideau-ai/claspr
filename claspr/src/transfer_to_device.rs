@@ -39,8 +39,8 @@
 //! (kernel device).
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
-use claspr::{Device, DeviceSlice, Result};
+use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::{Device, DeviceSlice, Result};
 
 /// Combinator built by [`transfer_to_device`].
 pub struct TransferToDevice<T> {

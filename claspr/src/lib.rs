@@ -79,6 +79,31 @@ pub mod usm;
 #[doc(hidden)]
 pub mod util;
 
+// ── Tier 2 combinator layer (folded in from the former claspr-async) ──
+pub mod alloc;
+pub mod and_then_host;
+pub mod arc;
+pub mod buffer_ops;
+pub mod bundle;
+#[cfg(feature = "async-events")]
+pub mod chain_future;
+pub mod copy;
+pub mod device_op;
+pub mod dyn_op;
+pub mod eager;
+pub mod exec_ctx;
+pub mod fan_out;
+pub mod host_view;
+pub mod image_transfer;
+pub mod mappable;
+pub mod on_device;
+pub mod profile;
+pub mod transfer;
+pub mod transfer_to_device;
+mod tier2_macros;
+pub mod uninit_ext;
+pub mod usm_op;
+
 // ── Public surface ────────────────────────────────────────────────────
 
 pub use access::{
@@ -126,6 +151,45 @@ pub use mapped::{
     MappedWriteGuard, MappedWritePending, SvmCopyOp, SvmFillOp, SvmWriteOp,
 };
 pub use usm::{USMSlice, USMSliceUninit};
+
+// ── Tier 2 combinator re-exports (folded in from claspr-async) ──
+pub use alloc::{
+    DeviceSliceAllocUninit, DeviceSliceFromSlice, MappedSliceAllocUninit, MappedSliceFromSlice,
+};
+pub use and_then_host::{AndThenHost, AndThenHostWithContext, DeviceOperationHostExt};
+pub use arc::ArcSplit;
+pub use buffer_ops::{
+    DeviceSliceFillOp, DeviceSliceWriteOp, MappedSliceFillOp, device_slice_fill, device_slice_write,
+    mapped_slice_fill,
+};
+pub use bundle::{
+    Bundle2, Bundle3, Bundle4, Bundle5, Bundle6, Bundle7, Bundle8, Bundle9, Bundle10, Bundle11,
+    Bundle12, Bundle13, Bundle14, Bundle15, Bundle16,
+};
+#[cfg(feature = "async-events")]
+pub use chain_future::ChainFuture;
+pub use copy::{CopyTo, CopyToOp};
+pub use device_op::{
+    AndThen, AndThenWithContext, Arced, Dep, Deps, DeviceOperation, Value, deps_as_events, value,
+    wrap_event,
+};
+pub use dyn_op::DynOp;
+pub use eager::{AllocZero, EagerOp, EagerOpExt, Fill, Input, Pipe};
+pub use exec_ctx::ExecutionContext;
+pub use fan_out::{FanOut, FanOutExt, fan_out};
+pub use host_view::{
+    AcquireDeviceSliceOp, AcquireMappedSliceOp, DeviceSliceHostView, HostAccessibleExt,
+    HostReadableExt, HostWritableExt, MapAccess, MapReadOnly, MapReadWrite, MappedSliceHostView,
+    ReleaseDeviceSliceOp, ReleaseMappedSliceOp,
+};
+pub use image_transfer::{ImageDownload, ImageUpload, image_download, image_upload};
+pub use mappable::{DeviceSliceMapHandle, Mappable};
+pub use on_device::OnDevice;
+pub use profile::{DeviceOperationProfileExt, Profiled};
+pub use transfer::{Download, UploadSource};
+pub use transfer_to_device::{TransferToDevice, transfer_to_device};
+pub use uninit_ext::{FillFromUninitOp, FillUninit, WriteFromUninitOp, WriteUninit};
+pub use usm_op::{UsmSliceAllocUninit, UsmSliceOp};
 
 // Stage-3 proc-macro frontend.
 pub use claspr_macros::{device, kernel, kernels};

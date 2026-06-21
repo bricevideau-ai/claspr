@@ -31,9 +31,9 @@
 //! user-facing call shape cover all three.
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
 use crate::transfer::UploadSource;
-use claspr::{
+use crate::{
     DeviceSlice, DeviceSliceUninit, Fillable, HostUploadable, HostWritable, MappedSlice,
     MappedSliceUninit, MemMode, Result, USMSlice, USMSliceUninit, register_drop_callback,
 };

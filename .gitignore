@@ -12,3 +12,4 @@
 Cargo.lock.*
 *.swp
 *.ppm
+spikes/**/Cargo.lock

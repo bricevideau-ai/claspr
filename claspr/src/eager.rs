@@ -28,8 +28,8 @@
 //! every leaf is ported.
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, wrap_event};
-use claspr::{Context, DeviceSlice, Error, Fillable, MemMode, ReadWrite, Result};
+use crate::device_op::{Deps, wrap_event};
+use crate::{Context, DeviceSlice, Error, Fillable, MemMode, ReadWrite, Result};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 

@@ -101,13 +101,13 @@
 //! Multiple concurrent failures in `bundle!` / `fan_out`: first-writer-
 //! wins. Acceptable — the others are typically cascades of the first.
 //!
-//! [`Error`]: claspr::Error
+//! [`Error`]: crate::Error
 //! [`ExecutionContext`]: crate::ExecutionContext
 
 use crate::exec_ctx::ExecutionContext;
 use crate::mappable::Mappable;
-use crate::op::{Deps, DeviceOperation, wrap_event};
-use claspr::{Context, Error, Launcher, Result, complete_user_event, create_user_event};
+use crate::device_op::{Deps, DeviceOperation, wrap_event};
+use crate::{Context, Error, Launcher, Result, complete_user_event, create_user_event};
 use opencl3::event::CL_COMPLETE;
 use opencl3::types::{cl_event, cl_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -162,7 +162,7 @@ where
     }
 
     /// Like [`and_then_host`](Self::and_then_host) but the closure
-    /// also receives a [`&Context`](claspr::Context) — the chain's
+    /// also receives a [`&Context`](crate::Context) — the chain's
     /// running context, for host-side use (read device props,
     /// iterate `context.devices()`, etc.).
     ///
@@ -397,7 +397,7 @@ where
 /// with the view.
 fn run_worker_with_context<O, F>(
     handle: O::MapHandle,
-    map_events: Vec<claspr::Event>,
+    map_events: Vec<crate::Event>,
     source_evts: Deps,
     context: Context,
     f: F,
@@ -453,7 +453,7 @@ where
 /// host cause) is responsible for that signal.
 fn run_worker<O, F>(
     handle: O::MapHandle,
-    map_events: Vec<claspr::Event>,
+    map_events: Vec<crate::Event>,
     source_evts: Deps,
     f: F,
 ) -> (cl_int, O::MapHandle, Option<Error>)

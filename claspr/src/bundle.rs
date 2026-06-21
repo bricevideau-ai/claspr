@@ -23,8 +23,8 @@
 //! ```
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation, wrap_event};
-use claspr::{Error, Launcher, Result};
+use crate::device_op::{Deps, DeviceOperation, wrap_event};
+use crate::{Error, Launcher, Result};
 
 /// Implementation detail — generates `BundleN` + a constructor function
 /// + a `DeviceOperation` impl for each arity.

@@ -30,7 +30,7 @@
 //! - [`.arc()`](DeviceOperation::arc) — wrap output in `Arc<T>`.
 
 use crate::exec_ctx::ExecutionContext;
-use claspr::{Event, Result};
+use crate::{Event, Result};
 use std::sync::Arc;
 
 // ── Deps ────────────────────────────────────────────────────────────
@@ -95,7 +95,7 @@ pub trait DeviceOperation: Send + Sized {
     /// that works across both. The mutex is touched only at this
     /// terminal boundary — not on the per-enqueue hot path inside
     /// `execute`.
-    fn sync(self, context: &claspr::Context) -> Result<Self::Output> {
+    fn sync(self, context: &crate::Context) -> Result<Self::Output> {
         let device = context.device().clone();
         let queue = context.default_outoforder_queue(&device)?;
         let result = run_chain_sync(self, context, &device, &queue);
@@ -113,8 +113,8 @@ pub trait DeviceOperation: Send + Sized {
     /// that resolves when the chain's events fire.
     ///
     /// Same queue-invalidation-on-error contract as [`sync`](Self::sync).
-    fn run(self, context: &claspr::Context) -> crate::future::ChainFuture<Self::Output> {
-        crate::future::run_chain(self, context)
+    fn run(self, context: &crate::Context) -> crate::chain_future::ChainFuture<Self::Output> {
+        crate::chain_future::run_chain(self, context)
     }
 
     /// Sequential dependency: when `self` produces its output, hand
@@ -151,7 +151,7 @@ pub trait DeviceOperation: Send + Sized {
     /// receives the running [`ExecutionContext`] — handy when the
     /// next op needs `ec.context()` (e.g. to compose with
     /// [`device_slice_alloc_zero!`](crate::device_slice_alloc_zero) etc.) or
-    /// `ec` as a [`claspr::Launcher`].
+    /// `ec` as a [`crate::Launcher`].
     ///
     /// Closure returns an op (`U: DeviceOperation`), not a
     /// `Result<value>` — mirroring `.and_then`. If the closure body
@@ -197,7 +197,7 @@ pub trait DeviceOperation: Send + Sized {
     /// ```
     ///
     /// See [`crate::OnDevice`] for the full design rationale.
-    fn on_device(self, device: &claspr::Device) -> crate::on_device::OnDevice<Self> {
+    fn on_device(self, device: &crate::Device) -> crate::on_device::OnDevice<Self> {
         crate::on_device::OnDevice::new(self, device.clone())
     }
 }
@@ -208,9 +208,9 @@ pub trait DeviceOperation: Send + Sized {
 /// the "invalidate-on-error" guard cheaply.
 fn run_chain_sync<S>(
     chain: S,
-    context: &claspr::Context,
-    device: &claspr::Device,
-    queue: &claspr::Queue<claspr::OutOfOrder>,
+    context: &crate::Context,
+    device: &crate::Device,
+    queue: &crate::Queue<crate::OutOfOrder>,
 ) -> Result<S::Output>
 where
     S: DeviceOperation,
@@ -241,12 +241,12 @@ where
     // a join marker); fan-outs may have several. Record the first
     // error but keep waiting on the rest so we don't strand
     // terminated commands.
-    let mut wait_err: Option<claspr::Error> = None;
+    let mut wait_err: Option<crate::Error> = None;
     for ev in &events {
         if let Err(e) = ev.wait()
             && wait_err.is_none()
         {
-            wait_err = Some(claspr::Error::OpenCl(e));
+            wait_err = Some(crate::Error::OpenCl(e));
         }
     }
     // No defensive `finish` on the OOO queues here — the OOO queues
@@ -383,7 +383,7 @@ where
 // ── Blanket: KernelOp → DeviceOperation ─────────────────────────────
 //
 // Every proc-macro-generated kernel `Op` implements
-// [`claspr::KernelOp`]. This blanket lifts that single enqueue contract
+// [`crate::KernelOp`]. This blanket lifts that single enqueue contract
 // into Tier 2 chain composition, so kernel Ops flow through
 // `and_then` / `bundle!` / `fan_out` without the macro itself ever
 // mentioning `claspr-async`. The split is the reason Tier 1-only
@@ -399,12 +399,12 @@ where
 // overlap to resolve.
 impl<O> DeviceOperation for O
 where
-    O: claspr::KernelOp + 'static,
+    O: crate::KernelOp + 'static,
 {
     type Output = O::Output;
 
     fn execute(self, ctx: &ExecutionContext<'_>, chain_deps: Deps) -> Result<(Self::Output, Deps)> {
-        let raw: Vec<claspr::cl_event> = chain_deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw: Vec<crate::cl_event> = chain_deps.iter().map(|d| d.as_ref().get()).collect();
         let (out, event) = self.enqueue_into(ctx, &raw)?;
         drop(chain_deps);
         Ok((out, vec![wrap_event(event)]))

@@ -35,9 +35,9 @@
 //! leak its mapped state. This is the only blocking call in the
 //! whole module, and only fires on the error path.
 
-use claspr::map_primitive;
-use claspr::util::{RetainedQueue, mapped_slice_mut};
-use claspr::{Buffer, Context, DeviceSlice, Event, Result};
+use crate::map_primitive;
+use crate::util::{RetainedQueue, mapped_slice_mut};
+use crate::{Buffer, Context, DeviceSlice, Event, Result};
 use opencl3::command_queue::CommandQueue;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, ClMem};
 use opencl3::types::{cl_event, cl_mem};
@@ -354,7 +354,7 @@ impl_mappable_tuple!(A, B, C, D; ha, hb, hc, hd; 0, 1, 2, 3);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claspr::{Context, DeviceSlice};
+    use crate::{Context, DeviceSlice};
 
     /// Map a DeviceSlice, write through the view, unmap, read back via
     /// Tier 1, assert. Exercises the whole `Mappable::DeviceSlice<T>`

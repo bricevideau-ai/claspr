@@ -22,8 +22,8 @@
 //! ```
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation};
-use claspr::Result;
+use crate::device_op::{Deps, DeviceOperation};
+use crate::Result;
 
 // ── Object-safe inner trait ─────────────────────────────────────────
 

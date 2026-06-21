@@ -5,8 +5,8 @@
 //! and passes `deps` through unchanged.
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation};
-use claspr::{MemMode, ReadWrite, Result, USMSlice, USMSliceUninit};
+use crate::device_op::{Deps, DeviceOperation};
+use crate::{MemMode, ReadWrite, Result, USMSlice, USMSliceUninit};
 use std::marker::PhantomData;
 
 /// Wrap a host `Vec<T>` as a [`USMSlice<T, M>`] at chain execute

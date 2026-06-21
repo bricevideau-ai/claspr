@@ -32,8 +32,8 @@
 //! may be either).
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation};
-use claspr::{Device, Result};
+use crate::device_op::{Deps, DeviceOperation};
+use crate::{Device, Result};
 
 /// Combinator built by [`DeviceOperation::on_device`].
 pub struct OnDevice<S> {

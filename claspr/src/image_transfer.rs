@@ -11,8 +11,8 @@
 //!
 //! ```ignore
 //! use claspr_async::{DeviceOperation, image_download, image_upload};
-//! use claspr::image::format::R32Uint;
-//! use claspr::{Image2D, ReadWrite};
+//! use crate::image::format::R32Uint;
+//! use crate::{Image2D, ReadWrite};
 //!
 //! let pixels: Vec<u32> = ...;
 //! let result: Vec<u32> = image_upload::<Image2D<ReadWrite, R32Uint>>(pixels, (32, 32))
@@ -32,9 +32,9 @@
 //! a `DeviceSlice<T>` and `Image1DBufferView::view_of(&slice)`.
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
-use claspr::image::ImageHostTransfer;
-use claspr::{Result, register_drop_callback};
+use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::image::ImageHostTransfer;
+use crate::{Result, register_drop_callback};
 use std::marker::PhantomData;
 
 // ── upload ─────────────────────────────────────────────────────────

@@ -22,8 +22,8 @@
 //! ```
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation, wrap_event};
-use claspr::{Error, Launcher, Result};
+use crate::device_op::{Deps, DeviceOperation, wrap_event};
+use crate::{Error, Launcher, Result};
 
 /// N-ary homogeneous parallel composition. Construct with [`fan_out`].
 pub struct FanOut<I, F> {

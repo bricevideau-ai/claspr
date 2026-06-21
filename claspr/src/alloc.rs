@@ -15,9 +15,9 @@
 //! `Fillable` / `HostWritable` gate.
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation};
+use crate::device_op::{Deps, DeviceOperation};
 use crate::transfer::UploadSource;
-use claspr::{
+use crate::{
     DeviceSlice, DeviceSliceUninit, MappedSlice, MappedSliceUninit, MemMode, ReadWrite, Result,
 };
 use std::marker::PhantomData;

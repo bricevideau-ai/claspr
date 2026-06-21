@@ -4,7 +4,7 @@
 //!
 //! Where the Tier 1 builders [`DeviceSlice::write`] /
 //! [`DeviceSlice::read`] take a borrowed source / destination and a
-//! [`Launcher`](claspr::Launcher), these consume ownership and pick the chain's queue
+//! [`Launcher`](crate::Launcher), these consume ownership and pick the chain's queue
 //! from the [`ExecutionContext`] at execute time. That makes them
 //! compose cleanly into combinator chains:
 //!
@@ -43,8 +43,8 @@
 //! ```
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
-use claspr::{Buffer, DeviceSlice, MemMode, ReadWrite, Result};
+use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::{Buffer, DeviceSlice, MemMode, ReadWrite, Result};
 use std::sync::Arc;
 
 // ── UploadSource ────────────────────────────────────────────────────
@@ -116,7 +116,7 @@ pub struct Download<T, M: MemMode = ReadWrite> {
 impl<T, M> Download<T, M>
 where
     T: Clone + Default + Send + 'static,
-    M: MemMode + claspr::HostReadable + Send + 'static,
+    M: MemMode + crate::HostReadable + Send + 'static,
 {
     pub fn new(buf: DeviceSlice<T, M>) -> Self {
         Self { buf: Some(buf) }
@@ -126,7 +126,7 @@ where
 impl<T, M> DeviceOperation for Download<T, M>
 where
     T: Clone + Default + Send + 'static,
-    M: MemMode + claspr::HostReadable + Send + 'static,
+    M: MemMode + crate::HostReadable + Send + 'static,
 {
     type Output = Vec<T>;
 

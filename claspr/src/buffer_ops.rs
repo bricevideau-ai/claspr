@@ -21,7 +21,7 @@
 //!    .and_then(|buf| device_slice_fill(buf, 0u32))
 //!    ```
 //! 2. **Preserve the marker.** `device_slice_fill` carries `M` through
-//!    — a [`HostReadOnly`](claspr::HostReadOnly) buffer stays
+//!    — a [`HostReadOnly`](crate::HostReadOnly) buffer stays
 //!    `HostReadOnly` after the fill. The Tier 1 bounds
 //!    (`KernelWritable` for fill, `HostWritable` for write) propagate
 //!    so misuse rejects at compile time (see the
@@ -49,13 +49,13 @@
 //! `last_use` registration inside [`SvmFillOp`] / [`SvmCopyOp`]
 //! `into_event`) so cross-queue free is queue-ordered correctly.
 //!
-//! [`SvmFillOp`]: claspr::SvmFillOp
-//! [`SvmCopyOp`]: claspr::SvmCopyOp
+//! [`SvmFillOp`]: crate::SvmFillOp
+//! [`SvmCopyOp`]: crate::SvmCopyOp
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
 use crate::transfer::UploadSource;
-use claspr::{
+use crate::{
     DeviceSlice, Fillable, HostWritable, MappedSlice, MemMode, Result, register_drop_callback,
 };
 
@@ -74,8 +74,8 @@ pub struct DeviceSliceFillOp<T: Copy, M: MemMode> {
 /// output so the chain can keep using it.
 ///
 /// Bound `M: KernelWritable` — `clEnqueueFillBuffer` counts as a
-/// kernel-side write. [`ReadOnly`](claspr::ReadOnly) and
-/// [`Frozen`](claspr::Frozen) markers reject at compile time (see
+/// kernel-side write. [`ReadOnly`](crate::ReadOnly) and
+/// [`Frozen`](crate::Frozen) markers reject at compile time (see
 /// `compile_fail/buffer_ops_fill_on_*`).
 pub fn device_slice_fill<T, M>(buf: DeviceSlice<T, M>, value: T) -> DeviceSliceFillOp<T, M>
 where
@@ -131,9 +131,9 @@ pub struct DeviceSliceWriteOp<T, M: MemMode> {
 /// macro uses. The buffer passes through as the op's output.
 ///
 /// Bound `M: HostWritable` — excludes
-/// [`HostReadOnly`](claspr::HostReadOnly),
-/// [`Frozen`](claspr::Frozen), and
-/// [`DeviceScratch`](claspr::DeviceScratch). `Vec<T>` / `Box<[T]>` /
+/// [`HostReadOnly`](crate::HostReadOnly),
+/// [`Frozen`](crate::Frozen), and
+/// [`DeviceScratch`](crate::DeviceScratch). `Vec<T>` / `Box<[T]>` /
 /// `Arc<[T]>` all coerce via [`UploadSource`].
 pub fn device_slice_write<T, M, S>(buf: DeviceSlice<T, M>, source: S) -> DeviceSliceWriteOp<T, M>
 where
@@ -188,7 +188,7 @@ pub struct MappedSliceFillOp<T: Copy, M: MemMode> {
 /// through as the op's output. Bound `M: KernelWritable` — same gate
 /// as [`device_slice_fill`].
 ///
-/// Drop-ordering: the Tier 1 [`SvmFillOp`](claspr::SvmFillOp)
+/// Drop-ordering: the Tier 1 [`SvmFillOp`](crate::SvmFillOp)
 /// `into_event` already registers the fill event on the buffer's
 /// `last_use` list, so the buffer's eventual `clEnqueueSVMFree` will
 /// wait for this op.

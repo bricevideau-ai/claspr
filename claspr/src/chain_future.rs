@@ -8,7 +8,7 @@
 //! [`clEnqueueMarkerWithWaitList`] on the chain's out-of-order queue.
 //! The marker completes after every previously-submitted command on
 //! the same queue does. The returned [`ChainFuture`] wraps that marker
-//! in a [`claspr::EventFuture`] — the existing Tier 1
+//! in a [`crate::EventFuture`] — the existing Tier 1
 //! `clSetEventCallback` machinery (with `catch_unwind` + `AtomicWaker`)
 //! does the actual waker dispatch when the marker fires.
 //!
@@ -20,13 +20,13 @@
 //! roughly equivalent to `.sync()`. Non-blocking chains let `.await`
 //! genuinely overlap with other host work.
 //!
-//! [`DeviceOperation::run`]: crate::op::DeviceOperation::run
+//! [`DeviceOperation::run`]: crate::device_op::DeviceOperation::run
 //! [`ExecutionContext`]: crate::ExecutionContext
 //! [`clEnqueueMarkerWithWaitList`]: https://registry.khronos.org/OpenCL/specs/3.0-unified/html/OpenCL_API.html#clEnqueueMarkerWithWaitList
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::DeviceOperation;
-use claspr::{Context, Error, EventFuture, EventFutureExt, Result};
+use crate::device_op::DeviceOperation;
+use crate::{Context, Error, EventFuture, EventFutureExt, Result};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};

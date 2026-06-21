@@ -7,11 +7,11 @@
 //! Under the hood it enqueues an `clEnqueueMarkerWithWaitList` after
 //! the source op runs and registers the user callback on the marker
 //! using the same FFI shim Tier 1 uses
-//! ([`claspr::register_profiling_callback`]).
+//! ([`crate::register_profiling_callback`]).
 //!
 //! Like Tier 1, requires the chain's OOO queue to have
-//! `CL_QUEUE_PROFILING_ENABLE` — build the [`Context`](claspr::Context)
-//! with [`.profiling(true)`](claspr::context::ContextBuilder::profiling).
+//! `CL_QUEUE_PROFILING_ENABLE` — build the [`Context`](crate::Context)
+//! with [`.profiling(true)`](crate::context::ContextBuilder::profiling).
 //! Otherwise the closure receives `Err(Error::ProfilingDisabled)` (the
 //! source op still executes, and the chain continues — profiling is a
 //! side-effect on the host, not data flow).
@@ -35,11 +35,11 @@
 //!
 //! [`Bundle`]: crate::Bundle2
 //! [`FanOut`]: crate::FanOut
-//! [`LaunchOp::profiled`]: claspr::LaunchOp::profiled
+//! [`LaunchOp::profiled`]: crate::LaunchOp::profiled
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation, wrap_event};
-use claspr::{
+use crate::device_op::{Deps, DeviceOperation, wrap_event};
+use crate::{
     CL_QUEUE_PROFILING_ENABLE, Error, Launcher, ProfilingInfo, Result, register_profiling_callback,
 };
 

@@ -30,7 +30,7 @@
 //! [`Arc<T>`] you produce inside an [`and_then`](crate::DeviceOperation::and_then)
 //! closure can be split.
 
-use crate::op::{Value, value};
+use crate::device_op::{Value, value};
 use std::sync::Arc;
 
 /// Fan-out helper on [`Arc<T>`]. See module docs.

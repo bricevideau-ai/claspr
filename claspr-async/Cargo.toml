@@ -5,22 +5,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Tier 2 combinator API on top of claspr — DeviceOperation + and_then + bundle + fan_out, lazy-execution model with sync and async terminals"
+description = "Compatibility shim — the Tier 2 combinator API folded into `claspr`. Re-exports `claspr` so existing `claspr_async::…` paths keep working."
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-# `async-events` enables claspr::EventFuture, which claspr-async's
-# `.run().await` builds on. It's the whole point of this crate, so the
-# feature is on unconditionally.
-claspr = { path = "../claspr", features = ["async-events"] }
-# Direct opencl3 dep so the per-buffer HostAccessible impls in
-# host_view.rs can call enqueue_svm_map / enqueue_svm_unmap and the
-# command-queue retain/release helpers without re-exporting them
-# through claspr. opencl3 is already in our transitive dep graph
-# via claspr — this just makes the imports cleaner.
-opencl3.workspace = true
+# The Tier 2 layer now lives in `claspr`; this crate is a thin re-export shim
+# kept so existing `claspr_async::` paths resolve. `async-events` is default-on
+# in claspr now.
+claspr = { path = "../claspr" }
 
 [lints]
 workspace = true

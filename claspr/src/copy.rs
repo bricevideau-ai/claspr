@@ -50,8 +50,8 @@
 //! Event that downstream stages can wait on.)
 
 use crate::exec_ctx::ExecutionContext;
-use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
-use claspr::{
+use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::{
     Buffer, DeviceSlice, DeviceSliceUninit, Launcher, MappedSlice, MappedSliceUninit, MemMode,
     Result, USMSlice, USMSliceUninit,
 };
@@ -262,7 +262,7 @@ unsafe fn retain_for_register(event: &Event) -> Result<std::sync::Arc<Event>> {
     // inside the Arc returned here.
     unsafe {
         retain_event(event.get())
-            .map_err(|code| claspr::Error::OpenCl(opencl3::error_codes::ClError(code)))?;
+            .map_err(|code| crate::Error::OpenCl(opencl3::error_codes::ClError(code)))?;
     }
     Ok(std::sync::Arc::new(Event::new(event.get())))
 }
@@ -296,7 +296,7 @@ where
     fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, dst) = self.take();
         if src.len() != dst.len() {
-            return Err(claspr::Error::LengthMismatch {
+            return Err(crate::Error::LengthMismatch {
                 src: src.len(),
                 dst: dst.len(),
             });
@@ -351,7 +351,7 @@ where
     fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, uninit_dst) = self.take();
         if src.len() != uninit_dst.len() {
-            return Err(claspr::Error::LengthMismatch {
+            return Err(crate::Error::LengthMismatch {
                 src: src.len(),
                 dst: uninit_dst.len(),
             });
@@ -403,7 +403,7 @@ where
     fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, dst) = self.take();
         if src.len() != dst.len() {
-            return Err(claspr::Error::LengthMismatch {
+            return Err(crate::Error::LengthMismatch {
                 src: src.len(),
                 dst: dst.len(),
             });
@@ -452,7 +452,7 @@ where
     fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, uninit_dst) = self.take();
         if src.len() != uninit_dst.len() {
-            return Err(claspr::Error::LengthMismatch {
+            return Err(crate::Error::LengthMismatch {
                 src: src.len(),
                 dst: uninit_dst.len(),
             });
@@ -503,7 +503,7 @@ where
     fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, dst) = self.take();
         if src.len() != dst.len() {
-            return Err(claspr::Error::LengthMismatch {
+            return Err(crate::Error::LengthMismatch {
                 src: src.len(),
                 dst: dst.len(),
             });
@@ -552,7 +552,7 @@ where
     fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, uninit_dst) = self.take();
         if src.len() != uninit_dst.len() {
-            return Err(claspr::Error::LengthMismatch {
+            return Err(crate::Error::LengthMismatch {
                 src: src.len(),
                 dst: uninit_dst.len(),
             });

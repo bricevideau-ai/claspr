@@ -46,11 +46,11 @@
 
 use crate::exec_ctx::ExecutionContext;
 use crate::mappable::Mappable;
-use crate::op::{Deps, DeviceOperation, deps_as_events, wrap_event};
-use claspr::access::{HostReadable, HostWritable, MemMode};
-use claspr::map_primitive;
-use claspr::util::{RetainedQueue, mapped_slice, mapped_slice_mut};
-use claspr::{Buffer, DeviceSlice, Event, Launcher, MappedSlice, Result};
+use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::access::{HostReadable, HostWritable, MemMode};
+use crate::map_primitive;
+use crate::util::{RetainedQueue, mapped_slice, mapped_slice_mut};
+use crate::{Buffer, DeviceSlice, Event, Launcher, MappedSlice, Result};
 use opencl3::command_queue::CommandQueue;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, ClMem};
 use opencl3::types::{cl_event, cl_map_flags};
@@ -60,10 +60,10 @@ use std::ops::{Deref, DerefMut};
 // ── Map-flag markers (host-side map access mode) ───────────────────
 //
 // These are `cl_map_flags` markers for `clEnqueueMapBuffer` — distinct
-// from the `cl_mem_flags` markers in `claspr::access` (which describe
+// from the `cl_mem_flags` markers in `crate::access` (which describe
 // the buffer's creation-time kernel/host access). `MapReadOnly` says
 // "the map call uses CL_MAP_READ only"; `MapReadWrite` says "CL_MAP_READ |
-// CL_MAP_WRITE." The two layers compose: a `DeviceSlice<T, claspr::ReadOnly>`
+// CL_MAP_WRITE." The two layers compose: a `DeviceSlice<T, crate::ReadOnly>`
 // (buffer-level kernel-RO) can be acquired with a `MapReadOnly` view
 // (host-level read), but never with a `MapReadWrite` view (host can't
 // write a buffer-level-kernel-RO buffer through the typed surface;
@@ -107,7 +107,7 @@ pub use map_access::{MapAccess, MapReadOnly, MapReadWrite};
 
 /// Adds [`acquire_host_view_read`](Self::acquire_host_view_read) to
 /// buffer types whose marker permits host reads
-/// ([`claspr::access::HostReadable`]).
+/// ([`crate::access::HostReadable`]).
 pub trait HostReadableExt: Sized {
     /// The acquire op type for the read-only variant.
     type AcquireReadOp: DeviceOperation;
@@ -120,7 +120,7 @@ pub trait HostReadableExt: Sized {
 
 /// Adds [`acquire_host_view`](Self::acquire_host_view) (the mutating
 /// variant) to buffer types whose marker permits host writes
-/// ([`claspr::access::HostWritable`]).
+/// ([`crate::access::HostWritable`]).
 pub trait HostWritableExt: Sized {
     /// The acquire op type for the read/write variant.
     type AcquireOp: DeviceOperation;
