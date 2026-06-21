@@ -46,6 +46,19 @@ works. TODO to reach parity:
 LESSON (Brice): should've ported the suite directly (all-fail-then-fix) to see
 this shape set at once instead of piecemeal.
 
+**EXECUTE-TIME CLOSURE NODES (spiked green) — and_then_with_context / on_device
+/ and_then_host.** These 3 combinators are NOT eager builders (their closure
+needs the live `ec` / runtime mapped data, absent at build). They're
+closure-at-EXECUTE nodes: the struct holds `f: Option<F>` + source pipe + out
+pipe; `execute(self, ec, mode)` runs source, takes the upstream runtime value,
+runs `f(ec, value)` (or `f(view)` for host seam) NOW to get the downstream op,
+grabs its out-pipe BEFORE `run`/execute (move-once), runs it, moves result to
+out. Spiked: capture `downstream.output_pipe()` before `downstream.execute()`.
+host seam (`and_then_host`) additionally drains the upstream `Deps`
+(blocking-wait) before the closure reads the `Mappable` View<'a> (host touches
+real data). This is the ONE place closures legitimately survive in the eager
+model — by design (host/scheduling concern, not graph description).
+
 **MOVE-ONCE RESOLUTION (spiked green /tmp/inferspike) — implementation shape.**
 The tension: a multi-output kernel's buffers can't be moved BOTH into a single
 `Pipe<(A,B,C)>` (terminal) AND into per-element pipes (downstream) — DeviceSlice
