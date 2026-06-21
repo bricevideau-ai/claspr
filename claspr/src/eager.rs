@@ -831,6 +831,31 @@ where
     }
 }
 
+/// Method-call form of [`fan_out`]: `vec![a, b].fan_out(|i| value(i))`.
+///
+/// Mirrors the old closure-layer `FanOutExt`. Reads as data → operation and
+/// composes cleanly with downstream `.and_then`; the free-fn form stays
+/// available — use whichever fits the call site. Named `EagerFanOutExt` to
+/// avoid clashing with the old [`FanOutExt`](crate::FanOutExt) (both are
+/// re-exported at the crate root).
+pub trait EagerFanOutExt<I>: Sized {
+    /// See [`fan_out`] — this delegates to it.
+    fn fan_out<F, U>(self, f: F) -> FanOut<U>
+    where
+        F: FnMut(I) -> U,
+        U: EagerOp;
+}
+
+impl<I> EagerFanOutExt<I> for Vec<I> {
+    fn fan_out<F, U>(self, f: F) -> FanOut<U>
+    where
+        F: FnMut(I) -> U,
+        U: EagerOp,
+    {
+        fan_out(self, f)
+    }
+}
+
 impl<U: EagerOp> EagerOp for FanOut<U> {
     type Output = Vec<U::Output>;
 
@@ -2443,12 +2468,29 @@ where
     for ev in &map_events {
         ev.wait().map_err(Error::OpenCl)?;
     }
-    // Run the host closure on the borrowed view. On Err, the handle's `Drop`
-    // issues the defensive blocking unmap (unmap_enqueued still false), so the
-    // buffer is left clean.
+    // Run the host closure on the borrowed view, inside `catch_unwind` so a
+    // panic becomes `Error::HostPanic` rather than unwinding the caller
+    // (mirrors the old closure-layer `and_then_host`). On Err or panic, the
+    // handle's `Drop` issues the defensive blocking unmap (unmap_enqueued still
+    // false), so the buffer is left clean.
     {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
         let view = <O as Mappable>::view(&mut handle);
-        host_call(view)?;
+        match catch_unwind(AssertUnwindSafe(|| host_call(view))) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(panic) => {
+                // `catch_unwind` yields `Box<dyn Any + Send>`; the payload is
+                // typically `&'static str` (`panic!("lit")`) or `String`
+                // (`panic!("{}", x)`). Anything else gets a placeholder.
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+                return Err(Error::HostPanic(msg));
+            }
+        }
     }
     // Commit mutations: enqueue the unmap (no waiter) and wait its event.
     let unmap_events = <O as Mappable>::enqueue_unmap(&mut handle, q, &[])?;
@@ -2534,5 +2576,107 @@ where
     fn describe(&self, out: &mut Vec<String>) {
         self.source.describe(out);
         out.push("and_then_host_with_context".into());
+    }
+}
+
+// ── Profiled: wall-clock timing for a sub-chain ────────────────────────
+
+/// Times whatever the source op enqueued, registering a completion callback —
+/// built by [`profiled`](EagerProfileExt::profiled). Mirrors the old
+/// closure-layer `Profiled`: at execute it runs the source, enqueues an
+/// `clEnqueueMarkerWithWaitList` over the source's events, registers the user
+/// callback on the marker via [`register_profiling_callback`], and forwards the
+/// **same** value downstream with the marker as its deps (so anything after the
+/// `.profiled()` waits on the marker, which subsumes the source's events).
+///
+/// Requires the chain's OOO queue to have `CL_QUEUE_PROFILING_ENABLE` (build
+/// the [`Context`] with [`.profiling(true)`](crate::context::ContextBuilder::profiling));
+/// otherwise `execute` returns [`Error::ProfilingDisabled`] up front (the
+/// source op still ran — profiling is a host side-effect, not data flow).
+pub struct Profiled<S: EagerOp, F> {
+    source: S,
+    src_pipe: Pipe<S::Output>,
+    cb: Option<F>,
+    out: Pipe<S::Output>,
+}
+
+/// Extension trait adding [`profiled`](Self::profiled) to every [`EagerOp`].
+/// Separate from [`EagerOpExt`] to mirror the old layer's
+/// `DeviceOperationProfileExt`. Blanket-implemented.
+pub trait EagerProfileExt: EagerOp + Sized {
+    /// Register `cb` to receive the wall-clock [`ProfilingInfo`] for everything
+    /// `self` enqueued onto the chain's queue. The closure fires on an OpenCL
+    /// callback thread when the marker event completes. See [`Profiled`].
+    fn profiled<F>(self, cb: F) -> Profiled<Self, F>
+    where
+        F: FnOnce(Result<crate::ProfilingInfo>) + Send + 'static,
+    {
+        let src_pipe = self.output_pipe();
+        Profiled {
+            source: self,
+            src_pipe,
+            cb: Some(cb),
+            out: Pipe::new(),
+        }
+    }
+}
+impl<T: EagerOp> EagerProfileExt for T {}
+
+impl<S, F> EagerOp for Profiled<S, F>
+where
+    S: EagerOp,
+    F: FnOnce(Result<crate::ProfilingInfo>) + Send + 'static,
+{
+    // Profiling is a host side-effect; the chain's data flow is unchanged.
+    type Output = S::Output;
+
+    fn output_pipe(&self) -> Pipe<S::Output> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        use crate::Launcher;
+        self.source.execute(ec, ExecMode::Pipelined)?;
+        let (value, source_deps) = self.src_pipe.take().ok_or(Error::NotSupported(
+            "eager profiled: source produced no output",
+        ))?;
+        // Same up-front check as the old layer / Tier 1: the queue needs
+        // profiling enabled before we waste a marker + callback registration.
+        if (ec.cl_queue().properties()? & crate::CL_QUEUE_PROFILING_ENABLE) == 0 {
+            return Err(Error::ProfilingDisabled);
+        }
+        // The marker waits for the source op's events, so the timestamps
+        // reflect the source's wall-clock duration (first command queued to
+        // last command finished).
+        let wait_list: Vec<crate::cl_event> =
+            source_deps.iter().map(|d| d.as_ref().get()).collect();
+        // SAFETY: cl_event handles are valid — held by `source_deps` Arcs until
+        // this call returns.
+        let marker = unsafe { ec.cl_queue().enqueue_marker_with_wait_list(&wait_list) }
+            .map_err(Error::OpenCl)?;
+        // `source_deps` keeps the underlying cl_events alive across the
+        // enqueue; safe to drop after.
+        drop(source_deps);
+        crate::register_profiling_callback(
+            &marker,
+            Box::new(
+                self.cb
+                    .take()
+                    .expect("Profiled::execute called twice — internal eager bug"),
+            ),
+        )?;
+        // The marker becomes this op's completion event for downstream
+        // chaining (it subsumes the source's events).
+        self.out.put(value, vec![wrap_event(marker)]);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        self.source.describe(out);
+        out.push("profiled".into());
     }
 }

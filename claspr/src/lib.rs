@@ -181,7 +181,7 @@ pub use dyn_op::DynOp;
 // (`eager::{EagerOp, EagerOpExt, Pipe, Input, …}`) to avoid name clashes with
 // the legacy `Download`/`upload` surface during the cutover.
 pub use eager::{
-    EagerOp, EagerOpExt, ExecMode, Input, Pipe, ToInput,
+    EagerFanOutExt, EagerOp, EagerOpExt, EagerProfileExt, ExecMode, Input, Pipe, ToInput,
     arced as eager_arced, bundle2 as eager_bundle2, bundle3 as eager_bundle3,
     bundle4 as eager_bundle4, fan_out as eager_fan_out, forward as eager_forward,
     value as eager_value,

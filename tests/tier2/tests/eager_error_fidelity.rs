@@ -8,13 +8,12 @@
 //!   `bundle!(l, r)`   → `bundle2(l, r)`
 //!   `.and_then_host`  → same method on `EagerOpExt`
 //!
-//! TWO of the three cases hit KNOWN eager gaps and are BLOCKED (see comments):
-//!   - panic-in-closure: the eager host seam (`run_host_seam`) runs the closure
-//!     WITHOUT `catch_unwind`, so a panic unwinds the thread rather than being
-//!     converted to `Error::HostPanic`. There is no eager equivalent.
+//! ONE of the three cases still hits a KNOWN eager gap and is BLOCKED:
 //!   - async `.run().await`: the eager API has no async terminal (only `.sync`).
 //!
-//! The third case (bundle first-writer-wins) ports 1:1.
+//! The panic-in-closure case now ports: the eager host seam (`run_host_seam`)
+//! wraps the closure in `catch_unwind`, converting a panic to
+//! `Error::HostPanic`. The bundle first-writer-wins case ports 1:1.
 
 use claspr::eager::{EagerOpExt, bundle2, value};
 use claspr::{Context, Error};
@@ -29,11 +28,22 @@ fn ctx() -> Option<Context> {
     }
 }
 
-// BLOCKED: panic→HostPanic conversion — eager host seam (`run_host_seam`)
-// invokes the closure without `catch_unwind`, so a closure panic unwinds
-// instead of surfacing as `Error::HostPanic`. Needs a catch_unwind wrapper in
-// the eager host seam (deliberate non-goal of the eager port today). Original
-// `panic_in_host_closure_surfaces_host_panic` cannot be expressed.
+// A panic inside an `and_then_host` closure is caught by the eager host seam
+// (`run_host_seam`'s `catch_unwind`) and surfaced as `Error::HostPanic(msg)`
+// at the terminal — not an unwind of the caller, and not the `OpenCl(-1)`
+// cascade. The message carries the panic literal.
+#[test]
+fn panic_in_host_closure_surfaces_host_panic() {
+    let Some(ctx) = ctx() else { return };
+    let err = value(())
+        .and_then_host(|()| -> claspr::Result<()> { panic!("boom") })
+        .sync(&ctx)
+        .expect_err("expected error");
+    match err {
+        Error::HostPanic(msg) => assert!(msg.contains("boom"), "msg was {msg:?}"),
+        other => panic!("expected HostPanic, got {other:?}"),
+    }
+}
 
 // BLOCKED: async `.run().await` terminal — eager has no async/`ChainFuture`
 // terminal (only `.sync()`). Original `async_terminal_run_also_delivers_rich_variant`
