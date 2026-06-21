@@ -27,9 +27,12 @@
 //! (NOTES → "CONVERSION PLAN"); the old trait stays alive in parallel until
 //! every leaf is ported.
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, wrap_event};
-use crate::{Context, DeviceSlice, Error, Fillable, MemMode, ReadWrite, Result};
+use crate::exec_ctx::ExecutionContext;
+use crate::transfer::UploadSource;
+use crate::{
+    Buffer, Context, DeviceSlice, Error, Fillable, HostReadable, MemMode, ReadWrite, Result,
+};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
@@ -294,5 +297,105 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("fill".into());
+    }
+}
+
+// ── Leaf: upload (host → device, alloc + CL_MEM_COPY_HOST_PTR) ──────────
+
+/// Allocate a `DeviceSlice<T, M>` and bake `src` into it at creation
+/// (`CL_MEM_COPY_HOST_PTR`). A chain-entry leaf — no upstream input. (Uses the
+/// from_slice path: works for any marker, one synchronous create, no in-flight
+/// event.)
+pub struct Upload<T: Copy, M: MemMode = ReadWrite> {
+    src: Option<UploadSource<T>>,
+    out: Pipe<DeviceSlice<T, M>>,
+}
+
+/// Build an upload leaf from any `Vec<T>` / `Box<[T]>` / `Arc<[T]>`.
+pub fn upload<T, M, S>(src: S) -> Upload<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Send + 'static,
+    S: Into<UploadSource<T>>,
+{
+    Upload {
+        src: Some(src.into()),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for Upload<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Send + 'static,
+{
+    type Output = DeviceSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn execute(mut self, ec: &ExecutionContext<'_>) -> Result<()> {
+        let src = self
+            .src
+            .take()
+            .expect("Upload::execute called twice — internal eager bug");
+        let buf = DeviceSlice::<T, M>::from_slice(ec.context(), src.as_slice())?;
+        self.out.put(buf, Deps::new());
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("upload".into());
+    }
+}
+
+// ── Leaf: download (device → host Vec, non-blocking read) ──────────────
+
+/// Consume an upstream buffer, alloc a host `Vec<T>`, non-blocking-read into it
+/// threading the upstream events. Output is the `Vec<T>`.
+pub struct Download<T, M: MemMode = ReadWrite> {
+    buf: Input<DeviceSlice<T, M>>,
+    out: Pipe<Vec<T>>,
+}
+
+/// Build a download leaf over an upstream buffer.
+pub fn download<T, M>(buf: impl Into<Input<DeviceSlice<T, M>>>) -> Download<T, M>
+where
+    T: Clone + Default + Send + 'static,
+    M: MemMode + HostReadable + Send + 'static,
+{
+    Download {
+        buf: buf.into(),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for Download<T, M>
+where
+    T: Clone + Default + Send + 'static,
+    M: MemMode + HostReadable + Send + 'static,
+{
+    type Output = Vec<T>;
+
+    fn output_pipe(&self) -> Pipe<Vec<T>> {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>) -> Result<()> {
+        let (buf, deps) = self.buf.resolve()?;
+        let mut host = vec![T::default(); buf.len()];
+        let event = buf
+            .read(&mut host)
+            .after_all(deps.iter().map(|d| d.as_ref()))
+            .submit_on(ec)?;
+        // The read is non-blocking; its event gates the host Vec being valid.
+        // Carry it forward so the terminal wait covers it.
+        self.out.put(host, vec![wrap_event(event)]);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("download".into());
     }
 }

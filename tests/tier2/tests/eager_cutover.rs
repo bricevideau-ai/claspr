@@ -4,7 +4,7 @@
 //! claspr-async `ExecutionContext`/queue before the macro change (step 1b).
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, alloc_zero, fill};
+use claspr::eager::{EagerOpExt, alloc_zero, download, fill, upload};
 
 const N: usize = 256;
 
@@ -46,6 +46,38 @@ fn alloc_then_fill_syncs() {
         "eager fill; got {:?}",
         &host[..8]
     );
+}
+
+/// The canonical chain shape minus the kernel: upload → fill → download,
+/// round-tripping host data through the eager graph. Proves the transfer
+/// leaves (Upload/Download) port + event-thread correctly.
+#[test]
+fn upload_fill_download_roundtrip() {
+    let Some(ctx) = ctx() else { return };
+
+    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+        .and_then(|b| fill(b, 9u32))
+        .and_then(|b| download(b))
+        .sync(&ctx)
+        .expect("sync");
+
+    assert_eq!(out.len(), N);
+    assert!(out.iter().all(|&v| v == 9), "fill then download; got {:?}", &out[..8]);
+}
+
+/// Upload host data and read it straight back (no transform) — the upload
+/// leaf's CL_MEM_COPY_HOST_PTR path preserves contents.
+#[test]
+fn upload_download_preserves_data() {
+    let Some(ctx) = ctx() else { return };
+
+    let src: Vec<u32> = (0..N as u32).collect();
+    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(src.clone())
+        .and_then(|b| download(b))
+        .sync(&ctx)
+        .expect("sync");
+
+    assert_eq!(out, src, "round-trip preserves data");
 }
 
 /// A longer fill chain: each fill threads the prior fill's event as its
