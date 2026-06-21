@@ -31,12 +31,26 @@ terminal wait in `sync`. `Input<T> = Concrete|Pipe` is the unified edge.
   Cleaner than the cb-graphs merge: only opencl3 extra dep, no record/cl3. claspr
   -async = re-export shim. Whole workspace builds; existing tier2 suites green
   through the shim (no regression).
-- **1b NEXT** (the chosen snag fix): macro-emitted kernel ops take `Input<T>`
-  for buffer args → `kernels.foo([N], pipe)` typechecks + composes as an EagerOp
-  leaf, keeping concrete Tier-1 `.wait`/`.submit`. Macro arg classification is
-  at claspr-macros lib.rs ~497 (`classify_param` → Slice/Image/Scalar); buffer
-  args currently become a generic `__claspr_D{n}: KernelSliceArg`. Plan: slice
-  args become `Input`-wrapped, Op gets a persistent output `Pipe`, eager execute.
+- **Transfer leaves DONE** (`8ea081e`): `upload` (alloc+COPY_HOST_PTR) +
+  `download` (non-blocking read→Vec, event-threaded) eager leaves. upload→fill→
+  download round-trip green (5/5). Old closure layer still live in parallel
+  (kernels can't enter eager until 1b) → zero regression.
+- **1b — kernel macro — DESIGN VALIDATED, REWRITE PENDING (the capstone).**
+  Two coherence/inference snags solved via spikes (/tmp/inferspike, both green):
+  - per-buffer-family `IntoKernelInput<E>` impls (DeviceSlice/Mapped/USM + a
+    `Pipe<D>` impl) — NOT a blanket over `D` (that conflicts: a `Pipe` could be
+    a `KernelSliceArg`). `kernels.foo(buf)` and `kernels.foo(pipe)` both infer,
+    no turbofish.
+  - **associated `Op` type** preserves Tier-1 compile-time safety: `IntoKernelInput`
+    has `type Op: EagerOp`; concrete buffer → `ConcreteKernelOp` (has inherent
+    `.wait()`/`.submit()`/`KernelOp`), pipe → `PipedKernelOp` (EagerOp only, no
+    `.wait()`). One method serves both tiers; `.wait()` exists ONLY on the
+    concrete variant. SPIKED working.
+  - **Scope/risk:** this is the deepest single change — rewrites the macro's
+    Op emission (arg classification ~497, Op struct ~683, KernelOp impl ~798)
+    while keeping the existing Tier-1 surface intact for ~17 kernel-chaining
+    tier2 tests + all Tier-1 use. Pending. Element type `E` is fixed per kernel
+    (from the sig), so the macro hardcodes it — only the buffer generic varies.
 
 **Then (per CONVERSION PLAN, carried mentally):** port remaining leaves
 (transfer/copy/uninit/usm/image_transfer/host_view), host seams (and_then_host /
