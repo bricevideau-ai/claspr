@@ -5,7 +5,8 @@
 
 use claspr::Context;
 use claspr::eager::{
-    EagerOpExt, alloc_zero, arced, bundle2, bundle3, download, fan_out, fill, upload, value,
+    EagerOpExt, alloc_zero, arced, bundle2, bundle3, download, eager_copy_to, fan_out, fill, upload,
+    value,
 };
 use claspr_test_kernels::kernels;
 
@@ -277,6 +278,34 @@ fn multi_output_kernel_terminal_tuple() {
     assert!(
         result.iter().all(|&v| v == 11),
         "multi-output terminal tuple (5+6); got {:?}",
+        &result[..8]
+    );
+}
+
+/// Eager `copy_to` is a TWO-output op: `eager_copy_to(src, dst)` has
+/// `Output = (DeviceSlice, DeviceSlice)`, so its `Handle` is `(Pipe<src>,
+/// Pipe<dst>)` — the same per-element scatter the multi-output kernel uses. The
+/// downstream `and_then(|(_src, dst)| download(dst))` selects the `dst` pipe and
+/// drops the `src` pipe (move-once). Proves the copy port event-threads + the
+/// copy actually moved the bytes (dst == src == all 7s).
+#[test]
+fn device_copy_eager() {
+    let Some(ctx) = ctx() else { return };
+
+    let src = upload::<u32, claspr::ReadWrite, _>(vec![7u32; N])
+        .sync(&ctx)
+        .expect("upload src");
+    let dst = alloc_zero::<u32, claspr::ReadWrite>(N)
+        .sync(&ctx)
+        .expect("alloc dst");
+
+    let result: Vec<u32> = eager_copy_to(src, dst)
+        .and_then(|(_src, dst)| download(dst))
+        .sync(&ctx)
+        .expect("sync");
+    assert!(
+        result.iter().all(|&v| v == 7),
+        "eager copy_to (DeviceSlice→DeviceSlice); got {:?}",
         &result[..8]
     );
 }

@@ -27,6 +27,7 @@
 //! (NOTES → "CONVERSION PLAN"); the old trait stays alive in parallel until
 //! every leaf is ported.
 
+use crate::copy::CopyTo;
 use crate::device_op::{Deps, DeviceOperation, wrap_event};
 use crate::exec_ctx::ExecutionContext;
 use crate::host_view::{
@@ -1795,5 +1796,164 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("release_mapped_view".into());
+    }
+}
+
+// ── Multi-output leaf: copy_to (src, dst) → (src, dst) ──────────────────────
+//
+// The eager analog of the closure-layer `CopyToOp` family in `copy.rs`. A copy
+// is a **two-output** op: it returns BOTH the source and destination buffers so
+// the chain can thread either onward. It mirrors the macro-emitted multi-output
+// kernel shape (commit 0f7083d): two element pipes (`Handle = (Pipe<OS>,
+// Pipe<OD>)`), `execute` enqueues once and scatters each output into its element
+// pipe (cloning the single completion `Dep` onto both), and `into_output` drains
+// both pipes to reconstruct the `(src, dst)` tuple.
+//
+// Rather than re-deriving the ten (src, dst) family bodies (incl. the unsafe
+// cross-type SVM-memcpy machinery in `copy.rs`), this op **reuses** the existing
+// `CopyTo` / `DeviceOperation` `CopyToOp` impls: resolve the two inputs, build
+// the old op via `src.copy_to(dst)`, run its `DeviceOperation::execute` (which
+// owns every per-family primitive + Uninit→Init transition + buffer-use
+// registration), then scatter its `(out_src, out_dst)` Output across the two
+// pipes. All ten families come along for free — no `copy.rs` change.
+//
+// Copy ops have no native blocking enqueue (the closure layer always uses
+// `submit_on` + event); `mode` is therefore ignored — `submit_on`+event is the
+// only path, and copy is rarely terminal anyway (it returns buffers onward).
+
+/// Split a copy op's 2-tuple `Output` into its source + destination halves so
+/// the eager [`CopyTo2`] op can hold one typed element pipe per side and
+/// reconstruct the tuple in `into_output`. Implemented once for every `(A, B)`.
+pub trait CopyOutputs {
+    /// The post-copy source buffer (element 0 of the copy Output).
+    type Src: Send;
+    /// The post-copy destination buffer (element 1 of the copy Output).
+    type Dst: Send;
+    /// Decompose into `(src, dst)`.
+    fn into_parts(self) -> (Self::Src, Self::Dst);
+}
+
+impl<A: Send, B: Send> CopyOutputs for (A, B) {
+    type Src = A;
+    type Dst = B;
+    fn into_parts(self) -> (A, B) {
+        self
+    }
+}
+
+/// Eager multi-output copy: `eager_copy_to(src, dst)` enqueues a copy and yields
+/// `(src, dst)`. `Handle = (Pipe<OutSrc>, Pipe<OutDst>)` — two element pipes, so
+/// a downstream `.and_then(|(src, dst)| …)` selects either side. Polymorphic
+/// over every supported `(src, dst)` family via the `Src: CopyTo<Dst>` bound.
+pub struct CopyTo2<Src, Dst>
+where
+    Src: CopyTo<Dst>,
+    <Src::Op as DeviceOperation>::Output: CopyOutputs,
+{
+    src: Input<Src>,
+    dst: Input<Dst>,
+    // One element pipe per copy output (move-once storage), mirroring the
+    // macro-emitted multi-output kernel. The output tuple is reconstructed from
+    // both in `into_output`.
+    src_pipe: Pipe<<<Src::Op as DeviceOperation>::Output as CopyOutputs>::Src>,
+    dst_pipe: Pipe<<<Src::Op as DeviceOperation>::Output as CopyOutputs>::Dst>,
+}
+
+/// Build an eager copy leaf. `src` / `dst` may each be a concrete buffer or an
+/// upstream [`Pipe`]. Output is `(src, dst)` (an `Uninit` dst comes back `Init`
+/// — the copy wrote every byte). See [`CopyTo2`].
+pub fn eager_copy_to<Src, Dst>(
+    src: impl Into<Input<Src>>,
+    dst: impl Into<Input<Dst>>,
+) -> CopyTo2<Src, Dst>
+where
+    Src: CopyTo<Dst>,
+    <Src::Op as DeviceOperation>::Output: CopyOutputs,
+{
+    CopyTo2 {
+        src: src.into(),
+        dst: dst.into(),
+        src_pipe: Pipe::new(),
+        dst_pipe: Pipe::new(),
+    }
+}
+
+impl<Src, Dst> EagerOp for CopyTo2<Src, Dst>
+where
+    Src: CopyTo<Dst> + Send,
+    Dst: Send,
+    Src::Op: Send,
+    <Src::Op as DeviceOperation>::Output: CopyOutputs,
+{
+    type Output = (
+        <<Src::Op as DeviceOperation>::Output as CopyOutputs>::Src,
+        <<Src::Op as DeviceOperation>::Output as CopyOutputs>::Dst,
+    );
+    // Two element pipes, like the multi-output kernel: the downstream closure
+    // gets `(pa, pb)` and selects either buffer.
+    type Handle = (
+        Pipe<<<Src::Op as DeviceOperation>::Output as CopyOutputs>::Src>,
+        Pipe<<<Src::Op as DeviceOperation>::Output as CopyOutputs>::Dst>,
+    );
+
+    fn output_pipe(&self) -> Pipe<Self::Output> {
+        // Multi-output storage is the per-element pipes; this single pipe is
+        // never filled or drained (the default `into_output` is overridden, and
+        // `and_then` uses `handle()`). Return a fresh empty pipe — well-typed,
+        // never read.
+        Pipe::new()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        (self.src_pipe.clone(), self.dst_pipe.clone())
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // Resolve both inputs → (buffer, upstream Deps). Either may be a pipe
+        // (upstream output) or concrete. Combine their wait-lists.
+        let (src, src_deps) = self.src.resolve()?;
+        let (dst, dst_deps) = self.dst.resolve()?;
+        let mut deps = src_deps;
+        deps.extend(dst_deps);
+        // Reuse the closure-layer copy op: it owns the right per-family
+        // primitive (CopyBuffer / SVMMemcpy), the Uninit→Init transition, and
+        // buffer-use registration. ONE enqueue → its returned Deps hold one
+        // completion event.
+        let op = src.copy_to(dst);
+        let (out, out_deps) = op.execute(ec, deps)?;
+        let (out_src, out_dst) = out.into_parts();
+        // Clone the completion Dep onto BOTH element pipes so whichever side
+        // flows downstream carries the wait-list (and the terminal reconstruct
+        // gathers from both).
+        self.src_pipe.put(out_src, out_deps.clone());
+        self.dst_pipe.put(out_dst, out_deps);
+        Ok(())
+    }
+
+    fn into_output(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
+    where
+        Self: Sized,
+    {
+        // Grab the element pipes before consuming `self`, then scatter via
+        // `execute`, then drain + reconstruct the `(src, dst)` tuple, gathering
+        // both pipes' deps and waiting on them.
+        let src_pipe = self.src_pipe.clone();
+        let dst_pipe = self.dst_pipe.clone();
+        self.execute(ec, mode)?;
+        let (out_src, mut deps) = src_pipe.take().ok_or(Error::NotSupported(
+            "eager graph: terminal copy produced no output",
+        ))?;
+        let (out_dst, dst_deps) = dst_pipe.take().ok_or(Error::NotSupported(
+            "eager graph: terminal copy produced no output",
+        ))?;
+        deps.extend(dst_deps);
+        for d in &deps {
+            d.as_ref().wait().map_err(Error::OpenCl)?;
+        }
+        Ok((out_src, out_dst))
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("copy_to".into());
     }
 }
