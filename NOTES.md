@@ -11,6 +11,18 @@ items resolve.
 
 ### Eager struct-graph cutover (branch `eager-cutover`, from main, 2026-06-18)
 
+**host_view `View<'a>` RISK RETIRED (probed).** The flagged-medium-risk
+`View<'a>` borrow is NOT in the host_view DeviceOperation leaves — `Acquire/
+ReleaseDeviceSliceOp::Output` is an OWNED `DeviceSliceHostView` (owns buf +
+host_ptr + RetainedQueue), so those leaves port to EagerOp by move like any
+other. The `for<'a> FnOnce(View<'a>)` borrow lives ONLY in `and_then_host`'s
+closure — the genuine host seam, which the design ALWAYS kept as an explicit
+closure-at-execute boundary node (the host reads real mapped data mid-graph; it
+is not an eager builder by nature). So: the eager model has exactly ONE
+closure-bearing node — the host seam — by design, not as a limitation. No
+blocker. host_view acquire/release leaves are mechanical ports; and_then_host
+stays a closure boundary (its closure runs at execute, segmenting the graph).
+
 **⚠ FIRST REAL EXPRESSIVENESS LIMIT FOUND (combinators):** in the eager model a
 multi-output combinator (`bundle`'s tuple `Pipe<(A,B)>`) **can't be
 destructured into per-element pipes** in a downstream `and_then` — the pipe is
