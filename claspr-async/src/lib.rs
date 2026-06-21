@@ -44,6 +44,7 @@ pub mod buffer_ops;
 pub mod bundle;
 pub mod copy;
 pub mod dyn_op;
+pub mod eager;
 pub mod exec_ctx;
 pub mod fan_out;
 pub mod future;
