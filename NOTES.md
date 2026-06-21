@@ -68,6 +68,16 @@ parity backlog. None block the model; each needs a primitive or is a non-shape.*
   only the HOST-side reduction variant.
 - **FanOutExt method form** (`vec.fan_out(op)`) — trivial alias; eager has only
   the free `fan_out(vec, op)`. (blocks 1 fan_out.rs equivalence test)
+- **No async terminal `.run().await`.** eager has only `.sync()`; no
+  ChainFuture/poll. Needs an eager async terminal over the chain. (blocks all
+  run_await.rs + 1 error_fidelity async test)
+- **No eager `.profiled(cb)`.** Closure layer's `DeviceOperationProfileExt`
+  (per-op completion-timestamp callback + ProfilingDisabled surfacing) has no
+  EagerOpExt analogue. (blocks 2 host_and_profile.rs)
+- **No `catch_unwind` in the host seam.** eager `and_then_host` lets a closure
+  panic UNWIND (no `Error::HostPanic` conversion the old layer did). (blocks 1
+  error_fidelity panic test). Minor — add catch_unwind to the host seam if
+  HostPanic parity is wanted.
 
 **⚠ TWO GAPS FOUND porting chain.rs (eager_chain.rs proof, 5/5 green):**
 1. **`bundle(...).and_then(|(a,b,out)| kernel(a,b,out))` — bundle Handle is one

@@ -1,0 +1,81 @@
+//! Eager-API port of `split_await.rs`: run a partial chain to completion, do
+//! host work in between, then submit a second chain that consumes the first's
+//! output. Validates buffers flow correctly across a terminal boundary.
+//!
+//! Despite the file name, the original uses NO async terminal — it terminates
+//! with `.sync()` (and one Tier-1 `.wait()` mid-stream). Both map directly onto
+//! the eager `.sync(&ctx)` terminal:
+//!   `upload!(v)`              → `upload::<u32, ReadWrite, _>(v)`
+//!   `download!(buf)`          → `.and_then(download)`
+//!   Tier-1 `kernel(...).wait()` → eager `kernel(...).sync(&ctx)` (single-output
+//!                                kernel `.sync()` yields the `DeviceSlice`,
+//!                                same "run to completion, hand back the buffer"
+//!                                semantics as the Tier-1 `.wait()`).
+//! Both test fns port 1:1 — same N, values, assertions.
+
+use claspr::Context;
+use claspr::eager::{EagerOpExt, download, upload};
+use claspr_test_kernels::kernels;
+
+const N: usize = 128;
+
+fn ctx() -> Option<Context> {
+    match Context::any() {
+        Ok(c) => Some(c),
+        Err(_) => {
+            eprintln!("SKIP: no OpenCL device");
+            None
+        }
+    }
+}
+
+#[test]
+fn split_chain_with_host_decision_between() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    // First chain: upload + fill. Buffer flows out via .sync().
+    let buf = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+        .and_then(|b| kernels.fill_u32([N], b, 5))
+        .sync(&ctx)
+        .expect("first half");
+
+    // Host decision: pick a scale factor based on something we know about the
+    // chain's mid-state (here, the value we filled with).
+    let factor = if 5 < 10 { 4 } else { 2 };
+
+    // Second chain: take the buffer back in, scale by the decided factor.
+    let result: Vec<u32> = kernels
+        .scale_u32([N], buf, factor)
+        .and_then(download)
+        .sync(&ctx)
+        .expect("second half");
+    assert!(result.iter().all(|&v| v == 20));
+}
+
+#[test]
+fn split_chain_then_reuse_buffer_for_independent_work() {
+    // Split where the host owns the buffer between halves and uses it for
+    // something orthogonal. Validates the buffer's identity / refcount survive
+    // the chain boundary.
+    let Some(ctx) = ctx() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let buf = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+        .and_then(|b| kernels.fill_u32([N], b, 1))
+        .sync(&ctx)
+        .expect("phase 1");
+    // Mid-stream "Tier 1"-style run-to-completion: eager `.sync()` yields the
+    // buffer back (the single-output kernel's `Output = DeviceSlice`).
+    let buf = kernels
+        .scale_u32([N], buf, 10)
+        .sync(&ctx)
+        .expect("phase 2 (run-to-completion in the middle)");
+    // Pick the second half back up as an eager chain.
+    let result: Vec<u32> = kernels
+        .scale_u32([N], buf, 5)
+        .and_then(download)
+        .sync(&ctx)
+        .expect("phase 3");
+    assert!(result.iter().all(|&v| v == 50));
+}
