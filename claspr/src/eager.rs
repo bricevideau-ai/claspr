@@ -27,11 +27,18 @@
 //! (NOTES → "CONVERSION PLAN"); the old trait stays alive in parallel until
 //! every leaf is ported.
 
-use crate::device_op::{Deps, wrap_event};
+use crate::device_op::{Deps, DeviceOperation, wrap_event};
 use crate::exec_ctx::ExecutionContext;
+use crate::host_view::{
+    DeviceSliceHostView, HostReadableExt, HostWritableExt, MapAccess, MapReadOnly, MapReadWrite,
+    MappedSliceHostView,
+};
+use crate::image::ImageHostTransfer;
 use crate::transfer::UploadSource;
 use crate::{
-    Buffer, Context, DeviceSlice, Error, Fillable, HostReadable, MemMode, ReadWrite, Result,
+    Buffer, Context, DeviceSlice, DeviceSliceUninit, Error, Fillable, HostReadable,
+    HostUploadable, HostWritable, MappedSlice, MappedSliceUninit, MemMode, ReadWrite, Result,
+    USMSlice, USMSliceUninit, register_drop_callback,
 };
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -799,5 +806,975 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("download".into());
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// uninit_ext.rs ports — fill / write an alloc-uninit buffer → initialised
+// ════════════════════════════════════════════════════════════════════════
+
+// ── Leaf: fill a DeviceSliceUninit → DeviceSlice (eager FillFromUninitOp) ──
+
+/// Consume an uninit `DeviceSlice` (upstream pipe or concrete) and fill it
+/// with `value`, yielding the initialised buffer. Mirrors [`Fill`] (transform
+/// shape, ExecMode branch on the Tier-1 `fill` builder's `wait_on`/`submit_on`).
+pub struct FillDeviceUninit<T: Copy, M: MemMode> {
+    uninit: Input<DeviceSliceUninit<T, M>>,
+    value: T,
+    out: Pipe<DeviceSlice<T, M>>,
+}
+
+/// Build an eager fill-from-uninit leaf over a `DeviceSliceUninit`.
+pub fn fill_device_uninit<T, M>(
+    uninit: impl Into<Input<DeviceSliceUninit<T, M>>>,
+    value: T,
+) -> FillDeviceUninit<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Fillable + Send + 'static,
+{
+    FillDeviceUninit {
+        uninit: uninit.into(),
+        value,
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for FillDeviceUninit<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Fillable + Send + 'static,
+{
+    type Output = DeviceSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        let (uninit, deps) = self.uninit.resolve()?;
+        // SAFETY: the fill below writes every byte; downstream gates on the
+        // returned fill event (Pipelined) or the driver waits (Blocking).
+        let mut buf = unsafe { uninit.assume_init() };
+        match mode {
+            ExecMode::Blocking => {
+                buf.fill(self.value)
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .wait_on(ec)?;
+                self.out.put(buf, Deps::new());
+            }
+            ExecMode::Pipelined => {
+                let event = buf
+                    .fill(self.value)
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .submit_on(ec)?;
+                self.out.put(buf, vec![wrap_event(event)]);
+            }
+        }
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("fill_device_uninit".into());
+    }
+}
+
+// ── Leaf: fill a MappedSliceUninit → MappedSlice ───────────────────────────
+
+/// Eager analog of `FillFromUninitOp<MappedSliceUninit, _>`: fill an uninit
+/// SVM slice with `value`. Mirrors [`Fill`].
+pub struct FillMappedUninit<T: Copy, M: MemMode> {
+    uninit: Input<MappedSliceUninit<T, M>>,
+    value: T,
+    out: Pipe<MappedSlice<T, M>>,
+}
+
+/// Build an eager fill-from-uninit leaf over a `MappedSliceUninit`.
+pub fn fill_mapped_uninit<T, M>(
+    uninit: impl Into<Input<MappedSliceUninit<T, M>>>,
+    value: T,
+) -> FillMappedUninit<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Fillable + Send + 'static,
+{
+    FillMappedUninit {
+        uninit: uninit.into(),
+        value,
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for FillMappedUninit<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Fillable + Send + 'static,
+{
+    type Output = MappedSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<MappedSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        let (uninit, deps) = self.uninit.resolve()?;
+        // SAFETY: the SVM fill below writes every byte.
+        let buf = unsafe { uninit.assume_init() };
+        match mode {
+            ExecMode::Blocking => {
+                buf.fill(self.value)
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .wait_on(ec)?;
+                self.out.put(buf, Deps::new());
+            }
+            ExecMode::Pipelined => {
+                let event = buf
+                    .fill(self.value)
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .submit_on(ec)?;
+                self.out.put(buf, vec![wrap_event(event)]);
+            }
+        }
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("fill_mapped_uninit".into());
+    }
+}
+
+// ── Leaf: fill a USMSliceUninit → USMSlice (pure host op) ───────────────────
+
+/// Eager analog of `FillFromUninitOp<USMSliceUninit, _>`. USM is host memory,
+/// so this is a pure host op: no enqueue, no event, deps pass through (mode
+/// N/A) — mirrors [`Upload`]'s synchronous-create shape.
+pub struct FillUsmUninit<T: Copy, M: MemMode> {
+    uninit: Input<USMSliceUninit<T, M>>,
+    value: T,
+    out: Pipe<USMSlice<T, M>>,
+}
+
+/// Build an eager fill-from-uninit leaf over a `USMSliceUninit`.
+pub fn fill_usm_uninit<T, M>(
+    uninit: impl Into<Input<USMSliceUninit<T, M>>>,
+    value: T,
+) -> FillUsmUninit<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Send + 'static,
+{
+    FillUsmUninit {
+        uninit: uninit.into(),
+        value,
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for FillUsmUninit<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Send + 'static,
+{
+    type Output = USMSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<USMSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // Pure host op — no event; forward the upstream deps unchanged.
+        let (uninit, deps) = self.uninit.resolve()?;
+        let buf = uninit.fill_into(self.value);
+        self.out.put(buf, deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("fill_usm_uninit".into());
+    }
+}
+
+// ── Leaf: write host data into a DeviceSliceUninit → DeviceSlice ────────────
+
+/// Consume an uninit `DeviceSlice` and write host `src` into it, yielding the
+/// initialised buffer. Mirrors [`Fill`] (ExecMode branch). For the non-blocking
+/// path the host `src` is kept alive until the write event fires via
+/// `register_drop_callback`; for the blocking path the write completes before
+/// return, so `src` drops normally at end of `execute`.
+pub struct WriteDeviceUninit<T, M: MemMode> {
+    uninit: Input<DeviceSliceUninit<T, M>>,
+    src: Option<UploadSource<T>>,
+    out: Pipe<DeviceSlice<T, M>>,
+}
+
+/// Build an eager write-from-uninit leaf over a `DeviceSliceUninit`.
+pub fn write_device_uninit<T, M, S>(
+    uninit: impl Into<Input<DeviceSliceUninit<T, M>>>,
+    src: S,
+) -> WriteDeviceUninit<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostUploadable + HostWritable + Send + 'static,
+    S: Into<UploadSource<T>>,
+{
+    WriteDeviceUninit {
+        uninit: uninit.into(),
+        src: Some(src.into()),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for WriteDeviceUninit<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostUploadable + HostWritable + Send + 'static,
+{
+    type Output = DeviceSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        let (uninit, deps) = self.uninit.resolve()?;
+        let src = self
+            .src
+            .take()
+            .expect("WriteDeviceUninit::execute called twice — internal eager bug");
+        // SAFETY: the write below covers every byte; downstream gates on the
+        // returned write event (Pipelined) or the driver waits (Blocking).
+        let mut buf = unsafe { uninit.assume_init() };
+        match mode {
+            ExecMode::Blocking => {
+                buf.write(src.as_slice())
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .wait_on(ec)?;
+                // Blocking write completed — `src` drops at end of execute.
+                self.out.put(buf, Deps::new());
+            }
+            ExecMode::Pipelined => {
+                let event = buf
+                    .write(src.as_slice())
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .submit_on(ec)?;
+                // Keep-alive: drop the host source when CL_COMPLETE fires.
+                register_drop_callback(&event, Box::new(src))?;
+                self.out.put(buf, vec![wrap_event(event)]);
+            }
+        }
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("write_device_uninit".into());
+    }
+}
+
+// ── Leaf: write host data into a MappedSliceUninit → MappedSlice ────────────
+
+/// Eager analog of `WriteFromUninitOp<MappedSliceUninit, _>`. Mirrors
+/// [`WriteDeviceUninit`].
+pub struct WriteMappedUninit<T, M: MemMode> {
+    uninit: Input<MappedSliceUninit<T, M>>,
+    src: Option<UploadSource<T>>,
+    out: Pipe<MappedSlice<T, M>>,
+}
+
+/// Build an eager write-from-uninit leaf over a `MappedSliceUninit`.
+pub fn write_mapped_uninit<T, M, S>(
+    uninit: impl Into<Input<MappedSliceUninit<T, M>>>,
+    src: S,
+) -> WriteMappedUninit<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostWritable + Send + 'static,
+    S: Into<UploadSource<T>>,
+{
+    WriteMappedUninit {
+        uninit: uninit.into(),
+        src: Some(src.into()),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for WriteMappedUninit<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostWritable + Send + 'static,
+{
+    type Output = MappedSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<MappedSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        let (uninit, deps) = self.uninit.resolve()?;
+        let src = self
+            .src
+            .take()
+            .expect("WriteMappedUninit::execute called twice — internal eager bug");
+        // SAFETY: the SVM write below covers every byte.
+        let buf = unsafe { uninit.assume_init() };
+        match mode {
+            ExecMode::Blocking => {
+                buf.write(src.as_slice())
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .wait_on(ec)?;
+                self.out.put(buf, Deps::new());
+            }
+            ExecMode::Pipelined => {
+                let event = buf
+                    .write(src.as_slice())
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .submit_on(ec)?;
+                register_drop_callback(&event, Box::new(src))?;
+                self.out.put(buf, vec![wrap_event(event)]);
+            }
+        }
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("write_mapped_uninit".into());
+    }
+}
+
+// ── Leaf: write host data into a USMSliceUninit → USMSlice (pure host op) ───
+
+/// Eager analog of `WriteFromUninitOp<USMSliceUninit, _>`. Pure host memcpy via
+/// the Tier-1 `write_from` helper — surfaces `LengthMismatch` at execute. No
+/// enqueue, deps pass through (mode N/A) — mirrors [`Upload`].
+pub struct WriteUsmUninit<T: Copy, M: MemMode> {
+    uninit: Input<USMSliceUninit<T, M>>,
+    src: Option<UploadSource<T>>,
+    out: Pipe<USMSlice<T, M>>,
+}
+
+/// Build an eager write-from-uninit leaf over a `USMSliceUninit`.
+pub fn write_usm_uninit<T, M, S>(
+    uninit: impl Into<Input<USMSliceUninit<T, M>>>,
+    src: S,
+) -> WriteUsmUninit<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Send + 'static,
+    S: Into<UploadSource<T>>,
+{
+    WriteUsmUninit {
+        uninit: uninit.into(),
+        src: Some(src.into()),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for WriteUsmUninit<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Send + 'static,
+{
+    type Output = USMSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<USMSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // Host memcpy via Tier-1 helper; Err on length mismatch propagates.
+        let (uninit, deps) = self.uninit.resolve()?;
+        let src = self
+            .src
+            .take()
+            .expect("WriteUsmUninit::execute called twice — internal eager bug");
+        let buf = uninit.write_from(src.as_slice())?;
+        // src drops at end of execute — memcpy is done, no async keep-alive.
+        self.out.put(buf, deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("write_usm_uninit".into());
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// usm_op.rs ports — USM alloc / wrap (pure host, synchronous)
+// ════════════════════════════════════════════════════════════════════════
+
+// ── Leaf: wrap a host Vec<T> as a USMSlice (eager UsmSliceOp) ───────────────
+
+/// Wrap a host `Vec<T>` as a [`USMSlice<T, M>`]. Source leaf (no upstream
+/// input); construction is pure host code (`USMSlice::new`) — no enqueue, no
+/// event (mode N/A). Mirrors [`Upload`]'s synchronous-create shape.
+pub struct UsmSlice<T, M: MemMode = ReadWrite> {
+    data: Option<Vec<T>>,
+    out: Pipe<USMSlice<T, M>>,
+}
+
+/// Build an eager USM-wrap leaf from a host `Vec<T>`.
+pub fn usm_slice<T, M>(data: Vec<T>) -> UsmSlice<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + Send + 'static,
+{
+    UsmSlice {
+        data: Some(data),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for UsmSlice<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + Send + 'static,
+{
+    type Output = USMSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<USMSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // USMSlice::new is pure host code — no in-flight event, mode N/A.
+        let data = self
+            .data
+            .take()
+            .expect("UsmSlice::execute called twice — internal eager bug");
+        let slice = USMSlice::new(ec.context(), data)?;
+        self.out.put(slice, Deps::new());
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("usm_slice".into());
+    }
+}
+
+// ── Leaf: alloc an uninit USMSlice (eager UsmSliceAllocUninit) ──────────────
+
+/// Allocate a [`USMSliceUninit<T, M>`]. Source leaf; allocation is pure host
+/// code (`USMSlice::alloc_uninit`) — no enqueue, no event (mode N/A). Mirrors
+/// [`Upload`]'s synchronous-create shape.
+pub struct UsmAllocUninit<T, M: MemMode = ReadWrite> {
+    len: usize,
+    out: Pipe<USMSliceUninit<T, M>>,
+    _t: PhantomData<fn() -> (T, M)>,
+}
+
+/// Build an eager uninit-USM alloc leaf.
+pub fn usm_alloc_uninit<T, M>(len: usize) -> UsmAllocUninit<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + Send + 'static,
+{
+    UsmAllocUninit {
+        len,
+        out: Pipe::new(),
+        _t: PhantomData,
+    }
+}
+
+impl<T, M> EagerOp for UsmAllocUninit<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + Send + 'static,
+{
+    type Output = USMSliceUninit<T, M>;
+
+    fn output_pipe(&self) -> Pipe<USMSliceUninit<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // alloc_uninit is pure host code — no in-flight event, mode N/A.
+        let uninit = USMSlice::<T, M>::alloc_uninit(ec.context(), self.len)?;
+        self.out.put(uninit, Deps::new());
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push(format!("usm_alloc_uninit(len={})", self.len));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// image_transfer.rs ports — image upload / download
+// ════════════════════════════════════════════════════════════════════════
+
+// ── Leaf: image upload (host pixels → image I) ──────────────────────────────
+
+/// Allocate an image of type `I` with `dims` and write `pixels` into it.
+/// Source-ish leaf (no upstream image input). The underlying image `write_op`
+/// has **only a non-blocking enqueue** (no native `wait_on`), so this op always
+/// uses `submit_on` and ignores `mode`; the source `pixels` is kept alive until
+/// the write event fires via `register_drop_callback`. Mirrors [`Upload`]
+/// (chain-entry) but carries a write event because the enqueue is non-blocking.
+pub struct ImageUploadEager<I: ImageHostTransfer> {
+    pixels: Option<Vec<I::Pixel>>,
+    dims: I::Dims,
+    out: Pipe<I>,
+    _ty: PhantomData<fn() -> I>,
+}
+
+/// Build an eager image-upload leaf.
+pub fn image_upload<I>(pixels: Vec<I::Pixel>, dims: I::Dims) -> ImageUploadEager<I>
+where
+    I: ImageHostTransfer + Send + 'static,
+    I::Pixel: Send + 'static,
+{
+    ImageUploadEager {
+        pixels: Some(pixels),
+        dims,
+        out: Pipe::new(),
+        _ty: PhantomData,
+    }
+}
+
+impl<I> EagerOp for ImageUploadEager<I>
+where
+    I: ImageHostTransfer + Send + 'static,
+    I::Pixel: Send + 'static,
+{
+    type Output = I;
+
+    fn output_pipe(&self) -> Pipe<I> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // `write_op` is non-blocking only — always submit_on, mode ignored.
+        let pixels = self
+            .pixels
+            .take()
+            .expect("ImageUploadEager::execute called twice — internal eager bug");
+        let mut img = I::alloc(ec.context(), self.dims)?;
+        // Source leaf: no upstream Input, so no wait-list to thread.
+        let event = img.write_op(&pixels).submit_on(ec)?;
+        // Keep-alive: the runtime reads from `pixels` until the write fires.
+        register_drop_callback(&event, Box::new(pixels))?;
+        self.out.put(img, vec![wrap_event(event)]);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("image_upload".into());
+    }
+}
+
+// ── Leaf: image download (image I → host Vec<Pixel>) ────────────────────────
+
+/// Consume an upstream image of type `I`, alloc a host `Vec<I::Pixel>`, and
+/// read the image into it. The underlying image `read_op` has **only a
+/// non-blocking enqueue** (no native `wait_on`), so this op always uses
+/// `submit_on` and ignores `mode`. Mirrors [`Download`] (output leaf) but
+/// without the blocking branch the buffer read has.
+pub struct ImageDownloadEager<I: ImageHostTransfer> {
+    img: Input<I>,
+    out: Pipe<Vec<I::Pixel>>,
+}
+
+/// Build an eager image-download leaf over an upstream image.
+pub fn image_download<I>(img: impl Into<Input<I>>) -> ImageDownloadEager<I>
+where
+    I: ImageHostTransfer + Send + 'static,
+    I::Pixel: Default + Copy + Send + 'static,
+{
+    ImageDownloadEager {
+        img: img.into(),
+        out: Pipe::new(),
+    }
+}
+
+impl<I> EagerOp for ImageDownloadEager<I>
+where
+    I: ImageHostTransfer + Send + 'static,
+    I::Pixel: Default + Copy + Send + 'static,
+{
+    type Output = Vec<I::Pixel>;
+
+    fn output_pipe(&self) -> Pipe<Vec<I::Pixel>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // `read_op` is non-blocking only — always submit_on, mode ignored.
+        let (img, deps) = self.img.resolve()?;
+        let pixel_count = img.pixel_count();
+        let mut pixels = vec![<I::Pixel as Default>::default(); pixel_count];
+        let event = img
+            .read_op(&mut pixels)?
+            .after_all(deps.iter().map(|d| d.as_ref()))
+            .submit_on(ec)?;
+        self.out.put(pixels, vec![wrap_event(event)]);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("image_download".into());
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// host_view.rs ports — acquire / release host views (map / unmap)
+// ════════════════════════════════════════════════════════════════════════
+//
+// The host-view types (`DeviceSliceHostView` / `MappedSliceHostView`) have
+// private fields, so the eager ops cannot reconstruct them directly. Instead
+// each eager op holds the buffer/view and delegates the exact enqueue body by
+// constructing the OLD `DeviceOperation` (via its public trait method
+// `acquire_host_view{,_read}` / `release_to_device`) and calling its
+// `execute(ec, deps)`. This reuses the old map/unmap body verbatim without
+// modifying the old module. None of these primitives has a native blocking
+// enqueue (the map/unmap is always non-blocking `false`), so `mode` is ignored.
+
+// ── Leaf: acquire a read/write DeviceSlice host view ────────────────────────
+
+/// Acquire a read/write host view of an upstream `DeviceSlice` via a
+/// non-blocking `clEnqueueMapBuffer`. Output is the owned
+/// [`DeviceSliceHostView`]. No native blocking enqueue — `mode` ignored.
+/// Delegates to the old `AcquireDeviceSliceOp` body via `acquire_host_view`.
+pub struct AcquireDeviceView<T, M: MemMode> {
+    buf: Input<DeviceSlice<T, M>>,
+    out: Pipe<DeviceSliceHostView<T, M, MapReadWrite>>,
+}
+
+/// Build an eager acquire-read/write-view leaf over an upstream `DeviceSlice`.
+pub fn acquire_device_view<T, M>(
+    buf: impl Into<Input<DeviceSlice<T, M>>>,
+) -> AcquireDeviceView<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + HostWritable + HostReadable,
+{
+    AcquireDeviceView {
+        buf: buf.into(),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for AcquireDeviceView<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + HostWritable + HostReadable,
+{
+    type Output = DeviceSliceHostView<T, M, MapReadWrite>;
+
+    fn output_pipe(&self) -> Pipe<Self::Output> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        let (buf, deps) = self.buf.resolve()?;
+        // Delegate to the old op's verbatim map body (map/unmap is always
+        // non-blocking — mode ignored).
+        let (view, out_deps) = buf.acquire_host_view().execute(ec, deps)?;
+        self.out.put(view, out_deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("acquire_device_view".into());
+    }
+}
+
+// ── Leaf: acquire a read-only DeviceSlice host view ─────────────────────────
+
+/// Acquire a read-only host view of an upstream `DeviceSlice`
+/// (`clEnqueueMapBuffer(CL_MAP_READ)`). Output is the owned
+/// [`DeviceSliceHostView`]. No native blocking enqueue — `mode` ignored.
+pub struct AcquireDeviceViewRead<T, M: MemMode> {
+    buf: Input<DeviceSlice<T, M>>,
+    out: Pipe<DeviceSliceHostView<T, M, MapReadOnly>>,
+}
+
+/// Build an eager acquire-read-only-view leaf over an upstream `DeviceSlice`.
+pub fn acquire_device_view_read<T, M>(
+    buf: impl Into<Input<DeviceSlice<T, M>>>,
+) -> AcquireDeviceViewRead<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + HostReadable,
+{
+    AcquireDeviceViewRead {
+        buf: buf.into(),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for AcquireDeviceViewRead<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + HostReadable,
+{
+    type Output = DeviceSliceHostView<T, M, MapReadOnly>;
+
+    fn output_pipe(&self) -> Pipe<Self::Output> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        let (buf, deps) = self.buf.resolve()?;
+        let (view, out_deps) = buf.acquire_host_view_read().execute(ec, deps)?;
+        self.out.put(view, out_deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("acquire_device_view_read".into());
+    }
+}
+
+// ── Leaf: release a DeviceSlice host view back to the device ─────────────────
+
+/// Enqueue `clEnqueueUnmapMemObject` for an upstream
+/// [`DeviceSliceHostView`] and yield the [`DeviceSlice`] back. No native
+/// blocking enqueue — `mode` ignored. Generic over the view's map-access mode.
+pub struct ReleaseDeviceView<T, M: MemMode, A: MapAccess> {
+    view: Input<DeviceSliceHostView<T, M, A>>,
+    out: Pipe<DeviceSlice<T, M>>,
+}
+
+/// Build an eager release-view leaf over an upstream `DeviceSliceHostView`.
+pub fn release_device_view<T, M, A>(
+    view: impl Into<Input<DeviceSliceHostView<T, M, A>>>,
+) -> ReleaseDeviceView<T, M, A>
+where
+    T: Send + 'static,
+    M: MemMode,
+    A: MapAccess,
+{
+    ReleaseDeviceView {
+        view: view.into(),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M, A> EagerOp for ReleaseDeviceView<T, M, A>
+where
+    T: Send + 'static,
+    M: MemMode,
+    A: MapAccess,
+{
+    type Output = DeviceSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        let (view, deps) = self.view.resolve()?;
+        let (buf, out_deps) = view.release_to_device().execute(ec, deps)?;
+        self.out.put(buf, out_deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("release_device_view".into());
+    }
+}
+
+// ── Leaf: acquire a read/write MappedSlice (SVM) host view ──────────────────
+
+/// Acquire a read/write SVM host view of an upstream `MappedSlice` via a
+/// non-blocking `clEnqueueSVMMap`. No native blocking enqueue — `mode` ignored.
+pub struct AcquireMappedView<T, M: MemMode> {
+    buf: Input<MappedSlice<T, M>>,
+    out: Pipe<MappedSliceHostView<T, M, MapReadWrite>>,
+}
+
+/// Build an eager acquire-read/write-SVM-view leaf over a `MappedSlice`.
+pub fn acquire_mapped_view<T, M>(
+    buf: impl Into<Input<MappedSlice<T, M>>>,
+) -> AcquireMappedView<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostWritable + HostReadable,
+{
+    AcquireMappedView {
+        buf: buf.into(),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for AcquireMappedView<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostWritable + HostReadable,
+{
+    type Output = MappedSliceHostView<T, M, MapReadWrite>;
+
+    fn output_pipe(&self) -> Pipe<Self::Output> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        let (buf, deps) = self.buf.resolve()?;
+        let (view, out_deps) = buf.acquire_host_view().execute(ec, deps)?;
+        self.out.put(view, out_deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("acquire_mapped_view".into());
+    }
+}
+
+// ── Leaf: acquire a read-only MappedSlice (SVM) host view ───────────────────
+
+/// Acquire a read-only SVM host view of an upstream `MappedSlice`
+/// (`clEnqueueSVMMap(CL_MAP_READ)`). No native blocking enqueue — `mode`
+/// ignored.
+pub struct AcquireMappedViewRead<T, M: MemMode> {
+    buf: Input<MappedSlice<T, M>>,
+    out: Pipe<MappedSliceHostView<T, M, MapReadOnly>>,
+}
+
+/// Build an eager acquire-read-only-SVM-view leaf over a `MappedSlice`.
+pub fn acquire_mapped_view_read<T, M>(
+    buf: impl Into<Input<MappedSlice<T, M>>>,
+) -> AcquireMappedViewRead<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostReadable,
+{
+    AcquireMappedViewRead {
+        buf: buf.into(),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for AcquireMappedViewRead<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostReadable,
+{
+    type Output = MappedSliceHostView<T, M, MapReadOnly>;
+
+    fn output_pipe(&self) -> Pipe<Self::Output> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        let (buf, deps) = self.buf.resolve()?;
+        let (view, out_deps) = buf.acquire_host_view_read().execute(ec, deps)?;
+        self.out.put(view, out_deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("acquire_mapped_view_read".into());
+    }
+}
+
+// ── Leaf: release a MappedSlice (SVM) host view back to the device ───────────
+
+/// Enqueue `clEnqueueSVMUnmap` for an upstream [`MappedSliceHostView`] and
+/// yield the [`MappedSlice`] back. No native blocking enqueue — `mode` ignored.
+/// Generic over the view's map-access mode.
+pub struct ReleaseMappedView<T, M: MemMode, A: MapAccess> {
+    view: Input<MappedSliceHostView<T, M, A>>,
+    out: Pipe<MappedSlice<T, M>>,
+}
+
+/// Build an eager release-SVM-view leaf over an upstream `MappedSliceHostView`.
+pub fn release_mapped_view<T, M, A>(
+    view: impl Into<Input<MappedSliceHostView<T, M, A>>>,
+) -> ReleaseMappedView<T, M, A>
+where
+    T: Send + 'static,
+    M: MemMode,
+    A: MapAccess,
+{
+    ReleaseMappedView {
+        view: view.into(),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M, A> EagerOp for ReleaseMappedView<T, M, A>
+where
+    T: Send + 'static,
+    M: MemMode,
+    A: MapAccess,
+{
+    type Output = MappedSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<MappedSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        let (view, deps) = self.view.resolve()?;
+        let (buf, out_deps) = view.release_to_device().execute(ec, deps)?;
+        self.out.put(buf, out_deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("release_mapped_view".into());
     }
 }
