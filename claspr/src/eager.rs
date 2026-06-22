@@ -393,7 +393,8 @@ pub trait EagerOpExt: EagerOp + Sized {
     where
         Self::Output: crate::mappable::Mappable,
         F: for<'a> FnOnce(<Self::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
-            + Send,
+            + Send
+            + 'static,
     {
         AndThenHost {
             source: self,
@@ -412,7 +413,8 @@ pub trait EagerOpExt: EagerOp + Sized {
                 &Context,
                 <Self::Output as crate::mappable::Mappable>::View<'a>,
             ) -> Result<()>
-            + Send,
+            + Send
+            + 'static,
     {
         AndThenHostWithContext {
             source: self,
@@ -431,7 +433,22 @@ pub trait EagerOpExt: EagerOp + Sized {
         // events (Blocking); upstream ops pipeline. Single-output ops use the
         // default `into_output` (drain output pipe + wait); multi-output ops
         // override it to scatter-then-reconstruct the tuple.
-        self.into_output(&ec, ExecMode::Blocking)
+        let result = self.into_output(&ec, ExecMode::Blocking);
+        match result {
+            // A failing `and_then_host` worker stashed its rich error and signalled
+            // its user event negative; the blocking wait may return the cl_event
+            // cascade (`Error::OpenCl(-1)`). Prefer the stashed variant.
+            Err(cascade) => Err(ec.take_host_error().unwrap_or(cascade)),
+            // Even on a "successful" wait, a worker may have stashed an error the
+            // wait did NOT surface: pocl does not cascade negative user-event
+            // status to commands downstream of it (and a discarded-handle chain
+            // may not even wait on the failing op's events). A non-empty slot is
+            // itself the failure signal — check it. (Same as the async terminal.)
+            Ok(v) => match ec.take_host_error() {
+                Some(rust_err) => Err(rust_err),
+                None => Ok(v),
+            },
+        }
     }
 
     /// Async terminal — run `self` on `context` and return a future that
@@ -478,6 +495,26 @@ impl<T: EagerOp> EagerOpExt for T {}
 
 // ── AndThen: source then next; next eagerly built over source's pipe ───
 
+/// If `src_pipe` still holds a value (the `and_then` closure discarded the
+/// source's handle), merge its stranded events into `out_pipe`'s deps so the
+/// whole chain's events still gate the terminal. See `AndThen::collect`. No-op
+/// when the source pipe was consumed by `next` (the normal case). The discarded
+/// source value drops.
+fn thread_orphaned_source_deps<A, B>(src_pipe: &Pipe<A>, out_pipe: &Pipe<B>) {
+    // Source pipe consumed by `next` (the normal case) → nothing to thread.
+    let Some((_discarded, src_deps)) = src_pipe.take() else {
+        return;
+    };
+    // Merge the stranded source events into the out pipe's deps. If `out_pipe` is
+    // empty (a multi-output `next` whose storage is its element pipes, not
+    // `output_pipe`), `execute` isn't the gather path — `collect` handles
+    // orphaned deps for that case directly, so this is a no-op here.
+    if let Some((v, mut deps)) = out_pipe.take() {
+        deps.extend(src_deps);
+        out_pipe.put(v, deps);
+    }
+}
+
 /// Sequential composition node. Holds the source op and the **already-built**
 /// downstream op (which reads the source's output via a [`Pipe`]). No `FnOnce`.
 pub struct AndThen<S, U> {
@@ -505,8 +542,14 @@ where
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         // Source is always upstream → must pipeline (its output feeds `next`).
         // Only the tail inherits the caller's `mode` (Blocking iff terminal).
+        // Capture the source's output pipe BEFORE moving it, so we can thread any
+        // events the `next` op discarded (see `collect`'s note on orphaned deps).
+        let src_pipe = self.source.output_pipe();
+        let out_pipe = self.next.output_pipe();
         self.source.execute(ec, ExecMode::Pipelined)?;
-        self.next.execute(ec, mode)
+        self.next.execute(ec, mode)?;
+        thread_orphaned_source_deps(&src_pipe, &out_pipe);
+        Ok(())
     }
 
     fn collect(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(U::Output, Deps)>
@@ -518,8 +561,22 @@ where
         // (scatter-then-reconstruct over its per-element pipes) rather than the
         // default single-pipe drain — whose `output_pipe` it never fills. The
         // source pipelines; only the tail observes the terminal `mode`.
+        let src_pipe = self.source.output_pipe();
         self.source.execute(ec, ExecMode::Pipelined)?;
-        self.next.collect(ec, mode)
+        let (value, mut deps) = self.next.collect(ec, mode)?;
+        // ORPHANED DEPS: if the `and_then` closure discarded the source's handle
+        // (e.g. `.and_then(|_buf| value(0))`), the source's value + events are
+        // still sitting un-taken in its output pipe. Those events MUST still gate
+        // the terminal — most critically when the source is an `and_then_host`
+        // whose worker thread signals completion via a user event; without this,
+        // `sync` would return before the worker ran. Thread them in. (The old
+        // closure layer got this for free by passing `prior_evts` into
+        // `next.execute`.) The discarded value drops here — the closure didn't
+        // want it; its `cl_mem` is retained by any in-flight unmap until done.
+        if let Some((_discarded, src_deps)) = src_pipe.take() {
+            deps.extend(src_deps);
+        }
+        Ok((value, deps))
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -2851,33 +2908,28 @@ where
 /// Run a host closure on a borrowed [`Mappable::View`](crate::mappable::Mappable::View) of the upstream output,
 /// in chain order — built by [`and_then_host`](EagerOpExt::and_then_host).
 ///
-/// At execute: run the source, take its `(value, deps)`, **drain the deps
-/// (blocking wait)** so the data is host-valid, map the value, run the closure
-/// on its view (mutations persist via the unmap), then forward the **same**
-/// value downstream (`Output = S::Output`).
+/// ## In-queue, worker-thread (NOT submit-thread)
 ///
-/// ## 🚨 REGRESSION: currently synchronous, MUST become worker-thread-spawned
+/// At execute (on the submitting thread, all non-blocking): gather the source,
+/// enqueue maps for its value (wait-list = its upstream events), create a user
+/// event downstream gates on, enqueue the unmaps gated on that user event, then
+/// **spawn a worker thread** and return immediately — the chain continues at
+/// submit time, the host stage overlaps pipelined device work.
 ///
-/// This node currently runs the host call **synchronously at execute** (drain
-/// upstream deps with a blocking wait, map, wait the map event, run the closure,
-/// unmap, wait, forward). **That is a regression, not an acceptable
-/// simplification.** The old closure-layer `and_then_host`
-/// (`claspr/src/and_then_host.rs`) deliberately engineered map →
-/// `clCreateUserEvent` → unmap(gated on the user event) → **spawned worker
-/// thread** precisely so a host stage sits *in-queue* and overlaps pipelined
-/// device work — the chain continues at submit time, not when the closure
-/// returns. The whole map/user-event apparatus exists for exactly that. Running
-/// it on the submitting thread throws that away and serializes the chain.
+/// The worker waits the map events (host-side, on its own thread), runs the
+/// closure on the view inside `catch_unwind` (mutations persist via the unmap),
+/// and signals the user event: `CL_COMPLETE` on success, negative on closure
+/// `Err` / panic (→ `Error::HostPanic`) / map failure. `Output = S::Output`
+/// (the value passes through unchanged).
 ///
-/// TODO (tracked in NOTES "SERIOUS REGRESSION"): port the old async machinery —
-/// worker thread waits the all-data-mapped events, runs the closure under
-/// `catch_unwind`, signals a user event (CL_COMPLETE / negative); `execute`
-/// returns the unmap events as deps so downstream gates on the user event
-/// WITHOUT the submit thread blocking. Reinstate the `ExecutionContext`
-/// host-error slot (rich Rust error survives the negative-status cascade) and
-/// the defensive sync-unmap-on-error. The `catch_unwind` → `Error::HostPanic`
-/// behaviour stays as the worker's panic handling. Do NOT conflate this with
-/// the genuinely-synchronous host-VALUE seam (`and_then_host_value`).
+/// **Errors** are stashed in the chain-wide host-error slot on the
+/// `ExecutionContext` and the user event is signalled
+/// negative; the status cascades through the in-queue dependency graph and the
+/// terminal (`sync` / `run`) prefers the stashed rich variant over the
+/// `Error::OpenCl(-1)` cascade. On error the worker forces a defensive
+/// synchronous unmap so the buffer is left clean. This mirrors the old
+/// closure-layer `and_then_host.rs` exactly. (Distinct from any future
+/// host-VALUE seam, which would be pure host compute with no map.)
 pub struct AndThenHost<S: EagerOp, F>
 where
     S::Output: crate::mappable::Mappable,
@@ -2898,76 +2950,154 @@ where
     out: Pipe<S::Output>,
 }
 
-/// Shared body: run source, drain its deps host-side, map, run `host_call` on
-/// the view, unmap, and forward the value with the unmap event as deps.
+/// Shared body for the host seam: enqueue maps for the source value (wait-list =
+/// its upstream events), create a user event downstream gates on, enqueue the
+/// unmaps (gated on the user event), then **spawn a worker thread** that waits
+/// the map events, runs `host_call` on the view, and signals the user event.
+/// Returns the (unchanged) value + the unmap events as deps **without blocking
+/// the submitting thread** — so the host stage sits *in-queue* and overlaps
+/// pipelined device work. This is the async machinery ported from the old
+/// closure-layer `and_then_host.rs`; running it synchronously was a regression.
 ///
-/// 🚨 REGRESSION: this is the synchronous (submit-thread) implementation. It MUST
-/// be replaced by the worker-thread + user-event machinery from the old
-/// `and_then_host.rs` so the host stage overlaps device work — see the
-/// `AndThenHost` doc above and NOTES "SERIOUS REGRESSION".
-fn run_host_seam<O>(
+/// Errors (closure `Err`, panic → `HostPanic`, map-wait failure) are stashed in
+/// the chain-wide host-error slot (first-writer-wins) and the user event is
+/// signalled with a negative status; the negative status cascades through the
+/// in-queue dependency graph and the terminal (`sync`/`run`) prefers the stashed
+/// rich variant over the `Error::OpenCl(-1)` cascade.
+fn run_host_seam<O, F>(
     source_value: O,
     source_deps: Deps,
     ec: &ExecutionContext<'_>,
-    host_call: impl FnOnce(<O as crate::mappable::Mappable>::View<'_>) -> Result<()>,
+    host_call: F,
 ) -> Result<(O, Deps)>
 where
     O: crate::mappable::Mappable,
+    F: for<'a> FnOnce(<O as crate::mappable::Mappable>::View<'a>) -> Result<()> + Send + 'static,
 {
-    use crate::Launcher;
     use crate::mappable::Mappable;
-    // Drain upstream events so the mapped memory is host-valid before the
-    // closure reads it (the host seam's defining wait).
-    for d in &source_deps {
-        d.as_ref().wait().map_err(Error::OpenCl)?;
-    }
+    use crate::{Launcher, complete_user_event, create_user_event};
+    use std::sync::Arc;
+
     let q = ec.cl_queue();
-    // Non-blocking map (deps already drained → empty wait-list), then wait its
-    // event synchronously so the view is coherent.
-    let (mut handle, map_events) = source_value.map(q, &[])?;
-    for ev in &map_events {
-        ev.wait().map_err(Error::OpenCl)?;
-    }
-    // Run the host closure on the borrowed view, inside `catch_unwind` so a
-    // panic becomes `Error::HostPanic` rather than unwinding the caller
-    // (mirrors the old closure-layer `and_then_host`). On Err or panic, the
-    // handle's `Drop` issues the defensive blocking unmap (unmap_enqueued still
-    // false), so the buffer is left clean.
-    {
-        use std::panic::{AssertUnwindSafe, catch_unwind};
-        let view = <O as Mappable>::view(&mut handle);
-        match catch_unwind(AssertUnwindSafe(|| host_call(view))) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(panic) => {
-                // `catch_unwind` yields `Box<dyn Any + Send>`; the payload is
-                // typically `&'static str` (`panic!("lit")`) or `String`
-                // (`panic!("{}", x)`). Anything else gets a placeholder.
-                let msg = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "non-string panic payload".to_string());
-                return Err(Error::HostPanic(msg));
+    // Non-blocking maps with the upstream events as wait-list — the worker waits
+    // these (host-side, on its own thread) before reading the mapped memory.
+    let source_cl: Vec<crate::cl_event> = source_deps.iter().map(|d| d.as_ref().get()).collect();
+    let (mut handle, map_events) = source_value.map(q, &source_cl)?;
+
+    // The user event downstream waits on (via the unmaps). Worker signals it.
+    let user_event = Arc::new(create_user_event(ec.context())?);
+
+    // Enqueue the unmaps gated on the user event — they fire once the worker
+    // signals completion. After this point we MUST signal the user event before
+    // any early return, or the queue would wait on it forever.
+    let unmap_events = match <O as Mappable>::enqueue_unmap(&mut handle, q, &[user_event.get()]) {
+        Ok(evs) => evs,
+        Err(e) => {
+            let _ = complete_user_event(&user_event, -1);
+            return Err(e);
+        }
+    };
+
+    // Spawn the worker. It owns the handle, the map events, the source events
+    // (for upstream-error short-circuit), the user-event Arc clone, the chain's
+    // host-error slot, and the closure.
+    let worker_user_event = Arc::clone(&user_event);
+    let worker_host_error = ec.host_error_slot();
+    std::thread::spawn(move || {
+        let (status, mut handle, rust_err) =
+            run_host_worker::<O, F>(handle, map_events, source_deps, host_call);
+        // Stash the rich Rust error before signalling, so the terminal can prefer
+        // it over the cl_event cascade. First-writer-wins (a concurrent failing
+        // host worker in the same bundle/fan-out may already have written).
+        if let Some(err) = rust_err {
+            let mut slot = worker_host_error.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(err);
             }
         }
+        if status < 0 {
+            // On error the queued unmap (waiting on the user event) is terminated
+            // by the runtime rather than executing — leaving the buffer mapped.
+            // Force the defensive sync unmap NOW so the buffer is clean by the
+            // time the terminal observes the error.
+            <O as Mappable>::mark_unmap_not_done(&mut handle);
+            drop(handle);
+        }
+        let _ = complete_user_event(&worker_user_event, status);
+        // Success path: handle drops here (no-op — the queued unmap fires via the
+        // user event on its own).
+    });
+
+    // Downstream gates on the unmap events (transitively the user event). When
+    // the output has no buffers (scalar / unit), unmaps are empty — fall back to
+    // the user event directly so downstream still has a gate.
+    let deps_out: Deps = if unmap_events.is_empty() {
+        vec![user_event]
+    } else {
+        unmap_events.into_iter().map(wrap_event).collect()
+    };
+    Ok((source_value, deps_out))
+}
+
+/// Worker body for [`run_host_seam`]. Waits the source + map events, runs the
+/// closure under `catch_unwind`, and returns `(status, handle, optional rich
+/// error)` so the caller can stash the error + trigger the defensive unmap on
+/// failure. `status` is `CL_COMPLETE` on success, negative otherwise.
+fn run_host_worker<O, F>(
+    mut handle: O::MapHandle,
+    map_events: Vec<crate::Event>,
+    source_deps: Deps,
+    host_call: F,
+) -> (i32, O::MapHandle, Option<Error>)
+where
+    O: crate::mappable::Mappable,
+    F: for<'a> FnOnce(<O as crate::mappable::Mappable>::View<'a>) -> Result<()> + Send + 'static,
+{
+    use crate::mappable::Mappable;
+    use opencl3::event::CL_COMPLETE;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    // Short-circuit on an upstream chain error (negative source-event status,
+    // e.g. a previous failing host seam). Don't stash — the upstream already did.
+    for ev in &source_deps {
+        if ev.as_ref().wait().is_err() {
+            return (-1, handle, None);
+        }
     }
-    // Commit mutations: enqueue the unmap (no waiter) and wait its event.
-    let unmap_events = <O as Mappable>::enqueue_unmap(&mut handle, q, &[])?;
-    let unmap_deps: Deps = unmap_events.into_iter().map(wrap_event).collect();
-    for d in &unmap_deps {
-        d.as_ref().wait().map_err(Error::OpenCl)?;
+    // Map-event failure is a host-observable CL error — stash the real cause.
+    for ev in &map_events {
+        if let Err(e) = ev.wait() {
+            return (-1, handle, Some(Error::OpenCl(e)));
+        }
     }
-    // `handle` drops here — `unmap_enqueued` is true, so no second unmap.
-    drop(handle);
-    Ok((source_value, unmap_deps))
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let view = <O as Mappable>::view(&mut handle);
+        host_call(view)
+    }));
+    match result {
+        Ok(Ok(())) => (CL_COMPLETE, handle, None),
+        Ok(Err(rust_err)) => (-1, handle, Some(rust_err)),
+        Err(panic) => {
+            // `catch_unwind` yields `Box<dyn Any + Send>`; the payload is
+            // typically `&'static str` (`panic!("lit")`) or `String`
+            // (`panic!("{}", x)`). Anything else gets a placeholder.
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            (-1, handle, Some(Error::HostPanic(msg)))
+        }
+    }
 }
 
 impl<S, F> EagerOp for AndThenHost<S, F>
 where
     S: EagerOp,
     S::Output: crate::mappable::Mappable,
-    F: for<'a> FnOnce(<S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()> + Send,
+    F: for<'a> FnOnce(<S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
+        + Send
+        + 'static,
 {
     type Output = S::Output;
 
@@ -2987,7 +3117,7 @@ where
             .f
             .take()
             .expect("AndThenHost::execute called twice — internal eager bug");
-        let (out_value, out_deps) = run_host_seam::<S::Output>(value, deps, ec, f)?;
+        let (out_value, out_deps) = run_host_seam::<S::Output, F>(value, deps, ec, f)?;
         self.out.put(out_value, out_deps);
         Ok(())
     }
@@ -3003,7 +3133,8 @@ where
     S: EagerOp,
     S::Output: crate::mappable::Mappable,
     F: for<'a> FnOnce(&Context, <S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
-        + Send,
+        + Send
+        + 'static,
 {
     type Output = S::Output;
 
@@ -3022,11 +3153,12 @@ where
             .f
             .take()
             .expect("AndThenHostWithContext::execute called twice — internal eager bug");
-        // Bind the context up front so the `host_call` closure borrows it
-        // (cheap Arc-backed handle); the view borrow is supplied by the seam.
+        // Move a `Context` clone (cheap, Arc-backed, 'static) into the worker
+        // closure so it can call `f(&context, view)`; the view borrow is supplied
+        // by the seam. The closure is Send + 'static (context + f both are).
         let context = ec.context().clone();
         let (out_value, out_deps) =
-            run_host_seam::<S::Output>(value, deps, ec, move |view| f(&context, view))?;
+            run_host_seam::<S::Output, _>(value, deps, ec, move |view| f(&context, view))?;
         self.out.put(out_value, out_deps);
         Ok(())
     }
@@ -3140,25 +3272,27 @@ where
 /// chain's commands have all completed on the device (or immediately, with an
 /// error, if the chain failed to submit or any host seam returned `Err`).
 ///
-/// The eager analog of `chain_future::ChainFuture`. The key simplification
-/// versus the old layer: the eager host seam (`run_host_seam`) runs its closure
-/// synchronously inside `execute` and returns `Err` directly, rather than
-/// stashing into a shared `Arc<Mutex<Option<Error>>>` from a worker thread. So a
-/// host-side failure is already captured as a synchronous `Err` from `execute`
-/// and becomes [`Errored`](Self::Errored) — there is no poll-time host-error
-/// slot to reconcile.
+/// The eager analog of `chain_future::ChainFuture`. The host seam
+/// (`run_host_seam`) runs its closure on a worker thread and stashes any failure
+/// into the chain's host-error slot before signalling its user event with a
+/// negative status. That status cascades into the trailing marker, so the
+/// future's marker poll resolves with `Err`; [`Running`](Self::Running) then
+/// prefers the stashed rich variant (closure `Err`, `HostPanic`) over the
+/// `Error::OpenCl(-1)` cascade — mirroring the `sync` terminal.
 #[cfg(feature = "async-events")]
 pub enum EagerChainFuture<T> {
-    /// Chain failed during setup, `execute` (including a host-seam closure
-    /// `Err`/panic), or marker enqueue. The error surfaces on the first `poll`.
+    /// Chain failed during setup, `execute`, or marker enqueue. The error
+    /// surfaces on the first `poll`.
     Errored(Option<Error>),
     /// Chain submitted successfully; waiting for the trailing marker event to
     /// complete. The host-side `Output` is already materialised (drained from
     /// the output pipe at `run` time); the future just gates *when* the caller
-    /// sees it on whether the queue work is done.
+    /// sees it on whether the queue work is done. `host_error` is the chain's
+    /// stash, preferred over the cl_event cascade if the marker resolves `Err`.
     Running {
         output: Option<T>,
         event_future: crate::EventFuture,
+        host_error: std::sync::Arc<std::sync::Mutex<Option<Error>>>,
     },
 }
 
@@ -3182,12 +3316,29 @@ impl<T: Unpin> std::future::Future for EagerChainFuture<T> {
             EagerChainFuture::Running {
                 output,
                 event_future,
+                host_error,
             } => match std::pin::Pin::new(event_future).poll(cx) {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Ready(Ok(())) => Poll::Ready(Ok(output
-                    .take()
-                    .expect("EagerChainFuture polled after Ready (Running)"))),
+                // Marker resolved Err: a host worker (or a CL command) failed.
+                // Prefer the rich Rust variant the worker stashed over the
+                // cl_event cascade, mirroring `sync`.
+                Poll::Ready(Err(e)) => {
+                    Poll::Ready(Err(host_error.lock().unwrap().take().unwrap_or(e)))
+                }
+                // Even on a "successful" marker, a host worker may have stashed
+                // an error the marker did NOT propagate: pocl's
+                // `clEnqueueMarkerWithWaitList` does not cascade negative status
+                // from a user event in its wait-list (it reports CL_COMPLETE while
+                // the chain genuinely failed). A non-empty slot is itself the
+                // failure signal. (Same handling as the old `ChainFuture`.)
+                Poll::Ready(Ok(())) => {
+                    if let Some(rust_err) = host_error.lock().unwrap().take() {
+                        return Poll::Ready(Err(rust_err));
+                    }
+                    Poll::Ready(Ok(output
+                        .take()
+                        .expect("EagerChainFuture polled after Ready (Running)")))
+                }
             },
         }
     }
@@ -3215,14 +3366,17 @@ where
         Err(e) => return EagerChainFuture::Errored(Some(e)),
     };
     let ec = ExecutionContext::new(context, device.clone(), queue.raw());
+    // Clone the chain's host-error slot out before `ec` drops — host-seam workers
+    // stash failures here, and the future reconciles them at poll time.
+    let host_error = ec.host_error_slot();
 
     // 2-3. Run the chain non-blocking and gather its result via `collect` —
     //    the uniform gather seam. `collect` dispatches to the right per-op
     //    reconstruction (single OR multi-output: bundle*, arc_split, the copy
     //    pair all yield their reconstructed value + joined deps), so the async
-    //    terminal supports every arity the blocking `sync` does. The eager host
-    //    seam executes its closure here and returns any `Err` synchronously (no
-    //    worker-thread stash), so a host failure becomes `Errored` directly.
+    //    terminal supports every arity the blocking `sync` does. A host-seam
+    //    setup error (map/unmap enqueue) still surfaces synchronously here; a
+    //    host-CLOSURE failure surfaces at poll time via the host-error slot.
     let (output, deps) = match chain.collect(&ec, ExecMode::Pipelined) {
         Ok(pair) => pair,
         Err(e) => {
@@ -3263,5 +3417,6 @@ where
     EagerChainFuture::Running {
         output: Some(output),
         event_future: marker.into_future(),
+        host_error,
     }
 }
