@@ -18,16 +18,11 @@
 //!   `.and_then_with_context(...)`                → same name on `EagerOpExt`
 //!   `kernel(...).on_device(dev)`                 → same `.on_device(...)` eager op
 //!
-//! ## Single-device runners (pocl)
-//!
-//! The old tests routed to `device_at(1)` and skipped when only one device was
-//! available. On the common single-device pocl runner, migrating a buffer to the
-//! device it already lives on is a valid **no-op exercise**: the migrate is still
-//! enqueued and its event still threads through the chain's deps, so it proves
-//! the op enqueues + composes correctly even where there is no second device. So
-//! these tests pick the target index as `min(desired, num_devices - 1)` — they
-//! run for real everywhere, and exercise true cross-device movement when a second
-//! device exists.
+//! Both tests need a genuine two-device context (a real two-device platform or a
+//! sub-device partition) and **skip otherwise** — same as `transfer_to_device.rs`.
+//! They route to `device_at(0)` / `device_at(1)` and exercise real cross-device
+//! migration; there is no single-device no-op fallback (migrating to the device a
+//! buffer already lives on wouldn't test cross-device movement).
 
 use claspr::device::Platform;
 use claspr::eager::{EagerOpExt, download, transfer_to_device, upload};
@@ -36,11 +31,10 @@ use claspr_test_kernels::kernels;
 
 const N: usize = 64;
 
-/// Build a context: prefer a real two-device platform, then a sub-device
-/// partition, else fall back to a single default device (so the tests still run
-/// on pocl). Mirrors `transfer_to_device.rs`'s discovery, with a single-device
-/// fallback appended.
-fn ctx() -> Option<Context> {
+/// Build a genuine two-device context: prefer a real two-device platform, then a
+/// sub-device partition. Returns `None` (test skips) when no two-device context
+/// is available — mirrors `transfer_to_device.rs::ctx_two_devices`.
+fn ctx_two_devices() -> Option<Context> {
     if let Ok(platforms) = Platform::all() {
         for p in platforms {
             if let Ok(devs) = p.devices()
@@ -76,35 +70,26 @@ fn ctx() -> Option<Context> {
             }
         }
     }
-    // Single-device fallback — migrate-to-same-device is a valid no-op exercise.
-    match Context::any() {
-        Ok(ctx) => Some(ctx),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device available");
-            None
-        }
-    }
+    eprintln!("SKIP: no two-device context available (real or sub-device)");
+    None
 }
 
 /// transfer_to_device.rs::transfer_to_device_completes_in_chain —
-/// upload → transfer → kernel.on_device → download. The transfer is a queue
-/// command (non-blocking); the chain completes without an explicit `.wait()`,
-/// without hang, and the result matches. Routes to `device_at(1)` where a second
-/// device exists, else `device_at(0)` (migrate no-op).
+/// upload → transfer to dev[1] → kernel.on_device(dev[1]) → download. The
+/// transfer is a queue command (non-blocking); the chain completes without an
+/// explicit `.wait()`, without hang, and the result matches.
 #[test]
 fn transfer_to_device_completes_in_chain() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_two_devices() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
-    // Desired second device, clamped to what's actually present.
-    let target = (ctx.devices().len() - 1).min(1);
 
     let result: Vec<u32> = upload::<u32, ReadWrite, _>(vec![5u32; N])
-        .and_then_with_context(move |ec, buf| transfer_to_device(buf, ec.device_at(target)))
+        .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(1)))
         .and_then_with_context(move |ec, buf| {
             kernels_ref
                 .scale_u32([N], buf, 4)
-                .on_device(ec.device_at(target))
+                .on_device(ec.device_at(1))
         })
         .and_then(download)
         .sync(&ctx)
@@ -116,33 +101,27 @@ fn transfer_to_device_completes_in_chain() {
 
 /// transfer_to_device.rs::transfer_then_on_device_matches_scenario_14_shape —
 /// the literal scenario-14 shape (transfer → scale → transfer → scale →
-/// transfer → download). Regression test for the cross-device pipeline. Each
-/// transfer/scale is routed via `device_at(i)`, clamped to the available device
-/// count (so on single-device pocl every stage runs on device 0 and the
-/// migrates are no-ops, but still enqueue + thread deps).
+/// transfer → download). Regression test for the cross-device pipeline.
 #[test]
 fn transfer_then_on_device_matches_scenario_14_shape() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_two_devices() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
-    let ndev = ctx.devices().len();
-    let d0 = 0usize;
-    let d1 = (ndev - 1).min(1);
 
     let result: Vec<u32> = upload::<u32, ReadWrite, _>(vec![1u32; N])
-        .and_then_with_context(move |ec, buf| transfer_to_device(buf, ec.device_at(d0)))
+        .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(0)))
         .and_then_with_context(move |ec, buf| {
             kernels_ref
                 .scale_u32([N], buf, 2)
-                .on_device(ec.device_at(d0))
+                .on_device(ec.device_at(0))
         })
-        .and_then_with_context(move |ec, buf| transfer_to_device(buf, ec.device_at(d1)))
+        .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(1)))
         .and_then_with_context(move |ec, buf| {
             kernels_ref
                 .scale_u32([N], buf, 10)
-                .on_device(ec.device_at(d1))
+                .on_device(ec.device_at(1))
         })
-        .and_then_with_context(move |ec, buf| transfer_to_device(buf, ec.device_at(d0)))
+        .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(0)))
         .and_then(download)
         .sync(&ctx)
         .expect("scenario-14 chain");
