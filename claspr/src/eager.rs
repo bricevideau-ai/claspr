@@ -1921,6 +1921,88 @@ where
     }
 }
 
+// ── Leaf: write host data into an existing (init) DeviceSlice ───────────────
+
+/// Write host `src` into an already-initialised `DeviceSlice`, in place, via a
+/// non-blocking `clEnqueueWriteBuffer` — the eager analog of the closure layer's
+/// `device_slice_write(buf, src)`. The buffer passes through as the op's output.
+///
+/// This is a real **async host→device transfer** (a queue command), NOT a
+/// map/host-memcpy/unmap host seam: `submit_on` enqueues `CL_FALSE` and returns
+/// the write event as the op's deps, so the write overlaps downstream device
+/// work; `register_drop_callback` keeps the host `src` alive until the DMA
+/// completes (`CL_COMPLETE`). The `Blocking` terminal path uses `wait_on`
+/// (`CL_BLOCKING`) instead, mirroring [`WriteDeviceUninit`].
+pub struct WriteDevice<T, M: MemMode = ReadWrite> {
+    buf: Input<DeviceSlice<T, M>>,
+    src: Option<UploadSource<T>>,
+    out: Pipe<DeviceSlice<T, M>>,
+}
+
+/// Build an eager in-place write leaf over an existing `DeviceSlice` (concrete or
+/// piped). `M: HostWritable` — same gate as the closure layer's
+/// `device_slice_write`.
+pub fn write<T, M, S>(buf: impl Into<Input<DeviceSlice<T, M>>>, src: S) -> WriteDevice<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostWritable + Send + 'static,
+    S: Into<UploadSource<T>>,
+{
+    WriteDevice {
+        buf: buf.into(),
+        src: Some(src.into()),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> EagerOp for WriteDevice<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostWritable + Send + 'static,
+{
+    type Output = DeviceSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        let (mut buf, deps) = self.buf.resolve()?;
+        let src = self
+            .src
+            .take()
+            .expect("WriteDevice::execute called twice — internal eager bug");
+        match mode {
+            ExecMode::Blocking => {
+                buf.write(src.as_slice())
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .wait_on(ec)?;
+                // Blocking write completed — `src` drops at end of execute.
+                self.out.put(buf, Deps::new());
+            }
+            ExecMode::Pipelined => {
+                let event = buf
+                    .write(src.as_slice())
+                    .after_all(deps.iter().map(|d| d.as_ref()))
+                    .submit_on(ec)?;
+                // Keep-alive: drop the host source when CL_COMPLETE fires (the
+                // runtime is done reading the host heap exactly then).
+                register_drop_callback(&event, Box::new(src))?;
+                self.out.put(buf, vec![wrap_event(event)]);
+            }
+        }
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("write".into());
+    }
+}
+
 // ── Leaf: write host data into a MappedSliceUninit → MappedSlice ────────────
 
 /// Eager analog of `WriteFromUninitOp<MappedSliceUninit, _>`. Mirrors

@@ -191,6 +191,7 @@ pub use eager::{
     bundle13 as eager_bundle13, bundle14 as eager_bundle14, bundle15 as eager_bundle15,
     bundle16 as eager_bundle16, fan_out as eager_fan_out, forward as eager_forward,
     lift as eager_lift, transfer_to_device as eager_transfer_to_device, value as eager_value,
+    write as eager_write,
 };
 pub use exec_ctx::ExecutionContext;
 pub use fan_out::{FanOut, FanOutExt, fan_out};

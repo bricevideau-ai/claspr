@@ -4,9 +4,8 @@
 //! Old → new mapping:
 //!   `device_slice_alloc_zero!(u32, N)`  → `alloc_zero::<u32, ReadWrite>(N)`
 //!   `device_slice_fill(buf, v)`         → `fill(buf, v)`
-//!   `device_slice_write(buf, vec)`      → `write_device_uninit` is uninit-only;
-//!       for an already-initialised buffer the eager verb is a host-view write —
-//!       see `device_slice_write_*` below (uses the `and_then_host` host seam).
+//!   `device_slice_write(buf, vec)`      → `write(buf, vec)` (eager `write` op:
+//!       the same non-blocking `clEnqueueWriteBuffer`, not a host-view seam).
 //!   `src.copy_to(dst)`                  → `eager_copy_to(src, dst)` (2-output:
 //!       `.and_then(|(_src, dst)| download(dst))`).
 //!   `upload!(v)`                        → `upload::<T, ReadWrite, _>(v)`
@@ -20,7 +19,9 @@
 //! `eager_copy_to` head — `eager_copy_to`'s `Src: CopyTo<Dst>` bound covers all
 //! the same Mapped→Mapped / Mapped→USM pairs. Same values, same assertions.
 
-use claspr::eager::{EagerOpExt, alloc_zero, bundle2, download, eager_copy_to, fill, upload};
+use claspr::eager::{
+    EagerOpExt, alloc_zero, bundle2, download, eager_copy_to, fill, upload, write,
+};
 use claspr::{Buffer, Context, DeviceSlice, Error, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
 
@@ -152,20 +153,16 @@ fn device_slice_copy_length_mismatch_errors() {
 
 // ── device_slice_write ─────────────────────────────────────────────
 
-/// buffer_ops.rs::device_slice_write_into_existing_buffer — write a host vec
-/// into an existing buffer. The eager host-write verb for an already-allocated
-/// buffer is the `and_then_host` seam (write-mapped view): alloc → host write →
-/// download.
+/// buffer_ops.rs::device_slice_write_into_existing_buffer — write a host vec into
+/// an existing buffer via the eager `write` op (`device_slice_write`'s analog: a
+/// non-blocking `clEnqueueWriteBuffer`, NOT a map/host-memcpy seam). alloc →
+/// write → download.
 #[test]
 fn device_slice_write_into_existing_buffer() {
     let Some(ctx) = ctx() else { return };
     let data: Vec<u32> = (1..=N as u32).collect();
-    let data_for_closure = data.clone();
     let result: Vec<u32> = alloc_zero::<u32, claspr::ReadWrite>(N)
-        .and_then_host(move |slice: &mut [u32]| {
-            slice.copy_from_slice(&data_for_closure);
-            Ok(())
-        })
+        .and_then(|buf| write(buf, data.clone()))
         .and_then(download)
         .sync(&ctx)
         .expect("alloc + write + download");
@@ -173,19 +170,16 @@ fn device_slice_write_into_existing_buffer() {
 }
 
 /// buffer_ops.rs::device_slice_write_overwrites_kernel_output — kernel fill 99,
-/// then host write of [1..N] must wait for the kernel; final state = host data.
+/// then the `write` of [1..N] must wait for the kernel (its event threads through
+/// the chain's deps into the write's wait-list); final state = host data.
 #[test]
 fn device_slice_write_overwrites_kernel_output() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let data: Vec<u32> = (1..=N as u32).collect();
-    let data_for_closure = data.clone();
     let result: Vec<u32> = alloc_zero::<u32, claspr::ReadWrite>(N)
         .and_then(|buf| kernels.fill_u32([N], buf, 99u32))
-        .and_then_host(move |slice: &mut [u32]| {
-            slice.copy_from_slice(&data_for_closure);
-            Ok(())
-        })
+        .and_then(|buf| write(buf, data.clone()))
         .and_then(download)
         .sync(&ctx)
         .expect("kernel + write + download");
