@@ -183,8 +183,8 @@ pub use eager::EagerChainFuture;
 // (`eager::{EagerOp, EagerOpExt, Pipe, Input, …}`) to avoid name clashes with
 // the legacy `Download`/`upload` surface during the cutover.
 pub use eager::{
-    EagerFanOutExt, EagerOp, EagerOpExt, EagerProfileExt, ExecMode, Input, Pipe, ToInput,
-    arced as eager_arced, bundle2 as eager_bundle2, bundle3 as eager_bundle3,
+    EagerDynOp, EagerFanOutExt, EagerOp, EagerOpExt, EagerProfileExt, ExecMode, Input, Pipe,
+    ToInput, arced as eager_arced, bundle2 as eager_bundle2, bundle3 as eager_bundle3,
     bundle4 as eager_bundle4, bundle5 as eager_bundle5, bundle6 as eager_bundle6,
     bundle7 as eager_bundle7, bundle8 as eager_bundle8, bundle9 as eager_bundle9,
     bundle10 as eager_bundle10, bundle11 as eager_bundle11, bundle12 as eager_bundle12,

@@ -595,6 +595,126 @@ impl<T: Send + 'static> EagerOp for Forward<T> {
     }
 }
 
+// ── EagerDynOp: type-erased single-output op for conditional graphs ─────
+
+/// Object-safe erasure of [`EagerOp`], specialised to output `T`. Crate-internal
+/// — users go through [`EagerDynOp`]. `EagerOp` itself is NOT object-safe (it has
+/// an associated `Handle` type and `self`-consuming `collect`/`into_output`), so
+/// this mirror trait restates the one operation a terminal/branch needs —
+/// gather `(value, deps)` — as a `self: Box<Self>` method that *is*
+/// dyn-dispatchable. It delegates to the concrete op's [`collect`](EagerOp::collect),
+/// which already reconstructs any arity down to a single `Output`, so even a
+/// multi-output inner op erases cleanly to a single-output `EagerDynOp`.
+trait ErasedEagerOp<T>: Send {
+    fn collect_erased(
+        self: Box<Self>,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(T, Deps)>;
+
+    fn describe_erased(&self, out: &mut Vec<String>);
+}
+
+impl<O> ErasedEagerOp<O::Output> for O
+where
+    O: EagerOp,
+{
+    fn collect_erased(
+        self: Box<Self>,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(O::Output, Deps)> {
+        (*self).collect(ec, mode)
+    }
+
+    fn describe_erased(&self, out: &mut Vec<String>) {
+        self.describe(out);
+    }
+}
+
+/// Type-erased single-output [`EagerOp`] yielding `T`. Lets `if` / `match` arms
+/// produce DIFFERENT concrete op types as long as they agree on `Output` — the
+/// eager analog of the legacy closure-layer `DynOp`.
+///
+/// Each combinator chain has its own deeply-nested concrete type
+/// (`AndThen<Upload, AndThen<…>>` vs `Value<T>`), so an `if`/`else` that builds a
+/// chain in each arm is a type-mismatch error. Wrapping each arm in
+/// `EagerDynOp::new(...)` erases the concrete type to one nominal
+/// `EagerDynOp<'op, T>`, which is itself an [`EagerOp`] and composes with
+/// `and_then` / `bundle` / `fan_out` like any single-output leaf.
+///
+/// ```ignore
+/// let chain: EagerDynOp<u32> = if use_kernel {
+///     EagerDynOp::new(upload(v).and_then(|b| ks.fill_u32([N], b, 9)).and_then(|_| value(0u32)))
+/// } else {
+///     EagerDynOp::new(value(0u32))            // different concrete type, same Output
+/// };
+/// let r = chain.sync(&ctx)?;
+/// ```
+///
+/// One heap allocation per erased op. The `'op` lifetime lets the boxed op borrow
+/// from the surrounding scope (typically `&Kernels` for kernel launches); it
+/// infers to `'static` for chains built from owned data only.
+///
+/// **Single-output.** `Handle = Pipe<T>` (the default). A multi-output op CAN be
+/// erased — its tuple `Output` becomes the `T` of the `EagerDynOp` (reconstructed
+/// via the inner op's `collect`), but the per-element build-time handle is gone;
+/// downstream sees one `Pipe<tuple>`. For the conditional-graph use case (arms
+/// agreeing on one `Output`) that is exactly right.
+pub struct EagerDynOp<'op, T> {
+    inner: Option<Box<dyn ErasedEagerOp<T> + 'op>>,
+    out: Pipe<T>,
+}
+
+impl<'op, T: Send + 'static> EagerDynOp<'op, T> {
+    /// Erase a concrete op into a single-output `EagerDynOp`. Both arms of an
+    /// `if`/`match` can produce `EagerDynOp::new(...)` of the same `T` without
+    /// their concrete types matching.
+    pub fn new<O>(op: O) -> Self
+    where
+        O: EagerOp<Output = T> + 'op,
+    {
+        EagerDynOp {
+            inner: Some(Box::new(op)),
+            out: Pipe::new(),
+        }
+    }
+}
+
+impl<T: Send + 'static> EagerOp for EagerDynOp<'_, T> {
+    type Output = T;
+
+    fn output_pipe(&self) -> Pipe<T> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // Gather the erased inner op (any arity → one value + deps) and deposit
+        // into our own pipe, so the default collect/into_output/handle path treats
+        // this as an ordinary single-output leaf. The inner op observes `mode`
+        // (it is the real terminal work when this EagerDynOp is the chain tail).
+        let inner = self
+            .inner
+            .take()
+            .expect("EagerDynOp::execute called twice — internal eager bug");
+        let (v, deps) = inner.collect_erased(ec, mode)?;
+        self.out.put(v, deps);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("dyn_op{".into());
+        if let Some(inner) = &self.inner {
+            inner.describe_erased(out);
+        }
+        out.push("}".into());
+    }
+}
+
 // ── Arced: wrap the output in Arc<T> ───────────────────────────────────
 
 /// Wrap an upstream op's output in [`Arc`] for shared fan-out. Passes events
