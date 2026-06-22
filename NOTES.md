@@ -47,20 +47,19 @@ LESSON (Brice): should've ported the suite directly (all-fail-then-fix) to see
 this shape set at once instead of piecemeal.
 
 **⚠ GAPS FOUND porting the full suite (systematic, sub-agent clusters) — the
-parity backlog. MOSTLY CLOSED 2026-06-21 — 6/8 gaps done + a root-cause
+parity backlog. NEARLY CLOSED 2026-06-22 — 7/8 gaps done + a root-cause
 multi-output bug fixed (commits 4811c5b small gaps, c130145 transfer+async,
-d756e0d bundle gather + arity 2..=16 + eager_bundle!). Only the two DESIGN-heavy
-gaps remain (DynOp, host-value seam).**
+d756e0d bundle gather + arity 2..=16 + eager_bundle!, 2f681d2 EagerDynOp). Only
+ONE DESIGN-heavy gap remains (host-value reduction seam).**
 - ✅ **transfer_to_device** — DONE (c130145). Eager leaf `transfer_to_device(buf,
   device)` wrapping clEnqueueMigrateMemObjects on the target OOO queue;
   re-export `eager_transfer_to_device`; composes with `.on_device`.
-- ⚠ **DynOp — NO eager type-erased op. STILL OPEN (needs DESIGN).** `EagerOp`
-  isn't object-safe (assoc `Handle` + `into_output(self)`/`collect(self)`), and
-  there's no boxing ctor. Blocks the
-  if/else-arms-of-different-op-types shape (a REAL public-API pattern — `DynOp`
-  is in dyn_op.rs, not test-only). Needs a `dyn`-safe erasure boundary (e.g.
-  erase to `Box<dyn ErasedEagerOp>` with monomorphic execute+output_pipe+collect).
-  Biggest gap. (blocks 7/8 conditional.rs)
+- ✅ **DynOp → EagerDynOp** — DONE (2f681d2). Object-safe `ErasedEagerOp<T>` shim
+  (`collect_erased(self: Box<Self>)`, blanket over every `O: EagerOp`, delegates
+  to `O::collect`) boxed into single-output `EagerDynOp<'op, T>`. Multi-output
+  inner ops erase cleanly (tuple becomes `T` via `collect`; per-element handle
+  dropped — fine for conditional arms agreeing on one Output). All of
+  conditional.rs ported (eager_conditional 10/10, was 1 + 8 blocked).
 - ⚠ **Host-value passthrough / host reduction mid-graph. STILL OPEN (needs
   DESIGN).** eager `and_then` hands
   a Pipe, not the host VALUE; `and_then_host` is for device `&mut [T]` views,
