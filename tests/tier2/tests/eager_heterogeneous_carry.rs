@@ -112,12 +112,15 @@ fn bare_pipe_is_an_op_in_a_bundle() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("kernels");
 
-    // Three producer branches (each upload→fill), bundled; then add_u32's
-    // 3-pipe handle. Take `out` BARE into a bundle alongside a value.
+    let a = claspr::DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("a");
+    let b = claspr::DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("b");
+    let out = claspr::DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("out");
+
+    // add_u32 has a 3-pipe handle (a, b, out); take `out` BARE into a bundle.
     let (summed, tag): (Vec<u32>, u32) = eager_bundle!(
-        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N]).and_then(|buf| ks.fill_u32([N], buf, 3)),
-        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N]).and_then(|buf| ks.fill_u32([N], buf, 4)),
-        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+        ks.fill_u32([N], a, 3),
+        ks.fill_u32([N], b, 4),
+        ks.fill_u32([N], out, 0)
     )
     .and_then(|(a, b, out)| ks.add_u32([N], a, b, out))
     .and_then(|(_a, _b, out)| eager_bundle!(out, value(99u32))) // `out`: bare Pipe
