@@ -29,7 +29,7 @@
 
 use claspr::Context;
 use claspr::eager::{
-    EagerOpExt, alloc_zero, arc_split, arced, bundle2, bundle3, download, forward, upload,
+    DeviceOpExt, alloc_zero, arc_split, arced, bundle2, bundle3, download, forward, upload,
 };
 use claspr_test_kernels::kernels;
 

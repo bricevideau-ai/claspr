@@ -4,9 +4,9 @@
 //!
 //! Old → new mapping:
 //!   `value(v).and_then(|x| upload!(x))` → `upload::<u32, ReadWrite, _>(v)`
-//!   `.profiled(cb)`                     → `EagerProfileExt::profiled`
+//!   `.profiled(cb)`                     → `DeviceProfileExt::profiled`
 
-use claspr::eager::{EagerOpExt, EagerProfileExt, upload, value};
+use claspr::eager::{DeviceOpExt, DeviceProfileExt, upload, value};
 use claspr::{Context, Device};
 use claspr_test_kernels::kernels;
 

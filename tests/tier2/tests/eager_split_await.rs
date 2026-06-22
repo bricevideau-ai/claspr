@@ -14,7 +14,7 @@
 //! Both test fns port 1:1 — same N, values, assertions.
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, download, upload};
+use claspr::eager::{DeviceOpExt, download, upload};
 use claspr_test_kernels::kernels;
 
 const N: usize = 128;

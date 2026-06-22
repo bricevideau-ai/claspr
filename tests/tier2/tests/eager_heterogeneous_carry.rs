@@ -16,15 +16,15 @@
 //!   2. Because the carried scalar arrives by value, it can be COMPUTED ON at
 //!      build time downstream (`step + 1`) and re-carried — multi-stage, in
 //!      chain, with no host-side hand-tracking of the counter.
-//!   3. A bare `Pipe<T>` is itself an `EagerOp` (the identity node), so a buffer
+//!   3. A bare `Pipe<T>` is itself an `DeviceOp` (the identity node), so a buffer
 //!      branch passes into a bundle WITHOUT a `forward(..)` wrapper.
 //!
 //! If a redesign makes `value` hand a pipe again (losing by-value), or flattens
-//! bundle branch handles to pipes, or drops `Pipe: EagerOp`, one or more of
+//! bundle branch handles to pipes, or drops `Pipe: DeviceOp`, one or more of
 //! these stops compiling — which is the point.
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, bundle2, download, upload, value};
+use claspr::eager::{DeviceOpExt, bundle2, download, upload, value};
 use claspr::eager_bundle;
 use claspr_test_kernels::kernels;
 

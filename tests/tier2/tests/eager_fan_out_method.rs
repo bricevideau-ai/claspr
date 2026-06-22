@@ -1,10 +1,10 @@
 //! Eager-API method-form fan-out: `vec.fan_out(|i| value(i))` via
-//! [`EagerFanOutExt`] must match the free-fn [`eager::fan_out`] result.
+//! [`DeviceFanOutExt`] must match the free-fn [`eager::fan_out`] result.
 //!
 //! Mirrors the old `fan_out.rs` `vec_method_form_matches_free_fn` shape.
 
 use claspr::Context;
-use claspr::eager::{EagerFanOutExt, EagerOpExt, fan_out, value};
+use claspr::eager::{DeviceFanOutExt, DeviceOpExt, fan_out, value};
 
 fn ctx() -> Option<Context> {
     match Context::any() {

@@ -16,7 +16,7 @@
 //! the old lazy op. Same N, same 99/×2 = 198 and 0..N values.
 
 use claspr::eager::{
-    EagerOpExt, alloc_zero, bundle3, device_alloc_uninit, download, fill_device_uninit,
+    DeviceOpExt, alloc_zero, bundle3, device_alloc_uninit, download, fill_device_uninit,
     fill_mapped_uninit, lift, mapped_alloc_uninit, upload, write_device_uninit,
 };
 use claspr::{Buffer, Context, Error, MappedSlice, SvmLevel};

@@ -1,4 +1,4 @@
-// `associated_type_defaults`: `EagerOp::Handle` defaults to `Pipe<Output>`
+// `associated_type_defaults`: `DeviceOp::Handle` defaults to `Pipe<Output>`
 // (the common case); multi-output combinators override it. See `eager`.
 #![feature(associated_type_defaults)]
 //! claspr — single-source OpenCL with rust-gpu.
@@ -178,12 +178,12 @@ pub use device_op::{
 };
 pub use dyn_op::DynOp;
 #[cfg(feature = "async-events")]
-pub use eager::EagerChainFuture;
+pub use eager::DeviceChainFuture;
 // The eager graph types are reached via the `claspr::eager::` module path
-// (`eager::{EagerOp, EagerOpExt, Pipe, Input, …}`) to avoid name clashes with
+// (`eager::{DeviceOp, DeviceOpExt, Pipe, Input, …}`) to avoid name clashes with
 // the legacy `Download`/`upload` surface during the cutover.
 pub use eager::{
-    EagerDynOp, EagerFanOutExt, EagerOp, EagerOpExt, EagerProfileExt, ExecMode, Input, Pipe,
+    DeviceDynOp, DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt, ExecMode, Input, Pipe,
     ToInput, arced as eager_arced, bundle2 as eager_bundle2, bundle3 as eager_bundle3,
     bundle4 as eager_bundle4, bundle5 as eager_bundle5, bundle6 as eager_bundle6,
     bundle7 as eager_bundle7, bundle8 as eager_bundle8, bundle9 as eager_bundle9,

@@ -12,7 +12,7 @@
 //! same fill values, same assertions as `bundle.rs`.
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, bundle2, bundle3, download, fan_out, upload, value};
+use claspr::eager::{DeviceOpExt, bundle2, bundle3, download, fan_out, upload, value};
 use claspr_test_kernels::kernels;
 
 const N: usize = 128;

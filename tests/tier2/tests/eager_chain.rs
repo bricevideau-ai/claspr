@@ -16,7 +16,7 @@
 //! 1:1 thanks to `value`'s by-value handle.
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, alloc_zero, bundle3, download, upload, value};
+use claspr::eager::{DeviceOpExt, alloc_zero, bundle3, download, upload, value};
 use claspr_test_kernels::kernels;
 use std::sync::Arc;
 

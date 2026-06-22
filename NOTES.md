@@ -71,10 +71,27 @@ this shape set at once instead of piecemeal.
 parity backlog. ALL 8 GAPS CLOSED 2026-06-22 (commits 4811c5b small gaps,
 c130145 transfer+async, d756e0d bundle gather + arity 2..=16 + eager_bundle!,
 2f681d2 EagerDynOp, 81e5d7e heterogeneous carry) + the and_then_host async
-regression FIXED (cc5f3bc, above). The ONLY remaining eager-model work is the
-DESTRUCTIVE CLEANUP: delete the old `DeviceOperation` closure layer, migrate the
-entry macros (`upload!`/`download!`/`bundle!`→eager; rename `eager_bundle!`→
-`bundle!`), re-bless compile-fail, full gate.**
+regression FIXED (cc5f3bc, above).**
+
+**⭐ NEXT: Tier-1/Tier-2 REUNIFICATION (plan approved 2026-06-22, subsumes the
+destructive cleanup).** Collapse `EagerOp`+`KernelOp`+`DeviceOperation`+the
+standalone Tier-1 buffer builders into ONE trait `DeviceOp` (abbrev of
+cuda-oxide's `DeviceOperation`; the `sync`/`wait`/`submit` terminal vocabulary is
+cuda-oxide / Rust-CUDA heritage — README must credit both). Unified terminals
+(`wait`/`wait_on`/`submit`/`submit_on`/`sync`/`run`); buffer verbs become methods
+on concrete AND piped buffers; concrete-head ops keep context-free `wait()`;
+marker-turbofish ergonomics (`upload(src, ReadWrite)` witness-arg; `from_slice`
+stays the ONLY immutable-init path); delete old closure layer + flatten the
+`eager` namespace to crate root. 7 staged green sub-commits. Plan file:
+`.claude/plans/declarative-hopping-parrot.md`.
+
+**📋 POST-REUNIFICATION (Brice): re-read cuda-oxide's async docs and decide
+match-vs-diverge per primitive.**
+https://nvlabs.github.io/cuda-oxide/async-programming/the-device-operation-model.html
+and .../combinators-and-composition.html — compare claspr's final DeviceOp model
+against cuda-oxide's; where we're close, match their naming/shape; where we
+genuinely diverge (eager inspectable struct-graph vs theirs), keep ours and
+document why.
 - ✅ **transfer_to_device** — DONE (c130145). Eager leaf `transfer_to_device(buf,
   device)` wrapping clEnqueueMigrateMemObjects on the target OOO queue;
   re-export `eager_transfer_to_device`; composes with `.on_device`.

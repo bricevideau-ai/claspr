@@ -2,7 +2,7 @@
 //!
 //! The chain is built and submitted exactly like the sync case; the difference
 //! is the terminal — instead of `.sync(&ctx)`, the user calls `.run(&ctx)` and
-//! `.await`s the resulting [`claspr::EagerChainFuture`]. Under the hood,
+//! `.await`s the resulting [`claspr::DeviceChainFuture`]. Under the hood,
 //! completion is signaled by an `clEnqueueMarkerWithWaitList` event whose
 //! `CL_COMPLETE` callback wakes the future's waker (the Tier-1 `EventFuture`
 //! machinery, gated behind the `async-events` feature — on by default).
@@ -19,7 +19,7 @@
 //!   chain error via `with_context`      → `.and_then_host(|_| Err(..))` (the
 //!     eager host seam surfaces the closure's exact `Error` variant).
 
-use claspr::eager::{EagerOpExt, download, upload, value};
+use claspr::eager::{DeviceOpExt, download, upload, value};
 use claspr::{Context, Error};
 use claspr_test_kernels::kernels;
 use futures::executor::block_on;
@@ -73,7 +73,7 @@ fn await_pure_value_chain() {
 ///
 /// The eager host seam runs its closure synchronously inside `execute` and
 /// returns the closure's exact `Error` variant; `run` turns that synchronous
-/// `Err` into `EagerChainFuture::Errored`, which surfaces on the first poll.
+/// `Err` into `DeviceChainFuture::Errored`, which surfaces on the first poll.
 #[test]
 fn await_propagates_chain_error() {
     let Some(ctx) = ctx() else { return };

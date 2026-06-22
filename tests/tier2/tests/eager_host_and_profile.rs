@@ -1,13 +1,13 @@
 //! Eager-API port of `host_and_profile.rs` — the `and_then_host` mid-chain host
 //! work cases. The two `.profiled` cases are ported in `eager_profile.rs` (the
-//! eager `.profiled` hook is `EagerProfileExt`); this file keeps only the
+//! eager `.profiled` hook is `DeviceProfileExt`); this file keeps only the
 //! host-seam half. All four originals are accounted for across the two files.
 //!
 //! Old → new mapping:
 //!   `value(v).and_then(|x| upload!(x))` → `upload::<u32, ReadWrite, _>(v)`
-//!   `.and_then_host(|view|…)`           → same method on `EagerOpExt`
+//!   `.and_then_host(|view|…)`           → same method on `DeviceOpExt`
 
-use claspr::eager::{EagerOpExt, upload, value};
+use claspr::eager::{DeviceOpExt, upload, value};
 use claspr::{Context, Device};
 use claspr_test_kernels::kernels;
 use std::sync::{Arc, Mutex};
@@ -69,4 +69,4 @@ fn and_then_host_error_propagates() {
 //
 // `profile_chain_fires_callback_when_profiling_on` and
 // `profile_chain_errors_when_profiling_off` are ported in `eager_profile.rs`
-// (the eager `.profiled` hook is `EagerProfileExt::profiled`).
+// (the eager `.profiled` hook is `DeviceProfileExt::profiled`).

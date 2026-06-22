@@ -20,7 +20,7 @@
 //! the same Mapped→Mapped / Mapped→USM pairs. Same values, same assertions.
 
 use claspr::eager::{
-    EagerOpExt, alloc_zero, bundle2, download, eager_copy_to, fill, upload, write,
+    DeviceOpExt, alloc_zero, bundle2, download, eager_copy_to, fill, upload, write,
 };
 use claspr::{Buffer, Context, DeviceSlice, Error, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;

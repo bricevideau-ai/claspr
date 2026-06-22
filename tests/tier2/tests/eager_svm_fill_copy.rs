@@ -20,7 +20,7 @@
 //!
 //! Skips on devices without SVM. Guard preserved verbatim.
 
-use claspr::eager::{EagerOpExt, fill_mapped_uninit, mapped_alloc_uninit};
+use claspr::eager::{DeviceOpExt, fill_mapped_uninit, mapped_alloc_uninit};
 use claspr::{Buffer, Context, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
 

@@ -5,7 +5,7 @@
 
 use claspr::Context;
 use claspr::eager::{
-    EagerOpExt, alloc_zero, arc_split, arced, bundle2, bundle3, download, eager_copy_to, fan_out,
+    DeviceOpExt, alloc_zero, arc_split, arced, bundle2, bundle3, download, eager_copy_to, fan_out,
     fill, upload, value,
 };
 use claspr_test_kernels::kernels;
@@ -74,7 +74,7 @@ fn upload_fill_download_roundtrip() {
 }
 
 /// **The headline: a KERNEL composes in an eager graph.** `kernels.fill_u32`
-/// is now an `EagerOp` — its buffer arg accepts the upstream `Pipe`, and it
+/// is now an `DeviceOp` — its buffer arg accepts the upstream `Pipe`, and it
 /// deposits the buffer into its output pipe for the next stage. upload → kernel
 /// (fill_u32 = 7) → kernel (scale_u32 ×3) → download = 21.
 #[test]

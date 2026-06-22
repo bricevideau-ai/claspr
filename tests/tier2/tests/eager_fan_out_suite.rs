@@ -11,7 +11,7 @@
 //! Same N, same values, same assertions as `fan_out.rs`.
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, download, fan_out, upload, value};
+use claspr::eager::{DeviceOpExt, download, fan_out, upload, value};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;
@@ -66,7 +66,7 @@ fn fan_out_of_kernel_ops_runs_each_branch() {
 }
 
 // vec_method_form_matches_free_fn lives in `eager_fan_out_method.rs` — the
-// eager `Vec::fan_out` method (`EagerFanOutExt`) exists; the equivalence test
+// eager `Vec::fan_out` method (`DeviceFanOutExt`) exists; the equivalence test
 // is ported faithfully there.
 
 #[test]

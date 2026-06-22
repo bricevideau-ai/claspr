@@ -6,8 +6,8 @@
 //! Old → new mapping:
 //!   `value(x)`        → `value(x)` (eager)
 //!   `bundle!(l, r)`   → `bundle2(l, r)`
-//!   `.and_then_host`  → same method on `EagerOpExt`
-//!   `.run(&ctx)`      → same async terminal on `EagerOpExt` (async-events)
+//!   `.and_then_host`  → same method on `DeviceOpExt`
+//!   `.run(&ctx)`      → same async terminal on `DeviceOpExt` (async-events)
 //!
 //! All three exercise the host-error slot: the eager host seam (`run_host_seam`)
 //! runs the closure on a worker thread under `catch_unwind`, stashing the rich
@@ -15,7 +15,7 @@
 //! Both terminals (`sync` + `run`) prefer the stashed variant over the
 //! `OpenCl(-1)` cascade.
 
-use claspr::eager::{EagerOpExt, bundle2, value};
+use claspr::eager::{DeviceOpExt, bundle2, value};
 use claspr::{Context, Error};
 use futures::executor::block_on;
 
@@ -50,7 +50,7 @@ fn panic_in_host_closure_surfaces_host_panic() {
 
 // async_terminal_run_also_delivers_rich_variant — the same rich-variant
 // guarantee for the `.run(&ctx).await` path. The eager async terminal exists
-// (`EagerChainFuture`); its poll prefers the stashed host-error slot over the
+// (`DeviceChainFuture`); its poll prefers the stashed host-error slot over the
 // marker's cascade, mirroring `.sync()`'s contract.
 #[test]
 fn async_terminal_run_also_delivers_rich_variant() {

@@ -9,7 +9,7 @@
 //! Old → new mapping:
 //!   `upload!(v)`                  → `upload::<u32, claspr::ReadWrite, _>(v)`
 //!   `download!(buf)`              → `download`
-//!   `.and_then_with_context(...)` → same name on `EagerOpExt`
+//!   `.and_then_with_context(...)` → same name on `DeviceOpExt`
 //!   `kernel(...).on_device(dev)`  → same `.on_device(...)` on the eager kernel op
 //!   `bundle!(a, b)`              → `bundle2(a, b)`
 //!
@@ -24,7 +24,7 @@
 //! sub-device partition). Guard copied verbatim from on_device.rs.
 
 use claspr::device::Platform;
-use claspr::eager::{EagerOpExt, bundle2, download, upload};
+use claspr::eager::{DeviceOpExt, bundle2, download, upload};
 use claspr::{Context, Device, Error};
 use claspr_test_kernels::kernels;
 

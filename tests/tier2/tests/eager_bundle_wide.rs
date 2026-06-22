@@ -17,7 +17,7 @@
 //!    nested bundles, and a bundle whose branch is a `copy_to` chain.
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, alloc_zero, bundle2, download, eager_copy_to, upload, value};
+use claspr::eager::{DeviceOpExt, alloc_zero, bundle2, download, eager_copy_to, upload, value};
 use claspr::eager_bundle;
 use claspr_test_kernels::kernels;
 

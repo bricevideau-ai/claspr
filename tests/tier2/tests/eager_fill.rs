@@ -13,7 +13,7 @@
 
 use claspr::Context;
 use claspr::DeviceSlice;
-use claspr::eager::{EagerOpExt, alloc_zero, download, fill, upload};
+use claspr::eager::{DeviceOpExt, alloc_zero, download, fill, upload};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;

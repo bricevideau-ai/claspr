@@ -12,7 +12,7 @@
 //! context boundaries, `CL_INVALID_CONTEXT` would surface here.
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, download, upload};
+use claspr::eager::{DeviceOpExt, download, upload};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;

@@ -7,7 +7,7 @@
 //! Old → new mapping:
 //!   `upload!(v)`                  → `upload::<u32, claspr::ReadWrite, _>(v)`
 //!   `download!(buf)`              → `download`
-//!   `.and_then_with_context(...)` → same name on `EagerOpExt`
+//!   `.and_then_with_context(...)` → same name on `DeviceOpExt`
 //!   `kernel(...).on_device(dev)`  → same `.on_device(...)` on the eager kernel op
 //!
 //! NOTE (known eager seam): `and_then_with_context` passes the upstream VALUE,
@@ -21,7 +21,7 @@
 //! sub-device partition support). Guard copied verbatim from cross_device.rs.
 
 use claspr::device::Platform;
-use claspr::eager::{EagerOpExt, download, upload};
+use claspr::eager::{DeviceOpExt, download, upload};
 use claspr::{Context, Device};
 use claspr_test_kernels::kernels;
 

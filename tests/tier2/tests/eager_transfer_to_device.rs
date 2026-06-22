@@ -15,7 +15,7 @@
 //!   `claspr_async::transfer_to_device(buf, dev)` → `claspr::eager::transfer_to_device(buf, dev)`
 //!   `upload!(v)`                                 → `upload::<u32, ReadWrite, _>(v)`
 //!   `download!(buf)`                             → `download`
-//!   `.and_then_with_context(...)`                → same name on `EagerOpExt`
+//!   `.and_then_with_context(...)`                → same name on `DeviceOpExt`
 //!   `kernel(...).on_device(dev)`                 → same `.on_device(...)` eager op
 //!
 //! Both tests need a genuine two-device context (a real two-device platform or a
@@ -25,7 +25,7 @@
 //! buffer already lives on wouldn't test cross-device movement).
 
 use claspr::device::Platform;
-use claspr::eager::{EagerOpExt, download, transfer_to_device, upload};
+use claspr::eager::{DeviceOpExt, download, transfer_to_device, upload};
 use claspr::{Context, Device, ReadWrite};
 use claspr_test_kernels::kernels;
 

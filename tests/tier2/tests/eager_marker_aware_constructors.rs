@@ -14,7 +14,7 @@
 //!       same compositional path as the original).
 //!   `download!(buf)`                      → `download`
 
-use claspr::eager::{EagerOpExt, alloc_zero, download, fill, upload};
+use claspr::eager::{DeviceOpExt, alloc_zero, download, fill, upload};
 use claspr::{Context, DeviceSlice, Frozen, HostReadOnly, ReadOnly};
 use claspr_test_kernels::kernels;
 

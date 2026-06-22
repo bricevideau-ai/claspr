@@ -10,7 +10,7 @@
 //!
 //! Same shapes, same pixel patterns, same N, same round-trip assertions.
 
-use claspr::eager::{EagerOpExt, image_download, image_upload};
+use claspr::eager::{DeviceOpExt, image_download, image_upload};
 use claspr::{
     Context, Image1D, Image1DArray, Image2D, Image2DArray, Image3D, ReadWrite,
     image::format::R32Uint,

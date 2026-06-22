@@ -10,7 +10,7 @@
 //! Same N, same scale factors, same assertions as `ml_pass.rs`.
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, bundle3, download, upload, value};
+use claspr::eager::{DeviceOpExt, bundle3, download, upload, value};
 use claspr::eager_bundle;
 use claspr_test_kernels::kernels;
 use std::sync::{Arc, Mutex};
@@ -56,7 +56,7 @@ fn forward_pass_threads_buffer_through_three_stages() {
 /// PORT NOTE: the original wrote `value((buf, step))` to pack the buffer + scalar
 /// into one edge. Eager `value` can't pack a not-yet-resolved buffer pipe inside
 /// a tuple, so the eager idiom BUNDLES the two graph members instead: the buffer
-/// (a `Pipe<DeviceSlice>`, passed BARE — `Pipe<T>: EagerOp`, no `forward(..)`)
+/// (a `Pipe<DeviceSlice>`, passed BARE — `Pipe<T>: DeviceOp`, no `forward(..)`)
 /// and the scalar (`value(step)`, a BY-VALUE handle). `bundle2` joins them, and
 /// the downstream closure receives `(Pipe<DeviceSlice>, u32)` — `step` is a real
 /// `u32`, so `step + 1` is computed in-graph at the next stage (NOT hand-tracked;

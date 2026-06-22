@@ -11,7 +11,7 @@
 //! `RUSTICL_FEATURES=fp64`, set in CI). Guard preserved verbatim.
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, download, upload};
+use claspr::eager::{DeviceOpExt, download, upload};
 use claspr_test_kernels::kernels_f64 as kernels;
 
 const N: usize = 256;

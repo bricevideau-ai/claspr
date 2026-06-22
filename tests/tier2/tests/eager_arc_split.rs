@@ -17,7 +17,7 @@
 //! by-value handle hands it the `Arc`, which derefs to the value). This mirrors
 //! old `arc.split::<3>()` → 3 `Arc::clone`s exactly.
 
-use claspr::eager::{EagerOpExt, bundle2, bundle3, value};
+use claspr::eager::{DeviceOpExt, bundle2, bundle3, value};
 use claspr::{Context, Error};
 use std::sync::Arc;
 

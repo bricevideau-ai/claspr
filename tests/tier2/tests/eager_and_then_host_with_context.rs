@@ -4,14 +4,14 @@
 //! Old → new mapping:
 //!   `upload!(v)`                                → `upload::<u32, ReadWrite, _>(v)`
 //!   `download!(buf)`                            → `.and_then(download)`
-//!   `.and_then_host_with_context(|ctx, view|…)` → same method on `EagerOpExt`
+//!   `.and_then_host_with_context(|ctx, view|…)` → same method on `DeviceOpExt`
 //!
 //! The eager `and_then_host_with_context` closure receives `(&Context, view)`
 //! exactly like the closure layer's, and propagates `Err` via `?` through the
 //! terminal (see eager_cutover `eager_and_then_host_error_propagates`). All
 //! three test fns port 1:1 — same N, values, and assertions.
 
-use claspr::eager::{EagerOpExt, download, upload};
+use claspr::eager::{DeviceOpExt, download, upload};
 use claspr::{Context, Error};
 use claspr_test_kernels::kernels;
 use std::sync::{Arc, Mutex};

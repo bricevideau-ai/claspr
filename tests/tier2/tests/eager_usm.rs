@@ -20,7 +20,7 @@
 //! `SvmLevel::FineSystem`, so these run on both. The FineSystem guard is
 //! preserved exactly — a SKIP on a non-FineSystem device is a PASS.
 
-use claspr::eager::{EagerOpExt, fill_usm_uninit, usm_alloc_uninit, usm_slice};
+use claspr::eager::{DeviceOpExt, fill_usm_uninit, usm_alloc_uninit, usm_slice};
 use claspr::{Buffer, Context, SvmLevel, USMSliceUninit};
 use claspr_test_kernels::kernels;
 

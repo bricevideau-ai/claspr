@@ -731,7 +731,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // ── Output-pipe storage: single `Pipe<Output>` vs per-element pipes ──
     //
     // Single-output (incl. zero): one `__claspr_out: Pipe<Output>` field; the
-    // EagerOp impl uses the default `into_output` (drain that pipe + wait).
+    // DeviceOp impl uses the default `into_output` (drain that pipe + wait).
     //
     // Multi-output: one element pipe per output buffer (`__claspr_op0: Pipe<D0>,
     // …`). `Handle = (Pipe<D0>, …)`; `handle()` clones them so a downstream
@@ -745,7 +745,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
             .zip(output_types.iter())
             .map(|(f, t)| {
                 quote! {
-                    /// Eager-graph per-element output pipe: `EagerOp::execute`
+                    /// Eager-graph per-element output pipe: `DeviceOp::execute`
                     /// scatters this output buffer here (move-once) with a clone of
                     /// the launch's completion event. Unused by the Tier-1 terminals.
                     pub #f: ::claspr::Pipe<#t>
@@ -763,7 +763,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     } else {
         (
             quote! {
-                /// Eager-graph output pipe: `EagerOp::execute` deposits the
+                /// Eager-graph output pipe: `DeviceOp::execute` deposits the
                 /// output buffer(s) + completion event here; downstream ops
                 /// grab a clone via `output_pipe()` at build time. Unused by
                 /// the Tier-1 terminals.
@@ -774,7 +774,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         )
     };
 
-    // ── EagerOp impl body — single vs multi output ──────────────────────
+    // ── DeviceOp impl body — single vs multi output ──────────────────────
     let eager_impl = if multi_output {
         // `Handle = (Pipe<D0>, Pipe<D1>, …)`; per-element scatter; reconstruct
         // in `into_output`. `output_pipe()` is unused on this path (the default
@@ -785,7 +785,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
             ( #( ::core::clone::Clone::clone(&self.#op_pipe_fields) ),* )
         };
         quote! {
-            impl #gen_decl ::claspr::EagerOp for Op #gen_use {
+            impl #gen_decl ::claspr::DeviceOp for Op #gen_use {
                 type Output = #output_ty;
                 type Handle = #handle_ty;
 
@@ -871,7 +871,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         }
     } else {
         quote! {
-            impl #gen_decl ::claspr::EagerOp for Op #gen_use {
+            impl #gen_decl ::claspr::DeviceOp for Op #gen_use {
                 type Output = #output_ty;
 
                 fn output_pipe(&self) -> ::claspr::Pipe<#output_ty> {
@@ -1126,7 +1126,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 }
             }
 
-            // ── Tier 2 (eager graph): EagerOp ───────────────────────────
+            // ── Tier 2 (eager graph): DeviceOp ───────────────────────────
             // The Op is a first-class eager graph node. `execute` resolves each
             // buffer `Input` (concrete or upstream pipe) to `(buffer, deps)`,
             // merges all inputs' events + caller deps into the kernel's

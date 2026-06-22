@@ -6,7 +6,7 @@
 //!   `value(x)`            → `value(x)` (eager `value`; scalar/`()` is `Mappable`,
 //!                            so the host seam's "view" is the value by-copy)
 //!   `upload!(v)`          → `upload::<u32, ReadWrite, _>(v)`
-//!   `.and_then_host(|_|…)`→ same method on `EagerOpExt`; closure `Err` surfaces
+//!   `.and_then_host(|_|…)`→ same method on `DeviceOpExt`; closure `Err` surfaces
 //!                            at the terminal via `?` (see eager_cutover
 //!                            `eager_and_then_host_error_propagates`).
 //!
@@ -15,7 +15,7 @@
 //! propagates the closure's exact `Error` variant (no `OpenCl(-1)` cascade),
 //! and short-circuits before the downstream `and_then_host` builds/executes.
 
-use claspr::eager::{EagerOpExt, upload, value};
+use claspr::eager::{DeviceOpExt, upload, value};
 use claspr::{Context, Error};
 use claspr_test_kernels::kernels;
 use std::sync::{

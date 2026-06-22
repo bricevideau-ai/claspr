@@ -1,6 +1,6 @@
 //! Eager struct-graph core — the closure-free `DeviceOperation` replacement.
 //!
-//! A graph is a **closure-free nested struct** of [`EagerOp`]s. `.and_then(f)`
+//! A graph is a **closure-free nested struct** of [`DeviceOp`]s. `.and_then(f)`
 //! runs the builder `f` **once at construction**, handing it a [`Pipe<T>`]
 //! handle for the upstream's future output, and stores the **returned op** —
 //! never the closure. So `g = upload(v).and_then(|p| fill(p, 7))` is a plain
@@ -14,7 +14,7 @@
 //! wait-list of its **non-blocking** enqueue, and deposits `(output,
 //! vec![its_event])` into its output pipe. Nothing blocks mid-graph — the same
 //! `execute(deps) -> (out, deps)` threading the old closure layer did, carried
-//! through the pipe payload. Only [`sync`](EagerOpExt::sync) waits, on the
+//! through the pipe payload. Only [`sync`](DeviceOpExt::sync) waits, on the
 //! terminal pipe's `Deps`.
 //!
 //! ## `Input<T>`: concrete or piped
@@ -98,7 +98,7 @@ impl<T> Pipe<T> {
 // same sub-chain before this node is gathered (`AndThen`/composites run the
 // source first, so this holds). If not, `collect` finds an empty cell and returns
 // the standard "op produced no output" error — loud, never silent.
-impl<T: Send + 'static> EagerOp for Pipe<T> {
+impl<T: Send + 'static> DeviceOp for Pipe<T> {
     type Output = T;
 
     fn output_pipe(&self) -> Pipe<T> {
@@ -237,7 +237,7 @@ where
 
 // ── ExecMode: terminal-blocking opt-in ─────────────────────────────────
 
-/// How an op should enqueue, threaded through [`execute`](EagerOp::execute).
+/// How an op should enqueue, threaded through [`execute`](DeviceOp::execute).
 ///
 /// Only the **terminal** op of a chain (the outermost one a `sync`/`wait`
 /// terminal calls) ever sees [`Blocking`](ExecMode::Blocking); every upstream
@@ -256,12 +256,12 @@ pub enum ExecMode {
     Blocking,
 }
 
-// ── EagerOp: the closure-free graph node ───────────────────────────────
+// ── DeviceOp: the closure-free graph node ───────────────────────────────
 
 /// A node in the eager graph. `execute` runs it against the context, moving its
 /// output into its pipe; `describe` reports structure **without** executing.
-/// Builder verbs ([`and_then`](EagerOpExt::and_then)) are on [`EagerOpExt`].
-pub trait EagerOp: Send {
+/// Builder verbs ([`and_then`](DeviceOpExt::and_then)) are on [`DeviceOpExt`].
+pub trait DeviceOp: Send {
     /// What this op produces at run time.
     type Output: Send;
 
@@ -324,7 +324,7 @@ pub trait EagerOp: Send {
     ///
     /// Uniform across single- and multi-output ops: it [`collect`](Self::collect)s
     /// (which dispatches to the right per-op gather) then waits once on the
-    /// returned deps. This is the seam that lets [`sync`](EagerOpExt::sync) be
+    /// returned deps. This is the seam that lets [`sync`](DeviceOpExt::sync) be
     /// arity-agnostic. Ops never override this — they override `collect`.
     fn into_output(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
     where
@@ -341,13 +341,13 @@ pub trait EagerOp: Send {
     fn describe(&self, out: &mut Vec<String>);
 }
 
-/// Builder verbs for composing [`EagerOp`]s. Blanket-implemented.
-pub trait EagerOpExt: EagerOp + Sized {
+/// Builder verbs for composing [`DeviceOp`]s. Blanket-implemented.
+pub trait DeviceOpExt: DeviceOp + Sized {
     /// Sequential composition. **Eager**: runs `f` now with the upstream's
     /// build-time output [`Pipe`], stores the returned op. No closure is kept.
     fn and_then<U, F>(self, f: F) -> AndThen<Self, U>
     where
-        U: EagerOp,
+        U: DeviceOp,
         F: FnOnce(Self::Handle) -> U,
     {
         let next = f(self.handle());
@@ -362,7 +362,7 @@ pub trait EagerOpExt: EagerOp + Sized {
     /// building the downstream op. See [`AndThenWithContext`].
     fn and_then_with_context<U, F>(self, f: F) -> AndThenWithContext<Self, U, F>
     where
-        U: EagerOp,
+        U: DeviceOp,
         F: for<'a> FnOnce(&ExecutionContext<'a>, Self::Output) -> U + Send,
     {
         AndThenWithContext {
@@ -452,7 +452,7 @@ pub trait EagerOpExt: EagerOp + Sized {
     }
 
     /// Async terminal — run `self` on `context` and return a future that
-    /// resolves to its [`Output`](EagerOp::Output) once every command the
+    /// resolves to its [`Output`](DeviceOp::Output) once every command the
     /// chain enqueued has completed on the device.
     ///
     /// The non-blocking analog of [`sync`](Self::sync): instead of draining
@@ -469,15 +469,15 @@ pub trait EagerOpExt: EagerOp + Sized {
     /// into an `Arc<Mutex<Option<Error>>>` slot read at poll time), the
     /// eager host seam runs its closure *inside* `execute` and returns the
     /// closure's `Err` directly (see `run_host_seam`). So a failing chain
-    /// returns [`EagerChainFuture::Errored`] right here — there is no
+    /// returns [`DeviceChainFuture::Errored`] right here — there is no
     /// host-error slot to drain at poll time.
     ///
     /// Arity-agnostic: like [`sync`](Self::sync), `run` gathers via
-    /// [`collect`](EagerOp::collect), so multi-output terminals (`arc_split`,
+    /// [`collect`](DeviceOp::collect), so multi-output terminals (`arc_split`,
     /// `bundle*`, the `CopyTo` pair) reconstruct their tuple/array the same way
     /// the blocking terminal does — the future then resolves to that value.
     #[cfg(feature = "async-events")]
-    fn run(self, context: &Context) -> EagerChainFuture<Self::Output>
+    fn run(self, context: &Context) -> DeviceChainFuture<Self::Output>
     where
         Self::Output: Unpin,
     {
@@ -491,7 +491,7 @@ pub trait EagerOpExt: EagerOp + Sized {
         v
     }
 }
-impl<T: EagerOp> EagerOpExt for T {}
+impl<T: DeviceOp> DeviceOpExt for T {}
 
 // ── AndThen: source then next; next eagerly built over source's pipe ───
 
@@ -522,10 +522,10 @@ pub struct AndThen<S, U> {
     next: U,
 }
 
-impl<S, U> EagerOp for AndThen<S, U>
+impl<S, U> DeviceOp for AndThen<S, U>
 where
-    S: EagerOp,
-    U: EagerOp,
+    S: DeviceOp,
+    U: DeviceOp,
 {
     type Output = U::Output;
     // The chain's downstream handle is the tail op's handle.
@@ -624,7 +624,7 @@ pub fn value<T: Send + Clone + 'static>(v: T) -> Value<T> {
     }
 }
 
-impl<T: Send + Clone + 'static> EagerOp for Value<T> {
+impl<T: Send + Clone + 'static> DeviceOp for Value<T> {
     type Output = T;
     // By-value handle: downstream gets `T`, enabling build-time host compute.
     type Handle = T;
@@ -683,7 +683,7 @@ pub fn lift<T: Send + 'static>(v: T) -> Lift<T> {
     }
 }
 
-impl<T: Send + 'static> EagerOp for Lift<T> {
+impl<T: Send + 'static> DeviceOp for Lift<T> {
     type Output = T;
     // Default `Handle = Pipe<T>` — a resource flows, it isn't read at build.
 
@@ -712,13 +712,13 @@ impl<T: Send + 'static> EagerOp for Lift<T> {
 // ── Forward: select/identity — make one upstream Pipe a single-output op ──
 
 /// Forward a single upstream value (a `Pipe<T>`) onward as a single-output
-/// [`EagerOp`]. The identity op: it resolves its input and re-deposits it
+/// [`DeviceOp`]. The identity op: it resolves its input and re-deposits it
 /// (threading the deps), changing nothing. Its purpose is **shape**, not work —
 /// it lets you pick ONE element out of a multi-output op's handle (e.g. a
 /// kernel's `(Pipe<a>, Pipe<b>, Pipe<out>)`, or a bundle's per-branch pipes) and
 /// continue on-device with that single value, instead of dropping to the host
 /// or inserting a no-op kernel. The selected pipe becomes a normal
-/// `EagerOp<Output = T>` that composes via `and_then` / `bundle` like any leaf.
+/// `DeviceOp<Output = T>` that composes via `and_then` / `bundle` like any leaf.
 ///
 /// ```ignore
 /// // pick `out` from add_u32's 3-tuple handle and keep going on-device:
@@ -740,7 +740,7 @@ pub fn forward<T: Send + 'static>(pipe: Pipe<T>) -> Forward<T> {
     }
 }
 
-impl<T: Send + 'static> EagerOp for Forward<T> {
+impl<T: Send + 'static> DeviceOp for Forward<T> {
     type Output = T;
 
     fn output_pipe(&self) -> Pipe<T> {
@@ -764,17 +764,17 @@ impl<T: Send + 'static> EagerOp for Forward<T> {
     }
 }
 
-// ── EagerDynOp: type-erased single-output op for conditional graphs ─────
+// ── DeviceDynOp: type-erased single-output op for conditional graphs ─────
 
-/// Object-safe erasure of [`EagerOp`], specialised to output `T`. Crate-internal
-/// — users go through [`EagerDynOp`]. `EagerOp` itself is NOT object-safe (it has
+/// Object-safe erasure of [`DeviceOp`], specialised to output `T`. Crate-internal
+/// — users go through [`DeviceDynOp`]. `DeviceOp` itself is NOT object-safe (it has
 /// an associated `Handle` type and `self`-consuming `collect`/`into_output`), so
 /// this mirror trait restates the one operation a terminal/branch needs —
 /// gather `(value, deps)` — as a `self: Box<Self>` method that *is*
-/// dyn-dispatchable. It delegates to the concrete op's [`collect`](EagerOp::collect),
+/// dyn-dispatchable. It delegates to the concrete op's [`collect`](DeviceOp::collect),
 /// which already reconstructs any arity down to a single `Output`, so even a
-/// multi-output inner op erases cleanly to a single-output `EagerDynOp`.
-trait ErasedEagerOp<T>: Send {
+/// multi-output inner op erases cleanly to a single-output `DeviceDynOp`.
+trait ErasedDeviceOp<T>: Send {
     fn collect_erased(
         self: Box<Self>,
         ec: &ExecutionContext<'_>,
@@ -784,9 +784,9 @@ trait ErasedEagerOp<T>: Send {
     fn describe_erased(&self, out: &mut Vec<String>);
 }
 
-impl<O> ErasedEagerOp<O::Output> for O
+impl<O> ErasedDeviceOp<O::Output> for O
 where
-    O: EagerOp,
+    O: DeviceOp,
 {
     fn collect_erased(
         self: Box<Self>,
@@ -801,22 +801,22 @@ where
     }
 }
 
-/// Type-erased single-output [`EagerOp`] yielding `T`. Lets `if` / `match` arms
+/// Type-erased single-output [`DeviceOp`] yielding `T`. Lets `if` / `match` arms
 /// produce DIFFERENT concrete op types as long as they agree on `Output` — the
 /// eager analog of the legacy closure-layer `DynOp`.
 ///
 /// Each combinator chain has its own deeply-nested concrete type
 /// (`AndThen<Upload, AndThen<…>>` vs `Value<T>`), so an `if`/`else` that builds a
 /// chain in each arm is a type-mismatch error. Wrapping each arm in
-/// `EagerDynOp::new(...)` erases the concrete type to one nominal
-/// `EagerDynOp<'op, T>`, which is itself an [`EagerOp`] and composes with
+/// `DeviceDynOp::new(...)` erases the concrete type to one nominal
+/// `DeviceDynOp<'op, T>`, which is itself an [`DeviceOp`] and composes with
 /// `and_then` / `bundle` / `fan_out` like any single-output leaf.
 ///
 /// ```ignore
-/// let chain: EagerDynOp<u32> = if use_kernel {
-///     EagerDynOp::new(upload(v).and_then(|b| ks.fill_u32([N], b, 9)).and_then(|_| value(0u32)))
+/// let chain: DeviceDynOp<u32> = if use_kernel {
+///     DeviceDynOp::new(upload(v).and_then(|b| ks.fill_u32([N], b, 9)).and_then(|_| value(0u32)))
 /// } else {
-///     EagerDynOp::new(value(0u32))            // different concrete type, same Output
+///     DeviceDynOp::new(value(0u32))            // different concrete type, same Output
 /// };
 /// let r = chain.sync(&ctx)?;
 /// ```
@@ -826,31 +826,31 @@ where
 /// infers to `'static` for chains built from owned data only.
 ///
 /// **Single-output.** `Handle = Pipe<T>` (the default). A multi-output op CAN be
-/// erased — its tuple `Output` becomes the `T` of the `EagerDynOp` (reconstructed
+/// erased — its tuple `Output` becomes the `T` of the `DeviceDynOp` (reconstructed
 /// via the inner op's `collect`), but the per-element build-time handle is gone;
 /// downstream sees one `Pipe<tuple>`. For the conditional-graph use case (arms
 /// agreeing on one `Output`) that is exactly right.
-pub struct EagerDynOp<'op, T> {
-    inner: Option<Box<dyn ErasedEagerOp<T> + 'op>>,
+pub struct DeviceDynOp<'op, T> {
+    inner: Option<Box<dyn ErasedDeviceOp<T> + 'op>>,
     out: Pipe<T>,
 }
 
-impl<'op, T: Send + 'static> EagerDynOp<'op, T> {
-    /// Erase a concrete op into a single-output `EagerDynOp`. Both arms of an
-    /// `if`/`match` can produce `EagerDynOp::new(...)` of the same `T` without
+impl<'op, T: Send + 'static> DeviceDynOp<'op, T> {
+    /// Erase a concrete op into a single-output `DeviceDynOp`. Both arms of an
+    /// `if`/`match` can produce `DeviceDynOp::new(...)` of the same `T` without
     /// their concrete types matching.
     pub fn new<O>(op: O) -> Self
     where
-        O: EagerOp<Output = T> + 'op,
+        O: DeviceOp<Output = T> + 'op,
     {
-        EagerDynOp {
+        DeviceDynOp {
             inner: Some(Box::new(op)),
             out: Pipe::new(),
         }
     }
 }
 
-impl<T: Send + 'static> EagerOp for EagerDynOp<'_, T> {
+impl<T: Send + 'static> DeviceOp for DeviceDynOp<'_, T> {
     type Output = T;
 
     fn output_pipe(&self) -> Pipe<T> {
@@ -865,11 +865,11 @@ impl<T: Send + 'static> EagerOp for EagerDynOp<'_, T> {
         // Gather the erased inner op (any arity → one value + deps) and deposit
         // into our own pipe, so the default collect/into_output/handle path treats
         // this as an ordinary single-output leaf. The inner op observes `mode`
-        // (it is the real terminal work when this EagerDynOp is the chain tail).
+        // (it is the real terminal work when this DeviceDynOp is the chain tail).
         let inner = self
             .inner
             .take()
-            .expect("EagerDynOp::execute called twice — internal eager bug");
+            .expect("DeviceDynOp::execute called twice — internal eager bug");
         let (v, deps) = inner.collect_erased(ec, mode)?;
         self.out.put(v, deps);
         Ok(())
@@ -888,13 +888,13 @@ impl<T: Send + 'static> EagerOp for EagerDynOp<'_, T> {
 
 /// Wrap an upstream op's output in [`Arc`] for shared fan-out. Passes events
 /// through unchanged.
-pub struct Arced<S: EagerOp> {
+pub struct Arced<S: DeviceOp> {
     source: S,
     out: Pipe<Arc<S::Output>>,
 }
 
 /// Wrap `source`'s output in `Arc`.
-pub fn arced<S: EagerOp>(source: S) -> Arced<S>
+pub fn arced<S: DeviceOp>(source: S) -> Arced<S>
 where
     S::Output: Sync,
 {
@@ -904,9 +904,9 @@ where
     }
 }
 
-impl<S> EagerOp for Arced<S>
+impl<S> DeviceOp for Arced<S>
 where
-    S: EagerOp,
+    S: DeviceOp,
     S::Output: Sync,
 {
     type Output = Arc<S::Output>;
@@ -949,7 +949,7 @@ where
 /// event. `Output = [S::Output; N]` (the `N` clones) for the terminal case.
 ///
 /// Use [`arc_split`] to build one — it follows an [`arced`] source.
-pub struct ArcSplit<S: EagerOp, const N: usize>
+pub struct ArcSplit<S: DeviceOp, const N: usize>
 where
     S::Output: Clone,
 {
@@ -963,7 +963,7 @@ where
 /// branches. `source` is typically an [`arced`] op (`Output = Arc<T>`), so the
 /// per-branch clone is a cheap refcount bump. Pick `N` via turbofish to match
 /// the destructure arity: `arc_split::<3, _>(arced(upload(…)))`.
-pub fn arc_split<const N: usize, S: EagerOp>(source: S) -> ArcSplit<S, N>
+pub fn arc_split<const N: usize, S: DeviceOp>(source: S) -> ArcSplit<S, N>
 where
     S::Output: Clone,
 {
@@ -973,9 +973,9 @@ where
     }
 }
 
-impl<S, const N: usize> EagerOp for ArcSplit<S, N>
+impl<S, const N: usize> DeviceOp for ArcSplit<S, N>
 where
-    S: EagerOp,
+    S: DeviceOp,
     S::Output: Clone,
 {
     type Output = [S::Output; N];
@@ -1059,7 +1059,7 @@ macro_rules! impl_eager_bundle {
         #[doc = concat!("Eager bundle of independent branches (arity ",
             stringify!($name), "). Built by [`", stringify!($ctor),
             "`]; branches run with no inter-ordering, joined by a marker.")]
-        pub struct $name<$($ty: EagerOp),+> {
+        pub struct $name<$($ty: DeviceOp),+> {
             $($field: $ty,)+
             // Each branch's output pipe, captured at build. These are the
             // move-once storage (like `CopyTo2`'s element pipes): the branch
@@ -1067,18 +1067,18 @@ macro_rules! impl_eager_bundle {
             // downstream multi-arg op (e.g. a kernel) can pull each branch as a
             // separate `Pipe<buffer>` input; `into_output` drains them for the
             // terminal-tuple case.
-            $($pf: Pipe<<$ty as EagerOp>::Output>,)+
+            $($pf: Pipe<<$ty as DeviceOp>::Output>,)+
         }
 
         #[doc = concat!("Construct an eager [`", stringify!($name), "`].")]
         #[allow(clippy::too_many_arguments)]
-        pub fn $ctor<$($ty: EagerOp),+>($($field: $ty),+) -> $name<$($ty),+> {
+        pub fn $ctor<$($ty: DeviceOp),+>($($field: $ty),+) -> $name<$($ty),+> {
             $(let $pf = $field.output_pipe();)+
             $name { $($field,)+ $($pf,)+ }
         }
 
-        impl<$($ty: EagerOp),+> EagerOp for $name<$($ty),+> {
-            type Output = ( $(<$ty as EagerOp>::Output,)+ );
+        impl<$($ty: DeviceOp),+> DeviceOp for $name<$($ty),+> {
+            type Output = ( $(<$ty as DeviceOp>::Output,)+ );
             // A tuple of each branch's OWN build-time handle (NOT forced to a
             // pipe). For a buffer-producing branch that handle defaults to
             // `Pipe<buffer>` (so a multi-arg op consumes it via `ToInput`, as
@@ -1087,7 +1087,7 @@ macro_rules! impl_eager_bundle {
             // for a nested bundle / multi-output branch it is that branch's own
             // composite handle. Composing per-branch handles (rather than
             // flattening to pipes) is what carries computable host values down.
-            type Handle = ( $(<$ty as EagerOp>::Handle,)+ );
+            type Handle = ( $(<$ty as DeviceOp>::Handle,)+ );
 
             fn output_pipe(&self) -> Pipe<Self::Output> {
                 // Multi-output storage is the per-branch pipes; this single pipe
@@ -1235,7 +1235,7 @@ macro_rules! eager_bundle {
 /// Eager fan-out: build one op per input (the builder `f` runs at construction
 /// — eager — over the known input list), run them independently, join via a
 /// marker. Output is `Vec<U::Output>`.
-pub struct FanOut<U: EagerOp> {
+pub struct FanOut<U: DeviceOp> {
     ops: Vec<U>,
     pipes: Vec<Pipe<U::Output>>,
     out: Pipe<Vec<U::Output>>,
@@ -1245,7 +1245,7 @@ pub struct FanOut<U: EagerOp> {
 pub fn fan_out<I, F, U>(inputs: Vec<I>, mut f: F) -> FanOut<U>
 where
     F: FnMut(I) -> U,
-    U: EagerOp,
+    U: DeviceOp,
 {
     let ops: Vec<U> = inputs.into_iter().map(&mut f).collect();
     let pipes: Vec<Pipe<U::Output>> = ops.iter().map(|o| o.output_pipe()).collect();
@@ -1260,28 +1260,28 @@ where
 ///
 /// Mirrors the old closure-layer `FanOutExt`. Reads as data → operation and
 /// composes cleanly with downstream `.and_then`; the free-fn form stays
-/// available — use whichever fits the call site. Named `EagerFanOutExt` to
+/// available — use whichever fits the call site. Named `DeviceFanOutExt` to
 /// avoid clashing with the old [`FanOutExt`](crate::FanOutExt) (both are
 /// re-exported at the crate root).
-pub trait EagerFanOutExt<I>: Sized {
+pub trait DeviceFanOutExt<I>: Sized {
     /// See [`fan_out`] — this delegates to it.
     fn fan_out<F, U>(self, f: F) -> FanOut<U>
     where
         F: FnMut(I) -> U,
-        U: EagerOp;
+        U: DeviceOp;
 }
 
-impl<I> EagerFanOutExt<I> for Vec<I> {
+impl<I> DeviceFanOutExt<I> for Vec<I> {
     fn fan_out<F, U>(self, f: F) -> FanOut<U>
     where
         F: FnMut(I) -> U,
-        U: EagerOp,
+        U: DeviceOp,
     {
         fan_out(self, f)
     }
 }
 
-impl<U: EagerOp> EagerOp for FanOut<U> {
+impl<U: DeviceOp> DeviceOp for FanOut<U> {
     type Output = Vec<U::Output>;
 
     fn output_pipe(&self) -> Pipe<Vec<U::Output>> {
@@ -1338,7 +1338,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for AllocZero<T, M>
+impl<T, M> DeviceOp for AllocZero<T, M>
 where
     T: Copy + Default + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
@@ -1388,7 +1388,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for Fill<T, M>
+impl<T, M> DeviceOp for Fill<T, M>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
@@ -1455,7 +1455,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for Upload<T, M>
+impl<T, M> DeviceOp for Upload<T, M>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Send + 'static,
@@ -1508,7 +1508,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for Download<T, M>
+impl<T, M> DeviceOp for Download<T, M>
 where
     T: Clone + Default + Send + 'static,
     M: MemMode + HostReadable + Send + 'static,
@@ -1558,11 +1558,11 @@ where
 /// Eager port of the closure-layer `transfer_to_device(buf, &dev)`. Enqueues a
 /// `clEnqueueMigrateMemObjects` for the buffer on `device`'s default OOO queue,
 /// yielding the (now-migrated) buffer. The matching per-op routing combinator
-/// kernels need after the buffer is migrated is [`on_device`](EagerOpExt::on_device).
+/// kernels need after the buffer is migrated is [`on_device`](DeviceOpExt::on_device).
 ///
 /// ## Shape: a leaf, not a wrapping method
 ///
-/// Unlike [`on_device`](EagerOpExt::on_device) (which *routes* an upstream op's
+/// Unlike [`on_device`](DeviceOpExt::on_device) (which *routes* an upstream op's
 /// own enqueue to another queue without touching its value), `transfer_to_device`
 /// is a buffer-*consuming* leaf: it resolves the upstream `DeviceSlice` value,
 /// reads its `cl_mem`, and enqueues a migrate. That puts it in the same family as
@@ -1605,7 +1605,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for TransferToDevice<T, M>
+impl<T, M> DeviceOp for TransferToDevice<T, M>
 where
     T: Send + 'static,
     M: MemMode + Send + 'static,
@@ -1675,7 +1675,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for FillDeviceUninit<T, M>
+impl<T, M> DeviceOp for FillDeviceUninit<T, M>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
@@ -1744,7 +1744,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for FillMappedUninit<T, M>
+impl<T, M> DeviceOp for FillMappedUninit<T, M>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
@@ -1813,7 +1813,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for FillUsmUninit<T, M>
+impl<T, M> DeviceOp for FillUsmUninit<T, M>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Send + 'static,
@@ -1871,7 +1871,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for WriteDeviceUninit<T, M>
+impl<T, M> DeviceOp for WriteDeviceUninit<T, M>
 where
     T: Send + Sync + 'static,
     M: MemMode + HostUploadable + HostWritable + Send + 'static,
@@ -1955,7 +1955,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for WriteDevice<T, M>
+impl<T, M> DeviceOp for WriteDevice<T, M>
 where
     T: Send + Sync + 'static,
     M: MemMode + HostWritable + Send + 'static,
@@ -2030,7 +2030,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for WriteMappedUninit<T, M>
+impl<T, M> DeviceOp for WriteMappedUninit<T, M>
 where
     T: Send + Sync + 'static,
     M: MemMode + HostWritable + Send + 'static,
@@ -2105,7 +2105,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for WriteUsmUninit<T, M>
+impl<T, M> DeviceOp for WriteUsmUninit<T, M>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Send + 'static,
@@ -2164,7 +2164,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for UsmSlice<T, M>
+impl<T, M> DeviceOp for UsmSlice<T, M>
 where
     T: Send + 'static,
     M: MemMode + Send + 'static,
@@ -2219,7 +2219,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for UsmAllocUninit<T, M>
+impl<T, M> DeviceOp for UsmAllocUninit<T, M>
 where
     T: Send + 'static,
     M: MemMode + Send + 'static,
@@ -2272,7 +2272,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for DeviceAllocUninit<T, M>
+impl<T, M> DeviceOp for DeviceAllocUninit<T, M>
 where
     T: Send + 'static,
     M: MemMode + Send + 'static,
@@ -2325,7 +2325,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for MappedAllocUninit<T, M>
+impl<T, M> DeviceOp for MappedAllocUninit<T, M>
 where
     T: Send + 'static,
     M: MemMode + Send + 'static,
@@ -2386,7 +2386,7 @@ where
     }
 }
 
-impl<I> EagerOp for ImageUploadEager<I>
+impl<I> DeviceOp for ImageUploadEager<I>
 where
     I: ImageHostTransfer + Send + 'static,
     I::Pixel: Send + 'static,
@@ -2445,7 +2445,7 @@ where
     }
 }
 
-impl<I> EagerOp for ImageDownloadEager<I>
+impl<I> DeviceOp for ImageDownloadEager<I>
 where
     I: ImageHostTransfer + Send + 'static,
     I::Pixel: Default + Copy + Send + 'static,
@@ -2516,7 +2516,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for AcquireDeviceView<T, M>
+impl<T, M> DeviceOp for AcquireDeviceView<T, M>
 where
     T: Send + 'static,
     M: MemMode + HostWritable + HostReadable,
@@ -2569,7 +2569,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for AcquireDeviceViewRead<T, M>
+impl<T, M> DeviceOp for AcquireDeviceViewRead<T, M>
 where
     T: Send + 'static,
     M: MemMode + HostReadable,
@@ -2621,7 +2621,7 @@ where
     }
 }
 
-impl<T, M, A> EagerOp for ReleaseDeviceView<T, M, A>
+impl<T, M, A> DeviceOp for ReleaseDeviceView<T, M, A>
 where
     T: Send + 'static,
     M: MemMode,
@@ -2672,7 +2672,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for AcquireMappedView<T, M>
+impl<T, M> DeviceOp for AcquireMappedView<T, M>
 where
     T: Send + Sync + 'static,
     M: MemMode + HostWritable + HostReadable,
@@ -2723,7 +2723,7 @@ where
     }
 }
 
-impl<T, M> EagerOp for AcquireMappedViewRead<T, M>
+impl<T, M> DeviceOp for AcquireMappedViewRead<T, M>
 where
     T: Send + Sync + 'static,
     M: MemMode + HostReadable,
@@ -2775,7 +2775,7 @@ where
     }
 }
 
-impl<T, M, A> EagerOp for ReleaseMappedView<T, M, A>
+impl<T, M, A> DeviceOp for ReleaseMappedView<T, M, A>
 where
     T: Send + 'static,
     M: MemMode,
@@ -2882,7 +2882,7 @@ where
     }
 }
 
-impl<Src, Dst> EagerOp for CopyTo2<Src, Dst>
+impl<Src, Dst> DeviceOp for CopyTo2<Src, Dst>
 where
     Src: CopyTo<Dst> + Send,
     Dst: Send,
@@ -2976,23 +2976,23 @@ where
 
 /// Sequential composition whose builder runs at **execute** with the live
 /// [`ExecutionContext`] in scope — built by
-/// [`and_then_with_context`](EagerOpExt::and_then_with_context).
+/// [`and_then_with_context`](DeviceOpExt::and_then_with_context).
 ///
 /// Unlike [`AndThen`] (builder at construction, `Pipe` handle), the closure
 /// here receives `&ExecutionContext` + the upstream's **runtime value**, so it
-/// can read `ec.device()` / `ec.context()` / route via [`on_device`](EagerOpExt::on_device) while
+/// can read `ec.device()` / `ec.context()` / route via [`on_device`](DeviceOpExt::on_device) while
 /// building the downstream op. The downstream op is therefore built — and run —
 /// at execute time.
-pub struct AndThenWithContext<S: EagerOp, U: EagerOp, F> {
+pub struct AndThenWithContext<S: DeviceOp, U: DeviceOp, F> {
     source: S,
     f: Option<F>,
     out: Pipe<U::Output>,
 }
 
-impl<S, U, F> EagerOp for AndThenWithContext<S, U, F>
+impl<S, U, F> DeviceOp for AndThenWithContext<S, U, F>
 where
-    S: EagerOp,
-    U: EagerOp,
+    S: DeviceOp,
+    U: DeviceOp,
     F: for<'a> FnOnce(&ExecutionContext<'a>, S::Output) -> U + Send,
 {
     type Output = U::Output;
@@ -3039,22 +3039,22 @@ where
 // ── OnDevice: re-point the op at a different device's queue at execute ──
 
 /// Route `source`'s `execute` to a **different** device's default
-/// out-of-order queue — built by [`on_device`](EagerOpExt::on_device).
+/// out-of-order queue — built by [`on_device`](DeviceOpExt::on_device).
 ///
 /// No user closure: at execute it resolves the target device's queue from the
 /// running context, builds a sibling [`ExecutionContext`] (same context + same
 /// host-error slot, different device + queue), and runs `source` against it.
 /// The source's events are valid across queues of the same context, so
 /// downstream stages on the parent's queue can wait on them cross-device.
-pub struct OnDevice<S: EagerOp> {
+pub struct OnDevice<S: DeviceOp> {
     source: S,
     device: crate::Device,
     out: Pipe<S::Output>,
 }
 
-impl<S, S2> EagerOp for OnDevice<S>
+impl<S, S2> DeviceOp for OnDevice<S>
 where
-    S: EagerOp<Output = S2>,
+    S: DeviceOp<Output = S2>,
     S2: Send,
 {
     type Output = S::Output;
@@ -3095,7 +3095,7 @@ where
 // ── AndThenHost / AndThenHostWithContext: the host seam ──
 
 /// Run a host closure on a borrowed [`Mappable::View`](crate::mappable::Mappable::View) of the upstream output,
-/// in chain order — built by [`and_then_host`](EagerOpExt::and_then_host).
+/// in chain order — built by [`and_then_host`](DeviceOpExt::and_then_host).
 ///
 /// ## In-queue, worker-thread (NOT submit-thread)
 ///
@@ -3119,7 +3119,7 @@ where
 /// synchronous unmap so the buffer is left clean. This mirrors the old
 /// closure-layer `and_then_host.rs` exactly. (Distinct from any future
 /// host-VALUE seam, which would be pure host compute with no map.)
-pub struct AndThenHost<S: EagerOp, F>
+pub struct AndThenHost<S: DeviceOp, F>
 where
     S::Output: crate::mappable::Mappable,
 {
@@ -3129,8 +3129,8 @@ where
 }
 
 /// Like [`AndThenHost`] but the closure also receives `&Context` — built by
-/// [`and_then_host_with_context`](EagerOpExt::and_then_host_with_context).
-pub struct AndThenHostWithContext<S: EagerOp, F>
+/// [`and_then_host_with_context`](DeviceOpExt::and_then_host_with_context).
+pub struct AndThenHostWithContext<S: DeviceOp, F>
 where
     S::Output: crate::mappable::Mappable,
 {
@@ -3280,9 +3280,9 @@ where
     }
 }
 
-impl<S, F> EagerOp for AndThenHost<S, F>
+impl<S, F> DeviceOp for AndThenHost<S, F>
 where
-    S: EagerOp,
+    S: DeviceOp,
     S::Output: crate::mappable::Mappable,
     F: for<'a> FnOnce(<S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
         + Send
@@ -3317,9 +3317,9 @@ where
     }
 }
 
-impl<S, F> EagerOp for AndThenHostWithContext<S, F>
+impl<S, F> DeviceOp for AndThenHostWithContext<S, F>
 where
-    S: EagerOp,
+    S: DeviceOp,
     S::Output: crate::mappable::Mappable,
     F: for<'a> FnOnce(&Context, <S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
         + Send
@@ -3361,7 +3361,7 @@ where
 // ── Profiled: wall-clock timing for a sub-chain ────────────────────────
 
 /// Times whatever the source op enqueued, registering a completion callback —
-/// built by [`profiled`](EagerProfileExt::profiled). Mirrors the old
+/// built by [`profiled`](DeviceProfileExt::profiled). Mirrors the old
 /// closure-layer `Profiled`: at execute it runs the source, enqueues an
 /// `clEnqueueMarkerWithWaitList` over the source's events, registers the user
 /// callback on the marker via [`register_profiling_callback`](crate::register_profiling_callback), and forwards the
@@ -3372,16 +3372,16 @@ where
 /// the [`Context`] with [`.profiling(true)`](crate::context::ContextBuilder::profiling));
 /// otherwise `execute` returns [`Error::ProfilingDisabled`] up front (the
 /// source op still ran — profiling is a host side-effect, not data flow).
-pub struct Profiled<S: EagerOp, F> {
+pub struct Profiled<S: DeviceOp, F> {
     source: S,
     cb: Option<F>,
     out: Pipe<S::Output>,
 }
 
-/// Extension trait adding [`profiled`](Self::profiled) to every [`EagerOp`].
-/// Separate from [`EagerOpExt`] to mirror the old layer's
+/// Extension trait adding [`profiled`](Self::profiled) to every [`DeviceOp`].
+/// Separate from [`DeviceOpExt`] to mirror the old layer's
 /// `DeviceOperationProfileExt`. Blanket-implemented.
-pub trait EagerProfileExt: EagerOp + Sized {
+pub trait DeviceProfileExt: DeviceOp + Sized {
     /// Register `cb` to receive the wall-clock [`ProfilingInfo`](crate::ProfilingInfo) for everything
     /// `self` enqueued onto the chain's queue. The closure fires on an OpenCL
     /// callback thread when the marker event completes. See [`Profiled`].
@@ -3396,11 +3396,11 @@ pub trait EagerProfileExt: EagerOp + Sized {
         }
     }
 }
-impl<T: EagerOp> EagerProfileExt for T {}
+impl<T: DeviceOp> DeviceProfileExt for T {}
 
-impl<S, F> EagerOp for Profiled<S, F>
+impl<S, F> DeviceOp for Profiled<S, F>
 where
-    S: EagerOp,
+    S: DeviceOp,
     F: FnOnce(Result<crate::ProfilingInfo>) + Send + 'static,
 {
     // Profiling is a host side-effect; the chain's data flow is unchanged.
@@ -3455,9 +3455,9 @@ where
     }
 }
 
-// ── EagerChainFuture: the async `.run().await` terminal ────────────────
+// ── DeviceChainFuture: the async `.run().await` terminal ────────────────
 
-/// Future returned by [`EagerOpExt::run`]. Resolves to `Result<T>` once the
+/// Future returned by [`DeviceOpExt::run`]. Resolves to `Result<T>` once the
 /// chain's commands have all completed on the device (or immediately, with an
 /// error, if the chain failed to submit or any host seam returned `Err`).
 ///
@@ -3469,7 +3469,7 @@ where
 /// prefers the stashed rich variant (closure `Err`, `HostPanic`) over the
 /// `Error::OpenCl(-1)` cascade — mirroring the `sync` terminal.
 #[cfg(feature = "async-events")]
-pub enum EagerChainFuture<T> {
+pub enum DeviceChainFuture<T> {
     /// Chain failed during setup, `execute`, or marker enqueue. The error
     /// surfaces on the first `poll`.
     Errored(Option<Error>),
@@ -3489,7 +3489,7 @@ pub enum EagerChainFuture<T> {
 // `Arc<T>`, tuples of those, ...) and lets us pin-project via the cheap
 // `Pin::get_mut`. Mirrors `ChainFuture`'s bound.
 #[cfg(feature = "async-events")]
-impl<T: Unpin> std::future::Future for EagerChainFuture<T> {
+impl<T: Unpin> std::future::Future for DeviceChainFuture<T> {
     type Output = Result<T>;
 
     fn poll(
@@ -3499,10 +3499,10 @@ impl<T: Unpin> std::future::Future for EagerChainFuture<T> {
         use std::task::Poll;
         let this = self.as_mut().get_mut();
         match this {
-            EagerChainFuture::Errored(slot) => Poll::Ready(Err(slot
+            DeviceChainFuture::Errored(slot) => Poll::Ready(Err(slot
                 .take()
-                .expect("EagerChainFuture polled after Ready (Errored)"))),
-            EagerChainFuture::Running {
+                .expect("DeviceChainFuture polled after Ready (Errored)"))),
+            DeviceChainFuture::Running {
                 output,
                 event_future,
                 host_error,
@@ -3526,14 +3526,14 @@ impl<T: Unpin> std::future::Future for EagerChainFuture<T> {
                     }
                     Poll::Ready(Ok(output
                         .take()
-                        .expect("EagerChainFuture polled after Ready (Running)")))
+                        .expect("DeviceChainFuture polled after Ready (Running)")))
                 }
             },
         }
     }
 }
 
-/// Crate-internal worker behind [`EagerOpExt::run`]: build the
+/// Crate-internal worker behind [`DeviceOpExt::run`]: build the
 /// [`ExecutionContext`] (default OOO queue, like `sync`), run `execute` in
 /// [`ExecMode::Pipelined`], drain the single output pipe, enqueue a marker over
 /// the chain's deps, and wrap it in an [`EventFuture`](crate::EventFuture).
@@ -3541,9 +3541,9 @@ impl<T: Unpin> std::future::Future for EagerChainFuture<T> {
 /// Synchronous-error paths invalidate the context's cached OOO queue, mirroring
 /// `chain_future::run_chain`'s contract.
 #[cfg(feature = "async-events")]
-fn run_eager_chain<Op>(chain: Op, context: &Context) -> EagerChainFuture<Op::Output>
+fn run_eager_chain<Op>(chain: Op, context: &Context) -> DeviceChainFuture<Op::Output>
 where
-    Op: EagerOp,
+    Op: DeviceOp,
     Op::Output: Unpin,
 {
     use crate::EventFutureExt;
@@ -3552,7 +3552,7 @@ where
     let device = context.device().clone();
     let queue = match context.default_outoforder_queue(&device) {
         Ok(q) => q,
-        Err(e) => return EagerChainFuture::Errored(Some(e)),
+        Err(e) => return DeviceChainFuture::Errored(Some(e)),
     };
     let ec = ExecutionContext::new(context, device.clone(), queue.raw());
     // Clone the chain's host-error slot out before `ec` drops — host-seam workers
@@ -3571,7 +3571,7 @@ where
         Err(e) => {
             drop(queue);
             context.invalidate_default_outoforder_queue(&device);
-            return EagerChainFuture::Errored(Some(e));
+            return DeviceChainFuture::Errored(Some(e));
         }
     };
 
@@ -3586,7 +3586,7 @@ where
             drop(deps);
             drop(queue);
             context.invalidate_default_outoforder_queue(&device);
-            return EagerChainFuture::Errored(Some(Error::OpenCl(code)));
+            return DeviceChainFuture::Errored(Some(Error::OpenCl(code)));
         }
     };
     drop(deps);
@@ -3599,11 +3599,11 @@ where
     if let Err(e) = context.flush_all_outoforder_queues() {
         drop(queue);
         context.invalidate_default_outoforder_queue(&device);
-        return EagerChainFuture::Errored(Some(e));
+        return DeviceChainFuture::Errored(Some(e));
     }
 
     // 5. Wrap the marker in the EventFuture machinery (clSetEventCallback).
-    EagerChainFuture::Running {
+    DeviceChainFuture::Running {
         output: Some(output),
         event_future: marker.into_future(),
         host_error,
