@@ -76,7 +76,7 @@ fn forward_pass_carries_scalar_state_via_bundle() {
             // Pack: kernel output (a bare `Pipe<DeviceSlice>`) + the scalar 1.
             eager_bundle!(kernels.scale_u32([N], buf, 2), value(1u32))
         })
-        .and_then(|(buf, step): (_, u32)| {
+        .and_then(|(buf, step)| {
             // `buf` is a `Pipe<DeviceSlice>`, `step` is `u32` (by-value handle) —
             // so `step + 1` computes here, carried in-chain, not hand-tracked.
             eager_bundle!(kernels.scale_u32([N], buf, 3), value(step + 1))

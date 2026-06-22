@@ -53,7 +53,7 @@ fn bundle_mixes_pipe_and_value_scalar_arrives_by_value() {
         .and_then(|buf| eager_bundle!(ks.fill_u32([N], buf, 7), value(42u32)))
         // `buf` is a Pipe<DeviceSlice>, `scalar` is a u32 BY VALUE — this binding
         // would not type-check if the bundle handed a Pipe<u32> here.
-        .and_then(|(buf, scalar): (_, u32)| {
+        .and_then(|(buf, scalar)| {
             // Use the scalar as a value to prove it's not a pipe: pick the kernel
             // factor from it, and carry it onward unchanged.
             let factor = if scalar == 42 { 1u32 } else { 0 };
@@ -77,11 +77,11 @@ fn carried_scalar_is_computed_on_in_chain() {
 
     let (out, step): (Vec<u32>, u32) = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
         .and_then(|buf| eager_bundle!(ks.scale_u32([N], buf, 2), value(0u32)))
-        .and_then(|(buf, step): (_, u32)| {
+        .and_then(|(buf, step)| {
             // step: u32 — `step + 1` is a build-time host computation.
             eager_bundle!(ks.scale_u32([N], buf, 2), value(step + 1))
         })
-        .and_then(|(buf, step): (_, u32)| eager_bundle!(ks.scale_u32([N], buf, 2), value(step + 1)))
+        .and_then(|(buf, step)| eager_bundle!(ks.scale_u32([N], buf, 2), value(step + 1)))
         .and_then(|(buf, step)| eager_bundle!(download(buf), value(step)))
         .sync(&ctx)
         .expect("counter chain");
