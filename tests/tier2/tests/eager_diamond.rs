@@ -17,19 +17,15 @@
 //! `eager_cutover::arc_split_read_only_fan_out`. THIS PART OF THE PORT WORKED
 //! WITH NO FRICTION.
 //!
-//! DEVIATION (on-device branch reducer): a bundle branch must end on a single
-//! `Pipe<DeviceSlice>` so the join hands the combine kernel a per-branch buffer
-//! input (`ToInput` is impl'd for `Pipe<one buffer>`, not for the multi-output
-//! kernel's `Pipe<(a,b,out)>`). `add_u32`'s output handle is the 3-tuple
-//! `(Pipe<a>, Pipe<b>, Pipe<out>)`, and the eager API has NO primitive that
-//! forwards one selected `Pipe<DeviceSlice>` as its own single-output `EagerOp`
-//! (a `select`/`forward`/identity node). To reduce each branch to one buffer
-//! while keeping the fan-in ON-DEVICE (faithful to diamond_arc, whose combine
-//! is `add_u32`), every branch ends with `scale_u32([N], out, 1)` — an identity
-//! kernel (×1) whose output IS a single `Pipe<DeviceSlice>`. The arithmetic
-//! result and final assertions are byte-identical to diamond_arc; the only
-//! addition is one no-op kernel per branch. See the report for the missing
-//! primitive (`select`/`forward`).
+//! Branch reducer: a bundle branch must end on a single `Pipe<DeviceSlice>` so
+//! the join hands the combine kernel a per-branch buffer input (`ToInput` is
+//! impl'd for `Pipe<one buffer>`, not for the multi-output kernel's
+//! `Pipe<(a,b,out)>`). `add_u32`'s output handle is the 3-tuple
+//! `(Pipe<a>, Pipe<b>, Pipe<out>)`, so each branch ends with `forward(out)` — the
+//! eager analog of the old reducer's `value(out)`: a pure select/identity node
+//! that re-deposits the chosen pipe (resolve + forward, NO device work). Faithful
+//! 1:1 to `diamond_arc.rs` (which ended each branch `add_u32(...).and_then(|(_,_,
+//! out)| value(out))`); no extra kernel.
 
 use claspr::Context;
 use claspr::eager::{
@@ -69,22 +65,22 @@ fn diamond_shares_single_cl_mem_via_arc_device_slice() {
             .and_then(|[s1, s2]| {
                 let ks = &kernels;
                 bundle3(
-                    // Branch A: out = shared + [10; N], reduced to one buffer
-                    // via the identity (×1) kernel so the bundle hands the
-                    // combine kernel a `Pipe<DeviceSlice>`.
+                    // Branch A: out = shared + [10; N], reduced to its single
+                    // `out` pipe via `forward` (= old `value(out)`, no device work)
+                    // so the bundle hands the combine kernel a `Pipe<DeviceSlice>`.
                     bundle2(
                         upload::<u32, claspr::ReadWrite, _>(vec![10u32; N]),
                         alloc_zero::<u32, claspr::ReadWrite>(N),
                     )
                     .and_then(move |(a_in, out)| ks.add_u32([N], s1, a_in, out))
-                    .and_then(move |(_s, _a_in, out)| ks.scale_u32([N], out, 1)),
+                    .and_then(|(_s, _a_in, out)| forward(out)),
                     // Branch B: out = shared + [20; N], same reducer.
                     bundle2(
                         upload::<u32, claspr::ReadWrite, _>(vec![20u32; N]),
                         alloc_zero::<u32, claspr::ReadWrite>(N),
                     )
                     .and_then(move |(b_in, out)| ks.add_u32([N], s2, b_in, out))
-                    .and_then(move |(_s, _b_in, out)| ks.scale_u32([N], out, 1)),
+                    .and_then(|(_s, _b_in, out)| forward(out)),
                     // Fresh destination for the combine.
                     alloc_zero::<u32, claspr::ReadWrite>(N),
                 )
@@ -110,8 +106,9 @@ fn diamond_shares_single_cl_mem_via_arc_device_slice() {
 /// nested bundle-of-bundles, then branch A's result is downloaded and the
 /// sticky error counter is asserted 0 — if the shared `cl_mem` were released
 /// before the last branch's kernel finished, a use-after-free / sticky error
-/// would surface. Each branch ends with the identity (×1) reducer so the nested
-/// bundles compose over single `Pipe<DeviceSlice>` outputs.
+/// would surface. Each branch ends with `forward(out)` (select/identity, no
+/// device work) so the nested bundles compose over single `Pipe<DeviceSlice>`
+/// outputs.
 #[test]
 fn arc_device_slice_refcount_holds_until_last_branch_finishes() {
     let Some(ctx) = ctx() else { return };
@@ -140,7 +137,7 @@ fn arc_device_slice_refcount_holds_until_last_branch_finishes() {
                         alloc_zero::<u32, claspr::ReadWrite>(N),
                     )
                     .and_then(move |(b, out)| ks.add_u32([N], s, b, out))
-                    .and_then(move |(_s, _b, out)| ks.scale_u32([N], out, 1))
+                    .and_then(|(_s, _b, out)| forward(out))
                     .and_then(download)
                 };
                 // Bundle of bundles (nested join) — composes cleanly in eager.
@@ -154,45 +151,4 @@ fn arc_device_slice_refcount_holds_until_last_branch_finishes() {
 
     assert!(a.iter().all(|&v| v == 7));
     assert_eq!(ctx.error_count(), 0);
-}
-
-/// **`forward` closes the diamond's deviation.** With the `forward` primitive a
-/// branch reduces a multi-output kernel to ONE on-device pipe WITHOUT the
-/// identity-×1 kernel: `add_u32(...).and_then(|(_s,_a,out)| forward(out))`. Two
-/// such branches feed a combine `add_u32` — the clean diamond, fully on-device,
-/// no host hop, no no-op kernel. Same (5+10)+(5+20)=40 as the ×1-kernel version.
-#[test]
-fn diamond_on_device_via_forward() {
-    let Some(ctx) = ctx() else { return };
-    let kernels = kernels::kernels(&ctx).expect("kernels");
-
-    let result: Vec<u32> =
-        arc_split::<2, _>(arced(upload::<u32, claspr::ReadWrite, _>(vec![5u32; N])))
-            .and_then(|[s1, s2]| {
-                let ks = &kernels;
-                bundle3(
-                    bundle2(
-                        upload::<u32, claspr::ReadWrite, _>(vec![10u32; N]),
-                        alloc_zero::<u32, claspr::ReadWrite>(N),
-                    )
-                    .and_then(move |(a_in, out)| ks.add_u32([N], s1, a_in, out))
-                    .and_then(|(_s, _a_in, out)| forward(out)),
-                    bundle2(
-                        upload::<u32, claspr::ReadWrite, _>(vec![20u32; N]),
-                        alloc_zero::<u32, claspr::ReadWrite>(N),
-                    )
-                    .and_then(move |(b_in, out)| ks.add_u32([N], s2, b_in, out))
-                    .and_then(|(_s, _b_in, out)| forward(out)),
-                    alloc_zero::<u32, claspr::ReadWrite>(N),
-                )
-                .and_then(move |(a_out, b_out, out)| ks.add_u32([N], a_out, b_out, out))
-                .and_then(|(_a, _b, out)| download(out))
-            })
-            .sync(&ctx)
-            .expect("diamond via forward");
-    assert!(
-        result.iter().all(|&v| v == 40),
-        "diamond via forward; got {:?}",
-        &result[..4]
-    );
 }
