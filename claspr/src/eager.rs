@@ -423,12 +423,15 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         }
     }
 
-    /// Run `self` to completion on `context` (forward path; no replay). Blocks
-    /// once, here, on the terminal op's events — the only wait in the graph.
-    fn sync(self, context: &Context) -> Result<Self::Output> {
-        let device = context.device().clone();
-        let queue = context.default_outoforder_queue(&device)?;
-        let ec = ExecutionContext::new(context, device, queue.raw());
+    /// Run `self` to completion on `launcher`'s queue (forward path; no replay).
+    /// Blocks once, here, on the terminal op's events — the only wait in the
+    /// graph. The general blocking terminal: a [`Launcher`] is a specific queue
+    /// (`Context` → its default OOO queue; a `Queue`/`ExecutionContext` → that
+    /// exact queue), so `wait_on` is also the cross-queue / cross-device control
+    /// (Tier-1 heritage). [`sync`](Self::sync) is `wait_on` over a `Context`.
+    fn wait_on<L: crate::Launcher + ?Sized>(self, launcher: &L) -> Result<Self::Output> {
+        let device = launcher.context().device().clone();
+        let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
         // The terminal op yields its Output and waits on its own completion
         // events (Blocking); upstream ops pipeline. Single-output ops use the
         // default `into_output` (drain output pipe + wait); multi-output ops
@@ -449,6 +452,36 @@ pub trait DeviceOpExt: DeviceOp + Sized {
                 None => Ok(v),
             },
         }
+    }
+
+    /// Run `self` to completion on `context`'s default out-of-order queue. The
+    /// named graph terminal (cuda-oxide / Rust-CUDA heritage spelling); equal to
+    /// [`wait_on`](Self::wait_on) over the `context`. Use `wait_on` with an
+    /// explicit `Queue` for cross-queue ordering.
+    fn sync(self, context: &Context) -> Result<Self::Output> {
+        let device = context.device().clone();
+        let queue = context.default_outoforder_queue(&device)?;
+        self.wait_on(&*queue)
+    }
+
+    /// Non-blocking terminal — enqueue the whole graph on `launcher`'s queue and
+    /// return a single completion [`Event`](crate::Event) (a marker over every
+    /// command the graph produced) WITHOUT waiting. The caller can `.wait()` the
+    /// event or thread it into other Tier-1 ordering. The graph's `Output` value
+    /// is materialised here (handles/Vecs); the event just gates *when* the
+    /// device work is done. Tier-1 heritage spelling; `submit` is the
+    /// concrete-head no-launcher form (see the buffer ops).
+    fn submit_on<L: crate::Launcher + ?Sized>(self, launcher: &L) -> Result<crate::Event> {
+        use crate::Launcher;
+        let device = launcher.context().device().clone();
+        let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
+        // Gather non-blocking (Pipelined); a host-seam setup error surfaces here.
+        let (_output, deps) = self.collect(&ec, ExecMode::Pipelined)?;
+        let wait_list: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        // SAFETY: the cl_events are held alive by `deps` across this call.
+        let marker = unsafe { ec.cl_queue().enqueue_marker_with_wait_list(&wait_list) }
+            .map_err(Error::OpenCl)?;
+        Ok(marker)
     }
 
     /// Async terminal — run `self` on `context` and return a future that
