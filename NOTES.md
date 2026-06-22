@@ -70,12 +70,12 @@ LESSON (Brice): should've ported the suite directly (all-fail-then-fix) to see
 this shape set at once instead of piecemeal.
 
 **⚠ GAPS FOUND porting the full suite (systematic, sub-agent clusters) — the
-parity backlog. NEARLY CLOSED 2026-06-22 — 7/8 gaps done + a root-cause
-multi-output bug fixed (commits 4811c5b small gaps, c130145 transfer+async,
-d756e0d bundle gather + arity 2..=16 + eager_bundle!, 2f681d2 EagerDynOp). Only
-ONE DESIGN-heavy gap remains (host-value reduction seam) — PLUS the 🚨
-`and_then_host` async regression above (separate from the gaps; a correctness
-issue in already-"done" code, must be fixed before the destructive cleanup).**
+parity backlog. ALL 8 GAPS CLOSED 2026-06-22 (commits 4811c5b small gaps,
+c130145 transfer+async, d756e0d bundle gather + arity 2..=16 + eager_bundle!,
+2f681d2 EagerDynOp, 81e5d7e heterogeneous carry). The ONLY remaining eager-model
+work is the 🚨 `and_then_host` async regression above (separate from the parity
+gaps; a correctness issue in already-"done" code — MUST be fixed before the
+destructive cleanup), then the destructive cleanup itself.**
 - ✅ **transfer_to_device** — DONE (c130145). Eager leaf `transfer_to_device(buf,
   device)` wrapping clEnqueueMigrateMemObjects on the target OOO queue;
   re-export `eager_transfer_to_device`; composes with `.on_device`.
@@ -85,15 +85,27 @@ issue in already-"done" code, must be fixed before the destructive cleanup).**
   inner ops erase cleanly (tuple becomes `T` via `collect`; per-element handle
   dropped — fine for conditional arms agreeing on one Output). All of
   conditional.rs ported (eager_conditional 10/10, was 1 + 8 blocked).
-- ⚠ **Host-value passthrough / host reduction mid-graph. STILL OPEN (needs
-  DESIGN).** eager `and_then` hands
-  a Pipe, not the host VALUE; `and_then_host` is for device `&mut [T]` views,
-  not host scalars/Arc<Vec>. So: host reductions over an `arc_split` of a lifted
-  host `value(vec)` (sum/len), and `value((buf, step))` scalar-state repack, have
-  no seam. Needs an `and_then_host_value`-style seam OR make host wrappers
-  Mappable. (blocks all 3 arc_split.rs + 1 ml_pass.rs). Same class as chain.rs
-  gap 2. NOTE: arc_split of a DEVICE buffer (the diamond) works fine — this is
-  only the HOST-side reduction variant.
+- ✅ **Host-value passthrough / host reduction / scalar carry — DONE (81e5d7e),
+  the LAST gap.** Fixed by a type-system change, NOT a host-value seam (an
+  `and_then_host_value` was explicitly rejected: sending host data TO the gpu is
+  `and_then_host`'s job [map→write→unmap], and host scalars are computable
+  eagerly — the real question was just whether they can flow as graph edges, and
+  they can). Three composable pieces: (1) `Pipe<T>: EagerOp` (identity node) so a
+  bare pipe is a bundle/and_then source with no `forward()`; (2) `Value<T: Clone>`
+  exposes a BY-VALUE handle (`Handle = T`) so a downstream closure gets the value
+  not a pipe → build-time host compute works (`value(n).and_then(|n| value(n+1))`;
+  carried `step + 1` in-chain); non-Clone owned resources use the new `lift()`
+  leaf (default Pipe handle); (3) `bundle` composes per-branch handles
+  (`Handle = (<$ty>::Handle,)`) so `bundle!(kernel, value(7))` hands down
+  `(Pipe<DeviceSlice>, u32)` — buffer-pipe + scalar-by-value. Un-blocked all 3
+  arc_split host-reductions (no arc_split op needed — by-value `value` covers
+  host fan-out) + ml_pass repack (faithful). ALSO fixed a latent recurrence of
+  the d756e0d multi-output gather bug: every single-source wrapper
+  (and_then_host{,_with_context}/on_device/arced/arc_split/and_then_with_context/
+  profiled) drained `source.output_pipe()` → broken for bundle sources; all now
+  `source.collect()`. NEW requirement-lock suite `eager_heterogeneous_carry`
+  (4 tests) makes pipe+scalar carry + in-chain scalar compute a COMPILE/RUN
+  requirement so a redesign can't silently drop it.
 - ✅ **FanOutExt method form** (`vec.fan_out(op)`) — DONE (4811c5b). `EagerFanOutExt`.
 - ✅ **async terminal `.run().await`** — DONE (c130145, extended d756e0d).
   `EagerChainFuture` + `EagerOpExt::run` (async-events feature); arity-agnostic —
