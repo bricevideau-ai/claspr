@@ -11,28 +11,26 @@ items resolve.
 
 ### Eager struct-graph cutover (branch `eager-cutover`, from main, 2026-06-18)
 
-**🚨 SERIOUS REGRESSION TO FIX — eager `and_then_host` runs SYNCHRONOUSLY at
-execute; it MUST spawn a worker thread (2026-06-22).** The eager `run_host_seam`
-(eager.rs ~2799) drains the upstream deps with a blocking `wait()`, maps, runs
-the closure inline, unmaps, all on the submitting thread. That throws away the
-entire reason the old `and_then_host` exists. The old model (`and_then_host.rs`)
-deliberately engineered map → `clCreateUserEvent` → unmap(gated on user event) →
-**spawned worker thread** precisely so the host stage sits **in-queue** and
-overlaps pipelined device work; the chain continues at submit time, not when the
-closure returns (see that module's "What's wrong with sync host work in a chain"
-+ "Why no value-returning closure" docs). The eager node's doc-comment calls the
-sync shape an acceptable "simplification" — that is WRONG; it is a regression and
-the claim must be removed. FIX: port the old async machinery to the eager node —
-worker thread waits on the all-data-mapped events, runs the closure under
-`catch_unwind`, signals a user event (CL_COMPLETE / negative); `execute` returns
-the unmap events as deps so downstream gates on the user event WITHOUT the submit
-thread blocking. Reinstate the host-error slot on the eager `ExecutionContext`
-(rich Rust error survives the cl_event negative-status cascade; terminals prefer
-it) and the defensive sync-unmap-on-error (`mark_unmap_not_done`). Applies to
-BOTH `AndThenHost` and `AndThenHostWithContext`. The synchronous `catch_unwind`
-→ HostPanic added in 4811c5b stays as the worker's panic handling. NOTE: the
-new host-VALUE seam (`and_then_host_value`, below) is a SEPARATE, genuinely
-synchronous node (pure host compute, no map) — do not conflate the two.
+**✅ and_then_host async regression FIXED (cc5f3bc, 2026-06-22).** The eager host
+seam had been (mis)ported to run the closure SYNCHRONOUSLY on the submit thread,
+discarding the whole point of the map/user-event machinery. Restored the
+in-queue worker-thread model from `and_then_host.rs`: `run_host_seam` enqueues
+maps over the source's events, creates a user event, enqueues unmaps gated on it,
+SPAWNS a worker (new `run_host_worker`), and returns the unmap events as deps —
+chain continues at submit time, host stage overlaps device work. Worker waits map
+events, runs closure under `catch_unwind`, stashes errors in the
+`ExecutionContext` host-error slot, defensive-unmaps on error, signals the user
+event. Applies to both `AndThenHost` + `AndThenHostWithContext`; closures now
+need `+ 'static`. THREE latent issues the sync seam masked, all fixed in the same
+commit: (1) terminals (`sync` + `EagerChainFuture`) must drain the host-error
+slot even on `Ok` — pocl's `clEnqueueMarkerWithWaitList` does NOT cascade
+negative user-event status, so a failed worker can leave the marker reporting
+CL_COMPLETE; a non-empty slot is itself the failure signal; (2) `EagerChainFuture
+::Running` gained a `host_error` Arc; (3) ORPHANED DEPS — `.and_then(|_buf|
+value(0))` discards the source handle, so a host worker's user event never
+reached the terminal (`sync` returned before the worker ran); `AndThen` now
+threads the source pipe's un-taken deps into the result
+(`thread_orphaned_source_deps`), as the old layer did via `next.execute(deps)`.
 
 **host_view `View<'a>` RISK RETIRED (probed).** The flagged-medium-risk
 `View<'a>` borrow is NOT in the host_view DeviceOperation leaves — `Acquire/
@@ -72,10 +70,11 @@ this shape set at once instead of piecemeal.
 **⚠ GAPS FOUND porting the full suite (systematic, sub-agent clusters) — the
 parity backlog. ALL 8 GAPS CLOSED 2026-06-22 (commits 4811c5b small gaps,
 c130145 transfer+async, d756e0d bundle gather + arity 2..=16 + eager_bundle!,
-2f681d2 EagerDynOp, 81e5d7e heterogeneous carry). The ONLY remaining eager-model
-work is the 🚨 `and_then_host` async regression above (separate from the parity
-gaps; a correctness issue in already-"done" code — MUST be fixed before the
-destructive cleanup), then the destructive cleanup itself.**
+2f681d2 EagerDynOp, 81e5d7e heterogeneous carry) + the and_then_host async
+regression FIXED (cc5f3bc, above). The ONLY remaining eager-model work is the
+DESTRUCTIVE CLEANUP: delete the old `DeviceOperation` closure layer, migrate the
+entry macros (`upload!`/`download!`/`bundle!`→eager; rename `eager_bundle!`→
+`bundle!`), re-bless compile-fail, full gate.**
 - ✅ **transfer_to_device** — DONE (c130145). Eager leaf `transfer_to_device(buf,
   device)` wrapping clEnqueueMigrateMemObjects on the target OOO queue;
   re-export `eager_transfer_to_device`; composes with `.on_device`.
