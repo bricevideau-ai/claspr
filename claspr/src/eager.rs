@@ -2760,19 +2760,28 @@ where
 /// on its view (mutations persist via the unmap), then forward the **same**
 /// value downstream (`Output = S::Output`).
 ///
-/// ## Synchronous, not spawned (eager port simplification)
+/// ## 🚨 REGRESSION: currently synchronous, MUST become worker-thread-spawned
 ///
-/// The old closure-layer `and_then_host` spawned a worker thread (plus a user
-/// event and a host-error slot) so a host stage could sit *in-queue* with
-/// pipelined device work. The eager node runs the host call **synchronously at
-/// execute**: it drains the upstream deps, does a (non-blocking) map then waits
-/// its event, runs the closure, enqueues the unmap then waits its event, then
-/// forwards. This is correct and simpler: errors propagate directly via
-/// `?`/`return Err` (no user-event stash needed), panics are not caught (they
-/// unwind the caller), and mutations commit through the unmap. The cost is that
-/// the host stage no longer overlaps downstream device work; for a host seam (a
-/// scheduling / host-touch concern) that serialization is acceptable and
-/// matches the pre-async synchronous shape the module docs describe.
+/// This node currently runs the host call **synchronously at execute** (drain
+/// upstream deps with a blocking wait, map, wait the map event, run the closure,
+/// unmap, wait, forward). **That is a regression, not an acceptable
+/// simplification.** The old closure-layer `and_then_host`
+/// (`claspr/src/and_then_host.rs`) deliberately engineered map →
+/// `clCreateUserEvent` → unmap(gated on the user event) → **spawned worker
+/// thread** precisely so a host stage sits *in-queue* and overlaps pipelined
+/// device work — the chain continues at submit time, not when the closure
+/// returns. The whole map/user-event apparatus exists for exactly that. Running
+/// it on the submitting thread throws that away and serializes the chain.
+///
+/// TODO (tracked in NOTES "SERIOUS REGRESSION"): port the old async machinery —
+/// worker thread waits the all-data-mapped events, runs the closure under
+/// `catch_unwind`, signals a user event (CL_COMPLETE / negative); `execute`
+/// returns the unmap events as deps so downstream gates on the user event
+/// WITHOUT the submit thread blocking. Reinstate the `ExecutionContext`
+/// host-error slot (rich Rust error survives the negative-status cascade) and
+/// the defensive sync-unmap-on-error. The `catch_unwind` → `Error::HostPanic`
+/// behaviour stays as the worker's panic handling. Do NOT conflate this with
+/// the genuinely-synchronous host-VALUE seam (`and_then_host_value`).
 pub struct AndThenHost<S: EagerOp, F>
 where
     S::Output: crate::mappable::Mappable,
@@ -2797,6 +2806,11 @@ where
 
 /// Shared body: run source, drain its deps host-side, map, run `host_call` on
 /// the view, unmap, and forward the value with the unmap event as deps.
+///
+/// 🚨 REGRESSION: this is the synchronous (submit-thread) implementation. It MUST
+/// be replaced by the worker-thread + user-event machinery from the old
+/// `and_then_host.rs` so the host stage overlaps device work — see the
+/// `AndThenHost` doc above and NOTES "SERIOUS REGRESSION".
 fn run_host_seam<O>(
     source_value: O,
     source_deps: Deps,

@@ -11,6 +11,29 @@ items resolve.
 
 ### Eager struct-graph cutover (branch `eager-cutover`, from main, 2026-06-18)
 
+**🚨 SERIOUS REGRESSION TO FIX — eager `and_then_host` runs SYNCHRONOUSLY at
+execute; it MUST spawn a worker thread (2026-06-22).** The eager `run_host_seam`
+(eager.rs ~2799) drains the upstream deps with a blocking `wait()`, maps, runs
+the closure inline, unmaps, all on the submitting thread. That throws away the
+entire reason the old `and_then_host` exists. The old model (`and_then_host.rs`)
+deliberately engineered map → `clCreateUserEvent` → unmap(gated on user event) →
+**spawned worker thread** precisely so the host stage sits **in-queue** and
+overlaps pipelined device work; the chain continues at submit time, not when the
+closure returns (see that module's "What's wrong with sync host work in a chain"
++ "Why no value-returning closure" docs). The eager node's doc-comment calls the
+sync shape an acceptable "simplification" — that is WRONG; it is a regression and
+the claim must be removed. FIX: port the old async machinery to the eager node —
+worker thread waits on the all-data-mapped events, runs the closure under
+`catch_unwind`, signals a user event (CL_COMPLETE / negative); `execute` returns
+the unmap events as deps so downstream gates on the user event WITHOUT the submit
+thread blocking. Reinstate the host-error slot on the eager `ExecutionContext`
+(rich Rust error survives the cl_event negative-status cascade; terminals prefer
+it) and the defensive sync-unmap-on-error (`mark_unmap_not_done`). Applies to
+BOTH `AndThenHost` and `AndThenHostWithContext`. The synchronous `catch_unwind`
+→ HostPanic added in 4811c5b stays as the worker's panic handling. NOTE: the
+new host-VALUE seam (`and_then_host_value`, below) is a SEPARATE, genuinely
+synchronous node (pure host compute, no map) — do not conflate the two.
+
 **host_view `View<'a>` RISK RETIRED (probed).** The flagged-medium-risk
 `View<'a>` borrow is NOT in the host_view DeviceOperation leaves — `Acquire/
 ReleaseDeviceSliceOp::Output` is an OWNED `DeviceSliceHostView` (owns buf +
@@ -50,7 +73,9 @@ this shape set at once instead of piecemeal.
 parity backlog. NEARLY CLOSED 2026-06-22 — 7/8 gaps done + a root-cause
 multi-output bug fixed (commits 4811c5b small gaps, c130145 transfer+async,
 d756e0d bundle gather + arity 2..=16 + eager_bundle!, 2f681d2 EagerDynOp). Only
-ONE DESIGN-heavy gap remains (host-value reduction seam).**
+ONE DESIGN-heavy gap remains (host-value reduction seam) — PLUS the 🚨
+`and_then_host` async regression above (separate from the gaps; a correctness
+issue in already-"done" code, must be fixed before the destructive cleanup).**
 - ✅ **transfer_to_device** — DONE (c130145). Eager leaf `transfer_to_device(buf,
   device)` wrapping clEnqueueMigrateMemObjects on the target OOO queue;
   re-export `eager_transfer_to_device`; composes with `.on_device`.
