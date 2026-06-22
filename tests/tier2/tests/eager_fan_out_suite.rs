@@ -65,13 +65,9 @@ fn fan_out_of_kernel_ops_runs_each_branch() {
     }
 }
 
-// BLOCKED: vec_method_form_matches_free_fn — needs a `FanOutExt` method form
-// (`Vec::fan_out(op)`) on the eager API. `claspr::eager` exposes only the free
-// `fan_out(vec, op)` fn; there is no `Vec::fan_out` method to compare against,
-// so the "method form == free fn" equivalence this test asserts is not
-// expressible. Reproducing both halves via the free fn would make the
-// equivalence trivially true and test nothing — left blocked rather than
-// fake-passed.
+// vec_method_form_matches_free_fn lives in `eager_fan_out_method.rs` — the
+// eager `Vec::fan_out` method (`EagerFanOutExt`) exists; the equivalence test
+// is ported faithfully there.
 
 #[test]
 fn fan_out_propagates_child_error() {

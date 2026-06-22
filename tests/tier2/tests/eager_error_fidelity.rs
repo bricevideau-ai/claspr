@@ -1,22 +1,23 @@
 //! Eager-API port of `error_fidelity.rs`. Three cases beyond the variant
 //! assertions in `eager_error.rs` / `eager_host_and_profile.rs`: closure
 //! panics, the async (`.run`) terminal, and concurrent failures in a bundle
-//! (first-writer-wins).
+//! (first-writer-wins). All three port 1:1.
 //!
 //! Old → new mapping:
 //!   `value(x)`        → `value(x)` (eager)
 //!   `bundle!(l, r)`   → `bundle2(l, r)`
 //!   `.and_then_host`  → same method on `EagerOpExt`
+//!   `.run(&ctx)`      → same async terminal on `EagerOpExt` (async-events)
 //!
-//! ONE of the three cases still hits a KNOWN eager gap and is BLOCKED:
-//!   - async `.run().await`: the eager API has no async terminal (only `.sync`).
-//!
-//! The panic-in-closure case now ports: the eager host seam (`run_host_seam`)
-//! wraps the closure in `catch_unwind`, converting a panic to
-//! `Error::HostPanic`. The bundle first-writer-wins case ports 1:1.
+//! All three exercise the host-error slot: the eager host seam (`run_host_seam`)
+//! runs the closure on a worker thread under `catch_unwind`, stashing the rich
+//! `Error` variant (or `HostPanic`) before signalling its user event negative.
+//! Both terminals (`sync` + `run`) prefer the stashed variant over the
+//! `OpenCl(-1)` cascade.
 
 use claspr::eager::{EagerOpExt, bundle2, value};
 use claspr::{Context, Error};
+use futures::executor::block_on;
 
 fn ctx() -> Option<Context> {
     match Context::any() {
@@ -31,23 +32,33 @@ fn ctx() -> Option<Context> {
 // A panic inside an `and_then_host` closure is caught by the eager host seam
 // (`run_host_seam`'s `catch_unwind`) and surfaced as `Error::HostPanic(msg)`
 // at the terminal — not an unwind of the caller, and not the `OpenCl(-1)`
-// cascade. The message carries the panic literal.
+// cascade. The payload is the FORMATTED panic text (a format-string panic, to
+// prove interpolated runtime content survives the `catch_unwind` → `HostPanic`
+// conversion, not just a static literal).
 #[test]
 fn panic_in_host_closure_surfaces_host_panic() {
     let Some(ctx) = ctx() else { return };
     let err = value(())
-        .and_then_host(|()| -> claspr::Result<()> { panic!("boom") })
+        .and_then_host(|()| -> claspr::Result<()> { panic!("boom-{}", 42) })
         .sync(&ctx)
         .expect_err("expected error");
     match err {
-        Error::HostPanic(msg) => assert!(msg.contains("boom"), "msg was {msg:?}"),
+        Error::HostPanic(msg) => assert!(msg.contains("boom-42"), "msg was {msg:?}"),
         other => panic!("expected HostPanic, got {other:?}"),
     }
 }
 
-// BLOCKED: async `.run().await` terminal — eager has no async/`ChainFuture`
-// terminal (only `.sync()`). Original `async_terminal_run_also_delivers_rich_variant`
-// needs an eager async terminal primitive.
+// async_terminal_run_also_delivers_rich_variant — the same rich-variant
+// guarantee for the `.run(&ctx).await` path. The eager async terminal exists
+// (`EagerChainFuture`); its poll prefers the stashed host-error slot over the
+// marker's cascade, mirroring `.sync()`'s contract.
+#[test]
+fn async_terminal_run_also_delivers_rich_variant() {
+    let Some(ctx) = ctx() else { return };
+    let chain = value(()).and_then_host(|()| -> claspr::Result<()> { Err(Error::SvmNotAvailable) });
+    let err = block_on(chain.run(&ctx)).expect_err("expected error");
+    assert!(matches!(err, Error::SvmNotAvailable), "got {err:?}");
+}
 
 #[test]
 fn first_writer_wins_when_bundle_branches_both_fail() {

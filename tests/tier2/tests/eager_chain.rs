@@ -8,13 +8,12 @@
 //!   `download!(buf)`      → `download` (terminal `.and_then(download).sync()` yields the Vec)
 //!   multi-output add_u32 → `.and_then(|(_a,_b,out)| ...)` per-element pipe select
 //!
-//! TWO chain.rs shapes are NOT expressible in the eager API; each is rewritten to
-//! the closest faithful equivalent with a `DEVIATION` note on its test:
-//!   - `bundle!(...).and_then(|(a,b,out)| kernel(...))` — bundle Handle is one
-//!     `Pipe<(A,B,C)>`, not a tuple of input pipes (see three_slice... below).
-//!   - `value(x).and_then(|n| value(n+1))` — `and_then` hands a `Pipe<u32>`, not
-//!     the host scalar, so in-graph host arithmetic is impossible (see
-//!     value_passthrough below).
+//! All chain.rs shapes port to the eager API. One has a documented DEVIATION in
+//! construction only (`three_slice...` below: the inputs are built as concrete
+//! buffers up front rather than via an in-graph `bundle!`, since that shape is
+//! covered by the additive `bundle_feeds_multi_arg_kernel`); assertions are
+//! identical. The host-value chain (`value(x).and_then(|n| value(n+1))`) ports
+//! 1:1 thanks to `value`'s by-value handle.
 
 use claspr::Context;
 use claspr::eager::{EagerOpExt, alloc_zero, bundle3, download, upload, value};
@@ -128,23 +127,18 @@ fn kernel_op_chains_two_kernels() {
     assert!(result.iter().all(|&v| v == 35));
 }
 
-/// chain.rs::value_passthrough — host value chain through the graph.
-///
-/// DEVIATION FROM chain.rs: the old test transforms the *host value* between
-/// stages — `value(42).and_then(|n| value(n.wrapping_add(1)))` — where `n` is the
-/// concrete `u32`. In the eager API `and_then`'s closure receives `Self::Handle`
-/// = `Pipe<u32>`, not the value, so host arithmetic on it is impossible, and the
-/// only host-transform seam (`and_then_host`) operates on a `&mut [T]` *device
-/// buffer view*, not a passed-through host scalar. There is no eager equivalent
-/// of "map a lifted host value." We assert the same final value (86) via the one
-/// thing the eager API does support for `value`: lifting a single host value
-/// computed up front.
+/// chain.rs::value_passthrough — host value chain through the graph. Ports 1:1:
+/// `value`'s by-value handle hands each `and_then` closure the concrete `u32`, so
+/// the multi-stage in-graph host arithmetic is expressible directly.
 #[test]
 fn value_passthrough() {
     let Some(ctx) = ctx() else { return };
 
-    let computed = 42u32.wrapping_add(1).wrapping_mul(2);
-    let out = value(computed).sync(&ctx).expect("value chain");
+    let out = value(42u32)
+        .and_then(|n| value(n.wrapping_add(1)))
+        .and_then(|n| value(n.wrapping_mul(2)))
+        .sync(&ctx)
+        .expect("value chain");
     assert_eq!(out, 86);
 }
 

@@ -1,13 +1,11 @@
-//! Eager-API port of `host_and_profile.rs`: `and_then_host` mid-chain host work
-//! plus the `.profiled` callback hook.
+//! Eager-API port of `host_and_profile.rs` — the `and_then_host` mid-chain host
+//! work cases. The two `.profiled` cases are ported in `eager_profile.rs` (the
+//! eager `.profiled` hook is `EagerProfileExt`); this file keeps only the
+//! host-seam half. All four originals are accounted for across the two files.
 //!
 //! Old → new mapping:
 //!   `value(v).and_then(|x| upload!(x))` → `upload::<u32, ReadWrite, _>(v)`
 //!   `.and_then_host(|view|…)`           → same method on `EagerOpExt`
-//!
-//! The two `and_then_host` cases port 1:1 (same N, values, assertions). The two
-//! `.profiled` cases are BLOCKED — the eager API has no `.profiled` hook (no
-//! `DeviceOperationProfileExt` analogue on `EagerOpExt`). See comments.
 
 use claspr::eager::{EagerOpExt, upload, value};
 use claspr::{Context, Device};
@@ -68,9 +66,7 @@ fn and_then_host_error_propagates() {
 }
 
 // ── profile ──────────────────────────────────────────────────────────
-
-// BLOCKED: `.profiled(cb)` — the eager API has no profiling hook (no
-// `DeviceOperationProfileExt` analogue / no `.profiled` on `EagerOpExt`).
-// Originals `profile_chain_fires_callback_when_profiling_on` and
-// `profile_chain_errors_when_profiling_off` need an eager `.profiled` primitive
-// that registers a per-op completion callback and surfaces `ProfilingDisabled`.
+//
+// `profile_chain_fires_callback_when_profiling_on` and
+// `profile_chain_errors_when_profiling_off` are ported in `eager_profile.rs`
+// (the eager `.profiled` hook is `EagerProfileExt::profiled`).
