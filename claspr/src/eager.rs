@@ -2246,6 +2246,113 @@ where
     }
 }
 
+// ── Leaf: alloc an uninit DeviceSlice (eager DeviceSliceAllocUninit) ─────────
+
+/// Allocate a [`DeviceSliceUninit<T, M>`] inside the graph. Producing source
+/// leaf; allocation happens at execute (`DeviceSlice::alloc_uninit`), so the
+/// uninit is a graph-produced value a downstream `fill_device_uninit` /
+/// `write_device_uninit` consumes — the eager analog of the old layer's
+/// `DeviceSliceAllocUninit`. Mirrors [`UsmAllocUninit`].
+pub struct DeviceAllocUninit<T, M: MemMode = ReadWrite> {
+    len: usize,
+    out: Pipe<DeviceSliceUninit<T, M>>,
+    _t: PhantomData<fn() -> (T, M)>,
+}
+
+/// Build an eager uninit-`DeviceSlice` alloc leaf.
+pub fn device_alloc_uninit<T, M>(len: usize) -> DeviceAllocUninit<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + Send + 'static,
+{
+    DeviceAllocUninit {
+        len,
+        out: Pipe::new(),
+        _t: PhantomData,
+    }
+}
+
+impl<T, M> EagerOp for DeviceAllocUninit<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + Send + 'static,
+{
+    type Output = DeviceSliceUninit<T, M>;
+
+    fn output_pipe(&self) -> Pipe<DeviceSliceUninit<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // alloc_uninit is pure host code — no in-flight event, mode N/A.
+        let uninit = DeviceSlice::<T, M>::alloc_uninit(ec.context(), self.len)?;
+        self.out.put(uninit, Deps::new());
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push(format!("device_alloc_uninit(len={})", self.len));
+    }
+}
+
+// ── Leaf: alloc an uninit MappedSlice (eager MappedSliceAllocUninit) ─────────
+
+/// Allocate a [`MappedSliceUninit<T, M>`] inside the graph. Producing source
+/// leaf; allocation happens at execute (`MappedSlice::alloc_uninit`), which on a
+/// no-SVM device surfaces [`Error::SvmNotAvailable`] **at the graph terminal**
+/// (not eagerly) — the eager analog of the old layer's `MappedSliceAllocUninit`.
+/// A downstream `fill_mapped_uninit` / `write_mapped_uninit` consumes the result.
+pub struct MappedAllocUninit<T, M: MemMode = ReadWrite> {
+    len: usize,
+    out: Pipe<MappedSliceUninit<T, M>>,
+    _t: PhantomData<fn() -> (T, M)>,
+}
+
+/// Build an eager uninit-`MappedSlice` alloc leaf.
+pub fn mapped_alloc_uninit<T, M>(len: usize) -> MappedAllocUninit<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + Send + 'static,
+{
+    MappedAllocUninit {
+        len,
+        out: Pipe::new(),
+        _t: PhantomData,
+    }
+}
+
+impl<T, M> EagerOp for MappedAllocUninit<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + Send + 'static,
+{
+    type Output = MappedSliceUninit<T, M>;
+
+    fn output_pipe(&self) -> Pipe<MappedSliceUninit<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // alloc_uninit is pure host code; on a no-SVM device it returns
+        // `SvmNotAvailable` here (at execute → surfaces at the terminal).
+        let uninit = MappedSlice::<T, M>::alloc_uninit(ec.context(), self.len)?;
+        self.out.put(uninit, Deps::new());
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push(format!("mapped_alloc_uninit(len={})", self.len));
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // image_transfer.rs ports — image upload / download
 // ════════════════════════════════════════════════════════════════════════

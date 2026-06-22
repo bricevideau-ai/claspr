@@ -7,12 +7,10 @@
 //! are reproduced verbatim — same suite coverage.
 //!
 //! Tier-2 mapped chains — old → new mapping:
-//!   `mapped_slice_filled!(v, N)` → `fill_mapped_uninit(MappedSlice::alloc_uninit(&ctx, N)?, v)`
-//!         The eager API has no `mapped_slice_alloc_zero` / filled PRODUCING leaf
-//!         over a Context; the uninit head is built synchronously (Tier 1
-//!         `MappedSlice::alloc_uninit`) and threaded into the eager
-//!         `fill_mapped_uninit` leaf — the exact pattern eager_alloc_ops.rs uses
-//!         for `mapped_alloc_uninit_then_fill_via_trait_verb`.
+//!   `mapped_slice_filled!(v, N)` → `mapped_alloc_uninit(N).and_then(|u| fill_mapped_uninit(u, v))`
+//!         The eager `mapped_alloc_uninit` PRODUCING leaf allocates the uninit
+//!         `MappedSlice` at execute (graph-produced, like the old
+//!         `MappedSliceAllocUninit`), so the no-SVM check defers to the terminal.
 //!   `mapped_slice_upload!(v)`    → concrete `MappedSlice::from_slice(&ctx, &v)`
 //!         fed into the eager kernel op (the eager API has no mapped-upload
 //!         PRODUCING leaf; eager_buffer_ops.rs threads MappedSlice concretely the
@@ -20,16 +18,9 @@
 //!   `mapped_slice![v; N]`       → repeat arm → fill_mapped_uninit path.
 //!   `mapped_slice![a, b, c]`    → literal arm → from_slice path.
 //!
-//! DEVIATION (no-SVM path): `tier2_mapped_slice_filled_surfaces_svm_not_available`
-//! relied on the lazy Tier-2 op deferring the SVM-availability check to execute
-//! time. The eager mapped path has no Context-bound producing leaf — the uninit
-//! head is the Tier-1 `MappedSlice::alloc_uninit`, which itself surfaces
-//! `Error::SvmNotAvailable` on a no-SVM device (see its rustdoc). We assert that
-//! same error at the same boundary.
-//!
 //! Skips on devices without SVM. Guard preserved verbatim.
 
-use claspr::eager::{EagerOpExt, fill_mapped_uninit};
+use claspr::eager::{EagerOpExt, fill_mapped_uninit, mapped_alloc_uninit};
 use claspr::{Buffer, Context, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
 
@@ -145,15 +136,15 @@ fn tier1_svm_write_after_all_chains_after_fill() {
     assert_eq!(ctx.error_count(), 0);
 }
 
-/// svm_fill_copy.rs::tier2_mapped_slice_filled_threads_into_kernel — eager
-/// `fill_mapped_uninit` over a concrete uninit head → scale 2 → 10.
+/// svm_fill_copy.rs::tier2_mapped_slice_filled_threads_into_kernel — graph-produced
+/// `mapped_alloc_uninit` → `fill_mapped_uninit` → scale 2 → 10.
 #[test]
 fn tier2_mapped_slice_filled_threads_into_kernel() {
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let uninit = MappedSlice::<u32>::alloc_uninit(&ctx, N).expect("mapped alloc_uninit");
-    let buf = fill_mapped_uninit(uninit, 5u32)
+    let buf = mapped_alloc_uninit::<u32, claspr::ReadWrite>(N)
+        .and_then(|u| fill_mapped_uninit(u, 5u32))
         .and_then(|buf| kernels.scale_u32([N], buf, 2))
         .sync(&ctx)
         .expect("filled svm chain");
@@ -187,8 +178,8 @@ fn macro_mapped_slice_repeat_arm() {
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let uninit = MappedSlice::<u32>::alloc_uninit(&ctx, N).expect("mapped alloc_uninit");
-    let buf = fill_mapped_uninit(uninit, 4u32)
+    let buf = mapped_alloc_uninit::<u32, claspr::ReadWrite>(N)
+        .and_then(|u| fill_mapped_uninit(u, 4u32))
         .and_then(|buf| kernels.scale_u32([N], buf, 5))
         .sync(&ctx)
         .expect("macro repeat");
@@ -213,11 +204,10 @@ fn macro_mapped_slice_literal_arm() {
     assert_eq!(&g[..], &[20u32, 40, 60, 80]);
 }
 
-/// svm_fill_copy.rs::tier2_mapped_slice_filled_surfaces_svm_not_available —
-/// DEVIATION (see module doc): the eager mapped path has no Context-bound lazy
-/// producing leaf, so the SVM-availability check fires at the Tier-1 uninit
-/// alloc (`MappedSlice::alloc_uninit`), which surfaces the same
-/// `Error::SvmNotAvailable` on a no-SVM device.
+/// svm_fill_copy.rs::tier2_mapped_slice_filled_surfaces_svm_not_available — on a
+/// no-SVM device the `mapped_alloc_uninit` PRODUCING leaf defers its allocation
+/// to execute, so `SvmNotAvailable` surfaces AT THE TERMINAL (`.sync()`), not
+/// eagerly — faithful to the old lazy `mapped_slice_filled!` op's "at execute".
 #[test]
 fn tier2_mapped_slice_filled_surfaces_svm_not_available() {
     let Ok(ctx) = Context::any() else {
@@ -228,6 +218,9 @@ fn tier2_mapped_slice_filled_surfaces_svm_not_available() {
         eprintln!("SKIP: device supports SVM, can't test no-SVM path here");
         return;
     }
-    let err = MappedSlice::<u32>::alloc_uninit(&ctx, N).expect_err("expected SvmNotAvailable");
+    let err = mapped_alloc_uninit::<u32, claspr::ReadWrite>(N)
+        .and_then(|u| fill_mapped_uninit(u, 0u32))
+        .sync(&ctx)
+        .expect_err("expected SvmNotAvailable");
     assert!(matches!(err, claspr::Error::SvmNotAvailable), "got {err:?}",);
 }

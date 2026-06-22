@@ -8,20 +8,18 @@
 //!   `value(x)`                          → `value(x)`
 //!   `.and_then_with_context(...)`       → `.and_then_with_context(...)`
 //!
-//! Uninit trait-verb shapes: the closure layer's `device_slice_alloc_uninit!`
-//! is a lazy op producing a `DeviceSliceUninit`. The eager API has no
-//! uninit-PRODUCING device op (only `usm_alloc_uninit`), but the uninit
-//! fill/write verbs (`fill_device_uninit` / `write_device_uninit`) accept a
-//! CONCRETE `DeviceSliceUninit` head (ToInput's concrete arm). So the uninit is
-//! built synchronously up front and threaded as the chain head — the same
-//! "alloc_uninit then fill/write verb" compositional path the original tests
-//! exercise. Same N, same 99/×2 = 198 and 0..N values.
+//! Uninit trait-verb shapes: the closure layer's `device_slice_alloc_uninit!` is
+//! a lazy op producing a `DeviceSliceUninit`. The eager analog is the
+//! `device_alloc_uninit` / `mapped_alloc_uninit` PRODUCING leaf — it allocates at
+//! execute, so the uninit is GRAPH-PRODUCED and threaded into the fill/write verb
+//! (`device_alloc_uninit(N).and_then(|u| fill_device_uninit(u, v))`), faithful to
+//! the old lazy op. Same N, same 99/×2 = 198 and 0..N values.
 
 use claspr::eager::{
-    EagerOpExt, alloc_zero, bundle3, download, fill_device_uninit, fill_mapped_uninit, lift,
-    upload, write_device_uninit,
+    EagerOpExt, alloc_zero, bundle3, device_alloc_uninit, download, fill_device_uninit,
+    fill_mapped_uninit, lift, mapped_alloc_uninit, upload, write_device_uninit,
 };
-use claspr::{Buffer, Context, DeviceSlice, Error, MappedSlice, SvmLevel};
+use claspr::{Buffer, Context, Error, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;
@@ -118,8 +116,8 @@ fn and_then_with_context_closure_returns_kernel_op_directly() {
 fn alloc_uninit_then_fill_via_trait_verb() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let uninit = DeviceSlice::<u32>::alloc_uninit(&ctx, N).expect("alloc_uninit");
-    let result: Vec<u32> = fill_device_uninit(uninit, 99u32)
+    let result: Vec<u32> = device_alloc_uninit::<u32, claspr::ReadWrite>(N)
+        .and_then(|u| fill_device_uninit(u, 99u32))
         .and_then(|buf| kernels.scale_u32([N], buf, 2))
         .and_then(download)
         .sync(&ctx)
@@ -133,8 +131,8 @@ fn alloc_uninit_then_fill_via_trait_verb() {
 #[test]
 fn alloc_uninit_then_write_via_trait_verb() {
     let Some(ctx) = ctx() else { return };
-    let uninit = DeviceSlice::<u32>::alloc_uninit(&ctx, N).expect("alloc_uninit");
-    let result: Vec<u32> = write_device_uninit(uninit, (0u32..N as u32).collect::<Vec<_>>())
+    let result: Vec<u32> = device_alloc_uninit::<u32, claspr::ReadWrite>(N)
+        .and_then(|u| write_device_uninit(u, (0u32..N as u32).collect::<Vec<_>>()))
         .and_then(download)
         .sync(&ctx)
         .expect("alloc_uninit + write chain");
@@ -142,7 +140,7 @@ fn alloc_uninit_then_write_via_trait_verb() {
 }
 
 /// alloc_ops.rs::mapped_alloc_uninit_then_fill_via_trait_verb — SVM analog via
-/// a concrete `MappedSliceUninit` head + `fill_mapped_uninit`.
+/// the graph-produced `mapped_alloc_uninit` leaf + `fill_mapped_uninit`.
 #[test]
 fn mapped_alloc_uninit_then_fill_via_trait_verb() {
     let Some(ctx) = ctx() else { return };
@@ -150,8 +148,8 @@ fn mapped_alloc_uninit_then_fill_via_trait_verb() {
         eprintln!("SKIP: no SVM");
         return;
     }
-    let uninit = MappedSlice::<u32>::alloc_uninit(&ctx, N).expect("mapped alloc_uninit");
-    let buf: MappedSlice<u32> = fill_mapped_uninit(uninit, 7u32)
+    let buf: MappedSlice<u32> = mapped_alloc_uninit::<u32, claspr::ReadWrite>(N)
+        .and_then(|u| fill_mapped_uninit(u, 7u32))
         .sync(&ctx)
         .expect("mapped alloc_uninit + fill");
     assert_eq!(buf.len(), N);
