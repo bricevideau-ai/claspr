@@ -37,9 +37,9 @@ use crate::host_view::{
 use crate::image::ImageHostTransfer;
 use crate::transfer::UploadSource;
 use crate::{
-    Buffer, Context, DeviceSlice, DeviceSliceUninit, Error, Fillable, HostReadable,
-    HostUploadable, HostWritable, MappedSlice, MappedSliceUninit, MemMode, ReadWrite, Result,
-    USMSlice, USMSliceUninit, register_drop_callback,
+    Buffer, Context, DeviceSlice, DeviceSliceUninit, Error, Fillable, HostReadable, HostUploadable,
+    HostWritable, MappedSlice, MappedSliceUninit, MemMode, ReadWrite, Result, USMSlice,
+    USMSliceUninit, register_drop_callback,
 };
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -350,7 +350,7 @@ pub trait EagerOpExt: EagerOp + Sized {
         }
     }
 
-    /// Run a host closure on a borrowed [`Mappable::View`] of this op's output,
+    /// Run a host closure on a borrowed [`Mappable::View`](crate::mappable::Mappable::View) of this op's output,
     /// in chain order. The seam drains the upstream events (so the data is
     /// host-valid), maps the value, runs the closure (mutations persist via the
     /// unmap), then forwards the same value downstream. Errors from the closure
@@ -637,10 +637,9 @@ where
         // Source pipelines (its value feeds us); we add no device work, so the
         // terminal `mode` is irrelevant — pass it through for symmetry.
         self.source.execute(ec, mode)?;
-        let (v, deps) = self
-            .src_pipe
-            .take()
-            .ok_or(Error::NotSupported("eager arced: source produced no output"))?;
+        let (v, deps) = self.src_pipe.take().ok_or(Error::NotSupported(
+            "eager arced: source produced no output",
+        ))?;
         self.out.put(Arc::new(v), deps);
         Ok(())
     }
@@ -722,10 +721,9 @@ where
         // branch pipe (Arc::clone is a cheap refcount bump; Deps clone shares
         // the same producer events).
         self.source.execute(ec, ExecMode::Pipelined)?;
-        let (v, deps) = self
-            .src_pipe
-            .take()
-            .ok_or(Error::NotSupported("eager arc_split: source produced no output"))?;
+        let (v, deps) = self.src_pipe.take().ok_or(Error::NotSupported(
+            "eager arc_split: source produced no output",
+        ))?;
         for out in &self.outs {
             out.put(v.clone(), deps.clone());
         }
@@ -775,8 +773,8 @@ fn join_marker(ec: &ExecutionContext<'_>, branch_deps: &[Deps]) -> Result<Deps> 
         .collect();
     // SAFETY: cl_event handles are valid — held by the branch `Deps` Arcs
     // until this call returns.
-    let marker = unsafe { ec.cl_queue().enqueue_marker_with_wait_list(&all) }
-        .map_err(Error::OpenCl)?;
+    let marker =
+        unsafe { ec.cl_queue().enqueue_marker_with_wait_list(&all) }.map_err(Error::OpenCl)?;
     Ok(vec![wrap_event(marker)])
 }
 
@@ -891,7 +889,7 @@ impl_eager_bundle!(Bundle16, bundle16, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e
 /// Variadic constructor for the eager [`Bundle2`] through [`Bundle16`] — picks
 /// the right `bundleN` based on the number of arguments.
 ///
-/// The eager analog of the legacy [`bundle!`](crate::bundle) macro (which still
+/// The eager analog of the legacy [`bundle!`](crate::bundle!) macro (which still
 /// targets the closure layer during the cutover). Renamed to `bundle!` once the
 /// old layer is removed.
 ///
@@ -1287,7 +1285,7 @@ where
 /// own enqueue to another queue without touching its value), `transfer_to_device`
 /// is a buffer-*consuming* leaf: it resolves the upstream `DeviceSlice` value,
 /// reads its `cl_mem`, and enqueues a migrate. That puts it in the same family as
-/// [`download`] / [`fill`] / [`copy_to`](crate::eager::copy_to) — every member
+/// [`download`] / [`fill`] / [`copy_to`](crate::eager::eager_copy_to) — every member
 /// takes `impl Into<Input<DeviceSlice<…>>>` as its dataflow input — and mirrors
 /// the old free-fn signature `transfer_to_device(buf, dev)` 1:1. A method form
 /// would have to pin `S::Output = DeviceSlice<T>` (like [`OnDevice`]) yet still
@@ -2512,7 +2510,7 @@ where
 ///
 /// Unlike [`AndThen`] (builder at construction, `Pipe` handle), the closure
 /// here receives `&ExecutionContext` + the upstream's **runtime value**, so it
-/// can read `ec.device()` / `ec.context()` / route via [`on_device`] while
+/// can read `ec.device()` / `ec.context()` / route via [`on_device`](EagerOpExt::on_device) while
 /// building the downstream op. The downstream op is therefore built — and run —
 /// at execute time.
 pub struct AndThenWithContext<S: EagerOp, U: EagerOp, F> {
@@ -2545,9 +2543,10 @@ where
         let (value, src_deps) = self.src_pipe.take().ok_or(Error::NotSupported(
             "eager and_then_with_context: source produced no output",
         ))?;
-        let f = self.f.take().expect(
-            "AndThenWithContext::execute called twice — internal eager bug",
-        );
+        let f = self
+            .f
+            .take()
+            .expect("AndThenWithContext::execute called twice — internal eager bug");
         // Closure runs NOW, at execute, with the live ec + runtime value.
         let downstream = f(ec, value);
         // Grab the downstream's out-pipe BEFORE consuming it (move-once).
@@ -2606,9 +2605,7 @@ where
     fn execute(self, parent: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         // Resolve the target queue from the running context (cached, so the
         // terminal's flush_all_outoforder_queues picks it up).
-        let target_q = parent
-            .context()
-            .default_outoforder_queue(&self.device)?;
+        let target_q = parent.context().default_outoforder_queue(&self.device)?;
         // Sibling EC: same context + same host-error slot, different device +
         // queue. `target_q` lives on this frame; its `.raw()` borrows for the
         // inner execute().
@@ -2635,7 +2632,7 @@ where
 
 // ── AndThenHost / AndThenHostWithContext: the host seam ──
 
-/// Run a host closure on a borrowed [`Mappable::View`] of the upstream output,
+/// Run a host closure on a borrowed [`Mappable::View`](crate::mappable::Mappable::View) of the upstream output,
 /// in chain order — built by [`and_then_host`](EagerOpExt::and_then_host).
 ///
 /// At execute: run the source, take its `(value, deps)`, **drain the deps
@@ -2796,9 +2793,10 @@ where
         let (value, deps) = self.src_pipe.take().ok_or(Error::NotSupported(
             "eager and_then_host_with_context: source produced no output",
         ))?;
-        let f = self.f.take().expect(
-            "AndThenHostWithContext::execute called twice — internal eager bug",
-        );
+        let f = self
+            .f
+            .take()
+            .expect("AndThenHostWithContext::execute called twice — internal eager bug");
         // Bind the context up front so the `host_call` closure borrows it
         // (cheap Arc-backed handle); the view borrow is supplied by the seam.
         let context = ec.context().clone();
@@ -2820,7 +2818,7 @@ where
 /// built by [`profiled`](EagerProfileExt::profiled). Mirrors the old
 /// closure-layer `Profiled`: at execute it runs the source, enqueues an
 /// `clEnqueueMarkerWithWaitList` over the source's events, registers the user
-/// callback on the marker via [`register_profiling_callback`], and forwards the
+/// callback on the marker via [`register_profiling_callback`](crate::register_profiling_callback), and forwards the
 /// **same** value downstream with the marker as its deps (so anything after the
 /// `.profiled()` waits on the marker, which subsumes the source's events).
 ///
@@ -2839,7 +2837,7 @@ pub struct Profiled<S: EagerOp, F> {
 /// Separate from [`EagerOpExt`] to mirror the old layer's
 /// `DeviceOperationProfileExt`. Blanket-implemented.
 pub trait EagerProfileExt: EagerOp + Sized {
-    /// Register `cb` to receive the wall-clock [`ProfilingInfo`] for everything
+    /// Register `cb` to receive the wall-clock [`ProfilingInfo`](crate::ProfilingInfo) for everything
     /// `self` enqueued onto the chain's queue. The closure fires on an OpenCL
     /// callback thread when the marker event completes. See [`Profiled`].
     fn profiled<F>(self, cb: F) -> Profiled<Self, F>

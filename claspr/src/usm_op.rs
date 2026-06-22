@@ -4,8 +4,8 @@
 //! wraps the host Vec via [`USMSlice::new`] / [`USMSlice::alloc_zero`]
 //! and passes `deps` through unchanged.
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, DeviceOperation};
+use crate::exec_ctx::ExecutionContext;
 use crate::{MemMode, ReadWrite, Result, USMSlice, USMSliceUninit};
 use std::marker::PhantomData;
 

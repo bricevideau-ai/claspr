@@ -106,7 +106,11 @@ fn bundle_feeds_multi_arg_kernel() {
     .sync(&ctx)
     .expect("bundle → add chain");
 
-    assert!(result.iter().all(|&v| v == 7), "3+4=7; got {:?}", &result[..8]);
+    assert!(
+        result.iter().all(|&v| v == 7),
+        "3+4=7; got {:?}",
+        &result[..8]
+    );
 }
 
 /// chain.rs::kernel_op_chains_two_kernels — upload → fill_u32 → scale_u32 → download.

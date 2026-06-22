@@ -101,9 +101,9 @@ pub mod image_transfer;
 pub mod mappable;
 pub mod on_device;
 pub mod profile;
+mod tier2_macros;
 pub mod transfer;
 pub mod transfer_to_device;
-mod tier2_macros;
 pub mod uninit_ext;
 pub mod usm_op;
 
@@ -162,8 +162,8 @@ pub use alloc::{
 pub use and_then_host::{AndThenHost, AndThenHostWithContext, DeviceOperationHostExt};
 pub use arc::ArcSplit;
 pub use buffer_ops::{
-    DeviceSliceFillOp, DeviceSliceWriteOp, MappedSliceFillOp, device_slice_fill, device_slice_write,
-    mapped_slice_fill,
+    DeviceSliceFillOp, DeviceSliceWriteOp, MappedSliceFillOp, device_slice_fill,
+    device_slice_write, mapped_slice_fill,
 };
 pub use bundle::{
     Bundle2, Bundle3, Bundle4, Bundle5, Bundle6, Bundle7, Bundle8, Bundle9, Bundle10, Bundle11,
@@ -171,14 +171,14 @@ pub use bundle::{
 };
 #[cfg(feature = "async-events")]
 pub use chain_future::ChainFuture;
-#[cfg(feature = "async-events")]
-pub use eager::EagerChainFuture;
 pub use copy::{CopyTo, CopyToOp};
 pub use device_op::{
     AndThen, AndThenWithContext, Arced, Dep, Deps, DeviceOperation, Value, deps_as_events, value,
     wrap_event,
 };
 pub use dyn_op::DynOp;
+#[cfg(feature = "async-events")]
+pub use eager::EagerChainFuture;
 // The eager graph types are reached via the `claspr::eager::` module path
 // (`eager::{EagerOp, EagerOpExt, Pipe, Input, …}`) to avoid name clashes with
 // the legacy `Download`/`upload` surface during the cutover.

@@ -144,7 +144,10 @@ fn arc_device_slice_refcount_holds_until_last_branch_finishes() {
                     .and_then(download)
                 };
                 // Bundle of bundles (nested join) — composes cleanly in eager.
-                bundle2(branch(s1), bundle2(branch(s2), bundle2(branch(s3), branch(s4))))
+                bundle2(
+                    branch(s1),
+                    bundle2(branch(s2), bundle2(branch(s3), branch(s4))),
+                )
             })
             .sync(&ctx)
             .expect("4-way fan chain");

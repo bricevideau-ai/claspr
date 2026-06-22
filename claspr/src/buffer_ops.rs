@@ -52,8 +52,8 @@
 //! [`SvmFillOp`]: crate::SvmFillOp
 //! [`SvmCopyOp`]: crate::SvmCopyOp
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::exec_ctx::ExecutionContext;
 use crate::transfer::UploadSource;
 use crate::{
     DeviceSlice, Fillable, HostWritable, MappedSlice, MemMode, Result, register_drop_callback,

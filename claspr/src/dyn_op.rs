@@ -21,9 +21,9 @@
 //! let result = chain.sync(&ctx)?;
 //! ```
 
-use crate::exec_ctx::ExecutionContext;
-use crate::device_op::{Deps, DeviceOperation};
 use crate::Result;
+use crate::device_op::{Deps, DeviceOperation};
+use crate::exec_ctx::ExecutionContext;
 
 // ── Object-safe inner trait ─────────────────────────────────────────
 

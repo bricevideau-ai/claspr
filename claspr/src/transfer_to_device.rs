@@ -38,8 +38,8 @@
 //! they actually map to: migrate (data residency) + enqueue-on-queue
 //! (kernel device).
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::exec_ctx::ExecutionContext;
 use crate::{Device, DeviceSlice, Result};
 
 /// Combinator built by [`transfer_to_device`].

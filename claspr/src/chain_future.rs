@@ -24,8 +24,8 @@
 //! [`ExecutionContext`]: crate::ExecutionContext
 //! [`clEnqueueMarkerWithWaitList`]: https://registry.khronos.org/OpenCL/specs/3.0-unified/html/OpenCL_API.html#clEnqueueMarkerWithWaitList
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::DeviceOperation;
+use crate::exec_ctx::ExecutionContext;
 use crate::{Context, Error, EventFuture, EventFutureExt, Result};
 use std::future::Future;
 use std::pin::Pin;

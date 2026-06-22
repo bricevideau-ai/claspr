@@ -30,8 +30,8 @@
 //! Single trait per verb with an associated `Op` type lets one
 //! user-facing call shape cover all three.
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::exec_ctx::ExecutionContext;
 use crate::transfer::UploadSource;
 use crate::{
     DeviceSlice, DeviceSliceUninit, Fillable, HostUploadable, HostWritable, MappedSlice,

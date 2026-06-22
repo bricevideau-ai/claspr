@@ -31,8 +31,8 @@
 //! `cl_mem` buffer, so the natural chain shape there is to upload
 //! a `DeviceSlice<T>` and `Image1DBufferView::view_of(&slice)`.
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::exec_ctx::ExecutionContext;
 use crate::image::ImageHostTransfer;
 use crate::{Result, register_drop_callback};
 use std::marker::PhantomData;

@@ -44,11 +44,11 @@
 //! `&[T]` to the closure, the underlying map uses `CL_MAP_READ` only
 //! (no writeback on unmap).
 
-use crate::exec_ctx::ExecutionContext;
-use crate::mappable::Mappable;
-use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
 use crate::access::{HostReadable, HostWritable, MemMode};
+use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::exec_ctx::ExecutionContext;
 use crate::map_primitive;
+use crate::mappable::Mappable;
 use crate::util::{RetainedQueue, mapped_slice, mapped_slice_mut};
 use crate::{Buffer, DeviceSlice, Event, Launcher, MappedSlice, Result};
 use opencl3::command_queue::CommandQueue;

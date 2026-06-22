@@ -14,8 +14,8 @@
 //! a post-alloc enqueued write) — works for any marker, no
 //! `Fillable` / `HostWritable` gate.
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, DeviceOperation};
+use crate::exec_ctx::ExecutionContext;
 use crate::transfer::UploadSource;
 use crate::{
     DeviceSlice, DeviceSliceUninit, MappedSlice, MappedSliceUninit, MemMode, ReadWrite, Result,

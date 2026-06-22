@@ -104,9 +104,9 @@
 //! [`Error`]: crate::Error
 //! [`ExecutionContext`]: crate::ExecutionContext
 
+use crate::device_op::{Deps, DeviceOperation, wrap_event};
 use crate::exec_ctx::ExecutionContext;
 use crate::mappable::Mappable;
-use crate::device_op::{Deps, DeviceOperation, wrap_event};
 use crate::{Context, Error, Launcher, Result, complete_user_event, create_user_event};
 use opencl3::event::CL_COMPLETE;
 use opencl3::types::{cl_event, cl_int};

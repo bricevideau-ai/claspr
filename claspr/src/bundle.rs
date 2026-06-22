@@ -22,8 +22,8 @@
 //! let (a, b, c) = bundle!(op_a, op_b, op_c).sync(&ctx)?;
 //! ```
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, DeviceOperation, wrap_event};
+use crate::exec_ctx::ExecutionContext;
 use crate::{Error, Launcher, Result};
 
 /// Implementation detail — generates `BundleN` + a constructor function

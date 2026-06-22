@@ -69,8 +69,10 @@ fn mpsc_three_producers_into_single_combine() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let producers = bundle3(
-        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N]).and_then(|buf| kernels.fill_u32([N], buf, 3)),
-        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N]).and_then(|buf| kernels.fill_u32([N], buf, 4)),
+        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+            .and_then(|buf| kernels.fill_u32([N], buf, 3)),
+        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+            .and_then(|buf| kernels.fill_u32([N], buf, 4)),
         upload::<u32, claspr::ReadWrite, _>(vec![0u32; N]),
     );
 

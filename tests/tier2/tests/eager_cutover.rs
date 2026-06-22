@@ -61,12 +61,16 @@ fn upload_fill_download_roundtrip() {
 
     let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
         .and_then(|b| fill(b, 9u32))
-        .and_then(|b| download(b))
+        .and_then(download)
         .sync(&ctx)
         .expect("sync");
 
     assert_eq!(out.len(), N);
-    assert!(out.iter().all(|&v| v == 9), "fill then download; got {:?}", &out[..8]);
+    assert!(
+        out.iter().all(|&v| v == 9),
+        "fill then download; got {:?}",
+        &out[..8]
+    );
 }
 
 /// **The headline: a KERNEL composes in an eager graph.** `kernels.fill_u32`
@@ -81,7 +85,7 @@ fn kernel_composes_in_eager_graph() {
     let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
         .and_then(|b| ks.fill_u32([N], b, 7u32))
         .and_then(|b| ks.scale_u32([N], b, 3u32))
-        .and_then(|b| download(b))
+        .and_then(download)
         .sync(&ctx)
         .expect("sync");
 
@@ -102,10 +106,14 @@ fn eager_kernel_concrete_head() {
 
     let out: Vec<u32> = ks
         .fill_u32([N], buf, 5u32)
-        .and_then(|b| download(b))
+        .and_then(download)
         .sync(&ctx)
         .expect("sync");
-    assert!(out.iter().all(|&v| v == 5), "concrete-head kernel; got {:?}", &out[..8]);
+    assert!(
+        out.iter().all(|&v| v == 5),
+        "concrete-head kernel; got {:?}",
+        &out[..8]
+    );
 }
 
 /// Upload host data and read it straight back (no transform) — the upload
@@ -116,7 +124,7 @@ fn upload_download_preserves_data() {
 
     let src: Vec<u32> = (0..N as u32).collect();
     let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(src.clone())
-        .and_then(|b| download(b))
+        .and_then(download)
         .sync(&ctx)
         .expect("sync");
 
@@ -160,7 +168,11 @@ fn value_and_arced() {
         .expect("arced");
     let mut host = vec![0u32; N];
     shared.read(&mut host).wait().expect("read");
-    assert!(host.iter().all(|&v| v == 5), "arced buffer; got {:?}", &host[..8]);
+    assert!(
+        host.iter().all(|&v| v == 5),
+        "arced buffer; got {:?}",
+        &host[..8]
+    );
 }
 
 /// `bundle2`/`bundle3`: independent branches run and join; outputs tuple.
@@ -172,10 +184,10 @@ fn bundles_join_branches() {
     let (a, b) = bundle2(
         upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
             .and_then(|x| fill(x, 11u32))
-            .and_then(|x| download(x)),
+            .and_then(download),
         upload::<u32, claspr::ReadWrite, _>(vec![2u32; N])
             .and_then(|x| fill(x, 22u32))
-            .and_then(|x| download(x)),
+            .and_then(download),
     )
     .sync(&ctx)
     .expect("bundle2");
@@ -193,7 +205,7 @@ fn bundles_join_branches() {
 fn fan_out_homogeneous() {
     let Some(ctx) = ctx() else { return };
 
-    let vals: Vec<u32> = fan_out(vec![10u32, 20, 30], |v| value(v))
+    let vals: Vec<u32> = fan_out(vec![10u32, 20, 30], value)
         .sync(&ctx)
         .expect("fan_out");
     assert_eq!(vals, vec![10, 20, 30]);
@@ -207,7 +219,7 @@ fn fan_out_device_work() {
     let outs: Vec<Vec<u32>> = fan_out(vec![1u32, 2u32, 3u32], |v| {
         upload::<u32, claspr::ReadWrite, _>(vec![0u32; 8])
             .and_then(move |b| fill(b, v))
-            .and_then(|b| download(b))
+            .and_then(download)
     })
     .sync(&ctx)
     .expect("fan_out device");
@@ -332,12 +344,22 @@ fn arc_split_terminal_array() {
         .expect("arc_split terminal");
 
     // All three are clones of the one Arc the source produced.
-    assert!(std::sync::Arc::ptr_eq(&a, &b), "a and b share one allocation");
-    assert!(std::sync::Arc::ptr_eq(&a, &c), "a and c share one allocation");
+    assert!(
+        std::sync::Arc::ptr_eq(&a, &b),
+        "a and b share one allocation"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&a, &c),
+        "a and c share one allocation"
+    );
 
     let mut host = vec![0u32; N];
     a.read(&mut host).wait().expect("read shared buffer");
-    assert!(host.iter().all(|&v| v == 9), "shared buffer contents; got {:?}", &host[..8]);
+    assert!(
+        host.iter().all(|&v| v == 9),
+        "shared buffer contents; got {:?}",
+        &host[..8]
+    );
 }
 
 /// Eager `copy_to` is a TWO-output op: `eager_copy_to(src, dst)` has
@@ -384,7 +406,7 @@ fn eager_and_then_with_context() {
             let _dev = ec.device();
             fill(buf, 9u32)
         })
-        .and_then(|b| download(b))
+        .and_then(download)
         .sync(&ctx)
         .expect("sync");
 
@@ -411,7 +433,7 @@ fn eager_and_then_host() {
             }
             Ok(())
         })
-        .and_then(|b| download(b))
+        .and_then(download)
         .sync(&ctx)
         .expect("sync");
 
@@ -431,7 +453,7 @@ fn eager_and_then_host_error_propagates() {
 
     let res = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
         .and_then_host(|_slice: &mut [u32]| Err(claspr::Error::SvmNotAvailable))
-        .and_then(|b| download(b))
+        .and_then(download)
         .sync(&ctx);
 
     assert!(
@@ -445,8 +467,8 @@ fn eager_and_then_host_error_propagates() {
 /// runners skip it — there is no second queue to route to.
 #[test]
 fn eager_on_device() {
-    use claspr::device::Platform;
     use claspr::Device;
+    use claspr::device::Platform;
 
     // Discover a two-device context: real multi-device → sub-device partition →
     // skip. Mirrors tests/tier2/tests/on_device.rs.
@@ -495,7 +517,7 @@ fn eager_on_device() {
     let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
         .and_then_with_context(|ec, buf| fill(buf, 3u32).on_device(ec.device_at(0)))
         .and_then_with_context(|ec, buf| fill(buf, 7u32).on_device(ec.device_at(1)))
-        .and_then(|b| download(b))
+        .and_then(download)
         .sync(&ctx)
         .expect("on_device chain");
 

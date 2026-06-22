@@ -17,11 +17,11 @@
 //! "alloc_uninit then fill/write verb" compositional path the original tests
 //! exercise. Same N, same 99/×2 = 198 and 0..N values.
 
-use claspr::{Buffer, Context, DeviceSlice, Error, MappedSlice, SvmLevel};
 use claspr::eager::{
     EagerOpExt, alloc_zero, bundle3, download, fill_device_uninit, fill_mapped_uninit, upload,
     value, write_device_uninit,
 };
+use claspr::{Buffer, Context, DeviceSlice, Error, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;

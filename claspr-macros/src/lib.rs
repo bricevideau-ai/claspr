@@ -546,8 +546,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 } else {
                     quote! { #gid: ::claspr::KernelSliceReadArg<#elem> }
                 };
-                let ibound: TokenStream2 =
-                    quote! { #sid: ::claspr::ToInput<#elem, Buf = #gid> };
+                let ibound: TokenStream2 = quote! { #sid: ::claspr::ToInput<#elem, Buf = #gid> };
                 generics.push((gid_tt.clone(), dbound));
                 method_only_generics.push((iid_tt.clone(), ibound));
 
@@ -741,14 +740,17 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `into_output` is overridden: execute (scatter), then reconstruct the
     // `Output` tuple by draining all element pipes, gather their deps, wait.
     let (op_out_field_decl, op_out_field_init, op_out_destructure) = if multi_output {
-        let decls = op_pipe_fields.iter().zip(output_types.iter()).map(|(f, t)| {
-            quote! {
-                /// Eager-graph per-element output pipe: `EagerOp::execute`
-                /// scatters this output buffer here (move-once) with a clone of
-                /// the launch's completion event. Unused by the Tier-1 terminals.
-                pub #f: ::claspr::Pipe<#t>
-            }
-        });
+        let decls = op_pipe_fields
+            .iter()
+            .zip(output_types.iter())
+            .map(|(f, t)| {
+                quote! {
+                    /// Eager-graph per-element output pipe: `EagerOp::execute`
+                    /// scatters this output buffer here (move-once) with a clone of
+                    /// the launch's completion event. Unused by the Tier-1 terminals.
+                    pub #f: ::claspr::Pipe<#t>
+                }
+            });
         let inits = op_pipe_fields
             .iter()
             .map(|f| quote! { #f: ::claspr::Pipe::new() });

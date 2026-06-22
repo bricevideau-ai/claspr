@@ -31,8 +31,8 @@
 //! `devs[0]`" (it landed on the context's *default* device, which
 //! may be either).
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, DeviceOperation};
+use crate::exec_ctx::ExecutionContext;
 use crate::{Device, Result};
 
 /// Combinator built by [`DeviceOperation::on_device`].

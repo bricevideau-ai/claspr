@@ -49,8 +49,8 @@
 //! late-bind-launcher pattern, every Tier 2 op should produce an
 //! Event that downstream stages can wait on.)
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::exec_ctx::ExecutionContext;
 use crate::{
     Buffer, DeviceSlice, DeviceSliceUninit, Launcher, MappedSlice, MappedSliceUninit, MemMode,
     Result, USMSlice, USMSliceUninit,

@@ -3,8 +3,8 @@
 //!
 //! Mirrors the old `fan_out.rs` `vec_method_form_matches_free_fn` shape.
 
-use claspr::eager::{EagerFanOutExt, EagerOpExt, fan_out, value};
 use claspr::Context;
+use claspr::eager::{EagerFanOutExt, EagerOpExt, fan_out, value};
 
 fn ctx() -> Option<Context> {
     match Context::any() {

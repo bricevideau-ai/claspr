@@ -21,8 +21,8 @@
 //! .sync(&ctx)?;
 //! ```
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, DeviceOperation, wrap_event};
+use crate::exec_ctx::ExecutionContext;
 use crate::{Error, Launcher, Result};
 
 /// N-ary homogeneous parallel composition. Construct with [`fan_out`].

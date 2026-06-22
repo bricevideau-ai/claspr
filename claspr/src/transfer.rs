@@ -42,8 +42,8 @@
 //! // (including the ones held by the keep-alive callbacks) drop.
 //! ```
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::exec_ctx::ExecutionContext;
 use crate::{Buffer, DeviceSlice, MemMode, ReadWrite, Result};
 use std::sync::Arc;
 

@@ -217,8 +217,9 @@ fn mapped_slice_copy_propagates_src_to_dst() {
     let src_data: Vec<u32> = (0..N as u32).map(|i| i + 1000).collect();
     let src = MappedSlice::from_slice(&ctx, &src_data).expect("upload src");
     let dst = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc dst");
-    let (_src, dst): (MappedSlice<u32>, MappedSlice<u32>) =
-        eager_copy_to(src, dst).sync(&ctx).expect("upload + alloc + copy");
+    let (_src, dst): (MappedSlice<u32>, MappedSlice<u32>) = eager_copy_to(src, dst)
+        .sync(&ctx)
+        .expect("upload + alloc + copy");
     let g = dst.map().wait().expect("map dst for read-back");
     assert_eq!(&*g, src_data.as_slice());
 }

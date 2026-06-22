@@ -37,8 +37,8 @@
 //! [`FanOut`]: crate::FanOut
 //! [`LaunchOp::profiled`]: crate::LaunchOp::profiled
 
-use crate::exec_ctx::ExecutionContext;
 use crate::device_op::{Deps, DeviceOperation, wrap_event};
+use crate::exec_ctx::ExecutionContext;
 use crate::{
     CL_QUEUE_PROFILING_ENABLE, Error, Launcher, ProfilingInfo, Result, register_profiling_callback,
 };
