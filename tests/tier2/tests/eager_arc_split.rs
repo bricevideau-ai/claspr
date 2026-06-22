@@ -1,42 +1,82 @@
-//! Eager-API port of `arc_split.rs`: `.arc()` + `ArcSplit::split::<N>()` — the
-//! shared-input fan-out pattern.
+//! Eager-API port of `arc_split.rs`: shared-input fan-out + host reductions.
 //!
-//! ALL THREE tests in `arc_split.rs` are BLOCKED in the eager API. Every test
-//! here splits a HOST VALUE (`value(vec![..]).arc()` / `value(String).arc()`)
-//! to N branches and then does HOST ARITHMETIC on each branch's clone
-//! (`arc.iter().sum()`, `arc.iter().product()`, `arc.len()`, `s.len()`).
-//!
-//! Two independent gaps block this in eager:
-//!   1. The eager `arc_split::<N>` slot is a `Pipe<Arc<T>>`, and an `and_then`
-//!      closure receives that PIPE, not the `Arc<T>` value — so `arc.iter()`
-//!      etc. cannot be called in-graph (same class as the `value_passthrough`
-//!      deviation in `eager_chain.rs`: `and_then` hands a pipe, not the host
-//!      value).
-//!   2. The only host-value seam, `and_then_host`, requires the upstream
-//!      `Output: Mappable`. `Arc<Vec<u32>>` / `Vec<u32>` / `String` are NOT
-//!      `Mappable` (only `DeviceSlice`, scalars, `()`, and tuples of those
-//!      are) — so there is no host seam that hands back the arc'd value either.
-//!
-//! The eager `arc_split` is designed for DEVICE-buffer Arc fan-out (each clone
-//! fed as a read-only kernel arg — see `eager_cutover::arc_split_read_only_fan_out`
-//! and `eager_diamond.rs`), not for host-side reductions over a shared lifted
-//! host value. See report for the needed primitive.
+//! The originals split a HOST value (`value(vec).arc().split::<N>()`) to N
+//! branches and reduce each on the host (`arc.iter().sum()`, `.product()`,
+//! `.len()`). With `value`'s BY-VALUE handle, the eager idiom expresses this
+//! directly: `value(vec)` hands the closure the `Vec` (not a pipe), so the
+//! reductions compute in-graph — and because `value` is `Clone`, a single
+//! `value(vec)` feeds all N branches without an explicit `Arc` (the closure
+//! borrows the vec to build each branch). So these port WITHOUT `arc_split` —
+//! the eager `arc_split` op is the DEVICE-buffer Arc fan-out tool (each clone a
+//! read-only kernel arg), exercised in `eager_cutover::arc_split_read_only_fan_out`
+//! and `eager_diamond.rs`; host-value reduction is a different shape that
+//! by-value `value` covers without it.
 
-// BLOCKED: arc_split_into_three_branches_share_value — split host value + host
-// reduce per branch (arc.iter().sum/product/len). Needs either an eager seam
-// that yields the arc'd value to a host closure (Arc/Vec Mappable in the host
-// seam), or a value-receiving `and_then` (the host-scalar-passthrough gap).
+use claspr::eager::{EagerOpExt, bundle3, value};
+use claspr::{Context, Error};
 
-// BLOCKED: arc_split_propagates_branch_error — same host-value-reduction shape;
-// branch A does `arc.iter().sum()` on the split host value. Blocked for the
-// identical reason. (The error injection via `and_then_host(|()| Err(..))` IS
-// expressible — `()` is Mappable — but the surrounding host reduction is not.)
-
-// BLOCKED: arc_split_single_does_not_panic — `value(String).arc().split::<1>()`
-// then `s.len()` on the host. `String` is not Mappable and `and_then` yields a
-// `Pipe<Arc<String>>`, so the host `.len()` on the value is not expressible.
-
-/// All three originals are blocked (see module doc). Placeholder keeps the test
-/// binary compiling without fake-passing any blocked shape.
 #[test]
-fn _placeholder() {}
+fn arc_split_into_three_branches_share_value() {
+    let Ok(ctx) = Context::any() else {
+        eprintln!("SKIP: no OpenCL device");
+        return;
+    };
+
+    // value(vec) by-value handle → the closure gets the Vec; one source feeds
+    // three host reductions (sum / product / len), bundled into a tuple.
+    let chain = value(vec![1u32, 2, 3, 4]).and_then(|v| {
+        bundle3(
+            value(v.iter().sum::<u32>()),
+            value(v.iter().product::<u32>()),
+            value(v.len() as u32),
+        )
+    });
+
+    let (sum, product, len) = chain.sync(&ctx).expect("arc-split chain");
+    assert_eq!(sum, 10);
+    assert_eq!(product, 24);
+    assert_eq!(len, 4);
+}
+
+#[test]
+fn arc_split_propagates_branch_error() {
+    // If one fan-out branch errors mid-chain, the joining bundle terminal must
+    // surface it. Branch A reduces the shared value; branch B injects an error
+    // via an `and_then_host` over a Mappable `()` (the eager host seam preserves
+    // the rich Rust variant, so we match it directly).
+    let Ok(ctx) = Context::any() else {
+        eprintln!("SKIP: no OpenCL device");
+        return;
+    };
+
+    let chain = value(vec![1u32, 2, 3]).and_then(|v| {
+        let sum = v.iter().sum::<u32>();
+        bundle3(
+            value(sum),
+            value(()).and_then_host(|()| -> claspr::Result<()> {
+                Err(Error::Build {
+                    log: "branch B aborted".to_string(),
+                })
+            }),
+            value(0u32),
+        )
+    });
+
+    let err = chain.sync(&ctx).expect_err("branch B errored");
+    assert!(
+        matches!(&err, Error::Build { log } if log == "branch B aborted"),
+        "got {err:?}",
+    );
+}
+
+#[test]
+fn arc_split_single_does_not_panic() {
+    // Edge case: a single branch over a non-numeric host value. `value(String)`
+    // hands the closure the `String` by value, so `s.len()` computes in-graph.
+    let Ok(ctx) = Context::any() else {
+        eprintln!("SKIP: no OpenCL device");
+        return;
+    };
+    let chain = value("only-input".to_string()).and_then(|s| value(s.len()));
+    assert_eq!(chain.sync(&ctx).expect("single branch"), 10);
+}

@@ -43,12 +43,11 @@ fn dyn_op_lets_if_arms_have_different_concrete_types() {
         // Arm 1: a bare `value`. Concrete type `Value<u32>`.
         EagerDynOp::new(value(7u32))
     } else {
-        // Arm 2: a value-chain — concrete type `AndThen<Value<u32>, Forward<u32>>`,
-        // DIFFERENT from arm 1, both `Output = u32`. (DEVIATION: the old else-arm
-        // transformed the host scalar `value(0).and_then(|n| value(n+100))`, which
-        // eager can't express — `and_then` hands a Pipe, not the scalar. The point
-        // is two arms of different concrete type sharing `Output`; this serves it.)
-        EagerDynOp::new(value(100u32).and_then(claspr::eager::forward))
+        // Arm 2: a value-chain of a DIFFERENT concrete type, both `Output = u32`.
+        // `value`'s handle is by-value, so the host-scalar transform the original
+        // used (`value(0).and_then(|n| value(n + 100))`) ports faithfully — `n` is
+        // the `u32`, computed at build.
+        EagerDynOp::new(value(0u32).and_then(|n| value(n + 100)))
     };
     let result = chain.sync(&ctx).expect("dyn_op");
     assert_eq!(result, 7);
@@ -65,15 +64,12 @@ fn dyn_op_wraps_simple_value() {
 
 /// conditional.rs::dyn_op_wraps_value_chain — erase a `value`-chain.
 ///
-/// DEVIATION (same as eager_chain.rs::value_passthrough): the old test
-/// transformed the host scalar between stages (`value(1).and_then(|n| value(n+41))`).
-/// Eager `and_then` hands a `Pipe<u32>`, not the scalar, so the transform is
-/// computed up front; the test still exercises `EagerDynOp` over a composed chain.
+/// Ports faithfully: `value`'s by-value handle lets the host-scalar transform
+/// `value(1).and_then(|n| value(n + 41))` run in-graph (`n` is the `u32`).
 #[test]
 fn dyn_op_wraps_value_chain() {
     let Some(ctx) = ctx() else { return };
-    let computed = 1u32 + 41;
-    let chain: EagerDynOp<u32> = EagerDynOp::new(value(computed).and_then(claspr::eager::forward));
+    let chain: EagerDynOp<u32> = EagerDynOp::new(value(1u32).and_then(|n| value(n + 41)));
     let v = chain.sync(&ctx).expect("sync");
     assert_eq!(v, 42);
 }
@@ -214,10 +210,7 @@ fn dyn_op_erases_multi_output_op() {
         if left {
             EagerDynOp::new(bundle2(value(1u32), value(2u32)))
         } else {
-            EagerDynOp::new(bundle2(
-                value(3u32).and_then(claspr::eager::forward),
-                value(4u32),
-            ))
+            EagerDynOp::new(bundle2(value(3u32).and_then(value), value(4u32)))
         }
     };
     assert_eq!(pick(true).sync(&ctx).expect("left"), (1, 2));

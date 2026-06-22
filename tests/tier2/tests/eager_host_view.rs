@@ -18,7 +18,7 @@
 
 use claspr::eager::{
     EagerOpExt, acquire_device_view, acquire_device_view_read, acquire_mapped_view,
-    acquire_mapped_view_read, download, release_device_view, release_mapped_view, upload, value,
+    acquire_mapped_view_read, download, lift, release_device_view, release_mapped_view, upload,
 };
 use claspr::{Context, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
@@ -147,7 +147,7 @@ fn mapped_slice_acquire_release_round_trip() {
 
     let buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("MappedSlice alloc");
 
-    let mut buf = value(buf)
+    let mut buf = lift(buf)
         .and_then(acquire_mapped_view)
         .and_then_host(|slice: &mut [u32]| {
             for x in slice.iter_mut() {
@@ -193,7 +193,7 @@ fn mapped_slice_acquire_release_read_only() {
     let sum_cell = std::sync::Arc::new(std::sync::Mutex::new(0u32));
     let scell = std::sync::Arc::clone(&sum_cell);
 
-    let buf = value(buf)
+    let buf = lift(buf)
         .and_then(acquire_mapped_view_read)
         .and_then_host(move |slice: &[u32]| {
             // Type is &[u32] — no mutation possible.

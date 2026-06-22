@@ -86,6 +86,44 @@ impl<T> Pipe<T> {
     }
 }
 
+// A bare `Pipe<T>` IS a single-output op — the identity node. This lets a pipe
+// (e.g. one branch of a multi-output `handle()`) be passed directly into a
+// `bundle!` / `and_then` source position WITHOUT a `forward(..)` wrapper: the
+// type system already knows which `handle` slots are pipes, so the coercion is
+// implicit. It is the wrapper-free form of [`Forward`] — `output_pipe()` aliases
+// the pipe's own storage, so `collect`'s default (`execute` then `take`) pulls
+// whatever the upstream producer already deposited.
+//
+// CONTRACT (same as `forward`): the pipe's producer must have run upstream in the
+// same sub-chain before this node is gathered (`AndThen`/composites run the
+// source first, so this holds). If not, `collect` finds an empty cell and returns
+// the standard "op produced no output" error — loud, never silent.
+impl<T: Send + 'static> EagerOp for Pipe<T> {
+    type Output = T;
+
+    fn output_pipe(&self) -> Pipe<T> {
+        // The pipe is its OWN output storage — no separate `out`. The producer
+        // already (or will) deposit here; we alias it.
+        self.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.clone()
+    }
+
+    fn execute(self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // No work: the value is deposited by the upstream producer, and
+        // `output_pipe()` already aliases this same cell, so `collect` reads it
+        // directly. (Unlike `Forward`, there is no resolve-and-re-deposit step —
+        // there is nowhere else to move it to.)
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("pipe".into());
+    }
+}
+
 /// An op argument: a concrete value known at build, or a [`Pipe`] filled by an
 /// upstream op at execute time.
 pub enum Input<T> {
@@ -327,10 +365,8 @@ pub trait EagerOpExt: EagerOp + Sized {
         U: EagerOp,
         F: for<'a> FnOnce(&ExecutionContext<'a>, Self::Output) -> U + Send,
     {
-        let src_pipe = self.output_pipe();
         AndThenWithContext {
             source: self,
-            src_pipe,
             f: Some(f),
             out: Pipe::new(),
         }
@@ -341,11 +377,9 @@ pub trait EagerOpExt: EagerOp + Sized {
     /// parent's queue; the routed op's events are valid across both via
     /// OpenCL's shared-context event semantics. See [`OnDevice`].
     fn on_device(self, device: &crate::Device) -> OnDevice<Self> {
-        let src_pipe = self.output_pipe();
         OnDevice {
             source: self,
             device: device.clone(),
-            src_pipe,
             out: Pipe::new(),
         }
     }
@@ -361,10 +395,8 @@ pub trait EagerOpExt: EagerOp + Sized {
         F: for<'a> FnOnce(<Self::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
             + Send,
     {
-        let src_pipe = self.output_pipe();
         AndThenHost {
             source: self,
-            src_pipe,
             f: Some(f),
             out: Pipe::new(),
         }
@@ -382,10 +414,8 @@ pub trait EagerOpExt: EagerOp + Sized {
             ) -> Result<()>
             + Send,
     {
-        let src_pipe = self.output_pipe();
         AndThenHostWithContext {
             source: self,
-            src_pipe,
             f: Some(f),
             out: Pipe::new(),
         }
@@ -501,29 +531,57 @@ where
 // ── Value: lift a host value into the graph ────────────────────────────
 
 /// A host value lifted into the graph — produces it with no device work and no
-/// events. Useful as a chain head or to thread a host value alongside buffers.
+/// events. Useful as a chain head, or to thread a host value alongside buffers.
+///
+/// ## By-VALUE handle (the whole point)
+///
+/// Unlike most ops (whose `Handle` defaults to `Pipe<Output>`), `Value` exposes
+/// its **value itself** as the build-time handle (`Handle = T`, requires
+/// `T: Clone`). So a downstream `and_then` / bundle closure receives the actual
+/// `T`, NOT a `Pipe<T>` — letting host-side computation happen at build:
+///
+/// ```ignore
+/// value(1u32).and_then(|n| value(n + 1))            // n is u32, n+1 works
+/// bundle!(kernel, value(1u32)).and_then(|(buf, step)| {  // step is u32...
+///     bundle!(kernel2(buf), value(step + 1))        // ...so step+1 computes here
+/// })
+/// ```
+///
+/// This is why `value` requires `T: Clone`: `handle(&self)` clones the value out
+/// while the op keeps its own copy for `execute` (which still deposits into the
+/// pipe for the terminal/bundle reconstruction path). For a non-`Clone` owned
+/// resource (a `DeviceSlice` etc.), use [`lift`] instead — it keeps the default
+/// `Pipe` handle (a buffer can't and shouldn't be computed on at build).
 pub struct Value<T: Send> {
     v: Option<T>,
     out: Pipe<T>,
 }
 
-/// Lift `v` into the graph.
-pub fn value<T: Send + 'static>(v: T) -> Value<T> {
+/// Lift a `Clone` host value into the graph with a **by-value** handle (so
+/// downstream closures get the value, not a pipe — see [`Value`]). For a
+/// non-`Clone` owned resource use [`lift`].
+pub fn value<T: Send + Clone + 'static>(v: T) -> Value<T> {
     Value {
         v: Some(v),
         out: Pipe::new(),
     }
 }
 
-impl<T: Send + 'static> EagerOp for Value<T> {
+impl<T: Send + Clone + 'static> EagerOp for Value<T> {
     type Output = T;
+    // By-value handle: downstream gets `T`, enabling build-time host compute.
+    type Handle = T;
 
     fn output_pipe(&self) -> Pipe<T> {
         self.out.clone()
     }
 
     fn handle(&self) -> Self::Handle {
-        self.out.clone()
+        // Clone the value out for the downstream closure; `execute` still has its
+        // own copy (in `self.v`) to deposit into the pipe for the terminal path.
+        self.v
+            .clone()
+            .expect("Value::handle after execute — internal eager bug")
     }
 
     fn execute(mut self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -537,6 +595,60 @@ impl<T: Send + 'static> EagerOp for Value<T> {
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("value".into());
+    }
+}
+
+// ── Lift: an owned (non-Clone) resource as a leaf, default Pipe handle ──
+
+/// An owned resource lifted into the graph as a leaf — like [`Value`] but with
+/// the **default `Pipe` handle** instead of by-value, so it works for non-`Clone`
+/// types (a [`DeviceSlice`] etc. owns a `cl_mem` and cannot be cloned). Use it
+/// to make a caller-owned buffer a chain head or a bundle branch:
+///
+/// ```ignore
+/// lift(buf).and_then(acquire_mapped_view)                  // buffer chain head
+/// bundle!(lift(buf), upload(v), alloc_zero(N))             // buffer bundle branch
+/// ```
+///
+/// A buffer can't be computed on at build time anyway, so its downstream handle
+/// is a `Pipe` (the value flows; you don't read it until execute). For a `Clone`
+/// host value you want to compute on downstream, use [`value`] (by-value handle).
+pub struct Lift<T: Send> {
+    v: Option<T>,
+    out: Pipe<T>,
+}
+
+/// Lift an owned resource into the graph (default `Pipe` handle — see [`Lift`]).
+pub fn lift<T: Send + 'static>(v: T) -> Lift<T> {
+    Lift {
+        v: Some(v),
+        out: Pipe::new(),
+    }
+}
+
+impl<T: Send + 'static> EagerOp for Lift<T> {
+    type Output = T;
+    // Default `Handle = Pipe<T>` — a resource flows, it isn't read at build.
+
+    fn output_pipe(&self) -> Pipe<T> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        let v = self
+            .v
+            .take()
+            .expect("Lift::execute called twice — internal eager bug");
+        self.out.put(v, Deps::new());
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("lift".into());
     }
 }
 
@@ -721,7 +833,6 @@ impl<T: Send + 'static> EagerOp for EagerDynOp<'_, T> {
 /// through unchanged.
 pub struct Arced<S: EagerOp> {
     source: S,
-    src_pipe: Pipe<S::Output>,
     out: Pipe<Arc<S::Output>>,
 }
 
@@ -730,10 +841,8 @@ pub fn arced<S: EagerOp>(source: S) -> Arced<S>
 where
     S::Output: Sync,
 {
-    let src_pipe = source.output_pipe();
     Arced {
         source,
-        src_pipe,
         out: Pipe::new(),
     }
 }
@@ -753,13 +862,10 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        // Source pipelines (its value feeds us); we add no device work, so the
-        // terminal `mode` is irrelevant — pass it through for symmetry.
-        self.source.execute(ec, mode)?;
-        let (v, deps) = self.src_pipe.take().ok_or(Error::NotSupported(
-            "eager arced: source produced no output",
-        ))?;
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // Gather the source via `collect` (reconstructs any arity — a bundle
+        // source fills element pipes, not output_pipe), then wrap in Arc.
+        let (v, deps) = self.source.collect(ec, ExecMode::Pipelined)?;
         self.out.put(Arc::new(v), deps);
         Ok(())
     }
@@ -791,7 +897,6 @@ where
     S::Output: Clone,
 {
     source: S,
-    src_pipe: Pipe<S::Output>,
     // One element pipe per branch (move-once storage); each gets an
     // `Arc::clone` of the source value in `execute`.
     outs: [Pipe<S::Output>; N],
@@ -805,10 +910,8 @@ pub fn arc_split<const N: usize, S: EagerOp>(source: S) -> ArcSplit<S, N>
 where
     S::Output: Clone,
 {
-    let src_pipe = source.output_pipe();
     ArcSplit {
         source,
-        src_pipe,
         outs: std::array::from_fn(|_| Pipe::new()),
     }
 }
@@ -836,14 +939,10 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // The source feeds us; we add no device work. Pipeline it, then take its
-        // value + completion events and scatter a clone of each into every
-        // branch pipe (Arc::clone is a cheap refcount bump; Deps clone shares
-        // the same producer events).
-        self.source.execute(ec, ExecMode::Pipelined)?;
-        let (v, deps) = self.src_pipe.take().ok_or(Error::NotSupported(
-            "eager arc_split: source produced no output",
-        ))?;
+        // Gather the source via `collect` (any arity), then scatter a clone of
+        // its value + events into every branch pipe (Arc::clone is a cheap
+        // refcount bump; Deps clone shares the same producer events).
+        let (v, deps) = self.source.collect(ec, ExecMode::Pipelined)?;
         for out in &self.outs {
             out.put(v.clone(), deps.clone());
         }
@@ -923,12 +1022,15 @@ macro_rules! impl_eager_bundle {
 
         impl<$($ty: EagerOp),+> EagerOp for $name<$($ty),+> {
             type Output = ( $(<$ty as EagerOp>::Output,)+ );
-            // A tuple of each branch's OWN output pipe. The downstream closure
-            // gets `(pa, pb, …)` — one `Pipe<branch output>` per branch — so a
-            // multi-arg op can consume them as separate inputs (each is a
-            // `Pipe<buffer>`, i.e. `ToInput`). Mirrors `CopyTo2`/the
-            // macro-emitted multi-output kernel.
-            type Handle = ( $(Pipe<<$ty as EagerOp>::Output>,)+ );
+            // A tuple of each branch's OWN build-time handle (NOT forced to a
+            // pipe). For a buffer-producing branch that handle defaults to
+            // `Pipe<buffer>` (so a multi-arg op consumes it via `ToInput`, as
+            // before); for a `value(scalar)` branch it is the scalar BY VALUE, so
+            // the downstream closure can compute on it at build (e.g. `step + 1`);
+            // for a nested bundle / multi-output branch it is that branch's own
+            // composite handle. Composing per-branch handles (rather than
+            // flattening to pipes) is what carries computable host values down.
+            type Handle = ( $(<$ty as EagerOp>::Handle,)+ );
 
             fn output_pipe(&self) -> Pipe<Self::Output> {
                 // Multi-output storage is the per-branch pipes; this single pipe
@@ -939,7 +1041,9 @@ macro_rules! impl_eager_bundle {
             }
 
             fn handle(&self) -> Self::Handle {
-                ( $(self.$pf.clone(),)+ )
+                // Delegate to each branch's own `handle()` — preserves by-value
+                // for `value`, pipe for buffers, composite for nested bundles.
+                ( $(self.$field.handle(),)+ )
             }
 
             fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -2635,7 +2739,6 @@ where
 /// at execute time.
 pub struct AndThenWithContext<S: EagerOp, U: EagerOp, F> {
     source: S,
-    src_pipe: Pipe<S::Output>,
     f: Option<F>,
     out: Pipe<U::Output>,
 }
@@ -2657,12 +2760,9 @@ where
     }
 
     fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        // Source is upstream — always pipeline it; its value + events feed the
-        // downstream op the closure builds.
-        self.source.execute(ec, ExecMode::Pipelined)?;
-        let (value, src_deps) = self.src_pipe.take().ok_or(Error::NotSupported(
-            "eager and_then_with_context: source produced no output",
-        ))?;
+        // Gather the source via `collect` (any arity); its value + events feed
+        // the downstream op the closure builds.
+        let (value, src_deps) = self.source.collect(ec, ExecMode::Pipelined)?;
         let f = self
             .f
             .take()
@@ -2703,7 +2803,6 @@ where
 pub struct OnDevice<S: EagerOp> {
     source: S,
     device: crate::Device,
-    src_pipe: Pipe<S::Output>,
     out: Pipe<S::Output>,
 }
 
@@ -2735,11 +2834,8 @@ where
             target_q.raw(),
             parent.host_error_slot(),
         );
-        // Run the source against the child EC — it deposits into `src_pipe`.
-        self.source.execute(&child, mode)?;
-        let (value, deps) = self.src_pipe.take().ok_or(Error::NotSupported(
-            "eager on_device: source produced no output",
-        ))?;
+        // Gather the source against the child EC via `collect` (any arity).
+        let (value, deps) = self.source.collect(&child, mode)?;
         self.out.put(value, deps);
         Ok(())
     }
@@ -2787,7 +2883,6 @@ where
     S::Output: crate::mappable::Mappable,
 {
     source: S,
-    src_pipe: Pipe<S::Output>,
     f: Option<F>,
     out: Pipe<S::Output>,
 }
@@ -2799,7 +2894,6 @@ where
     S::Output: crate::mappable::Mappable,
 {
     source: S,
-    src_pipe: Pipe<S::Output>,
     f: Option<F>,
     out: Pipe<S::Output>,
 }
@@ -2886,10 +2980,9 @@ where
     }
 
     fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        self.source.execute(ec, ExecMode::Pipelined)?;
-        let (value, deps) = self.src_pipe.take().ok_or(Error::NotSupported(
-            "eager and_then_host: source produced no output",
-        ))?;
+        // Gather the source via `collect` (any arity — a bundle source fills
+        // element pipes, not output_pipe).
+        let (value, deps) = self.source.collect(ec, ExecMode::Pipelined)?;
         let f = self
             .f
             .take()
@@ -2923,10 +3016,8 @@ where
     }
 
     fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        self.source.execute(ec, ExecMode::Pipelined)?;
-        let (value, deps) = self.src_pipe.take().ok_or(Error::NotSupported(
-            "eager and_then_host_with_context: source produced no output",
-        ))?;
+        // Gather the source via `collect` (any arity).
+        let (value, deps) = self.source.collect(ec, ExecMode::Pipelined)?;
         let f = self
             .f
             .take()
@@ -2962,7 +3053,6 @@ where
 /// source op still ran — profiling is a host side-effect, not data flow).
 pub struct Profiled<S: EagerOp, F> {
     source: S,
-    src_pipe: Pipe<S::Output>,
     cb: Option<F>,
     out: Pipe<S::Output>,
 }
@@ -2978,10 +3068,8 @@ pub trait EagerProfileExt: EagerOp + Sized {
     where
         F: FnOnce(Result<crate::ProfilingInfo>) + Send + 'static,
     {
-        let src_pipe = self.output_pipe();
         Profiled {
             source: self,
-            src_pipe,
             cb: Some(cb),
             out: Pipe::new(),
         }
@@ -3007,10 +3095,8 @@ where
 
     fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         use crate::Launcher;
-        self.source.execute(ec, ExecMode::Pipelined)?;
-        let (value, source_deps) = self.src_pipe.take().ok_or(Error::NotSupported(
-            "eager profiled: source produced no output",
-        ))?;
+        // Gather the source via `collect` (any arity).
+        let (value, source_deps) = self.source.collect(ec, ExecMode::Pipelined)?;
         // Same up-front check as the old layer / Tier 1: the queue needs
         // profiling enabled before we waste a marker + callback registration.
         if (ec.cl_queue().properties()? & crate::CL_QUEUE_PROFILING_ENABLE) == 0 {

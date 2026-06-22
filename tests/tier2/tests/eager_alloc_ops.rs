@@ -18,8 +18,8 @@
 //! exercise. Same N, same 99/×2 = 198 and 0..N values.
 
 use claspr::eager::{
-    EagerOpExt, alloc_zero, bundle3, download, fill_device_uninit, fill_mapped_uninit, upload,
-    value, write_device_uninit,
+    EagerOpExt, alloc_zero, bundle3, download, fill_device_uninit, fill_mapped_uninit, lift,
+    upload, write_device_uninit,
 };
 use claspr::{Buffer, Context, DeviceSlice, Error, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
@@ -173,7 +173,7 @@ fn and_then_with_context_composes_lazy_alloc_inside_closure() {
             // reduced to one pipe (download) INSIDE the sub-chain — the outer
             // chain can't destructure its tuple. Same 7 + 1 = 8 result.
             bundle3(
-                value(buf),
+                lift(buf),
                 upload::<u32, claspr::ReadWrite, _>(vec![1u32; N]),
                 alloc_zero::<u32, claspr::ReadWrite>(N),
             )

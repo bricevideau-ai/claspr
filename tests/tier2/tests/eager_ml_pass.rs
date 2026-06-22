@@ -10,7 +10,8 @@
 //! Same N, same scale factors, same assertions as `ml_pass.rs`.
 
 use claspr::Context;
-use claspr::eager::{EagerOpExt, bundle3, download, upload};
+use claspr::eager::{EagerOpExt, bundle3, download, upload, value};
+use claspr::eager_bundle;
 use claspr_test_kernels::kernels;
 use std::sync::{Arc, Mutex};
 
@@ -49,16 +50,47 @@ fn forward_pass_threads_buffer_through_three_stages() {
     assert_eq!(loss, 6 * N as u32);
 }
 
-// BLOCKED: forward_pass_carries_scalar_state_via_value_tuple_repack — needs the
-// host-value-passthrough seam. The original packs the device buffer + an
-// out-of-band scalar into `value((buf, step))` at each stage. In eager,
-// `and_then` hands a `Pipe<DeviceSlice>` (not the concrete `DeviceSlice`), so
-// `value((buf, step))` cannot be constructed in-graph — there is no way to lift
-// the upstream buffer *value* into a fresh `value(...)` node alongside a host
-// scalar. (The tuple `(DeviceSlice, u32)` IS Mappable, so the final
-// `and_then_host(|(slice, _step)| ...)` would type-check; the blocker is the
-// per-stage tuple repack, the same `value_passthrough` gap noted in
-// `eager_chain.rs`.) See report for the needed primitive.
+/// ml_pass.rs::forward_pass_carries_scalar_state_via_value_tuple_repack — thread
+/// an out-of-band scalar (step counter) alongside the buffer through the chain.
+///
+/// PORT NOTE: the original wrote `value((buf, step))` to pack the buffer + scalar
+/// into one edge. Eager `value` can't pack a not-yet-resolved buffer pipe inside
+/// a tuple, so the eager idiom BUNDLES the two graph members instead: the buffer
+/// (a `Pipe<DeviceSlice>`, passed BARE — `Pipe<T>: EagerOp`, no `forward(..)`)
+/// and the scalar (`value(step)`, a BY-VALUE handle). `bundle2` joins them, and
+/// the downstream closure receives `(Pipe<DeviceSlice>, u32)` — `step` is a real
+/// `u32`, so `step + 1` is computed in-graph at the next stage (NOT hand-tracked;
+/// this is the heterogeneous pipe+scalar carry the bundle handle composition
+/// enables). The reconstructed `(DeviceSlice, u32)` tuple IS Mappable, so the
+/// final `and_then_host(|(slice, _step)| ...)` type-checks. Same kernels, loss,
+/// step==2 as the original.
+#[test]
+fn forward_pass_carries_scalar_state_via_bundle() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let sum_cell = Arc::new(Mutex::new(0u32));
+    let cell = Arc::clone(&sum_cell);
+    let (_final_buf, step) = upload::<u32, claspr::ReadWrite, _>(vec![10u32; N])
+        .and_then(|buf| {
+            // Pack: kernel output (a bare `Pipe<DeviceSlice>`) + the scalar 1.
+            eager_bundle!(kernels.scale_u32([N], buf, 2), value(1u32))
+        })
+        .and_then(|(buf, step): (_, u32)| {
+            // `buf` is a `Pipe<DeviceSlice>`, `step` is `u32` (by-value handle) —
+            // so `step + 1` computes here, carried in-chain, not hand-tracked.
+            eager_bundle!(kernels.scale_u32([N], buf, 3), value(step + 1))
+        })
+        .and_then_host(move |(slice, _step): (&mut [u32], u32)| {
+            *cell.lock().unwrap() = slice.iter().sum();
+            Ok(())
+        })
+        .sync(&ctx)
+        .expect("stateful forward pass");
+    let final_sum = *sum_cell.lock().unwrap();
+    assert_eq!(final_sum, 60 * N as u32); // 10 * 2 * 3 = 60
+    assert_eq!(step, 2);
+}
 
 #[test]
 fn mpsc_three_producers_into_single_combine() {
