@@ -17,10 +17,11 @@
 //! `Pipe: Into<Input>`. All six test fns port 1:1 (same N, values, assertions).
 
 use claspr::eager::{
-    DeviceOpExt, acquire_device_view, acquire_device_view_read, acquire_mapped_view,
-    acquire_mapped_view_read, download, lift, release_device_view, release_mapped_view, upload,
+    acquire_device_view, acquire_device_view_read, acquire_mapped_view, acquire_mapped_view_read,
+    release_device_view, release_mapped_view,
 };
-use claspr::{Context, MappedSlice, SvmLevel};
+use claspr::prelude::*;
+use claspr::{MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;

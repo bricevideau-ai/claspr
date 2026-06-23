@@ -174,3 +174,52 @@ pub use opencl3::event::Event;
 pub use opencl3::kernel::Kernel;
 pub use opencl3::program::Program;
 pub use opencl3::types::cl_event;
+
+/// Convenience glob-import surface.
+///
+/// `use claspr::prelude::*;` brings claspr's graph verbs/terminals (the
+/// [`DeviceOp`]/[`DeviceOpExt`]/[`DeviceFanOutExt`]/[`DeviceProfileExt`]
+/// traits), the [`Launcher`] trait, the host-view ext traits
+/// ([`HostReadableExt`]/[`HostWritableExt`]/[`HostAccessibleExt`]), the common
+/// access markers ([`ReadWrite`]/[`ReadOnly`]/[`WriteOnly`]/[`Frozen`]), the
+/// high-frequency Tier 2 constructors (`upload`/`download`/`fill`/`alloc_zero`/
+/// `value`/`lift`/`bundle2..16`/`fan_out`/`arc_split`/…), the chain-entry
+/// macros (`bundle!`/`upload!`/`download!`/`device_slice!`/…), and the core
+/// types ([`Context`]/[`DeviceSlice`]/[`Device`]/[`Result`]/[`Error`]) into
+/// scope — so callers can invoke the trait methods without hand-listing every
+/// extension trait.
+///
+/// This is deliberately focused: it does **not** re-export the entire crate.
+/// Anything not in the prelude (image kernel-arg types, `Buffer`, the SVM/USM
+/// slice families, lower-level `op`/`launch` items, …) is still reachable at
+/// the crate root (`claspr::…`) and through the module paths.
+pub mod prelude {
+    // ── Graph verbs / terminals + supporting traits ──
+    pub use crate::eager::{DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt};
+    pub use crate::host_view::{HostAccessibleExt, HostReadableExt, HostWritableExt};
+    pub use crate::queue::Launcher;
+
+    // ── Access markers (the ones graphs are parameterised over) ──
+    pub use crate::access::{Frozen, ReadOnly, ReadWrite, WriteOnly};
+
+    // ── Core types ──
+    pub use crate::buffer::DeviceSlice;
+    pub use crate::context::Context;
+    pub use crate::device::Device;
+    pub use crate::error::{Error, Result};
+
+    // ── High-frequency Tier 2 constructors ──
+    pub use crate::eager::{
+        alloc_zero, arc_split, arced, bundle2, bundle3, bundle4, bundle5, bundle6, bundle7,
+        bundle8, bundle9, bundle10, bundle11, bundle12, bundle13, bundle14, bundle15, bundle16,
+        download, fan_out, fill, forward, lift, transfer_to_device, upload, upload_as, value,
+        write,
+    };
+
+    // ── Chain-entry macros (re-exported from the crate root, where
+    // `#[macro_export]` places them) ──
+    pub use crate::{
+        bundle, device_slice, device_slice_alloc_uninit, device_slice_alloc_zero,
+        device_slice_filled, device_slice_from_slice, download, upload,
+    };
+}

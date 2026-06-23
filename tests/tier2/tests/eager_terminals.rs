@@ -4,8 +4,8 @@
 //! returns a completion event without blocking. `sync(&ctx)` == `wait_on` over a
 //! context's default queue.
 
-use claspr::eager::{DeviceOpExt, alloc_zero, download, fill, upload};
-use claspr::{Context, Device, InOrder, Queue};
+use claspr::prelude::*;
+use claspr::{InOrder, Queue};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;

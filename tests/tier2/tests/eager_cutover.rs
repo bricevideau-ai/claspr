@@ -3,11 +3,8 @@
 //! Proves the closure-free model + event-threaded pipes work on the actual
 //! claspr `ExecutionContext`/queue before the macro change (step 1b).
 
-use claspr::Context;
-use claspr::eager::{
-    DeviceOpExt, alloc_zero, arc_split, arced, bundle2, bundle3, download, eager_copy_to, fan_out,
-    fill, upload, value,
-};
+use claspr::eager::eager_copy_to;
+use claspr::prelude::*;
 use claspr_test_kernels::kernels;
 
 const N: usize = 256;
@@ -467,7 +464,6 @@ fn eager_and_then_host_error_propagates() {
 /// runners skip it — there is no second queue to route to.
 #[test]
 fn eager_on_device() {
-    use claspr::Device;
     use claspr::device::Platform;
 
     // Discover a two-device context: real multi-device → sub-device partition →
