@@ -47,10 +47,10 @@
 //! }
 //! ```
 //!
-//! ## In an async chain
+//! ## In a device-op chain
 //!
 //! ```ignore
-//! use claspr_async::{download, upload, DeviceOperation};
+//! use claspr::{download, upload, DeviceOpExt};
 //!
 //! let result: Vec<u32> = upload!(initial_data)
 //!     .and_then(|buf| kernels.fill_u32([N], buf, 5))
@@ -1078,17 +1078,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 /// caller can keep using them.
                 pub fn wait(self) -> ::claspr::Result<#output_ty> {
                     let ctx = ::core::clone::Clone::clone(&self.ctx);
-                    self.wait_on(&ctx)
-                }
-
-                /// Tier 1 blocking terminal with an explicit launcher.
-                pub fn wait_on<L>(self, launcher: &L) -> ::claspr::Result<#output_ty>
-                where
-                    L: ::claspr::Launcher,
-                {
-                    let (out, event) = self.submit_on(launcher)?;
-                    event.wait()?;
-                    ::core::result::Result::Ok(out)
+                    // No inherent `wait_on` anymore — the kernel Op is a
+                    // `DeviceOp`, so this falls through to the blanket
+                    // `DeviceOpExt::wait_on` (eager.rs), which blocks on the
+                    // launch event just like the old inherent version did.
+                    ::claspr::DeviceOpExt::wait_on(self, &ctx)
                 }
             }
 

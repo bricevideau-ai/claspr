@@ -4,7 +4,7 @@
 //! `Queue::<InOrder>::on_device` instances so the event-wait-list
 //! handshake is what's actually doing the ordering.
 
-use claspr::{Context, Device, DeviceSlice, InOrder, Queue};
+use claspr::{Context, Device, DeviceOpExt, DeviceSlice, InOrder, Queue};
 use claspr_test_kernels::kernels;
 use std::panic;
 

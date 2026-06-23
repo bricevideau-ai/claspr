@@ -8,7 +8,9 @@
 //! behind the cross-queue work via the event wait-list instead of
 //! deadlocking or freeing while the unmap is still in flight.
 
-use claspr::{Context, Device, InOrder, Launcher, MappedSlice, OutOfOrder, Queue, SvmLevel};
+use claspr::{
+    Context, Device, DeviceOpExt, InOrder, Launcher, MappedSlice, OutOfOrder, Queue, SvmLevel,
+};
 use claspr_test_kernels::kernels;
 use std::sync::Arc;
 
