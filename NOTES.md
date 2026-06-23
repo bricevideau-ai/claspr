@@ -9,6 +9,50 @@ items resolve.
 
 ## Active
 
+### ✅ FIXED: `and_then_host` error path HANG on legacy Intel NEO (2026-06-23)
+
+**Separate bug from the now-fixed Context/queue leak.** Symptom: full tier2
+suite back-to-back on legacy NEO
+(`OCL_ICD_VENDORS=/etc/OpenCL/vendors/intel_legacy1.icd`) hung intermittently;
+serial+nocapture pinned **`eager_and_then_host_error_propagates`**
+(eager_cutover.rs). Minimal repro:
+`upload(vec![1u32;N]).and_then_host(|_| Err(...)).and_then(download).sync(&ctx)`.
+
+ROOT CAUSE (pinned via cliloader call-logging + microsecond/thread-id HSTRACE on
+NEO, cross-checked vs pocl): the host-seam ERROR path completed its user event
+with a **NEGATIVE** status. The downstream terminal `download` is a BLOCKING
+`clEnqueueReadBuffer` gated (via the queued unmap) on that user event. On legacy
+NEO, when the user event resolves negative, NEO aborts the gated unmap + read but
+**the blocking read's host-side wait never wakes → permanent hang.** The HANG
+schedule (cliloader, near-100%; bare HSTRACE): terminal thread enqueues the
+blocking read and enters its wait (event = unmap gated on user event E), THEN the
+worker thread sets E = -1 ~370µs later → NEO never returns from the read.
+pocl-equivalent SUCCESS schedule: identical call order, but pocl does NOT cascade
+the negative status to the downstream blocking read, so the read returns and the
+terminal's host-error-slot check converts it to `Err`. So the hang was NEO's
+handling of "blocking enqueue gated on a negatively-completed user event," not a
+pure ordering flip — but the fix is the same either way. Defensive double-unmap
+on the worker also raced to `CL_INVALID_VALUE` on NEO (visible in the cliloader
+log) — collateral, gone with the fix.
+
+FIX (eager.rs `run_host_seam` worker, option a + c): the worker ALWAYS completes
+the user event with `CL_COMPLETE`, never a negative status. The chain-wide
+host-error slot is already the authoritative failure channel — the terminal
+(`wait_on`/async poll) checks it even on a successful wait and prefers the rich
+error, discarding downstream output (abort semantics preserved: caller never
+gets stale data computed past the failing host closure). With `CL_COMPLETE` the
+queued unmap fires normally, cleaning the buffer, so the worker's defensive
+`mark_unmap_not_done`+drop block was removed (no longer needed; was the source of
+the NEO double-unmap). `mark_unmap_not_done` stays in the `Mappable` trait — the
+handle's Drop still uses the defensive sync-unmap path for the
+map-succeeds-then-`enqueue_unmap`-fails window.
+
+VERIFIED: 30 reps × full `eager_cutover` binary (20 tests) serial on **NEO +
+pocl + rusticl** = 30/30 OK, 0 hangs each (NEO was ~100% hang in isolation
+pre-fix). Sibling host-seam binaries `eager_and_then_host_with_context` (3) +
+`eager_error` (3) = 15/15 on NEO. fmt + workspace clippy `-D warnings` + claspr
+doc `-D warnings` all clean. Instrumentation removed.
+
 ### Blocking borrowing upload verb `write_sync` (branch `eager-cutover`, 2026-06-23)
 
 **✅ DONE.** Additive softening of the async owned `write`'s move-out tax. The
