@@ -39,13 +39,13 @@ fn image2d_copy_to_propagates_pixels() {
     const W: u32 = 8;
     const H: u32 = 4;
 
-    let mut src = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc src");
-    let mut dst = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc dst");
+    let src = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc src");
+    let dst = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc dst");
 
     let pixels: Vec<u32> = (0..(W * H)).map(|i| 0xCAFE_0000 | i).collect();
-    src.write(&pixels).wait().expect("write src");
+    let src = src.write(&pixels).wait().expect("write src");
 
-    src.copy_to(&mut dst).wait().expect("copy src→dst");
+    let (_src, dst) = src.copy_to(dst).wait().expect("copy src→dst");
 
     let got: Vec<u32> = dst.read_alloc().wait().expect("read dst");
     assert_eq!(got, pixels, "copy_to should propagate every pixel");
@@ -63,8 +63,8 @@ fn image2d_fill_writes_pattern_to_every_pixel() {
     const H: u32 = 2;
     let pattern: [u32; 4] = [10, 20, 30, 40];
 
-    let mut img = Image2D::<ReadWrite, R32G32B32A32Uint>::alloc(&ctx, W, H).expect("alloc");
-    img.fill(pattern).wait().expect("fill");
+    let img = Image2D::<ReadWrite, R32G32B32A32Uint>::alloc(&ctx, W, H).expect("alloc");
+    let img = img.fill(pattern).wait().expect("fill");
 
     let got: Vec<[u32; 4]> = img.read_alloc().wait().expect("read");
     assert_eq!(got.len(), (W as usize) * (H as usize));
@@ -85,8 +85,8 @@ fn image2d_fill_float_format_round_trips() {
     const H: u32 = 3;
     let pattern: [f32; 4] = [1.5, 2.5, 3.5, 4.5];
 
-    let mut img = Image2D::<ReadWrite, R32Float>::alloc(&ctx, W, H).expect("alloc");
-    img.fill(pattern).wait().expect("fill");
+    let img = Image2D::<ReadWrite, R32Float>::alloc(&ctx, W, H).expect("alloc");
+    let img = img.fill(pattern).wait().expect("fill");
 
     // R32Float is single-channel — only the first component lands.
     let got: Vec<f32> = img.read_alloc().wait().expect("read");
@@ -106,9 +106,9 @@ fn image2d_read_into_caller_dst() {
     const W: u32 = 8;
     const H: u32 = 4;
 
-    let mut img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
+    let img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let pixels: Vec<u32> = (0..(W * H)).map(|i| 0xBEEF_0000 | i).collect();
-    img.write(&pixels).wait().expect("write");
+    let img = img.write(&pixels).wait().expect("write");
 
     let mut got = vec![0u32; (W as usize) * (H as usize)];
     img.read(&mut got).expect("read op").wait().expect("wait");
@@ -147,12 +147,11 @@ fn image2d_write_submit_returns_event() {
     const W: u32 = 4;
     const H: u32 = 4;
 
-    let mut img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
+    let img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let pixels: Vec<u32> = (1..=(W * H)).collect();
-    {
-        let event = img.write(&pixels).submit().expect("submit write");
-        event.wait().expect("wait write");
-    } // event dropped — runtime has released its retain by now.
+    // Non-blocking submit returns the (rebindable) image plus the write event.
+    let (img, event) = img.write(&pixels).submit().expect("submit write");
+    event.wait().expect("wait write");
 
     let got: Vec<u32> = img.read_alloc().wait().expect("read");
     assert_eq!(got, pixels);
@@ -166,14 +165,15 @@ fn image2d_read_submit_returns_event() {
     const W: u32 = 4;
     const H: u32 = 4;
 
-    let mut img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
+    let img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let pixels: Vec<u32> = (100..(100 + W * H)).collect();
-    img.write(&pixels).wait().expect("write");
+    let img = img.write(&pixels).wait().expect("write");
 
     let mut got = vec![0u32; (W as usize) * (H as usize)];
     {
         let op = img.read(&mut got).expect("read op");
-        let event = op.submit().expect("submit read");
+        // Non-blocking submit returns the (rebindable) image plus the read event.
+        let (_img, event) = op.submit().expect("submit read");
         event.wait().expect("wait read");
     }
     assert_eq!(got, pixels);
@@ -190,33 +190,34 @@ fn image2d_write_bytes_and_read_bytes_round_trip() {
     let pixel_bytes = std::mem::size_of::<u32>();
     let byte_count = (W as usize) * (H as usize) * pixel_bytes;
 
-    let mut img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
+    let img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let raw: Vec<u8> = (0..byte_count as u8).collect();
-    img.write_bytes(&raw).wait().expect("write bytes");
+    let img = img.write_bytes(&raw).wait().expect("write bytes");
 
     let got = img.read_bytes_alloc().wait().expect("read bytes");
     assert_eq!(got, raw);
 }
 
-/// `.after(&event)` chains an image write after a prior event
-/// (here, a previous image write). Confirms the modifier wiring
-/// works for image ops the same way it does for buffer ops.
+/// Two writes to the same image, ordered via the move-out form: each verb
+/// consumes the image and rebinds it, so the second write is enqueued on the
+/// same context queue after the first. Confirms the folded image verbs sequence
+/// correctly (the eager-graph replacement for the old `.after(&event)` modifier).
 #[test]
 fn image2d_write_after_event() {
     let Some(ctx) = ctx() else { return };
     const W: u32 = 4;
     const H: u32 = 4;
 
-    let mut img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
+    let img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
 
     let first: Vec<u32> = vec![1u32; (W as usize) * (H as usize)];
-    let ev = img.write(&first).submit().expect("first write");
+    // Non-blocking first write; wait on its event before the second so the
+    // ordering is explicit (mirrors the former `.after(&ev)`).
+    let (img, ev) = img.write(&first).submit().expect("first write");
+    ev.wait().expect("wait first write");
 
     let second: Vec<u32> = vec![2u32; (W as usize) * (H as usize)];
-    img.write(&second)
-        .after(&ev)
-        .wait()
-        .expect("second write after first");
+    let img = img.write(&second).wait().expect("second write after first");
 
     let got: Vec<u32> = img.read_alloc().wait().expect("read");
     assert!(got.iter().all(|&v| v == 2), "second write should win");
@@ -233,9 +234,9 @@ fn image2d_write_only_marker_still_writes() {
     const W: u32 = 4;
     const H: u32 = 4;
 
-    let mut img = Image2D::<WriteOnly, R32Uint>::alloc(&ctx, W, H).expect("alloc");
+    let img = Image2D::<WriteOnly, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let pixels: Vec<u32> = vec![42u32; (W as usize) * (H as usize)];
-    img.write(&pixels).wait().expect("write");
+    let img = img.write(&pixels).wait().expect("write");
 
     // Reading back from a WriteOnly host marker: today the API
     // permits it (the marker gates kernel-side access, not

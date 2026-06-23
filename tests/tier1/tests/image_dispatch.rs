@@ -173,14 +173,14 @@ fn read_only_float_image_to_buffer() {
     let Some(ctx) = ctx() else { return };
     let kernels = claspr_test_image_kernels::dim2_float::kernels(&ctx).unwrap();
 
-    let mut img = claspr::Image2D::<ReadOnly, R32Float>::alloc(&ctx, W, H).unwrap();
+    let img = claspr::Image2D::<ReadOnly, R32Float>::alloc(&ctx, W, H).unwrap();
     let mut seed = vec![0.0f32; (W * H) as usize];
     for y in 0..H {
         for x in 0..W {
             seed[(y * W + x) as usize] = (x as f32) + (y as f32) * 100.0;
         }
     }
-    img.write(&seed).wait().unwrap();
+    let img = img.write(&seed).wait().unwrap();
 
     // Seed with finite values so the `out[i] * 0.0` trick in the
     // kernel produces a clean zero (NaN otherwise).
@@ -203,14 +203,14 @@ fn read_only_sint_image_to_buffer() {
     let Some(ctx) = ctx() else { return };
     let kernels = claspr_test_image_kernels::dim2_sint::kernels(&ctx).unwrap();
 
-    let mut img = claspr::Image2D::<ReadOnly, R32Sint>::alloc(&ctx, W, H).unwrap();
+    let img = claspr::Image2D::<ReadOnly, R32Sint>::alloc(&ctx, W, H).unwrap();
     let mut seed = vec![0i32; (W * H) as usize];
     for y in 0..H {
         for x in 0..W {
             seed[(y * W + x) as usize] = (x as i32) - (y as i32) * 10;
         }
     }
-    img.write(&seed).wait().unwrap();
+    let img = img.write(&seed).wait().unwrap();
 
     let zeros = vec![0i32; (W * H) as usize];
     let out = DeviceSlice::<i32>::from_slice(&ctx, &zeros).unwrap();
@@ -353,9 +353,9 @@ fn dim_buffer_read_to_slice() {
     let Some(ctx) = ctx() else { return };
     let kernels = claspr_test_image_kernels::dim_buffer_uint::kernels(&ctx).unwrap();
 
-    let mut img = Image1DBuffer::<ReadOnly, R32Uint>::alloc(&ctx, N).unwrap();
+    let img = Image1DBuffer::<ReadOnly, R32Uint>::alloc(&ctx, N).unwrap();
     let seed: Vec<u32> = (0..N).map(|x| x * 7 + 1).collect();
-    img.write(&seed).wait().unwrap();
+    let img = img.write(&seed).wait().unwrap();
 
     let zeros = vec![0u32; N as usize];
     let out = DeviceSlice::<u32>::from_slice(&ctx, &zeros).unwrap();

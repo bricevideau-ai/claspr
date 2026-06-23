@@ -2658,7 +2658,7 @@ pub struct ImageUploadEager<I: ImageHostTransfer> {
 /// Build an eager image-upload leaf.
 pub fn image_upload<I>(pixels: Vec<I::Pixel>, dims: I::Dims) -> ImageUploadEager<I>
 where
-    I: ImageHostTransfer + Send + 'static,
+    I: ImageHostTransfer + crate::image::ImageEnqueue + Send + 'static,
     I::Pixel: Send + 'static,
 {
     ImageUploadEager {
@@ -2671,7 +2671,7 @@ where
 
 impl<I> DeviceOp for ImageUploadEager<I>
 where
-    I: ImageHostTransfer + Send + 'static,
+    I: ImageHostTransfer + crate::image::ImageEnqueue + Send + 'static,
     I::Pixel: Send + 'static,
 {
     type Output = I;
@@ -2685,14 +2685,23 @@ where
     }
 
     fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // `write_op` is non-blocking only — always submit_on, mode ignored.
+        // Image write has no native CL_BLOCKING flag we want here — always a
+        // non-blocking enqueue, mode ignored; the chain terminal waits.
         let pixels = self
             .pixels
             .take()
             .expect("ImageUploadEager::execute called twice — internal eager bug");
         let mut img = I::alloc(ec.context(), self.dims)?;
+        let region = img.enqueue_region();
         // Source leaf: no upstream Input, so no wait-list to thread.
-        let event = img.write_op(&pixels).submit_on(ec)?;
+        let event = crate::image::write_image_enqueue(
+            img.image_mut(),
+            ec,
+            region,
+            pixels.as_ptr() as *const std::ffi::c_void,
+            false,
+            &[],
+        )?;
         // Keep-alive: the runtime reads from `pixels` until the write fires.
         register_drop_callback(&event, Box::new(pixels))?;
         self.out.put(img, vec![wrap_event(event)]);
@@ -2719,7 +2728,7 @@ pub struct ImageDownloadEager<I: ImageHostTransfer> {
 /// Build an eager image-download leaf over an upstream image.
 pub fn image_download<I>(img: impl Into<Input<I>>) -> ImageDownloadEager<I>
 where
-    I: ImageHostTransfer + Send + 'static,
+    I: ImageHostTransfer + crate::image::ImageEnqueue + Send + 'static,
     I::Pixel: Default + Copy + Send + 'static,
 {
     ImageDownloadEager {
@@ -2730,7 +2739,7 @@ where
 
 impl<I> DeviceOp for ImageDownloadEager<I>
 where
-    I: ImageHostTransfer + Send + 'static,
+    I: ImageHostTransfer + crate::image::ImageEnqueue + Send + 'static,
     I::Pixel: Default + Copy + Send + 'static,
 {
     type Output = Vec<I::Pixel>;
@@ -2744,14 +2753,20 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // `read_op` is non-blocking only — always submit_on, mode ignored.
+        // Image read enqueued non-blocking; the chain terminal waits, mode ignored.
         let (img, deps) = self.img.resolve()?;
         let pixel_count = img.pixel_count();
+        let region = img.enqueue_region();
         let mut pixels = vec![<I::Pixel as Default>::default(); pixel_count];
-        let event = img
-            .read_op(&mut pixels)?
-            .after_all(deps.iter().map(|d| d.as_ref()))
-            .submit_on(ec)?;
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let event = crate::image::read_image_enqueue(
+            img.image_ref(),
+            ec,
+            region,
+            pixels.as_mut_ptr() as *mut std::ffi::c_void,
+            false,
+            &raw,
+        )?;
         self.out.put(pixels, vec![wrap_event(event)]);
         Ok(())
     }
