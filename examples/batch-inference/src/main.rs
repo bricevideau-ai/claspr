@@ -39,7 +39,7 @@
 //! — all branches enqueue onto the same OOO queue on the same
 //! device, so one shared device buffer suffices.
 //!
-//! [`fan_out`](claspr_async::fan_out()) enqueues every branch on the
+//! [`fan_out`](claspr::fan_out()) enqueues every branch on the
 //! chain's out-of-order queue with independent event chains; a single
 //! `clEnqueueMarkerWithWaitList` joins them at the end. The OOO
 //! scheduler decides how much to overlap on the device.
@@ -47,7 +47,7 @@
 //! Verifies every batch's output against a host reference.
 
 use claspr::Context;
-use claspr_async::{DeviceOperation, download, fan_out, upload};
+use claspr::eager::{DeviceOpExt, download, fan_out, upload};
 use std::sync::Arc;
 
 const N: usize = 64;
@@ -116,7 +116,7 @@ fn run(ctx: Context) -> claspr::Result<()> {
     // device buffers and BATCHES × N × 4 bytes of redundant
     // host→device DMA. With the share-on-device pattern: one alloc,
     // one DMA, N branches read from the same `cl_mem`.
-    let weights_dev: Arc<claspr::DeviceSlice<u32>> = Arc::new(upload!(weights).sync(&ctx)?);
+    let weights_dev: Arc<claspr::DeviceSlice<u32>> = Arc::new(upload(weights).sync(&ctx)?);
 
     // The full fan_out chain: each branch uploads ONLY its own input
     // buffer, then runs `elem_mul` against the shared weights, then
@@ -129,7 +129,7 @@ fn run(ctx: Context) -> claspr::Result<()> {
     let downloaded: Vec<Vec<u32>> = fan_out(inputs.clone(), move |input| {
         // Cheap Arc::clone — both pointers refer to the same `cl_mem`.
         let weights_ref = Arc::clone(&weights_dev);
-        upload!(input)
+        upload(input)
             .and_then(move |input_buf| {
                 // elem_mul: `(a: &mut [u32], b: &[u32])`. `a` =
                 // input_buf (consumed + returned with mul applied),
@@ -138,7 +138,7 @@ fn run(ctx: Context) -> claspr::Result<()> {
                     move |(input_buf, _weights_arc)| kernels_ref.add_bias([N], input_buf, BIAS),
                 )
             })
-            .and_then(|buf| download!(buf))
+            .and_then(download)
     })
     .sync(&ctx)?;
     let outputs: Vec<u32> = downloaded.iter().map(|v| v.iter().sum()).collect();

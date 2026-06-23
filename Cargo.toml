@@ -11,11 +11,8 @@ members = [
     "examples/sobel-kernel",
     "examples/image-pipeline",
     "examples/two-device",
-    # async-pipeline + batch-inference still call the removed closure-layer
-    # surface (`claspr_async::DeviceOperation`, the free-fn `upload`/`download`).
-    # Re-added once they're migrated to the eager device-graph API.
-    # "examples/async-pipeline",
-    # "examples/batch-inference",
+    "examples/async-pipeline",
+    "examples/batch-inference",
     "examples/spv-introspect",
     "tests/kernels",
     "tests/image-kernels",

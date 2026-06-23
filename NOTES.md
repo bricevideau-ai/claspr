@@ -100,15 +100,35 @@ re-exported with plain names (`claspr::eager::X` paths still work — tests unch
 there). **CAUGHT + FIXED a stage-4 regression:** the deleted `KernelOp::enqueue_into`
 carried an `assert_same_context` loop over caller-added `.after()` deps that the new
 `DeviceOp::execute` had dropped — cross_queue's cross-context-panic test went red;
-restored the loop in both execute bodies (single + multi-output). The two Tier-2
-examples (async-pipeline, batch-inference) are temporarily commented out of the
-workspace members (they still call the removed closure surface) — stage 7 migrates
-+ re-adds them. The old tier2 closure tests + `safety_compile_fail` ui_test harness
-(old-API fixtures) were deleted with the layer. Remaining: stage 3 (fold Tier-1
-buffer builders into DeviceOps), stage 6 (marker ergonomics + piped-buffer methods +
-G1), stage 7 (examples + README cuda-oxide credit + compile-fail re-bless).
-Pre-existing env failure unrelated to this work: `image_dispatch` dim2_array/dim3
-(pocl lacks 3D/2D-array `write_image` builtins on this CPU — fails identically at HEAD).
+restored the loop in both execute bodies (single + multi-output). Stage 3
+(`e805d4a`, `daf5cc4`: fold Tier-1 buffer + image builders into DeviceOps), stage 6
+(`0038e9f`: marker ergonomics + piped-buffer methods + G1). **STAGE 7 (FINAL) LANDED
+— reunification COMPLETE.** The two examples (async-pipeline, batch-inference) were
+migrated off the deleted closure surface (`upload!`→`upload`, `download!`→`download`,
+`DeviceOperation`→`DeviceOpExt`, `claspr_async::`→`claspr::eager::`; the batch
+fan_out keeps its `Arc<DeviceSlice>` shared-weights pattern) and re-added to the
+workspace members; both build + run + pass their inline tests on pocl. Their
+`claspr-async` deps were dropped (they depend only on `claspr` + `claspr-build`).
+README: cuda-oxide / Rust-CUDA credit added to "Prior art and inspiration" plus the
+device-graph + workspace-layout + three-layers sections rewritten off the
+two-tier/`claspr-async` framing onto the unified `DeviceOp` surface. Compile-fail
+suite RE-CREATED (not deferred): `tests/tier2/tests/safety_compile_fail.rs` (ui_test
+direct-rustc harness cloned from tier1's `image_compile_fail`) with two fixtures —
+`fill_on_frozen` (`Frozen` isn't `Fillable`) and `arc_to_writable_arg`
+(`Arc<DeviceSlice>` impls only `KernelSliceReadArg`); goldens blessed, CI's
+`tests/*/compile_fail` rustfmt glob picks them up automatically. The
+`use-after-move` / `host-view-escape` invariants from the old suite were NOT
+re-created (they're move-semantics / lifetime checks that the eager move-out idiom
+already enforces structurally; the two re-created fixtures are the marker/trait-bound
+ones worth a golden). `claspr-async` survives as a thin re-export shim
+(`pub use claspr::*` + macro re-exports) — still a workspace member; a dead-shim
+deletion candidate but LEFT IN PLACE (legacy `claspr_async::` paths in test/doc
+comments still resolve through it; flag for Brice). Full gate green: workspace
+build (default + `--features async-events`), `cargo fmt --check`, clippy (default +
+async-events), `RUSTDOCFLAGS=-D warnings cargo doc`, compile-fail rustfmt, and the
+entire tier1+tier2 suite serial on pocl. Pre-existing env failure unrelated to this
+work: `image_dispatch` dim2_array/dim3 (pocl lacks 3D/2D-array `write_image`
+builtins on this CPU — fails identically at HEAD).
 
 **📋 POST-REUNIFICATION (Brice): re-read cuda-oxide's async docs and decide
 match-vs-diverge per primitive.**

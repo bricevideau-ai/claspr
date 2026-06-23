@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Multi-stage forward pass via claspr-async — upload → linear → activation → linear → download → host reduction"
+description = "Multi-stage forward pass via the claspr device-graph API — upload → linear → activation → linear → download → host reduction"
 
 [[bin]]
 name = "async_pipeline_example"
@@ -13,7 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 claspr = { path = "../../claspr" }
-claspr-async = { path = "../../claspr-async" }
 
 [build-dependencies]
 claspr-build = { path = "../../claspr-build" }

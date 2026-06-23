@@ -2,7 +2,7 @@
 
 Single-source OpenCL with [rust-gpu](https://github.com/Rust-GPU/rust-gpu) — kernel and host code in one Rust source file, with type-safe kernel launches.
 
-> **Status:** working end to end. The single-source pipeline (`#[claspr::device] mod` + `#[claspr::kernel]`) drives every example on pocl 7.2-pre / aarch64 and on rusticl-on-llvmpipe in CI. Two-tier API: synchronous launches (Tier 1, in `claspr`) and lazy combinator chains (Tier 2, in `claspr-async`). Supported today: single-file kernel modules, multi-file device modules (via `mod foo;` declarations), library-crate composition (each kernel published as its own crate, consumed from a host binary), coarse-grain SVM (`MappedSlice`) and fine-grain-system SVM (`USMSlice`, host `Vec<T>` straight into kernels) as first-class kernel args. APIs are still volatile — early iteration; see [Limitations](#limitations).
+> **Status:** working end to end. The single-source pipeline (`#[claspr::device] mod` + `#[claspr::kernel]`) drives every example on pocl 7.2-pre / aarch64 and on rusticl-on-llvmpipe in CI. Unified API: one `DeviceOp` trait — every operation runs standalone (`.wait()`) or composes into a lazy device-operation graph (`.and_then` / `bundle!` / `fan_out`, terminals `.sync(&ctx)` / `.run(&ctx)`). Supported today: single-file kernel modules, multi-file device modules (via `mod foo;` declarations), library-crate composition (each kernel published as its own crate, consumed from a host binary), coarse-grain SVM (`MappedSlice`) and fine-grain-system SVM (`USMSlice`, host `Vec<T>` straight into kernels) as first-class kernel args. APIs are still volatile — early iteration; see [Limitations](#limitations).
 
 ## What it looks like
 
@@ -141,37 +141,37 @@ against the source. In exchange you get to consume SPIR-V from any
 toolchain. `tests/explicit-compile/` exercises both `load_from` and
 `bind` end-to-end.
 
-## Composing kernels: the Tier 2 async chain
+## Composing kernels: the device-operation chain
 
-The same `kernels.foo(...)` method that returns a Tier 1 Op also implements `DeviceOperation`, so it composes into a lazy chain in `claspr-async`:
+Every operation — a buffer verb (`buf.write(data)`, `download(buf)`) and a kernel launch (`kernels.foo(...)`) alike — implements the one `DeviceOp` trait, so it works both standalone (`.wait()`) and composed into a lazy graph:
 
 ```rust
-use claspr_async::{DeviceOperation, download, upload};
+use claspr::eager::{DeviceOpExt, download, upload};
 
-let result: Vec<u32> = upload!(input)
+let result: Vec<u32> = upload(input)
     .and_then(|buf| kernels.linear([N], buf, W1, B1))
     .and_then(|buf| kernels.relu_threshold([N], buf, THRESHOLD))
     .and_then(|buf| kernels.linear([N], buf, W2, B2))
-    .and_then(|buf| download!(buf))
+    .and_then(download)
     .sync(&ctx)?;
 ```
 
-`.sync(&ctx)` enqueues the whole chain on the per-device out-of-order queue, the OpenCL runtime overlaps stages, and host-side work (via `.and_then_host` / `.and_then_host_with_context`) slots in without serialising through the submitting thread. `.run(&ctx)` returns a `Future` for the same chain. Other combinators: `bundle!(a, b, c)` for heterogeneous parallel composition, `items.fan_out(|i| op)` for N-way homogeneous parallelism, `DynOp<T>` for type-erased branches, `.and_then_with_context(|ec, prev| op)` when the next step needs the running context, `.on_device(&dev)` / `transfer_to_device(buf, &dev)` for non-blocking cross-device pipelines, and lazy `device_slice_alloc_zero!(T, N)` / `mapped_slice_alloc_zero!(T, N)` / `usm_slice!(vec)` so temp buffers materialize at execute time. See `examples/async-pipeline` and `examples/batch-inference`.
+`.sync(&ctx)` enqueues the whole chain on the per-device out-of-order queue, the OpenCL runtime overlaps stages, and host-side work (via `.and_then_host` / `.and_then_host_with_context`) slots in without serialising through the submitting thread. `.run(&ctx)` returns a `Future` for the same chain (feature `async-events`). Other combinators: `bundle!(a, b, c)` for heterogeneous parallel composition, `items.fan_out(|i| op)` for N-way homogeneous parallelism, `DeviceDynOp<T>` for type-erased branches, `.and_then_with_context(|ec, prev| op)` when the next step needs the running context, `.on_device(&dev)` / `transfer_to_device(buf, &dev)` for non-blocking cross-device pipelines, and lazy `device_slice_alloc_zero!(T, N)` / `mapped_slice_alloc_zero!(T, N)` / `usm_slice!(vec)` so temp buffers materialize at execute time. See `examples/async-pipeline` and `examples/batch-inference`. The `DeviceOp` trait and its `sync` / `wait` / `submit` terminal vocabulary are inspired by cuda-oxide's `DeviceOperation` / Rust-CUDA (see [Prior art](#prior-art-and-inspiration)).
 
 ## Workspace layout
 
 | Crate | Role |
 |-------|------|
-| `claspr/` | Runtime helper library (Tier 1): `Context`, `DeviceSlice<T>` / `MappedSlice<T>` / `USMSlice<T>`, `Queue<InOrder/OutOfOrder>` + `Launcher`, `KernelArgs` tuples, `Image2D<A, F>`, `write_ppm_rgba8`, typed `Error` enum, kernel/event/program re-exports from `opencl3`. Re-exports `claspr_macros::{kernel, device}`. Host-only — does *not* depend on `spirv-builder`. |
-| `claspr-async/` | Tier 2 lazy combinators: the `DeviceOperation` trait, `value`, `upload` / `download`, lazy `device_slice_alloc` / `mapped_slice_alloc` / `usm_slice`, `.and_then` / `.and_then_with_context` / `.and_then_host` / `.and_then_host_with_context`, `.on_device(&dev)` / `transfer_to_device(buf, &dev)` for cross-device routing, `bundle!` / `fan_out` / `DynOp<T>`. Composes ops into a typed, dependency-threaded graph; terminals are `.sync(&ctx)` (blocking) or `.run(&ctx)` (returns a `Future`). |
+| `claspr/` | The whole runtime: `Context`, `DeviceSlice<T>` / `MappedSlice<T>` / `USMSlice<T>`, `Queue<InOrder/OutOfOrder>` + `Launcher`, `KernelArgs` tuples, `Image2D<A, F>`, `write_ppm_rgba8`, typed `Error` enum, kernel/event/program re-exports from `opencl3` — **plus** the unified `DeviceOp` graph layer: `value`, `upload` / `download`, lazy `device_slice_alloc` / `mapped_slice_alloc` / `usm_slice`, `.and_then` / `.and_then_with_context` / `.and_then_host` / `.and_then_host_with_context`, `.on_device(&dev)` / `transfer_to_device(buf, &dev)` for cross-device routing, `bundle!` / `fan_out` / `DeviceDynOp<T>`. Every op works standalone (`.wait()` / `.submit()`) or composed into a typed, dependency-threaded graph; graph terminals are `.sync(&ctx)` (blocking) or `.run(&ctx)` (returns a `Future`, feature `async-events`). Re-exports `claspr_macros::{kernel, device}`. Host-only — does *not* depend on `spirv-builder`. |
+| `claspr-async/` | Compatibility shim: re-exports `claspr` so existing `claspr_async::…` paths keep resolving. The Tier 2 combinator layer it used to hold is now folded into `claspr` (the proc-macro emits `::claspr::` paths and can't name a separate crate's types). New code should depend on `claspr` directly. |
 | `claspr-build/` | Build-script library — `compile_from_host(src_file)` reads a host source, lifts `#[claspr::kernel]` / `#[claspr::device]` items into a generated kernel sub-crate, compiles via rust-gpu, emits the `Kernels` struct. |
 | `claspr-macros/` | Proc-macros: `#[kernel(kernels = path::to::Kernels)]` and `#[device]`. |
 | `examples/collatz/` | One-file demo: kernel + host validation in `src/main.rs`. The README quickstart above. |
 | `examples/raymarch/` | Multi-file demo: SDF ray-march with sun lighting + soft shadows. Splits the device module across `src/main.rs` + `src/gpu/scene.rs` + `src/gpu/shading.rs`. Writes `raymarch.ppm`. |
 | `examples/mandelbrot-kernel/` + `examples/sobel-kernel/` | Two **library** crates each packaging one kernel — demonstrates publishing a claspr kernel as a reusable dependency. |
 | `examples/image-pipeline/` | Binary that depends on both kernel libraries above and runs them as a two-stage pipeline (mandelbrot → sobel edge detection). No `build.rs` of its own; each kernel library carries its own. |
-| `examples/async-pipeline/` | Tier 2 demo: upload → linear → relu → linear → download as one lazy chain. Inline `#[test]` validates device output against an identical host implementation. |
-| `examples/batch-inference/` | Tier 2 fan-out: N independent batches in parallel via `fan_out` + `bundle!`, sharing model weights through `Arc`. |
+| `examples/async-pipeline/` | Device-graph demo: upload → linear → relu → linear → download as one lazy chain. Inline `#[test]` validates device output against an identical host implementation. |
+| `examples/batch-inference/` | Device-graph fan-out: N independent batches in parallel via `fan_out`, sharing model weights through one `Arc<DeviceSlice>` (uploaded once, read-only in every branch). |
 | `examples/two-device/` | Multi-device API: `Context::for_devices()`, `Queue::on_device()`, cross-queue buffer `copy_to`, plus a sub-device partition fallback so it does something useful even on single-physical-device boxes. No kernel code. |
 
 ## Running the examples
@@ -208,9 +208,9 @@ On macOS, the system OpenCL framework is picked up automatically (no `OCL_ICD_VE
 
 ## Three layers
 
-1. **Runtime helper crate (`claspr`)** — generalises the `OclContext` / `DeviceSlice` / `KernelArg` / image-and-ppm helper patterns from [rust-gpu-opencl-samples](https://github.com/bricevideau-ai/rust-gpu-opencl-samples) into a reusable library. Synchronous launch surface with two entry points: the lower-level `LaunchOp::new(...)` builder and the proc-macro-emitted `kernels.foo(...)` typed launchers. Host-only, no rust-gpu deps. Sibling crate `claspr-async` adds a lazy-combinator (Tier 2) surface on top — chains compose because every `kernels.foo(...)` Op implements `DeviceOperation`.
+1. **Runtime crate (`claspr`)** — generalises the `OclContext` / `DeviceSlice` / `KernelArg` / image-and-ppm helper patterns from [rust-gpu-opencl-samples](https://github.com/bricevideau-ai/rust-gpu-opencl-samples) into a reusable library. Launch surface with two entry points: the lower-level `LaunchOp::new(...)` builder and the proc-macro-emitted `kernels.foo(...)` typed launchers. Host-only, no rust-gpu deps. Every op implements the one `DeviceOp` trait, so the same operation runs standalone (`.wait()`) or composes into a lazy device-operation graph (`.and_then` / `bundle!` / `fan_out`, terminals `.sync(&ctx)` / `.run(&ctx)`). (The shim crate `claspr-async` re-exports `claspr` for legacy `claspr_async::…` paths.)
 2. **Build-script codegen (`claspr-build`)** — turns a host source file into a generated kernel crate + a `Kernels` struct with one field per entry point. Two flavours: `compile()` for the kernel-crate-as-separate-folder workflow, and `compile_from_host()` for the in-host source extraction that single-source mode uses (with multi-file support via `mod foo;` declarations following rustc's standard file-resolution rules).
-3. **Proc-macro frontend (`claspr-macros`)** — `#[claspr::kernel]` emits an `impl Kernels { fn name(...) -> Op<...> }` typed launch method whose signature mirrors the kernel's (each `#[spirv(cross_workgroup)] &mut [T]` becomes a generic `D: KernelSliceArg<T>` slot, builtin-tagged params dropped, image params translated to `Image2D<A, F>`). The emitted Op exposes both Tier 1 terminals (`.wait(&launcher)` / `.submit(&launcher)`) and a `DeviceOperation` impl for Tier 2 chains. `#[claspr::device]` marks individual fns or whole modules; on a module, also injects an `include!()` of the build-script-generated `Kernels` and a `pub fn kernels(&ctx)` convenience wrapper.
+3. **Proc-macro frontend (`claspr-macros`)** — `#[claspr::kernel]` emits an `impl Kernels { fn name(...) -> Op<...> }` typed launch method whose signature mirrors the kernel's (each `#[spirv(cross_workgroup)] &mut [T]` becomes a generic `D: KernelSliceArg<T>` slot, builtin-tagged params dropped, image params translated to `Image2D<A, F>`). The emitted Op implements the one `DeviceOp` trait, so it exposes the standalone terminals (`.wait(&launcher)` / `.submit(&launcher)`) and composes into device-operation graphs alike. `#[claspr::device]` marks individual fns or whole modules; on a module, also injects an `include!()` of the build-script-generated `Kernels` and a `pub fn kernels(&ctx)` convenience wrapper.
 
 ## Limitations
 
@@ -226,6 +226,7 @@ On macOS, the system OpenCL framework is picked up automatically (no `OCL_ICD_VE
 - [rust-gpu](https://github.com/Rust-GPU/rust-gpu) — the SPIR-V codegen backend
 - [krnl](https://github.com/charles-r-earp/krnl) — closest analog: proc-macro single-source for Vulkan compute
 - [cust](https://github.com/Rust-GPU/Rust-CUDA) — typed launch wrappers for CUDA-Rust
+- [cuda-oxide](https://github.com/Aandreba/cuda-oxide) / [Rust-CUDA](https://github.com/Rust-GPU/Rust-CUDA) — claspr's `DeviceOp` trait (an abbreviation of cuda-oxide's `DeviceOperation`) and its `sync` / `wait` / `submit` terminal vocabulary are inspired by their device-operation surface
 - [rust-gpu-opencl-samples](https://github.com/bricevideau-ai/rust-gpu-opencl-samples) — the runtime patterns claspr generalises
 
 ## License
