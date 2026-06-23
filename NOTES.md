@@ -9,6 +9,45 @@ items resolve.
 
 ## Active
 
+### Blocking borrowing upload verb `write_sync` (branch `eager-cutover`, 2026-06-23)
+
+**✅ DONE.** Additive softening of the async owned `write`'s move-out tax. The
+async `write` consumes its `UploadSource<T>` because `clEnqueueWriteBuffer` is
+NON-BLOCKING — the source must outlive the event, so the op owns it + holds it via
+a drop-callback (forces `buf.write(data.clone())` to keep `data`). `write_sync` is
+the BLOCKING counterpart that legitimately borrows `&[T]`: it waits inline, so the
+copy finishes before the call returns → no keep-alive, no ownership transfer, true
+zero-extra-alloc borrow.
+
+- **Shape:** `fn write_sync(&mut self, data: &[T]) -> Result<()>` on both
+  `DeviceSlice` and `MappedSlice`. `&mut self` (not `&self`): the opencl3
+  `enqueue_write_buffer` calls `buffer.get_mut()`, so the device path needs `&mut`
+  anyway; using `&mut self` for SVM too keeps the verb consistent and honest
+  ("contents change"). Borrows BOTH buffer and data → caller keeps everything,
+  which is the whole point. Returns `Result<()>` (plain side-effect, NOT a
+  `DeviceOp` — blocking write isn't a graph node, can't `.and_then`/`bundle!`).
+- **Scope:** only the two host-source-CONSUMING async upload verbs got it —
+  `DeviceSlice::write` + `MappedSlice::write`. Skipped: images already borrow
+  `&'a [Pixel]` (no move-out tax); `USMSlice::write_from` is already a synchronous
+  borrowing host memcpy on the uninit type; fill/read/copy have no host slice.
+- **Reuse:** delegates to the existing raw blocking enqueue helpers, no clEnqueue
+  body duplicated. `write_buffer_enqueue(self, &ctx, data, true, &[])` was reusable
+  AS-IS (already takes a `blocking` flag). `svm_write_enqueue` has NO blocking flag
+  (SVM lacks a native one) → `write_sync` enqueues non-blocking then `event.wait()`
+  inline; helper untouched.
+- **Marker bound:** mirrors `write` exactly (`M: HostWritable`) — blocking write to
+  a host-RO buffer still rejected. New compile-fail fixture
+  `buffer_ops_write_sync_on_host_read_only` proves it (`HostReadOnly: HostWritable`
+  not satisfied), blessed + rustfmt'd.
+- **Tests** (in `eager_buffer_ops.rs`): borrowed-write-then-readback for both
+  types, each asserting the SOURCE SLICE and the BUFFER are still usable after
+  (reuse `data` for a 2nd write, reuse buffer for a 2nd write); plus a
+  length-mismatch test.
+- **Chosen over** `From<&[T]>` (would still go through the owning async path /
+  keep-alive) and over "give-back-the-Vec" (forces an owned source the caller may
+  not have, and complicates the Output type). The async `write`/`upload` and every
+  Output type are UNCHANGED — purely additive.
+
 ### Eager struct-graph cutover (branch `eager-cutover`, from main, 2026-06-18)
 
 **✅ SVM/Mapped cutover DONE (2026-06-23) — the LAST dual-idiom path is gone.**

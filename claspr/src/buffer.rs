@@ -307,6 +307,45 @@ where
     {
         crate::eager::write(self, src)
     }
+
+    /// Blocking, **borrowing** host→device upload — the synchronous
+    /// counterpart to the async owned [`write`](Self::write).
+    ///
+    /// Borrows `data` as `&[T]`, enqueues a `clEnqueueWriteBuffer` with
+    /// `CL_BLOCKING` on the buffer's own context default queue, and waits
+    /// inline: the host copy is complete before the call returns, so the
+    /// source never has to outlive the call. That means **no ownership
+    /// transfer and no keep-alive allocation** — both this buffer and
+    /// `data` stay fully usable afterwards. Use this when you want to keep
+    /// the source (`buf.write_sync(&data)?;` instead of
+    /// `buf.write(data.clone())`).
+    ///
+    /// Tradeoffs vs [`write`](Self::write):
+    /// - **Blocks the calling thread** until the DMA finishes — no overlap
+    ///   with other device work. For pipelined / overlapped uploads (the
+    ///   non-blocking `clEnqueueWriteBuffer` whose source is owned and held
+    ///   alive via a drop-callback), use [`write`](Self::write).
+    /// - **Not a graph node** — it returns a plain `Result<()>`, not a
+    ///   [`DeviceOp`](crate::DeviceOp), so it can't be `.and_then(...)`-ed
+    ///   into a chain or `bundle!`-d. It's a standalone side effect on the
+    ///   buffer.
+    ///
+    /// `data.len()` must equal `self.len()` (returns
+    /// [`Error::LengthMismatch`] otherwise).
+    ///
+    /// **Marker constraint:** `M: HostWritable` — identical to
+    /// [`write`](Self::write). A blocking write to a host-read-only buffer
+    /// (`HostReadOnly`, `Frozen`) or a host-no-access buffer
+    /// (`DeviceScratch`) is rejected at compile time.
+    pub fn write_sync(&mut self, data: &[T]) -> Result<()> {
+        let ctx = self.ctx.clone();
+        // Blocking enqueue (`CL_BLOCKING`): the driver waits internally, so
+        // the borrowed `data` only needs to outlive this call — no keep-alive,
+        // no ownership transfer. Reuses the same raw helper the eager
+        // `WriteDevice::Blocking` terminal uses.
+        write_buffer_enqueue(self, &ctx, data, true, &[])?;
+        Ok(())
+    }
 }
 
 impl<T, M: MemMode + HostWritable + HostReadable> DeviceSlice<T, M> {

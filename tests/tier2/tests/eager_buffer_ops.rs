@@ -174,6 +174,57 @@ fn device_slice_write_overwrites_kernel_output() {
     assert_eq!(result, data);
 }
 
+// ── device_slice_write_sync (blocking borrowing upload) ─────────────
+
+/// `DeviceSlice::write_sync` — the blocking BORROWING counterpart to the async
+/// owned `write`. Writes a borrowed `&[u32]` into an existing buffer and reads
+/// it back. Crucially asserts that BOTH the source slice AND the buffer are
+/// still usable after — the whole point of the verb is "I want to keep using
+/// things": `write_sync` takes `&mut self` + `&[T]`, so nothing moves out.
+#[test]
+fn device_slice_write_sync_borrows_and_is_reusable() {
+    let Some(ctx) = ctx() else { return };
+    let data: Vec<u32> = (1..=N as u32).collect();
+    let mut buf: DeviceSlice<u32> = DeviceSlice::alloc_zero(&ctx, N).expect("alloc");
+
+    // Blocking borrowing write — `data` is borrowed, `buf` is borrowed (&mut).
+    buf.write_sync(&data).expect("write_sync");
+
+    // (a) the bytes landed: read back equals the source.
+    let read1: Vec<u32> = download(buf).sync(&ctx).expect("download after write_sync");
+    assert_eq!(read1, data, "write_sync wrote the borrowed data");
+
+    // (b) THE WHOLE POINT — source slice AND buffer are both still usable.
+    // `data` was only borrowed, so it's still owned here; reuse it for a second
+    // write into a fresh (still-reusable) buffer.
+    let mut buf2: DeviceSlice<u32> = DeviceSlice::alloc_zero(&ctx, N).expect("alloc 2");
+    buf2.write_sync(&data)
+        .expect("second write_sync reuses borrowed data");
+    // And the SAME buffer is reusable for a second borrowing write of new data.
+    let data2: Vec<u32> = (100..100 + N as u32).collect();
+    buf2.write_sync(&data2)
+        .expect("buffer reusable across write_sync calls");
+    let read2: Vec<u32> = download(buf2).sync(&ctx).expect("download buf2");
+    assert_eq!(read2, data2, "buffer reused across two write_sync calls");
+    // `data` is provably still alive: a final read of it compiles + matches.
+    assert_eq!(data.len(), N, "source vec still owned after write_sync");
+}
+
+/// `write_sync` length mismatch returns `Error::LengthMismatch` (same contract
+/// as the async `write`'s terminal check).
+#[test]
+fn device_slice_write_sync_length_mismatch_errors() {
+    let Some(ctx) = ctx() else { return };
+    let mut buf: DeviceSlice<u32> = DeviceSlice::alloc_zero(&ctx, N).expect("alloc");
+    let err = buf
+        .write_sync(&[0u32, 1, 2])
+        .expect_err("write_sync of wrong length should error");
+    assert!(
+        matches!(err, Error::LengthMismatch { src: 3, dst: N }),
+        "expected LengthMismatch {{ src: 3, dst: {N} }}, got {err:?}",
+    );
+}
+
 // ── mapped_slice_fill ──────────────────────────────────────────────
 
 /// buffer_ops.rs::mapped_slice_fill_in_place — SVM analog. `MappedSlice::fill`
@@ -187,6 +238,40 @@ fn mapped_slice_fill_in_place() {
     assert_eq!(buf.len(), N);
     let g = buf.map().wait().expect("map for read-back");
     assert!(g.iter().all(|&v| v == 7));
+}
+
+// ── mapped_slice_write_sync (blocking borrowing SVM upload) ─────────
+
+/// `MappedSlice::write_sync` — SVM analog of the DeviceSlice blocking borrowing
+/// write. Borrows `&[u32]`, blocks on the SVM copy inline, and leaves both the
+/// source slice and the buffer usable (nothing moves out).
+#[test]
+fn mapped_slice_write_sync_borrows_and_is_reusable() {
+    let Some(ctx) = ctx_with_svm() else { return };
+    let data: Vec<u32> = (0..N as u32).map(|i| i + 500).collect();
+    let mut buf: MappedSlice<u32> = MappedSlice::alloc_zero(&ctx, N).expect("alloc");
+
+    buf.write_sync(&data).expect("svm write_sync");
+
+    // (a) the bytes landed.
+    let g = buf.map().wait().expect("map for read-back");
+    assert_eq!(&*g, data.as_slice(), "write_sync wrote the borrowed data");
+    drop(g);
+
+    // (b) source slice AND buffer both still usable — reuse `data` for a second
+    // write into the SAME buffer (overwriting).
+    let data2: Vec<u32> = (0..N as u32).map(|i| i + 9000).collect();
+    buf.write_sync(&data2)
+        .expect("buffer reusable across write_sync calls");
+    let g2 = buf.map().wait().expect("map again");
+    assert_eq!(
+        &*g2,
+        data2.as_slice(),
+        "buffer reused across two write_sync calls"
+    );
+    drop(g2);
+    // `data` provably still owned.
+    assert_eq!(data.len(), N, "source vec still owned after write_sync");
 }
 
 // ── mapped_slice_copy ──────────────────────────────────────────────

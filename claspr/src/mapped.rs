@@ -434,6 +434,53 @@ impl<T, M: MemMode> MappedSlice<T, M> {
     {
         crate::eager::write_mapped(self, src)
     }
+
+    /// Blocking, **borrowing** host→SVM upload — the synchronous
+    /// counterpart to the async owned [`write`](Self::write). SVM analog of
+    /// [`crate::DeviceSlice::write_sync`].
+    ///
+    /// Borrows `data` as `&[T]`, enqueues a `clEnqueueSVMMemcpy` from the
+    /// host source pointer, and waits on the copy event **inline** before
+    /// returning. (SVM has no native `CL_BLOCKING` flag, so this is a
+    /// non-blocking enqueue followed by an immediate `event.wait()` — the
+    /// observable effect is identical: the copy is done when the call
+    /// returns.) Because the wait happens here, the borrowed source only
+    /// needs to live across the call — **no ownership transfer and no
+    /// keep-alive allocation**. Both this buffer and `data` stay usable
+    /// afterwards (`buf.write_sync(&data)?;` instead of
+    /// `buf.write(data.clone())`).
+    ///
+    /// Tradeoffs vs [`write`](Self::write):
+    /// - **Blocks the calling thread** until the SVM copy finishes — no
+    ///   overlap with other device work. For pipelined uploads (the
+    ///   non-blocking enqueue whose owned source is kept alive via a
+    ///   drop-callback), use [`write`](Self::write).
+    /// - **Not a graph node** — returns a plain `Result<()>`, not a
+    ///   [`DeviceOp`](crate::DeviceOp), so it can't be `.and_then(...)`-ed
+    ///   or `bundle!`-d.
+    ///
+    /// `data.len()` must equal `self.len()` (returns
+    /// [`Error::LengthMismatch`] otherwise). The copy event is
+    /// auto-registered on the buffer's last-use list (inside the raw
+    /// helper) so Drop's `clEnqueueSVMFree` queue-orders after it.
+    ///
+    /// **Marker constraint:** `M: HostWritable` — identical to
+    /// [`write`](Self::write). Excludes [`crate::HostReadOnly`] and
+    /// [`crate::Frozen`].
+    pub fn write_sync(&mut self, data: &[T]) -> Result<()>
+    where
+        M: HostWritable,
+    {
+        let ctx = self.ctx.clone();
+        // Non-blocking SVM enqueue + inline wait: `svm_write_enqueue` has no
+        // blocking flag (SVM lacks a native one), so we wait on the returned
+        // event here. The borrowed `data` lives across the wait, so — like the
+        // DeviceSlice blocking write — no keep-alive / ownership transfer is
+        // needed. Reuses the same raw helper the eager `WriteMapped` op uses.
+        let event = svm_write_enqueue(self, &ctx, data, &[])?;
+        event.wait().map_err(Error::OpenCl)?;
+        Ok(())
+    }
 }
 
 /// Metadata-only `Debug` — does not read through the SVM pointer
