@@ -687,6 +687,44 @@ extensions.
 
 ## Concerns
 
+### ✅ RESOLVED 2026-06-23 — Context/default-queue Arc reference CYCLE (cl_context + default queues never released)
+
+Was: a strong Arc cycle `Context(Arc<ContextInner>)` → `ContextInner.queues`
+(default `Queue<InOrder>` built at construction) → `QueueInner.ctx: Context`
+(strong) closed the moment any Context was built, so strong count never hit 0 and
+`ContextInner::drop` / `clReleaseContext` / default-queue release NEVER ran.
+cliloader --leak-checking BEFORE: **cl_context Alloc:16 Release:0**;
+**cl_command_queue Alloc:31 Release:5** (only user `Queue::new` drops). Pre-existing,
+identical on `main` — not the eager cutover.
+
+FIX (landed on `eager-cutover`, "trimmed Option B" applied to BOTH default queue
+orderings): `ContextInner` now stores its DEFAULT queues as RAW
+`ManuallyDrop<CommandQueue>` handles — NO `Queue` wrapper, NO `ctx` back-edge, so
+the cycle is structurally impossible. New `impl Drop for ContextInner` releases
+each populated raw default-queue handle BEFORE `cl_context` drops (field order:
+`cl_context` declared LAST + explicit release in the Drop body), bumping
+`error_state` on release Err (resurrects the previously-dead record-err path).
+`default_inorder_queue` now returns an OWNED `Queue<InOrder>` and
+`default_outoforder_queue` an `Arc<Queue<OutOfOrder>>`, each an on-demand wrapper
+over the cached raw handle with a strong `ctx` (like a user queue) balanced by
+`clRetainCommandQueue` on wrap / `clReleaseCommandQueue` on the wrapper's drop —
+no double-release, no leak. OOO de-cycle was CLEAN: caching only the raw handle
+(not a strong-ctx `Arc<Queue>`) satisfies the stability contract (same
+`cl_command_queue` across calls) without reintroducing the cycle; the
+context_builder stability/identity tests were updated from Arc/ptr identity to
+`.raw().get()` cl_command_queue-handle equality. USER queues
+(`Queue::new`/`on_device`) KEEP their strong `ctx` (they must outlive the caller's
+Context handle). `Launcher::cl_queue(&Context) -> &CommandQueue` stays infallible
+(derefs the raw `ManuallyDrop` slot).
+
+cliloader --leak-checking AFTER (`eager_buffer_ops`, 16 tests, legacy NEO):
+**No cl_context leaks detected. No cl_command_queue leaks detected.** (cl_mem /
+program / kernel / event / SVM also clean). Two pure-Rust leak-regression tests
+pin both directions: `tests/tier1/tests/context_drop.rs` —
+`default_queues_do_not_pin_context` (touch both default paths, drop, Context's
+`__test_weak` upgrades to dead) and `user_queue_outlives_its_context` (user queue
+keeps ctx alive, `finish()` works, ctx released only after the queue drops).
+
 ### Image format dispatch in the proc-macro
 
 Pre-existing item from REVIEW.md 2026-05-28. The proc-macro emits
@@ -717,6 +755,7 @@ host dep). Documented as a gotcha in `CLAUDE.md`.
 
 | Commit | What |
 |---|---|
+| `eager-cutover` | Fix Context/default-queue Arc reference cycle: ContextInner stores defaults as raw `ManuallyDrop<CommandQueue>` + `impl Drop` releases them before cl_context; user queues keep strong ctx. cliloader: cl_context/cl_command_queue leaks gone. +2 leak-regression tests. (see Concerns → RESOLVED) |
 | `2ba935a` | Ops carry ctx → no-arg `.wait()` / `.submit()` shortcut + rename to `.wait_on(&L)` / `.submit_on(&L)` for cross-queue case. 192 call sites migrated. |
 | `311db59` | Tier 1 `DeviceSlice::map` + non-blocking `.submit()` terminal on both DeviceSlice + MappedSlice map ops; closes latent cross-queue SVM Drop race. |
 | `a9d825a` | README "Other modes" section — pre-compiled + external SPIR-V via `claspr::kernels!`. |

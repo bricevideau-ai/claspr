@@ -191,6 +191,61 @@ impl<O: QueueOrder> Queue<O> {
         })
     }
 
+    /// Create a *bare* [`CommandQueue`] on `device` — no `Queue`
+    /// wrapper, no `ctx` back-edge, refcount 1 owned by the caller.
+    ///
+    /// Used by [`Context`] to seed its de-cycled default-queue slots:
+    /// the returned `CommandQueue` is stored raw (in `ManuallyDrop`)
+    /// and released by `ContextInner::drop`. Building it here (rather
+    /// than via `on_device` + unwrap) means no transient `QueueInner`
+    /// ever holds a strong `ctx` for a default queue, so no Arc cycle
+    /// can form even momentarily.
+    pub(crate) fn create_raw_default(
+        ctx: &Context,
+        device: &crate::Device,
+    ) -> Result<CommandQueue> {
+        let props = Self::effective_properties(ctx);
+        // SAFETY: `device` must belong to `ctx`. The default-queue
+        // accessors validate this via `device_index` before calling.
+        let cl_queue = unsafe {
+            CommandQueue::create_with_properties(ctx.raw_context(), device.raw_id(), props, 0)?
+        };
+        Ok(cl_queue)
+    }
+
+    /// Wrap a *raw* `cl_command_queue` that the [`Context`] owns as
+    /// one of its de-cycled default queues, handing back an owned
+    /// [`Queue<O>`] with a STRONG `ctx`.
+    ///
+    /// `ContextInner` stores its default queues as raw handles with
+    /// NO `Queue`/`ctx` back-edge (that back-edge was the Arc cycle
+    /// that leaked every `cl_context`). The default-queue accessors
+    /// build an on-demand wrapper through here so callers still get a
+    /// real `Queue<O>`. To keep refcounts balanced we `clRetainCommandQueue`
+    /// on wrap: the `ContextInner` slot owns one ref (released in
+    /// `ContextInner::drop`) and this wrapper's [`QueueInner::drop`]
+    /// releases the ref we retain here — no double-release, no leak.
+    ///
+    /// No cycle is reintroduced: the strong `ctx` lives in a wrapper
+    /// handed OUT to the caller (exactly like a user queue from
+    /// [`Queue::new`]); `ContextInner` itself holds no strong-`ctx`
+    /// `Queue`.
+    pub(crate) fn wrap_default(ctx: &Context, raw: &CommandQueue) -> Result<Self> {
+        let handle = raw.get();
+        // Retain: balances the release this wrapper's QueueInner::drop
+        // will perform, leaving the Context's own ref intact.
+        unsafe { opencl3::command_queue::retain_command_queue(handle) }
+            .map_err(|code| crate::Error::OpenCl(opencl3::error_codes::ClError(code)))?;
+        let wrapped = CommandQueue::new(handle, raw.max_work_item_dimensions());
+        Ok(Queue {
+            inner: Arc::new(QueueInner {
+                cl_queue: std::mem::ManuallyDrop::new(wrapped),
+                ctx: ctx.clone(),
+            }),
+            _order: PhantomData,
+        })
+    }
+
     /// Block until every previously submitted command on this queue
     /// has finished. Equivalent to `clFinish`.
     pub fn finish(&self) -> Result<()> {

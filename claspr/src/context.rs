@@ -27,6 +27,7 @@ use opencl3::device::{
 };
 use opencl3::kernel::Kernel;
 use opencl3::program::Program;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -44,7 +45,16 @@ pub struct Context {
 }
 
 struct ContextInner {
-    cl_context: opencl3::context::Context,
+    // FIELD DROP ORDER MATTERS. Rust drops struct fields in
+    // declaration order, so everything that releases an OpenCL object
+    // living *inside* `cl_context` (the default command queues in
+    // `queues`, the `fill_program`) MUST be declared BEFORE
+    // `cl_context` — its `Drop` calls `clReleaseContext`, after which
+    // releasing a queue against the freed context is undefined. The
+    // explicit `impl Drop for ContextInner` below runs first (whole-
+    // struct drop glue), releasing the default queue handles before
+    // any field's own `Drop` fires; the declaration order is the
+    // belt-and-suspenders backstop.
     /// All devices the context spans. `devices[0]` is the default
     /// (returned by `device()`); multi-device contexts add more.
     devices: Vec<Device>,
@@ -52,11 +62,15 @@ struct ContextInner {
     /// defaults below and any `Queue::new` / `Queue::on_device` the
     /// user constructs later — enable `CL_QUEUE_PROFILING_ENABLE`.
     profiling: bool,
-    /// Per-device default queue pair. `queues[i]` corresponds to
+    /// Per-device default queue pair, stored as RAW opencl3 queue
+    /// handles (no `Queue`/`QueueInner` wrapper, hence no `ctx`
+    /// back-edge — that back-edge was the Arc reference cycle that
+    /// leaked every `cl_context`). `queues[i]` corresponds to
     /// `devices[i]`. Lazily populated on first lookup except
     /// `queues[0].in_order` which is created at build time so the
     /// `Launcher::cl_queue` implementation for `&Context` can return
-    /// a `&CommandQueue` infallibly.
+    /// a `&CommandQueue` infallibly. Released in `impl Drop for
+    /// ContextInner`.
     queues: Vec<DeviceQueues>,
     /// Sticky-error counter. `Drop` impls that discover an OpenCL
     /// release failure can't propagate it; they bump this instead so
@@ -68,6 +82,10 @@ struct ContextInner {
     /// `None` until first device-fill — most contexts that only ever
     /// fill HostWritable buffers (runtime path) never build this.
     fill_program: OnceLock<Program>,
+    /// The OpenCL context. Declared LAST so it drops (and releases)
+    /// after the queues above — see the field-order note at the top
+    /// of this struct.
+    cl_context: opencl3::context::Context,
 }
 
 /// Lazy queue pair for one device in a [`Context`].
@@ -93,8 +111,15 @@ struct ContextInner {
 /// `DeviceOperation::run` — both grab an `Arc<Queue>` once and pass
 /// the raw `cl_command_queue` through to every enqueue call.
 struct DeviceQueues {
-    in_order: OnceLock<Queue<InOrder>>,
-    out_of_order: Mutex<Option<Arc<Queue<OutOfOrder>>>>,
+    /// Raw in-order default queue handle. `ManuallyDrop` so opencl3's
+    /// panicking `CommandQueue::drop` never fires — `ContextInner::drop`
+    /// releases it explicitly and records into the sticky-error counter
+    /// on failure. No `Queue`/`ctx` wrapper lives here, so no Arc cycle.
+    in_order: OnceLock<ManuallyDrop<CommandQueue>>,
+    /// Raw out-of-order default queue handle, same storage discipline.
+    /// `Mutex<Option<_>>` so it can be invalidated and rebuilt after a
+    /// terminated command renders the queue unusable (see struct docs).
+    out_of_order: Mutex<Option<ManuallyDrop<CommandQueue>>>,
 }
 
 impl DeviceQueues {
@@ -129,6 +154,47 @@ where
 // (CL §3.4.1).
 unsafe impl Send for ContextInner {}
 unsafe impl Sync for ContextInner {}
+
+impl Drop for ContextInner {
+    fn drop(&mut self) {
+        // Release every populated default-queue handle BEFORE
+        // `cl_context`'s own `Drop` runs `clReleaseContext`. This whole
+        // `drop` body executes ahead of any field's drop glue, so the
+        // context is still live here. Each handle was created (in_order
+        // / out_of_order build) with refcount 1 for this slot; any
+        // on-demand `Queue` wrapper handed to a caller added its own
+        // retained ref that its `QueueInner::drop` balances separately.
+        // `ManuallyDrop` means opencl3's panicking `CommandQueue::drop`
+        // never fires — we release exactly once per slot and bump the
+        // sticky-error counter on failure (the previously-dead
+        // record-err path for default queues, now reachable).
+        for slot in &self.queues {
+            if let Some(q) = slot.in_order.get() {
+                // SAFETY: `q` holds the cl_command_queue created for
+                // this slot (or wrapped via `wrap_default`, which
+                // retained); release exactly once.
+                let res = unsafe { opencl3::command_queue::release_command_queue(q.get()) };
+                if res.is_err() {
+                    self.error_state.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            // The mutex is poisoned only if a panic struck mid-lock;
+            // recover the inner value either way so teardown still
+            // releases the handle.
+            let guard = match slot.out_of_order.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(q) = guard.as_ref() {
+                // SAFETY: as above.
+                let res = unsafe { opencl3::command_queue::release_command_queue(q.get()) };
+                if res.is_err() {
+                    self.error_state.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
 
 impl Context {
     // ── Builder + canned constructors ──────────────────────────────
@@ -186,16 +252,41 @@ impl Context {
     // ── Default queues ─────────────────────────────────────────────
 
     /// Per-device default in-order queue (the Tier 1 default).
-    /// Lazily created on first lookup; stable reference thereafter.
+    /// Lazily created on first lookup; the underlying
+    /// `cl_command_queue` is stable thereafter (same raw handle on
+    /// every call, verifiable via [`Queue::raw`]).
+    ///
+    /// Returns an OWNED `Queue<InOrder>` (not a borrow) because the
+    /// context stores its defaults as raw handles with no `Queue`
+    /// wrapper to lend out — lending one with a strong `ctx` back to
+    /// the context is exactly the Arc cycle this de-cycle removes. The
+    /// owned wrapper carries a strong `ctx` (like a user queue) and is
+    /// balanced by `clRetainCommandQueue`/`clReleaseCommandQueue`, so
+    /// it neither double-releases nor leaks the shared handle.
     ///
     /// `device` must be one of the devices the context was built
     /// with — otherwise returns [`Error::InvalidArgument`]. Honors
     /// the [`profiling`](Self::profiling) setting from the builder.
-    pub fn default_inorder_queue(&self, device: &Device) -> Result<&Queue<InOrder>> {
+    pub fn default_inorder_queue(&self, device: &Device) -> Result<Queue<InOrder>> {
+        let raw = self.raw_inorder_queue(device)?;
+        Queue::<InOrder>::wrap_default(self, raw)
+    }
+
+    /// Lazily create + cache the raw in-order default queue for
+    /// `device` and borrow the cached handle. Infallible-shaped at the
+    /// `Launcher` layer (see [`Self::raw_default_queue`]); fallible
+    /// here only because a foreign device or queue creation can fail.
+    fn raw_inorder_queue(&self, device: &Device) -> Result<&CommandQueue> {
         let idx = self.device_index(device)?;
-        once_lock_get_or_try_init(&self.inner.queues[idx].in_order, || {
-            Queue::<InOrder>::on_device(self, device)
-        })
+        let cell = &self.inner.queues[idx].in_order;
+        let mdq = once_lock_get_or_try_init(cell, || {
+            // Create a bare raw queue (refcount 1) and move that single
+            // ref into the OnceLock slot, released by ContextInner::drop.
+            Ok::<_, Error>(ManuallyDrop::new(Queue::<InOrder>::create_raw_default(
+                self, device,
+            )?))
+        })?;
+        Ok(mdq)
     }
 
     /// Per-device default out-of-order queue (the Tier 2 default).
@@ -219,12 +310,20 @@ impl Context {
             .out_of_order
             .lock()
             .expect("DeviceQueues out_of_order mutex poisoned");
-        if let Some(q) = slot.as_ref() {
-            return Ok(Arc::clone(q));
+        // The CACHE is the raw handle (no strong-`ctx` wrapper — caching
+        // a wrapper here would reintroduce the Arc cycle). Each call
+        // builds a fresh on-demand `Arc<Queue>` over the SAME cached raw
+        // handle; "stability" means the same `cl_command_queue`, which
+        // this guarantees (verify via `.raw()`), not the same Arc.
+        if slot.is_none() {
+            let raw = Queue::<OutOfOrder>::create_raw_default(self, device)?;
+            *slot = Some(ManuallyDrop::new(raw));
         }
-        let q = Arc::new(Queue::<OutOfOrder>::on_device(self, device)?);
-        *slot = Some(Arc::clone(&q));
-        Ok(q)
+        let raw = slot.as_ref().expect("just populated");
+        // `wrap_default` retains the handle; the returned Arc's
+        // QueueInner::drop releases that retained ref, leaving the
+        // context's cached ref intact.
+        Ok(Arc::new(Queue::<OutOfOrder>::wrap_default(self, raw)?))
     }
 
     /// Drop the cached default out-of-order queue for `device`, if
@@ -255,7 +354,17 @@ impl Context {
             .out_of_order
             .lock()
             .expect("DeviceQueues out_of_order mutex poisoned");
-        *slot = None;
+        // The cached handle is `ManuallyDrop`, so dropping the Option
+        // alone would leak it — release this slot's ref explicitly. Any
+        // outstanding on-demand `Arc<Queue>` wrapper still holds its own
+        // retained ref and stays valid until it drops.
+        if let Some(raw) = slot.take() {
+            // SAFETY: this slot owned exactly one ref to the handle.
+            let res = unsafe { opencl3::command_queue::release_command_queue(raw.get()) };
+            if res.is_err() {
+                self.record_err();
+            }
+        }
     }
 
     /// Flush every per-device out-of-order queue this context has
@@ -283,7 +392,7 @@ impl Context {
                 .lock()
                 .expect("DeviceQueues out_of_order mutex poisoned");
             if let Some(q) = guard.as_ref() {
-                q.raw().flush()?;
+                q.flush()?;
             }
         }
         Ok(())
@@ -309,7 +418,7 @@ impl Context {
                 .lock()
                 .expect("DeviceQueues out_of_order mutex poisoned");
             if let Some(q) = guard.as_ref() {
-                q.raw().finish()?;
+                q.finish()?;
             }
         }
         Ok(())
@@ -349,12 +458,13 @@ impl Context {
     /// Always succeeds — created eagerly at build time.
     pub fn raw_default_queue(&self) -> &CommandQueue {
         // `queues[0].in_order` is populated at build time; unwrap is
-        // safe. See `ContextBuilder::build`.
+        // safe. See `ContextBuilder::build`. The slot stores a raw
+        // `ManuallyDrop<CommandQueue>` which deref-coerces to
+        // `&CommandQueue` at the return type.
         self.inner.queues[0]
             .in_order
             .get()
             .expect("devices[0] default in-order queue is populated at build time")
-            .raw()
     }
 
     /// Borrow the lazily-built fill `Program` for the device-kernel
@@ -400,6 +510,45 @@ impl Context {
     /// teardown — fault accumulator pattern from cuda-oxide.
     pub fn error_count(&self) -> u32 {
         self.inner.error_state.load(Ordering::Relaxed)
+    }
+
+    /// Strong reference count of this `Context`'s internal
+    /// `Arc<ContextInner>`, for leak-regression tests. After dropping
+    /// every strong `Context` (and every `Queue` that strong-holds
+    /// one), this — observed on a surviving clone before the final
+    /// drop — together with the [`error_count`](Self::error_count)
+    /// staying zero, proves no Arc cycle pins `ContextInner` alive.
+    ///
+    /// `#[doc(hidden)]` test affordance: exposed publicly only because
+    /// the leak tests live in external integration-test crates that
+    /// cannot reach `pub(crate)` internals. Not part of the stable API.
+    #[doc(hidden)]
+    pub fn __test_strong_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
+    /// Downgrade this `Context`'s internal `Arc<ContextInner>` to an
+    /// opaque weak handle whose liveness the leak tests probe via
+    /// [`__test_weak_is_dead`](Self::__test_weak_is_dead). After every
+    /// strong owner drops, the handle must read dead — proving
+    /// `ContextInner::drop` ran (cl_context + default queues released,
+    /// no Arc cycle).
+    ///
+    /// `#[doc(hidden)]` test affordance (see `__test_strong_count`).
+    /// Returns a type-erased `Box` so `ContextInner` stays private.
+    #[doc(hidden)]
+    pub fn __test_weak(&self) -> Box<dyn std::any::Any + Send + Sync> {
+        Box::new(Arc::downgrade(&self.inner))
+    }
+
+    /// `true` if the weak handle from [`__test_weak`](Self::__test_weak)
+    /// can no longer upgrade — i.e. its `ContextInner` has been dropped.
+    #[doc(hidden)]
+    pub fn __test_weak_is_dead(weak: &(dyn std::any::Any + Send + Sync)) -> bool {
+        weak.downcast_ref::<std::sync::Weak<ContextInner>>()
+            .expect("__test_weak_is_dead given a non-__test_weak handle")
+            .upgrade()
+            .is_none()
     }
 
     /// Bump the sticky-error counter. Called from `Drop` impls in
@@ -518,13 +667,12 @@ impl ContextBuilder {
                 fill_program: OnceLock::new(),
             }),
         };
-        // Eagerly populate the in-order queue for devices[0] so
-        // `Launcher::cl_queue(&ctx)` never has to fail. The lazy
-        // initialiser inside `default_inorder_queue` is the same
-        // path; calling it once now stores the queue into the
-        // OnceLock.
+        // Eagerly populate the raw in-order queue for devices[0] so
+        // `Launcher::cl_queue(&ctx)` never has to fail. `raw_inorder_queue`
+        // is the lazy initialiser; calling it once now stores the raw
+        // handle into the OnceLock (no `Queue` wrapper, no cycle).
         let dev0 = ctx.inner.devices[0].clone();
-        ctx.default_inorder_queue(&dev0)?;
+        ctx.raw_inorder_queue(&dev0)?;
         Ok(ctx)
     }
 }

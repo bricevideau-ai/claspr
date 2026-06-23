@@ -72,15 +72,19 @@ fn profiling_round_trips_through_default_queues() -> TestResult {
 }
 
 #[test]
-fn default_inorder_queue_returns_stable_reference() -> TestResult {
+fn default_inorder_queue_returns_stable_handle() -> TestResult {
     let Ok(dev) = Device::any() else {
         eprintln!("SKIP: no OpenCL device");
         return Ok(());
     };
     let ctx = Context::builder().device(&dev).build()?;
-    let a = ctx.default_inorder_queue(&dev)? as *const _;
-    let b = ctx.default_inorder_queue(&dev)? as *const _;
-    let c = ctx.default_inorder_queue(&dev)? as *const _;
+    // `default_inorder_queue` now returns an OWNED `Queue` (the context
+    // stores its defaults as raw handles to avoid the Arc cycle), so the
+    // stability contract is on the underlying `cl_command_queue` handle,
+    // not on a `&Queue` address.
+    let a = ctx.default_inorder_queue(&dev)?.raw().get();
+    let b = ctx.default_inorder_queue(&dev)?.raw().get();
+    let c = ctx.default_inorder_queue(&dev)?.raw().get();
     assert_eq!(a, b);
     assert_eq!(b, c);
     Ok(())
@@ -93,10 +97,13 @@ fn default_outoforder_queue_is_lazy_and_stable() -> TestResult {
         return Ok(());
     };
     let ctx = Context::builder().device(&dev).build()?;
-    // First call creates; subsequent calls return Arc clones of the
-    // same underlying Queue (until an invalidate is triggered).
-    let a = std::sync::Arc::as_ptr(&ctx.default_outoforder_queue(&dev)?);
-    let b = std::sync::Arc::as_ptr(&ctx.default_outoforder_queue(&dev)?);
+    // First call creates + caches the raw handle; subsequent calls
+    // wrap the SAME cached `cl_command_queue` in a fresh `Arc<Queue>`.
+    // Stability is on the raw handle (the cache), not the Arc identity
+    // (the wrappers are intentionally fresh to keep the strong-`ctx`
+    // back-edge out of the context — that back-edge was the leak).
+    let a = ctx.default_outoforder_queue(&dev)?.raw().get();
+    let b = ctx.default_outoforder_queue(&dev)?.raw().get();
     assert_eq!(a, b);
     Ok(())
 }
@@ -108,15 +115,18 @@ fn default_outoforder_queue_rebuilds_after_invalidate() -> TestResult {
         return Ok(());
     };
     let ctx = Context::builder().device(&dev).build()?;
-    // Hold a clone of the first Arc so the underlying Queue can't be
-    // freed by the invalidate (which would let the allocator reuse
-    // the address and obscure the test).
+    // Hold the first wrapper so its retained ref keeps the underlying
+    // cl_command_queue alive across the invalidate — otherwise the
+    // driver could recycle the freed handle value and obscure the test.
     let first = ctx.default_outoforder_queue(&dev)?;
-    let a = std::sync::Arc::as_ptr(&first);
+    let a = first.raw().get();
     ctx.invalidate_default_outoforder_queue(&dev);
     let second = ctx.default_outoforder_queue(&dev)?;
-    let b = std::sync::Arc::as_ptr(&second);
-    assert_ne!(a, b, "invalidate should force a fresh Queue allocation");
+    let b = second.raw().get();
+    assert_ne!(
+        a, b,
+        "invalidate should force a fresh cl_command_queue on next build"
+    );
     Ok(())
 }
 
@@ -165,8 +175,8 @@ fn multi_device_each_gets_its_own_queue() -> TestResult {
 
     let ctx = Context::builder().devices(&same_plat[..2]).build()?;
     assert_eq!(ctx.devices().len(), 2);
-    let q0 = ctx.default_inorder_queue(&same_plat[0])? as *const _;
-    let q1 = ctx.default_inorder_queue(&same_plat[1])? as *const _;
+    let q0 = ctx.default_inorder_queue(&same_plat[0])?.raw().get();
+    let q1 = ctx.default_inorder_queue(&same_plat[1])?.raw().get();
     assert_ne!(q0, q1, "per-device queues must be distinct");
     Ok(())
 }
@@ -181,8 +191,8 @@ fn launcher_routes_to_devices_zero_default_queue() -> TestResult {
     use claspr::Launcher;
     // The default in-order queue for devices[0] is eagerly populated
     // at build time and is what `Launcher::cl_queue(&ctx)` returns.
-    let via_launcher = ctx.cl_queue() as *const _;
-    let via_default = ctx.default_inorder_queue(&dev)?.raw() as *const _;
+    let via_launcher = ctx.cl_queue().get();
+    let via_default = ctx.default_inorder_queue(&dev)?.raw().get();
     assert_eq!(via_launcher, via_default);
     Ok(())
 }
