@@ -1,4 +1,4 @@
-//! claspr-async: N independent batches in parallel via `fan_out`,
+//! claspr Tier 2: N independent batches in parallel via `fan_out`,
 //! each consuming the same shared weight tensor — uploaded **once**
 //! to the device and shared across all branches via
 //! `Arc<DeviceSlice<u32>>`.

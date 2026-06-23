@@ -1,4 +1,4 @@
-//! claspr-async: multi-stage forward pass.
+//! claspr Tier 2: multi-stage forward pass.
 //!
 //! Demonstrates the Tier 2 chain shape on a small ML-style pipeline:
 //!

@@ -1,7 +1,7 @@
-//! Cutover step 1a: the eager struct-graph core ported into claspr-async,
+//! Cutover step 1a: the eager struct-graph core (now in `claspr`),
 //! exercised through the REAL runtime (non-kernel leaves: alloc + fill).
 //! Proves the closure-free model + event-threaded pipes work on the actual
-//! claspr-async `ExecutionContext`/queue before the macro change (step 1b).
+//! claspr `ExecutionContext`/queue before the macro change (step 1b).
 
 use claspr::Context;
 use claspr::eager::{

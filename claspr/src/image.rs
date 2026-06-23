@@ -953,7 +953,7 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> ImageFill<I, T> {
 //
 // Abstracts the per-image-type alloc / pixel-count / write / read
 // surface so a single pair of Tier 2 combinators (`image_upload` /
-// `image_download` in `claspr-async`) can handle every image type.
+// `image_download`) can handle every image type.
 // Each image type implements this with its own `Dims` shape: 1D
 // gets `u32`, 2D gets `(u32, u32)`, 3D gets `(u32, u32, u32)`, etc.
 //

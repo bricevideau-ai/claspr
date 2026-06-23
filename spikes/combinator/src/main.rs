@@ -1,12 +1,15 @@
-//! Combinator-API spike — **now rebased onto real claspr + claspr-async**.
+//! Combinator-API spike — **historical / stale.**
 //!
 //! Originally (2026-05-12) this was a 1300-line single-file prototype
 //! that faked every Tier 2 primitive (`DeviceOperation`, `AndThen`,
 //! `Bundle`, `FanOut`, `DynOp`, `HostAccessible`, ...) to validate
 //! the type structure before any of it shipped. The design those 16
-//! scenarios validated is now in the real `claspr` + `claspr-async`
-//! crates; this file is the same 16 scenarios re-expressed against
-//! the production API, running on actual OpenCL.
+//! scenarios validated has since shipped in `claspr`, but under the
+//! reunified `DeviceOp` / `DeviceOpExt` / `DeviceDynOp` names — the
+//! old closure-layer names this spike imports (`DeviceOperation`,
+//! `transfer_to_device`, `DynOp`, ...) no longer exist. This spike is
+//! reference-only and not part of the build; it does not compile
+//! against the current API and is kept only as a design record.
 //!
 //! It's a reference / regression program — `cargo run` from
 //! `spikes/combinator/` exercises every combinator shape end-to-end.
@@ -37,7 +40,11 @@
 //! API equivalent and notes the gap in a comment.
 
 use claspr::{Context, Device, DeviceSlice};
-use claspr_async::{
+// NOTE: stale imports — these closure-layer names were removed when the
+// Tier 2 layer was reunified into `claspr` under `DeviceOp` / `DeviceOpExt`
+// / `DeviceDynOp`. Kept verbatim as a design record; this spike no longer
+// compiles (see the module doc above).
+use claspr::{
     DeviceOperation, DeviceOperationHostExt, DeviceOperationProfileExt, DynOp, bundle,
     device_slice, device_slice_alloc_zero, download, fan_out, transfer_to_device, upload, value,
 };

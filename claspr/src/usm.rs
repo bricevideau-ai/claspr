@@ -278,7 +278,7 @@ impl<T: Copy, M: MemMode> USMSliceUninit<T, M> {
     /// is host memory, no OpenCL enqueue needed. Synchronous.
     ///
     /// Used by the Tier 2 [`crate::USMSlice`]-aware `.fill()` trait
-    /// method (in `claspr-async`) to implement the compositional
+    /// method to implement the compositional
     /// `alloc_uninit + fill` pattern uniformly across buffer kinds.
     pub fn fill_into(self, value: T) -> USMSlice<T, M> {
         let mut data = self.data;

@@ -301,13 +301,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "claspr-async"
-version = "0.0.0"
-dependencies = [
- "claspr",
-]
-
-[[package]]
 name = "claspr-build"
 version = "0.0.0"
 dependencies = [

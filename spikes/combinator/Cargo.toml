@@ -12,7 +12,6 @@ edition = "2024"
 # always exercises the latest API. Originally the spike faked the
 # whole Tier 2 framework in-tree; now it consumes the real one.
 claspr = { path = "../../claspr" }
-claspr-async = { path = "../../claspr-async" }
 pollster = "0.4"
 
 [build-dependencies]

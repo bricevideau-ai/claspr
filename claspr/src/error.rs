@@ -47,7 +47,7 @@ pub enum Error {
     /// description — the offending value is the caller's, not part
     /// of the error.
     InvalidArgument(&'static str),
-    /// A host closure inside `claspr_async::and_then_host` panicked.
+    /// A host closure inside `DeviceOpExt::and_then_host` panicked.
     /// The string is the panic payload extracted via `catch_unwind`
     /// then downcast to `&str` / `String`. The backtrace is lost, as
     /// is usual when a panic crosses a `catch_unwind` boundary.

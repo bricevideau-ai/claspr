@@ -201,8 +201,8 @@ impl<
 }
 
 // `Arc<DeviceSlice<T, M>>` — share one cl_mem across N parallel chain
-// branches without re-uploading. Pair with [`claspr_async::Arced`]
-// (built by `.arc()` on a `DeviceOperation` whose Output is
+// branches without re-uploading. Pair with [`crate::Arced`]
+// (built by `.arc()` on a `DeviceOp` whose Output is
 // `DeviceSlice<T, M>`): the chain produces `Arc<DeviceSlice<T, M>>`,
 // each branch gets an `Arc::clone`, the kernel launcher accepts the
 // Arc directly as a **read** kernel-arg slot, the underlying

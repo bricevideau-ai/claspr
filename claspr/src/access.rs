@@ -89,7 +89,7 @@
 //!
 //! ```compile_fail
 //! use claspr::{Context, DeviceSlice, Frozen};
-//! use claspr_async::HostWritableExt;
+//! use claspr::HostWritableExt;
 //! let ctx = Context::any().unwrap();
 //! let frozen: DeviceSlice<u32, Frozen> =
 //!     DeviceSlice::from_slice(&ctx, &[0u32; 16]).unwrap();
@@ -101,7 +101,7 @@
 //!
 //! ```ignore
 //! use claspr::{Context, DeviceSlice, Frozen};
-//! use claspr_async::HostReadableExt;
+//! use claspr::HostReadableExt;
 //! let ctx = Context::any()?;
 //! let frozen: DeviceSlice<u32, Frozen> =
 //!     DeviceSlice::from_slice(&ctx, &[0u32; 16])?;
@@ -262,7 +262,7 @@ impl HostReadable for Frozen {}
 // ── Bridge traits (deferral-safe aliases for Tier 1/Tier 2 bounds) ──
 //
 // `RuntimeFillable` / `HostUploadable` are super-traits that both
-// Tier 1 ops and Tier 2 ops (in `claspr-async`) reference in their
+// Tier 1 ops and Tier 2 (eager-graph) ops reference in their
 // `where` clauses. The blanket impls today alias to `HostWritable`;
 // future bound changes are one-line edits to the impl, propagating
 // to both tiers without two-place coordination.

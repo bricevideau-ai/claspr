@@ -1,13 +1,11 @@
-//! Small unsafe-FFI primitives shared across the crate (and used by
-//! `claspr-async`). Keeping them here lets the unsafe surface
-//! contract to a few well-documented helpers instead of being
-//! sprinkled across every `*BufferHostView` / `Shared*Guard` /
-//! `*MapHandle` Drop impl.
+//! Small unsafe-FFI primitives shared across the crate. Keeping them
+//! here lets the unsafe surface contract to a few well-documented
+//! helpers instead of being sprinkled across every `*BufferHostView`
+//! / `Shared*Guard` / `*MapHandle` Drop impl.
 //!
-//! Exposed `pub` (not `pub(crate)`) so `claspr-async` can use them
-//! across the crate boundary; tagged `#[doc(hidden)]` so they don't
-//! show up in the public docs — they're implementation details, not
-//! user-facing surface.
+//! Exposed `pub` (not `pub(crate)`) and tagged `#[doc(hidden)]` so
+//! they don't show up in the public docs — they're implementation
+//! details, not user-facing surface.
 
 use crate::error::{Error, Result};
 use opencl3::command_queue::{CommandQueue, release_command_queue, retain_command_queue};

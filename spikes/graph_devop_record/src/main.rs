@@ -40,7 +40,7 @@
 //! ## Carry-forward
 //!
 //! The traits + combinator-propagation pattern here is what real
-//! claspr's `claspr-async` crate would adopt. The user-facing
+//! claspr's Tier 2 (`DeviceOp`) layer would adopt. The user-facing
 //! surface on top (`.call()` / `.mutate_call()`, opt-ins, cache
 //! protocol) is a separate piece of work — see `NOTES.md`
 //! → "Command-buffer-backed graphs" for the agreed design and the

@@ -83,7 +83,7 @@ struct ContextInner {
 /// calls that use this context (and command-queues associated with
 /// this context) are now considered to be implementation-defined."
 /// We hit this path whenever a host closure errors and
-/// `claspr_async::AndThenHost` signals the user event with a
+/// [`AndThenHost`](crate::AndThenHost) signals the user event with a
 /// negative status. Some drivers (e.g. rusticl) make the queue
 /// permanently propagate the negative status to subsequent
 /// commands; others (e.g. pocl) keep it usable. Rebuilding the
@@ -264,7 +264,7 @@ impl Context {
     /// [`default_outoforder_queue`](Self::default_outoforder_queue)
     /// means the slot stays empty until first use).
     ///
-    /// Used by `claspr-async`'s terminals (sync / run) to push
+    /// Used by the Tier 2 terminals (sync / run) to push
     /// multi-device chains on non-eager implementations: rusticl
     /// (spec-strict) keeps enqueued commands in `CL_QUEUED` until an
     /// explicit `clFlush`, so a chain that touches `dev_b`'s queue
@@ -293,7 +293,7 @@ impl Context {
     /// per-device out-of-order queue this context has lazily
     /// instantiated. No-op for slots that are still empty.
     ///
-    /// **Not called by `claspr-async`'s terminals** — those would
+    /// **Not called by the Tier 2 terminals** — those would
     /// over-block on other users' work since the OOO queues are
     /// shared (cached per-device on the Context). Provided here as
     /// an explicit "drain everything on this context" primitive
@@ -406,7 +406,7 @@ impl Context {
     /// dependent types when a release fails and the error can't be
     /// propagated.
     ///
-    /// Public so external claspr-async impls (e.g. the SVM view's
+    /// Public so other in-crate impls (e.g. the SVM view's
     /// Drop in `host_view`) can record into the same counter.
     pub fn record_err(&self) {
         self.inner.error_state.fetch_add(1, Ordering::Relaxed);

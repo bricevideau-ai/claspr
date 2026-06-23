@@ -223,7 +223,7 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
 /// initialised [`DeviceSlice<T, M>`] via either
 /// [`unsafe fn assume_init`](Self::assume_init) (kernel-write-only
 /// pattern; caller vouches every byte gets written before any read)
-/// or by chaining through Tier 2 ops in `claspr-async` that consume
+/// or by chaining through Tier 2 (eager-graph) ops that consume
 /// the wrapper and produce the initialised buffer.
 ///
 /// The wrapper has no `read` / `download` / `acquire_host_view`

@@ -130,9 +130,9 @@
 //! single-source modules. The returned `Op` supports `.wait()`,
 //! `.submit()`, `.await`, plus `.profiled(...)` / `.after(...)`
 //! modifiers, and composes into Tier 2 chains via
-//! [`DeviceOperation`].
+//! [`DeviceOp`].
 //!
-//! [`DeviceOperation`]: https://docs.rs/claspr-async
+//! [`DeviceOp`]: https://docs.rs/claspr
 //! [kernels-macro]: https://docs.rs/claspr/latest/claspr/macro.kernels.html
 //! [claspr]: https://github.com/bricevideau-ai/claspr
 

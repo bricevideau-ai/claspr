@@ -90,8 +90,8 @@ impl ProfilingInfo {
 // ── LaunchOp ─────────────────────────────────────────────────────────
 
 /// Type alias for the boxed profiling closure. Public so
-/// [`register_profiling_callback`] callers (e.g. claspr-async's Tier
-/// 2 profile combinator) can name the same shape.
+/// [`register_profiling_callback`] callers (e.g. the Tier 2
+/// profile combinator) can name the same shape.
 pub type ProfileCb = Box<dyn FnOnce(Result<ProfilingInfo>) + Send + 'static>;
 
 /// Lazy builder for one kernel launch. Constructed by the
@@ -143,8 +143,8 @@ impl<'l, A: KernelArgs> LaunchOp<'l, A> {
     }
 
     /// Add multiple wait-list events at once. Equivalent to calling
-    /// [`after`](Self::after) for each in turn. Used by claspr-async
-    /// Tier 2 to thread per-op dependency chains.
+    /// [`after`](Self::after) for each in turn. Used by Tier 2
+    /// (eager-graph) ops to thread per-op dependency chains.
     ///
     /// Same cross-context panic as [`after`](Self::after).
     pub fn after_all<'e, I>(mut self, events: I) -> Self
@@ -282,7 +282,7 @@ struct ProfileData {
 /// reclaims the box on completion, queries the four CL profiling
 /// timestamps, and invokes `cb` with the result.
 ///
-/// Shared by [`LaunchOp::profiled`] and by claspr-async's Tier 2
+/// Shared by [`LaunchOp::profiled`] and by the Tier 2
 /// `.profiled()` combinator (which registers the same shim on a
 /// marker event after a sub-chain completes).
 pub fn register_profiling_callback(event: &Event, cb: ProfileCb) -> Result<()> {

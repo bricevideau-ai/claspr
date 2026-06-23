@@ -114,7 +114,7 @@ pub struct MappedSlice<T, M: MemMode = ReadWrite> {
     /// release path's unmap event.
     ///
     /// Mutex-protected because the buffer is commonly shared via
-    /// `Arc<MappedSlice<T>>` (e.g. through `.arc()` in claspr-async
+    /// `Arc<MappedSlice<T>>` (e.g. through `.arc()` in device-op
     /// chains) and multiple threads may register concurrently.
     last_use: Mutex<Vec<Arc<Event>>>,
     /// Type-level access-mode tag. SVM at the OpenCL level only

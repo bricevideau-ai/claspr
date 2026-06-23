@@ -11,7 +11,7 @@
 //! shape, so callers see one canonical signature instead of N
 //! near-identical ones with subtle inconsistencies.
 //!
-//! Kept `pub` (not `pub(crate)`) for `claspr-async`, and
+//! Kept `pub` (not `pub(crate)`) for in-crate Tier 2 plumbing, and
 //! `#[doc(hidden)]` so they don't appear in user-facing docs —
 //! callers are expected to be in-workspace plumbing, not user code.
 //!

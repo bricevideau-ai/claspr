@@ -120,10 +120,11 @@ direct-rustc harness cloned from tier1's `image_compile_fail`) with two fixtures
 `use-after-move` / `host-view-escape` invariants from the old suite were NOT
 re-created (they're move-semantics / lifetime checks that the eager move-out idiom
 already enforces structurally; the two re-created fixtures are the marker/trait-bound
-ones worth a golden). `claspr-async` survives as a thin re-export shim
-(`pub use claspr::*` + macro re-exports) — still a workspace member; a dead-shim
-deletion candidate but LEFT IN PLACE (legacy `claspr_async::` paths in test/doc
-comments still resolve through it; flag for Brice). Full gate green: workspace
+ones worth a golden). `claspr-async` (the thin `pub use claspr::*` re-export shim)
+has since been DELETED (post-reunification cleanup): the crate directory, its
+workspace-member entry, and the last `claspr-async` dep (spike) are gone, and the
+remaining `claspr_async::` mentions in test/doc comments were re-pointed to
+`claspr::` or rewritten as historical migration notes. Full gate green: workspace
 build (default + `--features async-events`), `cargo fmt --check`, clippy (default +
 async-events), `RUSTDOCFLAGS=-D warnings cargo doc`, compile-fail rustfmt, and the
 entire tier1+tier2 suite serial on pocl. Pre-existing env failure unrelated to this

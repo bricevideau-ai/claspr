@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "claspr",
-    "claspr-async",
     "claspr-build",
     "claspr-macros",
     "examples/collatz",
