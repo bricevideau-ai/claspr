@@ -80,15 +80,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
-name = "async-pipeline-example"
-version = "0.0.0"
-dependencies = [
- "claspr",
- "claspr-async",
- "claspr-build",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -107,15 +98,6 @@ dependencies = [
  "object 0.37.3",
  "rustc-demangle",
  "windows-link",
-]
-
-[[package]]
-name = "batch-inference-example"
-version = "0.0.0"
-dependencies = [
- "claspr",
- "claspr-async",
- "claspr-build",
 ]
 
 [[package]]
@@ -367,10 +349,8 @@ name = "claspr-tier2-tests"
 version = "0.0.0"
 dependencies = [
  "claspr",
- "claspr-async",
  "claspr-test-kernels",
  "futures",
- "ui_test",
 ]
 
 [[package]]

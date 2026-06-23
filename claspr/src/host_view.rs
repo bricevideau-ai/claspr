@@ -45,7 +45,7 @@
 //! (no writeback on unmap).
 
 use crate::access::{HostReadable, HostWritable, MemMode};
-use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::eager::{Deps, DeviceEnqueue, deps_as_events, wrap_event};
 use crate::exec_ctx::ExecutionContext;
 use crate::map_primitive;
 use crate::mappable::Mappable;
@@ -110,7 +110,7 @@ pub use map_access::{MapAccess, MapReadOnly, MapReadWrite};
 /// ([`crate::access::HostReadable`]).
 pub trait HostReadableExt: Sized {
     /// The acquire op type for the read-only variant.
-    type AcquireReadOp: DeviceOperation;
+    type AcquireReadOp: DeviceEnqueue;
 
     /// Acquire a read-only host view. Closure inside `and_then_host`
     /// receives `&[T]`. Cheaper for inspection-only patterns since
@@ -123,7 +123,7 @@ pub trait HostReadableExt: Sized {
 /// ([`crate::access::HostWritable`]).
 pub trait HostWritableExt: Sized {
     /// The acquire op type for the read/write variant.
-    type AcquireOp: DeviceOperation;
+    type AcquireOp: DeviceEnqueue;
 
     /// Acquire a read/write host view. Closure inside
     /// `and_then_host` receives `&mut [T]`.
@@ -179,7 +179,7 @@ pub struct AcquireDeviceSliceOp<T, M: MemMode, A: MapAccess> {
     _access: PhantomData<A>,
 }
 
-impl<T, M, A> DeviceOperation for AcquireDeviceSliceOp<T, M, A>
+impl<T, M, A> DeviceEnqueue for AcquireDeviceSliceOp<T, M, A>
 where
     T: Send + 'static,
     M: MemMode,
@@ -187,7 +187,7 @@ where
 {
     type Output = DeviceSliceHostView<T, M, A>;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let buf = self
             .buf
             .take()
@@ -334,7 +334,7 @@ pub struct ReleaseDeviceSliceOp<T, M: MemMode, A: MapAccess> {
     view: Option<DeviceSliceHostView<T, M, A>>,
 }
 
-impl<T, M, A> DeviceOperation for ReleaseDeviceSliceOp<T, M, A>
+impl<T, M, A> DeviceEnqueue for ReleaseDeviceSliceOp<T, M, A>
 where
     T: Send + 'static,
     M: MemMode,
@@ -342,11 +342,7 @@ where
 {
     type Output = DeviceSlice<T, M>;
 
-    fn execute(
-        mut self,
-        ctx: &ExecutionContext<'_>,
-        deps: Deps,
-    ) -> Result<(DeviceSlice<T, M>, Deps)> {
+    fn run(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(DeviceSlice<T, M>, Deps)> {
         let mut view = self
             .view
             .take()
@@ -510,7 +506,7 @@ pub struct AcquireMappedSliceOp<T, M: MemMode, A: MapAccess> {
     _access: PhantomData<A>,
 }
 
-impl<T, M, A> DeviceOperation for AcquireMappedSliceOp<T, M, A>
+impl<T, M, A> DeviceEnqueue for AcquireMappedSliceOp<T, M, A>
 where
     T: Send + Sync + 'static,
     M: MemMode,
@@ -518,7 +514,7 @@ where
 {
     type Output = MappedSliceHostView<T, M, A>;
 
-    fn execute(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let buf = self
             .buf
             .take()
@@ -649,7 +645,7 @@ pub struct ReleaseMappedSliceOp<T, M: MemMode, A: MapAccess> {
     view: Option<MappedSliceHostView<T, M, A>>,
 }
 
-impl<T, M, A> DeviceOperation for ReleaseMappedSliceOp<T, M, A>
+impl<T, M, A> DeviceEnqueue for ReleaseMappedSliceOp<T, M, A>
 where
     T: Send + 'static,
     M: MemMode,
@@ -657,11 +653,7 @@ where
 {
     type Output = MappedSlice<T, M>;
 
-    fn execute(
-        mut self,
-        ctx: &ExecutionContext<'_>,
-        deps: Deps,
-    ) -> Result<(MappedSlice<T, M>, Deps)> {
+    fn run(mut self, ctx: &ExecutionContext<'_>, deps: Deps) -> Result<(MappedSlice<T, M>, Deps)> {
         let mut view = self
             .view
             .take()

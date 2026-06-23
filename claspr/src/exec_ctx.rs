@@ -1,4 +1,4 @@
-//! [`ExecutionContext`] — what every [`DeviceOperation`]'s `execute`
+//! [`ExecutionContext`] — what every [`DeviceOp`]'s `execute`
 //! method receives.
 //!
 //! Carries the [`Context`], the current [`Device`], and a borrowed
@@ -13,7 +13,7 @@
 //! })
 //! ```
 //!
-//! [`DeviceOperation`]: crate::device_op::DeviceOperation
+//! [`DeviceOp`]: crate::DeviceOp
 //! [`Context`]: crate::Context
 //! [`Device`]: crate::Device
 //! [`CommandQueue`]: opencl3::command_queue::CommandQueue
@@ -22,15 +22,15 @@
 use crate::{CommandQueue, Context, Device, Error, Launcher};
 use std::sync::{Arc, Mutex};
 
-/// Execution-time environment for a [`DeviceOperation`].
+/// Execution-time environment for a [`DeviceOp`].
 ///
-/// Built by [`DeviceOperation::sync`] (and later, by the async terminal
+/// Built by [`DeviceOp::sync`] (and later, by the async terminal
 /// in Phase 3.4); op authors don't construct this directly. The
 /// `'ctx` lifetime is the lifetime of the borrow into the parent
 /// [`Context`] and its per-device default OOO queue.
 ///
-/// [`DeviceOperation`]: crate::device_op::DeviceOperation
-/// [`DeviceOperation::sync`]: crate::device_op::DeviceOperation::sync
+/// [`DeviceOp`]: crate::DeviceOp
+/// [`DeviceOp::sync`]: crate::DeviceOpExt::sync
 pub struct ExecutionContext<'ctx> {
     context: &'ctx Context,
     device: Device,
@@ -108,7 +108,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     }
 
     /// The [`Device`] this op currently targets. Use
-    /// [`DeviceOperation::on_device`](crate::DeviceOperation::on_device)
+    /// [`DeviceOpExt::on_device`](crate::DeviceOpExt::on_device)
     /// to route a sub-chain to a different device's queue, or
     /// [`transfer_to_device`](crate::transfer_to_device()) to migrate
     /// the buffer between devices in the same context.

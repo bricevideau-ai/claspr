@@ -71,7 +71,6 @@ pub(crate) mod fill_kernel;
 #[cfg(feature = "async-events")]
 pub mod future;
 pub mod image;
-pub mod kernel_op;
 pub mod launch;
 pub mod map_primitive;
 pub mod mapped;
@@ -82,30 +81,16 @@ pub mod usm;
 #[doc(hidden)]
 pub mod util;
 
-// ── Tier 2 combinator layer (folded in from the former claspr-async) ──
-pub mod alloc;
-pub mod and_then_host;
-pub mod arc;
-pub mod buffer_ops;
-pub mod bundle;
-#[cfg(feature = "async-events")]
-pub mod chain_future;
+// ── Tier 2 device-graph layer (the eager struct-graph core + its
+// supporting primitives: the polymorphic copy verb, the host-view
+// map/unmap layer, and the shared upload source) ──
 pub mod copy;
-pub mod device_op;
-pub mod dyn_op;
 pub mod eager;
 pub mod exec_ctx;
-pub mod fan_out;
 pub mod host_view;
-pub mod image_transfer;
 pub mod mappable;
-pub mod on_device;
-pub mod profile;
 mod tier2_macros;
 pub mod transfer;
-pub mod transfer_to_device;
-pub mod uninit_ext;
-pub mod usm_op;
 
 // ── Public surface ────────────────────────────────────────────────────
 
@@ -133,9 +118,6 @@ pub use image::{
     KernelImage3DReadWriteArg, KernelImage3DWriteArg, KernelImageBufferReadArg,
     KernelImageBufferReadWriteArg, KernelImageBufferWriteArg, format,
 };
-#[doc(hidden)]
-pub use kernel_op::__seal;
-pub use kernel_op::KernelOp;
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, KernelSliceArg, KernelSliceReadArg,
     KernelSliceReadWriteArg, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
@@ -155,59 +137,33 @@ pub use mapped::{
 };
 pub use usm::{USMSlice, USMSliceUninit};
 
-// ── Tier 2 combinator re-exports (folded in from claspr-async) ──
-pub use alloc::{
-    DeviceSliceAllocUninit, DeviceSliceFromSlice, MappedSliceAllocUninit, MappedSliceFromSlice,
-};
-pub use and_then_host::{AndThenHost, AndThenHostWithContext, DeviceOperationHostExt};
-pub use arc::ArcSplit;
-pub use buffer_ops::{
-    DeviceSliceFillOp, DeviceSliceWriteOp, MappedSliceFillOp, device_slice_fill,
-    device_slice_write, mapped_slice_fill,
-};
-pub use bundle::{
-    Bundle2, Bundle3, Bundle4, Bundle5, Bundle6, Bundle7, Bundle8, Bundle9, Bundle10, Bundle11,
-    Bundle12, Bundle13, Bundle14, Bundle15, Bundle16,
-};
-#[cfg(feature = "async-events")]
-pub use chain_future::ChainFuture;
-pub use copy::{CopyTo, CopyToOp};
-pub use device_op::{
-    AndThen, AndThenWithContext, Arced, Dep, Deps, DeviceOperation, Value, deps_as_events, value,
-    wrap_event,
-};
-pub use dyn_op::DynOp;
-#[cfg(feature = "async-events")]
-pub use eager::DeviceChainFuture;
-// The eager graph types are reached via the `claspr::eager::` module path
-// (`eager::{DeviceOp, DeviceOpExt, Pipe, Input, …}`) to avoid name clashes with
-// the legacy `Download`/`upload` surface during the cutover.
-pub use eager::{
-    DeviceDynOp, DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt, ExecMode, Input, Pipe,
-    ToInput, arced as eager_arced, bundle2 as eager_bundle2, bundle3 as eager_bundle3,
-    bundle4 as eager_bundle4, bundle5 as eager_bundle5, bundle6 as eager_bundle6,
-    bundle7 as eager_bundle7, bundle8 as eager_bundle8, bundle9 as eager_bundle9,
-    bundle10 as eager_bundle10, bundle11 as eager_bundle11, bundle12 as eager_bundle12,
-    bundle13 as eager_bundle13, bundle14 as eager_bundle14, bundle15 as eager_bundle15,
-    bundle16 as eager_bundle16, fan_out as eager_fan_out, forward as eager_forward,
-    lift as eager_lift, transfer_to_device as eager_transfer_to_device, value as eager_value,
-    write as eager_write,
-};
+// ── Tier 2 device-graph re-exports ──
+//
+// The eager struct-graph IS the Tier 2 API. Its items live in `mod eager`
+// (reachable as `claspr::eager::…`) and are re-exported here at the crate root
+// with their plain names — there is no longer a separate closure layer to
+// disambiguate against, so the former `eager_*` aliases are gone.
+pub use copy::CopyTo;
 pub use exec_ctx::ExecutionContext;
-pub use fan_out::{FanOut, FanOutExt, fan_out};
 pub use host_view::{
     AcquireDeviceSliceOp, AcquireMappedSliceOp, DeviceSliceHostView, HostAccessibleExt,
     HostReadableExt, HostWritableExt, MapAccess, MapReadOnly, MapReadWrite, MappedSliceHostView,
     ReleaseDeviceSliceOp, ReleaseMappedSliceOp,
 };
-pub use image_transfer::{ImageDownload, ImageUpload, image_download, image_upload};
 pub use mappable::{DeviceSliceMapHandle, Mappable};
-pub use on_device::OnDevice;
-pub use profile::{DeviceOperationProfileExt, Profiled};
-pub use transfer::{Download, UploadSource};
-pub use transfer_to_device::{TransferToDevice, transfer_to_device};
-pub use uninit_ext::{FillFromUninitOp, FillUninit, WriteFromUninitOp, WriteUninit};
-pub use usm_op::{UsmSliceAllocUninit, UsmSliceOp};
+pub use transfer::UploadSource;
+
+#[cfg(feature = "async-events")]
+pub use eager::DeviceChainFuture;
+pub use eager::{
+    AndThenHost, AndThenHostWithContext, ArcSplit, CopyTo2, Dep, Deps, DeviceDynOp, DeviceEnqueue,
+    DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt, Download, ExecMode, FanOut,
+    ImageDownloadEager, ImageUploadEager, Input, OnDevice, Pipe, ToInput, TransferToDevice, Upload,
+    arc_split, arced, bundle2, bundle3, bundle4, bundle5, bundle6, bundle7, bundle8, bundle9,
+    bundle10, bundle11, bundle12, bundle13, bundle14, bundle15, bundle16, deps_as_events,
+    deps_into_single_event, eager_copy_to, fan_out, forward, image_download, image_upload, lift,
+    transfer_to_device, value, wrap_event, write,
+};
 
 // Stage-3 proc-macro frontend.
 pub use claspr_macros::{device, kernel, kernels};

@@ -5,29 +5,19 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Integration tests for claspr-async's Tier 2 combinator API"
+description = "Integration tests for claspr's Tier 2 device-graph API"
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
 claspr = { path = "../../claspr" }
-claspr-async = { path = "../../claspr-async" }
 claspr-test-kernels = { path = "../kernels" }
 
 [dev-dependencies]
 # Just for `block_on` in the async-terminal tests — no need for tokio's
 # full machinery.
 futures = { version = "0.3", default-features = false, features = ["executor", "std"] }
-ui_test = "0.30"
-
-# ui_test requires harness = false so its `fn main()` runs instead of
-# cargo test scanning for `#[test]`s. Same pattern as
-# `tests/tier1/Cargo.toml`'s `image_compile_fail` harness.
-[[test]]
-name = "safety_compile_fail"
-path = "tests/safety_compile_fail.rs"
-harness = false
 
 [lints]
 workspace = true

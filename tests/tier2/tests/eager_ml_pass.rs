@@ -10,8 +10,8 @@
 //! Same N, same scale factors, same assertions as `ml_pass.rs`.
 
 use claspr::Context;
+use claspr::bundle;
 use claspr::eager::{DeviceOpExt, bundle3, download, upload, value};
-use claspr::eager_bundle;
 use claspr_test_kernels::kernels;
 use std::sync::{Arc, Mutex};
 
@@ -74,12 +74,12 @@ fn forward_pass_carries_scalar_state_via_bundle() {
     let (_final_buf, step) = upload::<u32, claspr::ReadWrite, _>(vec![10u32; N])
         .and_then(|buf| {
             // Pack: kernel output (a bare `Pipe<DeviceSlice>`) + the scalar 1.
-            eager_bundle!(kernels.scale_u32([N], buf, 2), value(1u32))
+            bundle!(kernels.scale_u32([N], buf, 2), value(1u32))
         })
         .and_then(|(buf, step)| {
             // `buf` is a `Pipe<DeviceSlice>`, `step` is `u32` (by-value handle) —
             // so `step + 1` computes here, carried in-chain, not hand-tracked.
-            eager_bundle!(kernels.scale_u32([N], buf, 3), value(step + 1))
+            bundle!(kernels.scale_u32([N], buf, 3), value(step + 1))
         })
         .and_then_host(move |(slice, _step): (&mut [u32], u32)| {
             *cell.lock().unwrap() = slice.iter().sum();

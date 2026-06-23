@@ -1,4 +1,4 @@
-//! Eager struct-graph core — the closure-free `DeviceOperation` replacement.
+//! Eager struct-graph core — the closure-free device-graph layer (`DeviceOp`).
 //!
 //! A graph is a **closure-free nested struct** of [`DeviceOp`]s. `.and_then(f)`
 //! runs the builder `f` **once at construction**, handing it a [`Pipe<T>`]
@@ -23,12 +23,12 @@
 //! `Pipe(Pipe<T>)` (produced upstream). One type, two states: this is the edge
 //! that unifies concrete args, intermediate values, and (later) slots.
 //!
-//! This module is being grown to replace the closure-based `op.rs` layer
-//! (NOTES → "CONVERSION PLAN"); the old trait stays alive in parallel until
-//! every leaf is ported.
+//! This module IS the Tier 2 device-graph layer. The former closure-based
+//! `DeviceOperation` layer it replaced has been removed; the only residue is the
+//! tiny [`DeviceEnqueue`] contract a few primitive leaves (host-view map/unmap,
+//! the polymorphic `copy_to` family) delegate their raw enqueue body to.
 
 use crate::copy::CopyTo;
-use crate::device_op::{Deps, DeviceOperation, wrap_event};
 use crate::exec_ctx::ExecutionContext;
 use crate::host_view::{
     DeviceSliceHostView, HostReadableExt, HostWritableExt, MapAccess, MapReadOnly, MapReadWrite,
@@ -43,6 +43,53 @@ use crate::{
 };
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
+
+// ── Deps: the event wait-list threaded through the graph ────────────────
+
+/// A single tracked event in a [`Deps`] chain. `Arc`-wrapped so it can be
+/// cheaply shared across parallel branches in `bundle!` / `fan_out` without
+/// extra `clRetainEvent` calls.
+pub type Dep = Arc<crate::Event>;
+
+/// The wait-list / produced-event list threaded through every op's
+/// [`execute`](DeviceOp::execute). Empty at chain start; one element per device
+/// op the previous step enqueued; multi-element after a parallel join
+/// (`bundle`/`fan_out`) collapses children's events into the marker that joins
+/// them.
+pub type Deps = Vec<Dep>;
+
+/// Borrow each [`Dep`] as `&Event` for an `after_all(...)` call on a Tier 1 op
+/// builder.
+pub fn deps_as_events(deps: &Deps) -> impl Iterator<Item = &crate::Event> {
+    deps.iter().map(|d| d.as_ref())
+}
+
+/// Wrap an opencl3 [`Event`](crate::Event) in a [`Dep`].
+pub fn wrap_event(event: crate::Event) -> Dep {
+    Arc::new(event)
+}
+
+// ── DeviceEnqueue: minimal raw-enqueue contract for delegated primitives ──
+//
+// A handful of eager leaves (the host-view acquire/release ops in `host_view.rs`
+// and the polymorphic `copy_to` family in `copy.rs`) can't be re-derived inline:
+// they reach into private fields and own per-family `clEnqueue*` bodies. Rather
+// than duplicate those bodies, the eager wrapper holds the buffer/view and
+// delegates to a small op type whose only job is one non-blocking enqueue
+// returning `(Output, Deps)`. This trait is that contract — the residue of the
+// old `DeviceOperation` trait, pared down to the single `run` method the eager
+// graph actually needs (no terminals, no combinators, no blanket).
+
+/// One non-blocking enqueue: take the upstream `deps` as the wait-list, enqueue,
+/// and return the produced value plus the events the enqueue created. Implemented
+/// by the few primitive ops the eager graph delegates to (host-view map/unmap,
+/// the `copy_to` family).
+pub trait DeviceEnqueue: Send + Sized {
+    /// The host value the enqueue produces.
+    type Output: Send;
+    /// Enqueue against `ec` with `deps` as the wait-list; return `(value, Deps)`.
+    fn run(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)>;
+}
 
 // ── Pipe<T> + Input<T>: the graph edge ─────────────────────────────────
 
@@ -148,9 +195,9 @@ impl<T> Input<T> {
     }
 
     /// Resolve to a concrete value, erroring if this is a pipe. Used by the
-    /// Tier-1 / `KernelOp` enqueue path, where a pipe is unreachable (a pipe
-    /// only exists inside an eager `and_then` closure — a context that never
-    /// calls the Tier-1 terminals). The `(value, Deps)` form is the eager path.
+    /// concrete-head terminal path, where a pipe is unreachable (a pipe only
+    /// exists inside an eager `and_then` closure — a context that never calls
+    /// the concrete-head terminals). The `(value, Deps)` form is the graph path.
     pub fn resolve_concrete(self) -> Result<T> {
         match self {
             Input::Concrete(v) => Ok(v),
@@ -425,7 +472,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
 
     /// Run `self` to completion on `launcher`'s queue (forward path; no replay).
     /// Blocks once, here, on the terminal op's events — the only wait in the
-    /// graph. The general blocking terminal: a [`Launcher`] is a specific queue
+    /// graph. The general blocking terminal: a [`Launcher`](crate::Launcher) is a specific queue
     /// (`Context` → its default OOO queue; a `Queue`/`ExecutionContext` → that
     /// exact queue), so `wait_on` is also the cross-queue / cross-device control
     /// (Tier-1 heritage). [`sync`](Self::sync) is `wait_on` over a `Context`.
@@ -482,6 +529,23 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         let marker = unsafe { ec.cl_queue().enqueue_marker_with_wait_list(&wait_list) }
             .map_err(Error::OpenCl)?;
         Ok(marker)
+    }
+
+    /// Non-blocking terminal returning BOTH the output value AND a single
+    /// completion event — the Tier-1 `(Output, Event)` contract used by the
+    /// kernel-op `submit`/`submit_on`. Runs `collect(Pipelined)` on `launcher`'s
+    /// queue, then reduces the op's deps to one chainable marker event. (The
+    /// plain [`submit_on`](Self::submit_on) drops the value; this keeps it so the
+    /// caller can keep using the buffers and chain via `.after(event)`.)
+    fn submit_value_on<L: crate::Launcher + ?Sized>(
+        self,
+        launcher: &L,
+    ) -> Result<(Self::Output, crate::Event)> {
+        let device = launcher.context().device().clone();
+        let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
+        let (output, deps) = self.collect(&ec, ExecMode::Pipelined)?;
+        let event = deps_into_single_event(&ec, deps)?;
+        Ok((output, event))
     }
 
     /// Async terminal — run `self` on `context` and return a future that
@@ -1087,6 +1151,22 @@ fn join_marker(ec: &ExecutionContext<'_>, branch_deps: &[Deps]) -> Result<Deps> 
     Ok(vec![wrap_event(marker)])
 }
 
+/// Reduce a gathered op's [`Deps`] to a single owned [`Event`](crate::Event) — used by the
+/// Tier-1 `submit`/`submit_on` terminals (which hand the caller a chainable
+/// event). Always enqueues a marker over the deps, so the result is one owned
+/// `Event` that completes exactly when the op's work does, regardless of how
+/// many events the op produced (one for a single-output kernel, several for a
+/// multi-output launch). Empty deps → a bare marker (fires immediately).
+pub fn deps_into_single_event(ec: &ExecutionContext<'_>, deps: Deps) -> Result<crate::Event> {
+    use crate::Launcher;
+    let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+    // SAFETY: the cl_event handles are held alive by `deps` across this call.
+    let marker =
+        unsafe { ec.cl_queue().enqueue_marker_with_wait_list(&raw) }.map_err(Error::OpenCl)?;
+    drop(deps);
+    Ok(marker)
+}
+
 macro_rules! impl_eager_bundle {
     ($name:ident, $ctor:ident, $($field:ident : $ty:ident : $pf:ident),+) => {
         #[doc = concat!("Eager bundle of independent branches (arity ",
@@ -1200,20 +1280,17 @@ impl_eager_bundle!(Bundle14, bundle14, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e
 impl_eager_bundle!(Bundle15, bundle15, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf, g: G: pg, h: H: ph, i: I: pi, j: J: pj, k: K: pk, l: L: pl, m: M: pm, n: N: pn, o: O: po);
 impl_eager_bundle!(Bundle16, bundle16, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e: E: pe, f: F: pf, g: G: pg, h: H: ph, i: I: pi, j: J: pj, k: K: pk, l: L: pl, m: M: pm, n: N: pn, o: O: po, p: P: pp);
 
-/// Variadic constructor for the eager [`Bundle2`] through [`Bundle16`] — picks
-/// the right `bundleN` based on the number of arguments.
-///
-/// The eager analog of the legacy [`bundle!`](crate::bundle!) macro (which still
-/// targets the closure layer during the cutover). Renamed to `bundle!` once the
-/// old layer is removed.
+/// Variadic constructor for [`Bundle2`] through [`Bundle16`] — picks the right
+/// `bundleN` based on the number of arguments. Each arm runs its branches
+/// independently and joins them with a single marker event.
 ///
 /// ```ignore
-/// let (a, b) = eager_bundle!(op_a, op_b).sync(&ctx)?;
-/// let (a, b, c) = eager_bundle!(op_a, op_b, op_c).sync(&ctx)?;
+/// let (a, b) = bundle!(op_a, op_b).sync(&ctx)?;
+/// let (a, b, c) = bundle!(op_a, op_b, op_c).sync(&ctx)?;
 /// // ... up to 16 children
 /// ```
 #[macro_export]
-macro_rules! eager_bundle {
+macro_rules! bundle {
     ($a:expr, $b:expr $(,)?) => {
         $crate::eager::bundle2($a, $b)
     };
@@ -1291,11 +1368,8 @@ where
 
 /// Method-call form of [`fan_out`]: `vec![a, b].fan_out(|i| value(i))`.
 ///
-/// Mirrors the old closure-layer `FanOutExt`. Reads as data → operation and
-/// composes cleanly with downstream `.and_then`; the free-fn form stays
-/// available — use whichever fits the call site. Named `DeviceFanOutExt` to
-/// avoid clashing with the old [`FanOutExt`](crate::FanOutExt) (both are
-/// re-exported at the crate root).
+/// Reads as data → operation and composes cleanly with downstream `.and_then`;
+/// the free-fn form stays available — use whichever fits the call site.
 pub trait DeviceFanOutExt<I>: Sized {
     /// See [`fan_out`] — this delegates to it.
     fn fan_out<F, U>(self, f: F) -> FanOut<U>
@@ -2517,19 +2591,19 @@ where
 //
 // The host-view types (`DeviceSliceHostView` / `MappedSliceHostView`) have
 // private fields, so the eager ops cannot reconstruct them directly. Instead
-// each eager op holds the buffer/view and delegates the exact enqueue body by
-// constructing the OLD `DeviceOperation` (via its public trait method
-// `acquire_host_view{,_read}` / `release_to_device`) and calling its
-// `execute(ec, deps)`. This reuses the old map/unmap body verbatim without
-// modifying the old module. None of these primitives has a native blocking
-// enqueue (the map/unmap is always non-blocking `false`), so `mode` is ignored.
+// each eager op holds the buffer/view and delegates the exact enqueue body to
+// the host-view layer's `acquire_host_view{,_read}` / `release_to_device`
+// builders and their inherent `run(ec, deps) -> (Output, Deps)` method (the
+// map/unmap primitive that survives in `host_view.rs`). None of these has a
+// native blocking enqueue (the map/unmap is always non-blocking `false`), so
+// `mode` is ignored.
 
 // ── Leaf: acquire a read/write DeviceSlice host view ────────────────────────
 
 /// Acquire a read/write host view of an upstream `DeviceSlice` via a
 /// non-blocking `clEnqueueMapBuffer`. Output is the owned
 /// [`DeviceSliceHostView`]. No native blocking enqueue — `mode` ignored.
-/// Delegates to the old `AcquireDeviceSliceOp` body via `acquire_host_view`.
+/// Delegates to the `AcquireDeviceSliceOp` body via `acquire_host_view`.
 pub struct AcquireDeviceView<T, M: MemMode> {
     buf: Input<DeviceSlice<T, M>>,
     out: Pipe<DeviceSliceHostView<T, M, MapReadWrite>>,
@@ -2568,7 +2642,7 @@ where
         let (buf, deps) = self.buf.resolve()?;
         // Delegate to the old op's verbatim map body (map/unmap is always
         // non-blocking — mode ignored).
-        let (view, out_deps) = buf.acquire_host_view().execute(ec, deps)?;
+        let (view, out_deps) = buf.acquire_host_view().run(ec, deps)?;
         self.out.put(view, out_deps);
         Ok(())
     }
@@ -2619,7 +2693,7 @@ where
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve()?;
-        let (view, out_deps) = buf.acquire_host_view_read().execute(ec, deps)?;
+        let (view, out_deps) = buf.acquire_host_view_read().run(ec, deps)?;
         self.out.put(view, out_deps);
         Ok(())
     }
@@ -2672,7 +2746,7 @@ where
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (view, deps) = self.view.resolve()?;
-        let (buf, out_deps) = view.release_to_device().execute(ec, deps)?;
+        let (buf, out_deps) = view.release_to_device().run(ec, deps)?;
         self.out.put(buf, out_deps);
         Ok(())
     }
@@ -2722,7 +2796,7 @@ where
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve()?;
-        let (view, out_deps) = buf.acquire_host_view().execute(ec, deps)?;
+        let (view, out_deps) = buf.acquire_host_view().run(ec, deps)?;
         self.out.put(view, out_deps);
         Ok(())
     }
@@ -2773,7 +2847,7 @@ where
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve()?;
-        let (view, out_deps) = buf.acquire_host_view_read().execute(ec, deps)?;
+        let (view, out_deps) = buf.acquire_host_view_read().run(ec, deps)?;
         self.out.put(view, out_deps);
         Ok(())
     }
@@ -2826,7 +2900,7 @@ where
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (view, deps) = self.view.resolve()?;
-        let (buf, out_deps) = view.release_to_device().execute(ec, deps)?;
+        let (buf, out_deps) = view.release_to_device().run(ec, deps)?;
         self.out.put(buf, out_deps);
         Ok(())
     }
@@ -2838,25 +2912,25 @@ where
 
 // ── Multi-output leaf: copy_to (src, dst) → (src, dst) ──────────────────────
 //
-// The eager analog of the closure-layer `CopyToOp` family in `copy.rs`. A copy
-// is a **two-output** op: it returns BOTH the source and destination buffers so
-// the chain can thread either onward. It mirrors the macro-emitted multi-output
-// kernel shape (commit 0f7083d): two element pipes (`Handle = (Pipe<OS>,
-// Pipe<OD>)`), `execute` enqueues once and scatters each output into its element
-// pipe (cloning the single completion `Dep` onto both), and `into_output` drains
-// both pipes to reconstruct the `(src, dst)` tuple.
+// The `copy_to` graph leaf. A copy is a **two-output** op: it returns BOTH the
+// source and destination buffers so the chain can thread either onward. It
+// mirrors the macro-emitted multi-output kernel shape (commit 0f7083d): two
+// element pipes (`Handle = (Pipe<OS>, Pipe<OD>)`), `execute` enqueues once and
+// scatters each output into its element pipe (cloning the single completion
+// `Dep` onto both), and `into_output` drains both pipes to reconstruct the
+// `(src, dst)` tuple.
 //
 // Rather than re-deriving the ten (src, dst) family bodies (incl. the unsafe
-// cross-type SVM-memcpy machinery in `copy.rs`), this op **reuses** the existing
-// `CopyTo` / `DeviceOperation` `CopyToOp` impls: resolve the two inputs, build
-// the old op via `src.copy_to(dst)`, run its `DeviceOperation::execute` (which
-// owns every per-family primitive + Uninit→Init transition + buffer-use
-// registration), then scatter its `(out_src, out_dst)` Output across the two
-// pipes. All ten families come along for free — no `copy.rs` change.
+// cross-type SVM-memcpy machinery in `copy.rs`), this op **reuses** the
+// `CopyTo` / [`DeviceEnqueue`] `CopyToOp` impls: resolve the two inputs, build
+// the op via `src.copy_to(dst)`, run its `DeviceEnqueue::run` (which owns every
+// per-family primitive + Uninit→Init transition + buffer-use registration), then
+// scatter its `(out_src, out_dst)` Output across the two pipes. All ten families
+// come along for free — no `copy.rs` change.
 //
-// Copy ops have no native blocking enqueue (the closure layer always uses
-// `submit_on` + event); `mode` is therefore ignored — `submit_on`+event is the
-// only path, and copy is rarely terminal anyway (it returns buffers onward).
+// Copy ops have no native blocking enqueue (`submit_on` + event is the only
+// path); `mode` is therefore ignored, and copy is rarely terminal anyway (it
+// returns buffers onward).
 
 /// Split a copy op's 2-tuple `Output` into its source + destination halves so
 /// the eager [`CopyTo2`] op can hold one typed element pipe per side and
@@ -2885,15 +2959,15 @@ impl<A: Send, B: Send> CopyOutputs for (A, B) {
 pub struct CopyTo2<Src, Dst>
 where
     Src: CopyTo<Dst>,
-    <Src::Op as DeviceOperation>::Output: CopyOutputs,
+    <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
 {
     src: Input<Src>,
     dst: Input<Dst>,
     // One element pipe per copy output (move-once storage), mirroring the
     // macro-emitted multi-output kernel. The output tuple is reconstructed from
     // both in `into_output`.
-    src_pipe: Pipe<<<Src::Op as DeviceOperation>::Output as CopyOutputs>::Src>,
-    dst_pipe: Pipe<<<Src::Op as DeviceOperation>::Output as CopyOutputs>::Dst>,
+    src_pipe: Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src>,
+    dst_pipe: Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
 }
 
 /// Build an eager copy leaf. `src` / `dst` may each be a concrete buffer or an
@@ -2905,7 +2979,7 @@ pub fn eager_copy_to<Src, Dst>(
 ) -> CopyTo2<Src, Dst>
 where
     Src: CopyTo<Dst>,
-    <Src::Op as DeviceOperation>::Output: CopyOutputs,
+    <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
 {
     CopyTo2 {
         src: src.into(),
@@ -2920,17 +2994,17 @@ where
     Src: CopyTo<Dst> + Send,
     Dst: Send,
     Src::Op: Send,
-    <Src::Op as DeviceOperation>::Output: CopyOutputs,
+    <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
 {
     type Output = (
-        <<Src::Op as DeviceOperation>::Output as CopyOutputs>::Src,
-        <<Src::Op as DeviceOperation>::Output as CopyOutputs>::Dst,
+        <<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src,
+        <<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst,
     );
     // Two element pipes, like the multi-output kernel: the downstream closure
     // gets `(pa, pb)` and selects either buffer.
     type Handle = (
-        Pipe<<<Src::Op as DeviceOperation>::Output as CopyOutputs>::Src>,
-        Pipe<<<Src::Op as DeviceOperation>::Output as CopyOutputs>::Dst>,
+        Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src>,
+        Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
     );
 
     fn output_pipe(&self) -> Pipe<Self::Output> {
@@ -2957,7 +3031,7 @@ where
         // buffer-use registration. ONE enqueue → its returned Deps hold one
         // completion event.
         let op = src.copy_to(dst);
-        let (out, out_deps) = op.execute(ec, deps)?;
+        let (out, out_deps) = op.run(ec, deps)?;
         let (out_src, out_dst) = out.into_parts();
         // Clone the completion Dep onto BOTH element pipes so whichever side
         // flows downstream carries the wait-list (and the terminal reconstruct

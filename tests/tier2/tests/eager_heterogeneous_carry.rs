@@ -24,8 +24,8 @@
 //! these stops compiling — which is the point.
 
 use claspr::Context;
+use claspr::bundle;
 use claspr::eager::{DeviceOpExt, bundle2, download, upload, value};
-use claspr::eager_bundle;
 use claspr_test_kernels::kernels;
 
 const N: usize = 32;
@@ -50,16 +50,16 @@ fn bundle_mixes_pipe_and_value_scalar_arrives_by_value() {
     let ks = kernels::kernels(&ctx).expect("kernels");
 
     let (out, carried): (Vec<u32>, u32) = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
-        .and_then(|buf| eager_bundle!(ks.fill_u32([N], buf, 7), value(42u32)))
+        .and_then(|buf| bundle!(ks.fill_u32([N], buf, 7), value(42u32)))
         // `buf` is a Pipe<DeviceSlice>, `scalar` is a u32 BY VALUE — this binding
         // would not type-check if the bundle handed a Pipe<u32> here.
         .and_then(|(buf, scalar)| {
             // Use the scalar as a value to prove it's not a pipe: pick the kernel
             // factor from it, and carry it onward unchanged.
             let factor = if scalar == 42 { 1u32 } else { 0 };
-            eager_bundle!(ks.scale_u32([N], buf, factor), value(scalar))
+            bundle!(ks.scale_u32([N], buf, factor), value(scalar))
         })
-        .and_then(|(buf, scalar)| eager_bundle!(download(buf), value(scalar)))
+        .and_then(|(buf, scalar)| bundle!(download(buf), value(scalar)))
         .sync(&ctx)
         .expect("mixed pipe+scalar bundle");
 
@@ -76,13 +76,13 @@ fn carried_scalar_is_computed_on_in_chain() {
     let ks = kernels::kernels(&ctx).expect("kernels");
 
     let (out, step): (Vec<u32>, u32) = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
-        .and_then(|buf| eager_bundle!(ks.scale_u32([N], buf, 2), value(0u32)))
+        .and_then(|buf| bundle!(ks.scale_u32([N], buf, 2), value(0u32)))
         .and_then(|(buf, step)| {
             // step: u32 — `step + 1` is a build-time host computation.
-            eager_bundle!(ks.scale_u32([N], buf, 2), value(step + 1))
+            bundle!(ks.scale_u32([N], buf, 2), value(step + 1))
         })
-        .and_then(|(buf, step)| eager_bundle!(ks.scale_u32([N], buf, 2), value(step + 1)))
-        .and_then(|(buf, step)| eager_bundle!(download(buf), value(step)))
+        .and_then(|(buf, step)| bundle!(ks.scale_u32([N], buf, 2), value(step + 1)))
+        .and_then(|(buf, step)| bundle!(download(buf), value(step)))
         .sync(&ctx)
         .expect("counter chain");
 
@@ -117,14 +117,14 @@ fn bare_pipe_is_an_op_in_a_bundle() {
     let out = claspr::DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("out");
 
     // add_u32 has a 3-pipe handle (a, b, out); take `out` BARE into a bundle.
-    let (summed, tag): (Vec<u32>, u32) = eager_bundle!(
+    let (summed, tag): (Vec<u32>, u32) = bundle!(
         ks.fill_u32([N], a, 3),
         ks.fill_u32([N], b, 4),
         ks.fill_u32([N], out, 0)
     )
     .and_then(|(a, b, out)| ks.add_u32([N], a, b, out))
-    .and_then(|(_a, _b, out)| eager_bundle!(out, value(99u32))) // `out`: bare Pipe
-    .and_then(|(out, tag)| eager_bundle!(download(out), value(tag)))
+    .and_then(|(_a, _b, out)| bundle!(out, value(99u32))) // `out`: bare Pipe
+    .and_then(|(out, tag)| bundle!(download(out), value(tag)))
     .sync(&ctx)
     .expect("bare-pipe-in-bundle");
 

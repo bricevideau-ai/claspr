@@ -85,6 +85,31 @@ stays the ONLY immutable-init path); delete old closure layer + flatten the
 `eager` namespace to crate root. 7 staged green sub-commits. Plan file:
 `.claude/plans/declarative-hopping-parrot.md`.
 
+**PROGRESS:** stages 1+2 (`38109f1`, `9177443`); stages 4+5 LANDED together
+(kernel macro is `DeviceOp`-only + old closure layer deleted + namespace
+flattened). The old `DeviceOperation` trait is gone; its only residue is a tiny
+`pub trait DeviceEnqueue { type Output; fn run(ec, deps) -> (Output, Deps) }` in
+`eager.rs` that the host-view acquire/release leaves (`host_view.rs`) and the
+`copy_to` family (`copy.rs`) delegate their raw enqueue body to — the eager wrappers
+can't reconstruct those private-field types, so they hold the buffer/view and call
+`.run()`. `Dep`/`Deps`/`deps_as_events`/`wrap_event` moved from the deleted
+`device_op.rs` into `eager.rs`. `eager_bundle!`→`bundle!`. Entry macros
+(`upload!`/`download!`/`device_slice!`/`mapped_slice!`/`usm_slice!`/…) re-pointed
+to the eager free fns. `eager_*` crate-root aliases dropped; eager items
+re-exported with plain names (`claspr::eager::X` paths still work — tests unchanged
+there). **CAUGHT + FIXED a stage-4 regression:** the deleted `KernelOp::enqueue_into`
+carried an `assert_same_context` loop over caller-added `.after()` deps that the new
+`DeviceOp::execute` had dropped — cross_queue's cross-context-panic test went red;
+restored the loop in both execute bodies (single + multi-output). The two Tier-2
+examples (async-pipeline, batch-inference) are temporarily commented out of the
+workspace members (they still call the removed closure surface) — stage 7 migrates
++ re-adds them. The old tier2 closure tests + `safety_compile_fail` ui_test harness
+(old-API fixtures) were deleted with the layer. Remaining: stage 3 (fold Tier-1
+buffer builders into DeviceOps), stage 6 (marker ergonomics + piped-buffer methods +
+G1), stage 7 (examples + README cuda-oxide credit + compile-fail re-bless).
+Pre-existing env failure unrelated to this work: `image_dispatch` dim2_array/dim3
+(pocl lacks 3D/2D-array `write_image` builtins on this CPU — fails identically at HEAD).
+
 **📋 POST-REUNIFICATION (Brice): re-read cuda-oxide's async docs and decide
 match-vs-diverge per primitive.**
 https://nvlabs.github.io/cuda-oxide/async-programming/the-device-operation-model.html

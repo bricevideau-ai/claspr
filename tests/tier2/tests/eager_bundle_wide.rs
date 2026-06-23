@@ -1,10 +1,10 @@
-//! Wide-arity `eager_bundle!` + the multi-output-branch root-cause lock.
+//! Wide-arity `bundle!` + the multi-output-branch root-cause lock.
 //!
 //! Two things this file guards that the cutover suite port had dropped:
 //!
 //! 1. **Arity 2..=16.** The eager layer originally generated only
 //!    `bundle2/3/4`; everything wider was expressed by nesting `bundle2`.
-//!    `eager_bundle!(a, …)` (the variadic macro) + `bundleN` for N up to 16 are
+//!    `bundle!(a, …)` (the variadic macro) + `bundleN` for N up to 16 are
 //!    restored, mirroring the legacy `bundle!`. Here: a flat 8-way and a flat
 //!    16-way bundle of pure values, plus an 8-way bundle of device chains.
 //!
@@ -17,8 +17,8 @@
 //!    nested bundles, and a bundle whose branch is a `copy_to` chain.
 
 use claspr::Context;
+use claspr::bundle;
 use claspr::eager::{DeviceOpExt, alloc_zero, bundle2, download, eager_copy_to, upload, value};
-use claspr::eager_bundle;
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;
@@ -38,7 +38,7 @@ fn ctx() -> Option<Context> {
 #[test]
 fn eager_bundle_macro_arity8() {
     let Some(ctx) = ctx() else { return };
-    let (a, b, c, d, e, f, g, h) = eager_bundle!(
+    let (a, b, c, d, e, f, g, h) = bundle!(
         value(1u32),
         value(2u32),
         value(3u32),
@@ -58,7 +58,7 @@ fn eager_bundle_macro_arity8() {
 #[test]
 fn eager_bundle_macro_arity16() {
     let Some(ctx) = ctx() else { return };
-    let t = eager_bundle!(
+    let t = bundle!(
         value(0u32),
         value(1u32),
         value(2u32),
@@ -99,7 +99,7 @@ fn eager_bundle_macro_arity8_device_chains() {
             .and_then(move |buf| ks.fill_u32([N], buf, seed))
             .and_then(download)
     };
-    let (a, b, c, d, e, f, g, h) = eager_bundle!(
+    let (a, b, c, d, e, f, g, h) = bundle!(
         branch(10),
         branch(11),
         branch(12),
@@ -133,7 +133,7 @@ fn eager_bundle_macro_arity8_device_chains() {
 #[test]
 fn bundle_of_multi_output_branches() {
     let Some(ctx) = ctx() else { return };
-    let ((a0, a1), (b0, b1)) = eager_bundle!(
+    let ((a0, a1), (b0, b1)) = bundle!(
         bundle2(value(1u32), value(2u32)),
         bundle2(value(3u32), value(4u32)),
     )
@@ -158,7 +158,7 @@ fn bundle_with_copy_chain_branch() {
         .sync(&ctx)
         .expect("alloc dst");
 
-    let (copied, marker): (Vec<u32>, u32) = eager_bundle!(
+    let (copied, marker): (Vec<u32>, u32) = bundle!(
         eager_copy_to(src, dst).and_then(|(_src, dst)| download(dst)),
         value(99u32),
     )

@@ -49,7 +49,7 @@
 //! late-bind-launcher pattern, every Tier 2 op should produce an
 //! Event that downstream stages can wait on.)
 
-use crate::device_op::{Deps, DeviceOperation, deps_as_events, wrap_event};
+use crate::eager::{Deps, DeviceEnqueue, deps_as_events, wrap_event};
 use crate::exec_ctx::ExecutionContext;
 use crate::{
     Buffer, DeviceSlice, DeviceSliceUninit, Launcher, MappedSlice, MappedSliceUninit, MemMode,
@@ -59,16 +59,17 @@ use opencl3::event::{Event, retain_event};
 use opencl3::types::{CL_NON_BLOCKING, cl_event};
 use std::ffi::c_void;
 
-/// Polymorphic copy: `src.copy_to(dst).and_then(...)`. The
-/// associated `Op` type is the [`DeviceOperation`] that knows how
-/// to perform the right runtime copy for the (src, dst) type pair.
-/// See the module rustdoc for the supported pairs.
+/// Polymorphic copy: `src.copy_to(dst)`. The associated `Op` type is the
+/// [`DeviceEnqueue`] op that knows how to perform the right runtime copy for the
+/// (src, dst) type pair. The eager `copy_to` graph leaf
+/// ([`CopyTo2`](crate::eager::CopyTo2)) drives it. See the module rustdoc for
+/// the supported pairs.
 pub trait CopyTo<Dst>: Sized {
-    type Op: DeviceOperation;
+    type Op: DeviceEnqueue;
     fn copy_to(self, dst: Dst) -> Self::Op;
 }
 
-/// Shared op-state container — one struct, many [`DeviceOperation`]
+/// Shared op-state container — one struct, many [`DeviceEnqueue`]
 /// impls (one per (src, dst) pair).
 pub struct CopyToOp<S, D> {
     state: Option<(S, D)>,
@@ -84,7 +85,7 @@ impl<S, D> CopyToOp<S, D> {
     fn take(&mut self) -> (S, D) {
         self.state
             .take()
-            .expect("CopyToOp::execute called twice — internal claspr-async bug")
+            .expect("CopyToOp::run called twice — internal claspr bug")
     }
 }
 
@@ -102,7 +103,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceOperation for CopyToOp<DeviceSlice<T, M1>, DeviceSlice<T, M2>>
+impl<T, M1, M2> DeviceEnqueue for CopyToOp<DeviceSlice<T, M1>, DeviceSlice<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -110,7 +111,7 @@ where
 {
     type Output = (DeviceSlice<T, M1>, DeviceSlice<T, M2>);
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, mut dst) = self.take();
         let event = DeviceSlice::copy_to(&src, &mut dst)
             .after_all(deps_as_events(&deps))
@@ -133,7 +134,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceOperation for CopyToOp<DeviceSlice<T, M1>, DeviceSliceUninit<T, M2>>
+impl<T, M1, M2> DeviceEnqueue for CopyToOp<DeviceSlice<T, M1>, DeviceSliceUninit<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -142,7 +143,7 @@ where
     // dst transitions Uninit → Init because the copy writes every byte.
     type Output = (DeviceSlice<T, M1>, DeviceSlice<T, M2>);
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, uninit_dst) = self.take();
         // SAFETY: the copy_to enqueue below writes every byte of dst
         // before the chain's downstream stages observe the buffer
@@ -170,7 +171,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceOperation for CopyToOp<MappedSlice<T, M1>, MappedSlice<T, M2>>
+impl<T, M1, M2> DeviceEnqueue for CopyToOp<MappedSlice<T, M1>, MappedSlice<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -178,7 +179,7 @@ where
 {
     type Output = (MappedSlice<T, M1>, MappedSlice<T, M2>);
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, dst) = self.take();
         let event = MappedSlice::copy_to(&src, &dst)
             .after_all(deps_as_events(&deps))
@@ -201,7 +202,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceOperation for CopyToOp<MappedSlice<T, M1>, MappedSliceUninit<T, M2>>
+impl<T, M1, M2> DeviceEnqueue for CopyToOp<MappedSlice<T, M1>, MappedSliceUninit<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -209,7 +210,7 @@ where
 {
     type Output = (MappedSlice<T, M1>, MappedSlice<T, M2>);
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, uninit_dst) = self.take();
         // SAFETY: copy_to below writes every byte of dst.
         let dst = unsafe { uninit_dst.assume_init() };
@@ -285,7 +286,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceOperation for CopyToOp<MappedSlice<T, M1>, USMSlice<T, M2>>
+impl<T, M1, M2> DeviceEnqueue for CopyToOp<MappedSlice<T, M1>, USMSlice<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -293,7 +294,7 @@ where
 {
     type Output = (MappedSlice<T, M1>, USMSlice<T, M2>);
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, dst) = self.take();
         if src.len() != dst.len() {
             return Err(crate::Error::LengthMismatch {
@@ -340,7 +341,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceOperation for CopyToOp<MappedSlice<T, M1>, USMSliceUninit<T, M2>>
+impl<T, M1, M2> DeviceEnqueue for CopyToOp<MappedSlice<T, M1>, USMSliceUninit<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -348,7 +349,7 @@ where
 {
     type Output = (MappedSlice<T, M1>, USMSlice<T, M2>);
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, uninit_dst) = self.take();
         if src.len() != uninit_dst.len() {
             return Err(crate::Error::LengthMismatch {
@@ -392,7 +393,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceOperation for CopyToOp<USMSlice<T, M1>, MappedSlice<T, M2>>
+impl<T, M1, M2> DeviceEnqueue for CopyToOp<USMSlice<T, M1>, MappedSlice<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -400,7 +401,7 @@ where
 {
     type Output = (USMSlice<T, M1>, MappedSlice<T, M2>);
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, dst) = self.take();
         if src.len() != dst.len() {
             return Err(crate::Error::LengthMismatch {
@@ -441,7 +442,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceOperation for CopyToOp<USMSlice<T, M1>, MappedSliceUninit<T, M2>>
+impl<T, M1, M2> DeviceEnqueue for CopyToOp<USMSlice<T, M1>, MappedSliceUninit<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -449,7 +450,7 @@ where
 {
     type Output = (USMSlice<T, M1>, MappedSlice<T, M2>);
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, uninit_dst) = self.take();
         if src.len() != uninit_dst.len() {
             return Err(crate::Error::LengthMismatch {
@@ -492,7 +493,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceOperation for CopyToOp<USMSlice<T, M1>, USMSlice<T, M2>>
+impl<T, M1, M2> DeviceEnqueue for CopyToOp<USMSlice<T, M1>, USMSlice<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -500,7 +501,7 @@ where
 {
     type Output = (USMSlice<T, M1>, USMSlice<T, M2>);
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, dst) = self.take();
         if src.len() != dst.len() {
             return Err(crate::Error::LengthMismatch {
@@ -541,7 +542,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceOperation for CopyToOp<USMSlice<T, M1>, USMSliceUninit<T, M2>>
+impl<T, M1, M2> DeviceEnqueue for CopyToOp<USMSlice<T, M1>, USMSliceUninit<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -549,7 +550,7 @@ where
 {
     type Output = (USMSlice<T, M1>, USMSlice<T, M2>);
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, uninit_dst) = self.take();
         if src.len() != uninit_dst.len() {
             return Err(crate::Error::LengthMismatch {
