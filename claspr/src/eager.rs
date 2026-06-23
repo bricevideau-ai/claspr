@@ -3981,15 +3981,10 @@ where
 /// closure-layer `and_then_host.rs`; running it synchronously was a regression.
 ///
 /// Errors (closure `Err`, panic → `HostPanic`, map-wait failure) are stashed in
-/// the chain-wide host-error slot (first-writer-wins). The host-error slot — NOT
-/// the user-event status — is the authoritative failure channel: the user event
-/// is **always** completed `CL_COMPLETE` (never a negative status), and the
-/// terminal (`sync`/`run`/async poll) checks the slot even on a successful wait,
-/// preferring the stashed rich error and discarding any downstream output. That
-/// keeps abort semantics (the caller never receives data computed past a failing
-/// host closure) without ever completing a user event negative — which deadlocks
-/// legacy Intel NEO on a downstream blocking transfer gated on it (see the worker
-/// body for the full diagnosis).
+/// the chain-wide host-error slot (first-writer-wins) and the user event is
+/// signalled with a negative status; the negative status cascades through the
+/// in-queue dependency graph and the terminal (`sync`/`run`) prefers the stashed
+/// rich variant over the `Error::OpenCl(-1)` cascade.
 fn run_host_seam<O, F>(
     source_value: O,
     source_deps: Deps,
@@ -4030,46 +4025,28 @@ where
     let worker_user_event = Arc::clone(&user_event);
     let worker_host_error = ec.host_error_slot();
     std::thread::spawn(move || {
-        let (_status, handle, rust_err) = run_host_worker::<O, F>(
-            handle,
-            map_events,
-            source_deps,
-            &worker_host_error,
-            host_call,
-        );
-        // Stash the rich Rust error. The chain-wide host-error slot — NOT the
-        // user-event status — is the authoritative failure channel. First-writer
-        // wins (a concurrent failing host worker in the same bundle/fan-out may
-        // already have written).
+        let (status, mut handle, rust_err) =
+            run_host_worker::<O, F>(handle, map_events, source_deps, host_call);
+        // Stash the rich Rust error before signalling, so the terminal can prefer
+        // it over the cl_event cascade. First-writer-wins (a concurrent failing
+        // host worker in the same bundle/fan-out may already have written).
         if let Some(err) = rust_err {
             let mut slot = worker_host_error.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(err);
             }
         }
-        // ALWAYS complete the user event with CL_COMPLETE — never a negative
-        // status. The terminal (`wait_on` / async poll) checks the host-error
-        // slot even on a "successful" wait and prefers the stashed rich error,
-        // discarding any downstream output. So abort semantics hold (the caller
-        // never receives data computed past a failing host closure) WITHOUT ever
-        // completing a user event negative.
-        //
-        // Why this matters: a NEGATIVE user-event status DEADLOCKS legacy Intel
-        // NEO. The queued unmap — and the downstream *blocking* transfer gated on
-        // it, e.g. `…and_then_host(|_| Err(..)).and_then(download)` — is aborted
-        // by NEO, but the blocking enqueue's host-side wait never wakes →
-        // permanent hang (pinned 2026-06-23: cliloader hung ~100%, HSTRACE showed
-        // the terminal's blocking read entering its wait, then the worker setting
-        // the user event to -1, then no return). pocl does NOT cascade the
-        // negative status downstream, so it completed and this path passed review.
-        // Completing CL_COMPLETE lets the queued unmap fire normally on every
-        // runtime — the buffer is cleaned by that in-queue unmap, so no defensive
-        // sync unmap is needed (and the old defensive unmap itself raced to
-        // CL_INVALID_VALUE on NEO, a double unmap).
-        let _ = complete_user_event(&worker_user_event, opencl3::event::CL_COMPLETE);
-        // The queued unmap fires here (gated on the now-complete user event); the
-        // handle then drops as a no-op (`unmap_enqueued` is set).
-        drop(handle);
+        if status < 0 {
+            // On error the queued unmap (waiting on the user event) is terminated
+            // by the runtime rather than executing — leaving the buffer mapped.
+            // Force the defensive sync unmap NOW so the buffer is clean by the
+            // time the terminal observes the error.
+            <O as Mappable>::mark_unmap_not_done(&mut handle);
+            drop(handle);
+        }
+        let _ = complete_user_event(&worker_user_event, status);
+        // Success path: handle drops here (no-op — the queued unmap fires via the
+        // user event on its own).
     });
 
     // Downstream gates on the unmap events (transitively the user event). When
@@ -4085,25 +4062,12 @@ where
 
 /// Worker body for [`run_host_seam`]. Waits the source + map events, runs the
 /// closure under `catch_unwind`, and returns `(status, handle, optional rich
-/// error)`. The caller stashes the rich error in the host-error slot; `status`
-/// is informational only (`CL_COMPLETE` on success, negative otherwise) — the
-/// caller no longer forwards it to the user event (that is always completed
-/// `CL_COMPLETE`; see [`run_host_seam`]).
-///
-/// `host_error` is the chain-wide error slot. Because the seam now always
-/// completes its user event `CL_COMPLETE` (never negative — that deadlocks NEO,
-/// see [`run_host_seam`]), the in-queue cl_event cascade can no longer carry "an
-/// upstream host stage already failed" to a downstream host worker. The slot
-/// does that: after its source events resolve, a downstream worker checks the
-/// slot and short-circuits (its closure never runs) if it is already set. This
-/// keeps abort semantics — `and_then_host(Err).and_then_host(side_effect)` must
-/// not run the second closure — without any negative user-event status. The
-/// check is host-side, so it behaves identically on every runtime.
+/// error)` so the caller can stash the error + trigger the defensive unmap on
+/// failure. `status` is `CL_COMPLETE` on success, negative otherwise.
 fn run_host_worker<O, F>(
     mut handle: O::MapHandle,
     map_events: Vec<crate::Event>,
     source_deps: Deps,
-    host_error: &std::sync::Arc<std::sync::Mutex<Option<Error>>>,
     host_call: F,
 ) -> (i32, O::MapHandle, Option<Error>)
 where
@@ -4114,23 +4078,12 @@ where
     use opencl3::event::CL_COMPLETE;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    // Short-circuit on a genuine CL failure in the source events. (An upstream
-    // *host* error no longer cascades through these — they now complete
-    // CL_COMPLETE — so a `wait()` Err here is a real device/runtime failure.)
-    // Don't stash — whoever produced the failing event already did.
+    // Short-circuit on an upstream chain error (negative source-event status,
+    // e.g. a previous failing host seam). Don't stash — the upstream already did.
     for ev in &source_deps {
         if ev.as_ref().wait().is_err() {
             return (-1, handle, None);
         }
-    }
-    // Upstream host-stage error already recorded in the chain slot: abort before
-    // running our closure. It must not execute on the result of a failed chain
-    // (restores the abort guarantee the negative user-event status used to give,
-    // now that the user event is always CL_COMPLETE). The upstream stashes the
-    // error BEFORE completing the user event we just waited on, so by the time
-    // that wait returns the slot is guaranteed visible.
-    if host_error.lock().unwrap().is_some() {
-        return (-1, handle, None);
     }
     // Map-event failure is a host-observable CL error — stash the real cause.
     for ev in &map_events {
