@@ -169,6 +169,25 @@ fn value_and_arced() {
     // through the Arc) instead.
     let g = shared.map().wait().expect("map");
     assert!(g.iter().all(|&v| v == 5), "arced buffer; got {:?}", &g[..8]);
+
+    // `.arc()` method is the cuda-oxide-style alias for `arced(self)` — must be
+    // equivalent. Same buffer, built via the method spelling.
+    let shared2 = upload(vec![5u32; N]).arc().sync(&ctx).expect("arc method");
+    let g2 = shared2.map().wait().expect("map");
+    assert!(
+        g2.iter().all(|&v| v == 5),
+        "arc() buffer; got {:?}",
+        &g2[..8]
+    );
+
+    // And it composes into `arc_split` exactly like `arced` does (one producer,
+    // 2 read-only branches), proving the method drops into the same graph slot.
+    // Both array slots are `Arc::clone`s of the SAME `cl_mem`.
+    let [s1, s2] = arc_split::<2, _>(upload(vec![6u32; N]).arc())
+        .sync(&ctx)
+        .expect("arc() into arc_split");
+    let (a, b) = (s1.map().wait().expect("map"), s2.map().wait().expect("map"));
+    assert!(a.iter().all(|&v| v == 6) && b.iter().all(|&v| v == 6));
 }
 
 /// `bundle2`/`bundle3`: independent branches run and join; outputs tuple.

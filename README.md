@@ -226,7 +226,7 @@ On macOS, the system OpenCL framework is picked up automatically (no `OCL_ICD_VE
 - [rust-gpu](https://github.com/Rust-GPU/rust-gpu) — the SPIR-V codegen backend
 - [krnl](https://github.com/charles-r-earp/krnl) — closest analog: proc-macro single-source for Vulkan compute
 - [cust](https://github.com/Rust-GPU/Rust-CUDA) — typed launch wrappers for CUDA-Rust
-- [cuda-oxide](https://github.com/Aandreba/cuda-oxide) / [Rust-CUDA](https://github.com/Rust-GPU/Rust-CUDA) — claspr's `DeviceOp` trait (an abbreviation of cuda-oxide's `DeviceOperation`) and its `sync` / `wait` / `submit` terminal vocabulary are inspired by their device-operation surface
+- [cuda-oxide](https://github.com/Aandreba/cuda-oxide) / [Rust-CUDA](https://github.com/Rust-GPU/Rust-CUDA) — claspr's `DeviceOp` trait (an abbreviation of cuda-oxide's `DeviceOperation`) and its `sync` / `wait` / `submit` / `run` terminal vocabulary are inspired by their device-operation surface. The **model diverges**, though: cuda-oxide's `DeviceOperation` is *lazy* and *closure-composed* (combinators capture `FnOnce`s that run at execute time over the runtime value), so the graph is opaque until you run it. claspr's `DeviceOp` shares the name and terminal vocabulary but is *eager* — builders run at construction over a build-time `Handle` — producing a **closure-free struct graph** you can `describe()`/`description()` to inspect node-by-node *without executing*. Same words, different mental model: don't import cuda-oxide's lazy-closure intuition.
 - [rust-gpu-opencl-samples](https://github.com/bricevideau-ai/rust-gpu-opencl-samples) — the runtime patterns claspr generalises
 
 ## License

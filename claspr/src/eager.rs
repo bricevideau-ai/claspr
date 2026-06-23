@@ -320,6 +320,16 @@ pub enum ExecMode {
 /// A node in the eager graph. `execute` runs it against the context, moving its
 /// output into its pipe; `describe` reports structure **without** executing.
 /// Builder verbs ([`and_then`](DeviceOpExt::and_then)) are on [`DeviceOpExt`].
+///
+/// **Inspectable without running.** Because the graph is a closure-free struct
+/// (builders ran eagerly at construction; no `FnOnce` is retained), it can be
+/// walked structurally before — or instead of — execution:
+/// [`description()`](DeviceOpExt::description) returns the node names in
+/// execution order without enqueueing a single command. This is the flagship
+/// capability cuda-oxide's lazy, closure-composed `DeviceOperation` cannot
+/// offer: there the composition lives inside opaque closures, so the only way
+/// to learn what a graph does is to run it. claspr's vocabulary is shared
+/// heritage; the eager, inspectable model is the divergence.
 pub trait DeviceOp: Send {
     /// What this op produces at run time.
     type Output: Send;
@@ -404,6 +414,13 @@ pub trait DeviceOp: Send {
 pub trait DeviceOpExt: DeviceOp + Sized {
     /// Sequential composition. **Eager**: runs `f` now with the upstream's
     /// build-time output [`Pipe`], stores the returned op. No closure is kept.
+    ///
+    /// **False friend with cuda-oxide.** Unlike cuda-oxide's `and_then` (whose
+    /// closure runs at *execute* time over the runtime value), claspr's runs the
+    /// builder **now, at construction**, over a build-time [`Handle`](DeviceOp::Handle)
+    /// — a [`Pipe`] or, for [`value`], the by-value `T` — and retains no closure.
+    /// Same name, opposite timing: the eager build is what makes the resulting
+    /// graph a closure-free, [`describe`](DeviceOp::describe)-able struct.
     fn and_then<U, F>(self, f: F) -> AndThen<Self, U>
     where
         U: DeviceOp,
@@ -530,6 +547,9 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// is materialised here (handles/Vecs); the event just gates *when* the
     /// device work is done. Tier-1 heritage spelling; `submit` is the
     /// concrete-head no-launcher form (see the buffer ops).
+    ///
+    /// ≈ cuda-oxide's `unsafe async_on`, but safe here and event-returning
+    /// (you get a completion [`Event`](crate::Event) to chain, not a raw stream).
     fn submit_on<L: crate::Launcher + ?Sized>(self, launcher: &L) -> Result<crate::Event> {
         use crate::Launcher;
         let device = launcher.context().device().clone();
@@ -598,6 +618,17 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         let mut v = Vec::new();
         self.describe(&mut v);
         v
+    }
+
+    /// Wrap this op's output in [`Arc`] for shared fan-out — the cuda-oxide-style
+    /// method spelling of the free fn [`arced(self)`](arced). Equivalent in every
+    /// way; pick whichever reads better at the call site
+    /// (`upload(v).arc()` vs `arced(upload(v))`). Feeds [`arc_split`].
+    fn arc(self) -> Arced<Self>
+    where
+        Self::Output: Sync,
+    {
+        arced(self)
     }
 }
 impl<T: DeviceOp> DeviceOpExt for T {}
@@ -726,6 +757,10 @@ pub struct Value<T: Send> {
 /// Lift a `Clone` host value into the graph with a **by-value** handle (so
 /// downstream closures get the value, not a pipe — see [`Value`]). For a
 /// non-`Clone` owned resource use [`lift`].
+///
+/// `value` + [`lift`] together ≈ cuda-oxide's `value` (one host value into the
+/// graph), split here by whether the handle is by-value (`value`) or by-pipe
+/// (`lift`).
 pub fn value<T: Send + Clone + 'static>(v: T) -> Value<T> {
     Value {
         v: Some(v),
@@ -785,6 +820,8 @@ pub struct Lift<T: Send> {
 }
 
 /// Lift an owned resource into the graph (default `Pipe` handle — see [`Lift`]).
+/// With [`value`], together ≈ cuda-oxide's `value` (the by-pipe half, for
+/// non-`Clone` owned resources).
 pub fn lift<T: Send + 'static>(v: T) -> Lift<T> {
     Lift {
         v: Some(v),
@@ -1002,7 +1039,8 @@ pub struct Arced<S: DeviceOp> {
     out: Pipe<Arc<S::Output>>,
 }
 
-/// Wrap `source`'s output in `Arc`.
+/// Wrap `source`'s output in `Arc`. ≈ cuda-oxide's `.arc()` (also available here
+/// as the [`arc`](DeviceOpExt::arc) method).
 pub fn arced<S: DeviceOp>(source: S) -> Arced<S>
 where
     S::Output: Sync,
@@ -1072,6 +1110,9 @@ where
 /// branches. `source` is typically an [`arced`] op (`Output = Arc<T>`), so the
 /// per-branch clone is a cheap refcount bump. Pick `N` via turbofish to match
 /// the destructure arity: `arc_split::<3, _>(arced(upload(…)))`.
+///
+/// ≈ a homogeneous N-ary `unzip!` over a shared [`arc`](DeviceOpExt::arc)ed input
+/// (one producer, `N` read-only consumers).
 pub fn arc_split<const N: usize, S: DeviceOp>(source: S) -> ArcSplit<S, N>
 where
     S::Output: Clone,
@@ -1195,7 +1236,8 @@ macro_rules! impl_eager_bundle {
             $($pf: Pipe<<$ty as DeviceOp>::Output>,)+
         }
 
-        #[doc = concat!("Construct an eager [`", stringify!($name), "`].")]
+        #[doc = concat!("Construct an eager [`", stringify!($name),
+            "`]. \u{2248} cuda-oxide's `zip!` at this fixed arity.")]
         #[allow(clippy::too_many_arguments)]
         pub fn $ctor<$($ty: DeviceOp),+>($($field: $ty),+) -> $name<$($ty),+> {
             $(let $pf = $field.output_pipe();)+
@@ -1295,6 +1337,8 @@ impl_eager_bundle!(Bundle16, bundle16, a: A: pa, b: B: pb, c: C: pc, d: D: pd, e
 /// Variadic constructor for [`Bundle2`] through [`Bundle16`] — picks the right
 /// `bundleN` based on the number of arguments. Each arm runs its branches
 /// independently and joins them with a single marker event.
+///
+/// ≈ cuda-oxide's `zip!` (heterogeneous parallel join into a tuple).
 ///
 /// ```ignore
 /// let (a, b) = bundle!(op_a, op_b).sync(&ctx)?;
