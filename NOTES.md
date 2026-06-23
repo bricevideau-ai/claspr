@@ -11,6 +11,47 @@ items resolve.
 
 ### Eager struct-graph cutover (branch `eager-cutover`, from main, 2026-06-18)
 
+**✅ SVM/Mapped cutover DONE (2026-06-23) — the LAST dual-idiom path is gone.**
+`MappedSlice`'s `write`/`fill`/`copy_to` were the only remaining borrow-based
+Tier-1 builders (`SvmWriteOp`/`SvmFillOp`/`SvmCopyOp`); everything else had moved
+to the eager `DeviceOp` graph. **PARTIAL cutover** because SVM `copy_to` was
+ALREADY eager (`CopyTo2`→`CopyToOp` in `copy.rs`, all 10 cross-type pairs) — only
+`write`/`fill` needed new ops. What changed: (1) the three old SVM builders'
+enqueue bodies were lifted into `pub(crate) fn svm_{fill,write,copy}_enqueue` raw
+helpers in `mapped.rs` (each does enqueue + retain + `register_use` on the
+owner(s), via a shared `register_event_on`; all NON-BLOCKING — SVM has no native
+`CL_BLOCKING` flag, the terminal waits); (2) new eager leaves `FillMapped` /
+`WriteMapped` in `eager.rs` (init `MappedSlice`, mirror `Fill`/`WriteDevice`:
+concrete-head no-arg `wait()`/`submit()` via new `concrete_svm_ctx`, pipe-fed
+`wait_on`/`sync` from the blanket); (3) `MappedSlice::{fill,write}` retargeted to
+consume `self` + return the eager op, `copy_to` retargeted to the eager `CopyTo`
+trait (`CopyTo2`, consuming, yields `(src,dst)`); (4) `Pipe<MappedSlice>` got
+`write`/`fill`/`copy_to` inherent verbs matching `Pipe<DeviceSlice>`; (5) the old
+builders DELETED; their internal callers re-wired to the raw helpers
+(`copy.rs` Mapped↔Mapped pair, `eager.rs` `WriteMappedUninit`/`FillMappedUninit`,
+`mapped.rs` `alloc_zero`). **`map`/`map_mut` deliberately KEPT as `MapOp`/
+`MapMutOp` host-access RAII** — they return guards for host reads/writes, are NOT
+graph nodes (exactly like `DeviceSlice::map`/`map_mut` → `DeviceMapOp` which the
+DeviceSlice fold also kept). SVM-specific semantics preserved: fill/write stay
+non-blocking; non-blocking host-source writes `register_drop_callback` to keep the
+source alive across the async window (mirrors `WriteDevice`); the copy/fill/write
+events still auto-register on the buffer(s)' `last_use` so Drop's
+`clEnqueueSVMFree` queue-orders after them. USM: no init-`USMSlice` write/fill
+verbs existed (USM is host memory — `USMSliceUninit::{fill_into,write_from}` are
+the synchronous host paths; `copy_to` is the eager `CopyTo` trait) — nothing to
+cut. Test sites respelled to move-out form (`let buf = buf.fill(v).wait()?`):
+`eager_svm_fill_copy.rs` (6 tier-1 fns; the `.after(&fill_evt)` write-after-fill
+became sequential fill→write) + `eager_buffer_ops.rs` (1 fn). Re-exports: dropped
+`Svm*Op` from `mapped`, added `FillMapped`/`WriteMapped`/`fill_mapped`/
+`write_mapped` to the eager crate-root set. Full gate green: workspace build
+(default + async-events, all-targets), fmt, clippy (default + async, `-D warnings`),
+`RUSTDOCFLAGS=-D warnings doc`, compile-fail rustfmt; SVM/USM suites serial on pocl
+(eager_svm_fill_copy 11, eager_buffer_ops 13, tier1 svm 9, stress_svm 1, svm_drop
+3, eager_usm 8, eager_svm_chain 2, eager_cutover 20, safety_compile_fail 8, +
+chain/terminals/host_view/piped/alloc/marker collateral). NOTE: `safety_compile_fail`
+first-run-after-edit hit the documented ui_test-against-stale-rlibs artifact
+([[compiletests_no_release]]) — green deterministically on re-run.
+
 **✅ and_then_host async regression FIXED (cc5f3bc, 2026-06-22).** The eager host
 seam had been (mis)ported to run the closure SYNCHRONOUSLY on the submit thread,
 discarding the whole point of the map/user-event machinery. Restored the

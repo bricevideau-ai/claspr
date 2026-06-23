@@ -1589,6 +1589,18 @@ fn concrete_buf_ctx<T, M: MemMode>(buf: &Input<DeviceSlice<T, M>>) -> Result<Con
         ))
 }
 
+/// SVM analog of [`concrete_buf_ctx`]: recover the owning [`Context`] from a
+/// concrete-head [`Input<MappedSlice>`], or a clear "pipe-fed" error.
+fn concrete_svm_ctx<T, M: MemMode>(buf: &Input<MappedSlice<T, M>>) -> Result<Context> {
+    use crate::Buffer;
+    buf.concrete()
+        .map(|b| b.ctx().clone())
+        .ok_or(Error::NotSupported(
+            "concrete-head terminal (wait/submit) on a pipe-fed SVM op — use \
+         wait_on(&ctx) / sync(&ctx) for piped (graph) inputs",
+        ))
+}
+
 // ── Leaf: in-place fill (eager port of DeviceSliceFillOp) ──────────────
 
 /// Fill a buffer (upstream pipe or concrete) with `value` via a non-blocking
@@ -2132,18 +2144,15 @@ where
         let (uninit, deps) = self.uninit.resolve()?;
         // SAFETY: the SVM fill below writes every byte.
         let buf = unsafe { uninit.assume_init() };
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        // SVM fill is always a non-blocking enqueue; Blocking waits here.
+        let event = crate::mapped::svm_fill_enqueue(&buf, ec, self.value, &raw)?;
         match mode {
             ExecMode::Blocking => {
-                buf.fill(self.value)
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .wait_on(ec)?;
+                event.wait().map_err(Error::OpenCl)?;
                 self.out.put(buf, Deps::new());
             }
             ExecMode::Pipelined => {
-                let event = buf
-                    .fill(self.value)
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .submit_on(ec)?;
                 self.out.put(buf, vec![wrap_event(event)]);
             }
         }
@@ -2438,18 +2447,17 @@ where
             .expect("WriteMappedUninit::execute called twice — internal eager bug");
         // SAFETY: the SVM write below covers every byte.
         let buf = unsafe { uninit.assume_init() };
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        // SVM write is always a non-blocking enqueue (no native CL_BLOCKING flag);
+        // Blocking waits on the returned event here, Pipelined threads it
+        // downstream and keeps `src` alive via register_drop_callback.
+        let event = crate::mapped::svm_write_enqueue(&buf, ec, src.as_slice(), &raw)?;
         match mode {
             ExecMode::Blocking => {
-                buf.write(src.as_slice())
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .wait_on(ec)?;
+                event.wait().map_err(Error::OpenCl)?;
                 self.out.put(buf, Deps::new());
             }
             ExecMode::Pipelined => {
-                let event = buf
-                    .write(src.as_slice())
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .submit_on(ec)?;
                 register_drop_callback(&event, Box::new(src))?;
                 self.out.put(buf, vec![wrap_event(event)]);
             }
@@ -2459,6 +2467,189 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("write_mapped_uninit".into());
+    }
+}
+
+// ── Leaf: in-place SVM fill (eager port of SvmFillOp) ──────────────────────
+
+/// Fill an existing (init) [`MappedSlice`] with `value` via a non-blocking
+/// `clEnqueueSVMMemFill` (or kernel fill for kernel-RO markers), threading the
+/// upstream events as the wait-list. SVM analog of [`Fill`]. The buffer passes
+/// through as the op's output (concrete-head reusable). The fill event is
+/// auto-registered on the buffer's last-use list (inside the raw helper) so
+/// Drop's `clEnqueueSVMFree` waits for it.
+pub struct FillMapped<T: Copy, M: MemMode> {
+    buf: Input<MappedSlice<T, M>>,
+    value: T,
+    out: Pipe<MappedSlice<T, M>>,
+}
+
+/// Build an SVM fill leaf over an existing `MappedSlice` (concrete or piped).
+pub fn fill_mapped<T, M>(buf: impl Into<Input<MappedSlice<T, M>>>, value: T) -> FillMapped<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Fillable + Send + 'static,
+{
+    FillMapped {
+        buf: buf.into(),
+        value,
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> DeviceOp for FillMapped<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Fillable + Send + 'static,
+{
+    type Output = MappedSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<MappedSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        let (buf, deps) = self.buf.resolve()?;
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        // SVM fill is always a non-blocking enqueue (no native CL_BLOCKING flag);
+        // Blocking waits on the returned event here.
+        let event = crate::mapped::svm_fill_enqueue(&buf, ec, self.value, &raw)?;
+        match mode {
+            ExecMode::Blocking => {
+                event.wait().map_err(Error::OpenCl)?;
+                self.out.put(buf, Deps::new());
+            }
+            ExecMode::Pipelined => {
+                self.out.put(buf, vec![wrap_event(event)]);
+            }
+        }
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("fill_mapped".into());
+    }
+}
+
+impl<T, M> FillMapped<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Fillable + Send + 'static,
+{
+    /// Concrete-head blocking terminal: fill on the buffer's own context default
+    /// queue and return the (filled) buffer (`let buf = buf.fill(v).wait()?;`).
+    pub fn wait(self) -> Result<MappedSlice<T, M>> {
+        let ctx = concrete_svm_ctx(&self.buf)?;
+        self.sync(&ctx)
+    }
+
+    /// Concrete-head non-blocking terminal: enqueue the fill on the buffer's own
+    /// context default queue and return a completion [`Event`](crate::Event).
+    pub fn submit(self) -> Result<crate::Event> {
+        let ctx = concrete_svm_ctx(&self.buf)?;
+        let queue = ctx.default_outoforder_queue(ctx.device())?;
+        self.submit_on(&*queue)
+    }
+}
+
+// ── Leaf: write host data into an existing (init) MappedSlice ───────────────
+
+/// Write host `src` into an already-initialised [`MappedSlice`], in place, via a
+/// non-blocking `clEnqueueSVMMemcpy` (host-pointer source). SVM analog of
+/// [`WriteDevice`]. The buffer passes through as the op's output.
+///
+/// SVM write stays **non-blocking** regardless of terminal: `submit_on` returns
+/// the write event so the copy overlaps downstream work, and
+/// `register_drop_callback` keeps the host `src` alive until the memcpy completes
+/// (`CL_COMPLETE`). The `Blocking` terminal waits on that same event.
+pub struct WriteMapped<T, M: MemMode = ReadWrite> {
+    buf: Input<MappedSlice<T, M>>,
+    src: Option<UploadSource<T>>,
+    out: Pipe<MappedSlice<T, M>>,
+}
+
+/// Build an in-place SVM write leaf over an existing `MappedSlice` (concrete or
+/// piped). `M: HostWritable` — same gate as [`MappedSlice::write`].
+pub fn write_mapped<T, M, S>(buf: impl Into<Input<MappedSlice<T, M>>>, src: S) -> WriteMapped<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostWritable + Send + 'static,
+    S: Into<UploadSource<T>>,
+{
+    WriteMapped {
+        buf: buf.into(),
+        src: Some(src.into()),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> DeviceOp for WriteMapped<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostWritable + Send + 'static,
+{
+    type Output = MappedSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<MappedSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        let (buf, deps) = self.buf.resolve()?;
+        let src = self
+            .src
+            .take()
+            .expect("WriteMapped::execute called twice — internal eager bug");
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        // SVM write is always a non-blocking enqueue; Blocking waits on the event
+        // here, Pipelined threads it downstream and keeps `src` alive past it.
+        let event = crate::mapped::svm_write_enqueue(&buf, ec, src.as_slice(), &raw)?;
+        match mode {
+            ExecMode::Blocking => {
+                event.wait().map_err(Error::OpenCl)?;
+                // Write completed — `src` drops at end of execute.
+                self.out.put(buf, Deps::new());
+            }
+            ExecMode::Pipelined => {
+                // Keep-alive: drop the host source when CL_COMPLETE fires.
+                register_drop_callback(&event, Box::new(src))?;
+                self.out.put(buf, vec![wrap_event(event)]);
+            }
+        }
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("write_mapped".into());
+    }
+}
+
+impl<T, M> WriteMapped<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostWritable + Send + 'static,
+{
+    /// Concrete-head blocking terminal: write on the buffer's own context default
+    /// queue and return the buffer for reuse (`let buf = buf.write(d).wait()?;`).
+    pub fn wait(self) -> Result<MappedSlice<T, M>> {
+        let ctx = concrete_svm_ctx(&self.buf)?;
+        self.sync(&ctx)
+    }
+
+    /// Concrete-head non-blocking terminal returning the buffer plus a completion
+    /// [`Event`](crate::Event) — mirrors the Tier-1 `(Output, Event)` contract.
+    pub fn submit(self) -> Result<(MappedSlice<T, M>, crate::Event)> {
+        let ctx = concrete_svm_ctx(&self.buf)?;
+        let queue = ctx.default_outoforder_queue(ctx.device())?;
+        self.submit_value_on(&*queue)
     }
 }
 
@@ -3491,6 +3682,42 @@ impl<T, M: MemMode> Pipe<DeviceSliceUninit<T, M>> {
         M: Fillable + Send + 'static,
     {
         fill_device_uninit(self, value)
+    }
+}
+
+impl<T, M: MemMode> Pipe<MappedSlice<T, M>> {
+    /// Write `src` into this piped SVM buffer — delegates to
+    /// [`write_mapped`](fn@write_mapped). Same `M: HostWritable` bound as
+    /// [`MappedSlice::write`](crate::MappedSlice::write).
+    pub fn write<S>(self, src: S) -> WriteMapped<T, M>
+    where
+        T: Send + Sync + 'static,
+        M: HostWritable + Send + 'static,
+        S: Into<UploadSource<T>>,
+    {
+        write_mapped(self, src)
+    }
+
+    /// Fill this piped SVM buffer with `value` — delegates to
+    /// [`fill_mapped`](fn@fill_mapped). Same `M: Fillable` bound as
+    /// [`MappedSlice::fill`](crate::MappedSlice::fill).
+    pub fn fill(self, value: T) -> FillMapped<T, M>
+    where
+        T: Copy + Send + Sync + 'static,
+        M: Fillable + Send + 'static,
+    {
+        fill_mapped(self, value)
+    }
+
+    /// SVM→SVM copy this piped buffer into `dst` — delegates to
+    /// [`eager_copy_to`]. Yields `(src, dst)`. Same shape as
+    /// [`MappedSlice::copy_to`](crate::MappedSlice::copy_to).
+    pub fn copy_to<Dst>(self, dst: Dst) -> CopyTo2<MappedSlice<T, M>, Dst>
+    where
+        MappedSlice<T, M>: crate::CopyTo<Dst>,
+        <<MappedSlice<T, M> as crate::CopyTo<Dst>>::Op as DeviceEnqueue>::Output: CopyOutputs,
+    {
+        eager_copy_to(self, dst)
     }
 }
 

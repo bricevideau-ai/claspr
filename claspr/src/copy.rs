@@ -49,7 +49,7 @@
 //! late-bind-launcher pattern, every Tier 2 op should produce an
 //! Event that downstream stages can wait on.)
 
-use crate::eager::{Deps, DeviceEnqueue, deps_as_events, wrap_event};
+use crate::eager::{Deps, DeviceEnqueue, wrap_event};
 use crate::exec_ctx::ExecutionContext;
 use crate::{
     Buffer, DeviceSlice, DeviceSliceUninit, Launcher, MappedSlice, MappedSliceUninit, MemMode,
@@ -179,9 +179,8 @@ where
 
     fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, dst) = self.take();
-        let event = MappedSlice::copy_to(&src, &dst)
-            .after_all(deps_as_events(&deps))
-            .submit_on(ec)?;
+        let raw: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let event = crate::mapped::svm_copy_enqueue(&src, &dst, ec, &raw)?;
         Ok(((src, dst), vec![wrap_event(event)]))
     }
 }
@@ -212,9 +211,8 @@ where
         let (src, uninit_dst) = self.take();
         // SAFETY: copy_to below writes every byte of dst.
         let dst = unsafe { uninit_dst.assume_init() };
-        let event = MappedSlice::copy_to(&src, &dst)
-            .after_all(deps_as_events(&deps))
-            .submit_on(ec)?;
+        let raw: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let event = crate::mapped::svm_copy_enqueue(&src, &dst, ec, &raw)?;
         Ok(((src, dst), vec![wrap_event(event)]))
     }
 }

@@ -176,14 +176,14 @@ fn device_slice_write_overwrites_kernel_output() {
 
 // ── mapped_slice_fill ──────────────────────────────────────────────
 
-/// buffer_ops.rs::mapped_slice_fill_in_place — SVM analog. The eager API has no
-/// mapped-fill verb over an existing `MappedSlice`; `MappedSlice::fill` (Tier 1)
-/// is the primitive both layers call, so the alloc + fill use it directly.
+/// buffer_ops.rs::mapped_slice_fill_in_place — SVM analog. `MappedSlice::fill`
+/// is now the eager `FillMapped` graph node: it consumes the buffer and rebinds
+/// it out (`let buf = buf.fill(v).wait()?;`), same as `DeviceSlice::fill`.
 #[test]
 fn mapped_slice_fill_in_place() {
     let Some(ctx) = ctx_with_svm() else { return };
     let buf: MappedSlice<u32> = MappedSlice::alloc_zero(&ctx, N).expect("alloc");
-    buf.fill(7u32).wait().expect("fill");
+    let buf = buf.fill(7u32).wait().expect("fill");
     assert_eq!(buf.len(), N);
     let g = buf.map().wait().expect("map for read-back");
     assert!(g.iter().all(|&v| v == 7));

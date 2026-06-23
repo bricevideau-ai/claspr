@@ -363,9 +363,9 @@ impl Context {
     ///
     /// Internal — used by the buffer fill path
     /// ([`fill_buffer_enqueue`](crate::buffer::fill_buffer_enqueue)) and
-    /// [`crate::mapped::SvmFillOp`] when the marker's
-    /// [`FillStrategy`](crate::FillStrategy) is `DeviceKernel`. Users
-    /// should not need this directly.
+    /// the SVM fill path ([`svm_fill_enqueue`](crate::mapped::svm_fill_enqueue))
+    /// when the marker's [`FillStrategy`](crate::FillStrategy) is
+    /// `DeviceKernel`. Users should not need this directly.
     pub(crate) fn fill_program(&self) -> Result<&Program> {
         once_lock_get_or_try_init(&self.inner.fill_program, || {
             Program::create_and_build_from_source(

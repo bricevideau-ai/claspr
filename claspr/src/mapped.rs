@@ -43,7 +43,6 @@ use crate::context::{Context, SvmLevel};
 use crate::error::{Error, Result};
 use crate::launch::KernelArg;
 use crate::map_primitive;
-use crate::op::{ProfileCb, ProfilingInfo, register_profiling_callback};
 use crate::queue::Launcher;
 use opencl3::event::{Event, retain_event};
 use opencl3::kernel::ExecuteKernel;
@@ -135,7 +134,9 @@ pub struct MappedSlice<T, M: MemMode = ReadWrite> {
 unsafe impl<T: Send, M: MemMode> Send for MappedSlice<T, M> {}
 unsafe impl<T: Sync, M: MemMode> Sync for MappedSlice<T, M> {}
 
-impl<T: Default + Copy, M: MemMode + Fillable> MappedSlice<T, M> {
+impl<T: Default + Copy + Send + Sync + 'static, M: MemMode + Fillable + Send + 'static>
+    MappedSlice<T, M>
+{
     /// Allocate `len` elements of T in SVM memory, zero-initialised
     /// via `clEnqueueSVMMemFill(T::default())` on the context's
     /// default queue. Blocks until the fill completes.
@@ -152,7 +153,8 @@ impl<T: Default + Copy, M: MemMode + Fillable> MappedSlice<T, M> {
         // SAFETY: synchronous fill below overwrites every byte
         // before returning, so no path can observe uninit data.
         let slice = unsafe { Self::alloc_uninit(ctx, len)?.assume_init() };
-        slice.fill(T::default()).wait()?;
+        // `fill` is now a graph node that consumes the buffer and rebinds it out.
+        let slice = slice.fill(T::default()).wait()?;
         Ok(slice)
     }
 }
@@ -359,80 +361,78 @@ impl<T, M: MemMode> MappedSlice<T, M> {
         self.ptr
     }
 
-    /// Begin filling this SVM buffer's contents with `value` repeated
-    /// for every element — wraps `clEnqueueSVMMemFill` (CL 2.0+).
-    /// SVM analog of [`crate::DeviceSlice::fill`].
+    /// Fill this SVM buffer's contents with `value` repeated for every
+    /// element (wraps `clEnqueueSVMMemFill`, CL 2.0+, or a built-in
+    /// fill kernel for kernel-RO markers). SVM analog of
+    /// [`crate::DeviceSlice::fill`].
     ///
-    /// Takes `&self` because the underlying SVM pointer is intentionally
-    /// aliased (host map guards govern exclusivity separately). The
-    /// resulting event is auto-registered on this buffer's
-    /// last-use list, so Drop's `clEnqueueSVMFree` waits for the
-    /// fill to finish.
+    /// Returns the [`FillMapped`](crate::eager::FillMapped) graph node
+    /// (a [`DeviceOp`](crate::DeviceOp)). Usable standalone — `let buf =
+    /// buf.fill(v).wait()?;` (the buffer moves in and rebinds out so it
+    /// can be reused) — or composed in a graph via `.and_then(...)`.
     ///
-    /// **Marker constraint:** `M: KernelWritable`. Runtime-side fill
-    /// requires write access at the OpenCL level; kernel-RO markers
-    /// (`ReadOnly`, `Frozen`) reject it.
-    pub fn fill(&self, value: T) -> SvmFillOp<'_, T, M>
+    /// The fill event is auto-registered on the buffer's last-use list
+    /// at execute, so Drop's `clEnqueueSVMFree` waits for the fill.
+    ///
+    /// **Marker constraint:** `M: Fillable`. Runtime-side fill counts
+    /// as a write at the OpenCL level, so kernel-RO markers
+    /// (`ReadOnly`, `Frozen`) can't be filled.
+    pub fn fill(self, value: T) -> crate::eager::FillMapped<T, M>
     where
-        T: Copy,
-        M: Fillable,
+        T: Copy + Send + Sync + 'static,
+        M: Fillable + Send + 'static,
     {
-        SvmFillOp {
-            owner: self,
-            pattern: value,
-            deps: Vec::new(),
-            profile_cb: None,
-        }
+        crate::eager::fill_mapped(self, value)
     }
 
-    /// Begin a SVM→SVM copy from `self` into `dst` — wraps
-    /// `clEnqueueSVMMemcpy` (CL 2.0+). SVM analog of
-    /// [`crate::DeviceSlice::copy_to`].
+    /// SVM→SVM copy from `self` into `dst` — wraps `clEnqueueSVMMemcpy`
+    /// (CL 2.0+). SVM analog of [`crate::DeviceSlice::copy_to`].
+    ///
+    /// Returns the [`CopyTo2`](crate::eager::CopyTo2) graph node (a
+    /// [`DeviceOp`](crate::DeviceOp)) whose output is `(src, dst)`.
+    /// Usable standalone via `.sync(&ctx)` / `.wait_on(&queue)` or
+    /// composed in a graph. Polymorphic over the SVM `(src, dst)`
+    /// families (`MappedSlice`/`USMSlice`, init / uninit dst) via the
+    /// [`CopyTo`](crate::CopyTo) trait.
     ///
     /// Both buffers must be on the same `Context` (the runtime
     /// enforces this; mismatch surfaces as a CL error at terminal
-    /// time). The resulting event is registered on **both** buffers'
-    /// last-use lists so Drop on either side is ordered after the
-    /// copy.
-    pub fn copy_to<'a, M2: MemMode>(
-        &'a self,
-        dst: &'a MappedSlice<T, M2>,
-    ) -> SvmCopyOp<'a, T, M, M2> {
-        SvmCopyOp {
-            src: self,
-            dst,
-            deps: Vec::new(),
-            profile_cb: None,
-        }
+    /// time). The copy event is registered on **both** buffers'
+    /// last-use lists so Drop on either side is ordered after it.
+    pub fn copy_to<Dst>(self, dst: Dst) -> crate::eager::CopyTo2<Self, Dst>
+    where
+        Self: crate::CopyTo<Dst>,
+        <<Self as crate::CopyTo<Dst>>::Op as crate::eager::DeviceEnqueue>::Output:
+            crate::eager::CopyOutputs,
+    {
+        crate::eager::eager_copy_to(self, dst)
     }
 
-    /// Begin a host→SVM memcpy from `data` into this buffer — wraps
-    /// `clEnqueueSVMMemcpy` (CL 2.0+) with a host pointer as source.
-    /// SVM analog of [`crate::DeviceSlice::write`].
+    /// Write host `data` into this buffer — wraps `clEnqueueSVMMemcpy`
+    /// (CL 2.0+) with a host pointer as source. SVM analog of
+    /// [`crate::DeviceSlice::write`].
     ///
-    /// `data` is borrowed for the op's lifetime; on the non-blocking
-    /// [`submit`](SvmWriteOp::submit) terminal the caller must keep
-    /// `data` alive until the returned event fires (same contract as
-    /// [`crate::DeviceSlice::write`]'s submit). [`wait`](SvmWriteOp::wait)
-    /// has no such constraint — it blocks until the memcpy completes.
+    /// Returns the [`WriteMapped`](crate::eager::WriteMapped) graph
+    /// node (a [`DeviceOp`](crate::DeviceOp)). Usable standalone — `let
+    /// buf = buf.write(data).wait()?;` (buffer rebinds out for reuse) —
+    /// or composed in a graph.
     ///
-    /// The resulting event is auto-registered on this buffer's
-    /// last-use list, so Drop's `clEnqueueSVMFree` waits for the
-    /// memcpy to finish.
+    /// The write stays NON-BLOCKING (`CL_NON_BLOCKING` enqueue); the
+    /// terminal waits. For the non-blocking terminal the host `src` is
+    /// kept alive until the write event fires via
+    /// `register_drop_callback`. The write event is auto-registered on
+    /// the buffer's last-use list so Drop's `clEnqueueSVMFree` waits.
     ///
     /// **Marker constraint:** `M: HostWritable`. Excludes
     /// [`crate::HostReadOnly`] and [`crate::Frozen`] — post-creation
     /// host writes break the contract those markers advertise.
-    pub fn write<'a>(&'a self, data: &'a [T]) -> SvmWriteOp<'a, T, M>
+    pub fn write<S>(self, src: S) -> crate::eager::WriteMapped<T, M>
     where
-        M: HostWritable,
+        T: Send + Sync + 'static,
+        M: HostWritable + Send + 'static,
+        S: Into<crate::transfer::UploadSource<T>>,
     {
-        SvmWriteOp {
-            owner: self,
-            data,
-            deps: Vec::new(),
-            profile_cb: None,
-        }
+        crate::eager::write_mapped(self, src)
     }
 }
 
@@ -458,114 +458,79 @@ impl<T, M: MemMode> Buffer<T> for MappedSlice<T, M> {
     }
 }
 
-// ── SvmFillOp / SvmCopyOp builders ─────────────────────────────────
+// ── Raw SVM enqueue helpers — the fold seam for the eager SVM ops ────
 //
-// Same terminal / modifier shape as `DeviceSlice`'s FillOp / CopyOp.
-// Take `&MappedSlice<T>` rather than a raw `cl_mem` reference because
-// the terminal needs to call `register_use` on the buffer(s) so Drop's
-// `clEnqueueSVMFree` waits for the fill/copy event.
+// Each helper is the `clEnqueueSVM*` body the matching Tier-1 builder
+// used to own, lifted out so the eager graph nodes (`FillMapped` /
+// `WriteMapped` in `eager.rs`, plus the `CopyTo` family in `copy.rs`)
+// can enqueue directly against a `MappedSlice` without round-tripping
+// through a borrow-based builder. Each does the enqueue, retains the
+// event, and registers it on the buffer(s)' last-use list so Drop's
+// `clEnqueueSVMFree` queue-orders after every recorded use. `deps` is
+// the already-collected `cl_event` wait-list (the eager op flattens
+// its `Deps` to raw handles, held alive across the call). All are
+// NON-BLOCKING enqueues — the eager op's `Blocking` terminal waits on
+// the returned event, exactly as the builder's `wait_on` did
+// (`submit + event.wait()`). SVM has no native `CL_BLOCKING` flag for
+// fill/memcpy the way `clEnqueueWriteBuffer` does.
 
-/// Lazy builder for `clEnqueueSVMMemFill`. Returned by
-/// [`MappedSlice::fill`].
-pub struct SvmFillOp<'a, T: Copy, M: MemMode> {
-    owner: &'a MappedSlice<T, M>,
-    pattern: T,
-    deps: Vec<cl_event>,
-    profile_cb: Option<ProfileCb>,
+/// Retain `event` once and register it on `owner`'s last-use list, so
+/// Drop's `clEnqueueSVMFree` waits for it. `clRetainEvent` bumps the
+/// `cl_event` refcount: the returned `event` and the registered
+/// `Arc<Event>` each hold an independent reference, balanced by their
+/// respective `Event::drop` → `clReleaseEvent`.
+fn register_event_on<T, M: MemMode>(owner: &MappedSlice<T, M>, event: &Event) -> Result<()> {
+    // SAFETY: event.get() is live; retain pairs with the Event::drop
+    // inside the Arc held by last_use.
+    unsafe {
+        retain_event(event.get())
+            .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
+    }
+    owner.register_use(std::sync::Arc::new(Event::new(event.get())));
+    Ok(())
 }
 
-impl<'a, T: Copy, M: MemMode + Fillable> SvmFillOp<'a, T, M> {
-    pub fn after(mut self, event: &Event) -> Self {
-        self.deps.push(event.get());
-        self
-    }
-
-    pub fn after_all<'e, I>(mut self, events: I) -> Self
-    where
-        I: IntoIterator<Item = &'e Event>,
-    {
-        self.deps.extend(events.into_iter().map(|e| e.get()));
-        self
-    }
-
-    pub fn profiled<F>(mut self, cb: F) -> Self
-    where
-        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
-    {
-        self.profile_cb = Some(Box::new(cb));
-        self
-    }
-
-    /// Sync terminal — enqueue + wait, on the owning SVM buffer's
-    /// context default queue.
-    pub fn wait(self) -> Result<()> {
-        let ctx = self.owner.ctx.clone();
-        self.wait_on(&ctx)
-    }
-
-    /// Sync terminal with an explicit launcher.
-    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
-        let event = self.into_event(launcher)?;
-        event.wait()?;
-        Ok(())
-    }
-
-    /// Non-blocking terminal — enqueue on the owning buffer's
-    /// context default queue.
-    pub fn submit(self) -> Result<Event> {
-        let ctx = self.owner.ctx.clone();
-        self.submit_on(&ctx)
-    }
-
-    /// Non-blocking terminal with an explicit launcher.
-    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
-        self.into_event(launcher)
-    }
-
-    pub(crate) fn into_event<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
-        let event = match M::FILL_STRATEGY {
-            FillStrategy::Runtime => {
-                let size = self.owner.len * std::mem::size_of::<T>();
-                // SAFETY: svm_ptr is a valid SVM allocation in the
-                // queue's context (caller's responsibility — same as
-                // `DeviceSlice::fill`). Pattern is a single T
-                // byte-copied across the buffer.
-                unsafe {
-                    launcher.cl_queue().enqueue_svm_mem_fill(
-                        self.owner.ptr as *mut c_void,
-                        std::slice::from_ref(&self.pattern),
-                        size,
-                        &self.deps,
-                    )?
-                }
+/// Raw `clEnqueueSVMMemFill` (or kernel fill) over `owner` — body of
+/// the former `SvmFillOp::into_event`. Non-blocking; auto-registers
+/// the fill event on `owner`'s last-use list.
+pub(crate) fn svm_fill_enqueue<T, M, L>(
+    owner: &MappedSlice<T, M>,
+    launcher: &L,
+    pattern: T,
+    deps: &[cl_event],
+) -> Result<Event>
+where
+    T: Copy,
+    M: MemMode + Fillable,
+    L: Launcher + ?Sized,
+{
+    let event = match M::FILL_STRATEGY {
+        FillStrategy::Runtime => {
+            let size = owner.len * std::mem::size_of::<T>();
+            // SAFETY: owner.ptr is a valid SVM allocation in the queue's
+            // context (caller's responsibility — same as
+            // `DeviceSlice::fill`). Pattern is a single T byte-copied
+            // across the buffer.
+            unsafe {
+                launcher.cl_queue().enqueue_svm_mem_fill(
+                    owner.ptr as *mut c_void,
+                    std::slice::from_ref(&pattern),
+                    size,
+                    deps,
+                )?
             }
-            FillStrategy::DeviceKernel => fill_via_kernel_svm(
-                &self.owner.ctx,
-                launcher,
-                self.owner.ptr as *mut c_void,
-                &self.pattern,
-                self.owner.len,
-                &self.deps,
-            )?,
-        };
-        if let Some(cb) = self.profile_cb {
-            register_profiling_callback(&event, cb)?;
         }
-        // Auto-register on the source buffer's last-use list so
-        // Drop's free waits for this fill. clRetainEvent bumps the
-        // cl_event refcount so the returned `event` and the
-        // registered Arc<Event> each hold an independent reference;
-        // both `Event::drop`s call `clReleaseEvent` to balance.
-        // SAFETY: event.get() is live; retain is paired with the
-        // Event::drop inside the Arc.
-        unsafe {
-            retain_event(event.get())
-                .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
-        }
-        self.owner
-            .register_use(std::sync::Arc::new(Event::new(event.get())));
-        Ok(event)
-    }
+        FillStrategy::DeviceKernel => fill_via_kernel_svm(
+            &owner.ctx,
+            launcher,
+            owner.ptr as *mut c_void,
+            &pattern,
+            owner.len,
+            deps,
+        )?,
+    };
+    register_event_on(owner, &event)?;
+    Ok(event)
 }
 
 /// Launch the built-in fill kernel for an SVM allocation
@@ -648,204 +613,84 @@ pub(crate) fn fill_via_kernel_svm<T: Copy, L: Launcher + ?Sized>(
     }
 }
 
-/// Lazy builder for `clEnqueueSVMMemcpy` with a host source pointer.
-/// Returned by [`MappedSlice::write`]. SVM analog of the cl_mem write path
-/// ([`DeviceSlice::write`](crate::DeviceSlice::write)).
-pub struct SvmWriteOp<'a, T, M: MemMode> {
-    owner: &'a MappedSlice<T, M>,
-    data: &'a [T],
-    deps: Vec<cl_event>,
-    profile_cb: Option<ProfileCb>,
+/// Raw `clEnqueueSVMMemcpy` with a host source pointer over `owner` —
+/// body of the former `SvmWriteOp::into_event`. Non-blocking
+/// (`CL_NON_BLOCKING`); the caller (eager `WriteMapped`) keeps `data`
+/// alive until the event fires. Auto-registers the write event on
+/// `owner`'s last-use list.
+pub(crate) fn svm_write_enqueue<T, M, L>(
+    owner: &MappedSlice<T, M>,
+    launcher: &L,
+    data: &[T],
+    deps: &[cl_event],
+) -> Result<Event>
+where
+    M: MemMode,
+    L: Launcher + ?Sized,
+{
+    if data.len() != owner.len {
+        return Err(Error::LengthMismatch {
+            src: data.len(),
+            dst: owner.len,
+        });
+    }
+    let size = owner.len * std::mem::size_of::<T>();
+    // SAFETY: SVM ptr is a valid allocation in the queue's context
+    // (caller's responsibility, same as DeviceSlice::write).
+    // data.as_ptr() points to host memory the eager op keeps alive past
+    // the event via register_drop_callback (CL_NON_BLOCKING contract).
+    let event = unsafe {
+        launcher.cl_queue().enqueue_svm_mem_cpy(
+            CL_NON_BLOCKING,
+            owner.ptr as *mut c_void,
+            data.as_ptr() as *const c_void,
+            size,
+            deps,
+        )?
+    };
+    register_event_on(owner, &event)?;
+    Ok(event)
 }
 
-impl<'a, T, M: MemMode> SvmWriteOp<'a, T, M> {
-    pub fn after(mut self, event: &Event) -> Self {
-        self.deps.push(event.get());
-        self
+/// Raw `clEnqueueSVMMemcpy` SVM→SVM from `src` into `dst` — body of the
+/// former `SvmCopyOp::into_event`. Non-blocking; auto-registers the
+/// copy event on **both** buffers' last-use lists so Drop on either
+/// side queue-orders after it. Used by the `CopyTo` family (`copy.rs`)
+/// for the same-type `MappedSlice → MappedSlice` pair.
+pub(crate) fn svm_copy_enqueue<T, M1, M2, L>(
+    src: &MappedSlice<T, M1>,
+    dst: &MappedSlice<T, M2>,
+    launcher: &L,
+    deps: &[cl_event],
+) -> Result<Event>
+where
+    M1: MemMode,
+    M2: MemMode,
+    L: Launcher + ?Sized,
+{
+    if src.len != dst.len {
+        return Err(Error::LengthMismatch {
+            src: src.len,
+            dst: dst.len,
+        });
     }
-
-    pub fn after_all<'e, I>(mut self, events: I) -> Self
-    where
-        I: IntoIterator<Item = &'e Event>,
-    {
-        self.deps.extend(events.into_iter().map(|e| e.get()));
-        self
-    }
-
-    pub fn profiled<F>(mut self, cb: F) -> Self
-    where
-        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
-    {
-        self.profile_cb = Some(Box::new(cb));
-        self
-    }
-
-    /// Sync terminal — enqueue + wait on the owning SVM buffer's
-    /// context default queue. Safe to drop `data` immediately after.
-    pub fn wait(self) -> Result<()> {
-        let ctx = self.owner.ctx.clone();
-        self.wait_on(&ctx)
-    }
-
-    /// Sync terminal with an explicit launcher.
-    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
-        let event = self.into_event(launcher)?;
-        event.wait()?;
-        Ok(())
-    }
-
-    /// Non-blocking terminal — enqueue on the owning buffer's
-    /// context default queue. `data` must outlive the event.
-    pub fn submit(self) -> Result<Event> {
-        let ctx = self.owner.ctx.clone();
-        self.submit_on(&ctx)
-    }
-
-    /// Non-blocking terminal with an explicit launcher.
-    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
-        self.into_event(launcher)
-    }
-
-    pub(crate) fn into_event<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
-        if self.data.len() != self.owner.len {
-            return Err(Error::LengthMismatch {
-                src: self.data.len(),
-                dst: self.owner.len,
-            });
-        }
-        let size = self.owner.len * std::mem::size_of::<T>();
-        // SAFETY: SVM ptr is a valid allocation in the queue's context
-        // (caller's responsibility, same as DeviceSlice::write).
-        // data.as_ptr() points to host memory borrowed for 'a. With
-        // CL_NON_BLOCKING the caller is responsible for keeping `data`
-        // alive until the event fires (documented on submit() above).
-        let event = unsafe {
-            launcher.cl_queue().enqueue_svm_mem_cpy(
-                CL_NON_BLOCKING,
-                self.owner.ptr as *mut c_void,
-                self.data.as_ptr() as *const c_void,
-                size,
-                &self.deps,
-            )?
-        };
-        if let Some(cb) = self.profile_cb {
-            register_profiling_callback(&event, cb)?;
-        }
-        // Auto-register on the buffer's last-use list so Drop's
-        // clEnqueueSVMFree waits for the memcpy. clRetainEvent so the
-        // returned `event` and the registered Arc<Event> each hold an
-        // independent refcount.
-        // SAFETY: event.get() is live; retain pairs with the
-        // Event::drop inside the Arc.
-        unsafe {
-            retain_event(event.get())
-                .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
-        }
-        self.owner
-            .register_use(std::sync::Arc::new(Event::new(event.get())));
-        Ok(event)
-    }
-}
-
-/// Lazy builder for `clEnqueueSVMMemcpy`. Returned by
-/// [`MappedSlice::copy_to`].
-pub struct SvmCopyOp<'a, T, M1: MemMode, M2: MemMode> {
-    src: &'a MappedSlice<T, M1>,
-    dst: &'a MappedSlice<T, M2>,
-    deps: Vec<cl_event>,
-    profile_cb: Option<ProfileCb>,
-}
-
-impl<'a, T, M1: MemMode, M2: MemMode> SvmCopyOp<'a, T, M1, M2> {
-    pub fn after(mut self, event: &Event) -> Self {
-        self.deps.push(event.get());
-        self
-    }
-
-    pub fn after_all<'e, I>(mut self, events: I) -> Self
-    where
-        I: IntoIterator<Item = &'e Event>,
-    {
-        self.deps.extend(events.into_iter().map(|e| e.get()));
-        self
-    }
-
-    pub fn profiled<F>(mut self, cb: F) -> Self
-    where
-        F: FnOnce(Result<ProfilingInfo>) + Send + 'static,
-    {
-        self.profile_cb = Some(Box::new(cb));
-        self
-    }
-
-    /// Sync terminal — enqueue + wait on the src buffer's context
-    /// default queue.
-    pub fn wait(self) -> Result<()> {
-        let ctx = self.src.ctx.clone();
-        self.wait_on(&ctx)
-    }
-
-    /// Sync terminal with an explicit launcher.
-    pub fn wait_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<()> {
-        let event = self.into_event(launcher)?;
-        event.wait()?;
-        Ok(())
-    }
-
-    /// Non-blocking terminal — enqueue on the src buffer's context
-    /// default queue.
-    pub fn submit(self) -> Result<Event> {
-        let ctx = self.src.ctx.clone();
-        self.submit_on(&ctx)
-    }
-
-    /// Non-blocking terminal with an explicit launcher.
-    pub fn submit_on<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
-        self.into_event(launcher)
-    }
-
-    pub(crate) fn into_event<L: Launcher + ?Sized>(self, launcher: &L) -> Result<Event> {
-        if self.src.len != self.dst.len {
-            return Err(Error::LengthMismatch {
-                src: self.src.len,
-                dst: self.dst.len,
-            });
-        }
-        let size = self.src.len * std::mem::size_of::<T>();
-        // SAFETY: both SVM pointers are valid allocations in the
-        // queue's context (caller's responsibility — runtime gives
-        // CL_INVALID_CONTEXT on mismatch). CL_NON_BLOCKING so the
-        // event encodes completion; .wait()/.submit() pick how to
-        // observe it.
-        let event = unsafe {
-            launcher.cl_queue().enqueue_svm_mem_cpy(
-                CL_NON_BLOCKING,
-                self.dst.ptr as *mut c_void,
-                self.src.ptr as *const c_void,
-                size,
-                &self.deps,
-            )?
-        };
-        if let Some(cb) = self.profile_cb {
-            register_profiling_callback(&event, cb)?;
-        }
-        // Two extra refcounts (one per buffer's last_use). The
-        // returned `event` keeps its original refcount. Three
-        // independent Event::drop → clReleaseEvent, balanced.
-        // SAFETY: event.get() is live; each retain is paired with
-        // a matching Event::drop in the registered Arc.
-        unsafe {
-            retain_event(event.get())
-                .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
-            retain_event(event.get())
-                .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
-        }
-        let src_arc = std::sync::Arc::new(Event::new(event.get()));
-        let dst_arc = std::sync::Arc::new(Event::new(event.get()));
-        self.src.register_use(src_arc);
-        self.dst.register_use(dst_arc);
-        Ok(event)
-    }
+    let size = src.len * std::mem::size_of::<T>();
+    // SAFETY: both SVM pointers are valid allocations in the queue's
+    // context (caller's responsibility — runtime gives
+    // CL_INVALID_CONTEXT on mismatch). CL_NON_BLOCKING so the event
+    // encodes completion; the eager terminal picks how to observe it.
+    let event = unsafe {
+        launcher.cl_queue().enqueue_svm_mem_cpy(
+            CL_NON_BLOCKING,
+            dst.ptr as *mut c_void,
+            src.ptr as *const c_void,
+            size,
+            deps,
+        )?
+    };
+    register_event_on(src, &event)?;
+    register_event_on(dst, &event)?;
+    Ok(event)
 }
 
 impl<T, M: MemMode> Drop for MappedSlice<T, M> {

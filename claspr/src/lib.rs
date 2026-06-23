@@ -135,7 +135,7 @@ pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 pub use future::{EventFuture, EventFutureExt, LaunchFuture};
 pub use mapped::{
     MapMutOp, MapOp, MappedReadGuard, MappedReadPending, MappedSlice, MappedSliceUninit,
-    MappedWriteGuard, MappedWritePending, SvmCopyOp, SvmFillOp, SvmWriteOp,
+    MappedWriteGuard, MappedWritePending,
 };
 pub use usm::{USMSlice, USMSliceUninit};
 
@@ -160,11 +160,12 @@ pub use eager::DeviceChainFuture;
 pub use eager::{
     AndThenHost, AndThenHostWithContext, ArcSplit, CopyTo2, Dep, Deps, DeviceDynOp, DeviceEnqueue,
     DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt, Download, ExecMode, FanOut, Fill,
-    ImageDownloadEager, ImageUploadEager, Input, OnDevice, Pipe, ReadInto, ToInput,
-    TransferToDevice, Upload, WriteDevice, arc_split, arced, bundle2, bundle3, bundle4, bundle5,
-    bundle6, bundle7, bundle8, bundle9, bundle10, bundle11, bundle12, bundle13, bundle14, bundle15,
-    bundle16, deps_as_events, deps_into_single_event, eager_copy_to, fan_out, forward,
-    image_download, image_upload, lift, read_into, transfer_to_device, value, wrap_event, write,
+    FillMapped, ImageDownloadEager, ImageUploadEager, Input, OnDevice, Pipe, ReadInto, ToInput,
+    TransferToDevice, Upload, WriteDevice, WriteMapped, arc_split, arced, bundle2, bundle3,
+    bundle4, bundle5, bundle6, bundle7, bundle8, bundle9, bundle10, bundle11, bundle12, bundle13,
+    bundle14, bundle15, bundle16, deps_as_events, deps_into_single_event, eager_copy_to, fan_out,
+    fill_mapped, forward, image_download, image_upload, lift, read_into, transfer_to_device, value,
+    wrap_event, write, write_mapped,
 };
 
 // Stage-3 proc-macro frontend.
