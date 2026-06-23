@@ -74,7 +74,7 @@ fn usm_slice_threads_into_kernel() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let host_data = vec![5u32; N];
-    let buf = usm_slice::<u32, claspr::ReadWrite>(host_data)
+    let buf = usm_slice::<u32>(host_data)
         .and_then(|s| kernels.scale_u32([N], s, 7))
         .sync(&ctx)
         .expect("usm slice chain");
@@ -108,7 +108,7 @@ fn usm_slice_alloc_produces_zero_initialised_buffer() {
     let Some(ctx) = ctx_with_fine_system() else {
         return;
     };
-    let buf = usm_alloc_uninit::<u32, claspr::ReadWrite>(N)
+    let buf = usm_alloc_uninit::<u32>(N)
         .and_then(|u| fill_usm_uninit(u, 0u32))
         .sync(&ctx)
         .expect("alloc");
@@ -124,7 +124,7 @@ fn macro_usm_slice_repeat_arm() {
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = usm_slice::<u32, claspr::ReadWrite>(vec![6u32; N])
+    let buf = usm_slice::<u32>(vec![6u32; N])
         .and_then(|s| kernels.scale_u32([N], s, 5))
         .sync(&ctx)
         .expect("macro repeat");
@@ -139,7 +139,7 @@ fn macro_usm_slice_literal_arm() {
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = usm_slice::<u32, claspr::ReadWrite>(vec![10u32, 20, 30, 40])
+    let buf = usm_slice::<u32>(vec![10u32, 20, 30, 40])
         .and_then(|s| kernels.scale_u32([4], s, 2))
         .sync(&ctx)
         .expect("macro literal");

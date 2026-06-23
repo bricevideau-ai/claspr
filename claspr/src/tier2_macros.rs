@@ -4,21 +4,24 @@
 //! `write_device_uninit`, the SVM / USM analogs, …).
 //!
 //! These are sugar for the common chain-entry shapes; the eager free fns are
-//! the canonical surface and accept an explicit marker turbofish. Two arms per
-//! macro:
+//! the canonical surface — `foo(args)` defaults the marker to `ReadWrite`, and
+//! `foo_as(args, M)` infers an explicit marker from a zero-sized witness value
+//! (no turbofish). Two arms per macro:
 //!   - default arm:   `foo!(args)`        — marker defaults to `ReadWrite`.
-//!   - marker arm:    `foo!(args; M)`     — marker stated explicitly.
+//!   - marker arm:    `foo!(args; M)`     — `M` is a marker *value* witness
+//!     (e.g. `Frozen`), forwarded to the `_as` constructor.
 
-/// Lazy zero-init `DeviceSlice<T, M>` — `alloc_zero::<T, M>(N)`.
+/// Lazy zero-init `DeviceSlice<T, M>` — `alloc_zero(N)`.
 /// `device_slice_alloc_zero!(T, N)` for the default marker,
-/// `device_slice_alloc_zero!(T, N; M)` for an explicit one.
+/// `device_slice_alloc_zero!(T, N; M)` for an explicit one (`M` is a marker
+/// value, e.g. `HostReadOnly`, passed as a witness).
 #[macro_export]
 macro_rules! device_slice_alloc_zero {
     ($t:ty, $n:expr) => {
-        $crate::alloc_zero::<$t, $crate::ReadWrite>($n)
+        $crate::alloc_zero::<$t>($n)
     };
-    ($t:ty, $n:expr; $m:ty) => {
-        $crate::alloc_zero::<$t, $m>($n)
+    ($t:ty, $n:expr; $m:expr) => {
+        $crate::alloc_zero_as::<$t, _>($n, $m)
     };
 }
 
@@ -28,10 +31,10 @@ macro_rules! device_slice_alloc_zero {
 #[macro_export]
 macro_rules! device_slice_alloc_uninit {
     ($t:ty, $n:expr) => {
-        $crate::device_alloc_uninit::<$t, $crate::ReadWrite>($n)
+        $crate::device_alloc_uninit::<$t>($n)
     };
-    ($t:ty, $n:expr; $m:ty) => {
-        $crate::device_alloc_uninit::<$t, $m>($n)
+    ($t:ty, $n:expr; $m:expr) => {
+        $crate::device_alloc_uninit_as::<$t, _>($n, $m)
     };
 }
 
@@ -40,13 +43,12 @@ macro_rules! device_slice_alloc_uninit {
 #[macro_export]
 macro_rules! device_slice_filled {
     ($v:expr, $n:expr) => {
-        $crate::DeviceOpExt::and_then(
-            $crate::device_alloc_uninit::<_, $crate::ReadWrite>($n),
-            move |u| $crate::fill_device_uninit(u, $v),
-        )
+        $crate::DeviceOpExt::and_then($crate::device_alloc_uninit::<_>($n), move |u| {
+            $crate::fill_device_uninit(u, $v)
+        })
     };
-    ($v:expr, $n:expr; $m:ty) => {
-        $crate::DeviceOpExt::and_then($crate::device_alloc_uninit::<_, $m>($n), move |u| {
+    ($v:expr, $n:expr; $m:expr) => {
+        $crate::DeviceOpExt::and_then($crate::device_alloc_uninit_as::<_, _>($n, $m), move |u| {
             $crate::fill_device_uninit(u, $v)
         })
     };
@@ -58,10 +60,10 @@ macro_rules! device_slice_filled {
 #[macro_export]
 macro_rules! device_slice_from_slice {
     ($data:expr) => {
-        $crate::upload::<_, $crate::ReadWrite, _>($data)
+        $crate::upload::<_, _>($data)
     };
-    ($data:expr; $m:ty) => {
-        $crate::upload::<_, $m, _>($data)
+    ($data:expr; $m:expr) => {
+        $crate::upload_as::<_, _, _>($data, $m)
     };
 }
 
@@ -70,10 +72,10 @@ macro_rules! device_slice_from_slice {
 #[macro_export]
 macro_rules! upload {
     ($src:expr) => {
-        $crate::upload::<_, $crate::ReadWrite, _>($src)
+        $crate::upload::<_, _>($src)
     };
-    ($src:expr; $m:ty) => {
-        $crate::upload::<_, $m, _>($src)
+    ($src:expr; $m:expr) => {
+        $crate::upload_as::<_, _, _>($src, $m)
     };
 }
 
@@ -91,13 +93,12 @@ macro_rules! download {
 #[macro_export]
 macro_rules! mapped_slice_alloc_zero {
     ($t:ty, $n:expr) => {
-        $crate::DeviceOpExt::and_then(
-            $crate::mapped_alloc_uninit::<$t, $crate::ReadWrite>($n),
-            |u| $crate::fill_mapped_uninit(u, <$t as ::core::default::Default>::default()),
-        )
+        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit::<$t>($n), |u| {
+            $crate::fill_mapped_uninit(u, <$t as ::core::default::Default>::default())
+        })
     };
-    ($t:ty, $n:expr; $m:ty) => {
-        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit::<$t, $m>($n), |u| {
+    ($t:ty, $n:expr; $m:expr) => {
+        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit_as::<$t, _>($n, $m), |u| {
             $crate::fill_mapped_uninit(u, <$t as ::core::default::Default>::default())
         })
     };
@@ -107,10 +108,10 @@ macro_rules! mapped_slice_alloc_zero {
 #[macro_export]
 macro_rules! mapped_slice_alloc_uninit {
     ($t:ty, $n:expr) => {
-        $crate::mapped_alloc_uninit::<$t, $crate::ReadWrite>($n)
+        $crate::mapped_alloc_uninit::<$t>($n)
     };
-    ($t:ty, $n:expr; $m:ty) => {
-        $crate::mapped_alloc_uninit::<$t, $m>($n)
+    ($t:ty, $n:expr; $m:expr) => {
+        $crate::mapped_alloc_uninit_as::<$t, _>($n, $m)
     };
 }
 
@@ -118,13 +119,12 @@ macro_rules! mapped_slice_alloc_uninit {
 #[macro_export]
 macro_rules! mapped_slice_filled {
     ($v:expr, $n:expr) => {
-        $crate::DeviceOpExt::and_then(
-            $crate::mapped_alloc_uninit::<_, $crate::ReadWrite>($n),
-            move |u| $crate::fill_mapped_uninit(u, $v),
-        )
+        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit::<_>($n), move |u| {
+            $crate::fill_mapped_uninit(u, $v)
+        })
     };
-    ($v:expr, $n:expr; $m:ty) => {
-        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit::<_, $m>($n), move |u| {
+    ($v:expr, $n:expr; $m:expr) => {
+        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit_as::<_, _>($n, $m), move |u| {
             $crate::fill_mapped_uninit(u, $v)
         })
     };
@@ -136,15 +136,14 @@ macro_rules! mapped_slice_from_slice {
     ($data:expr) => {{
         let data = $data;
         let n = data.len();
-        $crate::DeviceOpExt::and_then(
-            $crate::mapped_alloc_uninit::<_, $crate::ReadWrite>(n),
-            move |u| $crate::write_mapped_uninit(u, data),
-        )
+        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit::<_>(n), move |u| {
+            $crate::write_mapped_uninit(u, data)
+        })
     }};
-    ($data:expr; $m:ty) => {{
+    ($data:expr; $m:expr) => {{
         let data = $data;
         let n = data.len();
-        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit::<_, $m>(n), move |u| {
+        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit_as::<_, _>(n, $m), move |u| {
             $crate::write_mapped_uninit(u, data)
         })
     }};
@@ -156,7 +155,7 @@ macro_rules! mapped_slice_upload {
     ($src:expr) => {
         $crate::mapped_slice_from_slice!($src)
     };
-    ($src:expr; $m:ty) => {
+    ($src:expr; $m:expr) => {
         $crate::mapped_slice_from_slice!($src; $m)
     };
 }
@@ -165,10 +164,10 @@ macro_rules! mapped_slice_upload {
 #[macro_export]
 macro_rules! usm_slice_alloc_uninit {
     ($t:ty, $n:expr) => {
-        $crate::usm_alloc_uninit::<$t, $crate::ReadWrite>($n)
+        $crate::usm_alloc_uninit::<$t>($n)
     };
-    ($t:ty, $n:expr; $m:ty) => {
-        $crate::usm_alloc_uninit::<$t, $m>($n)
+    ($t:ty, $n:expr; $m:expr) => {
+        $crate::usm_alloc_uninit_as::<$t, _>($n, $m)
     };
 }
 
@@ -176,12 +175,12 @@ macro_rules! usm_slice_alloc_uninit {
 #[macro_export]
 macro_rules! usm_slice_alloc_zero {
     ($t:ty, $n:expr) => {
-        $crate::DeviceOpExt::and_then($crate::usm_alloc_uninit::<$t, $crate::ReadWrite>($n), |u| {
+        $crate::DeviceOpExt::and_then($crate::usm_alloc_uninit::<$t>($n), |u| {
             $crate::fill_usm_uninit(u, <$t as ::core::default::Default>::default())
         })
     };
-    ($t:ty, $n:expr; $m:ty) => {
-        $crate::DeviceOpExt::and_then($crate::usm_alloc_uninit::<$t, $m>($n), |u| {
+    ($t:ty, $n:expr; $m:expr) => {
+        $crate::DeviceOpExt::and_then($crate::usm_alloc_uninit_as::<$t, _>($n, $m), |u| {
             $crate::fill_usm_uninit(u, <$t as ::core::default::Default>::default())
         })
     };
@@ -245,16 +244,16 @@ macro_rules! mapped_slice {
 macro_rules! usm_slice {
     // `usm_slice![v; N]` — wrap host vec![v; N].
     [$value:expr; $count:expr] => {
-        $crate::usm_slice::<_, $crate::ReadWrite>(::std::vec![$value; $count])
+        $crate::usm_slice::<_>(::std::vec![$value; $count])
     };
     // `usm_slice!(host_vec)` — wrap an existing Vec, default marker. Put this
     // BEFORE the bracket-list arm so single-expr paren calls don't get wrapped
     // in another Vec.
     ($vec:expr) => {
-        $crate::usm_slice::<_, $crate::ReadWrite>($vec)
+        $crate::usm_slice::<_>($vec)
     };
     // `usm_slice![a, b, c]` — wrap a host vec literal.
     [$($v:expr),* $(,)?] => {
-        $crate::usm_slice::<_, $crate::ReadWrite>(::std::vec![$($v),*])
+        $crate::usm_slice::<_>(::std::vec![$($v),*])
     };
 }

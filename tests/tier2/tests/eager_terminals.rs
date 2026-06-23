@@ -28,7 +28,7 @@ fn wait_on_explicit_queue_runs_graph() {
     let device = Device::any().expect("device");
     let queue = Queue::<InOrder>::on_device(&ctx, &device).expect("queue");
 
-    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let out: Vec<u32> = upload(vec![0u32; N])
         .and_then(|buf| fill(buf, 9u32))
         .and_then(download)
         .wait_on(&queue)
@@ -46,7 +46,7 @@ fn wait_on_kernel_chain() {
     let queue = Queue::<InOrder>::on_device(&ctx, &device).expect("queue");
     let kernels = kernels::kernels(&ctx).expect("kernels");
 
-    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let out: Vec<u32> = upload(vec![0u32; N])
         .and_then(|b| kernels.fill_u32([N], b, 7u32))
         .and_then(|b| kernels.scale_u32([N], b, 3u32))
         .and_then(download)
@@ -66,9 +66,7 @@ fn submit_on_returns_completion_event() {
 
     // Build a buffer, fill it via a submitted (non-blocking) graph, wait the
     // returned event, then read it back via a separate wait_on to verify.
-    let buf = alloc_zero::<u32, claspr::ReadWrite>(N)
-        .wait_on(&queue)
-        .expect("alloc");
+    let buf = alloc_zero::<u32>(N).wait_on(&queue).expect("alloc");
 
     let event = fill(buf, 5u32).submit_on(&queue).expect("submit_on fill");
     // Block on the returned marker — the fill is done once it fires.
@@ -81,7 +79,7 @@ fn submit_on_returns_completion_event() {
 fn sync_matches_wait_on() {
     let Some(ctx) = ctx() else { return };
 
-    let via_sync: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![3u32; N])
+    let via_sync: Vec<u32> = upload(vec![3u32; N])
         .and_then(|buf| fill(buf, 4u32))
         .and_then(download)
         .sync(&ctx)

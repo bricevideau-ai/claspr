@@ -95,7 +95,7 @@ fn eager_bundle_macro_arity8_device_chains() {
     let ks = kernels::kernels(&ctx).expect("kernels");
     let branch = |seed: u32| {
         let ks = &ks;
-        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+        upload(vec![0u32; N])
             .and_then(move |buf| ks.fill_u32([N], buf, seed))
             .and_then(download)
     };
@@ -151,12 +151,8 @@ fn bundle_of_multi_output_branches() {
 fn bundle_with_copy_chain_branch() {
     let Some(ctx) = ctx() else { return };
 
-    let src = upload::<u32, claspr::ReadWrite, _>(vec![9u32; N])
-        .sync(&ctx)
-        .expect("upload src");
-    let dst = alloc_zero::<u32, claspr::ReadWrite>(N)
-        .sync(&ctx)
-        .expect("alloc dst");
+    let src = upload(vec![9u32; N]).sync(&ctx).expect("upload src");
+    let dst = alloc_zero::<u32>(N).sync(&ctx).expect("alloc dst");
 
     let (copied, marker): (Vec<u32>, u32) = bundle!(
         eager_copy_to(src, dst).and_then(|(_src, dst)| download(dst)),

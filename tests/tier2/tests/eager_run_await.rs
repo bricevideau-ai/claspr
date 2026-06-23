@@ -11,7 +11,7 @@
 //! async runtime — same harness as the old `run_await.rs`.
 //!
 //! Old → new mapping (mirrors `eager_chain.rs` / `eager_error.rs`):
-//!   `value(v).and_then(|x| upload!(x))` → `upload::<u32, ReadWrite, _>(v)`
+//!   `value(v).and_then(|x| upload!(x))` → `upload(v)`
 //!   `download!(buf)`                    → `.and_then(download)`
 //!   pure host-value arithmetic chain    → lifted single `value(..)` (the eager
 //!     `and_then` hands a `Pipe<u32>`, not the host scalar — same DEVIATION as
@@ -42,7 +42,7 @@ fn await_simple_chain() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let chain = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let chain = upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 0x1234_5678))
         .and_then(download);
 
@@ -78,14 +78,12 @@ fn await_pure_value_chain() {
 fn await_propagates_chain_error() {
     let Some(ctx) = ctx() else { return };
 
-    let chain = upload::<u32, claspr::ReadWrite, _>(vec![0u32; 16]).and_then_host(
-        |view: &mut [u32]| -> claspr::Result<()> {
-            Err(Error::LengthMismatch {
-                src: view.len(),
-                dst: 8,
-            })
-        },
-    );
+    let chain = upload(vec![0u32; 16]).and_then_host(|view: &mut [u32]| -> claspr::Result<()> {
+        Err(Error::LengthMismatch {
+            src: view.len(),
+            dst: 8,
+        })
+    });
 
     let err = block_on(chain.run(&ctx)).expect_err("chain should error");
     assert!(matches!(err, Error::LengthMismatch { .. }), "got {err:?}");

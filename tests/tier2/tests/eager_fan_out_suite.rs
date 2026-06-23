@@ -3,7 +3,7 @@
 //!
 //! Old → new mapping:
 //!   `fan_out(v, op)`    → `fan_out(v, op)` (same free-fn signature)
-//!   `upload!(v)`        → `upload::<T, claspr::ReadWrite, _>(v)`
+//!   `upload!(v)`        → `upload(v)`
 //!   `download!(buf)`    → `download`
 //!   `.and_then_host(f)` → `.and_then_host(f)` (host seam; `u32` is Mappable,
 //!                          so the View is the scalar by value — same closure)
@@ -54,7 +54,7 @@ fn fan_out_of_kernel_ops_runs_each_branch() {
     let kernels_ref = &kernels;
     let fill_values: Vec<u32> = vec![100, 200, 300, 400];
     let outputs: Vec<Vec<u32>> = fan_out(fill_values.clone(), move |val| {
-        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+        upload(vec![0u32; N])
             .and_then(move |buf| kernels_ref.fill_u32([N], buf, val))
             .and_then(download)
     })

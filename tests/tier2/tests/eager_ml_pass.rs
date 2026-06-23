@@ -1,7 +1,7 @@
 //! Eager-API port of `ml_pass.rs`: ML-style multi-stage chains.
 //!
 //! Old → new mapping:
-//!   `upload!(v)`        → `upload::<u32, claspr::ReadWrite, _>(v)`
+//!   `upload!(v)`        → `upload(v)`
 //!   `download!(buf)`    → `download`
 //!   `bundle!(a, b, c)`  → `bundle3(a, b, c)`
 //!   `.and_then_host(f)` → `.and_then_host(f)` (DeviceSlice View is `&mut [u32]`)
@@ -37,7 +37,7 @@ fn forward_pass_threads_buffer_through_three_stages() {
 
     let loss_cell = Arc::new(Mutex::new(0u32));
     let cell = Arc::clone(&loss_cell);
-    let _final_buf = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+    let _final_buf = upload(vec![1u32; N])
         .and_then(|buf| kernels.scale_u32([N], buf, 2)) // layer1
         .and_then(|buf| kernels.scale_u32([N], buf, 3)) // layer2
         .and_then_host(move |slice: &mut [u32]| {
@@ -71,7 +71,7 @@ fn forward_pass_carries_scalar_state_via_bundle() {
 
     let sum_cell = Arc::new(Mutex::new(0u32));
     let cell = Arc::clone(&sum_cell);
-    let (_final_buf, step) = upload::<u32, claspr::ReadWrite, _>(vec![10u32; N])
+    let (_final_buf, step) = upload(vec![10u32; N])
         .and_then(|buf| {
             // Pack: kernel output (a bare `Pipe<DeviceSlice>`) + the scalar 1.
             bundle!(kernels.scale_u32([N], buf, 2), value(1u32))
@@ -101,11 +101,9 @@ fn mpsc_three_producers_into_single_combine() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let producers = bundle3(
-        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
-            .and_then(|buf| kernels.fill_u32([N], buf, 3)),
-        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
-            .and_then(|buf| kernels.fill_u32([N], buf, 4)),
-        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N]),
+        upload(vec![0u32; N]).and_then(|buf| kernels.fill_u32([N], buf, 3)),
+        upload(vec![0u32; N]).and_then(|buf| kernels.fill_u32([N], buf, 4)),
+        upload(vec![0u32; N]),
     );
 
     let result: Vec<u32> = producers

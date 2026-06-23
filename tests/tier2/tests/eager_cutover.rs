@@ -26,7 +26,7 @@ fn ctx() -> Option<Context> {
 /// Context and no execution.
 #[test]
 fn describable_without_executing() {
-    let g = alloc_zero::<u32, claspr::ReadWrite>(N).and_then(|b| fill(b, 7u32));
+    let g = alloc_zero::<u32>(N).and_then(|b| fill(b, 7u32));
     assert_eq!(
         g.description(),
         vec!["alloc_zero(len=256)".to_string(), "fill".to_string()]
@@ -38,7 +38,7 @@ fn describable_without_executing() {
 fn alloc_then_fill_syncs() {
     let Some(ctx) = ctx() else { return };
 
-    let buf = alloc_zero::<u32, claspr::ReadWrite>(N)
+    let buf = alloc_zero::<u32>(N)
         .and_then(|b| fill(b, 0x55u32))
         .sync(&ctx)
         .expect("sync");
@@ -59,7 +59,7 @@ fn alloc_then_fill_syncs() {
 fn upload_fill_download_roundtrip() {
     let Some(ctx) = ctx() else { return };
 
-    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+    let out: Vec<u32> = upload(vec![1u32; N])
         .and_then(|b| fill(b, 9u32))
         .and_then(download)
         .sync(&ctx)
@@ -82,7 +82,7 @@ fn kernel_composes_in_eager_graph() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("kernels");
 
-    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let out: Vec<u32> = upload(vec![0u32; N])
         .and_then(|b| ks.fill_u32([N], b, 7u32))
         .and_then(|b| ks.scale_u32([N], b, 3u32))
         .and_then(download)
@@ -123,7 +123,7 @@ fn upload_download_preserves_data() {
     let Some(ctx) = ctx() else { return };
 
     let src: Vec<u32> = (0..N as u32).collect();
-    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(src.clone())
+    let out: Vec<u32> = upload(src.clone())
         .and_then(download)
         .sync(&ctx)
         .expect("sync");
@@ -137,7 +137,7 @@ fn upload_download_preserves_data() {
 fn chained_fills_order_via_events() {
     let Some(ctx) = ctx() else { return };
 
-    let buf = alloc_zero::<u32, claspr::ReadWrite>(N)
+    let buf = alloc_zero::<u32>(N)
         .and_then(|b| fill(b, 1u32))
         .and_then(|b| fill(b, 2u32))
         .and_then(|b| fill(b, 3u32))
@@ -163,9 +163,7 @@ fn value_and_arced() {
     assert_eq!(n, 42);
 
     // arced: wrap an uploaded buffer in Arc.
-    let shared = arced(upload::<u32, claspr::ReadWrite, _>(vec![5u32; N]))
-        .sync(&ctx)
-        .expect("arced");
+    let shared = arced(upload(vec![5u32; N])).sync(&ctx).expect("arced");
     // `shared` is an `Arc<DeviceSlice>` — a buffer verb would consume it, which
     // can't move out of the Arc. Inspect via a read map guard (borrows `&self`
     // through the Arc) instead.
@@ -180,10 +178,10 @@ fn bundles_join_branches() {
 
     // Two independent download branches join into a tuple of Vecs.
     let (a, b) = bundle2(
-        upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+        upload(vec![1u32; N])
             .and_then(|x| fill(x, 11u32))
             .and_then(download),
-        upload::<u32, claspr::ReadWrite, _>(vec![2u32; N])
+        upload(vec![2u32; N])
             .and_then(|x| fill(x, 22u32))
             .and_then(download),
     )
@@ -215,7 +213,7 @@ fn fan_out_device_work() {
     let Some(ctx) = ctx() else { return };
 
     let outs: Vec<Vec<u32>> = fan_out(vec![1u32, 2u32, 3u32], |v| {
-        upload::<u32, claspr::ReadWrite, _>(vec![0u32; 8])
+        upload(vec![0u32; 8])
             .and_then(move |b| fill(b, v))
             .and_then(download)
     })
@@ -241,15 +239,9 @@ fn multi_output_kernel_element_select() {
 
     // Concrete buffers as the kernel's chain head (ToInput accepts concrete in
     // eager too). `a = 3`, `b = 4` → `out = 7` element-wise.
-    let a = upload::<u32, claspr::ReadWrite, _>(vec![3u32; N])
-        .sync(&ctx)
-        .expect("upload a");
-    let b = upload::<u32, claspr::ReadWrite, _>(vec![4u32; N])
-        .sync(&ctx)
-        .expect("upload b");
-    let out = alloc_zero::<u32, claspr::ReadWrite>(N)
-        .sync(&ctx)
-        .expect("alloc out");
+    let a = upload(vec![3u32; N]).sync(&ctx).expect("upload a");
+    let b = upload(vec![4u32; N]).sync(&ctx).expect("upload b");
+    let out = alloc_zero::<u32>(N).sync(&ctx).expect("alloc out");
 
     let result: Vec<u32> = ks
         .add_u32([N], a, b, out)
@@ -271,15 +263,9 @@ fn multi_output_kernel_terminal_tuple() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("kernels");
 
-    let a = upload::<u32, claspr::ReadWrite, _>(vec![5u32; N])
-        .sync(&ctx)
-        .expect("upload a");
-    let b = upload::<u32, claspr::ReadWrite, _>(vec![6u32; N])
-        .sync(&ctx)
-        .expect("upload b");
-    let out = alloc_zero::<u32, claspr::ReadWrite>(N)
-        .sync(&ctx)
-        .expect("alloc out");
+    let a = upload(vec![5u32; N]).sync(&ctx).expect("upload a");
+    let b = upload(vec![6u32; N]).sync(&ctx).expect("upload b");
+    let out = alloc_zero::<u32>(N).sync(&ctx).expect("alloc out");
 
     // No downstream and_then — the kernel itself is the terminal; sync must
     // reconstruct the (a, b, out) tuple.
@@ -308,16 +294,16 @@ fn arc_split_read_only_fan_out() {
     // Shared, read-only input: 0,1,2,…,N-1.
     let src: Vec<u32> = (0..N as u32).collect();
 
-    let (out_a, out_b) = arc_split::<2, _>(arced(upload::<u32, claspr::ReadWrite, _>(src.clone())))
+    let (out_a, out_b) = arc_split::<2, _>(arced(upload(src.clone())))
         .and_then(|[a, b]| {
             // Each branch owns one Arc clone of the SAME device buffer and reads
             // it (read-only kernel arg) into its own private destination.
             let ks = &ks;
             bundle2(
-                alloc_zero::<u32, claspr::ReadWrite>(N)
+                alloc_zero::<u32>(N)
                     .and_then(move |dst| ks.copy_u32([N], a, dst))
                     .and_then(|(_src, dst)| download(dst)),
-                alloc_zero::<u32, claspr::ReadWrite>(N)
+                alloc_zero::<u32>(N)
                     .and_then(move |dst| ks.copy_u32([N], b, dst))
                     .and_then(|(_src, dst)| download(dst)),
             )
@@ -337,7 +323,7 @@ fn arc_split_read_only_fan_out() {
 fn arc_split_terminal_array() {
     let Some(ctx) = ctx() else { return };
 
-    let [a, b, c] = arc_split::<3, _>(arced(upload::<u32, claspr::ReadWrite, _>(vec![9u32; N])))
+    let [a, b, c] = arc_split::<3, _>(arced(upload(vec![9u32; N])))
         .sync(&ctx)
         .expect("arc_split terminal");
 
@@ -371,12 +357,8 @@ fn arc_split_terminal_array() {
 fn device_copy_eager() {
     let Some(ctx) = ctx() else { return };
 
-    let src = upload::<u32, claspr::ReadWrite, _>(vec![7u32; N])
-        .sync(&ctx)
-        .expect("upload src");
-    let dst = alloc_zero::<u32, claspr::ReadWrite>(N)
-        .sync(&ctx)
-        .expect("alloc dst");
+    let src = upload(vec![7u32; N]).sync(&ctx).expect("upload src");
+    let dst = alloc_zero::<u32>(N).sync(&ctx).expect("alloc dst");
 
     let result: Vec<u32> = eager_copy_to(src, dst)
         .and_then(|(_src, dst)| download(dst))
@@ -399,7 +381,7 @@ fn device_copy_eager() {
 fn eager_and_then_with_context() {
     let Some(ctx) = ctx() else { return };
 
-    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+    let out: Vec<u32> = upload(vec![1u32; N])
         .and_then_with_context(|ec, buf| {
             // Touch the live ExecutionContext to prove it's in scope at execute.
             let _dev = ec.device();
@@ -425,7 +407,7 @@ fn eager_and_then_with_context() {
 fn eager_and_then_host() {
     let Some(ctx) = ctx() else { return };
 
-    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+    let out: Vec<u32> = upload(vec![1u32; N])
         .and_then_host(|slice: &mut [u32]| {
             for x in slice.iter_mut() {
                 *x += 1;
@@ -450,7 +432,7 @@ fn eager_and_then_host() {
 fn eager_and_then_host_error_propagates() {
     let Some(ctx) = ctx() else { return };
 
-    let res = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+    let res = upload(vec![1u32; N])
         .and_then_host(|_slice: &mut [u32]| Err(claspr::Error::SvmNotAvailable))
         .and_then(download)
         .sync(&ctx);
@@ -513,7 +495,7 @@ fn eager_on_device() {
 
     // Two fill stages, each routed to a distinct device from the context, then
     // download. Device identity resolved from `ec` each stage (portable idiom).
-    let out: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let out: Vec<u32> = upload(vec![0u32; N])
         .and_then_with_context(|ec, buf| fill(buf, 3u32).on_device(ec.device_at(0)))
         .and_then_with_context(|ec, buf| fill(buf, 7u32).on_device(ec.device_at(1)))
         .and_then(download)

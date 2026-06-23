@@ -5,7 +5,7 @@
 //! Despite the file name, the original uses NO async terminal — it terminates
 //! with `.sync()` (and one Tier-1 `.wait()` mid-stream). Both map directly onto
 //! the eager `.sync(&ctx)` terminal:
-//!   `upload!(v)`              → `upload::<u32, ReadWrite, _>(v)`
+//!   `upload!(v)`              → `upload(v)`
 //!   `download!(buf)`          → `.and_then(download)`
 //!   Tier-1 `kernel(...).wait()` → eager `kernel(...).sync(&ctx)` (single-output
 //!                                kernel `.sync()` yields the `DeviceSlice`,
@@ -35,7 +35,7 @@ fn split_chain_with_host_decision_between() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     // First chain: upload + fill. Buffer flows out via .sync().
-    let buf = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let buf = upload(vec![0u32; N])
         .and_then(|b| kernels.fill_u32([N], b, 5))
         .sync(&ctx)
         .expect("first half");
@@ -61,15 +61,18 @@ fn split_chain_then_reuse_buffer_for_independent_work() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let buf = upload(vec![0u32; N])
         .and_then(|b| kernels.fill_u32([N], b, 1))
         .sync(&ctx)
         .expect("phase 1");
-    // Mid-stream "Tier 1"-style run-to-completion: eager `.sync()` yields the
-    // buffer back (the single-output kernel's `Output = DeviceSlice`).
+    // Mid-stream "Tier 1"-style run-to-completion: the kernel Op is a
+    // concrete-head `DeviceOp` (it owns its buffer arg), so its no-launcher
+    // `.wait()` recovers the context from the buffer and yields it back (the
+    // single-output kernel's `Output = DeviceSlice`) — the restored Tier-1
+    // terminal, no `&ctx`.
     let buf = kernels
         .scale_u32([N], buf, 10)
-        .sync(&ctx)
+        .wait()
         .expect("phase 2 (run-to-completion in the middle)");
     // Pick the second half back up as an eager chain.
     let result: Vec<u32> = kernels

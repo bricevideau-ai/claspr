@@ -5,7 +5,7 @@
 //! Old → new mapping:
 //!   `value(x)`            → `value(x)` (eager `value`; scalar/`()` is `Mappable`,
 //!                            so the host seam's "view" is the value by-copy)
-//!   `upload!(v)`          → `upload::<u32, ReadWrite, _>(v)`
+//!   `upload!(v)`          → `upload(v)`
 //!   `.and_then_host(|_|…)`→ same method on `DeviceOpExt`; closure `Err` surfaces
 //!                            at the terminal via `?` (see eager_cutover
 //!                            `eager_and_then_host_error_propagates`).
@@ -73,7 +73,7 @@ fn error_after_some_device_work_still_propagates() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let result = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let result = upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 5))
         .and_then_host(|_slice: &mut [u32]| {
             Err::<(), _>(Error::Build {

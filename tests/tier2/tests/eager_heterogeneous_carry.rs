@@ -49,7 +49,7 @@ fn bundle_mixes_pipe_and_value_scalar_arrives_by_value() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("kernels");
 
-    let (out, carried): (Vec<u32>, u32) = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let (out, carried): (Vec<u32>, u32) = upload(vec![0u32; N])
         .and_then(|buf| bundle!(ks.fill_u32([N], buf, 7), value(42u32)))
         // `buf` is a Pipe<DeviceSlice>, `scalar` is a u32 BY VALUE — this binding
         // would not type-check if the bundle handed a Pipe<u32> here.
@@ -75,7 +75,7 @@ fn carried_scalar_is_computed_on_in_chain() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("kernels");
 
-    let (out, step): (Vec<u32>, u32) = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+    let (out, step): (Vec<u32>, u32) = upload(vec![1u32; N])
         .and_then(|buf| bundle!(ks.scale_u32([N], buf, 2), value(0u32)))
         .and_then(|(buf, step)| {
             // step: u32 — `step + 1` is a build-time host computation.

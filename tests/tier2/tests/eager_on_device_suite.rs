@@ -7,7 +7,7 @@
 //! `eager_cutover::eager_on_device` test fn / harness expectations.
 //!
 //! Old → new mapping:
-//!   `upload!(v)`                  → `upload::<u32, claspr::ReadWrite, _>(v)`
+//!   `upload!(v)`                  → `upload(v)`
 //!   `download!(buf)`              → `download`
 //!   `.and_then_with_context(...)` → same name on `DeviceOpExt`
 //!   `kernel(...).on_device(dev)`  → same `.on_device(...)` on the eager kernel op
@@ -80,7 +80,7 @@ fn on_device_routes_chain_to_devices_from_context() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let result: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+    let result: Vec<u32> = upload(vec![1u32; N])
         .and_then_with_context(move |ec, buf| {
             kernels_ref
                 .scale_u32([N], buf, 3)
@@ -109,7 +109,7 @@ fn on_device_preserves_host_error_slot_across_routing() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let chain = upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+    let chain = upload(vec![1u32; N])
         .and_then_with_context(move |ec, buf| {
             kernels_ref
                 .scale_u32([N], buf, 2)
@@ -141,14 +141,14 @@ fn on_device_bundle_runs_branches_on_distinct_devices() {
     let kernels_ref = &kernels;
 
     let (a, b): (Vec<u32>, Vec<u32>) = bundle2(
-        upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+        upload(vec![1u32; N])
             .and_then_with_context(move |ec, buf| {
                 kernels_ref
                     .scale_u32([N], buf, 7)
                     .on_device(ec.device_at(0))
             })
             .and_then(download),
-        upload::<u32, claspr::ReadWrite, _>(vec![1u32; N])
+        upload(vec![1u32; N])
             .and_then_with_context(move |ec, buf| {
                 kernels_ref
                     .scale_u32([N], buf, 11)

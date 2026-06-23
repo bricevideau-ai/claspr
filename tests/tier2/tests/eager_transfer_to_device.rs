@@ -13,7 +13,7 @@
 //!
 //! Old → new mapping:
 //!   `claspr_async::transfer_to_device(buf, dev)` → `claspr::eager::transfer_to_device(buf, dev)`
-//!   `upload!(v)`                                 → `upload::<u32, ReadWrite, _>(v)`
+//!   `upload!(v)`                                 → `upload(v)`
 //!   `download!(buf)`                             → `download`
 //!   `.and_then_with_context(...)`                → same name on `DeviceOpExt`
 //!   `kernel(...).on_device(dev)`                 → same `.on_device(...)` eager op
@@ -26,7 +26,7 @@
 
 use claspr::device::Platform;
 use claspr::eager::{DeviceOpExt, download, transfer_to_device, upload};
-use claspr::{Context, Device, ReadWrite};
+use claspr::{Context, Device};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;
@@ -84,7 +84,7 @@ fn transfer_to_device_completes_in_chain() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let result: Vec<u32> = upload::<u32, ReadWrite, _>(vec![5u32; N])
+    let result: Vec<u32> = upload(vec![5u32; N])
         .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(1)))
         .and_then_with_context(move |ec, buf| {
             kernels_ref
@@ -108,7 +108,7 @@ fn transfer_then_on_device_matches_scenario_14_shape() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let result: Vec<u32> = upload::<u32, ReadWrite, _>(vec![1u32; N])
+    let result: Vec<u32> = upload(vec![1u32; N])
         .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(0)))
         .and_then_with_context(move |ec, buf| {
             kernels_ref

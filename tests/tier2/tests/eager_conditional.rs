@@ -11,7 +11,7 @@
 //! `eager_chain.rs::value_passthrough`; the value is computed up front).
 //!
 //!   `DynOp::new(op)`    → `DeviceDynOp::new(op)`
-//!   `upload!(v)`        → `upload::<u32, claspr::ReadWrite, _>(v)`
+//!   `upload!(v)`        → `upload(v)`
 //!   `download!(buf)`    → `download`
 //!   `.and_then_host(f)` → `.and_then_host(f)` (DeviceSlice View is `&mut [u32]`)
 
@@ -78,8 +78,7 @@ fn dyn_op_wraps_value_chain() {
 #[test]
 fn dyn_op_wraps_upload_download() {
     let Some(ctx) = ctx() else { return };
-    let chain: DeviceDynOp<Vec<u32>> =
-        DeviceDynOp::new(upload::<u32, claspr::ReadWrite, _>(vec![7u32; N]).and_then(download));
+    let chain: DeviceDynOp<Vec<u32>> = DeviceDynOp::new(upload(vec![7u32; N]).and_then(download));
     let v = chain.sync(&ctx).expect("sync");
     assert!(v.iter().all(|&x| x == 7));
 }
@@ -93,7 +92,7 @@ fn baseline_kernel_chain_without_dynop() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let sum_cell = Arc::new(Mutex::new(0u32));
     let cell = Arc::clone(&sum_cell);
-    let _final_buf = upload::<u32, claspr::ReadWrite, _>(vec![3u32; N])
+    let _final_buf = upload(vec![3u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 9))
         .and_then_host(move |slice: &mut [u32]| {
             *cell.lock().unwrap() = slice.iter().sum();
@@ -129,7 +128,7 @@ fn dyn_op_minimal_kernel_chain() {
     let cell = Arc::clone(&sum_cell);
 
     let chain: DeviceDynOp<claspr::DeviceSlice<u32>> = DeviceDynOp::new(
-        upload::<u32, claspr::ReadWrite, _>(vec![3u32; N])
+        upload(vec![3u32; N])
             .and_then(|buf| kernels.fill_u32([N], buf, 9))
             .and_then_host(move |slice: &mut [u32]| {
                 *cell.lock().unwrap() = slice.iter().sum();
@@ -154,7 +153,7 @@ fn dyn_op_picks_branch_with_or_without_kernel() {
         if use_kernel {
             let cell = Arc::clone(&sum_cell);
             DeviceDynOp::new(
-                upload::<u32, claspr::ReadWrite, _>(vec![3u32; N])
+                upload(vec![3u32; N])
                     .and_then(move |buf| kernels_ref.fill_u32([N], buf, 9))
                     .and_then_host(move |slice: &mut [u32]| {
                         *cell.lock().unwrap() = slice.iter().sum();
@@ -186,7 +185,7 @@ fn non_taken_branch_closure_does_not_fire() {
             DeviceDynOp::new(value(7u32))
         } else {
             DeviceDynOp::new(
-                upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+                upload(vec![0u32; N])
                     .and_then_host(|_slice: &mut [u32]| -> claspr::Result<()> {
                         panic!("non-taken branch fired — DeviceDynOp construction must be lazy");
                     })

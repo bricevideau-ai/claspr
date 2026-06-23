@@ -4,7 +4,7 @@
 //! surface marshals f64 exactly as it does u32.
 //!
 //! Old → new mapping (identical to the u32 chains in eager_chain.rs):
-//!   `upload!(v)`     → `upload::<f64, claspr::ReadWrite, _>(v)`
+//!   `upload!(v)`     → `upload(v)`
 //!   `download!(buf)` → `download` (terminal `.and_then(download).sync()`)
 //!
 //! Skips when the device doesn't advertise `Float64` (llvmpipe needs
@@ -37,7 +37,7 @@ fn f64_chain_via_async_combinators() {
     let Some(ctx) = ctx_with_f64() else { return };
     let kernels = kernels::kernels(&ctx).expect("kernels load");
 
-    let result: Vec<f64> = upload::<f64, claspr::ReadWrite, _>(vec![0.0f64; N])
+    let result: Vec<f64> = upload(vec![0.0f64; N])
         .and_then(|buf| kernels.fill_f64([N], buf, 1.0))
         .and_then(|buf| kernels.scale_f64([N], buf, 4.0))
         .and_then(download)

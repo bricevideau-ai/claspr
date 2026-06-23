@@ -60,35 +60,28 @@ fn diamond_shares_single_cl_mem_via_arc_device_slice() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let result: Vec<u32> =
-        arc_split::<2, _>(arced(upload::<u32, claspr::ReadWrite, _>(vec![5u32; N])))
-            .and_then(|[s1, s2]| {
-                let ks = &kernels;
-                bundle3(
-                    // Branch A: out = shared + [10; N], reduced to its single
-                    // `out` pipe via `forward` (= old `value(out)`, no device work)
-                    // so the bundle hands the combine kernel a `Pipe<DeviceSlice>`.
-                    bundle2(
-                        upload::<u32, claspr::ReadWrite, _>(vec![10u32; N]),
-                        alloc_zero::<u32, claspr::ReadWrite>(N),
-                    )
+    let result: Vec<u32> = arc_split::<2, _>(arced(upload(vec![5u32; N])))
+        .and_then(|[s1, s2]| {
+            let ks = &kernels;
+            bundle3(
+                // Branch A: out = shared + [10; N], reduced to its single
+                // `out` pipe via `forward` (= old `value(out)`, no device work)
+                // so the bundle hands the combine kernel a `Pipe<DeviceSlice>`.
+                bundle2(upload(vec![10u32; N]), alloc_zero::<u32>(N))
                     .and_then(move |(a_in, out)| ks.add_u32([N], s1, a_in, out))
                     .and_then(|(_s, _a_in, out)| forward(out)),
-                    // Branch B: out = shared + [20; N], same reducer.
-                    bundle2(
-                        upload::<u32, claspr::ReadWrite, _>(vec![20u32; N]),
-                        alloc_zero::<u32, claspr::ReadWrite>(N),
-                    )
+                // Branch B: out = shared + [20; N], same reducer.
+                bundle2(upload(vec![20u32; N]), alloc_zero::<u32>(N))
                     .and_then(move |(b_in, out)| ks.add_u32([N], s2, b_in, out))
                     .and_then(|(_s, _b_in, out)| forward(out)),
-                    // Fresh destination for the combine.
-                    alloc_zero::<u32, claspr::ReadWrite>(N),
-                )
-                .and_then(move |(a_out, b_out, out)| ks.add_u32([N], a_out, b_out, out))
-                .and_then(|(_a, _b, out)| download(out))
-            })
-            .sync(&ctx)
-            .expect("diamond chain");
+                // Fresh destination for the combine.
+                alloc_zero::<u32>(N),
+            )
+            .and_then(move |(a_out, b_out, out)| ks.add_u32([N], a_out, b_out, out))
+            .and_then(|(_a, _b, out)| download(out))
+        })
+        .sync(&ctx)
+        .expect("diamond chain");
 
     assert_eq!(result.len(), N);
     // (5 + 10) + (5 + 20) = 15 + 25 = 40
@@ -124,30 +117,26 @@ fn arc_device_slice_refcount_holds_until_last_branch_finishes() {
     // The nested-bundle terminal output type, named to keep the destructure
     // clippy-clean (type_complexity).
     type FanOutputs = (Vec<u32>, (Vec<u32>, (Vec<u32>, Vec<u32>)));
-    let (a, (_b, (_c, _d))): FanOutputs =
-        arc_split::<4, _>(arced(upload::<u32, claspr::ReadWrite, _>(vec![7u32; N])))
-            .and_then(|[s1, s2, s3, s4]| {
-                let ks = &kernels;
-                // out = shared(7) + [0; N] = 7 on every branch. Nested
-                // bundle-of-bundles: A joined with (B joined with (C joined
-                // with D)). Each branch downloads its own output.
-                let branch = |s| {
-                    bundle2(
-                        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N]),
-                        alloc_zero::<u32, claspr::ReadWrite>(N),
-                    )
+    let (a, (_b, (_c, _d))): FanOutputs = arc_split::<4, _>(arced(upload(vec![7u32; N])))
+        .and_then(|[s1, s2, s3, s4]| {
+            let ks = &kernels;
+            // out = shared(7) + [0; N] = 7 on every branch. Nested
+            // bundle-of-bundles: A joined with (B joined with (C joined
+            // with D)). Each branch downloads its own output.
+            let branch = |s| {
+                bundle2(upload(vec![0u32; N]), alloc_zero::<u32>(N))
                     .and_then(move |(b, out)| ks.add_u32([N], s, b, out))
                     .and_then(|(_s, _b, out)| forward(out))
                     .and_then(download)
-                };
-                // Bundle of bundles (nested join) — composes cleanly in eager.
-                bundle2(
-                    branch(s1),
-                    bundle2(branch(s2), bundle2(branch(s3), branch(s4))),
-                )
-            })
-            .sync(&ctx)
-            .expect("4-way fan chain");
+            };
+            // Bundle of bundles (nested join) — composes cleanly in eager.
+            bundle2(
+                branch(s1),
+                bundle2(branch(s2), bundle2(branch(s3), branch(s4))),
+            )
+        })
+        .sync(&ctx)
+        .expect("4-way fan chain");
 
     assert!(a.iter().all(|&v| v == 7));
     assert_eq!(ctx.error_count(), 0);

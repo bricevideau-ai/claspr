@@ -1444,12 +1444,25 @@ pub struct AllocZero<T, M: MemMode = ReadWrite> {
     _t: PhantomData<fn() -> T>,
 }
 
-/// Build a zero-init alloc leaf.
-pub fn alloc_zero<T, M>(len: usize) -> AllocZero<T, M>
+/// Build a zero-init alloc leaf with the **default [`ReadWrite`] marker** — no
+/// turbofish: `alloc_zero(N)`. For a non-default marker use [`alloc_zero_as`]
+/// with a marker witness (`alloc_zero_as(N, HostReadOnly)`).
+pub fn alloc_zero<T>(len: usize) -> AllocZero<T, ReadWrite>
+where
+    T: Copy + Default + Send + Sync + 'static,
+{
+    alloc_zero_as(len, ReadWrite)
+}
+
+/// Build a zero-init alloc leaf with an **explicit access marker**, inferred
+/// from the `marker` witness — no turbofish: `alloc_zero_as(N, HostReadOnly)`.
+/// The default-marker shorthand is [`alloc_zero`].
+pub fn alloc_zero_as<T, M>(len: usize, marker: M) -> AllocZero<T, M>
 where
     T: Copy + Default + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
 {
+    let _ = marker;
     AllocZero {
         len,
         out: Pipe::new(),
@@ -1602,13 +1615,32 @@ pub struct Upload<T: Copy, M: MemMode = ReadWrite> {
     out: Pipe<DeviceSlice<T, M>>,
 }
 
-/// Build an upload leaf from any `Vec<T>` / `Box<[T]>` / `Arc<[T]>`.
-pub fn upload<T, M, S>(src: S) -> Upload<T, M>
+/// Build an upload leaf from any `Vec<T>` / `Box<[T]>` / `Arc<[T]>`, with the
+/// **default [`ReadWrite`] marker** — the overwhelming common case, so no
+/// turbofish: `upload(vec![1u32, 2, 3])`. For a non-default marker use
+/// [`upload_as`] with a marker witness (`upload_as(src, Frozen)`); both paths
+/// go through `from_slice` (`CL_MEM_COPY_HOST_PTR`), the only constructor that
+/// can build an immutable `Frozen`/`ReadOnly` buffer.
+pub fn upload<T, S>(src: S) -> Upload<T, ReadWrite>
+where
+    T: Copy + Send + Sync + 'static,
+    S: Into<UploadSource<T>>,
+{
+    upload_as(src, ReadWrite)
+}
+
+/// Build an upload leaf with an **explicit access marker**, inferred from the
+/// `marker` witness — no turbofish: `upload_as(src, Frozen)` /
+/// `upload_as(src, ReadOnly)`. `T`/`S` infer from `src`, `M` from the witness.
+/// The default-marker shorthand is [`upload`]. Like `upload`, backed by
+/// `from_slice` (`CL_MEM_COPY_HOST_PTR`).
+pub fn upload_as<T, M, S>(src: S, marker: M) -> Upload<T, M>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Send + 'static,
     S: Into<UploadSource<T>>,
 {
+    let _ = marker; // witness only — fixes M, zero-sized, no runtime use.
     Upload {
         src: Some(src.into()),
         out: Pipe::new(),
@@ -2435,12 +2467,25 @@ pub struct UsmSlice<T, M: MemMode = ReadWrite> {
     out: Pipe<USMSlice<T, M>>,
 }
 
-/// Build an eager USM-wrap leaf from a host `Vec<T>`.
-pub fn usm_slice<T, M>(data: Vec<T>) -> UsmSlice<T, M>
+/// Build an eager USM-wrap leaf from a host `Vec<T>` with the **default
+/// [`ReadWrite`] marker** — no turbofish: `usm_slice(data)`. For a non-default
+/// marker use [`usm_slice_as`] with a marker witness.
+pub fn usm_slice<T>(data: Vec<T>) -> UsmSlice<T, ReadWrite>
+where
+    T: Send + 'static,
+{
+    usm_slice_as(data, ReadWrite)
+}
+
+/// Build an eager USM-wrap leaf with an **explicit access marker**, inferred
+/// from the `marker` witness — no turbofish: `usm_slice_as(data, HostReadOnly)`.
+/// The default-marker shorthand is [`usm_slice`].
+pub fn usm_slice_as<T, M>(data: Vec<T>, marker: M) -> UsmSlice<T, M>
 where
     T: Send + 'static,
     M: MemMode + Send + 'static,
 {
+    let _ = marker;
     UsmSlice {
         data: Some(data),
         out: Pipe::new(),
@@ -2489,12 +2534,25 @@ pub struct UsmAllocUninit<T, M: MemMode = ReadWrite> {
     _t: PhantomData<fn() -> (T, M)>,
 }
 
-/// Build an eager uninit-USM alloc leaf.
-pub fn usm_alloc_uninit<T, M>(len: usize) -> UsmAllocUninit<T, M>
+/// Build an eager uninit-USM alloc leaf with the **default [`ReadWrite`]
+/// marker** — no turbofish: `usm_alloc_uninit(N)`. For a non-default marker use
+/// [`usm_alloc_uninit_as`] with a marker witness.
+pub fn usm_alloc_uninit<T>(len: usize) -> UsmAllocUninit<T, ReadWrite>
+where
+    T: Send + 'static,
+{
+    usm_alloc_uninit_as(len, ReadWrite)
+}
+
+/// Build an eager uninit-USM alloc leaf with an **explicit access marker**,
+/// inferred from the `marker` witness. The default-marker shorthand is
+/// [`usm_alloc_uninit`].
+pub fn usm_alloc_uninit_as<T, M>(len: usize, marker: M) -> UsmAllocUninit<T, M>
 where
     T: Send + 'static,
     M: MemMode + Send + 'static,
 {
+    let _ = marker;
     UsmAllocUninit {
         len,
         out: Pipe::new(),
@@ -2542,12 +2600,25 @@ pub struct DeviceAllocUninit<T, M: MemMode = ReadWrite> {
     _t: PhantomData<fn() -> (T, M)>,
 }
 
-/// Build an eager uninit-`DeviceSlice` alloc leaf.
-pub fn device_alloc_uninit<T, M>(len: usize) -> DeviceAllocUninit<T, M>
+/// Build an eager uninit-`DeviceSlice` alloc leaf with the **default
+/// [`ReadWrite`] marker** — no turbofish: `device_alloc_uninit(N)`. For a
+/// non-default marker use [`device_alloc_uninit_as`] with a marker witness.
+pub fn device_alloc_uninit<T>(len: usize) -> DeviceAllocUninit<T, ReadWrite>
+where
+    T: Send + 'static,
+{
+    device_alloc_uninit_as(len, ReadWrite)
+}
+
+/// Build an eager uninit-`DeviceSlice` alloc leaf with an **explicit access
+/// marker**, inferred from the `marker` witness. The default-marker shorthand
+/// is [`device_alloc_uninit`].
+pub fn device_alloc_uninit_as<T, M>(len: usize, marker: M) -> DeviceAllocUninit<T, M>
 where
     T: Send + 'static,
     M: MemMode + Send + 'static,
 {
+    let _ = marker;
     DeviceAllocUninit {
         len,
         out: Pipe::new(),
@@ -2595,12 +2666,25 @@ pub struct MappedAllocUninit<T, M: MemMode = ReadWrite> {
     _t: PhantomData<fn() -> (T, M)>,
 }
 
-/// Build an eager uninit-`MappedSlice` alloc leaf.
-pub fn mapped_alloc_uninit<T, M>(len: usize) -> MappedAllocUninit<T, M>
+/// Build an eager uninit-`MappedSlice` alloc leaf with the **default
+/// [`ReadWrite`] marker** — no turbofish: `mapped_alloc_uninit(N)`. For a
+/// non-default marker use [`mapped_alloc_uninit_as`] with a marker witness.
+pub fn mapped_alloc_uninit<T>(len: usize) -> MappedAllocUninit<T, ReadWrite>
+where
+    T: Send + 'static,
+{
+    mapped_alloc_uninit_as(len, ReadWrite)
+}
+
+/// Build an eager uninit-`MappedSlice` alloc leaf with an **explicit access
+/// marker**, inferred from the `marker` witness. The default-marker shorthand
+/// is [`mapped_alloc_uninit`].
+pub fn mapped_alloc_uninit_as<T, M>(len: usize, marker: M) -> MappedAllocUninit<T, M>
 where
     T: Send + 'static,
     M: MemMode + Send + 'static,
 {
+    let _ = marker;
     MappedAllocUninit {
         len,
         out: Pipe::new(),
@@ -3254,6 +3338,135 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("copy_to".into());
+    }
+}
+
+// ── Piped-buffer verb methods: a piped buffer behaves as a buffer ───────────
+//
+// The concrete `DeviceSlice::{write,read,fill,copy_to}` verbs (buffer.rs) return
+// eager ops. A buffer that is *produced upstream* in a graph — a `Pipe<buffer>`,
+// the build-time handle of an alloc/upload/kernel op — should read the same way:
+// `device_alloc_uninit(n).and_then(|u| u.write(data))`, `bundle!(buf.write(vec),
+// other)`. These inherent impls give the pipe types the same verbs, each
+// delegating to the eager free fn (which takes `impl Into<Input<_>>`, and a
+// `Pipe<T>` converts to `Input::Pipe`). Inherent impls on the concrete owned
+// `Pipe<...>` type — no coherence wall. The marker bounds match the concrete
+// `DeviceSlice` methods exactly (`HostWritable` / `HostReadable` / `Fillable`).
+
+impl<T, M: MemMode> Pipe<DeviceSlice<T, M>> {
+    /// Write `src` into this piped buffer — delegates to [`write`](fn@write). Same
+    /// `M: HostWritable` bound as [`DeviceSlice::write`](crate::DeviceSlice::write).
+    pub fn write<S>(self, src: S) -> WriteDevice<T, M>
+    where
+        T: Send + Sync + 'static,
+        M: HostWritable + Send + 'static,
+        S: Into<UploadSource<T>>,
+    {
+        write(self, src)
+    }
+
+    /// Read this piped buffer into a fresh `Vec<T>` — delegates to [`download`].
+    /// Same `M: HostReadable` bound as [`download`].
+    pub fn read(self) -> Download<T, M>
+    where
+        T: Clone + Default + Send + 'static,
+        M: HostReadable + Send + 'static,
+    {
+        download(self)
+    }
+
+    /// Fill this piped buffer with `value` — delegates to [`fill`]. Same
+    /// `M: Fillable` bound as [`DeviceSlice::fill`](crate::DeviceSlice::fill).
+    pub fn fill(self, value: T) -> Fill<T, M>
+    where
+        T: Copy + Send + Sync + 'static,
+        M: Fillable + Send + 'static,
+    {
+        fill(self, value)
+    }
+
+    /// Device-to-device copy this piped buffer into `dst` — delegates to
+    /// [`eager_copy_to`]. Yields `(src, dst)`. Same shape as
+    /// [`DeviceSlice::copy_to`](crate::DeviceSlice::copy_to).
+    pub fn copy_to<M2>(
+        self,
+        dst: DeviceSlice<T, M2>,
+    ) -> CopyTo2<DeviceSlice<T, M>, DeviceSlice<T, M2>>
+    where
+        T: Send + 'static,
+        M: Send + 'static,
+        M2: MemMode + Send + 'static,
+    {
+        eager_copy_to(self, dst)
+    }
+}
+
+impl<T, M: MemMode> Pipe<DeviceSliceUninit<T, M>> {
+    /// Write `src` into this piped uninit buffer (transitioning it to init) —
+    /// delegates to [`write_device_uninit`].
+    pub fn write<S>(self, src: S) -> WriteDeviceUninit<T, M>
+    where
+        T: Send + Sync + 'static,
+        M: HostUploadable + HostWritable + Send + 'static,
+        S: Into<UploadSource<T>>,
+    {
+        write_device_uninit(self, src)
+    }
+
+    /// Fill this piped uninit buffer with `value` (transitioning it to init) —
+    /// delegates to [`fill_device_uninit`].
+    pub fn fill(self, value: T) -> FillDeviceUninit<T, M>
+    where
+        T: Copy + Send + Sync + 'static,
+        M: Fillable + Send + 'static,
+    {
+        fill_device_uninit(self, value)
+    }
+}
+
+impl<T, M: MemMode> Pipe<MappedSliceUninit<T, M>> {
+    /// Write `src` into this piped uninit mapped buffer — delegates to
+    /// [`write_mapped_uninit`].
+    pub fn write<S>(self, src: S) -> WriteMappedUninit<T, M>
+    where
+        T: Send + Sync + 'static,
+        M: HostWritable + Send + 'static,
+        S: Into<UploadSource<T>>,
+    {
+        write_mapped_uninit(self, src)
+    }
+
+    /// Fill this piped uninit mapped buffer with `value` — delegates to
+    /// [`fill_mapped_uninit`].
+    pub fn fill(self, value: T) -> FillMappedUninit<T, M>
+    where
+        T: Copy + Send + Sync + 'static,
+        M: Fillable + Send + 'static,
+    {
+        fill_mapped_uninit(self, value)
+    }
+}
+
+impl<T, M: MemMode> Pipe<USMSliceUninit<T, M>> {
+    /// Write `src` into this piped uninit USM buffer — delegates to
+    /// [`write_usm_uninit`].
+    pub fn write<S>(self, src: S) -> WriteUsmUninit<T, M>
+    where
+        T: Copy + Send + Sync + 'static,
+        M: Send + 'static,
+        S: Into<UploadSource<T>>,
+    {
+        write_usm_uninit(self, src)
+    }
+
+    /// Fill this piped uninit USM buffer with `value` — delegates to
+    /// [`fill_usm_uninit`].
+    pub fn fill(self, value: T) -> FillUsmUninit<T, M>
+    where
+        T: Copy + Send + Sync + 'static,
+        M: Send + 'static,
+    {
+        fill_usm_uninit(self, value)
     }
 }
 

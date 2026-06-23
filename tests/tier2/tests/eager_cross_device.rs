@@ -5,7 +5,7 @@
 //! `.and_then_with_context` closures.
 //!
 //! Old → new mapping:
-//!   `upload!(v)`                  → `upload::<u32, claspr::ReadWrite, _>(v)`
+//!   `upload!(v)`                  → `upload(v)`
 //!   `download!(buf)`              → `download`
 //!   `.and_then_with_context(...)` → same name on `DeviceOpExt`
 //!   `kernel(...).on_device(dev)`  → same `.on_device(...)` on the eager kernel op
@@ -87,7 +87,7 @@ fn pipeline_spans_two_devices_via_mapped_slice() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let result: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let result: Vec<u32> = upload(vec![0u32; N])
         .and_then_with_context(move |ec, buf| {
             kernels_ref.fill_u32([N], buf, 3).on_device(ec.device_at(0))
         })
@@ -112,14 +112,14 @@ fn downloaded_vec_can_be_reuploaded_into_a_fresh_chain() {
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let intermediate: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let intermediate: Vec<u32> = upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 5))
         .and_then(download)
         .sync(&ctx)
         .expect("chain 1");
     assert!(intermediate.iter().all(|&v| v == 5));
 
-    let final_result: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(intermediate)
+    let final_result: Vec<u32> = upload(intermediate)
         .and_then(|buf| kernels.scale_u32([N], buf, 6))
         .and_then(download)
         .sync(&ctx)

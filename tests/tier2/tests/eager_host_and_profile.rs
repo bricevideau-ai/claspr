@@ -4,7 +4,7 @@
 //! host-seam half. All four originals are accounted for across the two files.
 //!
 //! Old → new mapping:
-//!   `value(v).and_then(|x| upload!(x))` → `upload::<u32, ReadWrite, _>(v)`
+//!   `value(v).and_then(|x| upload!(x))` → `upload(v)`
 //!   `.and_then_host(|view|…)`           → same method on `DeviceOpExt`
 
 use claspr::eager::{DeviceOpExt, upload, value};
@@ -38,7 +38,7 @@ fn and_then_host_sum_between_device_stages() {
     // Arc<Mutex<_>> side-effect channel.
     let sum_cell = Arc::new(Mutex::new(0u32));
     let cell = Arc::clone(&sum_cell);
-    let _final_buf = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let _final_buf = upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 3))
         .and_then_host(move |slice: &mut [u32]| {
             *cell.lock().unwrap() = slice.iter().sum();

@@ -5,7 +5,7 @@
 //! `upload` of that Vec into a chain bound to the other Context.
 //!
 //! Old → new mapping:
-//!   `upload!(v)`     → `upload::<u32, claspr::ReadWrite, _>(v)`
+//!   `upload!(v)`     → `upload(v)`
 //!   `download!(buf)` → `download` (terminal `.and_then(download).sync(&ctx)`)
 //!
 //! Pins the same contract: if a future refactor let a `cl_mem` leak across
@@ -41,7 +41,7 @@ fn vec_round_trips_between_two_contexts() {
     let kernels_b = kernels::kernels(&ctx_b).expect("load kernels on ctx_b");
 
     // Chain 1 on ctx_a: fill → download. Result is a host-owned Vec.
-    let intermediate: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let intermediate: Vec<u32> = upload(vec![0u32; N])
         .and_then(|buf| kernels_a.fill_u32([N], buf, 7))
         .and_then(download)
         .sync(&ctx_a)
@@ -51,7 +51,7 @@ fn vec_round_trips_between_two_contexts() {
     // Chain 2 on ctx_b: re-upload that Vec → scale → download. The `cl_mem`
     // allocated by `upload` here is fresh in ctx_b's address space — proving the
     // Vec is the only bridge.
-    let final_result: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(intermediate)
+    let final_result: Vec<u32> = upload(intermediate)
         .and_then(|buf| kernels_b.scale_u32([N], buf, 6))
         .and_then(download)
         .sync(&ctx_b)

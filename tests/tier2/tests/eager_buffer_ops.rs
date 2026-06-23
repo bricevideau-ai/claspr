@@ -2,13 +2,13 @@
 //! rewritten against `claspr::eager`.
 //!
 //! Old → new mapping:
-//!   `device_slice_alloc_zero!(u32, N)`  → `alloc_zero::<u32, ReadWrite>(N)`
+//!   `device_slice_alloc_zero!(u32, N)`  → `alloc_zero::<u32>(N)`
 //!   `device_slice_fill(buf, v)`         → `fill(buf, v)`
 //!   `device_slice_write(buf, vec)`      → `write(buf, vec)` (eager `write` op:
 //!       the same non-blocking `clEnqueueWriteBuffer`, not a host-view seam).
 //!   `src.copy_to(dst)`                  → `eager_copy_to(src, dst)` (2-output:
 //!       `.and_then(|(_src, dst)| download(dst))`).
-//!   `upload!(v)`                        → `upload::<T, ReadWrite, _>(v)`
+//!   `upload!(v)`                        → `upload(v)`
 //!   `download!(buf)`                    → `download`
 //!   `bundle!(a, b)`                     → `bundle2(a, b)`
 //!
@@ -52,7 +52,7 @@ fn ctx_with_svm() -> Option<Context> {
 #[test]
 fn device_slice_fill_in_place() {
     let Some(ctx) = ctx() else { return };
-    let result: Vec<u32> = alloc_zero::<u32, claspr::ReadWrite>(N)
+    let result: Vec<u32> = alloc_zero::<u32>(N)
         .and_then(|buf| fill(buf, 7u32))
         .and_then(download)
         .sync(&ctx)
@@ -66,7 +66,7 @@ fn device_slice_fill_in_place() {
 fn device_slice_fill_chains_after_upload() {
     let Some(ctx) = ctx() else { return };
     let input: Vec<u32> = (0..N as u32).collect();
-    let result: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(input)
+    let result: Vec<u32> = upload(input)
         .and_then(|buf| fill(buf, 99u32))
         .and_then(download)
         .sync(&ctx)
@@ -79,7 +79,7 @@ fn device_slice_fill_chains_after_upload() {
 fn device_slice_fill_event_threads_to_kernel() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let result: Vec<u32> = alloc_zero::<u32, claspr::ReadWrite>(N)
+    let result: Vec<u32> = alloc_zero::<u32>(N)
         .and_then(|buf| fill(buf, 7u32))
         .and_then(|buf| kernels.scale_u32([N], buf, 2u32))
         .and_then(download)
@@ -98,12 +98,8 @@ fn device_slice_copy_propagates_src_to_dst() {
     // `eager_copy_to`'s `Src: CopyTo<Dst>` bound is on the concrete buffer
     // types, so its heads are concrete buffers (or pipes of them), not upstream
     // ops — build them synchronously first (mirrors eager_cutover::device_copy_eager).
-    let src = upload::<u32, claspr::ReadWrite, _>(src_data.clone())
-        .sync(&ctx)
-        .expect("upload src");
-    let dst = alloc_zero::<u32, claspr::ReadWrite>(N)
-        .sync(&ctx)
-        .expect("alloc dst");
+    let src = upload(src_data.clone()).sync(&ctx).expect("upload src");
+    let dst = alloc_zero::<u32>(N).sync(&ctx).expect("alloc dst");
     let result: Vec<u32> = eager_copy_to(src, dst)
         .and_then(|(_src, dst)| download(dst))
         .sync(&ctx)
@@ -117,12 +113,8 @@ fn device_slice_copy_propagates_src_to_dst() {
 fn device_slice_copy_returns_both_buffers() {
     let Some(ctx) = ctx() else { return };
     let src_data: Vec<u32> = (10..10 + N as u32).collect();
-    let src = upload::<u32, claspr::ReadWrite, _>(src_data.clone())
-        .sync(&ctx)
-        .expect("upload src");
-    let dst = alloc_zero::<u32, claspr::ReadWrite>(N)
-        .sync(&ctx)
-        .expect("alloc dst");
+    let src = upload(src_data.clone()).sync(&ctx).expect("upload src");
+    let dst = alloc_zero::<u32>(N).sync(&ctx).expect("alloc dst");
     let (src_out, dst_out): (Vec<u32>, Vec<u32>) = eager_copy_to(src, dst)
         .and_then(|(src, dst)| bundle2(download(src), download(dst)))
         .sync(&ctx)
@@ -135,12 +127,8 @@ fn device_slice_copy_returns_both_buffers() {
 #[test]
 fn device_slice_copy_length_mismatch_errors() {
     let Some(ctx) = ctx() else { return };
-    let src = upload::<u32, claspr::ReadWrite, _>(vec![0u32; 10])
-        .sync(&ctx)
-        .expect("upload src");
-    let dst = alloc_zero::<u32, claspr::ReadWrite>(5)
-        .sync(&ctx)
-        .expect("alloc dst");
+    let src = upload(vec![0u32; 10]).sync(&ctx).expect("upload src");
+    let dst = alloc_zero::<u32>(5).sync(&ctx).expect("alloc dst");
     let result = eager_copy_to(src, dst)
         .and_then(|(_src, dst)| download(dst))
         .sync(&ctx);
@@ -161,7 +149,7 @@ fn device_slice_copy_length_mismatch_errors() {
 fn device_slice_write_into_existing_buffer() {
     let Some(ctx) = ctx() else { return };
     let data: Vec<u32> = (1..=N as u32).collect();
-    let result: Vec<u32> = alloc_zero::<u32, claspr::ReadWrite>(N)
+    let result: Vec<u32> = alloc_zero::<u32>(N)
         .and_then(|buf| write(buf, data.clone()))
         .and_then(download)
         .sync(&ctx)
@@ -177,7 +165,7 @@ fn device_slice_write_overwrites_kernel_output() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let data: Vec<u32> = (1..=N as u32).collect();
-    let result: Vec<u32> = alloc_zero::<u32, claspr::ReadWrite>(N)
+    let result: Vec<u32> = alloc_zero::<u32>(N)
         .and_then(|buf| kernels.fill_u32([N], buf, 99u32))
         .and_then(|buf| write(buf, data.clone()))
         .and_then(download)
@@ -226,9 +214,7 @@ fn mapped_slice_copy_propagates_src_to_dst() {
 fn copy_to_device_slice_uninit_propagates_and_transitions_to_init() {
     let Some(ctx) = ctx() else { return };
     let src_data: Vec<u32> = (100..100 + N as u32).collect();
-    let src = upload::<u32, claspr::ReadWrite, _>(src_data.clone())
-        .sync(&ctx)
-        .expect("upload src");
+    let src = upload(src_data.clone()).sync(&ctx).expect("upload src");
     let uninit_dst = DeviceSlice::<u32>::alloc_uninit(&ctx, N).expect("alloc_uninit");
     let result: Vec<u32> = eager_copy_to(src, uninit_dst)
         .and_then(|(_src, dst)| download(dst))

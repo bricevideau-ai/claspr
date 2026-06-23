@@ -3,7 +3,7 @@
 //! Old → new mapping:
 //!   `bundle!(a, b)`       → `bundle2(a, b)`
 //!   `bundle!(a, b, c)`    → `bundle3(a, b, c)`
-//!   `upload!(v)`          → `upload::<T, claspr::ReadWrite, _>(v)`
+//!   `upload!(v)`          → `upload(v)`
 //!   `download!(buf)`      → `download`
 //!   `fan_out(v, |x| op)`  → `fan_out(v, |x| op)` (same signature)
 //!
@@ -61,10 +61,10 @@ fn bundle2_two_kernels_on_distinct_buffers() {
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let left = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let left = upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 0xAA))
         .and_then(download);
-    let right = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let right = upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 0xBB))
         .and_then(download);
 
@@ -84,7 +84,7 @@ fn fan_out_homogeneous_kernels() {
 
     let values: Vec<u32> = (0..4).collect();
     let outs: Vec<Vec<u32>> = fan_out(values.clone(), move |v| {
-        upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+        upload(vec![0u32; N])
             .and_then(move |buf| kernels_ref.fill_u32([N], buf, v))
             .and_then(download)
     })

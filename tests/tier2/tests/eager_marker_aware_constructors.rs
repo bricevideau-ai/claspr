@@ -2,19 +2,20 @@
 //! assertions, rewritten against `claspr::eager`.
 //!
 //! Old → new mapping:
-//!   `device_slice_from_slice!(data; M)`  → `upload::<u32, M, _>(data)`
+//!   `device_slice_from_slice!(data; M)`  → `upload_as(data, M)` (witness arg)
 //!       (`upload`'s leaf does a synchronous `DeviceSlice::from_slice`
 //!       CL_MEM_COPY_HOST_PTR create — no `Fillable` bound, so it works for any
-//!       marker incl. `Frozen`, exactly like `device_slice_from_slice!`.)
-//!   `device_slice_alloc_zero!(u32, N; M)` → `alloc_zero::<u32, M>(N)`
-//!   `device_slice_filled!(v, N; M)`       → `alloc_zero::<u32, M>(N).fill(v)`
+//!       marker incl. `Frozen`, exactly like `device_slice_from_slice!`. The
+//!       marker is inferred from the witness, no turbofish.)
+//!   `device_slice_alloc_zero!(u32, N; M)` → `alloc_zero_as::<u32, _>(N, M)`
+//!   `device_slice_filled!(v, N; M)`       → `alloc_zero_as::<u32,_>(N, M).fill(v)`
 //!   `device_slice_alloc_uninit!(u32, N)`  → concrete `DeviceSliceUninit` head
 //!       (the eager API has no uninit-producing device op; the uninit is built
 //!       synchronously and threaded as the chain head, then kernel-written —
 //!       same compositional path as the original).
 //!   `download!(buf)`                      → `download`
 
-use claspr::eager::{DeviceOpExt, alloc_zero, download, fill, upload};
+use claspr::eager::{DeviceOpExt, alloc_zero_as, download, fill, upload_as};
 use claspr::{Context, DeviceSlice, Frozen, HostReadOnly, ReadOnly};
 use claspr_test_kernels::kernels;
 
@@ -36,7 +37,7 @@ fn ctx() -> Option<Context> {
 fn from_slice_with_frozen_marker_round_trips() {
     let Some(ctx) = ctx() else { return };
     let data: Vec<u32> = (0..N as u32).collect();
-    let result: Vec<u32> = upload::<u32, Frozen, _>(data.clone())
+    let result: Vec<u32> = upload_as(data.clone(), Frozen)
         .and_then(download)
         .sync(&ctx)
         .expect("from_slice Frozen + download chain");
@@ -48,7 +49,7 @@ fn from_slice_with_frozen_marker_round_trips() {
 fn from_slice_with_read_only_marker() {
     let Some(ctx) = ctx() else { return };
     let data: Vec<u32> = (10..10 + N as u32).collect();
-    let result: Vec<u32> = upload::<u32, ReadOnly, _>(data.clone())
+    let result: Vec<u32> = upload_as(data.clone(), ReadOnly)
         .and_then(download)
         .sync(&ctx)
         .expect("from_slice ReadOnly + download chain");
@@ -60,7 +61,7 @@ fn from_slice_with_read_only_marker() {
 #[test]
 fn alloc_zero_with_host_read_only_via_device_kernel_path() {
     let Some(ctx) = ctx() else { return };
-    let result: Vec<u32> = alloc_zero::<u32, HostReadOnly>(N)
+    let result: Vec<u32> = alloc_zero_as::<u32, _>(N, HostReadOnly)
         .and_then(download)
         .sync(&ctx)
         .expect("alloc_zero HostReadOnly + download chain");
@@ -69,11 +70,11 @@ fn alloc_zero_with_host_read_only_via_device_kernel_path() {
 }
 
 /// marker_aware::filled_with_read_only_marker — `device_slice_filled!(7, N;
-/// ReadOnly)` → `alloc_zero::<ReadOnly>(N).fill(7)`.
+/// ReadOnly)` → `alloc_zero_as::<u32, _>(N, ReadOnly).fill(7)`.
 #[test]
 fn filled_with_read_only_marker() {
     let Some(ctx) = ctx() else { return };
-    let result: Vec<u32> = alloc_zero::<u32, ReadOnly>(N)
+    let result: Vec<u32> = alloc_zero_as::<u32, _>(N, ReadOnly)
         .and_then(|buf| fill(buf, 7u32))
         .and_then(download)
         .sync(&ctx)

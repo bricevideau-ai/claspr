@@ -143,7 +143,7 @@ fn tier2_mapped_slice_filled_threads_into_kernel() {
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = mapped_alloc_uninit::<u32, claspr::ReadWrite>(N)
+    let buf = mapped_alloc_uninit::<u32>(N)
         .and_then(|u| fill_mapped_uninit(u, 5u32))
         .and_then(|buf| kernels.scale_u32([N], buf, 2))
         .sync(&ctx)
@@ -178,7 +178,7 @@ fn macro_mapped_slice_repeat_arm() {
     let Some(ctx) = ctx_with_svm() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let buf = mapped_alloc_uninit::<u32, claspr::ReadWrite>(N)
+    let buf = mapped_alloc_uninit::<u32>(N)
         .and_then(|u| fill_mapped_uninit(u, 4u32))
         .and_then(|buf| kernels.scale_u32([N], buf, 5))
         .sync(&ctx)
@@ -218,7 +218,7 @@ fn tier2_mapped_slice_filled_surfaces_svm_not_available() {
         eprintln!("SKIP: device supports SVM, can't test no-SVM path here");
         return;
     }
-    let err = mapped_alloc_uninit::<u32, claspr::ReadWrite>(N)
+    let err = mapped_alloc_uninit::<u32>(N)
         .and_then(|u| fill_mapped_uninit(u, 0u32))
         .sync(&ctx)
         .expect_err("expected SvmNotAvailable");

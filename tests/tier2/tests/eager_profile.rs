@@ -3,7 +3,7 @@
 //!   - `.profiled` returns `Err(ProfilingDisabled)` when profiling is off.
 //!
 //! Old → new mapping:
-//!   `value(v).and_then(|x| upload!(x))` → `upload::<u32, ReadWrite, _>(v)`
+//!   `value(v).and_then(|x| upload!(x))` → `upload(v)`
 //!   `.profiled(cb)`                     → `DeviceProfileExt::profiled`
 
 use claspr::eager::{DeviceOpExt, DeviceProfileExt, upload, value};
@@ -31,7 +31,7 @@ fn profile_chain_fires_callback_when_profiling_on() {
 
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let (tx, rx) = std::sync::mpsc::channel();
-    upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 7))
         .profiled(move |info| {
             tx.send(info).expect("send profiling info");

@@ -4,7 +4,7 @@
 //! express the real Tier-2 chain test end-to-end before the full port.
 //!
 //! Old → new mapping:
-//!   `upload!(v)`          → `upload::<u32, claspr::ReadWrite, _>(v)`
+//!   `upload!(v)`          → `upload(v)`
 //!   `download!(buf)`      → `download` (terminal `.and_then(download).sync()` yields the Vec)
 //!   multi-output add_u32 → `.and_then(|(_a,_b,out)| ...)` per-element pipe select
 //!
@@ -39,7 +39,7 @@ fn linear_chain_upload_kernel_download() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("kernels load");
 
-    let result: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let result: Vec<u32> = upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, FILL_VALUE))
         .and_then(download)
         .sync(&ctx)
@@ -67,15 +67,9 @@ fn three_slice_kernel_op_threads_tuple_output() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("kernels load");
 
-    let a = upload::<u32, claspr::ReadWrite, _>(vec![3u32; N])
-        .sync(&ctx)
-        .expect("upload a");
-    let b = upload::<u32, claspr::ReadWrite, _>(vec![4u32; N])
-        .sync(&ctx)
-        .expect("upload b");
-    let out = alloc_zero::<u32, claspr::ReadWrite>(N)
-        .sync(&ctx)
-        .expect("alloc out");
+    let a = upload(vec![3u32; N]).sync(&ctx).expect("upload a");
+    let b = upload(vec![4u32; N]).sync(&ctx).expect("upload b");
+    let out = alloc_zero::<u32>(N).sync(&ctx).expect("alloc out");
 
     let result: Vec<u32> = kernels
         .add_u32([N], a, b, out)
@@ -96,9 +90,9 @@ fn bundle_feeds_multi_arg_kernel() {
     let kernels = kernels::kernels(&ctx).expect("kernels load");
 
     let result: Vec<u32> = bundle3(
-        upload::<u32, claspr::ReadWrite, _>(vec![3u32; N]),
-        upload::<u32, claspr::ReadWrite, _>(vec![4u32; N]),
-        alloc_zero::<u32, claspr::ReadWrite>(N),
+        upload(vec![3u32; N]),
+        upload(vec![4u32; N]),
+        alloc_zero::<u32>(N),
     )
     .and_then(|(a, b, out)| kernels.add_u32([N], a, b, out))
     .and_then(|(_a, _b, out)| download(out))
@@ -118,7 +112,7 @@ fn kernel_op_chains_two_kernels() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("kernels load");
 
-    let result: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(vec![0u32; N])
+    let result: Vec<u32> = upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 5))
         .and_then(|buf| kernels.scale_u32([N], buf, 7))
         .and_then(download)
@@ -151,7 +145,7 @@ fn upload_accepts_arc_source_caller_retains_clone() {
     let shared: Arc<[u32]> = Arc::from(vec![7u32; N]);
     let kept_by_caller = Arc::clone(&shared);
 
-    let result: Vec<u32> = upload::<u32, claspr::ReadWrite, _>(Arc::clone(&shared))
+    let result: Vec<u32> = upload(Arc::clone(&shared))
         .and_then(download)
         .sync(&ctx)
         .expect("arc upload");
