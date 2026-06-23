@@ -16,6 +16,22 @@
 //! - `arc_to_writable_arg` — `Arc<DeviceSlice<T, M>>` impls only
 //!   `KernelSliceReadArg`, so a writable kernel slot must reject it.
 //!   Restatement of the deleted `arc_to_writable_arg`.
+//! - `buffer_ops_write_on_host_read_only` — `DeviceSlice::write` requires
+//!   `M: HostWritable`; `HostReadOnly` isn't, so the write must be rejected.
+//! - `bundle_aliased_owned_writes` — two `bundle!` arms can't both move-write
+//!   the same owned buffer (the second arm is a use-after-move).
+//! - `sequential_use_after_move` — an `.and_then` follow-up can't reach a
+//!   moved outer `buf` instead of the upstream handle it is handed.
+//! - `and_then_host_escapes_buffer` — the mapped view can't escape the
+//!   `and_then_host` closure (HRTB `for<'a> FnOnce(View<'a>) -> Result<()>`).
+//! - `host_view_outlives_release` — use-after-move on
+//!   `DeviceSliceHostView::release_to_device(self)`.
+//!
+//! A second `compile_pass` config (`Mode::Pass`) runs `compile_pass/sanity.rs`:
+//! a known-good unified-API `DeviceOp` chain that MUST compile. It is the
+//! harness-integrity guard — if the `--extern`/`-L` wiring were misconfigured,
+//! every compile-fail fixture would fail for the wrong reason and the suite
+//! would pass spuriously; the pass fixture catches that.
 //!
 //! ## Why ui_test instead of trybuild
 //!
@@ -51,17 +67,24 @@ fn main() -> Result<()> {
 
     let externs = ExternRlibs::discover(&["claspr", "claspr_test_kernels"])?;
 
-    let fail_config = make_config("compile_fail", &args, &externs);
+    let fail_config = make_config("compile_fail", Mode::Fail, &args, &externs);
+    let pass_config = make_config("compile_pass", Mode::Pass, &args, &externs);
 
     run_tests_generic(
-        vec![fail_config],
+        vec![fail_config, pass_config],
         ui_test::default_file_filter,
         |_, _| {},
         Box::<dyn StatusEmitter>::from(args.format),
     )
 }
 
-fn make_config(path: &str, args: &ui_test::Args, externs: &ExternRlibs) -> Config {
+#[derive(Copy, Clone)]
+enum Mode {
+    Fail,
+    Pass,
+}
+
+fn make_config(path: &str, mode: Mode, args: &ui_test::Args, externs: &ExternRlibs) -> Config {
     let mut config = Config::rustc(path);
     config.with_args(args);
 
@@ -96,7 +119,11 @@ fn make_config(path: &str, args: &ui_test::Args, externs: &ExternRlibs) -> Confi
 
     // We use `.stderr` golden files, not inline `//~ ERROR` markers.
     config.comment_defaults.base().require_annotations = Spanned::dummy(false).into();
-    config.comment_defaults.base().exit_status = Spanned::dummy(1).into();
+    let expected_status = match mode {
+        Mode::Fail => 1,
+        Mode::Pass => 0,
+    };
+    config.comment_defaults.base().exit_status = Spanned::dummy(expected_status).into();
 
     config.bless_command =
         Some("cargo test -p claspr-tier2-tests --test safety_compile_fail -- --bless".into());

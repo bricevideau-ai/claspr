@@ -1,0 +1,45 @@
+error[E0521]: borrowed data escapes outside of closure
+  --> compile_fail/and_then_host_escapes_buffer.rs:30:13
+   |
+26 |     let mut escaped: Vec<&mut [u32]> = Vec::new();
+   |         ----------- `escaped` declared here, outside of the closure body
+27 |     let _ = upload(vec![1u32, 2, 3, 4])
+28 |         .and_then_host(|view| {
+   |                         ---- `view` is a reference that is only valid in the closure body
+29 |             // Try to leak the borrow past the closure body — must be rejected.
+30 |             escaped.push(view);
+   |             ^^^^^^^^^^^^^^^^^^ `view` escapes the closure body here
+   |
+   = note: requirement occurs because of a mutable reference to `std::vec::Vec<&mut [u32]>`
+   = note: mutable references are invariant over their type parameter
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance
+
+error[E0373]: closure may outlive the current function, but it borrows `escaped`, which is owned by the current function
+  --> compile_fail/and_then_host_escapes_buffer.rs:28:24
+   |
+28 |         .and_then_host(|view| {
+   |                        ^^^^^^ may outlive borrowed value `escaped`
+29 |             // Try to leak the borrow past the closure body — must be rejected.
+30 |             escaped.push(view);
+   |             ------- `escaped` is borrowed here
+   |
+note: function requires argument type to outlive `'static`
+  --> compile_fail/and_then_host_escapes_buffer.rs:27:13
+   |
+27 |       let _ = upload(vec![1u32, 2, 3, 4])
+   |  _____________^
+28 | |         .and_then_host(|view| {
+29 | |             // Try to leak the borrow past the closure body — must be rejected.
+30 | |             escaped.push(view);
+31 | |             Ok(())
+32 | |         })
+   | |__________^
+help: to force the closure to take ownership of `escaped` (and any other referenced variables), use the `move` keyword
+   |
+28 |         .and_then_host(move |view| {
+   |                        ++++
+
+error: aborting due to 2 previous errors
+
+Some errors have detailed explanations: E0373, E0521.
+For more information about an error, try `rustc --explain E0373`.

@@ -330,6 +330,14 @@ pub enum ExecMode {
 /// offer: there the composition lives inside opaque closures, so the only way
 /// to learn what a graph does is to run it. claspr's vocabulary is shared
 /// heritage; the eager, inspectable model is the divergence.
+///
+/// **Must be terminated.** Builder verbs run eagerly but enqueue *nothing* on
+/// the device until a terminal — [`.sync()`](DeviceOpExt::sync) /
+/// [`.wait_on()`](DeviceOpExt::wait_on) / [`.run()`](DeviceOpExt::run) /
+/// [`.submit_on()`](DeviceOpExt::submit_on), or the concrete-head `.wait()` —
+/// is called. Dropping a built op silently discards all the work it describes,
+/// so the trait is `#[must_use]`.
+#[must_use = "device ops do nothing until a terminal like .sync()/.wait()/.run() is called"]
 pub trait DeviceOp: Send {
     /// What this op produces at run time.
     type Output: Send;
@@ -436,6 +444,17 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// together with the upstream's runtime value, so it can read `ec.device()`
     /// / `ec.context()` or route via [`on_device`](Self::on_device) while
     /// building the downstream op. See [`AndThenWithContext`].
+    ///
+    /// **Ordering:** because the closure is handed the upstream's *concrete*
+    /// value (not a pipe), the downstream op's `clEnqueue*` wait-list would
+    /// otherwise be empty. `AndThenWithContext::execute` therefore enqueues a
+    /// `clEnqueueBarrierWithWaitList` over the source's completion events on the
+    /// chain queue *before* the closure builds and runs the downstream — so a
+    /// same-device read-after-write through this combinator is ordered on the
+    /// device, not by driver luck. If you prefer a wait-list edge threaded
+    /// directly into the downstream enqueue (no whole-queue barrier), use the
+    /// pipe-fed [`and_then`](Self::and_then) instead, whose closure receives a
+    /// `Handle` that carries the upstream deps into the downstream's input.
     fn and_then_with_context<U, F>(self, f: F) -> AndThenWithContext<Self, U, F>
     where
         U: DeviceOp,
@@ -593,13 +612,20 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// future when the marker fires. Mirrors the structure of the old
     /// `chain_future::run_chain` terminal.
     ///
-    /// **Host errors surface synchronously.** Unlike the old closure layer
-    /// (where `and_then_host` workers ran on their own threads and stashed
-    /// into an `Arc<Mutex<Option<Error>>>` slot read at poll time), the
-    /// eager host seam runs its closure *inside* `execute` and returns the
-    /// closure's `Err` directly (see `run_host_seam`). So a failing chain
-    /// returns [`DeviceChainFuture::Errored`] right here — there is no
-    /// host-error slot to drain at poll time.
+    /// **Host errors surface at poll time, via a worker thread.** The eager
+    /// host seam (`run_host_seam`) does *not* run its closure inside `execute`:
+    /// it spawns a worker thread that waits the upstream/map events, runs the
+    /// closure against the borrowed view, stashes any failure into the chain's
+    /// `Arc<Mutex<Option<Error>>>` host-error slot, then signals its user event
+    /// with a negative status (which gates the queued unmap). That status
+    /// cascades into the trailing marker, so the future's marker poll resolves
+    /// `Err`; [`DeviceChainFuture::poll`] then prefers the stashed rich error
+    /// over the `Error::OpenCl(-1)` cascade. The slot is also drained on a
+    /// *successful* marker, because some drivers (pocl) don't propagate a
+    /// user-event's negative status through `clEnqueueMarkerWithWaitList` — a
+    /// non-empty slot is itself the failure signal. Only an error *submitting*
+    /// the chain (before any worker spawns) returns
+    /// [`DeviceChainFuture::Errored`] eagerly here.
     ///
     /// Arity-agnostic: like [`sync`](Self::sync), `run` gathers via
     /// [`collect`](DeviceOp::collect), so multi-output terminals (`arc_split`,
@@ -3561,14 +3587,39 @@ where
     }
 
     fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        use crate::Launcher;
         // Gather the source via `collect` (any arity); its value + events feed
         // the downstream op the closure builds.
         let (value, src_deps) = self.source.collect(ec, ExecMode::Pipelined)?;
+
+        // The closure builds the downstream op from the source's CONCRETE value
+        // (not a pipe), so the downstream's enqueue carries an EMPTY wait-list —
+        // the source's completion events are not on its `clEnqueue*` wait-list.
+        // To install a real device-side ordering edge (rather than relying on
+        // driver queue ordering for a same-device read-after-write), enqueue a
+        // barrier over `src_deps` on this queue BEFORE the downstream runs:
+        // an out-of-order-queue barrier forces every later-enqueued command on
+        // the same queue to wait for `src_deps`, which is exactly the upstream
+        // edge the concrete-value build dropped. The barrier event then stands
+        // in for the source deps in the chain's downstream wait-list.
+        let edge: Deps = if src_deps.is_empty() {
+            Deps::new()
+        } else {
+            let raw: Vec<crate::cl_event> = src_deps.iter().map(|d| d.as_ref().get()).collect();
+            // SAFETY: the cl_event handles are held alive by `src_deps` across
+            // this call.
+            let barrier = unsafe { ec.cl_queue().enqueue_barrier_with_wait_list(&raw) }
+                .map_err(Error::OpenCl)?;
+            drop(src_deps);
+            vec![wrap_event(barrier)]
+        };
+
         let f = self
             .f
             .take()
             .expect("AndThenWithContext::execute called twice — internal eager bug");
-        // Closure runs NOW, at execute, with the live ec + runtime value.
+        // Closure runs NOW, at execute, with the live ec + runtime value. Any
+        // command it enqueues on `ec`'s queue is gated by the barrier above.
         let downstream = f(ec, value);
         // Grab the downstream's out-pipe BEFORE consuming it (move-once).
         let down_pipe = downstream.output_pipe();
@@ -3576,11 +3627,10 @@ where
         let (out_value, mut out_deps) = down_pipe.take().ok_or(Error::NotSupported(
             "eager and_then_with_context: downstream produced no output",
         ))?;
-        // Thread the source's events through: merge them with the downstream's
-        // so the terminal waits on the whole chain (the downstream consumed the
-        // value concretely, so its enqueue carries no upstream wait-list —
-        // forwarding the source deps keeps the chain's events live).
-        out_deps.extend(src_deps);
+        // Carry the source edge into the output deps too, so the terminal waits
+        // on the whole chain even when the downstream routed to another queue
+        // via `on_device` (cross-queue events are valid in the same context).
+        out_deps.extend(edge);
         self.out.put(out_value, out_deps);
         Ok(())
     }

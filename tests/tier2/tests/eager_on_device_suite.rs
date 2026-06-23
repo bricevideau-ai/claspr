@@ -13,12 +13,16 @@
 //!   `kernel(...).on_device(dev)`  → same `.on_device(...)` on the eager kernel op
 //!   `bundle!(a, b)`              → `bundle2(a, b)`
 //!
-//! NOTE (known eager seam): `and_then_with_context` passes the upstream VALUE,
-//! not a pipe, so a routed downstream enqueues without an explicit event edge to
-//! the source — terminal completion is correct; mid-chain OOO ordering relies on
-//! the driver. None of these tests assert cross-device event ORDERING (they
-//! assert final values / error surfacing / both-branches-ran), so the port is
-//! faithful.
+//! NOTE (eager seam): `and_then_with_context` passes the upstream VALUE, not a
+//! pipe, so the routed downstream enqueues with an empty wait-list. To preserve
+//! the device-side ordering edge, `AndThenWithContext::execute` now enqueues a
+//! `clEnqueueBarrierWithWaitList` over the source's events on the chain queue
+//! before the closure builds + runs the downstream — so a same-device
+//! read-after-write is ordered on the device, not just by driver luck. (Routed
+//! cross-device stages also carry the edge through the output deps.) These tests
+//! assert final values / error surfacing / both-branches-ran; the regression
+//! that exercises the edge itself lives in
+//! `and_then_with_context_same_device_raw` below.
 //!
 //! Skips when only one device is available (no real multi-device platform AND no
 //! sub-device partition). Guard copied verbatim from on_device.rs.
@@ -161,4 +165,43 @@ fn on_device_bundle_runs_branches_on_distinct_devices() {
 
     assert!(a.iter().all(|&v| v == 7));
     assert!(b.iter().all(|&v| v == 11));
+}
+
+/// Regression for the `and_then_with_context` device-side ordering edge.
+///
+/// `and_then_with_context` builds the downstream over the upstream's CONCRETE
+/// value, so the downstream kernel's `clEnqueue*` carries an empty wait-list.
+/// Without an explicit edge, a same-device read-after-write through this
+/// combinator would race on a shared out-of-order queue: the downstream scale
+/// could read the buffer before the upstream scale finished writing it. The
+/// `clEnqueueBarrierWithWaitList` over the source's events that
+/// `AndThenWithContext::execute` installs makes the ordering a device-side
+/// invariant, not driver luck.
+///
+/// Chain: upload `1`s → scale ×3 (upstream write, in src_deps) →
+/// `and_then_with_context` scale ×5 (downstream read-modify-write of the SAME
+/// buffer) → download. Correct result is `15`; a missing edge would let the
+/// ×5 read stale `1`s and yield `5` on a racy driver.
+#[test]
+fn and_then_with_context_same_device_raw() {
+    let Ok(ctx) = Context::any() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+    let kernels_ref = &kernels;
+
+    let out: Vec<u32> = upload(vec![1u32; N])
+        // Upstream write: buffer becomes all 3s. Its completion event is the
+        // src_dep the downstream must wait on.
+        .and_then(|buf| kernels_ref.scale_u32([N], buf, 3))
+        // Downstream read-after-write on the SAME buffer, built from the
+        // concrete value — relies on the installed barrier edge for ordering.
+        .and_then_with_context(move |_ec, buf| kernels_ref.scale_u32([N], buf, 5))
+        .and_then(download)
+        .sync(&ctx)
+        .expect("same-device R-A-W chain");
+
+    assert!(
+        out.iter().all(|&v| v == 15),
+        "expected all 15 (1*3*5); ordering edge missing? got {:?}",
+        &out[..out.len().min(8)],
+    );
 }

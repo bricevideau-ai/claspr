@@ -1,0 +1,18 @@
+error[E0382]: borrow of moved value: `view`
+  --> compile_fail/host_view_outlives_release.rs:27:25
+   |
+23 | fn forbidden(view: DeviceSliceHostView<u32, ReadWrite, MapReadWrite>) {
+   |              ---- move occurs because `view` has type `DeviceSliceHostView<u32, ReadWrite, MapReadWrite>`, which does not implement the `Copy` trait
+24 |     let _released = view.release_to_device();
+   |                          ------------------- `view` moved due to this method call
+...
+27 |     let _peek: &[u32] = &view;
+   |                         ^^^^^ value borrowed here after move
+   |
+note: `DeviceSliceHostView::<T, M, A>::release_to_device` takes ownership of the receiver `self`, which moves `view`
+  --> claspr/src/host_view.rs:324:29
+   = note: borrow occurs due to deref coercion to `[u32]`
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0382`.

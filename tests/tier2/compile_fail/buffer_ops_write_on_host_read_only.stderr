@@ -1,0 +1,12 @@
+error[E0599]: the method `write` exists for struct `DeviceSlice<u32, HostReadOnly>`, but its trait bounds were not satisfied
+  --> compile_fail/buffer_ops_write_on_host_read_only.rs:18:17
+   |
+18 |     let _ = buf.write(vec![7u32, 8, 9, 10]);
+   |                 ^^^^^ method cannot be called on `DeviceSlice<u32, HostReadOnly>` due to unsatisfied trait bounds
+   |
+   = note: the following trait bounds were not satisfied:
+           `HostReadOnly: HostWritable`
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0599`.

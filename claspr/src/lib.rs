@@ -30,10 +30,13 @@
 //!     let ctx = Context::any()?;
 //!     let kernels = gpu::kernels(&ctx)?;
 //!     let mut data: Vec<u32> = (1..=1024).collect();
-//!     let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, data.len())?;
-//!     buf.write(&data).wait(&ctx)?;
-//!     let buf = kernels.collatz_kernel([data.len()], buf).wait(&ctx)?;
-//!     buf.read(&mut data).wait(&ctx)?;
+//!     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, data.len())?;
+//!     // Verbs return eager `DeviceOp` builders; `.wait()` is the terminal.
+//!     // A concrete-head op's `wait()` takes no argument, and upload sources
+//!     // are owned (`Vec` / `Box<[T]>` / `Arc<[T]>`), not borrowed slices.
+//!     let buf = buf.write(data.clone()).wait()?;
+//!     let buf = kernels.collatz_kernel([data.len()], buf).wait()?;
+//!     buf.read(&mut data).wait()?;
 //!     Ok(())
 //! }
 //! ```
