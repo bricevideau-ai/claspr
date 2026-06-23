@@ -32,9 +32,9 @@ fn readwrite_default_marker_exercises_full_surface() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let mut buf: DeviceSlice<u32> = DeviceSlice::alloc_zero(&ctx, N).expect("alloc");
-    buf.write(&[1u32; N]).wait().expect("write");
-    buf.fill(7u32).wait().expect("fill");
+    let buf: DeviceSlice<u32> = DeviceSlice::alloc_zero(&ctx, N).expect("alloc");
+    let buf = buf.write(vec![1u32; N]).wait().expect("write");
+    let buf = buf.fill(7u32).wait().expect("fill");
     let buf = kernels.scale_u32([N], buf, 3).wait().expect("kernel");
     let mut out = vec![0u32; N];
     buf.read(&mut out).wait().expect("read");
@@ -60,12 +60,11 @@ fn read_only_kernel_constant_host_can_update_via_write() {
         .wait()
         .expect("kernel with ReadOnly source");
     let mut out = vec![0u32; N];
-    dst.read(&mut out).wait().expect("read dst");
+    let dst = dst.read(&mut out).wait().expect("read dst");
     assert!(out.iter().all(|&v| v == 2));
 
     // Host updates the ReadOnly buffer via write() — HostWritable.
-    let mut ro = ro;
-    ro.write(&[9u32; N]).wait().expect("host write");
+    let ro = ro.write(vec![9u32; N]).wait().expect("host write");
     // Run again with the updated bytes.
     let (_ro, dst) = kernels
         .copy_u32([N], ro, dst)
@@ -164,8 +163,9 @@ fn host_read_only_fill_uses_device_kernel_path() {
 
     let uninit = DeviceSlice::<u32, HostReadOnly>::alloc_uninit(&ctx, N).expect("alloc_uninit HRO");
     // SAFETY: fill below overwrites every byte before any read.
-    let mut buf = unsafe { uninit.assume_init() };
-    buf.fill(0xCAFE_BABEu32)
+    let buf = unsafe { uninit.assume_init() };
+    let buf = buf
+        .fill(0xCAFE_BABEu32)
         .wait()
         .expect("fill via device kernel");
     let mut out = vec![0u32; N];
@@ -184,8 +184,8 @@ fn device_scratch_fill_uses_device_kernel_path() {
     let uninit =
         DeviceSlice::<u32, DeviceScratch>::alloc_uninit(&ctx, N).expect("alloc_uninit scratch");
     // SAFETY: fill below overwrites every byte before any read.
-    let mut scratch = unsafe { uninit.assume_init() };
-    scratch
+    let scratch = unsafe { uninit.assume_init() };
+    let scratch = scratch
         .fill(0xDEAD_F00Du32)
         .wait()
         .expect("fill DeviceScratch via device kernel");
@@ -216,9 +216,10 @@ fn fill_byte_generic_kernel_for_size_12_pattern() {
     let uninit =
         DeviceSlice::<[u32; 3], HostReadOnly>::alloc_uninit(&ctx, COUNT).expect("alloc_uninit");
     // SAFETY: fill below overwrites every byte before any read.
-    let mut buf = unsafe { uninit.assume_init() };
+    let buf = unsafe { uninit.assume_init() };
     let pattern: [u32; 3] = [7, 11, 13];
-    buf.fill(pattern)
+    let buf = buf
+        .fill(pattern)
         .wait()
         .expect("fill via byte-generic kernel (size=12)");
     let mut out = vec![[0u32; 3]; COUNT];

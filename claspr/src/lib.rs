@@ -100,9 +100,8 @@ pub use access::{
     ReadWrite, RuntimeFillable, WriteOnly,
 };
 pub use buffer::{
-    Buffer, CopyOp, DeviceMapMutOp, DeviceMapOp, DeviceMapReadPending, DeviceMapWritePending,
-    DeviceMappedReadGuard, DeviceMappedWriteGuard, DeviceSlice, DeviceSliceUninit, FillOp,
-    MigrateOp, ReadOp, WriteOp,
+    Buffer, DeviceMapMutOp, DeviceMapOp, DeviceMapReadPending, DeviceMapWritePending,
+    DeviceMappedReadGuard, DeviceMappedWriteGuard, DeviceSlice, DeviceSliceUninit,
 };
 pub use context::{Context, SvmLevel};
 pub use device::{Device, DeviceType, Platform};
@@ -157,12 +156,12 @@ pub use transfer::UploadSource;
 pub use eager::DeviceChainFuture;
 pub use eager::{
     AndThenHost, AndThenHostWithContext, ArcSplit, CopyTo2, Dep, Deps, DeviceDynOp, DeviceEnqueue,
-    DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt, Download, ExecMode, FanOut,
-    ImageDownloadEager, ImageUploadEager, Input, OnDevice, Pipe, ToInput, TransferToDevice, Upload,
-    arc_split, arced, bundle2, bundle3, bundle4, bundle5, bundle6, bundle7, bundle8, bundle9,
-    bundle10, bundle11, bundle12, bundle13, bundle14, bundle15, bundle16, deps_as_events,
-    deps_into_single_event, eager_copy_to, fan_out, forward, image_download, image_upload, lift,
-    transfer_to_device, value, wrap_event, write,
+    DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt, Download, ExecMode, FanOut, Fill,
+    ImageDownloadEager, ImageUploadEager, Input, OnDevice, Pipe, ReadInto, ToInput,
+    TransferToDevice, Upload, WriteDevice, arc_split, arced, bundle2, bundle3, bundle4, bundle5,
+    bundle6, bundle7, bundle8, bundle9, bundle10, bundle11, bundle12, bundle13, bundle14, bundle15,
+    bundle16, deps_as_events, deps_into_single_event, eager_copy_to, fan_out, forward,
+    image_download, image_upload, lift, read_into, transfer_to_device, value, wrap_event, write,
 };
 
 // Stage-3 proc-macro frontend.

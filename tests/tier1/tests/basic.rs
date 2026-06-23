@@ -42,8 +42,8 @@ fn write_kernel_read_round_trip() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let initial: Vec<u32> = (0..N as u32).collect();
-    let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
-    buf.write(&initial).wait().expect("write");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
+    let buf = buf.write(initial).wait().expect("write");
 
     // Scale by 3, then read back.
     let buf = kernels.scale_u32([N], buf, 3).wait().expect("scale");
@@ -61,14 +61,14 @@ fn multi_buffer_kernel_combines_inputs() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let mut a = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc a");
-    let mut b = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc b");
+    let a = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc a");
+    let b = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc b");
     let out = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc out");
 
     let host_a: Vec<u32> = vec![10; N];
     let host_b: Vec<u32> = vec![32; N];
-    a.write(&host_a).wait().expect("write a");
-    b.write(&host_b).wait().expect("write b");
+    let a = a.write(host_a).wait().expect("write a");
+    let b = b.write(host_b).wait().expect("write b");
 
     let (_a, _b, out) = kernels.add_u32([N], a, b, out).wait().expect("add");
 

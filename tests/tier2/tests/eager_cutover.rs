@@ -166,13 +166,11 @@ fn value_and_arced() {
     let shared = arced(upload::<u32, claspr::ReadWrite, _>(vec![5u32; N]))
         .sync(&ctx)
         .expect("arced");
-    let mut host = vec![0u32; N];
-    shared.read(&mut host).wait().expect("read");
-    assert!(
-        host.iter().all(|&v| v == 5),
-        "arced buffer; got {:?}",
-        &host[..8]
-    );
+    // `shared` is an `Arc<DeviceSlice>` — a buffer verb would consume it, which
+    // can't move out of the Arc. Inspect via a read map guard (borrows `&self`
+    // through the Arc) instead.
+    let g = shared.map().wait().expect("map");
+    assert!(g.iter().all(|&v| v == 5), "arced buffer; got {:?}", &g[..8]);
 }
 
 /// `bundle2`/`bundle3`: independent branches run and join; outputs tuple.
@@ -353,12 +351,13 @@ fn arc_split_terminal_array() {
         "a and c share one allocation"
     );
 
-    let mut host = vec![0u32; N];
-    a.read(&mut host).wait().expect("read shared buffer");
+    // `a` is an `Arc<DeviceSlice>` (shared) — inspect via a read map guard
+    // (borrows `&self` through the Arc) rather than a consuming buffer verb.
+    let g = a.map().wait().expect("map shared buffer");
     assert!(
-        host.iter().all(|&v| v == 9),
+        g.iter().all(|&v| v == 9),
         "shared buffer contents; got {:?}",
-        &host[..8]
+        &g[..8]
     );
 }
 

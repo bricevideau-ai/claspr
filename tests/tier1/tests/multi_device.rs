@@ -17,7 +17,7 @@
 //! environments.
 
 use claspr::device::Platform;
-use claspr::{Context, Device, DeviceSlice, InOrder, Queue};
+use claspr::{Context, Device, DeviceOpExt, DeviceSlice, InOrder, Queue};
 use claspr_test_kernels::kernels;
 
 const N: usize = 256;

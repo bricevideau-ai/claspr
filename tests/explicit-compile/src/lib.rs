@@ -97,9 +97,9 @@ mod tests {
         let bytes: Vec<u8> = generated::SPV_BYTES.to_vec();
         let kernels = gpu::Kernels::load_from(&ctx, &bytes).expect("load kernels");
 
-        let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, 8).expect("alloc");
+        let buf = DeviceSlice::<u32>::alloc_zero(&ctx, 8).expect("alloc");
         let seed = vec![1u32; 8];
-        buf.write(&seed).wait().expect("seed write");
+        let buf = buf.write(seed).wait().expect("seed write");
 
         let buf = kernels
             .fill_u32([8usize], buf, 7u32)
@@ -126,8 +126,8 @@ mod tests {
             .expect("build program");
         let kernels = gpu::Kernels::bind(&ctx, program).expect("bind");
 
-        let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).expect("alloc");
-        buf.write(&[1u32; 4]).wait().expect("seed write");
+        let buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).expect("alloc");
+        let buf = buf.write(vec![1u32; 4]).wait().expect("seed write");
 
         let buf = kernels.fill_u32([4usize], buf, 42).wait().expect("launch");
 

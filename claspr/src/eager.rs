@@ -194,6 +194,18 @@ impl<T> Input<T> {
         }
     }
 
+    /// Borrow the concrete value, or `None` if this is a pipe. Used by the
+    /// concrete-head no-launcher terminals (`wait`/`submit` on a buffer verb op)
+    /// to recover the owning context from the buffer before consuming the op — a
+    /// pipe-fed op has no concrete buffer to read a context from, so those
+    /// terminals error clearly ("use `wait_on(&ctx)`").
+    pub fn concrete(&self) -> Option<&T> {
+        match self {
+            Input::Concrete(v) => Some(v),
+            Input::Pipe(_) => None,
+        }
+    }
+
     /// Resolve to a concrete value, erroring if this is a pipe. Used by the
     /// concrete-head terminal path, where a pipe is unreachable (a pipe only
     /// exists inside an eager `and_then` closure — a context that never calls
@@ -1472,6 +1484,28 @@ where
     }
 }
 
+// ── Concrete-head terminal helper ──────────────────────────────────────
+//
+// The buffer-verb ops (`Fill`/`Download`/`ReadInto`/`WriteDevice`/
+// `TransferToDevice`) are **concrete-head**: their input is a caller-owned
+// `DeviceSlice`, whose `.ctx()` supplies the queue. That lets them offer the
+// no-launcher Tier-1 terminals `wait()`/`submit()` — the context is recovered
+// from the owned buffer rather than passed in. A pipe-fed op (only reachable
+// inside an eager `and_then` closure) has no concrete buffer, so these terminals
+// error clearly, steering the caller to `wait_on(&ctx)` / `sync(&ctx)`.
+
+/// Recover the owning [`Context`] from a concrete-head [`Input<DeviceSlice>`],
+/// or a clear "pipe-fed" error for the no-launcher concrete-head terminals.
+fn concrete_buf_ctx<T, M: MemMode>(buf: &Input<DeviceSlice<T, M>>) -> Result<Context> {
+    use crate::Buffer;
+    buf.concrete()
+        .map(|b| b.ctx().clone())
+        .ok_or(Error::NotSupported(
+            "concrete-head terminal (wait/submit) on a pipe-fed buffer op — use \
+         wait_on(&ctx) / sync(&ctx) for piped (graph) inputs",
+        ))
+}
+
 // ── Leaf: in-place fill (eager port of DeviceSliceFillOp) ──────────────
 
 /// Fill a buffer (upstream pipe or concrete) with `value` via a non-blocking
@@ -1512,21 +1546,17 @@ where
 
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (mut buf, deps) = self.buf.resolve()?;
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        // Fill has no native CL_BLOCKING flag (it's always enqueue + optional
+        // wait — exactly what the old `FillOp::wait_on` did internally), so both
+        // modes enqueue non-blocking; Blocking then waits on the event here.
+        let event = crate::buffer::fill_buffer_enqueue(&mut buf, ec, self.value, &raw)?;
         match mode {
-            // Terminal: native blocking fill (CL_BLOCKING) — no event, the
-            // driver waits. Empty deps forward (nothing left to await).
             ExecMode::Blocking => {
-                buf.fill(self.value)
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .wait_on(ec)?;
+                event.wait().map_err(Error::OpenCl)?;
                 self.out.put(buf, Deps::new());
             }
-            // Pipelined: non-blocking; carry the event for downstream ordering.
             ExecMode::Pipelined => {
-                let event = buf
-                    .fill(self.value)
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .submit_on(ec)?;
                 self.out.put(buf, vec![wrap_event(event)]);
             }
         }
@@ -1535,6 +1565,29 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("fill".into());
+    }
+}
+
+impl<T, M> Fill<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Fillable + Send + 'static,
+{
+    /// Concrete-head blocking terminal: fill on the buffer's own context default
+    /// queue and return the (filled) buffer. The no-launcher Tier-1 spelling
+    /// (`buf.fill(v).wait()?`); use [`wait_on`](DeviceOpExt::wait_on) for a
+    /// specific queue, or `sync`/`wait_on` for a pipe-fed op.
+    pub fn wait(self) -> Result<DeviceSlice<T, M>> {
+        let ctx = concrete_buf_ctx(&self.buf)?;
+        self.sync(&ctx)
+    }
+
+    /// Concrete-head non-blocking terminal: enqueue the fill on the buffer's own
+    /// context default queue and return a completion [`Event`](crate::Event).
+    pub fn submit(self) -> Result<crate::Event> {
+        let ctx = concrete_buf_ctx(&self.buf)?;
+        let queue = ctx.default_outoforder_queue(ctx.device())?;
+        self.submit_on(&*queue)
     }
 }
 
@@ -1633,22 +1686,18 @@ where
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve()?;
         let mut host = vec![T::default(); buf.len()];
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         match mode {
             // Terminal: native blocking read (CL_BLOCKING) — the driver waits,
             // the host Vec is valid on return, no event. Matches Tier-1
             // `ReadOp::wait_on`; restores parity for `…download().sync()`.
             ExecMode::Blocking => {
-                buf.read(&mut host)
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .wait_on(ec)?;
+                crate::buffer::read_buffer_enqueue(&buf, ec, &mut host, true, &raw)?;
                 self.out.put(host, Deps::new());
             }
             // Pipelined: non-blocking; the event gates the Vec being valid.
             ExecMode::Pipelined => {
-                let event = buf
-                    .read(&mut host)
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .submit_on(ec)?;
+                let event = crate::buffer::read_buffer_enqueue(&buf, ec, &mut host, false, &raw)?;
                 self.out.put(host, vec![wrap_event(event)]);
             }
         }
@@ -1657,6 +1706,122 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("download".into());
+    }
+}
+
+impl<T, M> Download<T, M>
+where
+    T: Clone + Default + Send + 'static,
+    M: MemMode + HostReadable + Send + 'static,
+{
+    /// Concrete-head blocking terminal: read on the buffer's own context default
+    /// queue and return the host `Vec<T>`.
+    pub fn wait(self) -> Result<Vec<T>> {
+        let ctx = concrete_buf_ctx(&self.buf)?;
+        self.sync(&ctx)
+    }
+
+    /// Concrete-head non-blocking terminal returning the (not-yet-valid) host
+    /// `Vec<T>` plus a completion [`Event`](crate::Event) — mirrors the Tier-1
+    /// `(Output, Event)` submit contract.
+    pub fn submit(self) -> Result<(Vec<T>, crate::Event)> {
+        let ctx = concrete_buf_ctx(&self.buf)?;
+        let queue = ctx.default_outoforder_queue(ctx.device())?;
+        self.submit_value_on(&*queue)
+    }
+}
+
+// ── Leaf: read a DeviceSlice into a caller-supplied slice (read-into) ───────
+
+/// Read a buffer into a **caller-supplied** `&mut [T]` (rather than allocating a
+/// fresh `Vec` like [`Download`]), yielding the buffer back so it can be reused.
+/// The eager analog of the old Tier-1 `buf.read(&mut dst)` builder: a
+/// concrete-head op (it borrows the destination slice for `'d`, so it never
+/// flows through a pipe — a pipe-fed read uses [`Download`]).
+///
+/// `Output = DeviceSlice<T, M>`: the buffer moves in and rebinds out
+/// (`let buf = buf.read(&mut dst).wait()?;`), so a caller can read into the same
+/// destination repeatedly.
+pub struct ReadInto<'d, T, M: MemMode = ReadWrite> {
+    buf: Input<DeviceSlice<T, M>>,
+    dst: &'d mut [T],
+    out: Pipe<DeviceSlice<T, M>>,
+}
+
+/// Build a read-into leaf: read `buf` into the caller slice `dst`. See
+/// [`ReadInto`].
+pub fn read_into<T, M>(
+    buf: impl Into<Input<DeviceSlice<T, M>>>,
+    dst: &mut [T],
+) -> ReadInto<'_, T, M>
+where
+    T: Send + 'static,
+    M: MemMode + HostReadable + Send + 'static,
+{
+    ReadInto {
+        buf: buf.into(),
+        dst,
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> DeviceOp for ReadInto<'_, T, M>
+where
+    T: Send + 'static,
+    M: MemMode + HostReadable + Send + 'static,
+{
+    type Output = DeviceSlice<T, M>;
+
+    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        let (buf, deps) = self.buf.resolve()?;
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        match mode {
+            // Terminal: native blocking read — `dst` is valid on return, no event.
+            ExecMode::Blocking => {
+                crate::buffer::read_buffer_enqueue(&buf, ec, self.dst, true, &raw)?;
+                self.out.put(buf, Deps::new());
+            }
+            // Pipelined: non-blocking; the event gates `dst` being valid.
+            ExecMode::Pipelined => {
+                let event = crate::buffer::read_buffer_enqueue(&buf, ec, self.dst, false, &raw)?;
+                self.out.put(buf, vec![wrap_event(event)]);
+            }
+        }
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("read_into".into());
+    }
+}
+
+impl<T, M> ReadInto<'_, T, M>
+where
+    T: Send + 'static,
+    M: MemMode + HostReadable + Send + 'static,
+{
+    /// Concrete-head blocking terminal: read into the caller slice on the
+    /// buffer's own context default queue; return the buffer for reuse.
+    pub fn wait(self) -> Result<DeviceSlice<T, M>> {
+        let ctx = concrete_buf_ctx(&self.buf)?;
+        self.sync(&ctx)
+    }
+
+    /// Concrete-head non-blocking terminal: enqueue the read on the buffer's own
+    /// context default queue and return a completion [`Event`](crate::Event).
+    /// (The `dst` slice must outlive the event.)
+    pub fn submit(self) -> Result<crate::Event> {
+        let ctx = concrete_buf_ctx(&self.buf)?;
+        let queue = ctx.default_outoforder_queue(ctx.device())?;
+        self.submit_on(&*queue)
     }
 }
 
@@ -1738,10 +1903,8 @@ where
         // mode is ignored; the chain terminal's `into_output` does the final
         // wait. The migrate body mirrors the closure layer's
         // `transfer_to_device.rs` exactly.
-        let event = buf
-            .migrate()
-            .after_all(deps.iter().map(|d| d.as_ref()))
-            .submit_on(&*target_q)?;
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let event = crate::buffer::migrate_buffer_enqueue(&buf, &*target_q, &raw)?;
         self.out.put(buf, vec![wrap_event(event)]);
         Ok(())
     }
@@ -1802,18 +1965,15 @@ where
         // SAFETY: the fill below writes every byte; downstream gates on the
         // returned fill event (Pipelined) or the driver waits (Blocking).
         let mut buf = unsafe { uninit.assume_init() };
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        // Fill has no native CL_BLOCKING flag — enqueue, then wait on Blocking.
+        let event = crate::buffer::fill_buffer_enqueue(&mut buf, ec, self.value, &raw)?;
         match mode {
             ExecMode::Blocking => {
-                buf.fill(self.value)
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .wait_on(ec)?;
+                event.wait().map_err(Error::OpenCl)?;
                 self.out.put(buf, Deps::new());
             }
             ExecMode::Pipelined => {
-                let event = buf
-                    .fill(self.value)
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .submit_on(ec)?;
                 self.out.put(buf, vec![wrap_event(event)]);
             }
         }
@@ -2002,19 +2162,16 @@ where
         // SAFETY: the write below covers every byte; downstream gates on the
         // returned write event (Pipelined) or the driver waits (Blocking).
         let mut buf = unsafe { uninit.assume_init() };
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         match mode {
             ExecMode::Blocking => {
-                buf.write(src.as_slice())
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .wait_on(ec)?;
+                crate::buffer::write_buffer_enqueue(&mut buf, ec, src.as_slice(), true, &raw)?;
                 // Blocking write completed — `src` drops at end of execute.
                 self.out.put(buf, Deps::new());
             }
             ExecMode::Pipelined => {
-                let event = buf
-                    .write(src.as_slice())
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .submit_on(ec)?;
+                let event =
+                    crate::buffer::write_buffer_enqueue(&mut buf, ec, src.as_slice(), false, &raw)?;
                 // Keep-alive: drop the host source when CL_COMPLETE fires.
                 register_drop_callback(&event, Box::new(src))?;
                 self.out.put(buf, vec![wrap_event(event)]);
@@ -2083,19 +2240,16 @@ where
             .src
             .take()
             .expect("WriteDevice::execute called twice — internal eager bug");
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         match mode {
             ExecMode::Blocking => {
-                buf.write(src.as_slice())
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .wait_on(ec)?;
+                crate::buffer::write_buffer_enqueue(&mut buf, ec, src.as_slice(), true, &raw)?;
                 // Blocking write completed — `src` drops at end of execute.
                 self.out.put(buf, Deps::new());
             }
             ExecMode::Pipelined => {
-                let event = buf
-                    .write(src.as_slice())
-                    .after_all(deps.iter().map(|d| d.as_ref()))
-                    .submit_on(ec)?;
+                let event =
+                    crate::buffer::write_buffer_enqueue(&mut buf, ec, src.as_slice(), false, &raw)?;
                 // Keep-alive: drop the host source when CL_COMPLETE fires (the
                 // runtime is done reading the host heap exactly then).
                 register_drop_callback(&event, Box::new(src))?;
@@ -2107,6 +2261,28 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("write".into());
+    }
+}
+
+impl<T, M> WriteDevice<T, M>
+where
+    T: Send + Sync + 'static,
+    M: MemMode + HostWritable + Send + 'static,
+{
+    /// Concrete-head blocking terminal: write on the buffer's own context default
+    /// queue and return the buffer for reuse (`let buf = buf.write(d).wait()?;`).
+    pub fn wait(self) -> Result<DeviceSlice<T, M>> {
+        let ctx = concrete_buf_ctx(&self.buf)?;
+        self.sync(&ctx)
+    }
+
+    /// Concrete-head non-blocking terminal returning the buffer plus a completion
+    /// [`Event`](crate::Event) — mirrors the Tier-1 `(Output, Event)` contract so
+    /// the caller can keep using the buffer and chain via `.after(event)`.
+    pub fn submit(self) -> Result<(DeviceSlice<T, M>, crate::Event)> {
+        let ctx = concrete_buf_ctx(&self.buf)?;
+        let queue = ctx.default_outoforder_queue(ctx.device())?;
+        self.submit_value_on(&*queue)
     }
 }
 

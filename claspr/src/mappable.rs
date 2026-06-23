@@ -370,9 +370,9 @@ mod tests {
         let q = queue.raw();
 
         // Allocate + seed via Tier 1 write.
-        let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).expect("alloc");
-        let seed = [1u32, 2, 3, 4];
-        buf.write(&seed).wait().expect("seed");
+        let buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).expect("alloc");
+        let seed = vec![1u32, 2, 3, 4];
+        let buf = buf.write(seed).wait().expect("seed");
 
         // Map (no upstream deps; seed write already done).
         let (mut handle, map_events) =
@@ -418,8 +418,8 @@ mod tests {
         let queue = ctx.default_outoforder_queue(&device).expect("oo queue");
         let q = queue.raw();
 
-        let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).expect("alloc");
-        buf.write(&[10, 20, 30, 40]).wait().expect("seed");
+        let buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).expect("alloc");
+        let buf = buf.write(vec![10, 20, 30, 40]).wait().expect("seed");
 
         type T = (DeviceSlice<u32>, u32);
         let tup: T = (buf, 7u32);

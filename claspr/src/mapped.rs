@@ -649,8 +649,8 @@ pub(crate) fn fill_via_kernel_svm<T: Copy, L: Launcher + ?Sized>(
 }
 
 /// Lazy builder for `clEnqueueSVMMemcpy` with a host source pointer.
-/// Returned by [`MappedSlice::write`]. SVM analog of
-/// [`crate::buffer::WriteOp`].
+/// Returned by [`MappedSlice::write`]. SVM analog of the cl_mem write path
+/// ([`DeviceSlice::write`](crate::DeviceSlice::write)).
 pub struct SvmWriteOp<'a, T, M: MemMode> {
     owner: &'a MappedSlice<T, M>,
     data: &'a [T],

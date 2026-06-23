@@ -113,9 +113,8 @@ where
 
     fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, mut dst) = self.take();
-        let event = DeviceSlice::copy_to(&src, &mut dst)
-            .after_all(deps_as_events(&deps))
-            .submit_on(ec)?;
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let event = crate::buffer::copy_buffer_enqueue(&src, &mut dst, ec, &raw)?;
         Ok(((src, dst), vec![wrap_event(event)]))
     }
 }
@@ -150,9 +149,8 @@ where
         // (they wait on the returned event via Deps). No read can
         // observe uninit bytes.
         let mut dst = unsafe { uninit_dst.assume_init() };
-        let event = DeviceSlice::copy_to(&src, &mut dst)
-            .after_all(deps_as_events(&deps))
-            .submit_on(ec)?;
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let event = crate::buffer::copy_buffer_enqueue(&src, &mut dst, ec, &raw)?;
         Ok(((src, dst), vec![wrap_event(event)]))
     }
 }

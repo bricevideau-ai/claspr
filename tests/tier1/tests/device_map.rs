@@ -47,10 +47,10 @@ fn submit_returns_pending_then_wait_yields_guard() {
     // Non-blocking cl_mem map: `.submit()` returns DeviceMapReadPending
     // with an Event handle; `.wait()` blocks and yields the guard.
     let Some(ctx) = ctx() else { return };
-    let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     // Seed via write.
     let seed: Vec<u32> = (0..N as u32).collect();
-    buf.write(&seed).wait().expect("seed write");
+    let buf = buf.write(seed).wait().expect("seed write");
 
     let pending = buf.map().submit().expect("submit map");
     // Event handle exposed for chain ordering.

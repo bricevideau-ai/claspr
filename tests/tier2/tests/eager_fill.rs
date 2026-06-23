@@ -32,8 +32,8 @@ fn ctx() -> Option<Context> {
 #[test]
 fn tier1_fill_writes_value_to_every_element() {
     let Some(ctx) = ctx() else { return };
-    let mut buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
-    buf.fill(42u32).wait().expect("fill");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
+    let buf = buf.fill(42u32).wait().expect("fill");
 
     let mut readback = vec![0u32; N];
     buf.read(&mut readback).wait().expect("read");

@@ -361,7 +361,8 @@ impl Context {
     /// fill path (see [`crate::fill_kernel`]). Builds on first call;
     /// subsequent calls return the cached program.
     ///
-    /// Internal — used by [`crate::buffer::FillOp`] and
+    /// Internal — used by the buffer fill path
+    /// ([`fill_buffer_enqueue`](crate::buffer::fill_buffer_enqueue)) and
     /// [`crate::mapped::SvmFillOp`] when the marker's
     /// [`FillStrategy`](crate::FillStrategy) is `DeviceKernel`. Users
     /// should not need this directly.
