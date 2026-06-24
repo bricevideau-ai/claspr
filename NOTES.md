@@ -9,6 +9,51 @@ items resolve.
 
 ## Active
 
+### ⚠ OPEN: `and_then_host` error path — driver-unsafe device abort (two-event seam landed, abort design deferred) 2026-06-23
+
+**Status: seam improved + suite no longer hangs; the cross-driver ABORT
+mechanism is unsolved and deferred.**
+
+Landed (eager.rs `run_host_seam`): **two user events** replace the single one.
+- `fire` — gates the unmaps, **always** `CL_COMPLETE`. One clean unmap per
+  buffer. Removes the previous **defensive double-unmap** (worker did
+  `mark_unmap_not_done`+drop → a 2nd unmap on an already-unmapped buffer; NEO
+  decrements map-count at unmap *enqueue* not execution, so the 2nd returns
+  `CL_INVALID_VALUE` and corrupts queue state). That double-unmap was the
+  concrete bug; gone. Multi-buffer verified (one `fire` gates all N unmaps;
+  downstream waits all N unmap events + `proceed`).
+- `proceed` — gates downstream; `CL_COMPLETE` on success, **negative on error**.
+
+**Unsolved — negative `proceed` is driver-unsafe** (pinned via intercept layer +
+standalone C repros in `scratch/`):
+- **NEO (eager):** lost-wakeup race — negative status in the blocking transfer's
+  wait-commit window → deadlock. `race_enqueue.c` 30/30. A 3rd "gate" event
+  (worker waits it; main completes after whole graph enqueued) fixes the *race*
+  (40/40) but not pocl.
+- **pocl (eager):** `clFinish` on a queue with a *terminated* command
+  hangs/segfaults (~7/30 + occasional SIGSEGV). Gate does not help.
+- **rusticl (LAZY):** returns `-14` cleanly — only because it doesn't process the
+  queue until flush, so `proceed=-1` is already set → no race window. Laziness
+  sidesteps it, not better handling (Brice 2026-06-23).
+Device-timing confirmed negative `proceed` DOES abort the downstream device op
+(read/kernel never runs) when it doesn't deadlock — semantics right, reliability
+not. Caller-facing error stays the **host-error slot**, never the CL status /
+blocking return code (NEO+pocl return CL_SUCCESS even when the cmd was skipped).
+
+CANDIDATES (deferred — Brice to pick): (1) host-side enqueue gate — downstream
+`execute()` skips enqueue if slot set; truly aborts, no negative event, but adds
+seam host/device sync (`host_gate.c` clean on all 3). (2) let downstream run +
+discard — safe only for a discarded `download`, not arbitrary kernels. (3) make
+host-closure error **fatal** (panic/abort) — no negative event/barrier/garbage,
+changes contract from recoverable `Err` to fatal.
+
+TEST: `eager_and_then_host_error_propagates` (eager_cutover.rs) — the one shape
+hitting this (host-error → downstream device `download`) — marked `#[ignore]`
+(flaky) until the abort design lands. NEO eager_cutover 30/30 with it
+quarantined. Repros in `scratch/` (untracked): race_enqueue, gate, host_gate,
+two_event, multi_buf, neo_userevent_negative_repro, mapcount_probe — keep for the
+NEO/pocl driver-bug reports + the deferred design.
+
 ### Blocking borrowing upload verb `write_sync` (branch `eager-cutover`, 2026-06-23)
 
 **✅ DONE.** Additive softening of the async owned `write`'s move-out tax. The

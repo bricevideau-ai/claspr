@@ -3980,11 +3980,45 @@ where
 /// pipelined device work. This is the async machinery ported from the old
 /// closure-layer `and_then_host.rs`; running it synchronously was a regression.
 ///
+/// ## Error / abort path — TWO user events
+///
 /// Errors (closure `Err`, panic → `HostPanic`, map-wait failure) are stashed in
-/// the chain-wide host-error slot (first-writer-wins) and the user event is
-/// signalled with a negative status; the negative status cascades through the
-/// in-queue dependency graph and the terminal (`sync`/`run`) prefers the stashed
-/// rich variant over the `Error::OpenCl(-1)` cascade.
+/// the chain-wide host-error slot (first-writer-wins). The slot — **not** any
+/// cl_event status nor the terminal's blocking return code — is the
+/// authoritative caller-facing error channel: the terminal (`sync`/`run`/async
+/// poll) checks it even on a "successful" wait and surfaces the rich error.
+///
+/// The seam is gated by **two** user events, because one event cannot do both
+/// jobs at once:
+/// - **`fire`** gates the unmaps and is **always** completed `CL_COMPLETE`
+///   (success *and* error). Each buffer is unmapped exactly once, cleanly. We do
+///   NOT additionally issue a host-side defensive unmap — a *second* unmap on an
+///   already-unmapped buffer (legacy Intel NEO decrements map-count at enqueue,
+///   not execution) returns `CL_INVALID_VALUE` and corrupts queue state. Folding
+///   the defensive unmap away is the concrete bug this two-event split fixes vs.
+///   the previous single-event design.
+/// - **`proceed`** gates downstream and, on success, is `CL_COMPLETE`. On error
+///   it is completed with a negative status to abort downstream device work.
+///
+/// ### ⚠ KNOWN-FLAKY on error: negative `proceed` is driver-unsafe
+///
+/// Completing a *wait-list* user event with a negative status to abort the
+/// downstream is **not reliable across drivers** (pinned 2026-06-23 with the
+/// intercept layer + standalone C repros across legacy NEO / pocl / rusticl):
+/// - legacy Intel NEO: a blocking transfer parked on the event can lose its
+///   wakeup if the negative status lands in the wait-commit window → deadlock.
+/// - pocl: `clFinish` on a queue holding a *terminated* command can hang or
+///   segfault.
+/// - rusticl: honours it cleanly — but only because it is lazy (processes the
+///   queue at flush, after `proceed` is already set), so there is no race.
+///
+/// Adding a third "gate" user event (worker waits it; main completes it only
+/// after the whole graph is enqueued) removes the NEO *race* but not pocl's
+/// terminated-command problem. The correct, driver-independent abort is still an
+/// open design question (host-side enqueue gating, or making a host-closure error
+/// fatal) — tracked in NOTES. Until then the dedicated error-path test is marked
+/// `#[ignore]` (flaky), while the success path (the overwhelmingly common case)
+/// is solid on all three drivers.
 fn run_host_seam<O, F>(
     source_value: O,
     source_deps: Deps,
@@ -4005,65 +4039,66 @@ where
     let source_cl: Vec<crate::cl_event> = source_deps.iter().map(|d| d.as_ref().get()).collect();
     let (mut handle, map_events) = source_value.map(q, &source_cl)?;
 
-    // The user event downstream waits on (via the unmaps). Worker signals it.
-    let user_event = Arc::new(create_user_event(ec.context())?);
+    // `fire` gates the unmaps (always completed CL_COMPLETE — one clean unmap per
+    // buffer). `proceed` gates downstream and carries the abort. See the doc
+    // comment above for why these must be two distinct events.
+    let fire = Arc::new(create_user_event(ec.context())?);
+    let proceed = Arc::new(create_user_event(ec.context())?);
 
-    // Enqueue the unmaps gated on the user event — they fire once the worker
-    // signals completion. After this point we MUST signal the user event before
-    // any early return, or the queue would wait on it forever.
-    let unmap_events = match <O as Mappable>::enqueue_unmap(&mut handle, q, &[user_event.get()]) {
+    // Enqueue the unmaps gated on `fire`. After this point we MUST complete BOTH
+    // user events before any early return, or the queue would wait forever.
+    let unmap_events = match <O as Mappable>::enqueue_unmap(&mut handle, q, &[fire.get()]) {
         Ok(evs) => evs,
         Err(e) => {
-            let _ = complete_user_event(&user_event, -1);
+            let _ = complete_user_event(&fire, -1);
+            let _ = complete_user_event(&proceed, -1);
             return Err(e);
         }
     };
 
     // Spawn the worker. It owns the handle, the map events, the source events
-    // (for upstream-error short-circuit), the user-event Arc clone, the chain's
+    // (for upstream-error short-circuit), both user-event Arc clones, the chain's
     // host-error slot, and the closure.
-    let worker_user_event = Arc::clone(&user_event);
+    let worker_fire = Arc::clone(&fire);
+    let worker_proceed = Arc::clone(&proceed);
     let worker_host_error = ec.host_error_slot();
     std::thread::spawn(move || {
-        let (status, mut handle, rust_err) =
+        let (status, handle, rust_err) =
             run_host_worker::<O, F>(handle, map_events, source_deps, host_call);
-        // Stash the rich Rust error before signalling, so the terminal can prefer
-        // it over the cl_event cascade. First-writer-wins (a concurrent failing
-        // host worker in the same bundle/fan-out may already have written).
+        // Stash the rich Rust error first (first-writer-wins — a concurrent
+        // failing worker in the same bundle/fan-out may already have written).
         if let Some(err) = rust_err {
             let mut slot = worker_host_error.lock().unwrap();
             if slot.is_none() {
                 *slot = Some(err);
             }
         }
-        if status < 0 {
-            // On error the queued unmap (waiting on the user event) is terminated
-            // by the runtime rather than executing — leaving the buffer mapped.
-            // Force the defensive sync unmap NOW so the buffer is clean by the
-            // time the terminal observes the error.
-            <O as Mappable>::mark_unmap_not_done(&mut handle);
-            drop(handle);
-        }
-        let _ = complete_user_event(&worker_user_event, status);
-        // Success path: handle drops here (no-op — the queued unmap fires via the
-        // user event on its own).
+        // ALWAYS fire the unmaps cleanly (single unmap per buffer). No defensive
+        // unmap — that double-unmap is what corrupts legacy NEO.
+        let _ = complete_user_event(&worker_fire, opencl3::event::CL_COMPLETE);
+        // Allow / abort downstream device work via `proceed` (negative on error).
+        // NOTE: the negative-on-error path is driver-flaky (see doc comment).
+        let _ = complete_user_event(&worker_proceed, status);
+        // `handle` drops here: `enqueue_unmap` succeeded so its `unmap_enqueued`
+        // flag is set and Drop is a no-op — the gated unmap fired via `fire`.
+        drop(handle);
     });
 
-    // Downstream gates on the unmap events (transitively the user event). When
-    // the output has no buffers (scalar / unit), unmaps are empty — fall back to
-    // the user event directly so downstream still has a gate.
-    let deps_out: Deps = if unmap_events.is_empty() {
-        vec![user_event]
-    } else {
-        unmap_events.into_iter().map(wrap_event).collect()
-    };
+    // Downstream gates on ALL unmap events PLUS `proceed`. When the output has no
+    // buffers (scalar / unit), there are no unmaps and `fire` gates nothing — but
+    // `proceed` still gives downstream its proceed/abort gate.
+    let mut deps_out: Deps = unmap_events.into_iter().map(wrap_event).collect();
+    deps_out.push(proceed);
     Ok((source_value, deps_out))
 }
 
 /// Worker body for [`run_host_seam`]. Waits the source + map events, runs the
 /// closure under `catch_unwind`, and returns `(status, handle, optional rich
-/// error)` so the caller can stash the error + trigger the defensive unmap on
-/// failure. `status` is `CL_COMPLETE` on success, negative otherwise.
+/// error)`. The caller stashes the error in the chain host-error slot, always
+/// completes the `fire` event (so the unmaps run cleanly), and forwards `status`
+/// to the `proceed` event (negative aborts downstream). `status` is
+/// `CL_COMPLETE` on success, negative otherwise. The returned `handle` is
+/// dropped by the caller as a no-op (its unmap already fired via `fire`).
 fn run_host_worker<O, F>(
     mut handle: O::MapHandle,
     map_events: Vec<crate::Event>,
