@@ -182,11 +182,32 @@ pub enum Input<T> {
 
 impl<T> Input<T> {
     /// Resolve to `(value, upstream Deps)` at execute time (consuming it). A
-    /// concrete value carries no upstream events; a pipe carries whatever its
-    /// producer enqueued (the downstream wait-list).
-    pub fn resolve(self) -> Result<(T, Deps)> {
+    /// concrete value is an **entry leaf** — a chain head with no upstream — so
+    /// it normally carries no events. The ONE exception is the host-seam start
+    /// gate: when `ec` has a `start` event set
+    /// (only for chains that [`contains_host_seam`](DeviceOp::contains_host_seam)),
+    /// the entry leaf threads that one event into its wait-list so its enqueue
+    /// waits on the gate — the whole graph is committed before any of it runs.
+    /// (`scratch/start_threaded.c`: `mk()` merges `start` into every entry
+    /// command's wait-list.) A pipe is NOT an entry leaf — its producer is
+    /// already transitively gated — so the [`Pipe`](Input::Pipe) arm is
+    /// unchanged.
+    pub fn resolve(self, ec: &ExecutionContext<'_>) -> Result<(T, Deps)> {
         match self {
-            Input::Concrete(v) => Ok((v, Deps::new())),
+            Input::Concrete(v) => match ec.start_dep() {
+                // Retain the start event independently: `ec` owns the original
+                // handle for the whole enqueue; this `Dep`'s `Event::drop` will
+                // `clReleaseEvent` its own ref, so we balance it with a retain.
+                Some(raw) => {
+                    // SAFETY: `raw` is a live cl_event owned by the terminal for
+                    // the duration of the enqueue; retaining bumps its refcount,
+                    // balanced by the wrapped `Event`'s Drop.
+                    unsafe { opencl3::event::retain_event(raw) }
+                        .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
+                    Ok((v, vec![wrap_event(crate::Event::new(raw))]))
+                }
+                None => Ok((v, Deps::new())),
+            },
             Input::Pipe(p) => p.take().ok_or(Error::NotSupported(
                 "eager graph: upstream pipe was not filled before downstream ran \
                  — internal ordering bug",
@@ -416,6 +437,32 @@ pub trait DeviceOp: Send {
 
     /// Structural description — node names in execution order, NO execution.
     fn describe(&self, out: &mut Vec<String>);
+
+    /// Whether this op (transitively) contains an `and_then_host` /
+    /// `and_then_host_with_context` host seam — a node whose worker thread can
+    /// complete a downstream-gating user event with a **negative** status on
+    /// error. Default `false`; the two host-seam leaves override to `true`, and
+    /// every combinator ORs its owned children (mirroring [`describe`](Self::describe)).
+    ///
+    /// **Why it matters.** The host seam's negative `proceed` can race a
+    /// downstream blocking transfer's wait-commit on legacy Intel NEO
+    /// (lost-wakeup deadlock). The terminals fix this by gating the WHOLE graph
+    /// on a `start` user event (carried on the `ExecutionContext`) released only
+    /// after the entire graph is enqueued — so `proceed` negative can never land
+    /// in the enqueue/wait-commit window. That start-gate carries a small cost
+    /// (one extra user event + a deferred terminal wait), so it is paid **only
+    /// when this returns `true`**; pure device graphs keep the zero-overhead
+    /// fast path. Validated in `scratch/start_threaded.c` (NEO 40/40, 0 hung).
+    ///
+    /// NOTE: a host seam built *inside* an
+    /// [`and_then_with_context`](DeviceOpExt::and_then_with_context) closure is
+    /// NOT visible here (the downstream op is constructed at execute time, not at
+    /// build) and is therefore not gated — consistent with that combinator being
+    /// omitted from the OR set. Use the structural `and_then`/`and_then_host`
+    /// surface for host seams that need the gate.
+    fn contains_host_seam(&self) -> bool {
+        false
+    }
 }
 
 /// Builder verbs for composing [`DeviceOp`]s. Blanket-implemented.
@@ -526,25 +573,88 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// (Tier-1 heritage). [`sync`](Self::sync) is `wait_on` over a `Context`.
     fn wait_on<L: crate::Launcher + ?Sized>(self, launcher: &L) -> Result<Self::Output> {
         let device = launcher.context().device().clone();
-        let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
-        // The terminal op yields its Output and waits on its own completion
-        // events (Blocking); upstream ops pipeline. Single-output ops use the
-        // default `into_output` (drain output pipe + wait); multi-output ops
-        // override it to scatter-then-reconstruct the tuple.
-        let result = self.into_output(&ec, ExecMode::Blocking);
-        match result {
-            // A failing `and_then_host` worker stashed its rich error and signalled
-            // its user event negative; the blocking wait may return the cl_event
-            // cascade (`Error::OpenCl(-1)`). Prefer the stashed variant.
-            Err(cascade) => Err(ec.take_host_error().unwrap_or(cascade)),
-            // Even on a "successful" wait, a worker may have stashed an error the
-            // wait did NOT surface: pocl does not cascade negative user-event
-            // status to commands downstream of it (and a discarded-handle chain
-            // may not even wait on the failing op's events). A non-empty slot is
-            // itself the failure signal — check it. (Same as the async terminal.)
-            Ok(v) => match ec.take_host_error() {
-                Some(rust_err) => Err(rust_err),
-                None => Ok(v),
+        let mut ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
+
+        // FAST PATH — no host seam: the current zero-overhead terminal. The
+        // terminal op yields its Output and waits on its own completion events
+        // (Blocking); upstream ops pipeline. Single-output ops use the default
+        // `into_output` (drain output pipe + wait); multi-output ops override it
+        // to scatter-then-reconstruct the tuple.
+        if !self.contains_host_seam() {
+            let result = self.into_output(&ec, ExecMode::Blocking);
+            return match result {
+                // A failing `and_then_host` worker stashed its rich error and
+                // signalled its user event negative; the blocking wait may return
+                // the cl_event cascade (`Error::OpenCl(-1)`). Prefer the stash.
+                Err(cascade) => Err(ec.take_host_error().unwrap_or(cascade)),
+                // Even on a "successful" wait, a worker may have stashed an error
+                // the wait did NOT surface (pocl does not cascade negative
+                // user-event status). A non-empty slot is itself the failure
+                // signal — check it. (Same as the async terminal.)
+                Ok(v) => match ec.take_host_error() {
+                    Some(rust_err) => Err(rust_err),
+                    None => Ok(v),
+                },
+            };
+        }
+
+        // START-GATE PATH — the chain contains a host seam. Enqueue the WHOLE
+        // graph FIRST (gated on a `start` user event so nothing runs yet), then
+        // release `start`, then wait. This closes the legacy NEO lost-wakeup
+        // window: a host seam's negative `proceed` can never land while a
+        // downstream blocking transfer is committing to its wait, because the
+        // whole graph is already enqueued before any of it executes. Validated in
+        // `scratch/start_threaded.c` (enqueue all → release start → wait last).
+        let start = crate::create_user_event(ec.context())?;
+        ec.set_start(start.get());
+
+        // Enqueue non-blocking (Pipelined) — a Blocking leaf would wait inline on
+        // a command gated on the unreleased `start` and deadlock. The terminal
+        // wait happens below, after `start` is released.
+        let collected = self.collect(&ec, ExecMode::Pipelined);
+
+        // Release the graph regardless of a setup error: any commands already
+        // enqueued are gated on `start`; completing it lets them drain (or abort
+        // via their own `proceed`) instead of the queue waiting forever. After
+        // this, `start` may be dropped (its retained dep refs outlive it).
+        let _ = crate::complete_user_event(&start, opencl3::event::CL_COMPLETE);
+
+        let (value, deps) = match collected {
+            Ok(pair) => pair,
+            Err(setup_err) => {
+                // Setup failed before/while enqueueing. Join any workers that did
+                // spawn so their CL calls finish before we return, then surface
+                // the rich error if the seam stashed one.
+                ec.join_workers();
+                return Err(ec.take_host_error().unwrap_or(setup_err));
+            }
+        };
+
+        // Wait on the chain's completion events (NOT clFinish — clFinish on a
+        // terminated command is the pocl hang). A negative `proceed` from a
+        // failing seam surfaces here as a cl_event cascade; we reconcile it with
+        // the stashed rich error below.
+        let mut wait_err: Option<Error> = None;
+        for d in &deps {
+            if let Err(code) = d.as_ref().wait() {
+                wait_err.get_or_insert(Error::OpenCl(code));
+            }
+        }
+        drop(deps);
+
+        // Join host-seam workers AFTER the device wait, so no worker's late CL
+        // calls (signalling its user events, then dropping its retained queue)
+        // race the caller dropping the Context.
+        ec.join_workers();
+
+        // The host-error slot is the authoritative caller-facing error (a worker
+        // may have failed without the cl_event cascade reaching us — pocl). Prefer
+        // it over the cascade, mirroring the fast path.
+        match ec.take_host_error() {
+            Some(rust_err) => Err(rust_err),
+            None => match wait_err {
+                Some(cascade) => Err(cascade),
+                None => Ok(value),
             },
         }
     }
@@ -749,6 +859,13 @@ where
         self.source.describe(out);
         self.next.describe(out);
     }
+
+    fn contains_host_seam(&self) -> bool {
+        // `next` is the downstream op built eagerly inside the `and_then` closure
+        // at construction (a real owned field, not a deferred closure), so a host
+        // seam built in the closure IS visible here.
+        self.source.contains_host_seam() || self.next.contains_host_seam()
+    }
 }
 
 // ── Value: lift a host value into the graph ────────────────────────────
@@ -923,10 +1040,10 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
         self.out.clone()
     }
 
-    fn execute(self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Resolve the upstream value + its events and re-deposit unchanged — no
         // device work; deps threaded through so ordering/termination is intact.
-        let (v, deps) = self.input.resolve()?;
+        let (v, deps) = self.input.resolve(ec)?;
         self.out.put(v, deps);
         Ok(())
     }
@@ -954,6 +1071,11 @@ trait ErasedDeviceOp<T>: Send {
     ) -> Result<(T, Deps)>;
 
     fn describe_erased(&self, out: &mut Vec<String>);
+
+    /// Forwards [`DeviceOp::contains_host_seam`] through the erasure so a
+    /// [`DeviceDynOp`] reports the right gate bit for whichever concrete arm it
+    /// wraps.
+    fn contains_host_seam_erased(&self) -> bool;
 }
 
 impl<O> ErasedDeviceOp<O::Output> for O
@@ -970,6 +1092,10 @@ where
 
     fn describe_erased(&self, out: &mut Vec<String>) {
         self.describe(out);
+    }
+
+    fn contains_host_seam_erased(&self) -> bool {
+        self.contains_host_seam()
     }
 }
 
@@ -1054,6 +1180,12 @@ impl<T: Send + 'static> DeviceOp for DeviceDynOp<'_, T> {
         }
         out.push("}".into());
     }
+
+    fn contains_host_seam(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| inner.contains_host_seam_erased())
+    }
 }
 
 // ── Arced: wrap the output in Arc<T> ───────────────────────────────────
@@ -1103,6 +1235,10 @@ where
     fn describe(&self, out: &mut Vec<String>) {
         self.source.describe(out);
         out.push("arced".into());
+    }
+
+    fn contains_host_seam(&self) -> bool {
+        self.source.contains_host_seam()
     }
 }
 
@@ -1211,6 +1347,10 @@ where
     fn describe(&self, out: &mut Vec<String>) {
         self.source.describe(out);
         out.push(format!("arc_split[{N}]"));
+    }
+
+    fn contains_host_seam(&self) -> bool {
+        self.source.contains_host_seam()
     }
 }
 
@@ -1339,6 +1479,11 @@ macro_rules! impl_eager_bundle {
                 out.push(concat!(stringify!($name), "{").into());
                 $(self.$field.describe(out);)+
                 out.push("}".into());
+            }
+
+            fn contains_host_seam(&self) -> bool {
+                // OR every branch: a host seam in any one of them must gate.
+                false $(|| self.$field.contains_host_seam())+
             }
         }
     };
@@ -1503,6 +1648,10 @@ impl<U: DeviceOp> DeviceOp for FanOut<U> {
     fn describe(&self, out: &mut Vec<String>) {
         out.push(format!("fan_out[{}]", self.pipes.len()));
     }
+
+    fn contains_host_seam(&self) -> bool {
+        self.ops.iter().any(|op| op.contains_host_seam())
+    }
 }
 
 /// Allocate a zero-initialised `DeviceSlice<T, M>` of `len` elements. Eager
@@ -1640,7 +1789,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (mut buf, deps) = self.buf.resolve()?;
+        let (mut buf, deps) = self.buf.resolve(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // Fill has no native CL_BLOCKING flag (it's always enqueue + optional
         // wait — exactly what the old `FillOp::wait_on` did internally), so both
@@ -1798,7 +1947,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve()?;
+        let (buf, deps) = self.buf.resolve(ec)?;
         let mut host = vec![T::default(); buf.len()];
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         match mode {
@@ -1895,7 +2044,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve()?;
+        let (buf, deps) = self.buf.resolve(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         match mode {
             // Terminal: native blocking read — `dst` is valid on return, no event.
@@ -2007,7 +2156,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve()?;
+        let (buf, deps) = self.buf.resolve(ec)?;
         // Resolve the target device's default OOO queue (cached on the Context,
         // so the terminal's flush_all_outoforder_queues pushes it). Same path
         // OnDevice uses to reach a non-primary device's queue.
@@ -2075,7 +2224,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (uninit, deps) = self.uninit.resolve()?;
+        let (uninit, deps) = self.uninit.resolve(ec)?;
         // SAFETY: the fill below writes every byte; downstream gates on the
         // returned fill event (Pipelined) or the driver waits (Blocking).
         let mut buf = unsafe { uninit.assume_init() };
@@ -2141,7 +2290,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (uninit, deps) = self.uninit.resolve()?;
+        let (uninit, deps) = self.uninit.resolve(ec)?;
         // SAFETY: the SVM fill below writes every byte.
         let buf = unsafe { uninit.assume_init() };
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
@@ -2206,9 +2355,9 @@ where
         self.out.clone()
     }
 
-    fn execute(self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Pure host op — no event; forward the upstream deps unchanged.
-        let (uninit, deps) = self.uninit.resolve()?;
+        let (uninit, deps) = self.uninit.resolve(ec)?;
         let buf = uninit.fill_into(self.value);
         self.out.put(buf, deps);
         Ok(())
@@ -2265,7 +2414,7 @@ where
     }
 
     fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (uninit, deps) = self.uninit.resolve()?;
+        let (uninit, deps) = self.uninit.resolve(ec)?;
         let src = self
             .src
             .take()
@@ -2346,7 +2495,7 @@ where
     }
 
     fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (mut buf, deps) = self.buf.resolve()?;
+        let (mut buf, deps) = self.buf.resolve(ec)?;
         let src = self
             .src
             .take()
@@ -2440,7 +2589,7 @@ where
     }
 
     fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (uninit, deps) = self.uninit.resolve()?;
+        let (uninit, deps) = self.uninit.resolve(ec)?;
         let src = self
             .src
             .take()
@@ -2513,7 +2662,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve()?;
+        let (buf, deps) = self.buf.resolve(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // SVM fill is always a non-blocking enqueue (no native CL_BLOCKING flag);
         // Blocking waits on the returned event here.
@@ -2603,7 +2752,7 @@ where
     }
 
     fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve()?;
+        let (buf, deps) = self.buf.resolve(ec)?;
         let src = self
             .src
             .take()
@@ -2696,9 +2845,9 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Host memcpy via Tier-1 helper; Err on length mismatch propagates.
-        let (uninit, deps) = self.uninit.resolve()?;
+        let (uninit, deps) = self.uninit.resolve(ec)?;
         let src = self
             .src
             .take()
@@ -3099,7 +3248,7 @@ where
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Image read enqueued non-blocking; the chain terminal waits, mode ignored.
-        let (img, deps) = self.img.resolve()?;
+        let (img, deps) = self.img.resolve(ec)?;
         let pixel_count = img.pixel_count();
         let region = img.enqueue_region();
         let mut pixels = vec![<I::Pixel as Default>::default(); pixel_count];
@@ -3175,7 +3324,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve()?;
+        let (buf, deps) = self.buf.resolve(ec)?;
         // Delegate to the old op's verbatim map body (map/unmap is always
         // non-blocking — mode ignored).
         let (view, out_deps) = buf.acquire_host_view().run(ec, deps)?;
@@ -3228,7 +3377,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve()?;
+        let (buf, deps) = self.buf.resolve(ec)?;
         let (view, out_deps) = buf.acquire_host_view_read().run(ec, deps)?;
         self.out.put(view, out_deps);
         Ok(())
@@ -3281,7 +3430,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (view, deps) = self.view.resolve()?;
+        let (view, deps) = self.view.resolve(ec)?;
         let (buf, out_deps) = view.release_to_device().run(ec, deps)?;
         self.out.put(buf, out_deps);
         Ok(())
@@ -3331,7 +3480,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve()?;
+        let (buf, deps) = self.buf.resolve(ec)?;
         let (view, out_deps) = buf.acquire_host_view().run(ec, deps)?;
         self.out.put(view, out_deps);
         Ok(())
@@ -3382,7 +3531,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve()?;
+        let (buf, deps) = self.buf.resolve(ec)?;
         let (view, out_deps) = buf.acquire_host_view_read().run(ec, deps)?;
         self.out.put(view, out_deps);
         Ok(())
@@ -3435,7 +3584,7 @@ where
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (view, deps) = self.view.resolve()?;
+        let (view, deps) = self.view.resolve(ec)?;
         let (buf, out_deps) = view.release_to_device().run(ec, deps)?;
         self.out.put(buf, out_deps);
         Ok(())
@@ -3558,8 +3707,8 @@ where
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Resolve both inputs → (buffer, upstream Deps). Either may be a pipe
         // (upstream output) or concrete. Combine their wait-lists.
-        let (src, src_deps) = self.src.resolve()?;
-        let (dst, dst_deps) = self.dst.resolve()?;
+        let (src, src_deps) = self.src.resolve(ec)?;
+        let (dst, dst_deps) = self.dst.resolve(ec)?;
         let mut deps = src_deps;
         deps.extend(dst_deps);
         // Reuse the closure-layer copy op: it owns the right per-family
@@ -3911,6 +4060,8 @@ where
             self.device.clone(),
             target_q.raw(),
             parent.host_error_slot(),
+            parent.start_dep(),
+            parent.workers_handle(),
         );
         // Gather the source against the child EC via `collect` (any arity).
         let (value, deps) = self.source.collect(&child, mode)?;
@@ -3921,6 +4072,10 @@ where
     fn describe(&self, out: &mut Vec<String>) {
         self.source.describe(out);
         out.push("on_device".into());
+    }
+
+    fn contains_host_seam(&self) -> bool {
+        self.source.contains_host_seam()
     }
 }
 
@@ -4062,7 +4217,7 @@ where
     let worker_fire = Arc::clone(&fire);
     let worker_proceed = Arc::clone(&proceed);
     let worker_host_error = ec.host_error_slot();
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let (status, handle, rust_err) =
             run_host_worker::<O, F>(handle, map_events, source_deps, host_call);
         // Stash the rich Rust error first (first-writer-wins — a concurrent
@@ -4077,12 +4232,18 @@ where
         // unmap — that double-unmap is what corrupts legacy NEO.
         let _ = complete_user_event(&worker_fire, opencl3::event::CL_COMPLETE);
         // Allow / abort downstream device work via `proceed` (negative on error).
-        // NOTE: the negative-on-error path is driver-flaky (see doc comment).
+        // With the start gate (the whole graph is enqueued before `start` is
+        // released), a negative `proceed` can no longer race a downstream blocking
+        // transfer's wait-commit on legacy NEO.
         let _ = complete_user_event(&worker_proceed, status);
         // `handle` drops here: `enqueue_unmap` succeeded so its `unmap_enqueued`
         // flag is set and Drop is a no-op — the gated unmap fired via `fire`.
         drop(handle);
     });
+    // Hand the worker to the EC so the terminal joins it AFTER the device wait —
+    // no detached worker whose CL calls (signal events, drop retained queue) race
+    // the caller dropping the Context.
+    ec.push_worker(handle);
 
     // Downstream gates on ALL unmap events PLUS `proceed`. When the output has no
     // buffers (scalar / unit), there are no unmaps and `fire` gates nothing — but
@@ -4090,6 +4251,17 @@ where
     let mut deps_out: Deps = unmap_events.into_iter().map(wrap_event).collect();
     deps_out.push(proceed);
     Ok((source_value, deps_out))
+}
+
+/// Has `ev` been COMMITTED to a terminal error/cancellation state? Reads the
+/// event's `command_execution_status` (the authoritative committed value, unlike
+/// the `clWaitForEvents` return code which can lose the abort to a legacy-NEO
+/// wakeup race) and reports `true` when it is negative — i.e. the command (a
+/// device command, or an upstream host seam's `proceed` user event) terminated
+/// abnormally. A query failure is treated as "not cancelled" (conservative: we
+/// then fall through to the normal closure path rather than spuriously aborting).
+fn event_is_cancelled(ev: &crate::Event) -> bool {
+    ev.command_execution_status().map(|s| s.0).unwrap_or(0) < 0
 }
 
 /// Worker body for [`run_host_seam`]. Waits the source + map events, runs the
@@ -4113,17 +4285,49 @@ where
     use opencl3::event::CL_COMPLETE;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    // Short-circuit on an upstream chain error (negative source-event status,
-    // e.g. a previous failing host seam). Don't stash — the upstream already did.
+    // CHAINED-CANCEL via the EVENT DEPENDENCY (not a host-side slot — that races
+    // the upstream worker's stash). An upstream host seam that fails completes its
+    // `proceed` user event with a NEGATIVE status; that `proceed` is in THIS
+    // seam's `source_deps` (it is the upstream op's output dep). So once the
+    // upstream cancels, the cancellation is carried by the EVENT, and this seam
+    // short-circuits — DO NOT run its closure — then completes its own `proceed`
+    // negative so the rest of the chain cancels too.
+    //
+    // Robustness on legacy NEO: we do NOT trust `clWaitForEvents`' RETURN code to
+    // report the abort (a lost-wakeup-style race can let the wait return
+    // CL_SUCCESS even when the event was set negative — the same NEO race the
+    // start-gate fixes for device commands, but here on a host-side wait). After
+    // waiting, we re-read the event's COMMITTED `command_execution_status`: a
+    // negative value is the authoritative "this command terminated in error"
+    // signal and is not subject to the wakeup race. That negative status is what
+    // we treat as cancellation.
+    //
+    // Source events first: a negative committed status here is an upstream chain
+    // abort, not a fault of this seam — short-circuit WITHOUT stashing (the
+    // upstream already stashed the first/authoritative error).
     for ev in &source_deps {
-        if ev.as_ref().wait().is_err() {
+        let _ = ev.as_ref().wait();
+        if event_is_cancelled(ev.as_ref()) {
             return (-1, handle, None);
         }
     }
-    // Map-event failure is a host-observable CL error — stash the real cause.
+    // Map events: enqueued over the source events, so an upstream cancel also
+    // errors these. The source check above already caught the upstream-cancel
+    // case, so a negative status here means a real map failure — stash the cause.
     for ev in &map_events {
-        if let Err(e) = ev.wait() {
-            return (-1, handle, Some(Error::OpenCl(e)));
+        let _ = ev.wait();
+        if event_is_cancelled(ev) {
+            // Best-effort fetch of the concrete code; fall back to a generic
+            // exec-status error if the query itself fails.
+            let code = ev
+                .command_execution_status()
+                .map(|s| s.0)
+                .unwrap_or(opencl3::error_codes::CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
+            return (
+                -1,
+                handle,
+                Some(Error::OpenCl(opencl3::error_codes::ClError(code))),
+            );
         }
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
@@ -4182,6 +4386,10 @@ where
         self.source.describe(out);
         out.push("and_then_host".into());
     }
+
+    fn contains_host_seam(&self) -> bool {
+        true
+    }
 }
 
 impl<S, F> DeviceOp for AndThenHostWithContext<S, F>
@@ -4222,6 +4430,10 @@ where
     fn describe(&self, out: &mut Vec<String>) {
         self.source.describe(out);
         out.push("and_then_host_with_context".into());
+    }
+
+    fn contains_host_seam(&self) -> bool {
+        true
     }
 }
 
@@ -4320,6 +4532,10 @@ where
         self.source.describe(out);
         out.push("profiled".into());
     }
+
+    fn contains_host_seam(&self) -> bool {
+        self.source.contains_host_seam()
+    }
 }
 
 // ── DeviceChainFuture: the async `.run().await` terminal ────────────────
@@ -4349,7 +4565,25 @@ pub enum DeviceChainFuture<T> {
         output: Option<T>,
         event_future: crate::EventFuture,
         host_error: std::sync::Arc<std::sync::Mutex<Option<Error>>>,
+        /// Host-seam worker handles, joined once the marker resolves (so a
+        /// worker's late CL calls finish before the caller can drop the
+        /// `Context`). Empty for pure device graphs. Shared `Arc` with the EC
+        /// that spawned them (including routed `on_device` sub-chains).
+        workers: std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
     },
+}
+
+/// Drain and join every host-seam worker handle (no-op when empty). Mirrors
+/// [`ExecutionContext::join_workers`] for the async terminal, which only has the
+/// shared `Arc` (the EC dropped at `run` time).
+#[cfg(feature = "async-events")]
+fn join_chain_workers(
+    workers: &std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
+) {
+    let handles: Vec<std::thread::JoinHandle<()>> = std::mem::take(&mut *workers.lock().unwrap());
+    for h in handles {
+        let _ = h.join();
+    }
 }
 
 // `T: Unpin` covers every realistic chain output (`Vec<u8>`, `DeviceSlice<T>`,
@@ -4373,12 +4607,16 @@ impl<T: Unpin> std::future::Future for DeviceChainFuture<T> {
                 output,
                 event_future,
                 host_error,
+                workers,
             } => match std::pin::Pin::new(event_future).poll(cx) {
                 Poll::Pending => Poll::Pending,
                 // Marker resolved Err: a host worker (or a CL command) failed.
                 // Prefer the rich Rust variant the worker stashed over the
                 // cl_event cascade, mirroring `sync`.
                 Poll::Ready(Err(e)) => {
+                    // Marker done → all device work (and the seam's signals) are
+                    // settled; join workers before returning.
+                    join_chain_workers(workers);
                     Poll::Ready(Err(host_error.lock().unwrap().take().unwrap_or(e)))
                 }
                 // Even on a "successful" marker, a host worker may have stashed
@@ -4388,6 +4626,7 @@ impl<T: Unpin> std::future::Future for DeviceChainFuture<T> {
                 // the chain genuinely failed). A non-empty slot is itself the
                 // failure signal. (Same handling as the old `ChainFuture`.)
                 Poll::Ready(Ok(())) => {
+                    join_chain_workers(workers);
                     if let Some(rust_err) = host_error.lock().unwrap().take() {
                         return Poll::Ready(Err(rust_err));
                     }
@@ -4421,10 +4660,32 @@ where
         Ok(q) => q,
         Err(e) => return DeviceChainFuture::Errored(Some(e)),
     };
-    let ec = ExecutionContext::new(context, device.clone(), queue.raw());
-    // Clone the chain's host-error slot out before `ec` drops — host-seam workers
-    // stash failures here, and the future reconciles them at poll time.
+    let mut ec = ExecutionContext::new(context, device.clone(), queue.raw());
+    // Clone the chain's host-error slot + worker-join list out before `ec` drops
+    // — host-seam workers stash failures in the slot, and the future joins the
+    // workers + reconciles errors at poll time.
     let host_error = ec.host_error_slot();
+    let workers = ec.workers_handle();
+
+    // START-GATE (only when the chain contains a host seam): create a `start`
+    // user event, gate the whole graph on it, enqueue everything, then release
+    // `start`. Mirrors the blocking terminal — closes the legacy NEO lost-wakeup
+    // window. Pure device graphs skip this entirely (start = None, zero cost).
+    let start = if chain.contains_host_seam() {
+        match crate::create_user_event(context) {
+            Ok(ev) => {
+                ec.set_start(ev.get());
+                Some(ev)
+            }
+            Err(e) => {
+                drop(queue);
+                context.invalidate_default_outoforder_queue(&device);
+                return DeviceChainFuture::Errored(Some(e));
+            }
+        }
+    } else {
+        None
+    };
 
     // 2-3. Run the chain non-blocking and gather its result via `collect` —
     //    the uniform gather seam. `collect` dispatches to the right per-op
@@ -4433,12 +4694,26 @@ where
     //    terminal supports every arity the blocking `sync` does. A host-seam
     //    setup error (map/unmap enqueue) still surfaces synchronously here; a
     //    host-CLOSURE failure surfaces at poll time via the host-error slot.
-    let (output, deps) = match chain.collect(&ec, ExecMode::Pipelined) {
+    let collected = chain.collect(&ec, ExecMode::Pipelined);
+
+    // Release the graph (if gated) as soon as it is fully enqueued — or on setup
+    // error, so any already-enqueued commands can drain/abort instead of waiting
+    // on `start` forever. The marker enqueue below is non-blocking, so completing
+    // `start` here (before it) is correct.
+    if let Some(ref start) = start {
+        let _ = crate::complete_user_event(start, opencl3::event::CL_COMPLETE);
+    }
+
+    let (output, deps) = match collected {
         Ok(pair) => pair,
         Err(e) => {
+            // Join any workers that spawned before surfacing the error.
+            join_chain_workers(&workers);
             drop(queue);
             context.invalidate_default_outoforder_queue(&device);
-            return DeviceChainFuture::Errored(Some(e));
+            return DeviceChainFuture::Errored(Some(
+                host_error.lock().unwrap().take().unwrap_or(e),
+            ));
         }
     };
 
@@ -4451,6 +4726,7 @@ where
         Ok(ev) => ev,
         Err(code) => {
             drop(deps);
+            join_chain_workers(&workers);
             drop(queue);
             context.invalidate_default_outoforder_queue(&device);
             return DeviceChainFuture::Errored(Some(Error::OpenCl(code)));
@@ -4464,15 +4740,21 @@ where
     //     fire and the future would deadlock. flush_all also covers
     //     `.on_device(&dev_b)` chains whose commands land on non-primary queues.
     if let Err(e) = context.flush_all_outoforder_queues() {
+        join_chain_workers(&workers);
         drop(queue);
         context.invalidate_default_outoforder_queue(&device);
         return DeviceChainFuture::Errored(Some(e));
     }
+    // `start` (if any) has been completed; its retained dep refs keep the cl_event
+    // alive in the wait-lists until those commands run. Safe to drop here.
+    drop(start);
 
     // 5. Wrap the marker in the EventFuture machinery (clSetEventCallback).
+    //    The future joins `workers` when the marker resolves.
     DeviceChainFuture::Running {
         output: Some(output),
         event_future: marker.into_future(),
         host_error,
+        workers,
     }
 }

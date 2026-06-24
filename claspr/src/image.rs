@@ -707,7 +707,7 @@ impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (mut img, deps) = self.img.resolve()?;
+        let (mut img, deps) = self.img.resolve(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let data = self.data.as_ptr() as *const std::ffi::c_void;
         match mode {
@@ -772,7 +772,7 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (img, deps) = self.img.resolve()?;
+        let (img, deps) = self.img.resolve(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let dst = self.dst.as_mut_ptr() as *mut std::ffi::c_void;
         match mode {
@@ -839,8 +839,8 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (src, src_deps) = self.src.resolve()?;
-        let (mut dst, dst_deps) = self.dst.resolve()?;
+        let (src, src_deps) = self.src.resolve(ec)?;
+        let (mut dst, dst_deps) = self.dst.resolve(ec)?;
         let mut raw: Vec<crate::cl_event> = src_deps.iter().map(|d| d.as_ref().get()).collect();
         raw.extend(dst_deps.iter().map(|d| d.as_ref().get()));
         // Copy has no native CL_BLOCKING flag — always enqueue non-blocking; a
@@ -912,7 +912,7 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
     }
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (mut img, deps) = self.img.resolve()?;
+        let (mut img, deps) = self.img.resolve(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let pattern = self.pattern;
         // Fill has no native CL_BLOCKING flag — always enqueue non-blocking; a

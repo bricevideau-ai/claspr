@@ -564,7 +564,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // (named by the slice index so it's a valid, unique ident).
                 let deps_ident = quote::format_ident!("__claspr_deps{}", slice_gen_idx - 1);
                 input_resolve_eager.push(quote! {
-                    let (#pname, #deps_ident) = ::claspr::Input::resolve(#pname)?;
+                    let (#pname, #deps_ident) = ::claspr::Input::resolve(#pname, ec)?;
                 });
                 input_deps_idents.push(quote! { #deps_ident });
                 op_arg_pass.push(quote! { &#pname });

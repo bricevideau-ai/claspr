@@ -21,6 +21,7 @@
 
 use crate::{CommandQueue, Context, Device, Error, Launcher};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 /// Execution-time environment for a [`DeviceOp`].
 ///
@@ -43,6 +44,29 @@ pub struct ExecutionContext<'ctx> {
     /// when multiple `and_then_host`s in a bundle/fan-out fail
     /// concurrently — subsequent writers leave the slot alone.
     host_error: Arc<Mutex<Option<Error>>>,
+    /// The **start gate** — a host-side user event that every *entry* leaf
+    /// (a [`Concrete`](crate::Input::Concrete) input, i.e. a chain head with no
+    /// upstream) threads into its `clEnqueue*` wait-list. `None` for pure device
+    /// graphs (the zero-overhead fast path); `Some` only when the chain
+    /// [`contains_host_seam`](crate::DeviceOp::contains_host_seam).
+    ///
+    /// The terminal creates it, sets it here, enqueues the WHOLE graph (now
+    /// gated, so nothing runs yet), then completes it `CL_COMPLETE` to release
+    /// the graph — only after every command is enqueued. This closes the legacy
+    /// NEO lost-wakeup window where a host seam's negative `proceed` could race a
+    /// downstream blocking transfer's wait-commit. Validated in
+    /// `scratch/start_threaded.c`. Raw `cl_event` (not [`Event`](crate::Event)):
+    /// it is owned by the terminal for the whole enqueue, and each entry leaf
+    /// `clRetainEvent`s it independently when wrapping it as a dep.
+    start: Option<crate::cl_event>,
+    /// Host-seam worker [`JoinHandle`]s, joined at the terminal AFTER the device
+    /// wait. `run_host_seam` pushes its worker here instead of detaching it, so
+    /// no worker's CL calls (signalling `fire`/`proceed`, then
+    /// `release_command_queue` on the worker's retained-queue drop) can race the
+    /// caller dropping the [`Context`]. Shared `Arc` so a routed sub-chain's
+    /// workers (via [`with_host_error_slot`](Self::with_host_error_slot)) are
+    /// joined by the same terminal.
+    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl<'ctx> ExecutionContext<'ctx> {
@@ -59,6 +83,8 @@ impl<'ctx> ExecutionContext<'ctx> {
             device,
             cl_queue,
             host_error: Arc::new(Mutex::new(None)),
+            start: None,
+            workers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -77,13 +103,24 @@ impl<'ctx> ExecutionContext<'ctx> {
         device: Device,
         cl_queue: &'a CommandQueue,
         host_error: Arc<Mutex<Option<Error>>>,
+        start: Option<crate::cl_event>,
+        workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
     ) -> ExecutionContext<'a> {
         ExecutionContext {
             context,
             device,
             cl_queue,
             host_error,
+            start,
+            workers,
         }
+    }
+
+    /// `Arc` clone of the worker-join list, for the [`OnDevice`](crate::OnDevice)
+    /// sibling EC so a routed sub-chain's host-seam workers are joined by the
+    /// same terminal that owns the parent EC.
+    pub(crate) fn workers_handle(&self) -> Arc<Mutex<Vec<JoinHandle<()>>>> {
+        Arc::clone(&self.workers)
     }
 
     /// Cheap `Arc` clone of the host-error slot for an `and_then_host`
@@ -100,6 +137,42 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// of the `Error::OpenCl(-1)` cascade from the user-event signal.
     pub(crate) fn take_host_error(&self) -> Option<Error> {
         self.host_error.lock().unwrap().take()
+    }
+
+    /// Install the start gate (raw `cl_event`). Called by a terminal BEFORE it
+    /// runs the graph, only when the chain
+    /// [`contains_host_seam`](crate::DeviceOp::contains_host_seam). After this,
+    /// every entry leaf's enqueue waits on `ev` (see [`start_dep`](Self::start_dep)),
+    /// so nothing executes until the terminal completes `ev`.
+    pub(crate) fn set_start(&mut self, ev: crate::cl_event) {
+        self.start = Some(ev);
+    }
+
+    /// The start gate, if set. An entry leaf ([`Concrete`](crate::Input::Concrete)
+    /// input) threads this into its `clEnqueue*` wait-list so the whole graph is
+    /// committed before any of it runs.
+    pub(crate) fn start_dep(&self) -> Option<crate::cl_event> {
+        self.start
+    }
+
+    /// Push a host-seam worker handle to be joined at the terminal (after the
+    /// device wait). [`run_host_seam`](crate::run_host_seam) calls this instead
+    /// of detaching its worker.
+    pub(crate) fn push_worker(&self, h: JoinHandle<()>) {
+        self.workers.lock().unwrap().push(h);
+    }
+
+    /// Drain and join every host-seam worker. Called by the terminal AFTER the
+    /// chain's device events have been waited on, so a worker's late CL calls
+    /// (signalling its user events, then dropping its retained queue) complete
+    /// before the caller can drop the [`Context`].
+    pub(crate) fn join_workers(&self) {
+        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.workers.lock().unwrap());
+        for h in handles {
+            // A worker panic is already surfaced as a `HostPanic` in the
+            // host-error slot (the seam catches it); ignore the join error here.
+            let _ = h.join();
+        }
     }
 
     /// The [`Context`] this op-chain is running against.

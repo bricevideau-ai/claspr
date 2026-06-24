@@ -9,50 +9,88 @@ items resolve.
 
 ## Active
 
-### ⚠ OPEN: `and_then_host` error path — driver-unsafe device abort (two-event seam landed, abort design deferred) 2026-06-23
+### ✅ LANDED 2026-06-24: `and_then_host` error path — START-GATE + WORKER-JOIN + EVENT-BASED CHAINED-CANCEL
 
-**Status: seam improved + suite no longer hangs; the cross-driver ABORT
-mechanism is unsolved and deferred.**
+**Status: the NEO lost-wakeup deadlock is FIXED (was ~1-in-5 / ~100% under
+cliloader). NEO + rusticl 100% clean; pocl has 0 hangs, with a residual
+pocl-internal SIGSEGV (~15%) isolated to the error→downstream-device-op shape.**
 
-Landed (eager.rs `run_host_seam`): **two user events** replace the single one.
-- `fire` — gates the unmaps, **always** `CL_COMPLETE`. One clean unmap per
-  buffer. Removes the previous **defensive double-unmap** (worker did
-  `mark_unmap_not_done`+drop → a 2nd unmap on an already-unmapped buffer; NEO
-  decrements map-count at unmap *enqueue* not execution, so the 2nd returns
-  `CL_INVALID_VALUE` and corrupts queue state). That double-unmap was the
-  concrete bug; gone. Multi-buffer verified (one `fire` gates all N unmaps;
-  downstream waits all N unmap events + `proceed`).
-- `proceed` — gates downstream; `CL_COMPLETE` on success, **negative on error**.
+Two-event seam (unchanged, from 2026-06-23): `fire` gates the unmaps (always
+`CL_COMPLETE`, one clean unmap per buffer — the prior double-unmap that corrupted
+NEO is gone); `proceed` gates downstream (`CL_COMPLETE` on success, negative on
+error). The negative `proceed` was driver-unsafe ON ITS OWN (NEO lost-wakeup race
+in a downstream blocking transfer's wait-commit window). The fix makes it safe by
+ensuring the WHOLE graph is enqueued before ANY of it runs — validated in
+`scratch/start_threaded.c` (NEO 40/40, 0 hung; the threaded-start variant, NOT a
+queue barrier or marker). Five pieces, all gated on a transitive flag so
+no-host-seam graphs are unchanged (zero cost):
 
-**Unsolved — negative `proceed` is driver-unsafe** (pinned via intercept layer +
-standalone C repros in `scratch/`):
-- **NEO (eager):** lost-wakeup race — negative status in the blocking transfer's
-  wait-commit window → deadlock. `race_enqueue.c` 30/30. A 3rd "gate" event
-  (worker waits it; main completes after whole graph enqueued) fixes the *race*
-  (40/40) but not pocl.
-- **pocl (eager):** `clFinish` on a queue with a *terminated* command
-  hangs/segfaults (~7/30 + occasional SIGSEGV). Gate does not help.
-- **rusticl (LAZY):** returns `-14` cleanly — only because it doesn't process the
-  queue until flush, so `proceed=-1` is already set → no race window. Laziness
-  sidesteps it, not better handling (Brice 2026-06-23).
-Device-timing confirmed negative `proceed` DOES abort the downstream device op
-(read/kernel never runs) when it doesn't deadlock — semantics right, reliability
-not. Caller-facing error stays the **host-error slot**, never the CL status /
-blocking return code (NEO+pocl return CL_SUCCESS even when the cmd was skipped).
+1. **`DeviceOp::contains_host_seam() -> bool`** (eager.rs trait method, default
+   `false`). `AndThenHost`/`AndThenHostWithContext` → `true`; combinators OR their
+   owned children — `AndThen` (source||next, so a seam built in the closure IS
+   seen), `Bundle2..16`, `FanOut`, `ArcSplit`, `Arced`, `OnDevice`, `Profiled`,
+   `DeviceDynOp` (via a new `contains_host_seam_erased` on `ErasedDeviceOp`).
+   `CopyTo2` + `AndThenWithContext` are NOT in the OR set: CopyTo2's inputs are
+   pipes (edges; the producer op is owned elsewhere and ORs it), and
+   AndThenWithContext builds its downstream at execute time (not structurally
+   inspectable). A host seam inside an `and_then_with_context` closure is the one
+   documented un-gated shape — use the structural `and_then_host` surface.
+2. **Start gate, THREADED per entry-leaf** (NOT a barrier — a barrier would block
+   concurrent graphs; the validated `start_threaded.c` merges `start` into each
+   entry command's wait-list). `ExecutionContext` gained `start: Option<cl_event>`;
+   `Input::resolve(self, ec)` — the ONE entry-gating edit — threads `start` into a
+   `Concrete` input's deps (Concrete == chain head == entry leaf), `clRetainEvent`
+   per dep. The `Pipe` arm is unchanged (transitively gated). All ~28 `.resolve()`
+   call sites + the kernel macro updated to `.resolve(ec)`.
+3. **Worker join** (independent correctness fix — worker was DETACHED). EC holds
+   `workers: Arc<Mutex<Vec<JoinHandle>>>`; `run_host_seam` pushes its handle;
+   terminals join AFTER the device wait (so no worker's late CL calls — signal
+   events, drop retained queue — race the caller dropping the Context).
+   `with_host_error_slot` propagates `start` + shares the SAME `workers` Arc so a
+   routed `on_device` sub-chain's workers are joined too.
+4. **Terminals restructured** (`wait_on` blocking + `run_eager_chain` async). When
+   `contains_host_seam`: create `start`, `set_start`, `collect(Pipelined)` (NOT
+   Blocking — a Blocking leaf would wait inline on a start-gated command and
+   deadlock), complete `start` `CL_COMPLETE` (after the whole graph is enqueued),
+   wait on the deps (NEVER `clFinish` — clFinish on a terminated command is the
+   pocl hang), then `join_workers`. Non-host-seam: unchanged Blocking fast path.
+   The async future joins its workers when the marker resolves.
+5. **Chained-cancel via the EVENT, not a host slot** (Brice 2026-06-24: the
+   slot check raced the upstream worker's stash — confirmed 1/40 NEO failure with
+   the slot version). `run_host_worker` now propagates cancellation through the
+   cl_event dependency: an upstream seam's negative `proceed` is in this seam's
+   `source_deps`, so after waiting we re-read each event's COMMITTED
+   `command_execution_status` (new `event_is_cancelled` helper) — a negative
+   value short-circuits (don't run the closure), driver-independently. Reading the
+   committed status (not the `clWaitForEvents` return code) defeats the same NEO
+   wakeup race on the host wait: 60/60 NEO with this version. Makes
+   `and_then_host(Err).and_then_host(side_effect)` skip the second closure.
 
-CANDIDATES (deferred — Brice to pick): (1) host-side enqueue gate — downstream
-`execute()` skips enqueue if slot set; truly aborts, no negative event, but adds
-seam host/device sync (`host_gate.c` clean on all 3). (2) let downstream run +
-discard — safe only for a discarded `download`, not arbitrary kernels. (3) make
-host-closure error **fatal** (panic/abort) — no negative event/barrier/garbage,
-changes contract from recoverable `Err` to fatal.
+**VERIFY (this box, serial, every device run timeout-wrapped):**
+- NEO eager_cutover (full, incl. the re-enabled error test) **40/40, 0 hangs**;
+  isolated error test **40/40**; eager_error (chained-cancel counter==0) **40/40**;
+  chained-cancel isolated **60/60**; non-host-seam eager_chain/bundle/buffer_ops
+  clean (no regression).
+- rusticl: all host-seam suites **100% clean** (eager_cutover/error/
+  error_fidelity/with_context/host_view).
+- pocl: host-seam-only suites **100% clean** (eager_error 30/30, fidelity 15/15);
+  the error→`.and_then(download)` shape **34/40** (6 SIGSEGV/abort, **0 hangs**,
+  passes when it completes). The SIGSEGV is the pocl-internal terminated-read
+  cleanup bug — NOT a claspr correctness issue and NOT a hang.
 
-TEST: `eager_and_then_host_error_propagates` (eager_cutover.rs) — the one shape
-hitting this (host-error → downstream device `download`) — marked `#[ignore]`
-(flaky) until the abort design lands. NEO eager_cutover 30/30 with it
-quarantined. Repros in `scratch/` (untracked): race_enqueue, gate, host_gate,
-two_event, multi_buf, neo_userevent_negative_repro, mapcount_probe — keep for the
-NEO/pocl driver-bug reports + the deferred design.
+TEST: `eager_and_then_host_error_propagates` (eager_cutover.rs) RE-ENABLED
+(`#[ignore]` removed). Passes on NEO + rusticl (the gating platforms); may
+SIGSEGV ~15% on pocl (documented in the test doc + here). The
+`and_then_host_error_stops_chain_immediately` (eager_error.rs, `counter==0`) is
+the chained-cancel correctness lock.
+
+**RESIDUAL — pocl SIGSEGV on error→device-op (deferred, NOT a hang).** Debug order
+when revisited: (1) update pocl main (`~/local/pocl`, local is `7.2-pre
+main-0-ga4b1633fa`) + rebuild — may be fixed upstream; (2) if still crashing,
+valgrind the C repro (`scratch/start_threaded.c` error path) to confirm
+pocl-internal terminated-command cleanup vs how we drive it. The C repros in
+`scratch/` are the artifact for the pocl bug report + the (confirmed) NEO
+lost-wakeup bug report.
 
 ### Blocking borrowing upload verb `write_sync` (branch `eager-cutover`, 2026-06-23)
 
