@@ -9,6 +9,27 @@ items resolve.
 
 ## Active
 
+### ✅ LANDED 2026-06-24: removed `and_then_with_context`; device-by-index routing is now structural
+
+The execute-time `and_then_with_context` combinator (built its downstream op at
+EXECUTE, so the host-seam `contains_host_seam()` gate couldn't see through it —
+the one documented gap in the start-gate fix) is GONE. Its sole real use across
+~18 call sites was device selection (`ec.device_at(i)` fed into
+`on_device`/`transfer_to_device`), so it was re-expressed structurally: a
+`pub(crate) enum DeviceTarget { Concrete(Device), Index(usize) }` on `OnDevice`
++ `TransferToDevice`, resolved at the top of each `execute`. New builders
+`DeviceOpExt::on_device_at(i)` + free `transfer_to_device_at(buf, i)` (latter
+re-exported at crate root + prelude); concrete `on_device`/`transfer_to_device`
+unchanged. The whole graph is now build-time inspectable, so the gap is CLOSED
+(no un-gated host seam can hide inside an execute-time closure anymore). Migrated
+call sites in eager_{on_device_suite,cross_device,transfer_to_device,alloc_ops,
+cutover}.rs; the same-device read-after-write regression now rides the pipe-fed
+`.and_then` event edge (stronger than the removed barrier hack) and still asserts
+==15. `and_then_host_with_context` (a DIFFERENT, fully-gated construct) untouched.
+Verified: build/clippy/doc green (default + async-events); all single- and
+multi-device subset tests pass on pocl (2-device sub-device-partition context, so
+`on_device_at`/`transfer_to_device_at` were genuinely exercised, not skipped).
+
 ### ✅ LANDED 2026-06-24: `and_then_host` error path — START-GATE + WORKER-JOIN + EVENT-BASED CHAINED-CANCEL
 
 **Status: the NEO lost-wakeup deadlock is FIXED (was ~1-in-5 / ~100% under
@@ -84,13 +105,45 @@ SIGSEGV ~15% on pocl (documented in the test doc + here). The
 `and_then_host_error_stops_chain_immediately` (eager_error.rs, `counter==0`) is
 the chained-cancel correctness lock.
 
-**RESIDUAL — pocl SIGSEGV on error→device-op (deferred, NOT a hang).** Debug order
-when revisited: (1) update pocl main (`~/local/pocl`, local is `7.2-pre
-main-0-ga4b1633fa`) + rebuild — may be fixed upstream; (2) if still crashing,
-valgrind the C repro (`scratch/start_threaded.c` error path) to confirm
-pocl-internal terminated-command cleanup vs how we drive it. The C repros in
-`scratch/` are the artifact for the pocl bug report + the (confirmed) NEO
-lost-wakeup bug report.
+**RESIDUAL — pocl SIGSEGV on error→device-op: ROOT-CAUSED 2026-06-24 = a real
+pocl bug.** Updated pocl ~/projects/pocl main a4b1633fa→ea8257617 (now 8.0-pre,
+installed to ~/local/pocl) — NOT fixed upstream (still ~10% SIGSEGV on the
+error→`.and_then(download)` shape; race_finish even hung 1/40). valgrind memcheck
++ helgrind both HID it (single-threaded emulation kills the race; helgrind 0
+races / 266 suppressed). Caught it via the NATIVE core dump instead (apport
+stash /var/lib/apport/coredump/; ulimit -c was 0 + core_pattern→apport, no sudo
+to change it — pull the core from apport's dir). Faulting backtrace (thread that
+crashed):
+  __memcpy_evex_unaligned_erms   <- SIGSEGV
+  pocl_exec_command            (libpocl)
+  pocl_pthread_driver_thread   (libpocl-devices-pthread)
+i.e. a pocl WORKER thread executes the read command and memcpy's into a
+buffer the aborted upstream already freed/unmapped.
+ROOT CAUSE — `pocl_create_event_sync` (lib/CL/pocl_util.c:367):
+  `if (notifier_event->status < 0 || notifier_event->status == CL_COMPLETE) goto FINISH;`
+It treats an ALREADY-FAILED dependency (status<0) IDENTICALLY to a completed one
+— skips creating the sync edge so the waiter "can start right away" (per the
+comment). Correct for CL_COMPLETE; WRONG for a negative status: the waiting
+command must be FAILED/terminated (spec: a command whose wait-list event is in a
+negative state must not execute), not run. Because no sync edge is created, the
+normal failure cascade (notify_list → pocl_update_event_failed on waiters) never
+reaches this command → it's submitted → pocl_exec_command memcpy on freed mem →
+SIGSEGV. Triggered by our start-gate: everything is enqueued with `proceed`
+already negative when the read's dep is wired, so the check hits the "already
+failed" branch.
+FIX DONE 2026-06-24: bricevideau-ai/pocl branch `fix-event-sync-failed-dependency`
+commit `4e014976d` (pushed, NO PR — Brice opens it). `broken_dependency` flag on
+_cl_event: pocl_create_event_sync sets it when a dep is already failed at wiring
+time (under event lock — inline update_event_failed would deadlock on the CQ lock
+held by pocl_command_enqueue); pthread+basic submit/notify paths honor it and
+fail the command via the same unlock/relock dance pocl_pthread_notify already
+uses; also closed a 2nd window in pocl_broadcast. VERIFIED: repros 100/100+70/70
+clean (0 sig/0 hang/correct -14 abort; was 41/70 + crashes + 16 wrong-success on
+clean main); **full pocl ctest 311/311, 0 regressions** (baseline-checked vs
+main). RESIDUAL pre-existing (NOT this bug, left for a separate branch): a rarer
+race_finish --finish-only crash/hang confirmed on clean main too = the racy
+clFinish-after-cancellation class (same as NEO). scratch/ C repros are the
+artifact for both the pocl report and the NEO lost-wakeup report.
 
 ### Blocking borrowing upload verb `write_sync` (branch `eager-cutover`, 2026-06-23)
 

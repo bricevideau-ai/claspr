@@ -1,7 +1,8 @@
-//! Eager port of `on_device.rs`: `.on_device(&dev)` per-op device routing for
-//! eager graph chains. Device handles are pulled from `ec.device_at(i)` inside
-//! `.and_then_with_context` closures — the portable idiom (no external Device
-//! captures). Mirrors `eager_cutover::eager_on_device`.
+//! Eager port of `on_device.rs`: per-op device routing for eager graph chains.
+//! Device-by-index routing is expressed structurally via `.on_device_at(i)`,
+//! which resolves the index against the running context at execute (no external
+//! Device captures, no execute-time closure). Mirrors
+//! `eager_cutover::eager_on_device`.
 //!
 //! Named `eager_on_device_suite` to avoid a file-stem clash with the existing
 //! `eager_cutover::eager_on_device` test fn / harness expectations.
@@ -9,20 +10,15 @@
 //! Old → new mapping:
 //!   `upload!(v)`                  → `upload(v)`
 //!   `download!(buf)`              → `download`
-//!   `.and_then_with_context(...)` → same name on `DeviceOpExt`
-//!   `kernel(...).on_device(dev)`  → same `.on_device(...)` on the eager kernel op
+//!   `kernel(...).on_device(dev)`  → `.on_device_at(i)` on the eager kernel op
 //!   `bundle!(a, b)`              → `bundle2(a, b)`
 //!
-//! NOTE (eager seam): `and_then_with_context` passes the upstream VALUE, not a
-//! pipe, so the routed downstream enqueues with an empty wait-list. To preserve
-//! the device-side ordering edge, `AndThenWithContext::execute` now enqueues a
-//! `clEnqueueBarrierWithWaitList` over the source's events on the chain queue
-//! before the closure builds + runs the downstream — so a same-device
-//! read-after-write is ordered on the device, not just by driver luck. (Routed
-//! cross-device stages also carry the edge through the output deps.) These tests
-//! assert final values / error surfacing / both-branches-ran; the regression
-//! that exercises the edge itself lives in
-//! `and_then_with_context_same_device_raw` below.
+//! NOTE (eager seam): routing flows through the pipe-fed `.and_then`, so the
+//! routed downstream's `clEnqueue*` carries the upstream's completion event on
+//! its wait-list — a real device-side ordering edge, stronger than a whole-queue
+//! barrier. These tests assert final values / error surfacing / both-branches-
+//! ran; the regression that exercises the same-device read-after-write edge
+//! itself lives in `and_then_pipe_dep_same_device_raw` below.
 //!
 //! Skips when only one device is available (no real multi-device platform AND no
 //! sub-device partition). Guard copied verbatim from on_device.rs.
@@ -76,8 +72,8 @@ fn ctx_two_devices() -> Option<Context> {
 }
 
 /// on_device.rs::on_device_routes_chain_to_devices_from_context — two scale
-/// stages, one per device, plus a final download. Device identity resolved from
-/// `ec` each stage. 1 × 3 × 4 = 12.
+/// stages, one per device, plus a final download. Device identity resolved by
+/// index at execute each stage. 1 × 3 × 4 = 12.
 #[test]
 fn on_device_routes_chain_to_devices_from_context() {
     let Some(ctx) = ctx_two_devices() else { return };
@@ -85,16 +81,8 @@ fn on_device_routes_chain_to_devices_from_context() {
     let kernels_ref = &kernels;
 
     let result: Vec<u32> = upload(vec![1u32; N])
-        .and_then_with_context(move |ec, buf| {
-            kernels_ref
-                .scale_u32([N], buf, 3)
-                .on_device(ec.device_at(0))
-        })
-        .and_then_with_context(move |ec, buf| {
-            kernels_ref
-                .scale_u32([N], buf, 4)
-                .on_device(ec.device_at(1))
-        })
+        .and_then(move |buf| kernels_ref.scale_u32([N], buf, 3).on_device_at(0))
+        .and_then(move |buf| kernels_ref.scale_u32([N], buf, 4).on_device_at(1))
         .and_then(download)
         .sync(&ctx)
         .expect("on_device chain");
@@ -114,11 +102,7 @@ fn on_device_preserves_host_error_slot_across_routing() {
     let kernels_ref = &kernels;
 
     let chain = upload(vec![1u32; N])
-        .and_then_with_context(move |ec, buf| {
-            kernels_ref
-                .scale_u32([N], buf, 2)
-                .on_device(ec.device_at(1))
-        })
+        .and_then(move |buf| kernels_ref.scale_u32([N], buf, 2).on_device_at(1))
         // DeviceSlice's Mappable view is `&mut [T]`. Closure returns Err — the
         // rich variant must survive across the routed child EC's host-error slot
         // back to the chain terminal.
@@ -146,18 +130,10 @@ fn on_device_bundle_runs_branches_on_distinct_devices() {
 
     let (a, b): (Vec<u32>, Vec<u32>) = bundle2(
         upload(vec![1u32; N])
-            .and_then_with_context(move |ec, buf| {
-                kernels_ref
-                    .scale_u32([N], buf, 7)
-                    .on_device(ec.device_at(0))
-            })
+            .and_then(move |buf| kernels_ref.scale_u32([N], buf, 7).on_device_at(0))
             .and_then(download),
         upload(vec![1u32; N])
-            .and_then_with_context(move |ec, buf| {
-                kernels_ref
-                    .scale_u32([N], buf, 11)
-                    .on_device(ec.device_at(1))
-            })
+            .and_then(move |buf| kernels_ref.scale_u32([N], buf, 11).on_device_at(1))
             .and_then(download),
     )
     .sync(&ctx)
@@ -167,34 +143,33 @@ fn on_device_bundle_runs_branches_on_distinct_devices() {
     assert!(b.iter().all(|&v| v == 11));
 }
 
-/// Regression for the `and_then_with_context` device-side ordering edge.
+/// Regression for the pipe-fed `.and_then` device-side ordering edge.
 ///
-/// `and_then_with_context` builds the downstream over the upstream's CONCRETE
-/// value, so the downstream kernel's `clEnqueue*` carries an empty wait-list.
-/// Without an explicit edge, a same-device read-after-write through this
-/// combinator would race on a shared out-of-order queue: the downstream scale
-/// could read the buffer before the upstream scale finished writing it. The
-/// `clEnqueueBarrierWithWaitList` over the source's events that
-/// `AndThenWithContext::execute` installs makes the ordering a device-side
-/// invariant, not driver luck.
+/// The pipe-fed `.and_then` hands the downstream builder a `Handle` (a `Pipe`)
+/// that carries the upstream's deps. The `Input::Pipe` arm of `resolve` threads
+/// the upstream's completion event directly onto the downstream kernel's
+/// `clEnqueue*` wait-list — a real per-command device-side edge, strictly
+/// stronger than a whole-queue barrier. So a same-device read-after-write is
+/// ordered on the device, not by driver luck. (This is the concrete proof the
+/// barrier-free redesign is at least as strong as the removed combinator.)
 ///
-/// Chain: upload `1`s → scale ×3 (upstream write, in src_deps) →
-/// `and_then_with_context` scale ×5 (downstream read-modify-write of the SAME
-/// buffer) → download. Correct result is `15`; a missing edge would let the
-/// ×5 read stale `1`s and yield `5` on a racy driver.
+/// Chain: upload `1`s → scale ×3 (upstream write) → `.and_then` scale ×5
+/// (downstream read-modify-write of the SAME buffer, fed the upstream pipe) →
+/// download. Correct result is `15`; a missing edge would let the ×5 read stale
+/// `1`s and yield `5` on a racy driver.
 #[test]
-fn and_then_with_context_same_device_raw() {
+fn and_then_pipe_dep_same_device_raw() {
     let Ok(ctx) = Context::any() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
     let out: Vec<u32> = upload(vec![1u32; N])
-        // Upstream write: buffer becomes all 3s. Its completion event is the
-        // src_dep the downstream must wait on.
+        // Upstream write: buffer becomes all 3s. Its completion event rides the
+        // pipe handed to the downstream.
         .and_then(|buf| kernels_ref.scale_u32([N], buf, 3))
-        // Downstream read-after-write on the SAME buffer, built from the
-        // concrete value — relies on the installed barrier edge for ordering.
-        .and_then_with_context(move |_ec, buf| kernels_ref.scale_u32([N], buf, 5))
+        // Downstream read-after-write on the SAME buffer, fed the upstream pipe
+        // — the upstream event is threaded onto its enqueue wait-list.
+        .and_then(move |buf| kernels_ref.scale_u32([N], buf, 5))
         .and_then(download)
         .sync(&ctx)
         .expect("same-device R-A-W chain");

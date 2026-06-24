@@ -6,17 +6,17 @@
 //! device's default OOO queue. The eager analog is
 //! [`claspr::eager::transfer_to_device`] — a buffer-consuming **leaf** (same
 //! family as `download` / `fill`, taking `impl Into<Input<DeviceSlice<…>>>`), not
-//! a wrapping method like `.on_device`. It composes via `and_then_with_context`
-//! so the target `Device` is pulled from `ec` (the portable idiom, no external
-//! Device captures), exactly mirroring the old:
-//!   `.and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(i)))`
+//! a wrapping method like `.on_device`. For device-by-index targets it has a
+//! companion leaf [`claspr::eager::transfer_to_device_at`] that resolves the
+//! index against the running context at execute, composed via the pipe-fed
+//! `.and_then`:
+//!   `.and_then(|buf| transfer_to_device_at(buf, i))`
 //!
 //! Old → new mapping:
-//!   `claspr_async::transfer_to_device(buf, dev)` → `claspr::eager::transfer_to_device(buf, dev)`
+//!   `claspr_async::transfer_to_device(buf, dev)` → `claspr::eager::transfer_to_device_at(buf, i)`
 //!   `upload!(v)`                                 → `upload(v)`
 //!   `download!(buf)`                             → `download`
-//!   `.and_then_with_context(...)`                → same name on `DeviceOpExt`
-//!   `kernel(...).on_device(dev)`                 → same `.on_device(...)` eager op
+//!   `kernel(...).on_device(dev)`                 → `.on_device_at(i)` eager op
 //!
 //! Both tests need a genuine two-device context (a real two-device platform or a
 //! sub-device partition) and **skip otherwise** — same as `transfer_to_device.rs`.
@@ -25,7 +25,7 @@
 //! buffer already lives on wouldn't test cross-device movement).
 
 use claspr::device::Platform;
-use claspr::eager::{DeviceOpExt, download, transfer_to_device, upload};
+use claspr::eager::{DeviceOpExt, download, transfer_to_device_at, upload};
 use claspr::{Context, Device};
 use claspr_test_kernels::kernels;
 
@@ -85,12 +85,8 @@ fn transfer_to_device_completes_in_chain() {
     let kernels_ref = &kernels;
 
     let result: Vec<u32> = upload(vec![5u32; N])
-        .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(1)))
-        .and_then_with_context(move |ec, buf| {
-            kernels_ref
-                .scale_u32([N], buf, 4)
-                .on_device(ec.device_at(1))
-        })
+        .and_then(|buf| transfer_to_device_at(buf, 1))
+        .and_then(move |buf| kernels_ref.scale_u32([N], buf, 4).on_device_at(1))
         .and_then(download)
         .sync(&ctx)
         .expect("transfer + on_device chain");
@@ -109,19 +105,11 @@ fn transfer_then_on_device_matches_scenario_14_shape() {
     let kernels_ref = &kernels;
 
     let result: Vec<u32> = upload(vec![1u32; N])
-        .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(0)))
-        .and_then_with_context(move |ec, buf| {
-            kernels_ref
-                .scale_u32([N], buf, 2)
-                .on_device(ec.device_at(0))
-        })
-        .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(1)))
-        .and_then_with_context(move |ec, buf| {
-            kernels_ref
-                .scale_u32([N], buf, 10)
-                .on_device(ec.device_at(1))
-        })
-        .and_then_with_context(|ec, buf| transfer_to_device(buf, ec.device_at(0)))
+        .and_then(|buf| transfer_to_device_at(buf, 0))
+        .and_then(move |buf| kernels_ref.scale_u32([N], buf, 2).on_device_at(0))
+        .and_then(|buf| transfer_to_device_at(buf, 1))
+        .and_then(move |buf| kernels_ref.scale_u32([N], buf, 10).on_device_at(1))
+        .and_then(|buf| transfer_to_device_at(buf, 0))
         .and_then(download)
         .sync(&ctx)
         .expect("scenario-14 chain");

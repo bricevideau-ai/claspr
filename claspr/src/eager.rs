@@ -454,12 +454,13 @@ pub trait DeviceOp: Send {
     /// when this returns `true`**; pure device graphs keep the zero-overhead
     /// fast path. Validated in `scratch/start_threaded.c` (NEO 40/40, 0 hung).
     ///
-    /// NOTE: a host seam built *inside* an
-    /// [`and_then_with_context`](DeviceOpExt::and_then_with_context) closure is
-    /// NOT visible here (the downstream op is constructed at execute time, not at
-    /// build) and is therefore not gated — consistent with that combinator being
-    /// omitted from the OR set. Use the structural `and_then`/`and_then_host`
-    /// surface for host seams that need the gate.
+    /// NOTE: the former execute-time `and_then_with_context` combinator built its
+    /// downstream op at execute (invisible here), leaving any host seam nested in
+    /// its closure un-gated — the one documented gap. That combinator is gone:
+    /// its sole use (device-by-index routing) is now structural via
+    /// [`on_device_at`](DeviceOpExt::on_device_at) /
+    /// [`transfer_to_device_at`], so the whole graph is
+    /// build-time inspectable and the gap is CLOSED.
     fn contains_host_seam(&self) -> bool {
         false
     }
@@ -485,35 +486,6 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         AndThen { source: self, next }
     }
 
-    /// Sequential composition whose builder runs at **execute** with the live
-    /// [`ExecutionContext`] in scope (not at construction like
-    /// [`and_then`](Self::and_then)). The closure receives `&ExecutionContext`
-    /// together with the upstream's runtime value, so it can read `ec.device()`
-    /// / `ec.context()` or route via [`on_device`](Self::on_device) while
-    /// building the downstream op. See [`AndThenWithContext`].
-    ///
-    /// **Ordering:** because the closure is handed the upstream's *concrete*
-    /// value (not a pipe), the downstream op's `clEnqueue*` wait-list would
-    /// otherwise be empty. `AndThenWithContext::execute` therefore enqueues a
-    /// `clEnqueueBarrierWithWaitList` over the source's completion events on the
-    /// chain queue *before* the closure builds and runs the downstream — so a
-    /// same-device read-after-write through this combinator is ordered on the
-    /// device, not by driver luck. If you prefer a wait-list edge threaded
-    /// directly into the downstream enqueue (no whole-queue barrier), use the
-    /// pipe-fed [`and_then`](Self::and_then) instead, whose closure receives a
-    /// `Handle` that carries the upstream deps into the downstream's input.
-    fn and_then_with_context<U, F>(self, f: F) -> AndThenWithContext<Self, U, F>
-    where
-        U: DeviceOp,
-        F: for<'a> FnOnce(&ExecutionContext<'a>, Self::Output) -> U + Send,
-    {
-        AndThenWithContext {
-            source: self,
-            f: Some(f),
-            out: Pipe::new(),
-        }
-    }
-
     /// Route this op's `execute` to `device`'s default out-of-order queue
     /// instead of the chain's primary queue. Downstream stages resume on the
     /// parent's queue; the routed op's events are valid across both via
@@ -521,7 +493,22 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     fn on_device(self, device: &crate::Device) -> OnDevice<Self> {
         OnDevice {
             source: self,
-            device: device.clone(),
+            target: DeviceTarget::Concrete(device.clone()),
+            out: Pipe::new(),
+        }
+    }
+
+    /// Like [`on_device`](Self::on_device) but names the target device by
+    /// `index` into the running context's device list, resolved at execute.
+    /// Lets device-by-index routing be expressed structurally (no execute-time
+    /// closure). See [`OnDevice`].
+    ///
+    /// **Panics** at execute if `index` is out of range for `context().devices()`
+    /// (same timing/semantics as resolving `ec.device_at(index)` did).
+    fn on_device_at(self, index: usize) -> OnDevice<Self> {
+        OnDevice {
+            source: self,
+            target: DeviceTarget::Index(index),
             out: Pipe::new(),
         }
     }
@@ -2118,7 +2105,7 @@ where
 /// through host bounce ([`download`] → [`upload`]).
 pub struct TransferToDevice<T, M: MemMode = ReadWrite> {
     buf: Input<DeviceSlice<T, M>>,
-    device: crate::Device,
+    target: DeviceTarget,
     out: Pipe<DeviceSlice<T, M>>,
 }
 
@@ -2135,7 +2122,28 @@ where
 {
     TransferToDevice {
         buf: buf.into(),
-        device: device.clone(),
+        target: DeviceTarget::Concrete(device.clone()),
+        out: Pipe::new(),
+    }
+}
+
+/// Build a transfer-to-device leaf targeting the device at `index` in the
+/// running context's device list, resolved at execute. See [`transfer_to_device`]
+/// for migrate semantics.
+///
+/// **Panics** at execute if `index` is out of range for `context().devices()`
+/// (same timing/semantics as resolving `ec.device_at(index)` did).
+pub fn transfer_to_device_at<T, M>(
+    buf: impl Into<Input<DeviceSlice<T, M>>>,
+    index: usize,
+) -> TransferToDevice<T, M>
+where
+    T: Send + 'static,
+    M: MemMode + Send + 'static,
+{
+    TransferToDevice {
+        buf: buf.into(),
+        target: DeviceTarget::Index(index),
         out: Pipe::new(),
     }
 }
@@ -2157,10 +2165,16 @@ where
 
     fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve(ec)?;
+        // Resolve the target device (concrete, or by index into the running
+        // context's device list) before resolving its queue.
+        let device = match &self.target {
+            DeviceTarget::Concrete(d) => d.clone(),
+            DeviceTarget::Index(i) => ec.context().devices()[*i].clone(),
+        };
         // Resolve the target device's default OOO queue (cached on the Context,
         // so the terminal's flush_all_outoforder_queues pushes it). Same path
         // OnDevice uses to reach a non-primary device's queue.
-        let target_q = ec.context().default_outoforder_queue(&self.device)?;
+        let target_q = ec.context().default_outoforder_queue(&device)?;
         // Enqueue the migrate with the upstream events as the wait-list, on the
         // target queue (`&*target_q` is the `Queue: Launcher`). Non-blocking —
         // mode is ignored; the chain terminal's `into_output` does the final
@@ -3919,117 +3933,40 @@ impl<T, M: MemMode> Pipe<USMSliceUninit<T, M>> {
 // ════════════════════════════════════════════════════════════════════════
 // Execute-time closure nodes — the ONE place closures legitimately survive in
 // the eager model (NOTES → "EXECUTE-TIME CLOSURE NODES"). Unlike eager
-// `and_then` (its builder runs at BUILD with a `Pipe` handle), these three run
-// their closure at EXECUTE because it needs the live `ec` / mapped host data,
-// neither of which exists at build. Shape: hold `source` + `src_pipe` (captured
-// at build) + `f: Option<F>` + `out`; `execute` runs the source, takes the
-// upstream runtime value, runs the closure NOW to build the downstream op,
-// grabs the downstream's out-pipe BEFORE consuming it (move-once), runs it, and
-// moves the result into `out` (merging the source's deps so the terminal waits
-// on the whole chain).
+// `and_then` (its builder runs at BUILD with a `Pipe` handle), the host-seam
+// nodes below run their closure at EXECUTE because it needs the mapped host
+// data, which does not exist at build. (Device-by-index routing used to live
+// here too via `and_then_with_context`; it is now structural — see
+// [`OnDevice`] / [`TransferToDevice`] + `DeviceTarget` below.)
 // ════════════════════════════════════════════════════════════════════════
 
-// ── AndThenWithContext: closure gets the live ExecutionContext at execute ──
+// ── DeviceTarget: a device picked either concretely or by context index ──
 
-/// Sequential composition whose builder runs at **execute** with the live
-/// [`ExecutionContext`] in scope — built by
-/// [`and_then_with_context`](DeviceOpExt::and_then_with_context).
-///
-/// Unlike [`AndThen`] (builder at construction, `Pipe` handle), the closure
-/// here receives `&ExecutionContext` + the upstream's **runtime value**, so it
-/// can read `ec.device()` / `ec.context()` / route via [`on_device`](DeviceOpExt::on_device) while
-/// building the downstream op. The downstream op is therefore built — and run —
-/// at execute time.
-pub struct AndThenWithContext<S: DeviceOp, U: DeviceOp, F> {
-    source: S,
-    f: Option<F>,
-    out: Pipe<U::Output>,
-}
-
-impl<S, U, F> DeviceOp for AndThenWithContext<S, U, F>
-where
-    S: DeviceOp,
-    U: DeviceOp,
-    F: for<'a> FnOnce(&ExecutionContext<'a>, S::Output) -> U + Send,
-{
-    type Output = U::Output;
-
-    fn output_pipe(&self) -> Pipe<U::Output> {
-        self.out.clone()
-    }
-
-    fn handle(&self) -> Self::Handle {
-        self.out.clone()
-    }
-
-    fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        use crate::Launcher;
-        // Gather the source via `collect` (any arity); its value + events feed
-        // the downstream op the closure builds.
-        let (value, src_deps) = self.source.collect(ec, ExecMode::Pipelined)?;
-
-        // The closure builds the downstream op from the source's CONCRETE value
-        // (not a pipe), so the downstream's enqueue carries an EMPTY wait-list —
-        // the source's completion events are not on its `clEnqueue*` wait-list.
-        // To install a real device-side ordering edge (rather than relying on
-        // driver queue ordering for a same-device read-after-write), enqueue a
-        // barrier over `src_deps` on this queue BEFORE the downstream runs:
-        // an out-of-order-queue barrier forces every later-enqueued command on
-        // the same queue to wait for `src_deps`, which is exactly the upstream
-        // edge the concrete-value build dropped. The barrier event then stands
-        // in for the source deps in the chain's downstream wait-list.
-        let edge: Deps = if src_deps.is_empty() {
-            Deps::new()
-        } else {
-            let raw: Vec<crate::cl_event> = src_deps.iter().map(|d| d.as_ref().get()).collect();
-            // SAFETY: the cl_event handles are held alive by `src_deps` across
-            // this call.
-            let barrier = unsafe { ec.cl_queue().enqueue_barrier_with_wait_list(&raw) }
-                .map_err(Error::OpenCl)?;
-            drop(src_deps);
-            vec![wrap_event(barrier)]
-        };
-
-        let f = self
-            .f
-            .take()
-            .expect("AndThenWithContext::execute called twice — internal eager bug");
-        // Closure runs NOW, at execute, with the live ec + runtime value. Any
-        // command it enqueues on `ec`'s queue is gated by the barrier above.
-        let downstream = f(ec, value);
-        // Grab the downstream's out-pipe BEFORE consuming it (move-once).
-        let down_pipe = downstream.output_pipe();
-        downstream.execute(ec, mode)?;
-        let (out_value, mut out_deps) = down_pipe.take().ok_or(Error::NotSupported(
-            "eager and_then_with_context: downstream produced no output",
-        ))?;
-        // Carry the source edge into the output deps too, so the terminal waits
-        // on the whole chain even when the downstream routed to another queue
-        // via `on_device` (cross-queue events are valid in the same context).
-        out_deps.extend(edge);
-        self.out.put(out_value, out_deps);
-        Ok(())
-    }
-
-    fn describe(&self, out: &mut Vec<String>) {
-        self.source.describe(out);
-        out.push("and_then_with_context".into());
-    }
+/// How a routing op (`OnDevice` / `TransferToDevice`) names its target device:
+/// either a concrete [`Device`](crate::Device) resolved at build, or an index
+/// into the running [`ExecutionContext`]'s `context().devices()`, resolved at
+/// execute. The index form is what lets device-by-index routing be expressed
+/// structurally (no execute-time closure), so the host-seam gate sees through it.
+pub(crate) enum DeviceTarget {
+    Concrete(crate::Device),
+    Index(usize),
 }
 
 // ── OnDevice: re-point the op at a different device's queue at execute ──
 
 /// Route `source`'s `execute` to a **different** device's default
-/// out-of-order queue — built by [`on_device`](DeviceOpExt::on_device).
+/// out-of-order queue — built by [`on_device`](DeviceOpExt::on_device) (concrete
+/// device) or [`on_device_at`](DeviceOpExt::on_device_at) (device-by-index).
 ///
-/// No user closure: at execute it resolves the target device's queue from the
-/// running context, builds a sibling [`ExecutionContext`] (same context + same
-/// host-error slot, different device + queue), and runs `source` against it.
-/// The source's events are valid across queues of the same context, so
-/// downstream stages on the parent's queue can wait on them cross-device.
+/// No user closure: at execute it resolves the target device (concrete, or by
+/// index into the running context's device list), then its default queue, builds
+/// a sibling [`ExecutionContext`] (same context + same host-error slot, different
+/// device + queue), and runs `source` against it. The source's events are valid
+/// across queues of the same context, so downstream stages on the parent's queue
+/// can wait on them cross-device.
 pub struct OnDevice<S: DeviceOp> {
     source: S,
-    device: crate::Device,
+    target: DeviceTarget,
     out: Pipe<S::Output>,
 }
 
@@ -4049,15 +3986,21 @@ where
     }
 
     fn execute(self, parent: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // Resolve the target device (concrete, or by index into the running
+        // context's device list) before anything else; the rest is unchanged.
+        let device = match &self.target {
+            DeviceTarget::Concrete(d) => d.clone(),
+            DeviceTarget::Index(i) => parent.context().devices()[*i].clone(),
+        };
         // Resolve the target queue from the running context (cached, so the
         // terminal's flush_all_outoforder_queues picks it up).
-        let target_q = parent.context().default_outoforder_queue(&self.device)?;
+        let target_q = parent.context().default_outoforder_queue(&device)?;
         // Sibling EC: same context + same host-error slot, different device +
         // queue. `target_q` lives on this frame; its `.raw()` borrows for the
         // inner execute().
         let child = ExecutionContext::with_host_error_slot(
             parent.context(),
-            self.device.clone(),
+            device.clone(),
             target_q.raw(),
             parent.host_error_slot(),
             parent.start_dep(),

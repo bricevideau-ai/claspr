@@ -6,7 +6,8 @@
 //!   `download!(buf)`                    → `download`
 //!   `bundle!(a, b, c)`                  → `bundle3(a, b, c)`
 //!   `value(x)`                          → `value(x)`
-//!   `.and_then_with_context(...)`       → `.and_then_with_context(...)`
+//!   `.and_then_with_context(...)`       → `.and_then(...)` (pipe-fed; the
+//!                                          closures here never used `ec`)
 //!
 //! Uninit trait-verb shapes: the closure layer's `device_slice_alloc_uninit!` is
 //! a lazy op producing a `DeviceSliceUninit`. The eager analog is the
@@ -17,7 +18,7 @@
 
 use claspr::eager::{
     DeviceOpExt, alloc_zero, bundle3, device_alloc_uninit, download, fill_device_uninit,
-    fill_mapped_uninit, lift, mapped_alloc_uninit, upload, write_device_uninit,
+    fill_mapped_uninit, mapped_alloc_uninit, upload, write_device_uninit,
 };
 use claspr::{Buffer, Context, Error, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
@@ -91,19 +92,18 @@ fn hoisted_bundle_uploads_and_alloc_feed_three_arg_kernel() {
     assert!(result.iter().all(|&v| v == 3));
 }
 
-/// alloc_ops.rs::and_then_with_context_closure_returns_kernel_op_directly.
+/// alloc_ops.rs::and_then_closure_returns_kernel_op_directly — the closure just
+/// returns a kernel op over the upstream buffer (it never needed `ec`), so it is
+/// the plain pipe-fed `.and_then`.
 #[test]
-fn and_then_with_context_closure_returns_kernel_op_directly() {
+fn and_then_closure_returns_kernel_op_directly() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let result: Vec<u32> = upload(vec![6u32; N])
-        .and_then_with_context(|ec, buf| {
-            let _dev = ec.device().clone();
-            kernels.scale_u32([N], buf, 5)
-        })
+        .and_then(|buf| kernels.scale_u32([N], buf, 5))
         .and_then(download)
         .sync(&ctx)
-        .expect("and_then_with_context chain");
+        .expect("and_then chain");
     assert_eq!(result.len(), N);
     assert!(result.iter().all(|&v| v == 30));
 }
@@ -157,24 +157,27 @@ fn mapped_alloc_uninit_then_fill_via_trait_verb() {
     assert!(g.iter().all(|&v| v == 7));
 }
 
-/// alloc_ops.rs::and_then_with_context_composes_lazy_alloc_inside_closure —
-/// the mid-chain temp-buffer shape: grab `ec`, build a sub-chain bundling the
-/// upstream buf with a fresh alloc, add via a 3-arg kernel. 7 + 1 = 8.
+/// alloc_ops.rs::and_then_composes_lazy_alloc_inside_closure — the mid-chain
+/// temp-buffer shape: build a sub-chain bundling the upstream buf with a fresh
+/// alloc, add via a 3-arg kernel. 7 + 1 = 8. The closure never needed `ec`, so
+/// it is the plain pipe-fed `.and_then`.
 #[test]
-fn and_then_with_context_composes_lazy_alloc_inside_closure() {
+fn and_then_composes_lazy_alloc_inside_closure() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let result: Vec<u32> = upload(vec![7u32; N])
-        .and_then_with_context(|_ec, buf| {
-            // `and_then_with_context`'s Handle is a single `Pipe<Output>`, not a
+        .and_then(|buf| {
+            // `and_then`'s Handle here is a single `Pipe<Output>`, not a
             // per-element tuple-of-pipes, so the multi-output `add_u32` must be
             // reduced to one pipe (download) INSIDE the sub-chain — the outer
-            // chain can't destructure its tuple. Same 7 + 1 = 8 result.
-            bundle3(lift(buf), upload(vec![1u32; N]), alloc_zero::<u32>(N))
+            // chain can't destructure its tuple. `buf` is the upstream `Pipe`,
+            // which is itself a `DeviceOp`, so it bundles directly (no `lift`).
+            // Same 7 + 1 = 8 result.
+            bundle3(buf, upload(vec![1u32; N]), alloc_zero::<u32>(N))
                 .and_then(|(a, b, out)| kernels.add_u32([N], a, b, out))
                 .and_then(|(_a, _b, out)| download(out))
         })
         .sync(&ctx)
-        .expect("alloc-via-and_then_with_context chain");
+        .expect("alloc-via-and_then chain");
     assert!(result.iter().all(|&v| v == 8));
 }

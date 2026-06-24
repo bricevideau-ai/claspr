@@ -164,8 +164,8 @@ pub use eager::{
     TransferToDevice, Upload, WriteDevice, WriteMapped, arc_split, arced, bundle2, bundle3,
     bundle4, bundle5, bundle6, bundle7, bundle8, bundle9, bundle10, bundle11, bundle12, bundle13,
     bundle14, bundle15, bundle16, deps_as_events, deps_into_single_event, eager_copy_to, fan_out,
-    fill_mapped, forward, image_download, image_upload, lift, read_into, transfer_to_device, value,
-    wrap_event, write, write_mapped,
+    fill_mapped, forward, image_download, image_upload, lift, read_into, transfer_to_device,
+    transfer_to_device_at, value, wrap_event, write, write_mapped,
 };
 
 // Stage-3 proc-macro frontend.
@@ -216,8 +216,8 @@ pub mod prelude {
     pub use crate::eager::{
         alloc_zero, arc_split, arced, bundle2, bundle3, bundle4, bundle5, bundle6, bundle7,
         bundle8, bundle9, bundle10, bundle11, bundle12, bundle13, bundle14, bundle15, bundle16,
-        download, fan_out, fill, forward, lift, transfer_to_device, upload, upload_as, value,
-        write,
+        download, fan_out, fill, forward, lift, transfer_to_device, transfer_to_device_at, upload,
+        upload_as, value, write,
     };
 
     // ── Chain-entry macros (re-exported from the crate root, where

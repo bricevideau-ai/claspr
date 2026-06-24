@@ -4,12 +4,13 @@
 //! Carries the [`Context`], the current [`Device`], and a borrowed
 //! [`CommandQueue`] to enqueue on. Implements [`Launcher`] so any
 //! existing Tier 1 op (e.g. proc-macro-generated `kernels.foo(...)`)
-//! composes directly inside a chain via `.and_then_with_context`:
+//! composes directly inside a chain. Device-by-index routing is
+//! expressed structurally via `on_device_at` / `transfer_to_device_at`:
 //!
 //! ```ignore
-//! .and_then_with_context(|ec, buf| {
-//!     // ec: &ExecutionContext implements Launcher
-//!     kernels.foo([N], buf, scalar).on_device(ec.device_at(1))
+//! .and_then(move |buf| {
+//!     // route the kernel onto the device at context index 1
+//!     kernels.foo([N], buf, scalar).on_device_at(1)
 //! })
 //! ```
 //!
@@ -190,19 +191,18 @@ impl<'ctx> ExecutionContext<'ctx> {
     }
 
     /// The chain's running context's full device list — same as
-    /// `self.context().devices()`, surfaced here for ergonomics
-    /// inside `.and_then_with_context` closures.
+    /// `self.context().devices()`, surfaced here for ergonomics.
     pub fn devices(&self) -> &[Device] {
         self.context.devices()
     }
 
     /// Shortcut for `&self.context().devices()[i]`. Panics if `i` is
-    /// out of range (mirrors slice indexing). The common use is
-    /// inside `.and_then_with_context` to route or transfer:
+    /// out of range (mirrors slice indexing). For routing/transfer by
+    /// device index, prefer the structural builders that resolve the
+    /// index at execute:
     ///
     /// ```ignore
-    /// .and_then_with_context(|ec, buf|
-    ///     kernels.foo([N], buf).on_device(ec.device_at(1)))
+    /// .and_then(move |buf| kernels.foo([N], buf).on_device_at(1))
     /// ```
     pub fn device_at(&self, i: usize) -> &Device {
         &self.context.devices()[i]

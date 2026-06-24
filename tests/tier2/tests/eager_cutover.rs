@@ -389,20 +389,17 @@ fn device_copy_eager() {
 
 // ── Execute-time closure nodes ─────────────────────────────────────────
 
-/// `and_then_with_context`: the builder runs at EXECUTE with the live `ec`.
-/// The closure reads `ec.device()` (proving the EC is in scope) then builds the
-/// downstream `fill` over the upstream buffer. upload([1;N]) →
-/// with_context(fill 9) → download = 9.
+/// `and_then`: the pipe-fed builder runs at BUILD over the upstream's `Pipe`
+/// handle, building the downstream `fill` over the upstream buffer. The former
+/// `and_then_with_context` shape (closure used `ec` only for device selection)
+/// is now structural; this plain `.and_then` covers the no-routing case.
+/// upload([1;N]) → fill 9 → download = 9.
 #[test]
-fn eager_and_then_with_context() {
+fn eager_and_then() {
     let Some(ctx) = ctx() else { return };
 
     let out: Vec<u32> = upload(vec![1u32; N])
-        .and_then_with_context(|ec, buf| {
-            // Touch the live ExecutionContext to prove it's in scope at execute.
-            let _dev = ec.device();
-            fill(buf, 9u32)
-        })
+        .and_then(|buf| fill(buf, 9u32))
         .and_then(download)
         .sync(&ctx)
         .expect("sync");
@@ -410,7 +407,7 @@ fn eager_and_then_with_context() {
     assert_eq!(out.len(), N);
     assert!(
         out.iter().all(|&v| v == 9),
-        "and_then_with_context fill via live ec; got {:?}",
+        "and_then fill; got {:?}",
         &out[..8]
     );
 }
@@ -518,10 +515,10 @@ fn eager_on_device() {
     let Some(ctx) = ctx_two_devices() else { return };
 
     // Two fill stages, each routed to a distinct device from the context, then
-    // download. Device identity resolved from `ec` each stage (portable idiom).
+    // download. Device identity resolved by index at execute (portable idiom).
     let out: Vec<u32> = upload(vec![0u32; N])
-        .and_then_with_context(|ec, buf| fill(buf, 3u32).on_device(ec.device_at(0)))
-        .and_then_with_context(|ec, buf| fill(buf, 7u32).on_device(ec.device_at(1)))
+        .and_then(|buf| fill(buf, 3u32).on_device_at(0))
+        .and_then(|buf| fill(buf, 7u32).on_device_at(1))
         .and_then(download)
         .sync(&ctx)
         .expect("on_device chain");

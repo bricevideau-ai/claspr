@@ -1,21 +1,19 @@
 //! Eager port of `cross_device.rs`: cross-device pipeline within a single
 //! multi-device Context, expressed through the eager graph API. The shared
 //! `cl_context` makes a `DeviceSlice<T>` valid on either device's queue, so the
-//! chain spans devices via `.on_device(ec.device_at(i))` inside
-//! `.and_then_with_context` closures.
+//! chain spans devices via `.on_device_at(i)`, which resolves the device by
+//! index against the running context at execute.
 //!
 //! Old → new mapping:
 //!   `upload!(v)`                  → `upload(v)`
 //!   `download!(buf)`              → `download`
-//!   `.and_then_with_context(...)` → same name on `DeviceOpExt`
-//!   `kernel(...).on_device(dev)`  → same `.on_device(...)` on the eager kernel op
+//!   `kernel(...).on_device(dev)`  → `.on_device_at(i)` on the eager kernel op
 //!
-//! NOTE (known eager seam): `and_then_with_context` passes the upstream VALUE,
-//! not a pipe, so a routed downstream enqueues without an explicit event edge to
-//! the source — terminal completion is correct; mid-chain OOO ordering relies on
-//! the driver. Neither test asserts cross-device event ORDERING (they assert
-//! final values and the download→reupload ownership lifecycle), so the port is
-//! faithful.
+//! NOTE (eager seam): routing flows through the pipe-fed `.and_then`, so the
+//! routed downstream's `clEnqueue*` carries the upstream's completion event on
+//! its wait-list — a real per-command edge. Neither test asserts cross-device
+//! event ORDERING (they assert final values and the download→reupload ownership
+//! lifecycle), so the port is faithful.
 //!
 //! Skips when only one device is available (no real multi-device platform AND no
 //! sub-device partition support). Guard copied verbatim from cross_device.rs.
@@ -88,14 +86,8 @@ fn pipeline_spans_two_devices_via_mapped_slice() {
     let kernels_ref = &kernels;
 
     let result: Vec<u32> = upload(vec![0u32; N])
-        .and_then_with_context(move |ec, buf| {
-            kernels_ref.fill_u32([N], buf, 3).on_device(ec.device_at(0))
-        })
-        .and_then_with_context(move |ec, buf| {
-            kernels_ref
-                .scale_u32([N], buf, 4)
-                .on_device(ec.device_at(1))
-        })
+        .and_then(move |buf| kernels_ref.fill_u32([N], buf, 3).on_device_at(0))
+        .and_then(move |buf| kernels_ref.scale_u32([N], buf, 4).on_device_at(1))
         .and_then(download)
         .sync(&ctx)
         .expect("cross-device chain");
