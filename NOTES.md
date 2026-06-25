@@ -9,6 +9,29 @@ items resolve.
 
 ## Active
 
+### ✅ PROMOTED TO MAIN 2026-06-24: eager struct-graph cutover (72 commits)
+
+`eager-cutover` fast-forwarded onto `main` at `6d76fe2` (linear history, no merge
+commit) and pushed. This lands the whole reunification: `DeviceOp`/`DeviceOpExt`
+struct-graph, unified blocking/async terminals, host seam (start-gate + worker-join
++ event-based chained-cancel), device-by-index routing, prelude, the
+Context/default-queue Arc-cycle fix, and the marker-in-start-gate fix.
+
+Promoted on a FULL green gate: lint/doc clean (fmt + release clippy `-D warnings`
++ doc `-D warnings` + compile_fail-fixture rustfmt); tier1+tier2 263 passed/0
+failed and all 9 examples green on **all three ICDs** (pocl, Intel NEO legacy,
+rusticl); async error path stressed 40-80×/ICD, 0 crashes.
+
+**OPEN DEPENDENCY — 3 pocl PRs (not blocking the claspr merge, but required for
+the green result on stock distro pocl):** #2214 failed-dependency, #2215
+inline-retain, #2216 double-finish guard (all bricevideau-ai/pocl → pocl/pocl).
+The green gate ran against a local pocl carrying all three. claspr's own
+marker-in-start-gate fix (`6d76fe2`) makes the async terminal correct
+independently, but the general multi-dependency-error case still needs the pocl
+fixes. Details + root causes: see Concerns → "RESIDUAL pocl crashes" below. Once
+the PRs land + a release ships, revisit `project_claspr_ci_deferred` (CI was
+waiting on PoCL 7.2 anyway).
+
 ### ✅ LANDED 2026-06-24: removed `and_then_with_context`; device-by-index routing is now structural
 
 The execute-time `and_then_with_context` combinator (built its downstream op at
@@ -105,45 +128,58 @@ SIGSEGV ~15% on pocl (documented in the test doc + here). The
 `and_then_host_error_stops_chain_immediately` (eager_error.rs, `counter==0`) is
 the chained-cancel correctness lock.
 
-**RESIDUAL — pocl SIGSEGV on error→device-op: ROOT-CAUSED 2026-06-24 = a real
-pocl bug.** Updated pocl ~/projects/pocl main a4b1633fa→ea8257617 (now 8.0-pre,
-installed to ~/local/pocl) — NOT fixed upstream (still ~10% SIGSEGV on the
-error→`.and_then(download)` shape; race_finish even hung 1/40). valgrind memcheck
-+ helgrind both HID it (single-threaded emulation kills the race; helgrind 0
-races / 266 suppressed). Caught it via the NATIVE core dump instead (apport
-stash /var/lib/apport/coredump/; ulimit -c was 0 + core_pattern→apport, no sudo
-to change it — pull the core from apport's dir). Faulting backtrace (thread that
-crashed):
-  __memcpy_evex_unaligned_erms   <- SIGSEGV
-  pocl_exec_command            (libpocl)
-  pocl_pthread_driver_thread   (libpocl-devices-pthread)
-i.e. a pocl WORKER thread executes the read command and memcpy's into a
-buffer the aborted upstream already freed/unmapped.
-ROOT CAUSE — `pocl_create_event_sync` (lib/CL/pocl_util.c:367):
-  `if (notifier_event->status < 0 || notifier_event->status == CL_COMPLETE) goto FINISH;`
-It treats an ALREADY-FAILED dependency (status<0) IDENTICALLY to a completed one
-— skips creating the sync edge so the waiter "can start right away" (per the
-comment). Correct for CL_COMPLETE; WRONG for a negative status: the waiting
-command must be FAILED/terminated (spec: a command whose wait-list event is in a
-negative state must not execute), not run. Because no sync edge is created, the
-normal failure cascade (notify_list → pocl_update_event_failed on waiters) never
-reaches this command → it's submitted → pocl_exec_command memcpy on freed mem →
-SIGSEGV. Triggered by our start-gate: everything is enqueued with `proceed`
-already negative when the read's dep is wired, so the check hits the "already
-failed" branch.
-FIX DONE 2026-06-24: bricevideau-ai/pocl branch `fix-event-sync-failed-dependency`
-commit `4e014976d` (pushed, NO PR — Brice opens it). `broken_dependency` flag on
-_cl_event: pocl_create_event_sync sets it when a dep is already failed at wiring
-time (under event lock — inline update_event_failed would deadlock on the CQ lock
-held by pocl_command_enqueue); pthread+basic submit/notify paths honor it and
-fail the command via the same unlock/relock dance pocl_pthread_notify already
-uses; also closed a 2nd window in pocl_broadcast. VERIFIED: repros 100/100+70/70
-clean (0 sig/0 hang/correct -14 abort; was 41/70 + crashes + 16 wrong-success on
-clean main); **full pocl ctest 311/311, 0 regressions** (baseline-checked vs
-main). RESIDUAL pre-existing (NOT this bug, left for a separate branch): a rarer
-race_finish --finish-only crash/hang confirmed on clean main too = the racy
-clFinish-after-cancellation class (same as NEO). scratch/ C repros are the
-artifact for both the pocl report and the NEO lost-wakeup report.
+**RESIDUAL pocl crashes on the error path: ROOT-CAUSED + FIXED 2026-06-24 = THREE
+distinct pocl bugs, plus one claspr-side ordering fix. All resolved; the error
+path is now 0-crash on NEO + rusticl + pocl.** The original ~15% SIGSEGV turned
+out to be three independent races (a single fix only halved it):
+
+1. **Already-failed dependency runs anyway** — `pocl_create_event_sync` treated a
+   dep that was ALREADY failed (status<0) at wiring time identically to a completed
+   one (skip the sync edge). A negative status must FAIL the waiter, not let it run;
+   with no edge the failure cascade never reaches it → `pocl_exec_command` memcpy on
+   freed mem → SIGSEGV (`__memcpy <- pocl_exec_command <- pocl_pthread_driver_thread`).
+   Fix: `failed_dependency` flag on `_cl_event`, set in `pocl_create_event_sync` +
+   `pocl_broadcast`, honored in the pthread/basic submit+notify paths.
+   → **PR #2214** (bricevideau-ai/pocl `fix-event-sync-failed-dependency`); jansol
+   reviewed, all comments addressed (renamed flag, dropped the helper, folded the
+   notify check into the existing failure clause). Revised commit `b55a569a5`.
+2. **clSetEventCallback inline callback no-retain** — the synchronous (inline)
+   callback path fired `callback_function` holding no reference, so a concurrent
+   release (or the callback's own `clReleaseEvent`) could free the event mid-call.
+   Spec: "all callbacks registered for an event must be called before the event is
+   destroyed." Fix: retain across the inline call, release after.
+   → **PR #2215** (`pr-inline-retain`, commit `23c8ce3cd`).
+3. **Concurrent double-finish** — any command with ≥2 wait-list deps that reach a
+   terminal state concurrently can be finished twice (two error broadcasts, or a
+   fail racing a completion), tripping `assert(event->status > CL_COMPLETE)` at
+   pocl_util.c:1690 (Debug) / UAF in clReleaseEvent (NDEBUG). NOT marker-specific —
+   confirmed a plain `clEnqueueReadBuffer` with two concurrently-failed deps
+   double-finishes (tried scoping the guard to MARKER/BARRIER, re-enabled the assert
+   for other types, and it immediately caught READ_BUFFER → guard must be
+   unconditional). Fix: idempotency guard — event state is monotonic, so return if
+   already terminal under the locks already held.
+   → **PR #2216** (`pr-double-finish`, commit `4eb82e2f7`); reproducers
+   `scratch/pocl_double_error_repro.c` (pure two-errors) + `pocl_failed_dep_gate_repro.c`.
+4. **claspr-side: marker not inside the start-gate** (commit `6d76fe2`). The async
+   terminal (`run_eager_chain`) released `start` BEFORE enqueuing the terminal
+   marker, so the marker's wait-list edges were wired against deps already free to
+   resolve/fail — defeating the start-gate for the one command that aggregates the
+   rest, and feeding bugs #1/#3 above. Fixed: enqueue the marker before releasing
+   `start` (non-blocking, no deadlock); all release paths routed through one
+   `release_start()` helper. The blocking terminal was already correct.
+
+Heisenbug notes (kept for the next person): valgrind memcheck + helgrind + gdb all
+HIDE these (serialization kills the timing); catch via NATIVE core dump (apport
+stash `/var/lib/apport/coredump/`) or a Debug pocl build (the assert turns the
+race into a clean, catchable abort). The two-thread backtrace at the assert is in
+PR #2216's body.
+
+**Integrated validation (pocl built with all 3 fixes, Debug/asserts-active,
+installed ~/local/pocl):** full green on ALL THREE ICDs — tier1+tier2 263 passed
+0 failed × {pocl, NEO legacy Iris Plus Gen11, rusticl/llvmpipe}; async error-path
+stress 40-80×/ICD with 0 aborts; all 9 examples build + test + run clean ×3 ICDs.
+The historical NEO host-seam deadlock and the rusticl image2d SEGV baseline both
+came back CLEAN (no known-failures left to exclude). pocl ctest: no regressions.
 
 ### Blocking borrowing upload verb `write_sync` (branch `eager-cutover`, 2026-06-23)
 
@@ -891,9 +927,9 @@ host dep). Documented as a gotcha in `CLAUDE.md`.
 
 | Commit | What |
 |---|---|
-| `eager-cutover` | Fix Context/default-queue Arc reference cycle: ContextInner stores defaults as raw `ManuallyDrop<CommandQueue>` + `impl Drop` releases them before cl_context; user queues keep strong ctx. cliloader: cl_context/cl_command_queue leaks gone. +2 leak-regression tests. (see Concerns → RESOLVED) |
-| `2ba935a` | Ops carry ctx → no-arg `.wait()` / `.submit()` shortcut + rename to `.wait_on(&L)` / `.submit_on(&L)` for cross-queue case. 192 call sites migrated. |
-| `311db59` | Tier 1 `DeviceSlice::map` + non-blocking `.submit()` terminal on both DeviceSlice + MappedSlice map ops; closes latent cross-queue SVM Drop race. |
-| `a9d825a` | README "Other modes" section — pre-compiled + external SPIR-V via `claspr::kernels!`. |
-| `f82ffd3` | Sealed `KernelOp` (proc-macro is the only legitimate impl producer). |
-| `cc2437d` | Tier 2 alloc macros as sugar over `alloc_uninit + .fill()/.write()`. |
+| `6d76fe2` (now `main`) | **Cutover PROMOTED to main** (72-commit FF). Also the final fix: gate the terminal marker inside the start-gate in the async terminal (was released-then-enqueued, wiring marker deps in a live window). Full green ×3 ICDs. |
+| `c7bad34` | Remove `and_then_with_context`; device-by-index routing structural (`DeviceTarget::{Concrete,Index}`, `on_device_at`/`transfer_to_device_at`). Closes the last un-gated-host-seam gap. |
+| `02c6165` | `and_then_host` error path: start-gate + worker-join + event-based chained-cancel. NEO lost-wakeup deadlock fixed. |
+| `dee8aa0`/`b29fb03` | Two-event host seam (`fire`/`proceed`); remove defensive double-unmap (was corrupting NEO). |
+| `dee8aa0` | Break Context/default-queue Arc reference cycle (ManuallyDrop defaults released before cl_context). +2 leak-regression tests. |
+| `2ba935a` | Ops carry ctx → no-arg `.wait()` / `.submit()` + `.wait_on(&L)`/`.submit_on(&L)` for cross-queue. 192 sites migrated. |
