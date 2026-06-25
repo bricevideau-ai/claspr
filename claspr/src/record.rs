@@ -1,9 +1,27 @@
-//! Record-and-replay for eager device graphs (layer 1: software backend).
+//! Record-and-replay for eager device graphs.
 //!
 //! A recordable [`DeviceOp`] chain can be recorded once into a reusable command
 //! list and **replayed** many times — the foundation for reusable pipelines.
 //! This is *staging* infrastructure: the surface (`record` / `replay`) is
 //! provisional and may change as the design settles.
+//!
+//! # Two backends, one IR
+//!
+//! [`record`](RecordExt::record) walks the graph by `&self` and builds a
+//! software command list (the portable IR). On the first [`replay`]:
+//! - if the platform supports `cl_khr_command_buffer` and the recording is
+//!   all-`cl_mem` (the extension has no SVM command variants), the list is
+//!   compiled **once** into a real command buffer and cached — subsequent
+//!   replays are a single `clEnqueueCommandBufferKHR`;
+//! - otherwise (no extension, or SVM commands) replay re-issues the software
+//!   list with fresh events each call.
+//!
+//! Either way the result is identical; [`RecordedGraph::using_command_buffer`]
+//! reports which path engaged. The provisional CB extension's entry points are
+//! resolved via `clGetExtensionFunctionAddressForPlatform` (opencl3's safe
+//! wrapper can't reach them).
+//!
+//! [`replay`]: RecordedGraph::replay
 //!
 //! # Why the eager engine makes this clean
 //!
@@ -28,23 +46,133 @@
 //! non-recordable leaf fails to compile at [`record`](RecordExt::record), naming
 //! the offending leaf through the generic wrappers.
 //!
-//! # Scope of layer 1
+//! # Current scope
 //!
-//! - Software backend only: a `Vec` of commands with **structural** dependency
-//!   edges (indices), replayed by re-issuing on a queue with **fresh** events
-//!   each call. No `cl_khr_command_buffer` yet (layer 2, behind the same
-//!   [`RecordContext`] seam — leaf bodies won't change).
 //! - Replay re-runs against the **same** buffers. Rebinding inputs (replay
-//!   against different buffers) is a later layer (slots + mutable dispatch).
+//!   against different buffers, via `cl_khr_command_buffer_mutable_dispatch`) is
+//!   a later layer (slots + mutable dispatch).
+//! - Recordable leaves: fill, copy (same-family), kernels (buffer + scalar
+//!   args, no image). Host-touching leaves are excluded by not implementing
+//!   [`RecordableOp`].
 
 use crate::eager::DeviceOp;
 use crate::error::{Error, Result};
 use crate::queue::Launcher;
 use opencl3::types::{cl_command_queue, cl_event, cl_kernel, cl_mem, cl_uint};
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::marker::PhantomData;
 use std::ptr;
+use std::sync::Mutex;
+
+// ── cl_khr_command_buffer FFI (layer 2) ─────────────────────────────────────
+//
+// The extension is PROVISIONAL, so the ICD loader's dispatch table does NOT
+// export its entry points. We resolve them per-platform via
+// `clGetExtensionFunctionAddressForPlatform` (a core CL 1.2 call the loader DOES
+// export) and call through opencl-sys's PFN typedefs. opencl3's safe
+// `CommandBuffer` wrapper is unusable for this (its dlsym path returns -2001).
+
+use opencl_sys::{
+    cl_command_buffer_khr, cl_platform_id, cl_sync_point_khr, clCommandCopyBufferKHR_t,
+    clCommandFillBufferKHR_t, clCommandNDRangeKernelKHR_t, clCreateCommandBufferKHR_t,
+    clEnqueueCommandBufferKHR_t, clFinalizeCommandBufferKHR_t, clReleaseCommandBufferKHR_t,
+};
+
+/// The `cl_khr_command_buffer` entry points, resolved for one platform. Each
+/// field is the opencl-sys PFN typedef (`Option<unsafe extern "C" fn …>`);
+/// `None` means the loader returned a null address.
+struct CommandBufferExt {
+    create: clCreateCommandBufferKHR_t,
+    finalize: clFinalizeCommandBufferKHR_t,
+    enqueue: clEnqueueCommandBufferKHR_t,
+    release: clReleaseCommandBufferKHR_t,
+    fill_buffer: clCommandFillBufferKHR_t,
+    copy_buffer: clCommandCopyBufferKHR_t,
+    ndrange_kernel: clCommandNDRangeKernelKHR_t,
+}
+
+fn ext_addr(rt: &cl3::OpenClRuntime, platform: cl_platform_id, name: &CStr) -> *mut c_void {
+    rt.clGetExtensionFunctionAddressForPlatform(platform, name.as_ptr())
+        .unwrap_or(ptr::null_mut())
+}
+
+impl CommandBufferExt {
+    /// Resolve the entry points for `platform`, or `None` if the core
+    /// command-buffer lifecycle isn't reachable (extension absent/provisional).
+    fn load(platform: cl_platform_id) -> Option<Self> {
+        let rt = cl3::load_library().as_ref().ok()?;
+        // SAFETY: each address came from clGetExtensionFunctionAddressForPlatform
+        // for this platform + the matching name, so the ABI matches the PFN
+        // typedef; a null address transmutes to `None` via the fn-pointer niche.
+        let ext =
+            unsafe {
+                CommandBufferExt {
+                    create: std::mem::transmute::<*mut c_void, clCreateCommandBufferKHR_t>(
+                        ext_addr(rt, platform, c"clCreateCommandBufferKHR"),
+                    ),
+                    finalize: std::mem::transmute::<*mut c_void, clFinalizeCommandBufferKHR_t>(
+                        ext_addr(rt, platform, c"clFinalizeCommandBufferKHR"),
+                    ),
+                    enqueue: std::mem::transmute::<*mut c_void, clEnqueueCommandBufferKHR_t>(
+                        ext_addr(rt, platform, c"clEnqueueCommandBufferKHR"),
+                    ),
+                    release: std::mem::transmute::<*mut c_void, clReleaseCommandBufferKHR_t>(
+                        ext_addr(rt, platform, c"clReleaseCommandBufferKHR"),
+                    ),
+                    fill_buffer: std::mem::transmute::<*mut c_void, clCommandFillBufferKHR_t>(
+                        ext_addr(rt, platform, c"clCommandFillBufferKHR"),
+                    ),
+                    copy_buffer: std::mem::transmute::<*mut c_void, clCommandCopyBufferKHR_t>(
+                        ext_addr(rt, platform, c"clCommandCopyBufferKHR"),
+                    ),
+                    ndrange_kernel: std::mem::transmute::<*mut c_void, clCommandNDRangeKernelKHR_t>(
+                        ext_addr(rt, platform, c"clCommandNDRangeKernelKHR"),
+                    ),
+                }
+            };
+        // The full set we use must be present (lifecycle + the three commands).
+        if ext.create.is_some()
+            && ext.finalize.is_some()
+            && ext.enqueue.is_some()
+            && ext.release.is_some()
+            && ext.fill_buffer.is_some()
+            && ext.copy_buffer.is_some()
+            && ext.ndrange_kernel.is_some()
+        {
+            Some(ext)
+        } else {
+            None
+        }
+    }
+}
+
+/// A finalized `cl_khr_command_buffer` + the queue it was built for, RAII-
+/// releasing on drop. Replay is one `clEnqueueCommandBufferKHR`.
+struct RecordedCb {
+    cb: cl_command_buffer_khr,
+    queue: cl_command_queue,
+    enqueue: unsafe extern "C" fn(
+        cl_uint,
+        *mut cl_command_queue,
+        cl_command_buffer_khr,
+        cl_uint,
+        *const cl_event,
+        *mut cl_event,
+    ) -> opencl_sys::cl_int,
+    release: unsafe extern "C" fn(cl_command_buffer_khr) -> opencl_sys::cl_int,
+}
+
+// SAFETY: cl_command_buffer_khr / cl_command_queue are opaque handles into the
+// internally-synchronized runtime; the PFNs are plain fn pointers.
+unsafe impl Send for RecordedCb {}
+unsafe impl Sync for RecordedCb {}
+
+impl Drop for RecordedCb {
+    fn drop(&mut self) {
+        unsafe { (self.release)(self.cb) };
+    }
+}
 
 // ── Handles + sync points: the recording twins of (value, Deps) ─────────────
 
@@ -258,11 +386,11 @@ impl SoftCommand {
 
 // ── RecordContext: the seam leaf `record` bodies emit into ──────────────────
 
-/// The seam a [`RecordableOp::record`] body emits commands into. Layer 1 backs
-/// it with a software command list + a map from graph-edge identity
-/// ([`cell_id`](crate::eager::Pipe)) to the producer's recorded output. Layer 2
-/// will add a `cl_khr_command_buffer` backend behind the same typed helpers, so
-/// leaf bodies stay backend-agnostic.
+/// The seam a [`RecordableOp::record`] body emits commands into: a software
+/// command list (the portable IR) + a map from graph-edge identity
+/// ([`cell_id`](crate::eager::Pipe)) to the producer's recorded output. The
+/// software list is what [`RecordedGraph`] replays, or compiles once into a real
+/// `cl_khr_command_buffer` — leaf bodies are backend-agnostic either way.
 pub struct RecordContext {
     commands: Vec<SoftCommand>,
     /// Producer outputs keyed by their output pipe's `cell_id`.
@@ -472,8 +600,19 @@ pub trait RecordableOp: DeviceOp {
 /// A recorded eager graph, ready to [`replay`](RecordedGraph::replay) as many
 /// times as wanted. Borrows the source graph for `'g` so the buffers (and
 /// kernels) its commands reference stay live across every replay.
+///
+/// The software command list is the portable IR. On the first replay, if the
+/// platform supports `cl_khr_command_buffer` AND the recording is all-`cl_mem`
+/// (no SVM — the extension has no SVM command variants), the list is compiled
+/// once into a real command buffer and cached; subsequent replays are a single
+/// `clEnqueueCommandBufferKHR`. Otherwise (no extension / SVM commands), replay
+/// re-issues the software list with fresh events each call. Either way the
+/// observable result is identical.
 pub struct RecordedGraph<'g> {
     commands: Vec<SoftCommand>,
+    /// Lazily-built command buffer, keyed by the queue it was finalized for.
+    /// `None` until the first replay decides whether a CB is usable.
+    cb: Mutex<Option<RecordedCb>>,
     _borrow: PhantomData<&'g ()>,
 }
 
@@ -491,11 +630,210 @@ impl Drop for RecordedGraph<'_> {
 }
 
 impl RecordedGraph<'_> {
+    /// Whether a real `cl_khr_command_buffer` has been built and cached for this
+    /// recording (set on the first replay that successfully compiles one). Until
+    /// the first replay, or when replay falls back to the software path (no
+    /// extension / SVM commands), this is `false`. Introspection for tests +
+    /// callers that want to confirm the fast path engaged.
+    pub fn using_command_buffer(&self) -> bool {
+        self.cb.lock().unwrap().is_some()
+    }
+
+    /// True if every command is `cl_mem`-backed (the CB extension has no SVM
+    /// command variants, so an SVM recording must use software replay).
+    fn cb_eligible(&self) -> bool {
+        self.commands.iter().all(|c| match c {
+            SoftCommand::Fill { buffer, .. } => matches!(buffer, MemRef::Buffer(_)),
+            SoftCommand::Copy { src, dst, .. } => {
+                matches!(src, MemRef::Buffer(_)) && matches!(dst, MemRef::Buffer(_))
+            }
+            SoftCommand::NdRange { .. } => true,
+        })
+    }
+
     /// Replay the recording on `launcher`'s queue, blocking until every recorded
     /// command completes. Reusable — call repeatedly (serially; the buffers are
-    /// shared across replays).
+    /// shared across replays). Uses a cached `cl_khr_command_buffer` when one was
+    /// built, else the software path.
     pub fn replay<L: Launcher + ?Sized>(&self, launcher: &L) -> Result<()> {
         let queue = launcher.cl_queue().get();
+
+        // Fast path: a previously-built CB for this queue → one enqueue + wait.
+        {
+            let guard = self.cb.lock().unwrap();
+            if let Some(rec) = guard.as_ref()
+                && rec.queue == queue
+            {
+                return unsafe { Self::enqueue_cb(rec, queue) };
+            }
+        }
+
+        // Try to build a CB once (all-cl_mem + extension present). On any
+        // shortfall, fall through to software replay.
+        if self.cb_eligible()
+            && let Some(rec) = self.try_build_cb(launcher, queue)
+        {
+            let r = unsafe { Self::enqueue_cb(&rec, queue) };
+            *self.cb.lock().unwrap() = Some(rec);
+            return r;
+        }
+
+        self.replay_software(queue)
+    }
+
+    /// One `clEnqueueCommandBufferKHR` + wait on its completion event.
+    ///
+    /// # Safety
+    /// `rec` must be a finalized CB built for `queue`.
+    unsafe fn enqueue_cb(rec: &RecordedCb, mut queue: cl_command_queue) -> Result<()> {
+        let mut event: cl_event = ptr::null_mut();
+        let status = unsafe {
+            (rec.enqueue)(
+                1,
+                &mut queue as *mut cl_command_queue,
+                rec.cb,
+                0,
+                ptr::null(),
+                &mut event,
+            )
+        };
+        if status != opencl_sys::CL_SUCCESS {
+            return Err(Error::OpenCl(opencl3::error_codes::ClError(status)));
+        }
+        crate::Event::new(event).wait().map_err(Error::OpenCl)
+    }
+
+    /// Build + finalize a command buffer from the software command list, or
+    /// `None` if the extension isn't reachable / a command fails to record.
+    fn try_build_cb<L: Launcher + ?Sized>(
+        &self,
+        launcher: &L,
+        queue: cl_command_queue,
+    ) -> Option<RecordedCb> {
+        let platform = launcher.context().device().platform().raw_id();
+        let ext = CommandBufferExt::load(platform)?;
+        let (create, finalize, enqueue, release) =
+            (ext.create?, ext.finalize?, ext.enqueue?, ext.release?);
+        let fill = ext.fill_buffer?;
+        let copy = ext.copy_buffer?;
+        let ndr = ext.ndrange_kernel?;
+
+        // Create the command buffer over the single queue.
+        let mut q = queue;
+        let mut err: opencl_sys::cl_int = 0;
+        let cb = unsafe { create(1, &mut q as *mut _, ptr::null(), &mut err) };
+        if err != opencl_sys::CL_SUCCESS || cb.is_null() {
+            return None;
+        }
+        // RAII from here so any early return releases the CB.
+        let rec = RecordedCb {
+            cb,
+            queue,
+            enqueue,
+            release,
+        };
+
+        // Record each command, threading sync points by list index.
+        let mut sps: Vec<cl_sync_point_khr> = Vec::with_capacity(self.commands.len());
+        for cmd in &self.commands {
+            let waits: Vec<cl_sync_point_khr> = cmd.waits().iter().map(|&i| sps[i]).collect();
+            let wptr = if waits.is_empty() {
+                ptr::null()
+            } else {
+                waits.as_ptr()
+            };
+            let n = waits.len() as cl_uint;
+            let mut sp: cl_sync_point_khr = 0;
+            let st = match cmd {
+                SoftCommand::Fill {
+                    buffer: MemRef::Buffer(mem),
+                    pattern,
+                    offset,
+                    size,
+                    ..
+                } => unsafe {
+                    fill(
+                        cb,
+                        queue,
+                        ptr::null(),
+                        *mem as opencl_sys::cl_mem,
+                        pattern.as_ptr() as *const c_void,
+                        pattern.len(),
+                        *offset,
+                        *size,
+                        n,
+                        wptr,
+                        &mut sp,
+                        ptr::null_mut(),
+                    )
+                },
+                SoftCommand::Copy {
+                    src: MemRef::Buffer(s),
+                    dst: MemRef::Buffer(d),
+                    src_offset,
+                    dst_offset,
+                    size,
+                    ..
+                } => unsafe {
+                    copy(
+                        cb,
+                        queue,
+                        ptr::null(),
+                        *s as opencl_sys::cl_mem,
+                        *d as opencl_sys::cl_mem,
+                        *src_offset,
+                        *dst_offset,
+                        *size,
+                        n,
+                        wptr,
+                        &mut sp,
+                        ptr::null_mut(),
+                    )
+                },
+                SoftCommand::NdRange {
+                    kernel,
+                    global,
+                    local,
+                    ..
+                } => unsafe {
+                    ndr(
+                        cb,
+                        queue,
+                        ptr::null(),
+                        *kernel as opencl_sys::cl_kernel,
+                        global.len() as cl_uint,
+                        ptr::null(),
+                        global.as_ptr(),
+                        if local.is_empty() {
+                            ptr::null()
+                        } else {
+                            local.as_ptr()
+                        },
+                        n,
+                        wptr,
+                        &mut sp,
+                        ptr::null_mut(),
+                    )
+                },
+                // SVM commands can't be in a CB; cb_eligible() already excluded
+                // these, so this is unreachable.
+                _ => return None,
+            };
+            if st != opencl_sys::CL_SUCCESS {
+                return None;
+            }
+            sps.push(sp);
+        }
+
+        if unsafe { finalize(cb) } != opencl_sys::CL_SUCCESS {
+            return None;
+        }
+        Some(rec)
+    }
+
+    /// Software replay: re-issue each command on `queue`, threading fresh events
+    /// along the recorded structural edges, then wait on every command's event.
+    fn replay_software(&self, queue: cl_command_queue) -> Result<()> {
         let mut events: Vec<cl_event> = Vec::with_capacity(self.commands.len());
         for cmd in &self.commands {
             let wait_events: Vec<cl_event> = cmd.waits().iter().map(|&i| events[i]).collect();
@@ -532,6 +870,7 @@ pub trait RecordExt: RecordableOp {
         RecordableOp::record(self, &mut ctx)?;
         Ok(RecordedGraph {
             commands: ctx.commands,
+            cb: Mutex::new(None),
             _borrow: PhantomData,
         })
     }

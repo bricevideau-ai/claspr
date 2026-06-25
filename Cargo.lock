@@ -298,6 +298,7 @@ dependencies = [
  "cl3",
  "claspr-macros",
  "futures",
+ "opencl-sys",
  "opencl3",
 ]
 

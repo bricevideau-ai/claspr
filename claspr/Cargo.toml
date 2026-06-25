@@ -21,5 +21,9 @@ opencl3.workspace = true
 # Raw command-queue enqueue (record/replay): the cl3 layer opencl3 is built on.
 # Used by `record.rs` to re-issue baked `cl_mem` commands on replay.
 cl3 = "0.13"
+# `cl_khr_command_buffer` is provisional, so its entry points aren't in the ICD
+# dispatch table; we resolve them via clGetExtensionFunctionAddressForPlatform
+# and call through opencl-sys's PFN typedefs. See `record.rs` (layer-2 backend).
+opencl-sys = "0.6"
 claspr-macros = { version = "0.0.0", path = "../claspr-macros" }
 futures = { version = "0.3", default-features = false, features = ["std"], optional = true }

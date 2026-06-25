@@ -244,6 +244,48 @@ fn svm_kernel_records_and_replays() {
     );
 }
 
+/// Layer 2: a cl_mem graph should compile to a real `cl_khr_command_buffer` on
+/// the first replay (when the platform supports it). Asserts the CB fast path
+/// engaged AND produced the right result. Skips the CB assertion if the platform
+/// lacks the extension (software fallback still gives the right answer).
+#[test]
+fn cl_mem_graph_uses_command_buffer() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N)
+        .expect("alloc")
+        .fill(2u32)
+        .wait()
+        .expect("seed");
+    let graph = ks.scale_u32([N], buf, 5u32);
+    let recorded = graph.record().expect("record");
+
+    assert!(
+        !recorded.using_command_buffer(),
+        "CB should not exist before first replay"
+    );
+    recorded.replay(&ctx).expect("replay 1"); // 2 -> 10 (builds the CB)
+    let cb_built = recorded.using_command_buffer();
+    recorded.replay(&ctx).expect("replay 2"); // 10 -> 50 (reuses CB)
+    drop(recorded);
+
+    let scaled = graph.wait().expect("terminal"); // 50 -> 250
+    let mut readback = vec![0u32; N];
+    let r = scaled.read(&mut readback).wait().expect("read");
+    let _ = r;
+    assert!(
+        readback.iter().all(|&v| v == 250),
+        "expected all 250 (2*5*5*5), got {:?}",
+        &readback[..8]
+    );
+    // pocl 7.2-pre supports cl_khr_command_buffer, so the CB path must engage.
+    assert!(
+        cb_built,
+        "expected the cl_khr_command_buffer fast path to engage on this platform"
+    );
+}
+
 /// Repeated replays are stable over many iterations.
 #[test]
 fn fill_replays_many_times() {
