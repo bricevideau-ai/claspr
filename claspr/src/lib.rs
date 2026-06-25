@@ -92,6 +92,7 @@ pub mod eager;
 pub mod exec_ctx;
 pub mod host_view;
 pub mod mappable;
+pub mod record;
 mod tier2_macros;
 pub mod transfer;
 

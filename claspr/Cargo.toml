@@ -18,5 +18,8 @@ async-events = ["dep:futures"]
 
 [dependencies]
 opencl3.workspace = true
+# Raw command-queue enqueue (record/replay): the cl3 layer opencl3 is built on.
+# Used by `record.rs` to re-issue baked `cl_mem` commands on replay.
+cl3 = "0.13"
 claspr-macros = { version = "0.0.0", path = "../claspr-macros" }
 futures = { version = "0.3", default-features = false, features = ["std"], optional = true }

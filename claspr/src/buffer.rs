@@ -416,6 +416,12 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
         &self.buffer
     }
 
+    /// Size of the backing buffer in bytes (`len * size_of::<T>()`). Used by the
+    /// record/replay path to bake fill/copy sizes.
+    pub(crate) fn byte_len(&self) -> usize {
+        self.len * std::mem::size_of::<T>()
+    }
+
     /// Device-to-device copy from `self` into `dst`, returning the
     /// [`CopyTo2`](crate::eager::CopyTo2) graph node (a
     /// [`DeviceOp`](crate::DeviceOp)) whose output is `(src, dst)`. Usable

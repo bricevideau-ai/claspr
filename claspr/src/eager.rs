@@ -788,6 +788,17 @@ pub struct AndThen<S, U> {
     next: U,
 }
 
+impl<S, U> AndThen<S, U> {
+    /// Borrow the upstream op (for the non-consuming record walk).
+    pub(crate) fn source_ref(&self) -> &S {
+        &self.source
+    }
+    /// Borrow the downstream op (for the non-consuming record walk).
+    pub(crate) fn next_ref(&self) -> &U {
+        &self.next
+    }
+}
+
 impl<S, U> DeviceOp for AndThen<S, U>
 where
     S: DeviceOp,
@@ -1748,6 +1759,18 @@ pub struct Fill<T: Copy, M: MemMode> {
     buf: Input<DeviceSlice<T, M>>,
     value: T,
     out: Pipe<DeviceSlice<T, M>>,
+}
+
+impl<T: Copy, M: MemMode> Fill<T, M> {
+    /// Borrow the concrete input buffer, if this fill heads a chain (vs being
+    /// fed by an upstream pipe). For the non-consuming record walk.
+    pub(crate) fn input_buffer(&self) -> Option<&DeviceSlice<T, M>> {
+        self.buf.concrete()
+    }
+    /// The fill pattern value. For the non-consuming record walk.
+    pub(crate) fn fill_value(&self) -> T {
+        self.value
+    }
 }
 
 /// Build a fill leaf over an upstream buffer.

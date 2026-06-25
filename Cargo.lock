@@ -295,6 +295,7 @@ dependencies = [
 name = "claspr"
 version = "0.0.0"
 dependencies = [
+ "cl3",
  "claspr-macros",
  "futures",
  "opencl3",
