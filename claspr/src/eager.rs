@@ -4639,18 +4639,21 @@ where
     //    host-CLOSURE failure surfaces at poll time via the host-error slot.
     let collected = chain.collect(&ec, ExecMode::Pipelined);
 
-    // Release the graph (if gated) as soon as it is fully enqueued — or on setup
-    // error, so any already-enqueued commands can drain/abort instead of waiting
-    // on `start` forever. The marker enqueue below is non-blocking, so completing
-    // `start` here (before it) is correct.
-    if let Some(ref start) = start {
-        let _ = crate::complete_user_event(start, opencl3::event::CL_COMPLETE);
-    }
+    // Helper: release the start-gate (if any) so gated commands can drain/abort
+    // instead of waiting on `start` forever. Used on every exit path below.
+    let release_start = |start: &Option<crate::Event>| {
+        if let Some(start) = start {
+            let _ = crate::complete_user_event(start, opencl3::event::CL_COMPLETE);
+        }
+    };
 
     let (output, deps) = match collected {
         Ok(pair) => pair,
         Err(e) => {
-            // Join any workers that spawned before surfacing the error.
+            // Setup failed before/while enqueueing — release the gate so any
+            // already-enqueued commands drain, then join workers and surface the
+            // error (prefer the seam's rich stash).
+            release_start(&start);
             join_chain_workers(&workers);
             drop(queue);
             context.invalidate_default_outoforder_queue(&device);
@@ -4664,10 +4667,19 @@ where
     //    wait-list — we don't penalise other work sharing this OOO queue.
     //    SAFETY: each `cl_event` is held alive by the `deps` Arc wrappers for
     //    the duration of this call; the marker enqueue retains them internally.
+    //
+    //    ORDER: enqueue the marker BEFORE releasing `start`. The marker is part
+    //    of the chain's terminal join, so it must be inside the start-gate like
+    //    every other command — otherwise its wait-list edges get wired against
+    //    deps that may already be resolving/failing concurrently (the gate's
+    //    whole point is that the *entire* graph is committed before anything
+    //    runs). The marker enqueue is non-blocking, so wiring it while `start`
+    //    is still held does not deadlock.
     let wait_list: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
     let marker = match unsafe { queue.raw().enqueue_marker_with_wait_list(&wait_list) } {
         Ok(ev) => ev,
         Err(code) => {
+            release_start(&start);
             drop(deps);
             join_chain_workers(&workers);
             drop(queue);
@@ -4676,6 +4688,11 @@ where
         }
     };
     drop(deps);
+
+    // The whole graph — including the terminal marker — is now enqueued and
+    // gated on `start`. Release it so everything drains (or aborts via its own
+    // `proceed`).
+    release_start(&start);
 
     // 4a. clFlush — push every queue the chain touched without blocking.
     //     rusticl is spec-strict and keeps commands `CL_QUEUED` until an
