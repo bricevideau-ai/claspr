@@ -640,6 +640,76 @@ slots/bind/call, delete old closure trait. **Observe what (if anything) the new
 paradigm CANNOT express** — Brice's explicit interest; surface it when hit, don't
 presume.
 
+### 🧭 Replayable-eager-graph PROPOSAL (2026-06-25, from deep study of cb-graphs-impl/closure-free-graph + spikes)
+
+Two agents studied the prior replay impl (`origin/closure-free-graph`:
+record.rs 1471 / call.rs / slots.rs / slot_ops.rs / arg_bind.rs) + the 4 spikes
+(graph_cb, graph_devop_record, graph_slots, combinator), mapped onto the LANDED
+eager engine. Verdict: **the eager struct-graph is strictly MORE amenable to
+replay than the old closure layer** — the closure layer's trace-once machinery
+existed only because `and_then`'s `FnOnce` made the graph non-inspectable
+(description==execution). The eager `AndThen{source,next}` stores BUILT ops, so
+the graph is already the IR.
+
+**Linchpin VERIFIED in code:** recordable leaves can expose handle+params by
+`&self` — `Fill{ buf: Input<DeviceSlice>, value: T }`, `DeviceSlice::buffer() ->
+&ClBuffer` (buffer.rs:415). So **recording can be a non-consuming `&self` walk**
+(`record(&self, &mut RecordContext)`), NOT the old consuming `record(self)` that
+forced a factory. This is the key simplification the eager engine unlocks.
+
+**Proposed architecture (4 layers, each shippable on its own):**
+
+1. **`RecordableOp: DeviceOp` sub-trait** — one `record(&self, &mut RecordContext)
+   -> Result<(Output-handle, SyncPoints)>` mirroring `execute` but threading
+   `cl_sync_point_khr` where execute threads `Deps`. Recordability propagates as
+   a conditional bound: `impl RecordableOp for AndThen<S,U> where S: RecordableOp,
+   U: RecordableOp` — zero runtime walk, compile-time. Recordable leaves: kernel/
+   fill/copy/barrier. Non-recordable (`Upload`/`Download`/`AndThenHost`/`OnDevice`)
+   just don't impl it → a chain containing one fails to compile at `.record()`
+   with an E0277 naming the offending leaf through the generic wrappers. **Drops
+   in near-unchanged from spike `graph_devop_record`** (the eager AndThen is
+   closer to recordable than the spike's — children already built).
+
+2. **Dual-backend `RecordContext`** (KEEP from old record.rs near-verbatim):
+   `Backend::{Cb, Software}` behind typed `fill_buffer`/`copy_buffer`/`barrier`/
+   `ndrange_kernel`. Cb → real `cl_khr_command_buffer` (replay = 1
+   `clEnqueueCommandBufferKHR`); Software → `Vec<SoftCommand>` replayed with
+   FRESH per-replay events along the static sync-point topology (no stale events).
+   FFI loader (KEEP verbatim): provisional ext → resolve via
+   `clGetExtensionFunctionAddressForPlatform` on the cl3-already-dlopened loader +
+   transmute to opencl-sys PFNs (opencl3 safe wrapper is unusable — returns
+   -2001). RAII `RecordedCb`.
+
+3. **Replay-twice surface.** Smallest first step (works TODAY, zero engine change)
+   = the **factory `Fn() -> Graph`** rebuilt per run, for the all-buffers-in-graph
+   class. Then a `RecordedGraph`/`Graph<I,O>` cache wrapper (Arc-erased, nameable
+   return type for library export; per-arity `.call` macro from spike graph_cb)
+   that records once and replays N times.
+
+4. **Slots / rebindable inputs (LAST, only if needed).** `type Slots` (HList) +
+   `Complete` gate on terminals + `bind`/`call::<Tags>` + `clUpdateMutableCommands
+   KHR` in-place arg swap (KEEP slots.rs algebra + call.rs verbs). This is the one
+   genuinely-new axis (eager `Input` is resolve-once). Defer until replay-with-
+   different-buffers is actually wanted.
+
+**KEEP from old branch:** slots.rs (whole algebra), the FFI loader + RAII +
+mutable-dispatch plumbing, RecordContext dual-backend + SoftCommand/Software
+CB, per-leaf record bodies (twins of execute), the call/bind/cached verb surface.
+**DROP (closure-era scaffolding):** trace-once-by-running-closures, the concrete/
+slot fork (Pick / SlotKernelCall-vs-Op / KernelArgBind::Dispatch second axis /
+Reuse-as-machinery) — collapses because eager `Input::Concrete` + Arc-cell Pipe
+identity already unify "known value" and "deferred handle".
+
+**Buffer-persistence crux (the real design question):** an owned
+`Input::Concrete(DeviceSlice)` survives in the graph struct across `&self`
+replays; a `Pipe`-fed (in-graph-allocated) buffer is produced at trace time and
+must be re-instantiated or kept-alive per replay. Slots/mutable-dispatch are how
+you replay against DIFFERENT buffers; plain `&self` replay reuses the SAME ones.
+
+**Recommended build order:** (1) RecordableOp sub-trait + Software backend +
+`&self` record walk (no CB FFI yet, fully testable) → (2) CB backend + FFI loader
+→ (3) cache wrapper + `.call` → (4) slots/mutable. Each green on its own.
+
 ### 🔬 Graph-reuse investigation (2026-06-24, post-cutover, READ-ONLY — no code yet)
 
 Question (Brice's next step): **can `g.sync(&ctx)?` run twice — no command
