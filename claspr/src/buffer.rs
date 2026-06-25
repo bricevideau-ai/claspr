@@ -274,6 +274,14 @@ impl<T, M: MemMode> DeviceSliceUninit<T, M> {
     }
 }
 
+impl<T, M: MemMode> crate::record::RecordableBuffer for DeviceSliceUninit<T, M> {
+    fn record_handle(&self) -> crate::record::BufHandle {
+        // The uninit dst's backing cl_mem is its inner slice's; a recorded copy
+        // writes every byte (Uninit -> Init), the same as `execute`.
+        self.inner.record_handle()
+    }
+}
+
 impl<T, M: MemMode> fmt::Debug for DeviceSliceUninit<T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeviceSliceUninit")

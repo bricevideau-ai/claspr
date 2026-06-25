@@ -233,6 +233,12 @@ impl<T, M: MemMode> MappedSliceUninit<T, M> {
     }
 }
 
+impl<T, M: MemMode> crate::record::RecordableBuffer for MappedSliceUninit<T, M> {
+    fn record_handle(&self) -> crate::record::BufHandle {
+        self.inner.record_handle()
+    }
+}
+
 impl<T, M: MemMode> fmt::Debug for MappedSliceUninit<T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MappedSliceUninit")

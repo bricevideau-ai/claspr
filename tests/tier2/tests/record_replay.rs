@@ -114,6 +114,45 @@ fn fill_then_kernel_chain_records_and_replays() {
     );
 }
 
+/// Multi-output kernel: `add_u32(a, b, out)` has three buffer args (Handle is a
+/// 3-tuple of pipes). Record over three concrete buffers, replay twice, confirm
+/// `out = a + b` and that selecting `out` from the multi-output handle works.
+#[test]
+fn multi_output_kernel_records_and_replays() {
+    use claspr::eager::DeviceOpExt;
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    let a = DeviceSlice::<u32>::alloc_zero(&ctx, N)
+        .expect("a")
+        .fill(3u32)
+        .wait()
+        .expect("seed a");
+    let b = DeviceSlice::<u32>::alloc_zero(&ctx, N)
+        .expect("b")
+        .fill(4u32)
+        .wait()
+        .expect("seed b");
+    let out = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("out");
+
+    let graph = ks.add_u32([N], a, b, out);
+    let recorded = graph.record().expect("record add");
+    recorded.replay(&ctx).expect("replay 1");
+    recorded.replay(&ctx).expect("replay 2");
+    drop(recorded);
+
+    // Consume: output is (a, b, out); select out and read it.
+    let (_a, _b, out) = graph.sync(&ctx).expect("sync add");
+    let mut readback = vec![0u32; N];
+    let r = out.read(&mut readback).wait().expect("read out");
+    let _ = r;
+    assert!(
+        readback.iter().all(|&v| v == 7),
+        "expected out all 7 (3+4), got {:?}",
+        &readback[..8]
+    );
+}
+
 /// Record a device-to-device copy; replay it twice. Source holds 5; after the
 /// recorded copy replays, the destination also holds 5.
 #[test]
@@ -140,6 +179,37 @@ fn copy_records_and_replays() {
     assert!(
         readback.iter().all(|&v| v == 5),
         "expected dst all 5 after copy, got {:?}",
+        &readback[..8]
+    );
+}
+
+/// Copy into an UNINIT destination (the Uninit->Init transition): record +
+/// replay. The recorded copy writes every byte, so the uninit dst is valid.
+#[test]
+fn copy_to_uninit_dst_records_and_replays() {
+    use claspr::eager::{DeviceOpExt, eager_copy_to};
+    let Some(ctx) = ctx() else { return };
+
+    let src = DeviceSlice::<u32>::alloc_zero(&ctx, N)
+        .expect("src")
+        .fill(9u32)
+        .wait()
+        .expect("seed");
+    let dst = DeviceSlice::<u32>::alloc_uninit(&ctx, N).expect("uninit dst");
+
+    let graph = eager_copy_to(src, dst);
+    let recorded = graph.record().expect("record copy-to-uninit");
+    recorded.replay(&ctx).expect("replay 1");
+    recorded.replay(&ctx).expect("replay 2");
+    drop(recorded);
+
+    let (_src, dst) = graph.sync(&ctx).expect("sync");
+    let mut readback = vec![0u32; N];
+    let r = dst.read(&mut readback).wait().expect("read");
+    let _ = r;
+    assert!(
+        readback.iter().all(|&v| v == 9),
+        "expected dst all 9, got {:?}",
         &readback[..8]
     );
 }

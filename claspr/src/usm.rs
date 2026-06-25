@@ -263,6 +263,15 @@ impl<T, M: MemMode> USMSliceUninit<T, M> {
     }
 }
 
+impl<T, M: MemMode> crate::record::RecordableBuffer for USMSliceUninit<T, M> {
+    fn record_handle(&self) -> crate::record::BufHandle {
+        crate::record::BufHandle {
+            mem: crate::record::MemRef::Svm(self.data.as_ptr() as *mut std::ffi::c_void),
+            byte_len: self.data.len() * std::mem::size_of::<T>(),
+        }
+    }
+}
+
 impl<T, M: MemMode> fmt::Debug for USMSliceUninit<T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("USMSliceUninit")
