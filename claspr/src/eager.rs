@@ -131,6 +131,15 @@ impl<T> Pipe<T> {
     pub fn take(&self) -> Option<(T, Deps)> {
         self.cell.lock().unwrap().take()
     }
+
+    /// Stable identity of this pipe's storage cell — the graph-edge key. Two
+    /// clones of the same pipe share it; independently-built pipes differ. Used
+    /// by the record walk to thread a producer's output handle to the consumer
+    /// that holds a clone of the same pipe (the recording twin of how `execute`
+    /// moves the value through the cell).
+    pub(crate) fn cell_id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.cell) as *const () as usize
+    }
 }
 
 // A bare `Pipe<T>` IS a single-output op — the identity node. This lets a pipe
@@ -238,6 +247,16 @@ impl<T> Input<T> {
                 "kernel: a pipe input reached the Tier-1 path — use the eager \
                  `.and_then`/`.sync` terminals for piped (graph) inputs",
             )),
+        }
+    }
+
+    /// The upstream pipe's [`cell_id`](Pipe::cell_id) if this input is pipe-fed,
+    /// else `None` (a concrete entry-leaf buffer). The record walk uses it to
+    /// look up the producer's recorded output handle.
+    pub(crate) fn pipe_cell_id(&self) -> Option<usize> {
+        match self {
+            Input::Concrete(_) => None,
+            Input::Pipe(p) => Some(p.cell_id()),
         }
     }
 }
@@ -788,14 +807,17 @@ pub struct AndThen<S, U> {
     next: U,
 }
 
-impl<S, U> AndThen<S, U> {
-    /// Borrow the upstream op (for the non-consuming record walk).
-    pub(crate) fn source_ref(&self) -> &S {
-        &self.source
-    }
-    /// Borrow the downstream op (for the non-consuming record walk).
-    pub(crate) fn next_ref(&self) -> &U {
-        &self.next
+impl<S, U> crate::record::RecordableOp for AndThen<S, U>
+where
+    S: crate::record::RecordableOp,
+    U: crate::record::RecordableOp,
+{
+    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
+        // Record source first (registers its outputs), then next (which resolves
+        // its inputs from those edges) — the same source-before-next order as
+        // `execute`.
+        self.source.record(ctx)?;
+        self.next.record(ctx)
     }
 }
 
@@ -1761,15 +1783,34 @@ pub struct Fill<T: Copy, M: MemMode> {
     out: Pipe<DeviceSlice<T, M>>,
 }
 
-impl<T: Copy, M: MemMode> Fill<T, M> {
-    /// Borrow the concrete input buffer, if this fill heads a chain (vs being
-    /// fed by an upstream pipe). For the non-consuming record walk.
-    pub(crate) fn input_buffer(&self) -> Option<&DeviceSlice<T, M>> {
-        self.buf.concrete()
-    }
-    /// The fill pattern value. For the non-consuming record walk.
-    pub(crate) fn fill_value(&self) -> T {
-        self.value
+impl<T, M> crate::record::RecordableOp for Fill<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + Fillable + Send + 'static,
+{
+    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
+        use crate::record::BufHandle;
+        use opencl3::memory::ClMem;
+        // Resolve the buffer: this op's concrete input (chain head) or the
+        // upstream producer's output (mid-chain, in-place fill).
+        let concrete = self.buf.concrete().map(|b| BufHandle {
+            mem: b.buffer().get(),
+            byte_len: b.byte_len(),
+        });
+        let (handle, waits) = ctx.resolve_input(concrete, self.buf.pipe_cell_id())?;
+        // Byte pattern of the fill value.
+        // SAFETY: `T: Copy`; read its `size_of::<T>()` bytes.
+        let pattern = unsafe {
+            std::slice::from_raw_parts(
+                (&self.value as *const T) as *const u8,
+                std::mem::size_of::<T>(),
+            )
+        }
+        .to_vec();
+        let sp = ctx.fill_buffer(handle.mem, pattern, 0, handle.byte_len, waits);
+        // Fill is in-place: its output is the same buffer, gated on this command.
+        ctx.register_output(self.out.cell_id(), handle, vec![sp]);
+        Ok(())
     }
 }
 
