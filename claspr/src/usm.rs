@@ -367,6 +367,15 @@ impl<T, M: MemMode> fmt::Debug for USMSlice<T, M> {
     }
 }
 
+impl<T, M: MemMode> crate::record::RecordableBuffer for USMSlice<T, M> {
+    fn record_handle(&self) -> crate::record::BufHandle {
+        crate::record::BufHandle {
+            mem: crate::record::MemRef::Svm(self.ptr() as *mut std::ffi::c_void),
+            byte_len: self.data.len() * std::mem::size_of::<T>(),
+        }
+    }
+}
+
 impl<T, M: MemMode> KernelArg for USMSlice<T, M> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         // Same slice-decomposition as MappedSlice: SVM pointer

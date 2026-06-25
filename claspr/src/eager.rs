@@ -1789,12 +1789,12 @@ where
     M: MemMode + Fillable + Send + 'static,
 {
     fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
-        use crate::record::BufHandle;
+        use crate::record::{BufHandle, MemRef};
         use opencl3::memory::ClMem;
         // Resolve the buffer: this op's concrete input (chain head) or the
         // upstream producer's output (mid-chain, in-place fill).
         let concrete = self.buf.concrete().map(|b| BufHandle {
-            mem: b.buffer().get(),
+            mem: MemRef::Buffer(b.buffer().get()),
             byte_len: b.byte_len(),
         });
         let (handle, waits) = ctx.resolve_input(concrete, self.buf.pipe_cell_id())?;
@@ -3829,6 +3829,33 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("copy_to".into());
+    }
+}
+
+impl<Src, Dst> crate::record::RecordableOp for CopyTo2<Src, Dst>
+where
+    Src: CopyTo<Dst> + Send + crate::record::RecordableBuffer,
+    Dst: Send + crate::record::RecordableBuffer,
+    Src::Op: Send,
+    <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
+{
+    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
+        // `record_handle` comes from the `RecordableBuffer` bound on Src/Dst.
+        // Resolve src + dst (own concrete buffer, or upstream producer edge).
+        let src_concrete = self.src.concrete().map(|b| b.record_handle());
+        let (src_h, src_w) = ctx.resolve_input(src_concrete, self.src.pipe_cell_id())?;
+        let dst_concrete = self.dst.concrete().map(|b| b.record_handle());
+        let (dst_h, dst_w) = ctx.resolve_input(dst_concrete, self.dst.pipe_cell_id())?;
+        // The copy moves `min(src,dst)` bytes (both equal in practice).
+        let size = src_h.byte_len.min(dst_h.byte_len);
+        let mut waits = src_w;
+        waits.extend(dst_w);
+        let sp = ctx.copy_buffer(src_h.mem, dst_h.mem, 0, 0, size, waits);
+        // Output is `(src, dst)`; both element pipes carry their handle, gated on
+        // the copy. (The dst is now initialised — its bytes were written.)
+        ctx.register_output(self.src_pipe.cell_id(), src_h, vec![sp]);
+        ctx.register_output(self.dst_pipe.cell_id(), dst_h, vec![sp]);
+        Ok(())
     }
 }
 

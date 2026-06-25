@@ -114,6 +114,66 @@ fn fill_then_kernel_chain_records_and_replays() {
     );
 }
 
+/// Record a device-to-device copy; replay it twice. Source holds 5; after the
+/// recorded copy replays, the destination also holds 5.
+#[test]
+fn copy_records_and_replays() {
+    use claspr::eager::eager_copy_to;
+    let Some(ctx) = ctx() else { return };
+
+    let src = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc src");
+    let src = src.fill(5u32).wait().expect("seed src");
+    let dst = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc dst");
+
+    let graph = eager_copy_to(src, dst);
+    let recorded = graph.record().expect("record copy");
+    recorded.replay(&ctx).expect("replay 1");
+    recorded.replay(&ctx).expect("replay 2");
+    drop(recorded);
+
+    // Consume the graph normally; output is (src, dst). dst must now hold 5.
+    use claspr::eager::DeviceOpExt;
+    let (_src, dst) = graph.sync(&ctx).expect("sync copy");
+    let mut readback = vec![0u32; N];
+    let r = dst.read(&mut readback).wait().expect("read dst");
+    let _ = r;
+    assert!(
+        readback.iter().all(|&v| v == 5),
+        "expected dst all 5 after copy, got {:?}",
+        &readback[..8]
+    );
+}
+
+/// SVM (OpenCL 2+): record a kernel over an SVM-backed `MappedSlice` buffer;
+/// replay twice. Skips if the device has no SVM.
+#[test]
+fn svm_kernel_records_and_replays() {
+    use claspr::{MappedSlice, SvmLevel};
+    let Some(ctx) = ctx() else { return };
+    if ctx.svm_capability() == SvmLevel::None {
+        eprintln!("SKIP: no SVM");
+        return;
+    }
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    let buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc svm");
+    let buf = buf.fill(1u32).wait().expect("seed svm");
+
+    let graph = ks.scale_u32([N], buf, 3u32);
+    let recorded = graph.record().expect("record svm kernel");
+    recorded.replay(&ctx).expect("replay 1"); // 1 -> 3
+    recorded.replay(&ctx).expect("replay 2"); // 3 -> 9
+    drop(recorded);
+
+    let scaled = graph.wait().expect("terminal"); // 9 -> 27
+    let g = scaled.map().wait().expect("map svm");
+    assert!(
+        g.iter().all(|&v| v == 27),
+        "expected all 27, got {:?}",
+        &g[..8]
+    );
+}
+
 /// Repeated replays are stable over many iterations.
 #[test]
 fn fill_replays_many_times() {

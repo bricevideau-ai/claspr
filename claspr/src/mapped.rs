@@ -776,6 +776,15 @@ impl<T, M: MemMode> Drop for MappedSlice<T, M> {
     }
 }
 
+impl<T, M: MemMode> crate::record::RecordableBuffer for MappedSlice<T, M> {
+    fn record_handle(&self) -> crate::record::BufHandle {
+        crate::record::BufHandle {
+            mem: crate::record::MemRef::Svm(self.ptr as *mut std::ffi::c_void),
+            byte_len: self.len * std::mem::size_of::<T>(),
+        }
+    }
+}
+
 impl<T, M: MemMode> KernelArg for MappedSlice<T, M> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         // Slice decomposition matches rust-gpu's

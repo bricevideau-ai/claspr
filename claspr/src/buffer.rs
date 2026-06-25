@@ -483,6 +483,15 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
     }
 }
 
+impl<T, M: MemMode> crate::record::RecordableBuffer for DeviceSlice<T, M> {
+    fn record_handle(&self) -> crate::record::BufHandle {
+        crate::record::BufHandle {
+            mem: crate::record::MemRef::Buffer(self.buffer.get()),
+            byte_len: self.byte_len(),
+        }
+    }
+}
+
 // ── from_slice / from_vec — bake in initial data at create time ────
 
 impl<T: Copy, M: MemMode> DeviceSlice<T, M> {

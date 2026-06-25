@@ -119,13 +119,14 @@ pub trait KernelSliceReadArg<T>:
     /// from the upstream slice without re-fetching from OpenCL.
     fn element_count(&self) -> usize;
 
-    /// The recording handle (raw `cl_mem` + byte length) for this buffer arg,
-    /// used by the record/replay path to bake it into a recorded kernel launch.
-    /// `Err(NotSupported)` for SVM-backed args (MappedSlice/USMSlice), which the
-    /// `cl_mem`-based command path does not record (yet).
+    /// The recording handle (memory reference + byte length) for this buffer
+    /// arg, used by the record/replay path to bake it into a recorded kernel
+    /// launch. Every buffer family (`DeviceSlice` → cl_mem, `MappedSlice` /
+    /// `USMSlice` → SVM pointer) overrides this; the default errors only for a
+    /// hypothetical arg type that has no recordable memory.
     fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
         Err(crate::Error::NotSupported(
-            "record: this kernel arg type is not recordable (SVM-backed)",
+            "record: this kernel arg type has no recordable memory handle",
         ))
     }
 }
@@ -165,7 +166,7 @@ impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadabl
     fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
         use opencl3::memory::ClMem;
         Ok(crate::record::BufHandle {
-            mem: self.buffer().get(),
+            mem: crate::record::MemRef::Buffer(self.buffer().get()),
             byte_len: self.byte_len(),
         })
     }
@@ -189,6 +190,12 @@ impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadabl
     fn element_count(&self) -> usize {
         crate::Buffer::len(self)
     }
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
+        Ok(crate::record::BufHandle {
+            mem: crate::record::MemRef::Svm(self.ptr() as *mut std::ffi::c_void),
+            byte_len: crate::Buffer::len(self) * std::mem::size_of::<T>(),
+        })
+    }
 }
 impl<
     T: Send + 'static,
@@ -208,6 +215,12 @@ impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadabl
 {
     fn element_count(&self) -> usize {
         crate::Buffer::len(self)
+    }
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
+        Ok(crate::record::BufHandle {
+            mem: crate::record::MemRef::Svm(self.ptr() as *mut std::ffi::c_void),
+            byte_len: crate::Buffer::len(self) * std::mem::size_of::<T>(),
+        })
     }
 }
 impl<

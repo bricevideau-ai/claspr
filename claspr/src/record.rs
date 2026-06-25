@@ -48,24 +48,44 @@ use std::ptr;
 
 // ── Handles + sync points: the recording twins of (value, Deps) ─────────────
 
-/// The recording twin of a buffer-typed output: a raw `cl_mem` + byte length,
-/// threaded producer→consumer through the record walk where `execute` threads
-/// the owned `DeviceSlice`. `Copy` — the buffer it refers to is owned by the
-/// source graph and must outlive the recording.
+/// Where a recorded buffer lives: a `cl_mem` (a `DeviceSlice`) or a coarse/fine
+/// SVM pointer (a `MappedSlice`/`USMSlice`). The record/replay command path
+/// dispatches the right CL entry point on this (`clEnqueueFillBuffer` vs
+/// `clEnqueueSVMMemFill`, `clSetKernelArg` vs `clSetKernelArgSVMPointer`).
+#[derive(Clone, Copy)]
+pub enum MemRef {
+    /// `cl_mem`-backed buffer (`DeviceSlice`). OpenCL 1.0+.
+    Buffer(cl_mem),
+    /// SVM-pointer-backed buffer (`MappedSlice`/`USMSlice`). OpenCL 2.0+.
+    Svm(*mut std::ffi::c_void),
+}
+
+/// The recording twin of a buffer-typed output: a memory reference + byte
+/// length, threaded producer→consumer through the record walk where `execute`
+/// threads the owned `DeviceSlice`/`MappedSlice`/`USMSlice`. `Copy` — the buffer
+/// it refers to is owned by the source graph and must outlive the recording.
 #[derive(Clone, Copy)]
 pub struct BufHandle {
-    /// The backing device memory.
-    pub mem: cl_mem,
+    /// The backing device memory (cl_mem or SVM pointer).
+    pub mem: MemRef,
     /// Size of the buffer in bytes.
     pub byte_len: usize,
 }
 
-// SAFETY: a raw `cl_mem` + length. `cl_mem` is an opaque handle into the
-// internally-synchronized OpenCL runtime; it is only used to issue commands on a
-// single queue during replay. The owning `DeviceSlice` carries the real
-// Send/Sync story; this is a borrowed view kept live by the `RecordedGraph`.
+// SAFETY: a raw `cl_mem`/SVM pointer + length, opaque handles into the
+// internally-synchronized OpenCL runtime; only used to issue commands on a
+// single queue during replay. The owning slice carries the real Send/Sync
+// story; this is a borrowed view kept live by the `RecordedGraph`.
 unsafe impl Send for BufHandle {}
 unsafe impl Sync for BufHandle {}
+
+/// A concrete device buffer that can hand out its recording [`BufHandle`].
+/// Implemented by `DeviceSlice` (cl_mem) and `MappedSlice`/`USMSlice` (SVM).
+/// Lets polymorphic leaves (the copy verb) record over any buffer family.
+pub trait RecordableBuffer {
+    /// This buffer's recording handle (memory reference + byte length).
+    fn record_handle(&self) -> BufHandle;
+}
 
 /// A structural reference to an earlier command — its index in the command list.
 /// The recording twin of a `cl_event` dependency.
@@ -90,15 +110,15 @@ struct EdgeValue {
 /// earlier commands), NOT `cl_event`s.
 enum SoftCommand {
     Fill {
-        buffer: cl_mem,
+        buffer: MemRef,
         pattern: Vec<u8>,
         offset: usize,
         size: usize,
         waits: Vec<SyncPoint>,
     },
     Copy {
-        src: cl_mem,
-        dst: cl_mem,
+        src: MemRef,
+        dst: MemRef,
         src_offset: usize,
         dst_offset: usize,
         size: usize,
@@ -142,17 +162,32 @@ impl SoftCommand {
                 offset,
                 size,
                 ..
-            } => unsafe {
-                q::enqueue_fill_buffer(
-                    queue,
-                    *buffer,
-                    pattern.as_ptr() as *const c_void,
-                    pattern.len(),
-                    *offset,
-                    *size,
-                    n,
-                    wait_ptr,
-                )
+            } => match buffer {
+                MemRef::Buffer(mem) => unsafe {
+                    q::enqueue_fill_buffer(
+                        queue,
+                        *mem,
+                        pattern.as_ptr() as *const c_void,
+                        pattern.len(),
+                        *offset,
+                        *size,
+                        n,
+                        wait_ptr,
+                    )
+                },
+                MemRef::Svm(svm) => unsafe {
+                    // SVM fill: byte offset into the SVM pointer.
+                    let dst = (*svm as *mut u8).add(*offset) as *mut c_void;
+                    q::enqueue_svm_mem_fill(
+                        queue,
+                        dst,
+                        pattern.as_ptr() as *const c_void,
+                        pattern.len(),
+                        *size,
+                        n,
+                        wait_ptr,
+                    )
+                },
             },
             SoftCommand::Copy {
                 src,
@@ -161,17 +196,39 @@ impl SoftCommand {
                 dst_offset,
                 size,
                 ..
-            } => unsafe {
-                q::enqueue_copy_buffer(
-                    queue,
-                    *src,
-                    *dst,
-                    *src_offset,
-                    *dst_offset,
-                    *size,
-                    n,
-                    wait_ptr,
-                )
+            } => match (src, dst) {
+                (MemRef::Buffer(s), MemRef::Buffer(d)) => unsafe {
+                    q::enqueue_copy_buffer(
+                        queue,
+                        *s,
+                        *d,
+                        *src_offset,
+                        *dst_offset,
+                        *size,
+                        n,
+                        wait_ptr,
+                    )
+                },
+                (MemRef::Svm(s), MemRef::Svm(d)) => unsafe {
+                    let sp = (*s as *const u8).add(*src_offset) as *const c_void;
+                    let dp = (*d as *mut u8).add(*dst_offset) as *mut c_void;
+                    q::enqueue_svm_mem_cpy(
+                        queue,
+                        opencl3::types::CL_FALSE,
+                        dp,
+                        sp,
+                        *size,
+                        n,
+                        wait_ptr,
+                    )
+                },
+                // Mixed cl_mem<->SVM copies aren't a single CL primitive; the
+                // record path only produces same-family copies.
+                _ => {
+                    return Err(Error::NotSupported(
+                        "record: mixed cl_mem/SVM copy is not a single CL command",
+                    ));
+                }
             },
             SoftCommand::NdRange {
                 kernel,
@@ -246,10 +303,10 @@ impl RecordContext {
         self.edges.insert(cell, EdgeValue { handle, waits });
     }
 
-    /// Record a buffer fill. Returns its [`SyncPoint`].
+    /// Record a buffer fill (cl_mem or SVM). Returns its [`SyncPoint`].
     pub fn fill_buffer(
         &mut self,
-        buffer: cl_mem,
+        buffer: MemRef,
         pattern: Vec<u8>,
         offset: usize,
         size: usize,
@@ -266,11 +323,12 @@ impl RecordContext {
         idx
     }
 
-    /// Record a device-to-device buffer copy. Returns its [`SyncPoint`].
+    /// Record a device-to-device copy (both cl_mem or both SVM). Returns its
+    /// [`SyncPoint`].
     pub fn copy_buffer(
         &mut self,
-        src: cl_mem,
-        dst: cl_mem,
+        src: MemRef,
+        dst: MemRef,
         src_offset: usize,
         dst_offset: usize,
         size: usize,
@@ -289,8 +347,9 @@ impl RecordContext {
     }
 
     /// Set one buffer argument on `kernel` at `arg_index`, following claspr's
-    /// `(cl_mem, len)` convention (the kernel's slice params are emitted as a
-    /// pointer + a `usize` length). Advances `arg_index` by 2.
+    /// `(pointer, len)` convention (slice params are a pointer + a `usize`
+    /// length). Dispatches `clSetKernelArg` for a `cl_mem` or
+    /// `clSetKernelArgSVMPointer` for an SVM buffer. Advances `arg_index` by 2.
     ///
     /// # Safety
     /// `kernel` must be valid and `mem` a live buffer; `arg_index`/`arg_index+1`
@@ -299,22 +358,27 @@ impl RecordContext {
         &self,
         kernel: cl_kernel,
         arg_index: &mut cl_uint,
-        mem: cl_mem,
+        mem: MemRef,
         elem_count: usize,
     ) -> Result<()> {
         use std::ffi::c_void;
-        // arg N: the cl_mem pointer.
-        unsafe {
-            cl3::kernel::set_kernel_arg(
-                kernel,
-                *arg_index,
-                std::mem::size_of::<cl_mem>(),
-                (&mem as *const cl_mem) as *const c_void,
-            )
+        // arg N: the buffer pointer (cl_mem object or raw SVM pointer).
+        match mem {
+            MemRef::Buffer(m) => unsafe {
+                cl3::kernel::set_kernel_arg(
+                    kernel,
+                    *arg_index,
+                    std::mem::size_of::<cl_mem>(),
+                    (&m as *const cl_mem) as *const c_void,
+                )
+            },
+            MemRef::Svm(p) => unsafe {
+                cl3::kernel::set_kernel_arg_svm_pointer(kernel, *arg_index, p as *const c_void)
+            },
         }
         .map_err(|s| Error::OpenCl(opencl3::error_codes::ClError(s)))?;
         *arg_index += 1;
-        // arg N+1: the element-count length (matches `DeviceSlice::set`).
+        // arg N+1: the element-count length (matches the slice `set` convention).
         unsafe {
             cl3::kernel::set_kernel_arg(
                 kernel,
