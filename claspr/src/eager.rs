@@ -446,9 +446,10 @@ pub trait DeviceOp: Send {
     ///
     /// **Why it matters.** The host seam's negative `proceed` can race a
     /// downstream blocking transfer's wait-commit on legacy Intel NEO
-    /// (lost-wakeup deadlock). The terminals fix this by gating the WHOLE graph
-    /// on a `start` user event (carried on the `ExecutionContext`) released only
-    /// after the entire graph is enqueued — so `proceed` negative can never land
+    /// (lost-wakeup deadlock). The waiting terminals (`wait_on`/`sync`, `run`)
+    /// fix this by gating the WHOLE graph on a `start` user event (carried on the
+    /// `ExecutionContext`) released only after the entire graph — including the
+    /// terminal marker — is enqueued, so `proceed` negative can never land
     /// in the enqueue/wait-commit window. That start-gate carries a small cost
     /// (one extra user event + a deferred terminal wait), so it is paid **only
     /// when this returns `true`**; pure device graphs keep the zero-overhead
@@ -700,29 +701,31 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// resolves to its [`Output`](DeviceOp::Output) once every command the
     /// chain enqueued has completed on the device.
     ///
-    /// The non-blocking analog of [`sync`](Self::sync): instead of draining
-    /// the output pipe and *blocking* on its [`Deps`], `run` runs `execute`
-    /// in [`ExecMode::Pipelined`], drains the output pipe, then enqueues an
-    /// `clEnqueueMarkerWithWaitList` over the chain's deps on the same OOO
+    /// The non-blocking analog of [`sync`](Self::sync): instead of gathering
+    /// and *blocking* on the chain's [`Deps`], `run` gathers via
+    /// [`collect`](DeviceOp::collect) in [`ExecMode::Pipelined`], then enqueues
+    /// an `clEnqueueMarkerWithWaitList` over the chain's deps on the same OOO
     /// queue and wraps it in an [`EventFuture`](crate::EventFuture) — the
     /// Tier-1 `clSetEventCallback` + `AtomicWaker` machinery wakes the
-    /// future when the marker fires. Mirrors the structure of the old
-    /// `chain_future::run_chain` terminal.
+    /// future when the marker fires. (When the chain contains a host seam, the
+    /// marker is enqueued *before* the `start` gate is released, so it is gated
+    /// like the rest of the graph.)
     ///
     /// **Host errors surface at poll time, via a worker thread.** The eager
     /// host seam (`run_host_seam`) does *not* run its closure inside `execute`:
     /// it spawns a worker thread that waits the upstream/map events, runs the
     /// closure against the borrowed view, stashes any failure into the chain's
-    /// `Arc<Mutex<Option<Error>>>` host-error slot, then signals its user event
-    /// with a negative status (which gates the queued unmap). That status
-    /// cascades into the trailing marker, so the future's marker poll resolves
-    /// `Err`; [`DeviceChainFuture::poll`] then prefers the stashed rich error
-    /// over the `Error::OpenCl(-1)` cascade. The slot is also drained on a
-    /// *successful* marker, because some drivers (pocl) don't propagate a
-    /// user-event's negative status through `clEnqueueMarkerWithWaitList` — a
-    /// non-empty slot is itself the failure signal. Only an error *submitting*
-    /// the chain (before any worker spawns) returns
-    /// [`DeviceChainFuture::Errored`] eagerly here.
+    /// `Arc<Mutex<Option<Error>>>` host-error slot, then signals its `proceed`
+    /// user event with a negative status to abort downstream device work (the
+    /// unmap is gated by a separate, always-`CL_COMPLETE` `fire` event, never by
+    /// a negative status). That status cascades into the trailing marker, so the
+    /// future's marker poll resolves `Err`; the `Running` variant's `poll` then
+    /// prefers the stashed rich error over the `Error::OpenCl(-1)` cascade. The
+    /// slot is also drained on a *successful* marker, because some drivers (pocl)
+    /// don't propagate a user-event's negative status through
+    /// `clEnqueueMarkerWithWaitList` — a non-empty slot is itself the failure
+    /// signal. Only an error *submitting* the chain (before any worker spawns)
+    /// returns [`DeviceChainFuture::Errored`] eagerly here.
     ///
     /// Arity-agnostic: like [`sync`](Self::sync), `run` gathers via
     /// [`collect`](DeviceOp::collect), so multi-output terminals (`arc_split`,
@@ -4098,25 +4101,25 @@ where
 /// - **`proceed`** gates downstream and, on success, is `CL_COMPLETE`. On error
 ///   it is completed with a negative status to abort downstream device work.
 ///
-/// ### ⚠ KNOWN-FLAKY on error: negative `proceed` is driver-unsafe
+/// ### Error path: the start-gate makes the negative `proceed` driver-safe
 ///
 /// Completing a *wait-list* user event with a negative status to abort the
-/// downstream is **not reliable across drivers** (pinned 2026-06-23 with the
-/// intercept layer + standalone C repros across legacy NEO / pocl / rusticl):
-/// - legacy Intel NEO: a blocking transfer parked on the event can lose its
-///   wakeup if the negative status lands in the wait-commit window → deadlock.
-/// - pocl: `clFinish` on a queue holding a *terminated* command can hang or
-///   segfault.
-/// - rusticl: honours it cleanly — but only because it is lazy (processes the
-///   queue at flush, after `proceed` is already set), so there is no race.
+/// downstream was historically unreliable: on legacy Intel NEO a blocking
+/// transfer parked on the event could lose its wakeup if the negative status
+/// landed in the wait-commit window → deadlock. The fix (landed, see the
+/// [`contains_host_seam`](DeviceOp::contains_host_seam) and terminal docs) is the
+/// **start-gate**: the waiting terminals (`wait_on`/`sync`, `run`) gate the WHOLE
+/// graph on a `start` user event and release it only after everything — including
+/// the terminal marker — is enqueued, so a negative `proceed` can never race a
+/// downstream command's wait-commit. NEO + rusticl are clean; the error-path
+/// tests run normally (no `#[ignore]`).
 ///
-/// Adding a third "gate" user event (worker waits it; main completes it only
-/// after the whole graph is enqueued) removes the NEO *race* but not pocl's
-/// terminated-command problem. The correct, driver-independent abort is still an
-/// open design question (host-side enqueue gating, or making a host-closure error
-/// fatal) — tracked in NOTES. Until then the dedicated error-path test is marked
-/// `#[ignore]` (flaky), while the success path (the overwhelmingly common case)
-/// is solid on all three drivers.
+/// Driver note: on pocl the concurrent error cascade exercised three distinct
+/// pocl-internal event-handling races (an already-failed dependency running
+/// anyway, a `clSetEventCallback` inline-callback use-after-free, and a
+/// concurrent double-finish of a multi-dependency event). Those are pocl bugs,
+/// fixed in `bricevideau-ai/pocl` (PRs #2214/#2215/#2216) — not claspr
+/// correctness issues. See NOTES → Concerns for the root causes.
 fn run_host_seam<O, F>(
     source_value: O,
     source_deps: Deps,
@@ -4487,9 +4490,9 @@ where
 /// chain's commands have all completed on the device (or immediately, with an
 /// error, if the chain failed to submit or any host seam returned `Err`).
 ///
-/// The eager analog of `chain_future::ChainFuture`. The host seam
-/// (`run_host_seam`) runs its closure on a worker thread and stashes any failure
-/// into the chain's host-error slot before signalling its user event with a
+/// The future returned by the async terminal [`run`](DeviceOpExt::run). The host
+/// seam (`run_host_seam`) runs its closure on a worker thread and stashes any
+/// failure into the chain's host-error slot before signalling its user event with a
 /// negative status. That status cascades into the trailing marker, so the
 /// future's marker poll resolves with `Err`; [`Running`](Self::Running) then
 /// prefers the stashed rich variant (closure `Err`, `HostPanic`) over the
@@ -4583,12 +4586,12 @@ impl<T: Unpin> std::future::Future for DeviceChainFuture<T> {
 }
 
 /// Crate-internal worker behind [`DeviceOpExt::run`]: build the
-/// [`ExecutionContext`] (default OOO queue, like `sync`), run `execute` in
-/// [`ExecMode::Pipelined`], drain the single output pipe, enqueue a marker over
-/// the chain's deps, and wrap it in an [`EventFuture`](crate::EventFuture).
+/// [`ExecutionContext`] (default OOO queue, like `sync`), gather via `collect` in
+/// [`ExecMode::Pipelined`], enqueue a marker over the chain's deps (before
+/// releasing the `start` gate, when present), and wrap it in an
+/// [`EventFuture`](crate::EventFuture).
 ///
-/// Synchronous-error paths invalidate the context's cached OOO queue, mirroring
-/// `chain_future::run_chain`'s contract.
+/// Synchronous-error paths invalidate the context's cached OOO queue.
 #[cfg(feature = "async-events")]
 fn run_eager_chain<Op>(chain: Op, context: &Context) -> DeviceChainFuture<Op::Output>
 where

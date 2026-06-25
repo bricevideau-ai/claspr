@@ -1,5 +1,7 @@
-//! Async bridge: [`LaunchOp`]'s [`IntoFuture`] impl plus the
-//! [`EventFuture`] standalone wrapper for any raw [`Event`].
+//! Async bridge: the [`EventFuture`] standalone wrapper for any raw
+//! [`Event`], plus [`LaunchOp`]'s [`IntoFuture`] impl (which resolves to
+//! [`LaunchFuture`]). The eager device-graph terminal future
+//! (`DeviceChainFuture`) lives in [`eager`](crate::eager).
 //!
 //! Both go through `clSetEventCallback(CL_COMPLETE, ...)` to flip a
 //! `done` flag and wake the future's registered waker — the same

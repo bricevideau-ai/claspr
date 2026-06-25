@@ -8,10 +8,11 @@
 //! method `Kernels::foo(grid, slice_by_value, scalar)` that returns a
 //! per-kernel `Op` struct. The Op works in two modes:
 //!
-//! - **Tier 1 (sync, explicit launcher):** `.wait(launcher) -> Output`
-//!   or `.submit(launcher) -> (Output, Event)`. Modifiers: `.after(ev)`,
-//!   `.after_all(events)`, `.profiled(cb)`.
-//! - **Tier 2 (async chain):** the Op implements `DeviceOperation`,
+//! - **Tier 1 (sync):** `.wait() -> Output` or `.submit() -> (Output, Event)`
+//!   — the launcher carries the context, so these take no argument; use
+//!   `.submit_on(launcher)` to target a specific queue. Modifiers:
+//!   `.after(ev)`, `.after_all(events)`, `.profiled(cb)`.
+//! - **Tier 2 (device-graph chain):** the Op implements `DeviceOp`,
 //!   so it composes into `.and_then` / `bundle!` / `fan_out` chains.
 //!
 //! `Output` is the slice arg(s) the kernel touches — bare for one
@@ -36,13 +37,14 @@
 //!
 //! fn main() -> claspr::Result<()> {
 //!     let ctx = claspr::Context::any()?;
-//!     let kernels = kernels::Kernels::load(&ctx)?;
+//!     let kernels = kernels::Kernels::load_from(&ctx, kernels::SPV_BYTES)?;
 //!     let mut data: Vec<u32> = (1..=1024).collect();
-//!     let mut buf = claspr::DeviceSlice::alloc_zero(&ctx, data.len())?;
-//!     buf.write(&data).wait(&ctx)?;
-//!     // Tier 1: slices move in, come back out of `.wait()`.
-//!     let buf = kernels.collatz_kernel([data.len()], buf).wait(&ctx)?;
-//!     buf.read(&mut data).wait(&ctx)?;
+//!     let buf = claspr::DeviceSlice::<u32>::alloc_zero(&ctx, data.len())?;
+//!     // Tier 1 terminals take no launcher arg (the op carries the ctx);
+//!     // slices move in and come back out of `.wait()`.
+//!     let buf = buf.write(data.clone()).wait()?;
+//!     let buf = kernels.collatz_kernel([data.len()], buf).wait()?;
+//!     buf.read(&mut data).wait()?;
 //!     Ok(())
 //! }
 //! ```
@@ -80,10 +82,12 @@ use syn::{
 ///   SPIR-V built-in inputs filled in by the OpenCL runtime, not
 ///   host-side arguments.
 /// - A parameter `#[spirv(cross_workgroup)] name: &mut [T]` or `&[T]`
-///   is **translated** to `name: ::claspr::DeviceSlice<T>` (owned by
-///   the emitted Op; flows through `Output`).
-/// - A parameter `&Image!(...)` is translated to `::claspr::Image2D<A, F>`
-///   (also owned and threaded through `Output`).
+///   is **translated** to a generic arg bounded by
+///   `KernelSliceRead[Write]Arg<T>` (accepts `DeviceSlice`/`MappedSlice`/
+///   `USMSlice` by value; flows through `Output`). See `ParamRole::Slice`.
+/// - A parameter `&Image!(...)` is translated to a generic arg bounded by
+///   the matching `KernelImage<dim>D<Access>Arg<family>` trait (1D/2D/3D/
+///   Buffer, arrayed variants), also threaded through `Output`.
 /// - Any other parameter is passed through verbatim — used for scalar
 ///   `T` arguments via the `claspr::scalar_arg!`-emitted `KernelArg`
 ///   impl. Scalars do *not* flow through `Output`.
@@ -116,10 +120,11 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///    build time — every `use`, `const`, `static`, helper `fn`, type
 ///    def, even nested modules.
 /// 2. Appends two items **inside** the module body for the host build:
-///    `include!(concat!(env!("OUT_DIR"), "/kernels.rs"));` (which
-///    pulls in the build-script-generated `Kernels` struct and
-///    `Kernels::load`) and a `pub fn kernels(ctx: &Context) -> Result<Kernels>`
-///    convenience wrapper. Calling code reads `gpu::kernels(&ctx)?`,
+///    `include!(concat!(env!("OUT_DIR"), "/<modname>.rs"));` (which
+///    pulls in the build-script-generated `Kernels` struct +
+///    `SPV_BYTES`/`ENTRY_POINTS` + `Kernels::{bind,load_from,load}`) and a
+///    `pub fn kernels(ctx: &Context) -> Result<Kernels>` convenience wrapper
+///    (which calls `Kernels::load_from(ctx, SPV_BYTES)`). Calling code reads `gpu::kernels(&ctx)?`,
 ///    and `#[claspr::kernel]` defaults to targeting `Kernels` —
 ///    relative to where the macro is invoked, which is inside the
 ///    same module.
@@ -148,7 +153,7 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// // host code:
 /// let kernels = gpu::kernels(&ctx)?;
-/// kernels.raymarch(&ctx, /* ... */)?;
+/// kernels.raymarch([width, height], img, /* ... */).wait()?;
 /// ```
 ///
 /// Items at the same scope as the device module that aren't tagged

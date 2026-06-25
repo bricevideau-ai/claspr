@@ -545,10 +545,10 @@ impl IntoLaunchSpec for ([usize; 3], [usize; 3]) {
 
 /// Wall-clock kernel runtime as reported by OpenCL command profiling.
 ///
-/// Returns `None` if either profiling counter is unavailable (e.g. the
-/// command queue was created without `CL_QUEUE_PROFILING_ENABLE`, which
-/// claspr always sets — so `None` here generally signals the device
-/// dropped the profiling info).
+/// Returns `None` if either profiling counter is unavailable. The common
+/// case is that profiling was not enabled: it is opt-in (default off), so the
+/// queue is created without `CL_QUEUE_PROFILING_ENABLE` unless you build the
+/// context with [`ContextBuilder::profiling(true)`](crate::context::ContextBuilder::profiling).
 pub fn profiling_duration(event: &Event) -> Option<Duration> {
     let start = event.profiling_command_start().ok()?;
     let end = event.profiling_command_end().ok()?;

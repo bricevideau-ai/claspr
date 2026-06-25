@@ -57,7 +57,7 @@
 //! fn main() -> claspr::Result<()> {
 //!     let ctx = Context::any()?;
 //!     let kernels = gpu::kernels(&ctx)?;
-//!     // kernels.collatz_kernel([n], buf).wait(&ctx)?;
+//!     // kernels.collatz_kernel([n], buf).wait()?;
 //!     Ok(())
 //! }
 //! ```
@@ -98,7 +98,7 @@
 //! let kernels = gpu::Kernels::load_from(&ctx, generated::SPV_BYTES)?;
 //! // Or from any other source (file, network, generated):
 //! // let kernels = gpu::Kernels::load_from(&ctx, &std::fs::read("kernel.spv")?)?;
-//! kernels.collatz_kernel([n], buf).wait(&ctx)?;
+//! kernels.collatz_kernel([n], buf).wait()?;
 //! ```
 //!
 //! ## Runtime-loaded SPIR-V (no build script at all)

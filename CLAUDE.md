@@ -20,6 +20,14 @@ examples/mandelbrot-kernel/   kernel-as-library — Mandelbrot image kernel.
 examples/sobel-kernel/        kernel-as-library — Sobel edge detector.
 examples/image-pipeline/      bin that depends on both kernel libraries
                               above and chains them.
+examples/two-device/          multi-device routing (on_device_at /
+                              transfer_to_device_at).
+examples/async-pipeline/      .run().await async-terminal demo.
+examples/batch-inference/     Tier 2 device-graph batch demo.
+examples/spv-introspect/      SPIR-V introspection helper demo.
+
+tests/kernels, tests/image-kernels, tests/explicit-compile,
+tests/tier1, tests/tier2   integration-test crates (also workspace members).
 ```
 
 ## How the single-source pipeline fits together
@@ -27,9 +35,9 @@ examples/image-pipeline/      bin that depends on both kernel libraries
 User writes one source file (e.g. `examples/collatz/src/main.rs`). It contains:
 
 - **Top-level host code**: `use claspr::*`, `fn main`, optional `#[cfg(test)] mod tests`. No `mod compiled` — the device macro injects the include for you.
-- **`#[claspr::device] mod gpu { ... }`** — the device side, in a single tagged module. Inside (user-written): kernel-only `use` statements (cfg-gated to `target_arch = "spirv"` if the host doesn't depend on those crates), `const`s, helper `fn`s, optional `mod foo;` declarations to split the module across files, and one or more `#[claspr::kernel]` entry points (defaults to `kernels = Kernels` — the relative-path `Kernels` resolves to the one the macro injects below). Inside (macro-injected, at the end of the module body): `include!(concat!(env!("OUT_DIR"), "/<modname>.rs"))` (brings `Kernels` + `Kernels::load` + `SPV_BYTES` + `ENTRY_POINTS` in) and a `pub fn kernels(ctx) -> Result<Kernels>` convenience wrapper.
+- **`#[claspr::device] mod gpu { ... }`** — the device side, in a single tagged module. Inside (user-written): kernel-only `use` statements (cfg-gated to `target_arch = "spirv"` if the host doesn't depend on those crates), `const`s, helper `fn`s, optional `mod foo;` declarations to split the module across files, and one or more `#[claspr::kernel]` entry points (defaults to `kernels = Kernels` — the relative-path `Kernels` resolves to the one the macro injects below). Inside (macro-injected, at the end of the module body): `include!(concat!(env!("OUT_DIR"), "/<modname>.rs"))` (brings `Kernels` + `SPV_BYTES` + `ENTRY_POINTS` + `Kernels::{bind,load_from,load}` in) and a `pub fn kernels(ctx) -> Result<Kernels>` convenience wrapper (which calls `Kernels::load_from(ctx, SPV_BYTES)`).
 - The user does *not* need to import `spirv` from spirv-std — `claspr-build`'s preamble injects `use spirv_std::spirv;` because every translated `#[claspr::kernel]` becomes `#[spirv(kernel)]` and the `spirv` proc-macro must be in scope. Anything else (`Image`, `cl::*`, `opencl_std`, `num_traits::Float`, …) the user imports themselves.
-- Calling code reads `let kernels = gpu::kernels(&ctx)?;` then `kernels.collatz_kernel(&ctx, ...)`. Multiple `#[claspr::device]` modules in the same file each scope their own `Kernels`/`kernels()` — no collisions.
+- Calling code reads `let kernels = gpu::kernels(&ctx)?;` then `kernels.collatz_kernel([N], buf, ...).wait()?` (the typed launcher carries the context; no `&ctx` argument, and a terminal like `.wait()` / `.submit()` runs it). Multiple `#[claspr::device]` modules in the same file each scope their own `Kernels`/`kernels()` — no collisions.
 - The build script writes one `OUT_DIR/<modname>.rs` per device module it finds — the macro's injected include matches the module ident, so module name is the only piece of coupling between the build-script side and the host source. Top-level `#[claspr::kernel]` / `#[claspr::device]` items outside any module are rejected: organise kernel code into a module so the per-module file naming has something to key off.
 
 Two compilation paths run on the same source:
@@ -37,13 +45,13 @@ Two compilation paths run on the same source:
 1. **Host build** (cargo's normal flow). The proc-macros do the heavy lifting:
    - `#[claspr::device]` on a fn → `#[allow(dead_code, unused_imports)] <fn>` (no semantic change beyond the warning suppression).
    - `#[claspr::device]` on a mod → re-emits the user's module with two extra items appended *inside* the body: an `include!(concat!(env!("OUT_DIR"), "/<modname>.rs"))` (brings `Kernels`/`Kernels::load` into the module's scope) and a `pub fn kernels(&ctx) -> Result<Kernels>` convenience wrapper. The whole module is wrapped in `#[allow(dead_code, unused_imports)]`.
-   - `#[claspr::kernel(kernels = path)]` (path defaults to `Kernels` — relative; resolves to the device module's local `Kernels`) parses the kernel-style fn signature, drops `#[spirv(<builtin>)]` params, translates `#[spirv(cross_workgroup)] &mut [T]` → `&claspr::DeviceSlice<T>` and `&Image!(...)` → `&claspr::Image2DRgba8`, then emits `impl path { fn name(&self, ctx, grid, args...) }`. The impl ends up inside the same module, attached to the same `Kernels` struct the include brought in. The original kernel body is discarded on the host side.
+   - `#[claspr::kernel(kernels = path)]` (path defaults to `Kernels` — relative; resolves to the device module's local `Kernels`) parses the kernel-style fn signature, drops `#[spirv(<builtin>)]` params, and translates the device-pointer/image params into *generic* host args: `#[spirv(cross_workgroup)] &mut [T]` → a generic bound by `KernelSliceRead[Write]Arg<T>` (accepts `DeviceSlice`/`MappedSlice`/`USMSlice` by value), and `&Image!(...)` → a generic bound by the matching `KernelImage<dim>D<Access>Arg<family>` trait (1D/2D/3D/Buffer, arrayed variants). It then emits `impl path { fn name(&self, grid, args...) }` (the launcher carries the context). The impl ends up inside the same module, attached to the same `Kernels` struct the include brought in. The original kernel body is discarded on the host side.
 2. **Kernel build** (driven by `examples/<name>/build.rs` calling `claspr_build::compile_from_host(src).opencl12().write()`):
    - Reads the source file, parses with syn.
    - Discovers every top-level `Item::Mod` with `#[claspr::device]`. Top-level `Item::Fn` with `#[claspr::kernel]` / `#[claspr::device]` (no enclosing module) is an error — there's no module name to use for the output file.
    - For each device module, lifts its body into a fresh kernel sub-crate at `OUT_DIR/claspr_kernel_<modname>/`. `mod foo;` declarations inside the body are followed using rustc's standard file-resolution rules (`<dir>/<name>.rs` then `<dir>/<name>/mod.rs`); `cargo:rerun-if-changed` is emitted for each followed file. Inside the lifted body, translates `#[claspr::kernel(...)]` → `#[spirv(kernel)]` and strips `#[claspr::device]`. Wrapper preamble injects `#![cfg_attr(target_arch = "spirv", no_std)]`, `#![allow(unused_imports)]`, and `use spirv_std::spirv;`.
    - Writes a `Cargo.toml` for the sub-crate (with `[workspace]` so cargo doesn't try to attach it to the host workspace; spirv-std + glam deps hardcoded at the rust-gpu branch we depend on).
-   - Runs `SpirvBuilder` on each sub-crate, then writes the `Kernels { ... }` struct (one `pub` field per entry point + `Kernels::load(&Context)`) to `OUT_DIR/<modname>.rs`. The matching `#[claspr::device]` on the host side `include!()`s this exact path.
+   - Runs `SpirvBuilder` on each sub-crate, then writes the `Kernels` struct (holding the built program + context; constructed via `bind`/`load_from`/`load`) plus one typed launcher method per entry point, to `OUT_DIR/<modname>.rs`. The matching `#[claspr::device]` on the host side `include!()`s this exact path.
 
 ## Library-crate composition
 
@@ -55,7 +63,7 @@ A claspr kernel can be packaged as its own library crate (`pub mod gpu`, build.r
 ## Key files
 
 - `claspr-build/src/lib.rs` — both `compile()` (separate kernel crate) and `compile_from_host()` (single-source extraction) live here. The translation logic (`translate_and_inline`, `resolve_module_file`, `is_claspr_kernel_attr`, `is_claspr_device_attr`) is the most-likely-to-change surface as new kernel patterns surface; multi-file resolution rules also live there.
-- `claspr-macros/src/lib.rs` — `#[kernel]` + `#[device]`. The kernel signature → host wrapper translation lives in `classify_param`, `translate_cross_workgroup_ty`, `is_image_param`. The device-on-mod injection (include! + `kernels()` fn) lives in the `device` proc-macro body.
+- `claspr-macros/src/lib.rs` — `#[kernel]` + `#[device]`. The kernel signature → host wrapper translation lives in `classify_param`, `classify_image_param`, `slice_element_ty` (plus `parse_image_tokens`/`read_image_access_attr` for images). The device-on-mod injection (include! + `kernels()` fn) lives in the `device` proc-macro body.
 - `claspr/src/launch.rs` — `KernelArg` / `KernelArgs` / `LaunchSpec` / `IntoLaunchSpec`. Tuple impls are macro-emitted up to arity 8.
 - `examples/raymarch/src/main.rs` + `src/gpu/scene.rs` + `src/gpu/shading.rs` — multi-file device-module reference. Cross-file `use super::scene::...` works because the build script preserves module structure during inlining.
 - `examples/image-pipeline/src/main.rs` — library-composition reference. Pulls two kernel libraries and chains their launches.
@@ -99,7 +107,6 @@ On macOS the system OpenCL framework picks up automatically; no `OCL_ICD_VENDORS
 - **Library-crate spirv-std imports must be cfg-gated** if the library doesn't pull spirv-std as a regular host dep. The proc-macro discards builtin params and kernel bodies before host name resolution touches the spirv-std names, so `#[cfg(target_arch = "spirv")] use spirv_std::{...}` is enough — host doesn't need them. Helpers that take device-only parameter types (`fn foo(img: &Image!(...))`) can't be host-callable in this pattern; restructure to take primitive args, or switch to the "mixed kernel + host library" pattern (regular spirv-std host dep).
 - **Builtin param types are never name-resolved on host.** The `_id: ::glam::USizeVec3` in a `#[spirv(global_invocation_id)]` param doesn't require glam to be a host dep — the proc-macro discards the whole parameter before name resolution touches the type.
 - **Generated kernel `Cargo.toml` must have `[workspace]`** — without it, cargo tries to associate the OUT_DIR-located crate with the host workspace and refuses (`current package believes it's in a workspace when it's not`).
-- **`Kernel` field name == method name** on `Kernels`. The generated impl block adds a method named after the kernel; the field is also named after the kernel (private). Rust disambiguates by syntax (`kernels.foo` is the field, `kernels.foo(...)` is the method). Don't try to make them different.
 - **`librustc_codegen_spirv.so` collision warning** when running `cargo build --workspace`: cargo issue #6313 (workspace-level dylib build-dep collision). Building one example at a time (`cargo build -p collatz-example`) is silent. Forward-looking warning, not currently a hard error.
 
 ## Backlog (deferred)
