@@ -640,6 +640,54 @@ slots/bind/call, delete old closure trait. **Observe what (if anything) the new
 paradigm CANNOT express** — Brice's explicit interest; surface it when hit, don't
 presume.
 
+### 🔬 Graph-reuse investigation (2026-06-24, post-cutover, READ-ONLY — no code yet)
+
+Question (Brice's next step): **can `g.sync(&ctx)?` run twice — no command
+buffers, no slots yet?** Investigated the LANDED eager engine (agent + direct
+verification). Findings:
+
+- **Single-use is a COMPILE-TIME guarantee, not a runtime bug.** Every terminal
+  (`sync`/`wait_on`/`submit_on`/`run`) and `execute`/`collect`/`into_output`
+  takes `self` by value (eager.rs:391/410/427/562/654/735), so a second
+  `g.sync()` is use-after-move — it won't compile. So "run twice" is an API to
+  ADD, not a bug to fix.
+- **The DeviceSlice-ownership crux defines the boundary.** Buffers from in-graph
+  leaves (`upload`/`alloc_*`/`value`) are allocated FRESH each `execute`
+  (Upload→`DeviceSlice::from_slice` ~1893; AllocZero→`alloc_zero` ~1699), so a
+  rebuilt graph re-allocates. But a CAPTURED concrete `DeviceSlice`
+  (`Input::Concrete`, `lift(buf)`, a buffer handed to a kernel) is moved out by
+  `Input::resolve` (~195) and `DeviceSlice` is **not `Clone`** (buffer.rs:128) —
+  can never be re-run without re-supply. Host seeds (`Vec` for upload, scalars
+  for fill) are cheap to clone.
+- **`AndThenHost` holds an `FnOnce`** (Option<F>, ~4060) → permanently rules out
+  any `Clone`/`&self`-reuse of host-seam graphs.
+- **Already reuse-friendly:** `AndThen{source,next}` stores BUILT ops (eager,
+  closure-free, ~486); `describe()` is a non-consuming `&self` walk (but emits
+  only a flat name `Vec<String>` — no identity/edges/operands, so it can't drive
+  a re-interpreter); `Pipe` is `Arc`-shared; `Context` is `Clone`.
+
+**Approaches ranked:** (a) `&self`-execute = effectively a rewrite, blocked by
+`FnOnce` host seams + non-Clone DeviceSlice — rejected. (b) **factory
+`Fn() -> Graph` rebuilt per run = smallest, matches the long-standing decision
+(reuse is a factory, not Clone).** Works TODAY with zero engine change for the
+upload→kernels→download class: `let make = || upload(v.clone()).and_then(...);
+make().sync(&ctx)?; make().sync(&ctx)?;`. Optional ~15-LOC `Pipeline { factory:
+Arc<dyn Fn()->Op + Send + Sync> }` wrapper = the `Arc`-shareable, CB-free "walk
+DAG" tier of the eventual `.call()` design. (c) `describe`-driven re-interpreter
+= infeasible without growing `describe` into a reified IR (bigger lift; overlaps
+the deferred CB IR).
+
+**Recommendation / smallest first step:** ship the factory pattern for the
+"all buffers in-graph-allocated" class (works now); optionally add the thin
+`Pipeline` wrapper as the explicit eager/non-CB arm of `.call()`.
+
+**Decisions needed from Brice:** (1) accept the natural boundary (only
+in-graph-allocated buffers re-runnable; captured `DeviceSlice` needs re-supply,
+maybe via `Arc<DeviceSlice>` later)? (2) ship the `Pipeline` wrapper now, or keep
+reuse as a documented closure idiom until `.call()` lands? (3) build this as the
+explicit non-CB tier of the CB `.call()` design so it's not throwaway? (4) leave
+`describe` as a name list, or grow it into an IR (serves both re-run + CB export)?
+
 ### Command-buffer-backed graphs (design + spikes, 2026-06-12..15)
 
 **Goal.** When the platform supports `cl_khr_command_buffer`, record a
