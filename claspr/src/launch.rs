@@ -118,6 +118,16 @@ pub trait KernelSliceReadArg<T>:
     /// chain combinators that need to size a downstream allocation
     /// from the upstream slice without re-fetching from OpenCL.
     fn element_count(&self) -> usize;
+
+    /// The recording handle (raw `cl_mem` + byte length) for this buffer arg,
+    /// used by the record/replay path to bake it into a recorded kernel launch.
+    /// `Err(NotSupported)` for SVM-backed args (MappedSlice/USMSlice), which the
+    /// `cl_mem`-based command path does not record (yet).
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
+        Err(crate::Error::NotSupported(
+            "record: this kernel arg type is not recordable (SVM-backed)",
+        ))
+    }
 }
 
 /// The kernel may both read and write through this slice arg — the
@@ -151,6 +161,13 @@ impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadabl
 {
     fn element_count(&self) -> usize {
         crate::Buffer::len(self)
+    }
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
+        use opencl3::memory::ClMem;
+        Ok(crate::record::BufHandle {
+            mem: self.buffer().get(),
+            byte_len: self.byte_len(),
+        })
     }
 }
 impl<
@@ -242,6 +259,9 @@ impl<T: Send + Sync + 'static, M: crate::access::MemMode + crate::access::Kernel
 {
     fn element_count(&self) -> usize {
         crate::Buffer::len(&**self)
+    }
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
+        (**self).record_handle()
     }
 }
 // Deliberately no `KernelSliceReadWriteArg` impl — see comment above.

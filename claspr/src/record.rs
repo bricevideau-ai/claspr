@@ -288,6 +288,72 @@ impl RecordContext {
         idx
     }
 
+    /// Set one buffer argument on `kernel` at `arg_index`, following claspr's
+    /// `(cl_mem, len)` convention (the kernel's slice params are emitted as a
+    /// pointer + a `usize` length). Advances `arg_index` by 2.
+    ///
+    /// # Safety
+    /// `kernel` must be valid and `mem` a live buffer; `arg_index`/`arg_index+1`
+    /// must be the pointer/length slots of a slice parameter.
+    pub unsafe fn set_buffer_arg(
+        &self,
+        kernel: cl_kernel,
+        arg_index: &mut cl_uint,
+        mem: cl_mem,
+        elem_count: usize,
+    ) -> Result<()> {
+        use std::ffi::c_void;
+        // arg N: the cl_mem pointer.
+        unsafe {
+            cl3::kernel::set_kernel_arg(
+                kernel,
+                *arg_index,
+                std::mem::size_of::<cl_mem>(),
+                (&mem as *const cl_mem) as *const c_void,
+            )
+        }
+        .map_err(|s| Error::OpenCl(opencl3::error_codes::ClError(s)))?;
+        *arg_index += 1;
+        // arg N+1: the element-count length (matches `DeviceSlice::set`).
+        unsafe {
+            cl3::kernel::set_kernel_arg(
+                kernel,
+                *arg_index,
+                std::mem::size_of::<usize>(),
+                (&elem_count as *const usize) as *const c_void,
+            )
+        }
+        .map_err(|s| Error::OpenCl(opencl3::error_codes::ClError(s)))?;
+        *arg_index += 1;
+        Ok(())
+    }
+
+    /// Set one scalar (by-value) argument on `kernel` at `arg_index` from its
+    /// raw bytes, then advance `arg_index` by 1.
+    ///
+    /// # Safety
+    /// `kernel` must be valid and `bytes` must be the correct size/layout for
+    /// the scalar parameter at `arg_index`.
+    pub unsafe fn set_scalar_arg(
+        &self,
+        kernel: cl_kernel,
+        arg_index: &mut cl_uint,
+        bytes: &[u8],
+    ) -> Result<()> {
+        use std::ffi::c_void;
+        unsafe {
+            cl3::kernel::set_kernel_arg(
+                kernel,
+                *arg_index,
+                bytes.len(),
+                bytes.as_ptr() as *const c_void,
+            )
+        }
+        .map_err(|s| Error::OpenCl(opencl3::error_codes::ClError(s)))?;
+        *arg_index += 1;
+        Ok(())
+    }
+
     /// Record an ND-range kernel launch. The kernel is retained for the
     /// recording's lifetime and released on drop. Returns its [`SyncPoint`].
     ///

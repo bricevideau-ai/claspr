@@ -137,7 +137,7 @@ impl<T> Pipe<T> {
     /// by the record walk to thread a producer's output handle to the consumer
     /// that holds a clone of the same pipe (the recording twin of how `execute`
     /// moves the value through the cell).
-    pub(crate) fn cell_id(&self) -> usize {
+    pub fn cell_id(&self) -> usize {
         std::sync::Arc::as_ptr(&self.cell) as *const () as usize
     }
 }
@@ -253,7 +253,7 @@ impl<T> Input<T> {
     /// The upstream pipe's [`cell_id`](Pipe::cell_id) if this input is pipe-fed,
     /// else `None` (a concrete entry-leaf buffer). The record walk uses it to
     /// look up the producer's recorded output handle.
-    pub(crate) fn pipe_cell_id(&self) -> Option<usize> {
+    pub fn pipe_cell_id(&self) -> Option<usize> {
         match self {
             Input::Concrete(_) => None,
             Input::Pipe(p) => Some(p.cell_id()),

@@ -154,6 +154,8 @@ pub use host_view::{
     ReleaseDeviceSliceOp, ReleaseMappedSliceOp,
 };
 pub use mappable::{DeviceSliceMapHandle, Mappable};
+pub use opencl3::types::cl_uint;
+pub use record::{BufHandle, RecordContext, RecordExt, RecordableOp, RecordedGraph};
 pub use transfer::UploadSource;
 
 #[cfg(feature = "async-events")]
