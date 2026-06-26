@@ -503,6 +503,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     let mut op_arg_pass: Vec<TokenStream2> = Vec::new();
     let mut output_names: Vec<TokenStream2> = Vec::new();
     let mut output_types: Vec<TokenStream2> = Vec::new();
+    // Per-output HOME idents (`__claspr_home{n}`), in output order. A kernel
+    // writes in place to its buffer args, so each output buffer's home is the
+    // home of the input it was lent from — threaded through to the output pipe so
+    // the run's `Checkout` re-arms exactly the right concrete cell. This is what
+    // makes same-typed multi-buffer kernels (`add(a, b, out)`) re-arm correctly.
+    let mut output_homes: Vec<TokenStream2> = Vec::new();
     // Record-path codegen (one statement per arg, in signature order): resolve a
     // slice arg's buffer from the record edge-map and set it on the kernel, or
     // set a scalar's bytes. `has_image_param` gates whether the kernel gets a
@@ -562,16 +568,20 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 method_params.push(quote! { #pname: #iid_tt });
                 arg_types.push(quote! { ::claspr::Input<#gid_tt> });
                 op_field_init.push(quote! { ::claspr::ToInput::to_input(#pname) });
-                // Eager path: resolve to (buffer, deps); collect the deps ident
-                // (named by the slice index so it's a valid, unique ident).
+                // Eager path: resolve to (buffer, deps, home); collect the deps +
+                // home idents (named by the slice index so they're valid, unique
+                // idents). In-place write → the buffer's home threads to its output.
                 let deps_ident = quote::format_ident!("__claspr_deps{}", slice_gen_idx - 1);
+                let home_ident = quote::format_ident!("__claspr_home{}", slice_gen_idx - 1);
                 input_resolve_eager.push(quote! {
-                    let (#pname, #deps_ident) = ::claspr::Input::resolve(#pname, ec)?;
+                    let (#pname, #deps_ident, #home_ident) =
+                        ::claspr::Input::resolve_home(#pname, ec)?;
                 });
                 input_deps_idents.push(quote! { #deps_ident });
                 op_arg_pass.push(quote! { &#pname });
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
+                output_homes.push(quote! { #home_ident });
 
                 // Record path: resolve this slice's buffer (its own concrete
                 // input or the upstream producer's edge), set it as the kernel's
@@ -644,13 +654,16 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 arg_types.push(quote! { ::claspr::Input<#iid_tt> });
                 op_field_init.push(quote! { ::claspr::Input::from(#pname) });
                 let deps_ident = quote::format_ident!("__claspr_imgdeps{}", image_gen_idx - 1);
+                let home_ident = quote::format_ident!("__claspr_imghome{}", image_gen_idx - 1);
                 input_resolve_eager.push(quote! {
-                    let (#pname, #deps_ident) = ::claspr::Input::resolve(#pname, ec)?;
+                    let (#pname, #deps_ident, #home_ident) =
+                        ::claspr::Input::resolve_home(#pname, ec)?;
                 });
                 input_deps_idents.push(quote! { #deps_ident });
                 op_arg_pass.push(quote! { &#pname });
                 output_names.push(pname.clone());
                 output_types.push(iid_tt);
+                output_homes.push(quote! { #home_ident });
             }
             ParamRole::Scalar { name: pname, ty } => {
                 host_names.push(pname.clone());
@@ -750,6 +763,32 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         ),
     };
 
+    // Single-output home expression: the lone buffer/image output's home (for a
+    // zero-output kernel there is nothing to return → `None`). Used by the
+    // single-output `execute` to thread the home onto the output pipe.
+    let single_output_home: TokenStream2 = match output_homes.len() {
+        1 => output_homes[0].clone(),
+        _ => quote! { ::core::option::Option::None },
+    };
+
+    // `wait()` terminal: turn the `Checkouts` (single `Checkout` or a per-output
+    // tuple) back into the bare `#output_ty` by severing each via `into_inner`.
+    let wait_into_output: TokenStream2 = match output_names.len() {
+        0 => quote! { { let _ = __claspr_checkouts; () } },
+        1 => quote! { ::claspr::Checkout::into_inner(__claspr_checkouts) },
+        _ => {
+            let co_idents: Vec<syn::Ident> = (0..output_names.len())
+                .map(|i| quote::format_ident!("__claspr_wco{}", i))
+                .collect();
+            quote! {
+                {
+                    let ( #(#co_idents),* ) = __claspr_checkouts;
+                    ( #( ::claspr::Checkout::into_inner(#co_idents) ),* )
+                }
+            }
+        }
+    };
+
     // Multi-output flag: a kernel with >1 output buffer stores each output in
     // its OWN element pipe (move-once storage) rather than a single
     // `Pipe<Output>`. This lets a downstream `and_then(|(pa, pb, pc)| …)`
@@ -761,6 +800,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `multi_output`.
     let op_pipe_fields: Vec<syn::Ident> = (0..output_names.len())
         .map(|i| quote::format_ident!("__claspr_op{}", i))
+        .collect();
+    // Per-output checkout var idents for the multi-output `gather_checkouts`.
+    let op_co_idents: Vec<syn::Ident> = (0..output_names.len())
+        .map(|i| quote::format_ident!("__claspr_co{}", i))
         .collect();
 
     let kernels_path = &args.kernels;
@@ -855,10 +898,15 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         let handle_expr = quote! {
             ( #( ::core::clone::Clone::clone(&self.#op_pipe_fields) ),* )
         };
+        // Per-output Checkouts tuple type: one independent `Checkout` per buffer
+        // output, each with its own home → same-typed multi-buffer kernels
+        // (`add(a, b, out)`) re-arm every concrete cell correctly.
+        let checkouts_ty = quote! { ( #( ::claspr::Checkout<#output_types> ),* ) };
         quote! {
             impl #gen_decl ::claspr::DeviceOp for Op #gen_use {
                 type Output = #output_ty;
                 type Handle = #handle_ty;
+                type Checkouts = #checkouts_ty;
 
                 fn output_pipe(&self) -> ::claspr::Pipe<#output_ty> {
                     // Multi-output storage is the per-element pipes; this single
@@ -913,9 +961,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     // terminal reconstruct gathers from all.
                     let __claspr_dep = ::claspr::wrap_event(event);
                     #(
-                        self.#op_pipe_fields.put(
+                        self.#op_pipe_fields.put_home(
                             #output_names,
                             ::std::vec![::core::clone::Clone::clone(&__claspr_dep)],
+                            #output_homes,
                         );
                     )*
                     ::core::result::Result::Ok(())
@@ -943,6 +992,32 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         __claspr_deps.extend(__claspr_d);
                     )*
                     ::core::result::Result::Ok((( #(#output_names),* ), __claspr_deps))
+                }
+
+                fn gather_checkouts(
+                    &self,
+                    ec: &::claspr::ExecutionContext<'_>,
+                    mode: ::claspr::ExecMode,
+                ) -> ::claspr::Result<(Self::Checkouts, ::claspr::Deps)> {
+                    // Scatter via `execute`, then drain each element pipe (value +
+                    // HOME) into its OWN `Checkout`, so each output buffer re-arms
+                    // its exact concrete cell on drop (the same-typed-args case the
+                    // old single-guard / type-match design could not handle).
+                    #(
+                        let #op_pipe_fields = ::core::clone::Clone::clone(&self.#op_pipe_fields);
+                    )*
+                    self.execute(ec, mode)?;
+                    let mut __claspr_deps: ::claspr::Deps = ::std::vec::Vec::new();
+                    #(
+                        let (#output_names, __claspr_d, __claspr_h) = #op_pipe_fields
+                            .take_home()
+                            .ok_or(::claspr::Error::NotSupported(
+                                "eager graph: terminal op produced no output",
+                            ))?;
+                        __claspr_deps.extend(__claspr_d);
+                        let #op_co_idents = ::claspr::Checkout::new(#output_names, __claspr_h);
+                    )*
+                    ::core::result::Result::Ok((( #(#op_co_idents),* ), __claspr_deps))
                 }
 
                 fn describe(&self, out: &mut ::std::vec::Vec<::std::string::String>) {
@@ -1005,11 +1080,15 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     )
                     .with_state(raw_deps, profile_cb)
                     .submit()?;
-                    // Move the (lent) output buffer(s) into the pipe with this
-                    // op's completion event as the downstream wait-list.
-                    self.__claspr_out.put(
+                    // Move the (lent) output buffer into the pipe with this op's
+                    // completion event as the downstream wait-list, threading the
+                    // buffer's HOME through (in-place write → the output buffer IS
+                    // the lent buffer, so its concrete cell is re-armed on
+                    // `Checkout` drop).
+                    self.__claspr_out.put_home(
                         #output_expr,
                         ::std::vec![::claspr::wrap_event(event)],
+                        #single_output_home,
                     );
                     ::core::result::Result::Ok(())
                 }
@@ -1223,11 +1302,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 pub fn wait(self) -> ::claspr::Result<#output_ty> {
                     let ctx = ::core::clone::Clone::clone(&self.ctx);
                     // The kernel Op is a `DeviceOp`; `wait_on` blocks and returns
-                    // a `Checkout`. The Tier-1 contract hands the buffer(s) back by
-                    // value, so `into_inner` permanently extracts them (this is a
-                    // consuming terminal — the Op is dropped here).
-                    ::claspr::DeviceOpExt::wait_on(&self, &ctx)
-                        .map(::claspr::Checkout::into_inner)
+                    // its `Checkouts` (one `Checkout` for a single-output kernel, a
+                    // per-output tuple for a multi-output one). The Tier-1 contract
+                    // hands the buffer(s) back BY VALUE, so `into_inner` severs each
+                    // (this is a consuming terminal — the Op is dropped here).
+                    let __claspr_checkouts = ::claspr::DeviceOpExt::wait_on(&self, &ctx)?;
+                    ::core::result::Result::Ok(#wait_into_output)
                 }
             }
 

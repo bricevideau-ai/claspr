@@ -8,11 +8,15 @@
 //! 1. **Idempotent reseed** — a mint-and-consume graph (`upload→scale→download`)
 //!    gives the SAME result on every `sync`; the `upload` op re-seeds its buffer
 //!    each run (it does NOT compound).
-//! 2. **Multi-output** — a multi-output kernel's `Checkout<(A,B,Out)>` exposes
-//!    each output for reading.
+//! 2. **Multi-output** — a multi-output kernel yields a TUPLE of `Checkout`s
+//!    (`(Checkout<A>, Checkout<B>, Checkout<Out>)`), each independently readable /
+//!    `into_inner`'d / returned-on-drop.
 //! 3. **`into_inner`** — permanently extracts the output buffer.
 //! 4. **Graph busy** — a second `sync` while a `Checkout` holds a still-lent
 //!    concrete buffer errors at runtime.
+//! 5. **Per-output re-arm (`add(a, b, out)`)** — the home-in-pipe provenance
+//!    re-arms EVERY same-typed concrete cell, which the old single-guard /
+//!    type-match heuristic could not.
 
 use claspr::Context;
 use claspr::DeviceSlice;
@@ -81,8 +85,9 @@ fn reused_graph_three_runs_no_compounding() {
     }
 }
 
-/// Property 2: a multi-output kernel's `Checkout<(A, B, Out)>` exposes each
-/// output for reading via `Deref`.
+/// Property 2: a multi-output kernel yields a TUPLE of `Checkout`s — one per
+/// output — each independently readable. The transparency layer lets a
+/// `Checkout<DeviceSlice>` be `.read()` directly (no explicit `into_inner`).
 #[test]
 fn multi_output_checkout_reads_each_output() {
     let Some(ctx) = ctx() else { return };
@@ -100,25 +105,75 @@ fn multi_output_checkout_reads_each_output() {
         .expect("seed b");
     let out = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("out");
 
-    // add_u32(a, b, out) -> Output = (a, b, out); Checkout derefs to the tuple.
+    // add_u32(a, b, out) -> Checkouts = (Checkout<a>, Checkout<b>, Checkout<out>).
     let g = ks.add_u32([N], a, b, out);
-    let co = g.sync(&ctx).expect("sync add");
-    // Extract the three outputs (each is its own DeviceSlice). `read` consumes a
-    // buffer, so take them by value out of the Checkout.
-    let (a_out, _b_out, out_out) = co.into_inner();
+    let (a_co, _b_co, out_co) = g.sync(&ctx).expect("sync add");
 
+    // Transparency: `read` works DIRECTLY on a `Checkout<DeviceSlice>` (it severs
+    // the return and reads) — no `.into_inner()` needed.
     let mut out_rb = vec![0u32; N];
-    out_out.read(&mut out_rb).wait().expect("read out");
+    out_co.read(&mut out_rb).wait().expect("read out");
     assert!(
         out_rb.iter().all(|&v| v == 7),
         "out should be a+b = 7, got {:?}",
         &out_rb[..8]
     );
 
-    // The inputs are also present as the other tuple elements.
+    // Each input is its own independent Checkout — read one without touching the
+    // others.
     let mut a_rb = vec![0u32; N];
-    a_out.read(&mut a_rb).wait().expect("read a");
+    a_co.read(&mut a_rb).wait().expect("read a");
     assert!(a_rb.iter().all(|&v| v == 3), "a still 3");
+}
+
+/// Property 5: a same-typed multi-buffer kernel `add(a, b, out)` re-arms EVERY
+/// concrete cell on Checkout drop — the case the OLD type-match heuristic could
+/// NOT handle (three `DeviceSlice<u32>` lent inputs are ambiguous by type alone,
+/// so the heuristic re-armed none → second `sync` would error "busy"). With
+/// home-in-pipe each output carries its own home, so all three re-arm and the
+/// graph is runnable repeatedly.
+#[test]
+fn add_three_buffers_each_rearms() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    let a = DeviceSlice::<u32>::alloc_zero(&ctx, N)
+        .expect("a")
+        .fill(2u32)
+        .wait()
+        .expect("seed a");
+    let b = DeviceSlice::<u32>::alloc_zero(&ctx, N)
+        .expect("b")
+        .fill(5u32)
+        .wait()
+        .expect("seed b");
+    let out = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("out");
+
+    // out = a + b = 7. a, b are read-only inputs; out is written in place. All
+    // three are lent concrete `DeviceSlice<u32>` cells.
+    let g = ks.add_u32([N], a, b, out);
+
+    // Run twice, each time DROPPING all three Checkouts (return-on-drop) so every
+    // cell re-arms. If any of the three same-typed cells failed to re-arm, the
+    // NEXT `sync` would error "busy". Three clean runs prove all three re-arm.
+    for run in 0..3 {
+        let checkouts = g
+            .sync(&ctx)
+            .unwrap_or_else(|e| panic!("run {run}: graph must re-arm all 3 cells: {e}"));
+        // Drop all three Checkouts → a, b, out cells all re-armed.
+        drop(checkouts);
+    }
+
+    // Final run: read `out` to confirm the value is correct over the re-armed
+    // buffers (add is idempotent: 2 + 5 = 7 every run).
+    let (_a, _b, out_co) = g.sync(&ctx).expect("final run");
+    let mut rb = vec![0u32; N];
+    out_co.read(&mut rb).wait().expect("read out");
+    assert!(
+        rb.iter().all(|&v| v == 7),
+        "out should be a+b = 7 over re-armed buffers, got {:?}",
+        &rb[..8]
+    );
 }
 
 /// Property 3: `into_inner()` permanently extracts a buffer from the Checkout.

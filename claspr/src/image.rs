@@ -706,18 +706,19 @@ impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (mut img, deps) = self.img.resolve(ec)?;
+        // In-place: the written image is the lent image → home threads through.
+        let (mut img, deps, home) = self.img.resolve_home(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let data = self.data.as_ptr() as *const std::ffi::c_void;
         match mode {
             ExecMode::Blocking => {
                 write_image_enqueue(img.image_mut(), ec, self.region, data, true, &raw)?;
-                self.out.put(img, Deps::new());
+                self.out.put_home(img, Deps::new(), home);
             }
             ExecMode::Pipelined => {
                 let event =
                     write_image_enqueue(img.image_mut(), ec, self.region, data, false, &raw)?;
-                self.out.put(img, vec![wrap_event(event)]);
+                self.out.put_home(img, vec![wrap_event(event)], home);
             }
         }
         Ok(())
@@ -772,18 +773,19 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (img, deps) = self.img.resolve(ec)?;
+        // In-place: the read image is handed back unchanged → home threads.
+        let (img, deps, home) = self.img.resolve_home(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let mut dst_guard = self.dst.lock().unwrap();
         let dst = dst_guard.as_mut_ptr() as *mut std::ffi::c_void;
         match mode {
             ExecMode::Blocking => {
                 read_image_enqueue(img.image_ref(), ec, self.region, dst, true, &raw)?;
-                self.out.put(img, Deps::new());
+                self.out.put_home(img, Deps::new(), home);
             }
             ExecMode::Pipelined => {
                 let event = read_image_enqueue(img.image_ref(), ec, self.region, dst, false, &raw)?;
-                self.out.put(img, vec![wrap_event(event)]);
+                self.out.put_home(img, vec![wrap_event(event)], home);
             }
         }
         Ok(())
@@ -827,6 +829,7 @@ pub struct ImageCopy<Src: ImageEnqueue, Dst: ImageEnqueue> {
 impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
     type Output = (Src, Dst);
     type Handle = (Pipe<Src>, Pipe<Dst>);
+    type Checkouts = (crate::eager::Checkout<Src>, crate::eager::Checkout<Dst>);
 
     fn output_pipe(&self) -> Pipe<(Src, Dst)> {
         // Multi-output: the value is reconstructed in `collect` from the two
@@ -840,16 +843,18 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (src, src_deps) = self.src.resolve(ec)?;
-        let (mut dst, dst_deps) = self.dst.resolve(ec)?;
+        // In-place on both sides (image copy preserves type) → each home threads
+        // to its own element pipe.
+        let (src, src_deps, src_home) = self.src.resolve_home(ec)?;
+        let (mut dst, dst_deps, dst_home) = self.dst.resolve_home(ec)?;
         let mut raw: Vec<crate::cl_event> = src_deps.iter().map(|d| d.as_ref().get()).collect();
         raw.extend(dst_deps.iter().map(|d| d.as_ref().get()));
         // Copy has no native CL_BLOCKING flag — always enqueue non-blocking; a
         // blocking terminal waits on the event via the carried deps.
         let event = copy_image_enqueue(src.image_ref(), dst.image_mut(), ec, self.region, &raw)?;
         let dep = vec![wrap_event(event)];
-        self.src_pipe.put(src, dep.clone());
-        self.dst_pipe.put(dst, dep);
+        self.src_pipe.put_home(src, dep.clone(), src_home);
+        self.dst_pipe.put_home(dst, dep, dst_home);
         Ok(())
     }
 
@@ -867,6 +872,32 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         Ok(((src, dst), deps))
     }
 
+    fn gather_checkouts(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(Self::Checkouts, Deps)> {
+        // Drain each element pipe with its own home → a tuple of independent
+        // Checkouts (image copy preserves type, so both homes re-arm correctly).
+        let src_pipe = self.src_pipe.clone();
+        let dst_pipe = self.dst_pipe.clone();
+        self.execute(ec, mode)?;
+        let (src, src_deps, src_home) = src_pipe.take_home().ok_or(Error::NotSupported(
+            "eager graph: image copy produced no src",
+        ))?;
+        let (dst, mut deps, dst_home) = dst_pipe.take_home().ok_or(Error::NotSupported(
+            "eager graph: image copy produced no dst",
+        ))?;
+        deps.extend(src_deps);
+        Ok((
+            (
+                crate::eager::Checkout::new(src, src_home),
+                crate::eager::Checkout::new(dst, dst_home),
+            ),
+            deps,
+        ))
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("image_copy".into());
     }
@@ -877,7 +908,9 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> ImageCopy<Src, Dst> {
     /// context default queue, wait, and return `(src, dst)`.
     pub fn wait(self) -> Result<(Src, Dst)> {
         let ctx = concrete_image_ctx(&self.src)?;
-        self.sync(&ctx).map(Checkout::into_inner)
+        // Multi-output: `sync` yields a per-side tuple of Checkouts; extract both.
+        let (src_co, dst_co) = self.sync(&ctx)?;
+        Ok((src_co.into_inner(), dst_co.into_inner()))
     }
 
     /// Concrete-head non-blocking terminal returning `(src, dst)` plus a
@@ -913,7 +946,8 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (mut img, deps) = self.img.resolve(ec)?;
+        // In-place: the filled image is the lent image → home threads through.
+        let (mut img, deps, home) = self.img.resolve_home(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let pattern = self.pattern;
         // Fill has no native CL_BLOCKING flag — always enqueue non-blocking; a
@@ -925,7 +959,7 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
             pattern.as_ptr() as *const std::ffi::c_void,
             &raw,
         )?;
-        self.out.put(img, vec![wrap_event(event)]);
+        self.out.put_home(img, vec![wrap_event(event)], home);
         Ok(())
     }
 

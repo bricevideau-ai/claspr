@@ -115,6 +115,36 @@ profiled/lift/usm reuse deferred (one-shot, out of step-(a) scope).
 NEXT: migrate the ~175 old tests to `Checkout` (sweep `.sync()?`→`.sync()?` + read
 through deref / `into_inner`); then step (b) slots.
 
+#### ✅ STEP (a) REFINED 2026-06-26 (home-in-pipe; replaces the heuristic + per-output Checkouts)
+Both step-(a) flaws fixed. (1) **Per-output Checkouts.** `DeviceOp::Checkouts`
+(assoc-type-default `Checkout<Output>`); multi-output ops OVERRIDE to the tuple
+`(Checkout<A>, Checkout<B>, …)` (kernel macro, `CopyTo2`, `ImageCopy`, `bundleN`,
+`arc_split → [Checkout;N]`). `sync/wait_on → Self::Checkouts` via new
+`gather_checkouts(&self,…) -> (Self::Checkouts, Deps)` (default drains the output
+pipe via `take_home` → one `Checkout`; multi-output overrides drain each element
+pipe). `FromCheckout<O>` bridges the default; tuple/array impls are `unreachable!`
+(never hit — those ops override). (2) **Home-in-pipe (no heuristic, no `Any`).**
+`Pipe<T>` payload is now `PipePayload{value, deps, home: Option<Cell<T>>}`; `put`
+keeps its sig (home `None`, ~52 callers untouched), `put_home`/`take_home` carry
+it; `take` drops it. `Input::resolve_home(&self) -> (T, Deps, Option<Cell<T>>)`:
+a `Concrete` cell IS the home; a `Pipe` propagates whatever flowed in. **In-place**
+ops (Fill, WriteDevice, ReadInto, SVMfill/write, transfer, Forward, all image
+write/read/fill/copy, every kernel buffer/image arg) thread the input home →
+output pipe; **mint/transform/consume** ops (upload/value/alloc, download's Vec,
+uninit→init, host-view, copy's retyped outputs, OnDevice routing boundary, bundle
+branches collapsed via `collect`) put `None`. `Checkout<O>{value, home:
+Option<Cell<O>>}`: drop re-arms via the typed home, `into_inner` severs.
+**DELETED**: the type-match heuristic, `Checkout.lent_cells: Vec<Box<dyn Any>>`,
+and `ExecutionContext`'s `lent_cells`/`record_lent_cell`/`take_lent_cells`/
+`lent_cells_handle` ledger (home-in-pipe fully covers step (a)). **Transparency**:
+`ToInput`+`From<Checkout<buf>>` for Device/Mapped/USM/Arc slices (consume = sever),
+inherent `read`/`copy_to` forwarding on `Checkout<DeviceSlice>` → `checkout.read(&mut v)`
++ feeding a Checkout as a kernel arg both work with NO `into_inner`. PROOF:
+`graph_reuse.rs` 7/7 on pocl incl `add(a,b,out)` re-arming ALL THREE same-typed
+cells across runs (the heuristic case). Lib+collatz green; fmt/clippy(-D)/doc clean.
+Deferred (consistent boundary, read via `into_inner`): home re-arm through copy
+(retyped outputs), OnDevice routing, and bundle branches.
+
 ### ✅ PROMOTED TO MAIN 2026-06-24: eager struct-graph cutover (72 commits)
 
 `eager-cutover` fast-forwarded onto `main` at `6d76fe2` (linear history, no merge

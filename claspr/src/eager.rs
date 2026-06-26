@@ -108,7 +108,31 @@ pub type Cell<T> = Arc<Mutex<Option<T>>>;
 /// (`Arc`); identity is the `Arc` cell, so independently-built subgraphs
 /// compose with no global numbering.
 pub struct Pipe<T> {
-    cell: Arc<Mutex<Option<(T, Deps)>>>,
+    cell: Arc<Mutex<Option<PipePayload<T>>>>,
+}
+
+/// What a [`Pipe`] cell carries for one in-flight value: the value, the events
+/// its commands enqueued (the downstream wait-list), and an OPTIONAL **home** —
+/// the [`Cell`] the value must be returned to on [`Checkout`] drop.
+///
+/// ## The home channel (reusable-graph provenance)
+///
+/// The home is how an output knows which lent concrete cell to re-arm, with NO
+/// type-matching heuristic. It travels WITH the value through the graph:
+/// [`resolve`](Input::resolve) lends a `Concrete` cell and yields it as the home;
+/// an **in-place** op (fill/scale/copy-dst/the kernel writing its buffer arg)
+/// passes that home THROUGH to its output pipe; a **mint** op (upload/alloc/value)
+/// or a **transform/consume** op (download's host Vec, uninit→init, host-view) sets
+/// home `None`. At the terminal, each output pipe yields `(value, home)` and the
+/// [`Checkout`] is built with that exact home.
+///
+/// Most producers mint fresh values, so home defaults to `None`: [`Pipe::put`]
+/// stores `None`, and the home-carrying [`Pipe::put_home`] /
+/// [`Pipe::take_home`] are used only on the in-place paths and at the terminal.
+struct PipePayload<T> {
+    value: T,
+    deps: Deps,
+    home: Option<Cell<T>>,
 }
 
 impl<T> Clone for Pipe<T> {
@@ -132,13 +156,39 @@ impl<T> Pipe<T> {
     pub fn new() -> Self {
         Self::default()
     }
-    /// Deposit the value and the events its commands produced.
+    /// Deposit the value and the events its commands produced, with **no home**
+    /// (the common case: a producer that mints a fresh value or transforms/consumes
+    /// — nothing to return on `Checkout` drop). In-place ops that must return a lent
+    /// buffer use [`put_home`](Self::put_home) instead.
     pub fn put(&self, v: T, deps: Deps) {
-        *self.cell.lock().unwrap() = Some((v, deps));
+        self.put_home(v, deps, None);
     }
-    /// Move out the value + its events (the downstream wait-list).
+    /// Deposit value + events + the **home** cell the value should be returned to
+    /// on `Checkout` drop (re-arming the graph). Used by in-place ops, which pass
+    /// their input's home THROUGH to the output, and by the terminal builders.
+    pub fn put_home(&self, v: T, deps: Deps, home: Option<Cell<T>>) {
+        *self.cell.lock().unwrap() = Some(PipePayload {
+            value: v,
+            deps,
+            home,
+        });
+    }
+    /// Move out the value + its events (the downstream wait-list), **dropping the
+    /// home**. For callers that don't propagate provenance (most mid-graph gathers
+    /// and the structural/record walks). Use [`take_home`](Self::take_home) on the
+    /// in-place + terminal paths.
     pub fn take(&self) -> Option<(T, Deps)> {
-        self.cell.lock().unwrap().take()
+        self.take_home().map(|(v, deps, _home)| (v, deps))
+    }
+    /// Move out value + events + **home** — the provenance-preserving drain. An
+    /// in-place op uses it (via [`resolve_home`](Input::resolve_home)) to thread
+    /// the home; the terminal uses it to build the `Checkout` with the right home.
+    pub fn take_home(&self) -> Option<(T, Deps, Option<Cell<T>>)> {
+        self.cell
+            .lock()
+            .unwrap()
+            .take()
+            .map(|p| (p.value, p.deps, p.home))
     }
 
     /// Stable identity of this pipe's storage cell — the graph-edge key. Two
@@ -235,6 +285,25 @@ impl<T> Input<T> {
     where
         T: Send + 'static,
     {
+        let (v, deps, _home) = self.resolve_home(ec)?;
+        Ok((v, deps))
+    }
+
+    /// Like [`resolve`](Self::resolve), but also yields the value's **home** — the
+    /// [`Cell`] it must be returned to on the run's [`Checkout`] drop (re-arming
+    /// the graph). This is the provenance-preserving form, used by **in-place** ops
+    /// (fill/scale/copy-dst/the kernel writing its buffer arg) which pass the home
+    /// THROUGH to their output pipe via [`Pipe::put_home`].
+    ///
+    /// - A [`Concrete`](Input::Concrete) cell: the home IS that cell (the lent
+    ///   buffer must come back to it).
+    /// - A [`Pipe`](Input::Pipe): the home is whatever the upstream deposited
+    ///   (propagated from a concrete head through every in-place stage; `None` if
+    ///   the upstream minted/transformed the value).
+    pub fn resolve_home(&self, ec: &ExecutionContext<'_>) -> Result<(T, Deps, Option<Cell<T>>)>
+    where
+        T: Send + 'static,
+    {
         match self {
             Input::Concrete(cell) => {
                 let v = cell.lock().unwrap().take().ok_or(Error::NotSupported(
@@ -242,9 +311,9 @@ impl<T> Input<T> {
                      returned — a graph is `sync`'d while a previous `Checkout` is \
                      still alive (the graph is busy)",
                 ))?;
-                // Record the cell so the run's `Checkout` returns the (possibly
-                // in-place-transformed) value to it on drop, re-arming the graph.
-                ec.record_lent_cell(Box::new(Arc::clone(cell)));
+                // The home is this very cell: the lent buffer (possibly transformed
+                // in place) is returned here on `Checkout` drop, re-arming `g`.
+                let home = Some(Arc::clone(cell));
                 match ec.start_dep() {
                     // Retain the start event independently: `ec` owns the original
                     // handle for the whole enqueue; this `Dep`'s `Event::drop`
@@ -255,12 +324,12 @@ impl<T> Input<T> {
                         // refcount, balanced by the wrapped `Event`'s Drop.
                         unsafe { opencl3::event::retain_event(raw) }
                             .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
-                        Ok((v, vec![wrap_event(crate::Event::new(raw))]))
+                        Ok((v, vec![wrap_event(crate::Event::new(raw))], home))
                     }
-                    None => Ok((v, Deps::new())),
+                    None => Ok((v, Deps::new(), home)),
                 }
             }
-            Input::Pipe(p) => p.take().ok_or(Error::NotSupported(
+            Input::Pipe(p) => p.take_home().ok_or(Error::NotSupported(
                 "eager graph: upstream pipe was not filled before downstream ran \
                  — internal ordering bug",
             )),
@@ -375,6 +444,60 @@ impl_to_input_concrete!(DeviceSlice);
 impl_to_input_concrete!(MappedSlice);
 impl_to_input_concrete!(USMSlice);
 
+// ── Transparency: a `Checkout<buffer>` is usable wherever the bare buffer is ──
+//
+// So a reused-graph output flows straight into the next op WITHOUT an explicit
+// `.into_inner()`:
+//   let b = x.fill(7).wait()?;          // b: Checkout<DeviceSlice>
+//   ks.scale([N], b, 3) …               // fed directly as a kernel arg
+// Consuming the `Checkout` extracts the inner buffer (severing the return — the
+// same effect as `into_inner`) and feeds it as a concrete `Input`. Distinct
+// nominal type from the bare families and `Pipe<D>`, so it stays disjoint under
+// coherence.
+macro_rules! impl_to_input_checkout {
+    ($buf:ident) => {
+        impl<E, M> ToInput<E> for Checkout<$crate::$buf<E, M>>
+        where
+            M: $crate::MemMode,
+            E: Send,
+        {
+            type Buf = $crate::$buf<E, M>;
+            fn to_input(self) -> Input<$crate::$buf<E, M>> {
+                // Sever the return and feed the inner buffer as a concrete input.
+                Input::from(self.into_inner())
+            }
+        }
+
+        // `From<Checkout<buf>> for Input<buf>` for the `.into()` arg paths. The
+        // blanket `From<T> for Input<T>` doesn't cover it (source is the Checkout,
+        // not the buffer), and the source type differs, so no coherence clash.
+        impl<E, M> From<Checkout<$crate::$buf<E, M>>> for Input<$crate::$buf<E, M>>
+        where
+            M: $crate::MemMode,
+            E: Send,
+        {
+            fn from(co: Checkout<$crate::$buf<E, M>>) -> Self {
+                Input::from(co.into_inner())
+            }
+        }
+    };
+}
+impl_to_input_checkout!(DeviceSlice);
+impl_to_input_checkout!(MappedSlice);
+impl_to_input_checkout!(USMSlice);
+
+// `Checkout<Arc<DeviceSlice<E, M>>>` — the shared-buffer arg, severed to its Arc.
+impl<E, M> ToInput<E> for Checkout<std::sync::Arc<DeviceSlice<E, M>>>
+where
+    M: MemMode,
+    std::sync::Arc<DeviceSlice<E, M>>: Send,
+{
+    type Buf = std::sync::Arc<DeviceSlice<E, M>>;
+    fn to_input(self) -> Input<std::sync::Arc<DeviceSlice<E, M>>> {
+        Input::from(self.into_inner())
+    }
+}
+
 // `Arc<DeviceSlice<E, M>>` — the shared-buffer kernel arg (read-only fan-out;
 // impls `KernelSliceReadArg`). Separate impl since it's a distinct nominal type
 // from the bare families above; still disjoint from `Pipe<D>`.
@@ -444,6 +567,16 @@ pub trait DeviceOp: Send {
     /// pipes (`|(pa, pb)| …`) rather than one `Pipe<(A,B)>`. `Clone` so it can
     /// be handed to the closure while the op keeps its own copy.
     type Handle: Clone = Pipe<Self::Output>;
+
+    /// The **terminal result** — what [`sync`](DeviceOpExt::sync) /
+    /// [`wait_on`](DeviceOpExt::wait_on) hand back. Defaults to a single
+    /// [`Checkout<Output>`] (the common case). A **multi-output** op overrides it
+    /// to the per-element tuple `(Checkout<A>, Checkout<B>, …)` so each output is
+    /// independently readable / `into_inner`'d / returned-on-drop — built by
+    /// [`gather_checkouts`](Self::gather_checkouts) draining each element pipe with
+    /// its own [`home`](Cell). Mirrors how [`Handle`](Self::Handle) exposes the
+    /// per-element build-time pipes.
+    type Checkouts = Checkout<Self::Output>;
 
     /// The output value pipe — where `execute` deposits the result; what the
     /// terminal (`sync`) drains. Always a single `Pipe<Output>` regardless of
@@ -520,6 +653,42 @@ pub trait DeviceOp: Send {
             d.as_ref().wait().map_err(Error::OpenCl)?;
         }
         Ok(value)
+    }
+
+    /// Run this op as the **chain terminal** and build its
+    /// [`Checkouts`](Self::Checkouts) — the per-output [`Checkout`] guard(s),
+    /// each carrying its own typed return [`home`](Cell) — **without** waiting on
+    /// the completion events (the caller waits, per `mode`, on the returned
+    /// [`Deps`]).
+    ///
+    /// This is the home-aware analog of [`collect`](Self::collect): where
+    /// `collect` drains values+deps and discards provenance, this drains
+    /// value **+ home** ([`Pipe::take_home`]) and wraps each in a `Checkout` so
+    /// the run's drop re-arms exactly the right cell.
+    ///
+    /// Default (single-output ops): `execute`, drain the [`output_pipe`](Self::output_pipe)
+    /// with its home, build one `Checkout`. Multi-output ops override this to drain
+    /// each element pipe (value+home) into a tuple of `Checkout`s, gathering every
+    /// pipe's deps.
+    fn gather_checkouts(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(Self::Checkouts, Deps)>
+    where
+        Self: Sized,
+        Self::Output: Send + 'static,
+        Self::Checkouts: FromCheckout<Self::Output>,
+    {
+        let out = self.output_pipe();
+        self.execute(ec, mode)?;
+        let (value, deps, home) = out
+            .take_home()
+            .ok_or(Error::NotSupported("eager graph: op produced no output"))?;
+        Ok((
+            Self::Checkouts::from_single(Checkout::new(value, home)),
+            deps,
+        ))
     }
 
     /// Structural description — node names in execution order, NO execution.
@@ -655,33 +824,49 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// default OOO queue; a `Queue`/`ExecutionContext` → that exact queue), so
     /// `wait_on` is also the cross-queue / cross-device control (Tier-1 heritage).
     /// [`sync`](Self::sync) is `wait_on` over a `Context`.
-    fn wait_on<L: crate::Launcher + ?Sized>(&self, launcher: &L) -> Result<Checkout<Self::Output>>
+    fn wait_on<L: crate::Launcher + ?Sized>(&self, launcher: &L) -> Result<Self::Checkouts>
     where
         Self::Output: Send + 'static,
+        Self::Checkouts: FromCheckout<Self::Output>,
     {
         let device = launcher.context().device().clone();
         let mut ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
 
         // FAST PATH — no host seam: the current zero-overhead terminal. The
-        // terminal op yields its Output and waits on its own completion events
-        // (Blocking); upstream ops pipeline. Single-output ops use the default
-        // `into_output` (drain output pipe + wait); multi-output ops override it
-        // to scatter-then-reconstruct the tuple.
+        // terminal builds its per-output `Checkout`(s) (each with its own home
+        // for return-on-drop) via `gather_checkouts`, then waits on the chain's
+        // completion events here. Single-output ops use the default
+        // `gather_checkouts`; multi-output ops override it to build a tuple.
         if !self.contains_host_seam() {
-            let result = self.into_output(&ec, ExecMode::Blocking);
+            let result = self.gather_checkouts(&ec, ExecMode::Blocking);
             return match result {
                 // A failing `and_then_host` worker stashed its rich error and
                 // signalled its user event negative; the blocking wait may return
                 // the cl_event cascade (`Error::OpenCl(-1)`). Prefer the stash.
                 Err(cascade) => Err(ec.take_host_error().unwrap_or(cascade)),
-                // Even on a "successful" wait, a worker may have stashed an error
-                // the wait did NOT surface (pocl does not cascade negative
-                // user-event status). A non-empty slot is itself the failure
-                // signal — check it. (Same as the async terminal.)
-                Ok(v) => match ec.take_host_error() {
-                    Some(rust_err) => Err(rust_err),
-                    None => Ok(Checkout::new(v, ec.take_lent_cells())),
-                },
+                Ok((checkouts, deps)) => {
+                    // Blocking-mode leaves already waited inline, but pipelined
+                    // upstream stages (and kernels, which have no native blocking
+                    // enqueue) carry events here — wait on them so every command is
+                    // complete before the Checkout(s) are observed.
+                    let mut wait_err: Option<Error> = None;
+                    for d in &deps {
+                        if let Err(code) = d.as_ref().wait() {
+                            wait_err.get_or_insert(Error::OpenCl(code));
+                        }
+                    }
+                    // Even on a "successful" wait, a worker may have stashed an
+                    // error the wait did NOT surface (pocl does not cascade
+                    // negative user-event status). A non-empty slot is itself the
+                    // failure signal — check it. (Same as the async terminal.)
+                    match ec.take_host_error() {
+                        Some(rust_err) => Err(rust_err),
+                        None => match wait_err {
+                            Some(cascade) => Err(cascade),
+                            None => Ok(checkouts),
+                        },
+                    }
+                }
             };
         }
 
@@ -697,8 +882,9 @@ pub trait DeviceOpExt: DeviceOp + Sized {
 
         // Enqueue non-blocking (Pipelined) — a Blocking leaf would wait inline on
         // a command gated on the unreleased `start` and deadlock. The terminal
-        // wait happens below, after `start` is released.
-        let collected = self.collect(&ec, ExecMode::Pipelined);
+        // wait happens below, after `start` is released. `gather_checkouts` builds
+        // the per-output Checkout(s) with their homes (same as the fast path).
+        let collected = self.gather_checkouts(&ec, ExecMode::Pipelined);
 
         // Release the graph regardless of a setup error: any commands already
         // enqueued are gated on `start`; completing it lets them drain (or abort
@@ -706,7 +892,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         // this, `start` may be dropped (its retained dep refs outlive it).
         let _ = crate::complete_user_event(&start, opencl3::event::CL_COMPLETE);
 
-        let (value, deps) = match collected {
+        let (checkouts, deps) = match collected {
             Ok(pair) => pair,
             Err(setup_err) => {
                 // Setup failed before/while enqueueing. Join any workers that did
@@ -741,21 +927,23 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             Some(rust_err) => Err(rust_err),
             None => match wait_err {
                 Some(cascade) => Err(cascade),
-                None => Ok(Checkout::new(value, ec.take_lent_cells())),
+                None => Ok(checkouts),
             },
         }
     }
 
     /// Run `self` to completion on `context`'s default out-of-order queue and
-    /// hand back a [`Checkout`] over its output. The named graph terminal
-    /// (cuda-oxide / Rust-CUDA heritage spelling); equal to
+    /// hand back its [`Checkouts`](DeviceOp::Checkouts) — a [`Checkout`] over the
+    /// output (or a tuple of `Checkout`s for a multi-output graph). The named
+    /// graph terminal (cuda-oxide / Rust-CUDA heritage spelling); equal to
     /// [`wait_on`](Self::wait_on) over the `context`. Use `wait_on` with an
     /// explicit `Queue` for cross-queue ordering.
     ///
     /// Reusable: `&self`. See [`wait_on`](Self::wait_on) and [`Checkout`].
-    fn sync(&self, context: &Context) -> Result<Checkout<Self::Output>>
+    fn sync(&self, context: &Context) -> Result<Self::Checkouts>
     where
         Self::Output: Send + 'static,
+        Self::Checkouts: FromCheckout<Self::Output>,
     {
         let device = context.device().clone();
         let queue = context.default_outoforder_queue(&device)?;
@@ -888,64 +1076,162 @@ impl<T: DeviceOp> DeviceOpExt for T {}
 /// [`into_inner`](Checkout::into_inner) **permanently** extracts the output and
 /// severs the return (the lent cell stays empty / the graph re-allocates next
 /// run).
+///
+/// ## Per-output, typed home (no heuristic, no `Any`)
+///
+/// A `Checkout` carries ONE typed [`home`](Cell) — the exact cell this output
+/// must be returned to, learned via the [`Pipe`]'s home channel (not
+/// a type-match heuristic, not a type-erased ledger). A multi-output graph yields
+/// a **tuple of** `Checkout`s (`(Checkout<A>, Checkout<B>, …)`), each with its own
+/// home — so same-typed multi-buffer ops (`add(a, b, out)`) re-arm every cell
+/// correctly, which the old single-guard / type-match design could not.
 #[must_use = "a Checkout holds the graph's output; reading it requires keeping it alive"]
-pub struct Checkout<O: 'static> {
+pub struct Checkout<O> {
     // `Option` so `into_inner`/drop can move the output out.
     value: Option<O>,
-    // The cells lent during the run, type-erased (`Box<dyn Any>` over `Cell<T>`).
-    // On drop the output is returned to a cell whose `Cell<O>` type matches —
-    // the in-place buffer case (the lent buffer IS the output).
-    lent_cells: Vec<Box<dyn std::any::Any + Send>>,
+    // The ONE cell this output is returned to on drop (re-arming `g`). `None` for
+    // a minted/transformed/consumed output (nothing to return). Learned from the
+    // output pipe's home channel — no matching, no type-erasure.
+    home: Option<Cell<O>>,
 }
 
-impl<O: Send + 'static> Checkout<O> {
-    /// Build a checkout over `value`, carrying the run's lent cells for return.
-    pub(crate) fn new(value: O, lent_cells: Vec<Box<dyn std::any::Any + Send>>) -> Self {
+impl<O: Send> Checkout<O> {
+    /// Build a checkout over `value`, carrying its typed return `home` (the cell
+    /// to re-arm on drop), or `None` if nothing should be returned.
+    ///
+    /// `pub` (not `pub(crate)`): the `#[kernel]` proc-macro emits
+    /// `::claspr::Checkout::new(...)` inside the *user's* crate for multi-output
+    /// kernels' `gather_checkouts`, so this must be reachable cross-crate. Not
+    /// part of the stable surface — prefer the terminals (`sync`/`wait_on`).
+    #[doc(hidden)]
+    pub fn new(value: O, home: Option<Cell<O>>) -> Self {
         Checkout {
             value: Some(value),
-            lent_cells,
+            home,
         }
     }
 
-    /// Permanently extract the output, **severing** the lend-return: the lent
-    /// cell stays empty, so the graph re-allocates (or errors "Tag unbound" /
-    /// "busy") for that input next run. Use when you want to keep the buffer
-    /// rather than hand it back to `g`.
+    /// Permanently extract the output, **severing** the lend-return: the home
+    /// cell stays empty, so the graph re-allocates (or errors "busy") for that
+    /// input next run. Use when you want to keep the buffer rather than hand it
+    /// back to `g`.
     pub fn into_inner(mut self) -> O {
-        // Drop the lent cells WITHOUT returning (sever); take the value out.
-        self.lent_cells.clear();
+        // Drop the home WITHOUT returning (sever); take the value out.
+        self.home = None;
         self.value
             .take()
             .expect("Checkout::into_inner after value already taken — internal bug")
     }
 }
 
-impl<O: 'static> Drop for Checkout<O> {
+impl<O> Drop for Checkout<O> {
     fn drop(&mut self) {
-        // Return the output to its lending cell, re-arming `g`. The in-place
-        // buffer case: the lent buffer flowed through the graph unchanged and IS
-        // the output, so `O == T` for the lending cell.
+        // Return the output to its home cell, re-arming `g`. The home is the
+        // EXACT cell the value flowed from (concrete head → through every in-place
+        // stage), carried by the pipe — no type-matching, no ambiguity. A
+        // minted/transformed/consumed output has `home == None`: nothing to return.
         let Some(value) = self.value.take() else {
             return; // already taken by into_inner
         };
-        // Collect the lent cells whose stored type is `Cell<O>` — candidates to
-        // receive the output.
-        let mut matching: Vec<Arc<Mutex<Option<O>>>> = self
-            .lent_cells
-            .drain(..)
-            .filter_map(|c| c.downcast::<Cell<O>>().ok().map(|b| *b))
-            .collect();
-        // Re-arm ONLY when the home is unambiguous: exactly one lent cell of the
-        // output's type. With several same-typed lent inputs (e.g. a multi-input
-        // kernel `add(a,b,out)`), we can't tell which one the output belongs to by
-        // type alone, so we conservatively don't re-arm those cells — the graph is
-        // still safe (their cells stay empty → a second `sync` errors "busy"),
-        // just not auto-reusable for that shape in step (a). A pure mint graph
-        // has zero matching cells → nothing to return.
-        if matching.len() == 1 {
-            *matching.remove(0).lock().unwrap() = Some(value);
+        if let Some(home) = self.home.take() {
+            *home.lock().unwrap() = Some(value);
         }
         // else: `value` drops here — nothing re-armed.
+    }
+}
+
+// ── Transparency: consuming verbs forwarded from `Checkout<DeviceSlice>` ──
+//
+// `Deref`/`DerefMut` already give the `&self`/`&mut self` methods (`.iter()`,
+// indexing, `.len()`). The CONSUMING buffer verbs (`read(self)`, `copy_to(self)`,
+// `map(&self)`) take the buffer by value, which Deref-coercion can't reach — so
+// forward them here: each severs the return (`into_inner`) and calls through, so
+// `checkout.read(&mut v).wait()?` / `checkout.copy_to(dst)` compile WITHOUT an
+// explicit `.into_inner()`. (`map` only needs `&self`, but the underlying buffer
+// must outlive the map builder, so it too consumes the Checkout.)
+impl<T, M> Checkout<DeviceSlice<T, M>>
+where
+    M: MemMode,
+{
+    /// Read into a caller slice (severs the return, then `DeviceSlice::read`).
+    pub fn read<'d>(self, dst: &'d mut [T]) -> ReadInto<'d, T, M>
+    where
+        T: Send + 'static,
+        M: crate::HostReadable + Send + 'static,
+    {
+        self.into_inner().read(dst)
+    }
+
+    /// Device-to-device copy (severs the return, then `DeviceSlice::copy_to`).
+    pub fn copy_to<M2>(
+        self,
+        dst: DeviceSlice<T, M2>,
+    ) -> CopyTo2<DeviceSlice<T, M>, DeviceSlice<T, M2>>
+    where
+        T: Send + 'static,
+        M: Send + 'static,
+        M2: MemMode + Send + 'static,
+    {
+        self.into_inner().copy_to(dst)
+    }
+}
+
+/// Bridge for the default [`gather_checkouts`](DeviceOp::gather_checkouts): lets a
+/// single-output op build its `Self::Checkouts` (which defaults to
+/// `Checkout<Output>`) from one [`Checkout`] without the trait method statically
+/// knowing `Self::Checkouts == Checkout<Output>`. Implemented ONLY for
+/// `Checkout<O>`; multi-output ops override `gather_checkouts` and never use it.
+pub trait FromCheckout<O> {
+    /// Wrap a single output's checkout as the terminal result.
+    fn from_single(co: Checkout<O>) -> Self;
+}
+
+impl<O> FromCheckout<O> for Checkout<O> {
+    fn from_single(co: Checkout<O>) -> Self {
+        co
+    }
+}
+
+// Multi-output terminal results — a tuple / array of `Checkout`s — also satisfy
+// `FromCheckout<Output>` so the `sync`/`wait_on` bound holds uniformly. They
+// NEVER reach `from_single`: a multi-output op overrides
+// [`gather_checkouts`](DeviceOp::gather_checkouts) and builds the tuple directly.
+// The body is therefore unreachable (a defensive panic, not a real code path).
+macro_rules! impl_from_checkout_tuple {
+    ( $( $ty:ident ),+ ) => {
+        impl<$($ty),+> FromCheckout<( $($ty,)+ )> for ( $(Checkout<$ty>,)+ ) {
+            fn from_single(_co: Checkout<( $($ty,)+ )>) -> Self {
+                unreachable!(
+                    "multi-output graphs build their Checkouts tuple in \
+                     gather_checkouts; from_single is never called"
+                )
+            }
+        }
+    };
+}
+impl_from_checkout_tuple!(A, B);
+impl_from_checkout_tuple!(A, B, C);
+impl_from_checkout_tuple!(A, B, C, D);
+impl_from_checkout_tuple!(A, B, C, D, E);
+impl_from_checkout_tuple!(A, B, C, D, E, F);
+impl_from_checkout_tuple!(A, B, C, D, E, F, G);
+impl_from_checkout_tuple!(A, B, C, D, E, F, G, H);
+impl_from_checkout_tuple!(A, B, C, D, E, F, G, H, I);
+impl_from_checkout_tuple!(A, B, C, D, E, F, G, H, I, J);
+impl_from_checkout_tuple!(A, B, C, D, E, F, G, H, I, J, K);
+impl_from_checkout_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
+impl_from_checkout_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M);
+impl_from_checkout_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
+impl_from_checkout_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
+impl_from_checkout_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
+
+// Same for the homogeneous `[Checkout<O>; N]` shape produced by `arc_split`.
+impl<O, const N: usize> FromCheckout<[O; N]> for [Checkout<O>; N] {
+    fn from_single(_co: Checkout<[O; N]>) -> Self {
+        unreachable!(
+            "arc_split builds its [Checkout; N] in gather_checkouts; \
+             from_single is never called"
+        )
     }
 }
 
@@ -1256,8 +1542,9 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Resolve the upstream value + its events and re-deposit unchanged — no
         // device work; deps threaded through so ordering/termination is intact.
-        let (v, deps) = self.input.resolve(ec)?;
-        self.out.put(v, deps);
+        // In-place identity: the home flows straight through.
+        let (v, deps, home) = self.input.resolve_home(ec)?;
+        self.out.put_home(v, deps, home);
         Ok(())
     }
 
@@ -1496,6 +1783,8 @@ where
     // An array of N element pipes; the downstream closure does
     // `let [a, b, c] = handle` and routes each pipe into its own branch.
     type Handle = [Pipe<S::Output>; N];
+    // Per-branch Checkouts (homes are all `None` — these are read-only Arc clones).
+    type Checkouts = [Checkout<S::Output>; N];
 
     fn output_pipe(&self) -> Pipe<Self::Output> {
         // Multi-output storage is the per-element pipes; this single pipe is
@@ -1541,6 +1830,31 @@ where
         // `vals` has exactly N elements (one per element pipe) — the conversion
         // cannot fail.
         let arr = vals
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("arc_split drained exactly N branch pipes"));
+        Ok((arr, all_deps))
+    }
+
+    fn gather_checkouts(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(Self::Checkouts, Deps)> {
+        // Drain each branch pipe with its home → a `[Checkout; N]`. Arc-clone
+        // branches carry no home (read-only fan-out), so each Checkout's home is
+        // `None`; the per-branch shape is still correct.
+        let outs = self.outs.clone();
+        self.execute(ec, mode)?;
+        let mut all_deps: Deps = Deps::new();
+        let mut cos: Vec<Checkout<S::Output>> = Vec::with_capacity(N);
+        for p in &outs {
+            let (v, d, home) = p.take_home().ok_or(Error::NotSupported(
+                "eager arc_split: a branch produced no output",
+            ))?;
+            cos.push(Checkout::new(v, home));
+            all_deps.extend(d);
+        }
+        let arr = cos
             .try_into()
             .unwrap_or_else(|_| unreachable!("arc_split drained exactly N branch pipes"));
         Ok((arr, all_deps))
@@ -1623,6 +1937,13 @@ macro_rules! impl_eager_bundle {
             // composite handle. Composing per-branch handles (rather than
             // flattening to pipes) is what carries computable host values down.
             type Handle = ( $(<$ty as DeviceOp>::Handle,)+ );
+            // Per-branch Checkouts: one independent `Checkout` per branch output.
+            // (Branch values arrive via each branch's `collect`, which collapses
+            // any nested arity to a single value with no home, so a bundle's
+            // Checkouts carry `None` homes in step (a) — the per-branch SHAPE is
+            // what this fixes; home re-arm through a bundle is deferred, the same
+            // boundary as copy/OnDevice.)
+            type Checkouts = ( $(Checkout<<$ty as DeviceOp>::Output>,)+ );
 
             fn output_pipe(&self) -> Pipe<Self::Output> {
                 // Multi-output storage is the per-branch pipes; this single pipe
@@ -1675,6 +1996,27 @@ macro_rules! impl_eager_bundle {
                 },)+ );
                 let joined = join_marker(ec, &branch_deps)?;
                 Ok((outputs, joined))
+            }
+
+            fn gather_checkouts(
+                &self,
+                ec: &ExecutionContext<'_>,
+                mode: ExecMode,
+            ) -> Result<(Self::Checkouts, Deps)> {
+                // Scatter via `execute` (fills each `$pf`), then drain each branch
+                // pipe (value + home) into its own `Checkout`, joining the branch
+                // wait-lists into one marker.
+                $(let $pf = self.$pf.clone();)+
+                self.execute(ec, mode)?;
+                let mut branch_deps: Vec<Deps> = Vec::new();
+                let checkouts = ( $({
+                    let (v, d, home) = $pf.take_home().ok_or(Error::NotSupported(
+                        "eager bundle: a branch produced no output"))?;
+                    branch_deps.push(d);
+                    Checkout::new(v, home)
+                },)+ );
+                let joined = join_marker(ec, &branch_deps)?;
+                Ok((checkouts, joined))
             }
 
             fn describe(&self, out: &mut Vec<String>) {
@@ -2020,19 +2362,20 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (mut buf, deps) = self.buf.resolve(ec)?;
+        let (mut buf, deps, home) = self.buf.resolve_home(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // Fill has no native CL_BLOCKING flag (it's always enqueue + optional
         // wait — exactly what the old `FillOp::wait_on` did internally), so both
         // modes enqueue non-blocking; Blocking then waits on the event here.
+        // In-place: the filled buffer is the lent buffer → home threads through.
         let event = crate::buffer::fill_buffer_enqueue(&mut buf, ec, self.value, &raw)?;
         match mode {
             ExecMode::Blocking => {
                 event.wait().map_err(Error::OpenCl)?;
-                self.out.put(buf, Deps::new());
+                self.out.put_home(buf, Deps::new(), home);
             }
             ExecMode::Pipelined => {
-                self.out.put(buf, vec![wrap_event(event)]);
+                self.out.put_home(buf, vec![wrap_event(event)], home);
             }
         }
         Ok(())
@@ -2279,19 +2622,20 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve(ec)?;
+        let (buf, deps, home) = self.buf.resolve_home(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let mut dst = self.dst.lock().unwrap();
+        // In-place: the buffer is read and handed back unchanged → home threads.
         match mode {
             // Terminal: native blocking read — `dst` is valid on return, no event.
             ExecMode::Blocking => {
                 crate::buffer::read_buffer_enqueue(&buf, ec, &mut dst, true, &raw)?;
-                self.out.put(buf, Deps::new());
+                self.out.put_home(buf, Deps::new(), home);
             }
             // Pipelined: non-blocking; the event gates `dst` being valid.
             ExecMode::Pipelined => {
                 let event = crate::buffer::read_buffer_enqueue(&buf, ec, &mut dst, false, &raw)?;
-                self.out.put(buf, vec![wrap_event(event)]);
+                self.out.put_home(buf, vec![wrap_event(event)], home);
             }
         }
         Ok(())
@@ -2413,7 +2757,8 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve(ec)?;
+        // In-place: the migrated buffer is the same buffer → home threads through.
+        let (buf, deps, home) = self.buf.resolve_home(ec)?;
         // Resolve the target device (concrete, or by index into the running
         // context's device list) before resolving its queue.
         let device = match &self.target {
@@ -2431,7 +2776,7 @@ where
         // `transfer_to_device.rs` exactly.
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let event = crate::buffer::migrate_buffer_enqueue(&buf, &*target_q, &raw)?;
-        self.out.put(buf, vec![wrap_event(event)]);
+        self.out.put_home(buf, vec![wrap_event(event)], home);
         Ok(())
     }
 
@@ -2763,12 +3108,13 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (mut buf, deps) = self.buf.resolve(ec)?;
+        let (mut buf, deps, home) = self.buf.resolve_home(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        // In-place: the written buffer is the lent buffer → home threads through.
         match mode {
             ExecMode::Blocking => {
                 crate::buffer::write_buffer_enqueue(&mut buf, ec, self.src.as_slice(), true, &raw)?;
-                self.out.put(buf, Deps::new());
+                self.out.put_home(buf, Deps::new(), home);
             }
             ExecMode::Pipelined => {
                 // Non-blocking write; `self.src` stays valid for the whole `sync`
@@ -2781,7 +3127,7 @@ where
                     false,
                     &raw,
                 )?;
-                self.out.put(buf, vec![wrap_event(event)]);
+                self.out.put_home(buf, vec![wrap_event(event)], home);
             }
         }
         Ok(())
@@ -2926,18 +3272,18 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve(ec)?;
+        let (buf, deps, home) = self.buf.resolve_home(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // SVM fill is always a non-blocking enqueue (no native CL_BLOCKING flag);
-        // Blocking waits on the returned event here.
+        // Blocking waits on the returned event here. In-place → home threads.
         let event = crate::mapped::svm_fill_enqueue(&buf, ec, self.value, &raw)?;
         match mode {
             ExecMode::Blocking => {
                 event.wait().map_err(Error::OpenCl)?;
-                self.out.put(buf, Deps::new());
+                self.out.put_home(buf, Deps::new(), home);
             }
             ExecMode::Pipelined => {
-                self.out.put(buf, vec![wrap_event(event)]);
+                self.out.put_home(buf, vec![wrap_event(event)], home);
             }
         }
         Ok(())
@@ -3017,19 +3363,19 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve(ec)?;
+        let (buf, deps, home) = self.buf.resolve_home(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // SVM write is always a non-blocking enqueue; Blocking waits on the event
         // here, Pipelined threads it downstream. `self.src` is valid for the whole
-        // `sync` — no keep-alive callback needed.
+        // `sync` — no keep-alive callback needed. In-place → home threads through.
         let event = crate::mapped::svm_write_enqueue(&buf, ec, self.src.as_slice(), &raw)?;
         match mode {
             ExecMode::Blocking => {
                 event.wait().map_err(Error::OpenCl)?;
-                self.out.put(buf, Deps::new());
+                self.out.put_home(buf, Deps::new(), home);
             }
             ExecMode::Pipelined => {
-                self.out.put(buf, vec![wrap_event(event)]);
+                self.out.put_home(buf, vec![wrap_event(event)], home);
             }
         }
         Ok(())
@@ -3946,6 +4292,11 @@ where
         Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src>,
         Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
     );
+    // Per-output Checkouts: each side independently readable / into_inner'd.
+    type Checkouts = (
+        Checkout<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src>,
+        Checkout<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
+    );
 
     fn output_pipe(&self) -> Pipe<Self::Output> {
         // Multi-output storage is the per-element pipes; this single pipe is
@@ -3975,7 +4326,12 @@ where
         let (out_src, out_dst) = out.into_parts();
         // Clone the completion Dep onto BOTH element pipes so whichever side
         // flows downstream carries the wait-list (and the terminal reconstruct
-        // gathers from both).
+        // gathers from both). NO home is threaded: a copy's outputs are the
+        // `CopyOutputs` Src/Dst types, which may be RE-TYPED relative to the
+        // inputs (the Uninit→Init transition), so a lent input cell (`Cell<Dst>`)
+        // can't generically receive an init'd output (`Cell<CopyOutputs::Dst>`).
+        // Concrete copy buffers therefore stay non-re-arming in step (a) — the
+        // same boundary the uninit-transform ops have (read via `into_inner`).
         self.src_pipe.put(out_src, out_deps.clone());
         self.dst_pipe.put(out_dst, out_deps);
         Ok(())
@@ -3999,6 +4355,33 @@ where
         ))?;
         deps.extend(dst_deps);
         Ok(((out_src, out_dst), deps))
+    }
+
+    fn gather_checkouts(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(Self::Checkouts, Deps)> {
+        // Drain each element pipe with its own home → a tuple of independent
+        // Checkouts. (Copy threads no home, so both are `None`; the per-output
+        // shape is still correct — each side is its own guard.)
+        let src_pipe = self.src_pipe.clone();
+        let dst_pipe = self.dst_pipe.clone();
+        self.execute(ec, mode)?;
+        let (out_src, mut deps, src_home) = src_pipe.take_home().ok_or(Error::NotSupported(
+            "eager graph: terminal copy produced no output",
+        ))?;
+        let (out_dst, dst_deps, dst_home) = dst_pipe.take_home().ok_or(Error::NotSupported(
+            "eager graph: terminal copy produced no output",
+        ))?;
+        deps.extend(dst_deps);
+        Ok((
+            (
+                Checkout::new(out_src, src_home),
+                Checkout::new(out_dst, dst_home),
+            ),
+            deps,
+        ))
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -4273,9 +4656,12 @@ where
             parent.host_error_slot(),
             parent.start_dep(),
             parent.workers_handle(),
-            parent.lent_cells_handle(),
         );
-        // Gather the source against the child EC via `collect` (any arity).
+        // Gather the source against the child EC via `collect` (any arity). The
+        // routed sub-chain collapses to OnDevice's single output pipe, so any
+        // home a concrete head carried is not threaded across the routing boundary
+        // in step (a) (a routed concrete buffer is read via `into_inner`, not
+        // auto-re-armed) — the same boundary as the copy/transform ops.
         let (value, deps) = self.source.collect(&child, mode)?;
         self.out.put(value, deps);
         Ok(())
