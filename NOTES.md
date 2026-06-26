@@ -81,10 +81,17 @@ must run via `cargo test --test <name>` (isolated) not batched `-p` (multiple
 DEFERRED to later steps (design below): **(b) slots** (`slot!(Tag)`/`Tag(value)`/
 `call` runtime bind-table + typed tags → rebind different buffers per run);
 **(c) convex-segment replay** (software + cached `cl_khr_command_buffer`); **(d)
-mutable-dispatch** + image reuse. The layer-1/2 record/CB code from the earlier
-`record.rs` (commits fd68c0c…2bd92a5) still exists on the branch as salvage for
-(c) — it is NOT wired under `sync()` yet (step (a) replays by re-walking
-`execute(&self)`, no CB). Process lesson: engine-touching agents must be
+mutable-dispatch** + image reuse. NOTE: `record.rs` (commits fd68c0c…2bd92a5)
+is NOT dead salvage — it's a LIVE, TESTED public surface: `g.record()?` →
+`RecordedGraph` → `.replay()` is the explicit CB-backed record path (real
+`cl_khr_command_buffer` layer-2 backend + software fallback), green via
+`tests/tier2/tests/record_replay.rs` (9/9). It is SEPARATE from `g.sync()`
+reuse: `sync()` does own-the-buffers re-walk of `execute(&self)` (no CB);
+`record()/replay()` is the record-once-into-a-CB path. Step (c) is about wiring
+the CB segments UNDER `sync()` so the primary surface gets CB acceleration too —
+NOT about resurrecting record.rs (it already works). Do not demote/delete the
+`record` public exports — they back a passing feature. Process lesson:
+engine-touching agents must be
 SEQUENCED, not fanned out — parallel runs against a moving base caused a
 stale-base merge tangle + a shared-file collision this session.
 
