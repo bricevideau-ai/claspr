@@ -45,7 +45,7 @@ fn split_chain_with_host_decision_between() {
     let factor = if 5 < 10 { 4 } else { 2 };
 
     // Second chain: take the buffer back in, scale by the decided factor.
-    let result: Vec<u32> = kernels
+    let result = kernels
         .scale_u32([N], buf, factor)
         .and_then(download)
         .sync(&ctx)
@@ -75,7 +75,7 @@ fn split_chain_then_reuse_buffer_for_independent_work() {
         .wait()
         .expect("phase 2 (run-to-completion in the middle)");
     // Pick the second half back up as an eager chain.
-    let result: Vec<u32> = kernels
+    let result = kernels
         .scale_u32([N], buf, 5)
         .and_then(download)
         .sync(&ctx)
