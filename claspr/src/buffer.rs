@@ -257,6 +257,22 @@ impl<T, M: MemMode> DeviceSliceUninit<T, M> {
         self.inner
     }
 
+    /// Re-wrap an already-initialised [`DeviceSlice`] back into the
+    /// uninit type-state. The SOUND DOWNGRADE used by the reusable-graph
+    /// home channel: an op (e.g. a copy with an `Uninit` dst) takes a
+    /// `DeviceSliceUninit` in, writes every byte, and produces an `Init`
+    /// `DeviceSlice` out. To re-arm the original `Cell<DeviceSliceUninit>`
+    /// for the next run, the (now Init) buffer is wrapped back here.
+    ///
+    /// Safe: `Init` is the *stronger* capability (every byte is known
+    /// written); re-stating it as `Uninit` only *forgets* that knowledge,
+    /// which can never observe uninit bytes. No `unsafe` is involved — this
+    /// is a plain private-field re-wrap, the exact inverse of
+    /// [`assume_init`](Self::assume_init).
+    pub(crate) fn from_init(inner: DeviceSlice<T, M>) -> Self {
+        DeviceSliceUninit { inner }
+    }
+
     /// Length in elements — same as the eventual `DeviceSlice`'s
     /// length.
     pub fn len(&self) -> usize {

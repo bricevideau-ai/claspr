@@ -100,6 +100,43 @@ pub trait DeviceEnqueue: Send + Sized {
 /// hold a clone to deposit the value back home.
 pub type Cell<T> = Arc<Mutex<Option<T>>>;
 
+// ── Rehome: type-erased "deposit an output back into its origin cell" ───
+
+/// How a run's output value is returned to the (possibly weaker-typed) cell it
+/// came from, re-arming the graph on [`Checkout`] drop. The home channel carries
+/// a `Box<dyn Rehome<Out>>` instead of a bare `Cell<Out>` so the origin cell may
+/// hold a DIFFERENT (weaker) type than the output: a copy with a
+/// [`DeviceSliceUninit`] dst lends a
+/// `Cell<DeviceSliceUninit<T, M>>` but produces an `Init` `DeviceSlice<T, M>`;
+/// the rehome DOWNGRADES the Init buffer back into the uninit cell (a sound,
+/// `unsafe`-free re-wrap — `Init` is the stronger capability).
+///
+/// Keyed by the pipe's OWN output type `Out`, so generalizing `home` does not
+/// ripple into `Pipe<T>`'s type parameter. The common case (an in-place op whose
+/// output type equals its input cell type) is the identity rehome:
+/// [`Cell<Out>`] implements `Rehome<Out>` directly.
+///
+/// `: Send` so the boxed home can travel through the graph alongside the value
+/// (every buffer that reaches the home channel is already `Send + 'static`).
+pub trait Rehome<Out>: Send {
+    /// Deposit `value` into the origin cell (consuming the boxed home).
+    fn rehome(self: Box<Self>, value: Out);
+}
+
+/// A boxed, type-erased return home for an output of type `Out` — the home
+/// channel's payload (`None` = nothing to return). Aliased so the `Pipe` /
+/// `Input` / `Checkout` signatures stay readable.
+pub type BoxedHome<Out> = Box<dyn Rehome<Out>>;
+
+/// Identity rehome: an output returns to a cell of its own type (the in-place
+/// case — fill/scale/kernel-buffer-arg/copy's same-typed sides). This is the
+/// behaviour the old `Option<Cell<T>>` home had, now expressed through the trait.
+impl<T: Send> Rehome<T> for Cell<T> {
+    fn rehome(self: Box<Self>, value: T) {
+        *self.lock().unwrap() = Some(value);
+    }
+}
+
 // ── Pipe<T> + Input<T>: the graph edge ─────────────────────────────────
 
 /// A build-time handle to an op's future output, carrying `(value, Deps)`. The
@@ -132,7 +169,7 @@ pub struct Pipe<T> {
 struct PipePayload<T> {
     value: T,
     deps: Deps,
-    home: Option<Cell<T>>,
+    home: Option<BoxedHome<T>>,
 }
 
 impl<T> Clone for Pipe<T> {
@@ -166,7 +203,7 @@ impl<T> Pipe<T> {
     /// Deposit value + events + the **home** cell the value should be returned to
     /// on `Checkout` drop (re-arming the graph). Used by in-place ops, which pass
     /// their input's home THROUGH to the output, and by the terminal builders.
-    pub fn put_home(&self, v: T, deps: Deps, home: Option<Cell<T>>) {
+    pub fn put_home(&self, v: T, deps: Deps, home: Option<BoxedHome<T>>) {
         *self.cell.lock().unwrap() = Some(PipePayload {
             value: v,
             deps,
@@ -183,7 +220,7 @@ impl<T> Pipe<T> {
     /// Move out value + events + **home** — the provenance-preserving drain. An
     /// in-place op uses it (via [`resolve_home`](Input::resolve_home)) to thread
     /// the home; the terminal uses it to build the `Checkout` with the right home.
-    pub fn take_home(&self) -> Option<(T, Deps, Option<Cell<T>>)> {
+    pub fn take_home(&self) -> Option<(T, Deps, Option<BoxedHome<T>>)> {
         self.cell
             .lock()
             .unwrap()
@@ -300,7 +337,7 @@ impl<T> Input<T> {
     /// - A [`Pipe`](Input::Pipe): the home is whatever the upstream deposited
     ///   (propagated from a concrete head through every in-place stage; `None` if
     ///   the upstream minted/transformed the value).
-    pub fn resolve_home(&self, ec: &ExecutionContext<'_>) -> Result<(T, Deps, Option<Cell<T>>)>
+    pub fn resolve_home(&self, ec: &ExecutionContext<'_>) -> Result<(T, Deps, Option<BoxedHome<T>>)>
     where
         T: Send + 'static,
     {
@@ -312,8 +349,10 @@ impl<T> Input<T> {
                      still alive (the graph is busy)",
                 ))?;
                 // The home is this very cell: the lent buffer (possibly transformed
-                // in place) is returned here on `Checkout` drop, re-arming `g`.
-                let home = Some(Arc::clone(cell));
+                // in place) is returned here on `Checkout` drop, re-arming `g`. An
+                // in-place op's output type equals the cell type → identity rehome
+                // (`Cell<T>: Rehome<T>`).
+                let home: Option<BoxedHome<T>> = Some(Box::new(Arc::clone(cell)));
                 match ec.start_dep() {
                     // Retain the start event independently: `ec` owns the original
                     // handle for the whole enqueue; this `Dep`'s `Event::drop`
@@ -1109,10 +1148,12 @@ impl<T: DeviceOp> DeviceOpExt for T {}
 pub struct Checkout<O> {
     // `Option` so `into_inner`/drop can move the output out.
     value: Option<O>,
-    // The ONE cell this output is returned to on drop (re-arming `g`). `None` for
-    // a minted/transformed/consumed output (nothing to return). Learned from the
-    // output pipe's home channel — no matching, no type-erasure.
-    home: Option<Cell<O>>,
+    // How this output is returned to its origin cell on drop (re-arming `g`).
+    // `None` for a minted/transformed/consumed output (nothing to return).
+    // Learned from the output pipe's home channel — no matching, no `Any`. A
+    // type-erased rehome (not a bare `Cell<O>`) so the origin cell may hold a
+    // weaker type than `O` (the copy's Uninit→Init downgrade).
+    home: Option<BoxedHome<O>>,
 }
 
 impl<O: Send> Checkout<O> {
@@ -1124,7 +1165,7 @@ impl<O: Send> Checkout<O> {
     /// kernels' `gather_checkouts`, so this must be reachable cross-crate. Not
     /// part of the stable surface — prefer the terminals (`sync`/`wait_on`).
     #[doc(hidden)]
-    pub fn new(value: O, home: Option<Cell<O>>) -> Self {
+    pub fn new(value: O, home: Option<BoxedHome<O>>) -> Self {
         Checkout {
             value: Some(value),
             home,
@@ -1154,7 +1195,7 @@ impl<O> Drop for Checkout<O> {
             return; // already taken by into_inner
         };
         if let Some(home) = self.home.take() {
-            *home.lock().unwrap() = Some(value);
+            home.rehome(value);
         }
         // else: `value` drops here — nothing re-armed.
     }
@@ -4307,6 +4348,93 @@ impl<A: Send, B: Send> CopyOutputs for (A, B) {
     }
 }
 
+// ── CopyHome: build a copy output's return home from its input cell ─────
+//
+// A copy lends concrete `src`/`dst` cells but may RE-TYPE the dst (`Uninit →
+// Init`). `CopyHome<Out>` lets the (input-typed) cell rehome the (output-typed)
+// value: identity when the input type already equals `Out`, or a downgrade when
+// the input is the `Uninit` wrapper of `Out`. Implemented per buffer family;
+// the [`CopyTo2`] `DeviceOp` impl bounds `Src`/`Dst` by it so every supported
+// `(src, dst)` pair threads homes. A family that can't express the downgrade
+// returns `None` (still safe — that side just doesn't re-arm).
+
+/// Build the typed return [`Rehome`] for a copy output of type `Out` from the
+/// (possibly weaker-typed) input cell of type `Self`. `None` when this family
+/// can't soundly express the return.
+pub trait CopyHome<Out>: Sized {
+    /// The home that returns an `Out` into a `Cell<Self>` on `Checkout` drop.
+    fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<Out>>;
+}
+
+/// Rehome that DOWNGRADES an `Init` buffer back into a `Cell<Uninit-wrapper>`.
+/// Re-wraps via the family's `from_init` (a safe private-field re-wrap) before
+/// storing — `Init` is the stronger capability, so forgetting it is sound.
+struct DowngradeRehome<U, Init> {
+    cell: Cell<U>,
+    wrap: fn(Init) -> U,
+}
+
+impl<U: Send, Init: Send> Rehome<Init> for DowngradeRehome<U, Init> {
+    fn rehome(self: Box<Self>, value: Init) {
+        *self.cell.lock().unwrap() = Some((self.wrap)(value));
+    }
+}
+
+// Identity homes: src is never retyped, and an Init→Init dst is identity too.
+impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<DeviceSlice<T, M>>
+    for DeviceSlice<T, M>
+{
+    fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<DeviceSlice<T, M>>> {
+        Some(Box::new(cell))
+    }
+}
+impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<MappedSlice<T, M>>
+    for MappedSlice<T, M>
+{
+    fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<MappedSlice<T, M>>> {
+        Some(Box::new(cell))
+    }
+}
+impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<USMSlice<T, M>> for USMSlice<T, M> {
+    fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<USMSlice<T, M>>> {
+        Some(Box::new(cell))
+    }
+}
+
+// Downgrade homes: an Uninit dst comes back Init; re-wrap into the uninit cell.
+impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<DeviceSlice<T, M>>
+    for DeviceSliceUninit<T, M>
+{
+    fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<DeviceSlice<T, M>>> {
+        Some(Box::new(DowngradeRehome {
+            cell,
+            wrap: DeviceSliceUninit::from_init,
+        }))
+    }
+}
+impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<MappedSlice<T, M>>
+    for MappedSliceUninit<T, M>
+{
+    fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<MappedSlice<T, M>>> {
+        Some(Box::new(DowngradeRehome {
+            cell,
+            wrap: MappedSliceUninit::from_init,
+        }))
+    }
+}
+// USM uninit's backing is a `Vec<MaybeUninit<T>>` (not an `inner: USMSlice`), so
+// the Init→Uninit re-wrap isn't a plain private-field move — it would need a
+// same-layout `Vec` reinterpret (`unsafe`), which is beyond the safe re-wrap this
+// home channel uses. Left non-re-arming (home `None`, still safe): a USM-uninit
+// copy dst just reads via `into_inner`. Revisit if USM-uninit copy reuse is needed.
+impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<USMSlice<T, M>>
+    for USMSliceUninit<T, M>
+{
+    fn copy_home(_cell: Cell<Self>) -> Option<BoxedHome<USMSlice<T, M>>> {
+        None
+    }
+}
+
 /// Eager multi-output copy: `eager_copy_to(src, dst)` enqueues a copy and yields
 /// `(src, dst)`. `Handle = (Pipe<OutSrc>, Pipe<OutDst>)` — two element pipes, so
 /// a downstream `.and_then(|(src, dst)| …)` selects either side. Polymorphic
@@ -4350,6 +4478,10 @@ where
     Dst: Send + 'static,
     Src::Op: Send,
     <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
+    // Each input cell knows how to rehome its (possibly retyped) output: src is
+    // identity (never retyped), dst is identity or the Uninit→Init downgrade.
+    Src: CopyHome<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src>,
+    Dst: CopyHome<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
 {
     type Output = (
         <<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src,
@@ -4380,6 +4512,18 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // Grab each CONCRETE input's lending cell BEFORE resolving so we can
+        // thread it as the output's return home (re-arming `g` on Checkout drop).
+        // A pipe-fed input has no concrete cell → `None` (its producer re-mints
+        // the value each run; propagating a retyped pipe home is a later step).
+        let src_home = self
+            .src
+            .return_cell()
+            .and_then(<Src as CopyHome<_>>::copy_home);
+        let dst_home = self
+            .dst
+            .return_cell()
+            .and_then(<Dst as CopyHome<_>>::copy_home);
         // Resolve both inputs → (buffer, upstream Deps). Either may be a pipe
         // (upstream output) or concrete. Combine their wait-lists.
         let (src, src_deps) = self.src.resolve(ec)?;
@@ -4395,14 +4539,13 @@ where
         let (out_src, out_dst) = out.into_parts();
         // Clone the completion Dep onto BOTH element pipes so whichever side
         // flows downstream carries the wait-list (and the terminal reconstruct
-        // gathers from both). NO home is threaded: a copy's outputs are the
-        // `CopyOutputs` Src/Dst types, which may be RE-TYPED relative to the
-        // inputs (the Uninit→Init transition), so a lent input cell (`Cell<Dst>`)
-        // can't generically receive an init'd output (`Cell<CopyOutputs::Dst>`).
-        // Concrete copy buffers therefore stay non-re-arming in step (a) — the
-        // same boundary the uninit-transform ops have (read via `into_inner`).
-        self.src_pipe.put(out_src, out_deps.clone());
-        self.dst_pipe.put(out_dst, out_deps);
+        // gathers from both). Each output carries its return home: SRC is an
+        // identity rehome (the copy never retypes the source); DST is identity
+        // (Init→Init) or a sound DOWNGRADE (Uninit dst comes back Init, re-wrapped
+        // into its `Cell<…Uninit>` by `CopyHome`). So a concrete-buffer copy in a
+        // reused graph re-arms both cells on `Checkout` drop.
+        self.src_pipe.put_home(out_src, out_deps.clone(), src_home);
+        self.dst_pipe.put_home(out_dst, out_deps, dst_home);
         Ok(())
     }
 
@@ -4464,6 +4607,9 @@ where
     Dst: Send + crate::record::RecordableBuffer + 'static,
     Src::Op: Send,
     <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
+    // Mirror the `DeviceOp` impl's home bounds (RecordableOp: DeviceOp).
+    Src: CopyHome<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src>,
+    Dst: CopyHome<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
 {
     fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
         // `record_handle` comes from the `RecordableBuffer` bound on Src/Dst.

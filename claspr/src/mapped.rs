@@ -220,6 +220,14 @@ impl<T, M: MemMode> MappedSliceUninit<T, M> {
         self.inner
     }
 
+    /// Re-wrap an already-initialised [`MappedSlice`] back into the uninit
+    /// type-state — the sound downgrade used by the reusable-graph home channel
+    /// (see [`crate::DeviceSliceUninit::from_init`]). Safe private-field re-wrap,
+    /// the inverse of [`assume_init`](Self::assume_init).
+    pub(crate) fn from_init(inner: MappedSlice<T, M>) -> Self {
+        MappedSliceUninit { inner }
+    }
+
     pub fn len(&self) -> usize {
         self.inner.len
     }
