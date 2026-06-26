@@ -85,7 +85,7 @@ fn pipeline_spans_two_devices_via_mapped_slice() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let result: Vec<u32> = upload(vec![0u32; N])
+    let result = upload(vec![0u32; N])
         .and_then(move |buf| kernels_ref.fill_u32([N], buf, 3).on_device_at(0))
         .and_then(move |buf| kernels_ref.scale_u32([N], buf, 4).on_device_at(1))
         .and_then(download)
@@ -104,14 +104,15 @@ fn downloaded_vec_can_be_reuploaded_into_a_fresh_chain() {
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let intermediate: Vec<u32> = upload(vec![0u32; N])
+    let intermediate = upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 5))
         .and_then(download)
         .sync(&ctx)
-        .expect("chain 1");
+        .expect("chain 1")
+        .into_inner();
     assert!(intermediate.iter().all(|&v| v == 5));
 
-    let final_result: Vec<u32> = upload(intermediate)
+    let final_result = upload(intermediate)
         .and_then(|buf| kernels.scale_u32([N], buf, 6))
         .and_then(download)
         .sync(&ctx)

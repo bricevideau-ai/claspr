@@ -50,7 +50,7 @@ fn eager_bundle_macro_arity8() {
     )
     .sync(&ctx)
     .expect("8-way bundle");
-    assert_eq!((a, b, c, d, e, f, g, h), (1, 2, 3, 4, 5, 6, 7, 8));
+    assert_eq!((*a, *b, *c, *d, *e, *f, *g, *h), (1, 2, 3, 4, 5, 6, 7, 8));
 }
 
 /// Flat 16-way bundle — the widest arity. Exercises the last `impl_eager_bundle!`
@@ -80,9 +80,9 @@ fn eager_bundle_macro_arity16() {
     .expect("16-way bundle");
     // Bundle16's Output is a flat 16-tuple. Check a few representative slots.
     let (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) = t;
-    assert_eq!(a, 0);
-    assert_eq!(h, 7);
-    assert_eq!(p, 15);
+    assert_eq!(*a, 0);
+    assert_eq!(*h, 7);
+    assert_eq!(*p, 15);
     let _ = (b, c, d, e, f, g, i, j, k, l, m, n, o);
 }
 
@@ -133,12 +133,18 @@ fn eager_bundle_macro_arity8_device_chains() {
 #[test]
 fn bundle_of_multi_output_branches() {
     let Some(ctx) = ctx() else { return };
-    let ((a0, a1), (b0, b1)) = bundle!(
+    // Each outer branch is itself multi-output, so the outer bundle hands back a
+    // `Checkout` PER BRANCH whose inner value is the branch's reconstructed tuple
+    // — i.e. `(Checkout<(u32, u32)>, Checkout<(u32, u32)>)`, not a nested tuple of
+    // checkouts. Deref each branch checkout to read its pair.
+    let (ab, cd) = bundle!(
         bundle2(value(1u32), value(2u32)),
         bundle2(value(3u32), value(4u32)),
     )
     .sync(&ctx)
     .expect("bundle of bundles");
+    let (a0, a1) = *ab;
+    let (b0, b1) = *cd;
     assert_eq!((a0, a1, b0, b1), (1, 2, 3, 4));
 }
 
@@ -151,10 +157,18 @@ fn bundle_of_multi_output_branches() {
 fn bundle_with_copy_chain_branch() {
     let Some(ctx) = ctx() else { return };
 
-    let src = upload(vec![9u32; N]).sync(&ctx).expect("upload src");
-    let dst = alloc_zero::<u32>(N).sync(&ctx).expect("alloc dst");
+    // `into_inner` to concrete buffers: `eager_copy_to`'s `Src: CopyTo<Dst>` bound
+    // can't infer the marker from a `Checkout` (multiple `From<Checkout<…>>` impls).
+    let src = upload(vec![9u32; N])
+        .sync(&ctx)
+        .expect("upload src")
+        .into_inner();
+    let dst = alloc_zero::<u32>(N)
+        .sync(&ctx)
+        .expect("alloc dst")
+        .into_inner();
 
-    let (copied, marker): (Vec<u32>, u32) = bundle!(
+    let (copied, marker) = bundle!(
         eager_copy_to(src, dst).and_then(|(_src, dst)| download(dst)),
         value(99u32),
     )
@@ -162,5 +176,5 @@ fn bundle_with_copy_chain_branch() {
     .expect("bundle with copy-chain branch");
 
     assert!(copied.iter().all(|&v| v == 9), "copy moved the bytes");
-    assert_eq!(marker, 99);
+    assert_eq!(*marker, 99);
 }

@@ -40,9 +40,9 @@ fn arc_split_into_three_branches_share_value() {
     )
     .sync(&ctx)
     .expect("arc-split chain");
-    assert_eq!(sum, 10);
-    assert_eq!(product, 24);
-    assert_eq!(len, 4);
+    assert_eq!(*sum, 10);
+    assert_eq!(*product, 24);
+    assert_eq!(*len, 4);
 }
 
 /// arc_split.rs::arc_split_propagates_branch_error — one fan-out branch errors
@@ -71,7 +71,9 @@ fn arc_split_propagates_branch_error() {
             .and_then(|_p| value(0u32)),
     );
 
-    let err = chain.sync(&ctx).expect_err("branch B errored");
+    // `expect_err` needs the Ok type to be `Debug`; the success arm is a tuple of
+    // `Checkout`s (not `Debug`), so drop it before asserting the error.
+    let err = chain.sync(&ctx).map(|_| ()).expect_err("branch B errored");
     assert!(
         matches!(&err, Error::Build { log } if log == "branch B aborted"),
         "got {err:?}",
@@ -89,5 +91,5 @@ fn arc_split_single_does_not_panic() {
     };
     let shared = Arc::new("only-input".to_string());
     let chain = value(shared).and_then(|s| value(s.len()));
-    assert_eq!(chain.sync(&ctx).expect("single branch"), 10);
+    assert_eq!(*chain.sync(&ctx).expect("single branch"), 10);
 }

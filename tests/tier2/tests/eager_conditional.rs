@@ -50,7 +50,7 @@ fn dyn_op_lets_if_arms_have_different_concrete_types() {
         DeviceDynOp::new(value(0u32).and_then(|n| value(n + 100)))
     };
     let result = chain.sync(&ctx).expect("dyn_op");
-    assert_eq!(result, 7);
+    assert_eq!(*result, 7);
 }
 
 /// conditional.rs::dyn_op_wraps_simple_value — erase a bare `value`.
@@ -59,7 +59,7 @@ fn dyn_op_wraps_simple_value() {
     let Some(ctx) = ctx() else { return };
     let chain: DeviceDynOp<u32> = DeviceDynOp::new(value(42u32));
     let v = chain.sync(&ctx).expect("sync");
-    assert_eq!(v, 42);
+    assert_eq!(*v, 42);
 }
 
 /// conditional.rs::dyn_op_wraps_value_chain — erase a `value`-chain.
@@ -71,7 +71,7 @@ fn dyn_op_wraps_value_chain() {
     let Some(ctx) = ctx() else { return };
     let chain: DeviceDynOp<u32> = DeviceDynOp::new(value(1u32).and_then(|n| value(n + 41)));
     let v = chain.sync(&ctx).expect("sync");
-    assert_eq!(v, 42);
+    assert_eq!(*v, 42);
 }
 
 /// conditional.rs::dyn_op_wraps_upload_download — erase a transfer chain.
@@ -165,10 +165,10 @@ fn dyn_op_picks_branch_with_or_without_kernel() {
             DeviceDynOp::new(value(0u32))
         }
     };
-    assert_eq!(make(true).sync(&ctx).expect("a"), 0);
+    assert_eq!(*make(true).sync(&ctx).expect("a"), 0);
     assert_eq!(*sum_cell.lock().unwrap(), 9 * N as u32);
     *sum_cell.lock().unwrap() = 0;
-    assert_eq!(make(false).sync(&ctx).expect("b"), 0);
+    assert_eq!(*make(false).sync(&ctx).expect("b"), 0);
     assert_eq!(*sum_cell.lock().unwrap(), 0);
 }
 
@@ -193,7 +193,7 @@ fn non_taken_branch_closure_does_not_fire() {
             )
         }
     };
-    assert_eq!(make(true).sync(&ctx).expect("safe arm"), 7);
+    assert_eq!(*make(true).sync(&ctx).expect("safe arm"), 7);
 }
 
 /// DeviceDynOp over a MULTI-OUTPUT inner op. `bundle2` has `Output = (u32, u32)`;
@@ -212,6 +212,6 @@ fn dyn_op_erases_multi_output_op() {
             DeviceDynOp::new(bundle2(value(3u32).and_then(value), value(4u32)))
         }
     };
-    assert_eq!(pick(true).sync(&ctx).expect("left"), (1, 2));
-    assert_eq!(pick(false).sync(&ctx).expect("right"), (3, 4));
+    assert_eq!(*pick(true).sync(&ctx).expect("left"), (1, 2));
+    assert_eq!(*pick(false).sync(&ctx).expect("right"), (3, 4));
 }

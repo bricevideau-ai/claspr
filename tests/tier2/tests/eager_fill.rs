@@ -47,7 +47,7 @@ fn tier2_device_slice_filled_threads_into_chain() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let result: Vec<u32> = alloc_zero::<u32>(N)
+    let result = alloc_zero::<u32>(N)
         .and_then(|buf| fill(buf, 7u32))
         .and_then(|buf| kernels.scale_u32([N], buf, 2))
         .and_then(download)
@@ -63,7 +63,7 @@ fn macro_repeat_arm_matches_device_slice_filled() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let result: Vec<u32> = alloc_zero::<u32>(N)
+    let result = alloc_zero::<u32>(N)
         .and_then(|buf| fill(buf, 3u32))
         .and_then(|buf| kernels.scale_u32([N], buf, 5))
         .and_then(download)
@@ -79,10 +79,10 @@ fn macro_literal_list_arm_uploads_host_vec() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let result: Vec<u32> = upload(vec![1u32, 2, 3, 4])
+    let result = upload(vec![1u32, 2, 3, 4])
         .and_then(|buf| kernels.scale_u32([4], buf, 10))
         .and_then(download)
         .sync(&ctx)
         .expect("macro literal chain");
-    assert_eq!(result, vec![10, 20, 30, 40]);
+    assert_eq!(*result, vec![10, 20, 30, 40]);
 }

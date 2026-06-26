@@ -29,12 +29,12 @@ fn ctx() -> Option<Context> {
 fn piped_uninit_write_method() {
     let Some(ctx) = ctx() else { return };
     let data: Vec<u32> = (0..N as u32).collect();
-    let result: Vec<u32> = device_alloc_uninit(N)
+    let result = device_alloc_uninit(N)
         .and_then(|u| u.write(data.clone()))
         .and_then(download)
         .sync(&ctx)
         .expect("alloc_uninit + piped write + download");
-    assert_eq!(result, data);
+    assert_eq!(*result, data);
 }
 
 /// `device_alloc_uninit(n).and_then(|u| u.fill(v))` — the piped uninit buffer's
@@ -42,7 +42,7 @@ fn piped_uninit_write_method() {
 #[test]
 fn piped_uninit_fill_method() {
     let Some(ctx) = ctx() else { return };
-    let result: Vec<u32> = device_alloc_uninit(N)
+    let result = device_alloc_uninit(N)
         .and_then(|u| u.fill(7u32))
         .and_then(download)
         .sync(&ctx)
@@ -56,7 +56,7 @@ fn piped_uninit_fill_method() {
 #[test]
 fn piped_init_fill_method() {
     let Some(ctx) = ctx() else { return };
-    let result: Vec<u32> = alloc_zero::<u32>(N)
+    let result = alloc_zero::<u32>(N)
         .and_then(|buf| buf.fill(13u32))
         .and_then(download)
         .sync(&ctx)
@@ -69,7 +69,7 @@ fn piped_init_fill_method() {
 #[test]
 fn piped_init_write_method() {
     let Some(ctx) = ctx() else { return };
-    let result: Vec<u32> = upload(vec![0u32; N])
+    let result = upload(vec![0u32; N])
         .and_then(|buf| buf.write(vec![42u32; N]))
         .and_then(download)
         .sync(&ctx)
@@ -83,11 +83,11 @@ fn piped_init_write_method() {
 fn piped_read_method() {
     let Some(ctx) = ctx() else { return };
     let data: Vec<u32> = (100..100 + N as u32).collect();
-    let result: Vec<u32> = upload(data.clone())
+    let result = upload(data.clone())
         .and_then(|buf| buf.read())
         .sync(&ctx)
         .expect("upload + piped read");
-    assert_eq!(result, data);
+    assert_eq!(*result, data);
 }
 
 /// `upload(a).and_then(|src| src.copy_to(dst))` — the piped buffer's `.copy_to`
@@ -97,12 +97,19 @@ fn piped_copy_to_method() {
     let Some(ctx) = ctx() else { return };
     let data: Vec<u32> = (0..N as u32).collect();
     // Allocate the destination concretely, then copy the uploaded src into it.
-    let dst = alloc_zero::<u32>(N).wait_on(&ctx).expect("dst alloc");
-    let (_src, dst): (_, claspr::DeviceSlice<u32>) = upload(data.clone())
+    // The piped `.copy_to` wants a concrete `DeviceSlice`, so `into_inner` the dst.
+    let dst = alloc_zero::<u32>(N)
+        .wait_on(&ctx)
+        .expect("dst alloc")
+        .into_inner();
+    // Terminal is the `and_then` (single output): one `Checkout<(src, dst)>`.
+    // `into_inner` to own the pair so `dst` can feed the downstream `download`.
+    let (_src, dst) = upload(data.clone())
         .and_then(|src| src.copy_to(dst))
         .sync(&ctx)
-        .expect("upload + piped copy_to");
+        .expect("upload + piped copy_to")
+        .into_inner();
     // The copy landed in dst: download it and compare to the original data.
-    let back: Vec<u32> = download(dst).sync(&ctx).expect("download dst");
-    assert_eq!(back, data);
+    let back = download(dst).sync(&ctx).expect("download dst");
+    assert_eq!(*back, data);
 }

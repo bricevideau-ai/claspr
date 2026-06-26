@@ -52,7 +52,7 @@ fn ctx_with_svm() -> Option<Context> {
 #[test]
 fn device_slice_fill_in_place() {
     let Some(ctx) = ctx() else { return };
-    let result: Vec<u32> = alloc_zero::<u32>(N)
+    let result = alloc_zero::<u32>(N)
         .and_then(|buf| fill(buf, 7u32))
         .and_then(download)
         .sync(&ctx)
@@ -66,7 +66,7 @@ fn device_slice_fill_in_place() {
 fn device_slice_fill_chains_after_upload() {
     let Some(ctx) = ctx() else { return };
     let input: Vec<u32> = (0..N as u32).collect();
-    let result: Vec<u32> = upload(input)
+    let result = upload(input)
         .and_then(|buf| fill(buf, 99u32))
         .and_then(download)
         .sync(&ctx)
@@ -79,7 +79,7 @@ fn device_slice_fill_chains_after_upload() {
 fn device_slice_fill_event_threads_to_kernel() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let result: Vec<u32> = alloc_zero::<u32>(N)
+    let result = alloc_zero::<u32>(N)
         .and_then(|buf| fill(buf, 7u32))
         .and_then(|buf| kernels.scale_u32([N], buf, 2u32))
         .and_then(download)
@@ -98,13 +98,19 @@ fn device_slice_copy_propagates_src_to_dst() {
     // `eager_copy_to`'s `Src: CopyTo<Dst>` bound is on the concrete buffer
     // types, so its heads are concrete buffers (or pipes of them), not upstream
     // ops — build them synchronously first (mirrors eager_cutover::device_copy_eager).
-    let src = upload(src_data.clone()).sync(&ctx).expect("upload src");
-    let dst = alloc_zero::<u32>(N).sync(&ctx).expect("alloc dst");
-    let result: Vec<u32> = eager_copy_to(src, dst)
+    let src = upload(src_data.clone())
+        .sync(&ctx)
+        .expect("upload src")
+        .into_inner();
+    let dst = alloc_zero::<u32>(N)
+        .sync(&ctx)
+        .expect("alloc dst")
+        .into_inner();
+    let result = eager_copy_to(src, dst)
         .and_then(|(_src, dst)| download(dst))
         .sync(&ctx)
         .expect("upload + alloc + copy + download");
-    assert_eq!(result, src_data);
+    assert_eq!(*result, src_data);
 }
 
 /// buffer_ops.rs::device_slice_copy_returns_both_buffers — after copy, src is
@@ -113,26 +119,43 @@ fn device_slice_copy_propagates_src_to_dst() {
 fn device_slice_copy_returns_both_buffers() {
     let Some(ctx) = ctx() else { return };
     let src_data: Vec<u32> = (10..10 + N as u32).collect();
-    let src = upload(src_data.clone()).sync(&ctx).expect("upload src");
-    let dst = alloc_zero::<u32>(N).sync(&ctx).expect("alloc dst");
-    let (src_out, dst_out): (Vec<u32>, Vec<u32>) = eager_copy_to(src, dst)
+    let src = upload(src_data.clone())
+        .sync(&ctx)
+        .expect("upload src")
+        .into_inner();
+    let dst = alloc_zero::<u32>(N)
+        .sync(&ctx)
+        .expect("alloc dst")
+        .into_inner();
+    // Terminal is the `and_then` (single output): one `Checkout<(Vec, Vec)>`.
+    let result = eager_copy_to(src, dst)
         .and_then(|(src, dst)| bundle2(download(src), download(dst)))
         .sync(&ctx)
         .expect("copy + both downloads");
-    assert_eq!(src_out, src_data, "src unchanged after copy");
-    assert_eq!(dst_out, src_data, "dst received src's bytes");
+    let (src_out, dst_out) = &*result;
+    assert_eq!(*src_out, src_data, "src unchanged after copy");
+    assert_eq!(*dst_out, src_data, "dst received src's bytes");
 }
 
 /// buffer_ops.rs::device_slice_copy_length_mismatch_errors — src=10, dst=5.
 #[test]
 fn device_slice_copy_length_mismatch_errors() {
     let Some(ctx) = ctx() else { return };
-    let src = upload(vec![0u32; 10]).sync(&ctx).expect("upload src");
-    let dst = alloc_zero::<u32>(5).sync(&ctx).expect("alloc dst");
+    let src = upload(vec![0u32; 10])
+        .sync(&ctx)
+        .expect("upload src")
+        .into_inner();
+    let dst = alloc_zero::<u32>(5)
+        .sync(&ctx)
+        .expect("alloc dst")
+        .into_inner();
     let result = eager_copy_to(src, dst)
         .and_then(|(_src, dst)| download(dst))
         .sync(&ctx);
-    let err = result.expect_err("copy of mismatched lengths should error");
+    // `expect_err` needs the Ok type (`Checkout<Vec<u32>>`) to be `Debug`; drop it.
+    let err = result
+        .map(|_| ())
+        .expect_err("copy of mismatched lengths should error");
     assert!(
         matches!(err, Error::LengthMismatch { src: 10, dst: 5 }),
         "expected LengthMismatch {{ src: 10, dst: 5 }}, got {err:?}",
@@ -149,12 +172,12 @@ fn device_slice_copy_length_mismatch_errors() {
 fn device_slice_write_into_existing_buffer() {
     let Some(ctx) = ctx() else { return };
     let data: Vec<u32> = (1..=N as u32).collect();
-    let result: Vec<u32> = alloc_zero::<u32>(N)
+    let result = alloc_zero::<u32>(N)
         .and_then(|buf| write(buf, data.clone()))
         .and_then(download)
         .sync(&ctx)
         .expect("alloc + write + download");
-    assert_eq!(result, data);
+    assert_eq!(*result, data);
 }
 
 /// buffer_ops.rs::device_slice_write_overwrites_kernel_output — kernel fill 99,
@@ -165,13 +188,13 @@ fn device_slice_write_overwrites_kernel_output() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let data: Vec<u32> = (1..=N as u32).collect();
-    let result: Vec<u32> = alloc_zero::<u32>(N)
+    let result = alloc_zero::<u32>(N)
         .and_then(|buf| kernels.fill_u32([N], buf, 99u32))
         .and_then(|buf| write(buf, data.clone()))
         .and_then(download)
         .sync(&ctx)
         .expect("kernel + write + download");
-    assert_eq!(result, data);
+    assert_eq!(*result, data);
 }
 
 // ── device_slice_write_sync (blocking borrowing upload) ─────────────
@@ -191,8 +214,8 @@ fn device_slice_write_sync_borrows_and_is_reusable() {
     buf.write_sync(&data).expect("write_sync");
 
     // (a) the bytes landed: read back equals the source.
-    let read1: Vec<u32> = download(buf).sync(&ctx).expect("download after write_sync");
-    assert_eq!(read1, data, "write_sync wrote the borrowed data");
+    let read1 = download(buf).sync(&ctx).expect("download after write_sync");
+    assert_eq!(*read1, data, "write_sync wrote the borrowed data");
 
     // (b) THE WHOLE POINT — source slice AND buffer are both still usable.
     // `data` was only borrowed, so it's still owned here; reuse it for a second
@@ -204,8 +227,8 @@ fn device_slice_write_sync_borrows_and_is_reusable() {
     let data2: Vec<u32> = (100..100 + N as u32).collect();
     buf2.write_sync(&data2)
         .expect("buffer reusable across write_sync calls");
-    let read2: Vec<u32> = download(buf2).sync(&ctx).expect("download buf2");
-    assert_eq!(read2, data2, "buffer reused across two write_sync calls");
+    let read2 = download(buf2).sync(&ctx).expect("download buf2");
+    assert_eq!(*read2, data2, "buffer reused across two write_sync calls");
     // `data` is provably still alive: a final read of it compiles + matches.
     assert_eq!(data.len(), N, "source vec still owned after write_sync");
 }
@@ -282,9 +305,9 @@ fn mapped_slice_write_sync_borrows_and_is_reusable() {
 fn mapped_slice_copy_propagates_src_to_dst() {
     let Some(ctx) = ctx_with_svm() else { return };
     let src_data: Vec<u32> = (0..N as u32).map(|i| i + 1000).collect();
-    let src = MappedSlice::from_slice(&ctx, &src_data).expect("upload src");
+    let src: MappedSlice<u32> = MappedSlice::from_slice(&ctx, &src_data).expect("upload src");
     let dst = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc dst");
-    let (_src, dst): (MappedSlice<u32>, MappedSlice<u32>) = eager_copy_to(src, dst)
+    let (_src, dst) = eager_copy_to(src, dst)
         .sync(&ctx)
         .expect("upload + alloc + copy");
     let g = dst.map().wait().expect("map dst for read-back");
@@ -299,13 +322,16 @@ fn mapped_slice_copy_propagates_src_to_dst() {
 fn copy_to_device_slice_uninit_propagates_and_transitions_to_init() {
     let Some(ctx) = ctx() else { return };
     let src_data: Vec<u32> = (100..100 + N as u32).collect();
-    let src = upload(src_data.clone()).sync(&ctx).expect("upload src");
+    let src = upload(src_data.clone())
+        .sync(&ctx)
+        .expect("upload src")
+        .into_inner();
     let uninit_dst = DeviceSlice::<u32>::alloc_uninit(&ctx, N).expect("alloc_uninit");
-    let result: Vec<u32> = eager_copy_to(src, uninit_dst)
+    let result = eager_copy_to(src, uninit_dst)
         .and_then(|(_src, dst)| download(dst))
         .sync(&ctx)
         .expect("upload + alloc_uninit + copy_to + download");
-    assert_eq!(result, src_data);
+    assert_eq!(*result, src_data);
 }
 
 /// buffer_ops.rs::copy_to_mapped_slice_uninit_propagates_and_transitions_to_init
@@ -314,9 +340,9 @@ fn copy_to_device_slice_uninit_propagates_and_transitions_to_init() {
 fn copy_to_mapped_slice_uninit_propagates_and_transitions_to_init() {
     let Some(ctx) = ctx_with_svm() else { return };
     let src_data: Vec<u32> = (200..200 + N as u32).collect();
-    let src = MappedSlice::from_slice(&ctx, &src_data).expect("svm upload");
+    let src: MappedSlice<u32> = MappedSlice::from_slice(&ctx, &src_data).expect("svm upload");
     let uninit_dst = MappedSlice::<u32>::alloc_uninit(&ctx, N).expect("mapped alloc_uninit");
-    let (_src, dst): (MappedSlice<u32>, MappedSlice<u32>) = eager_copy_to(src, uninit_dst)
+    let (_src, dst) = eager_copy_to(src, uninit_dst)
         .sync(&ctx)
         .expect("svm upload + alloc_uninit + copy_to");
     let g = dst.map().wait().expect("map dst");
@@ -333,9 +359,9 @@ fn copy_to_cross_type_mapped_to_usm_svm_memcpy() {
         return;
     }
     let src_data: Vec<u32> = (300..300 + N as u32).collect();
-    let src = MappedSlice::from_slice(&ctx, &src_data).expect("svm upload");
+    let src: MappedSlice<u32> = MappedSlice::from_slice(&ctx, &src_data).expect("svm upload");
     let dst = claspr::USMSlice::<u32>::alloc_zero(&ctx, N).expect("usm alloc");
-    let (_src, dst): (MappedSlice<u32>, claspr::USMSlice<u32>) = eager_copy_to(src, dst)
+    let (_src, dst) = eager_copy_to(src, dst)
         .sync(&ctx)
         .expect("svm upload + usm alloc + cross-type copy");
     // USMSlice is host memory — read directly via Deref.

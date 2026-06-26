@@ -42,7 +42,7 @@ fn ctx() -> Option<Context> {
 fn device_slice_alloc_produces_buffer_usable_in_kernel() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let result: Vec<u32> = alloc_zero::<u32>(N)
+    let result = alloc_zero::<u32>(N)
         .and_then(|buf| kernels.fill_u32([N], buf, 42))
         .and_then(download)
         .sync(&ctx)
@@ -79,7 +79,7 @@ fn mapped_slice_alloc_succeeds_or_surfaces_svm_not_available() {
 fn hoisted_bundle_uploads_and_alloc_feed_three_arg_kernel() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let result: Vec<u32> = bundle3(
+    let result = bundle3(
         upload(vec![1u32; N]),
         upload(vec![2u32; N]),
         alloc_zero::<u32>(N),
@@ -99,7 +99,7 @@ fn hoisted_bundle_uploads_and_alloc_feed_three_arg_kernel() {
 fn and_then_closure_returns_kernel_op_directly() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let result: Vec<u32> = upload(vec![6u32; N])
+    let result = upload(vec![6u32; N])
         .and_then(|buf| kernels.scale_u32([N], buf, 5))
         .and_then(download)
         .sync(&ctx)
@@ -116,7 +116,7 @@ fn and_then_closure_returns_kernel_op_directly() {
 fn alloc_uninit_then_fill_via_trait_verb() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let result: Vec<u32> = device_alloc_uninit::<u32>(N)
+    let result = device_alloc_uninit::<u32>(N)
         .and_then(|u| fill_device_uninit(u, 99u32))
         .and_then(|buf| kernels.scale_u32([N], buf, 2))
         .and_then(download)
@@ -131,12 +131,12 @@ fn alloc_uninit_then_fill_via_trait_verb() {
 #[test]
 fn alloc_uninit_then_write_via_trait_verb() {
     let Some(ctx) = ctx() else { return };
-    let result: Vec<u32> = device_alloc_uninit::<u32>(N)
+    let result = device_alloc_uninit::<u32>(N)
         .and_then(|u| write_device_uninit(u, (0u32..N as u32).collect::<Vec<_>>()))
         .and_then(download)
         .sync(&ctx)
         .expect("alloc_uninit + write chain");
-    assert_eq!(result, (0u32..N as u32).collect::<Vec<_>>());
+    assert_eq!(*result, (0u32..N as u32).collect::<Vec<_>>());
 }
 
 /// alloc_ops.rs::mapped_alloc_uninit_then_fill_via_trait_verb — SVM analog via
@@ -148,7 +148,7 @@ fn mapped_alloc_uninit_then_fill_via_trait_verb() {
         eprintln!("SKIP: no SVM");
         return;
     }
-    let buf: MappedSlice<u32> = mapped_alloc_uninit::<u32>(N)
+    let buf = mapped_alloc_uninit::<u32>(N)
         .and_then(|u| fill_mapped_uninit(u, 7u32))
         .sync(&ctx)
         .expect("mapped alloc_uninit + fill");
@@ -165,7 +165,7 @@ fn mapped_alloc_uninit_then_fill_via_trait_verb() {
 fn and_then_composes_lazy_alloc_inside_closure() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
-    let result: Vec<u32> = upload(vec![7u32; N])
+    let result = upload(vec![7u32; N])
         .and_then(|buf| {
             // `and_then`'s Handle here is a single `Pipe<Output>`, not a
             // per-element tuple-of-pipes, so the multi-output `add_u32` must be
