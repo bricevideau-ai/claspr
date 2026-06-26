@@ -1222,11 +1222,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 /// caller can keep using them.
                 pub fn wait(self) -> ::claspr::Result<#output_ty> {
                     let ctx = ::core::clone::Clone::clone(&self.ctx);
-                    // No inherent `wait_on` anymore — the kernel Op is a
-                    // `DeviceOp`, so this falls through to the blanket
-                    // `DeviceOpExt::wait_on` (eager.rs), which blocks on the
-                    // launch event just like the old inherent version did.
-                    ::claspr::DeviceOpExt::wait_on(self, &ctx)
+                    // The kernel Op is a `DeviceOp`; `wait_on` blocks and returns
+                    // a `Checkout`. The Tier-1 contract hands the buffer(s) back by
+                    // value, so `into_inner` permanently extracts them (this is a
+                    // consuming terminal — the Op is dropped here).
+                    ::claspr::DeviceOpExt::wait_on(&self, &ctx)
+                        .map(::claspr::Checkout::into_inner)
                 }
             }
 

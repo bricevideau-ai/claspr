@@ -227,8 +227,14 @@ impl<T> Input<T> {
     ///
     /// The lent value is taken OUT of the `Concrete` cell here; the cell stays
     /// empty for the rest of the run. It is returned by the run's `Checkout` on
-    /// drop (see [`return_to`](Input::return_to)).
-    pub fn resolve(&self, ec: &ExecutionContext<'_>) -> Result<(T, Deps)> {
+    /// drop (see [`Checkout`](crate::Checkout)).
+    ///
+    /// `T: Send + 'static` so the lent cell can be recorded type-erased in the
+    /// run's ledger for return — every buffer type that flows here satisfies it.
+    pub fn resolve(&self, ec: &ExecutionContext<'_>) -> Result<(T, Deps)>
+    where
+        T: Send + 'static,
+    {
         match self {
             Input::Concrete(cell) => {
                 let v = cell.lock().unwrap().take().ok_or(Error::NotSupported(
@@ -236,6 +242,9 @@ impl<T> Input<T> {
                      returned — a graph is `sync`'d while a previous `Checkout` is \
                      still alive (the graph is busy)",
                 ))?;
+                // Record the cell so the run's `Checkout` returns the (possibly
+                // in-place-transformed) value to it on drop, re-arming the graph.
+                ec.record_lent_cell(Box::new(Arc::clone(cell)));
                 match ec.start_dep() {
                     // Retain the start event independently: `ec` owns the original
                     // handle for the whole enqueue; this `Dep`'s `Event::drop`
@@ -626,13 +635,25 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         }
     }
 
-    /// Run `self` to completion on `launcher`'s queue (forward path; no replay).
-    /// Blocks once, here, on the terminal op's events — the only wait in the
-    /// graph. The general blocking terminal: a [`Launcher`](crate::Launcher) is a specific queue
-    /// (`Context` → its default OOO queue; a `Queue`/`ExecutionContext` → that
-    /// exact queue), so `wait_on` is also the cross-queue / cross-device control
-    /// (Tier-1 heritage). [`sync`](Self::sync) is `wait_on` over a `Context`.
-    fn wait_on<L: crate::Launcher + ?Sized>(self, launcher: &L) -> Result<Self::Output> {
+    /// Run `self` to completion on `launcher`'s queue and hand back a
+    /// [`Checkout`] guard over its output (forward path; no replay). Blocks once,
+    /// here, on the terminal op's events — the only wait in the graph.
+    ///
+    /// **Reusable.** `&self` (not `self`): the graph stays intact. The returned
+    /// `Checkout` `Deref`s to the output; on **drop** it returns any LENT concrete
+    /// buffers to their cells (re-arming `g`) and releases the run, so `g` can be
+    /// `wait_on`/`sync`'d again. While a `Checkout` is live, a second run that
+    /// needs a still-lent buffer errors "graph busy". [`Checkout::into_inner`]
+    /// permanently extracts the output (severs the return).
+    ///
+    /// A [`Launcher`](crate::Launcher) is a specific queue (`Context` → its
+    /// default OOO queue; a `Queue`/`ExecutionContext` → that exact queue), so
+    /// `wait_on` is also the cross-queue / cross-device control (Tier-1 heritage).
+    /// [`sync`](Self::sync) is `wait_on` over a `Context`.
+    fn wait_on<L: crate::Launcher + ?Sized>(&self, launcher: &L) -> Result<Checkout<Self::Output>>
+    where
+        Self::Output: Send + 'static,
+    {
         let device = launcher.context().device().clone();
         let mut ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
 
@@ -654,7 +675,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
                 // signal — check it. (Same as the async terminal.)
                 Ok(v) => match ec.take_host_error() {
                     Some(rust_err) => Err(rust_err),
-                    None => Ok(v),
+                    None => Ok(Checkout::new(v, ec.take_lent_cells())),
                 },
             };
         }
@@ -715,16 +736,22 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             Some(rust_err) => Err(rust_err),
             None => match wait_err {
                 Some(cascade) => Err(cascade),
-                None => Ok(value),
+                None => Ok(Checkout::new(value, ec.take_lent_cells())),
             },
         }
     }
 
-    /// Run `self` to completion on `context`'s default out-of-order queue. The
-    /// named graph terminal (cuda-oxide / Rust-CUDA heritage spelling); equal to
+    /// Run `self` to completion on `context`'s default out-of-order queue and
+    /// hand back a [`Checkout`] over its output. The named graph terminal
+    /// (cuda-oxide / Rust-CUDA heritage spelling); equal to
     /// [`wait_on`](Self::wait_on) over the `context`. Use `wait_on` with an
     /// explicit `Queue` for cross-queue ordering.
-    fn sync(self, context: &Context) -> Result<Self::Output> {
+    ///
+    /// Reusable: `&self`. See [`wait_on`](Self::wait_on) and [`Checkout`].
+    fn sync(&self, context: &Context) -> Result<Checkout<Self::Output>>
+    where
+        Self::Output: Send + 'static,
+    {
         let device = context.device().clone();
         let queue = context.default_outoforder_queue(&device)?;
         self.wait_on(&*queue)
@@ -831,6 +858,107 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     }
 }
 impl<T: DeviceOp> DeviceOpExt for T {}
+
+// ── Checkout: runtime guard over one run's output ───────────────────────
+
+/// A runtime guard over the output of one reusable-graph run, returned by
+/// [`sync`](DeviceOpExt::sync) / [`wait_on`](DeviceOpExt::wait_on).
+///
+/// ## Lend-and-return
+///
+/// A graph (`g`) is reusable: `g.sync(&ctx)` enqueues its commands, waits, and
+/// returns a `Checkout` holding the output. While the `Checkout` is alive you can
+/// read (and mutate) the output via [`Deref`]/[`DerefMut`]. Any caller-owned
+/// buffer the run **lent** (a [`Concrete`](Input::Concrete) input) is held by the
+/// `Checkout` for return: on **drop** it deposits the output back into the lending
+/// cell, **re-arming** `g` for another `sync`. A second `sync` that needs a
+/// still-lent buffer (its cell empty) errors "graph busy" — so a `Checkout` is
+/// also the no-parallel-use guard.
+///
+/// Pure mint-and-consume graphs (`upload…download`) lend nothing, so the
+/// `Checkout` drop is a no-op for them and they are reusable purely by re-seeding
+/// (the `upload` op re-creates its buffer each run).
+///
+/// [`into_inner`](Checkout::into_inner) **permanently** extracts the output and
+/// severs the return (the lent cell stays empty / the graph re-allocates next
+/// run).
+#[must_use = "a Checkout holds the graph's output; reading it requires keeping it alive"]
+pub struct Checkout<O: 'static> {
+    // `Option` so `into_inner`/drop can move the output out.
+    value: Option<O>,
+    // The cells lent during the run, type-erased (`Box<dyn Any>` over `Cell<T>`).
+    // On drop the output is returned to a cell whose `Cell<O>` type matches —
+    // the in-place buffer case (the lent buffer IS the output).
+    lent_cells: Vec<Box<dyn std::any::Any + Send>>,
+}
+
+impl<O: Send + 'static> Checkout<O> {
+    /// Build a checkout over `value`, carrying the run's lent cells for return.
+    pub(crate) fn new(value: O, lent_cells: Vec<Box<dyn std::any::Any + Send>>) -> Self {
+        Checkout {
+            value: Some(value),
+            lent_cells,
+        }
+    }
+
+    /// Permanently extract the output, **severing** the lend-return: the lent
+    /// cell stays empty, so the graph re-allocates (or errors "Tag unbound" /
+    /// "busy") for that input next run. Use when you want to keep the buffer
+    /// rather than hand it back to `g`.
+    pub fn into_inner(mut self) -> O {
+        // Drop the lent cells WITHOUT returning (sever); take the value out.
+        self.lent_cells.clear();
+        self.value
+            .take()
+            .expect("Checkout::into_inner after value already taken — internal bug")
+    }
+}
+
+impl<O: 'static> Drop for Checkout<O> {
+    fn drop(&mut self) {
+        // Return the output to its lending cell, re-arming `g`. The in-place
+        // buffer case: the lent buffer flowed through the graph unchanged and IS
+        // the output, so `O == T` for the lending cell.
+        let Some(value) = self.value.take() else {
+            return; // already taken by into_inner
+        };
+        // Collect the lent cells whose stored type is `Cell<O>` — candidates to
+        // receive the output.
+        let mut matching: Vec<Arc<Mutex<Option<O>>>> = self
+            .lent_cells
+            .drain(..)
+            .filter_map(|c| c.downcast::<Cell<O>>().ok().map(|b| *b))
+            .collect();
+        // Re-arm ONLY when the home is unambiguous: exactly one lent cell of the
+        // output's type. With several same-typed lent inputs (e.g. a multi-input
+        // kernel `add(a,b,out)`), we can't tell which one the output belongs to by
+        // type alone, so we conservatively don't re-arm those cells — the graph is
+        // still safe (their cells stay empty → a second `sync` errors "busy"),
+        // just not auto-reusable for that shape in step (a). A pure mint graph
+        // has zero matching cells → nothing to return.
+        if matching.len() == 1 {
+            *matching.remove(0).lock().unwrap() = Some(value);
+        }
+        // else: `value` drops here — nothing re-armed.
+    }
+}
+
+impl<O> std::ops::Deref for Checkout<O> {
+    type Target = O;
+    fn deref(&self) -> &O {
+        self.value
+            .as_ref()
+            .expect("Checkout dereferenced after into_inner — internal bug")
+    }
+}
+
+impl<O> std::ops::DerefMut for Checkout<O> {
+    fn deref_mut(&mut self) -> &mut O {
+        self.value
+            .as_mut()
+            .expect("Checkout dereferenced after into_inner — internal bug")
+    }
+}
 
 // ── AndThen: source then next; next eagerly built over source's pipe ───
 
@@ -1916,7 +2044,7 @@ where
     /// specific queue, or `sync`/`wait_on` for a pipe-fed op.
     pub fn wait(self) -> Result<DeviceSlice<T, M>> {
         let ctx = concrete_buf_ctx(&self.buf)?;
-        self.sync(&ctx)
+        self.sync(&ctx).map(Checkout::into_inner)
     }
 
     /// Concrete-head non-blocking terminal: enqueue the fill on the buffer's own
@@ -2075,7 +2203,7 @@ where
     /// queue and return the host `Vec<T>`.
     pub fn wait(self) -> Result<Vec<T>> {
         let ctx = concrete_buf_ctx(&self.buf)?;
-        self.sync(&ctx)
+        self.sync(&ctx).map(Checkout::into_inner)
     }
 
     /// Concrete-head non-blocking terminal returning the (not-yet-valid) host
@@ -2173,7 +2301,7 @@ where
     /// buffer's own context default queue; return the buffer for reuse.
     pub fn wait(self) -> Result<DeviceSlice<T, M>> {
         let ctx = concrete_buf_ctx(&self.buf)?;
-        self.sync(&ctx)
+        self.sync(&ctx).map(Checkout::into_inner)
     }
 
     /// Concrete-head non-blocking terminal: enqueue the read on the buffer's own
@@ -2663,7 +2791,7 @@ where
     /// queue and return the buffer for reuse (`let buf = buf.write(d).wait()?;`).
     pub fn wait(self) -> Result<DeviceSlice<T, M>> {
         let ctx = concrete_buf_ctx(&self.buf)?;
-        self.sync(&ctx)
+        self.sync(&ctx).map(Checkout::into_inner)
     }
 
     /// Concrete-head non-blocking terminal returning the buffer plus a completion
@@ -2819,7 +2947,7 @@ where
     /// queue and return the (filled) buffer (`let buf = buf.fill(v).wait()?;`).
     pub fn wait(self) -> Result<MappedSlice<T, M>> {
         let ctx = concrete_svm_ctx(&self.buf)?;
-        self.sync(&ctx)
+        self.sync(&ctx).map(Checkout::into_inner)
     }
 
     /// Concrete-head non-blocking terminal: enqueue the fill on the buffer's own
@@ -2911,7 +3039,7 @@ where
     /// queue and return the buffer for reuse (`let buf = buf.write(d).wait()?;`).
     pub fn wait(self) -> Result<MappedSlice<T, M>> {
         let ctx = concrete_svm_ctx(&self.buf)?;
-        self.sync(&ctx)
+        self.sync(&ctx).map(Checkout::into_inner)
     }
 
     /// Concrete-head non-blocking terminal returning the buffer plus a completion
@@ -3793,8 +3921,8 @@ where
 
 impl<Src, Dst> DeviceOp for CopyTo2<Src, Dst>
 where
-    Src: CopyTo<Dst> + Send,
-    Dst: Send,
+    Src: CopyTo<Dst> + Send + 'static,
+    Dst: Send + 'static,
     Src::Op: Send,
     <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
 {
@@ -3870,8 +3998,8 @@ where
 
 impl<Src, Dst> crate::record::RecordableOp for CopyTo2<Src, Dst>
 where
-    Src: CopyTo<Dst> + Send + crate::record::RecordableBuffer,
-    Dst: Send + crate::record::RecordableBuffer,
+    Src: CopyTo<Dst> + Send + crate::record::RecordableBuffer + 'static,
+    Dst: Send + crate::record::RecordableBuffer + 'static,
     Src::Op: Send,
     <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
 {
@@ -4135,6 +4263,7 @@ where
             parent.host_error_slot(),
             parent.start_dep(),
             parent.workers_handle(),
+            parent.lent_cells_handle(),
         );
         // Gather the source against the child EC via `collect` (any arity).
         let (value, deps) = self.source.collect(&child, mode)?;

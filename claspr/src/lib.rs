@@ -163,7 +163,8 @@ pub use transfer::UploadSource;
 #[cfg(feature = "async-events")]
 pub use eager::DeviceChainFuture;
 pub use eager::{
-    AndThenHost, AndThenHostWithContext, ArcSplit, CopyTo2, Dep, Deps, DeviceDynOp, DeviceEnqueue,
+    AndThenHost, AndThenHostWithContext, ArcSplit, Cell, Checkout, CopyTo2, Dep, Deps, DeviceDynOp,
+    DeviceEnqueue,
     DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt, Download, ExecMode, FanOut, Fill,
     FillMapped, ImageDownloadEager, ImageUploadEager, Input, OnDevice, Pipe, ReadInto, ToInput,
     TransferToDevice, Upload, WriteDevice, WriteMapped, arc_split, arced, bundle2, bundle3,

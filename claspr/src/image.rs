@@ -46,7 +46,7 @@ use crate::Result;
 use crate::access::{KernelAccess, MemMode};
 use crate::buffer::{Buffer, DeviceSlice};
 use crate::context::Context;
-use crate::eager::{Deps, DeviceOp, DeviceOpExt, ExecMode, Input, Pipe, wrap_event};
+use crate::eager::{Checkout, Deps, DeviceOp, DeviceOpExt, ExecMode, Input, Pipe, wrap_event};
 use crate::error::Error;
 use crate::exec_ctx::ExecutionContext;
 use crate::launch::KernelArg;
@@ -733,7 +733,7 @@ impl<I: ImageEnqueue, E: Send + Sync> ImageWrite<'_, I, E> {
     /// queue and return the image for reuse.
     pub fn wait(self) -> Result<I> {
         let ctx = concrete_image_ctx(&self.img)?;
-        self.sync(&ctx)
+        self.sync(&ctx).map(Checkout::into_inner)
     }
 
     /// Concrete-head non-blocking terminal returning the image plus a completion
@@ -799,7 +799,7 @@ impl<I: ImageEnqueue, E: Send> ImageRead<'_, I, E> {
     /// own context default queue; return the image for reuse.
     pub fn wait(self) -> Result<I> {
         let ctx = concrete_image_ctx(&self.img)?;
-        self.sync(&ctx)
+        self.sync(&ctx).map(Checkout::into_inner)
     }
 
     /// Concrete-head non-blocking terminal returning the image plus a completion
@@ -877,7 +877,7 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> ImageCopy<Src, Dst> {
     /// context default queue, wait, and return `(src, dst)`.
     pub fn wait(self) -> Result<(Src, Dst)> {
         let ctx = concrete_image_ctx(&self.src)?;
-        self.sync(&ctx)
+        self.sync(&ctx).map(Checkout::into_inner)
     }
 
     /// Concrete-head non-blocking terminal returning `(src, dst)` plus a
@@ -939,7 +939,7 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> ImageFill<I, T> {
     /// queue, wait, and return the image for reuse.
     pub fn wait(self) -> Result<I> {
         let ctx = concrete_image_ctx(&self.img)?;
-        self.sync(&ctx)
+        self.sync(&ctx).map(Checkout::into_inner)
     }
 
     /// Concrete-head non-blocking terminal returning the image plus a completion

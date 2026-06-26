@@ -68,6 +68,14 @@ pub struct ExecutionContext<'ctx> {
     /// workers (via [`with_host_error_slot`](Self::with_host_error_slot)) are
     /// joined by the same terminal.
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// **Lend ledger** for the reusable graph. Each [`Concrete`](crate::Input)
+    /// input that [`resolve`](crate::Input::resolve) LENDS during a run pushes a
+    /// clone of its cell here (type-erased as `Box<dyn Any>` holding a
+    /// `Cell<T>`). The run's [`Checkout`](crate::Checkout) drains this and, on
+    /// drop, returns the output value to a matching cell — re-arming the graph.
+    /// Empty for pure mint-and-consume graphs (e.g. `upload…download`), which
+    /// have nothing to return.
+    lent_cells: Arc<Mutex<Vec<Box<dyn std::any::Any + Send>>>>,
 }
 
 impl<'ctx> ExecutionContext<'ctx> {
@@ -86,6 +94,7 @@ impl<'ctx> ExecutionContext<'ctx> {
             host_error: Arc::new(Mutex::new(None)),
             start: None,
             workers: Arc::new(Mutex::new(Vec::new())),
+            lent_cells: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -106,6 +115,7 @@ impl<'ctx> ExecutionContext<'ctx> {
         host_error: Arc<Mutex<Option<Error>>>,
         start: Option<crate::cl_event>,
         workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+        lent_cells: Arc<Mutex<Vec<Box<dyn std::any::Any + Send>>>>,
     ) -> ExecutionContext<'a> {
         ExecutionContext {
             context,
@@ -114,7 +124,26 @@ impl<'ctx> ExecutionContext<'ctx> {
             host_error,
             start,
             workers,
+            lent_cells,
         }
+    }
+
+    /// `Arc` clone of the lend ledger, for the [`OnDevice`](crate::OnDevice)
+    /// sibling EC so a routed sub-chain's lent buffers are returned by the same
+    /// terminal's [`Checkout`](crate::Checkout).
+    pub(crate) fn lent_cells_handle(&self) -> Arc<Mutex<Vec<Box<dyn std::any::Any + Send>>>> {
+        Arc::clone(&self.lent_cells)
+    }
+
+    /// Record a lent concrete input cell for return on the run's `Checkout` drop.
+    /// `resolve` calls this with a clone of the `Concrete` cell it took from.
+    pub(crate) fn record_lent_cell(&self, cell: Box<dyn std::any::Any + Send>) {
+        self.lent_cells.lock().unwrap().push(cell);
+    }
+
+    /// Drain the lend ledger (the terminal hands it to the `Checkout`).
+    pub(crate) fn take_lent_cells(&self) -> Vec<Box<dyn std::any::Any + Send>> {
+        std::mem::take(&mut *self.lent_cells.lock().unwrap())
     }
 
     /// `Arc` clone of the worker-join list, for the [`OnDevice`](crate::OnDevice)
