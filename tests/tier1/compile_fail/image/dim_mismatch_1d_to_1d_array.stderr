@@ -7,11 +7,11 @@ error[E0277]: the trait bound `Image1D<WriteOnly, R32Uint>: KernelImage1DArrayWr
    |                     required by a bound introduced by this call
    |
 help: the following other types implement trait `KernelImage1DArrayWriteArg<SF>`
-  --> claspr/src/image.rs:2074:0
-  ::: claspr/src/image.rs:2075:34
+  --> claspr/src/image.rs:2109:0
+  ::: claspr/src/image.rs:2110:34
    |
    = note: `Image1DArray<WriteOnly, F>`
-  ::: claspr/src/image.rs:2083:34
+  ::: claspr/src/image.rs:2118:34
    |
    = note: `Image1DArray<ReadWrite, F>`
 note: required by a bound in `claspr_test_image_kernels::dim1_array_uint::Kernels::fill_pattern`

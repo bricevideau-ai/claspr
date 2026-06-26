@@ -5,14 +5,14 @@ error[E0277]: the trait bound `std::sync::Arc<DeviceSlice<u32>>: KernelSliceRead
    |                     ^^^^^^^^^ the trait `KernelSliceReadWriteArg<u32>` is not implemented for `std::sync::Arc<DeviceSlice<u32>>`
    |
 help: the following other types implement trait `KernelSliceReadWriteArg<T>`
-  --> claspr/src/launch.rs:156:0
-  ::: claspr/src/launch.rs:159:50
+  --> claspr/src/launch.rs:174:0
+  ::: claspr/src/launch.rs:177:50
    |
    = note: `DeviceSlice<T, M>`
-  ::: claspr/src/launch.rs:179:57
+  ::: claspr/src/launch.rs:203:57
    |
    = note: `MappedSlice<T, M>`
-  ::: claspr/src/launch.rs:199:54
+  ::: claspr/src/launch.rs:229:54
    |
    = note: `USMSlice<T, M>`
 note: required by a bound in `claspr_test_kernels::kernels::Kernels::scale_u32`
