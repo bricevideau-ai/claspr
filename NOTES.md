@@ -87,6 +87,34 @@ multi-output, no slots) → (b) `slot!`/`Tag(v)`/`call` table + completeness →
 (d) mutable-dispatch segment for different-buffer rebind. Open soft spot: exact
 shape of what a slotted graph hands back post-sync (bound buffers via checkout).
 
+#### ✅ STEP (a) LANDED 2026-06-26 (branch `replayable-graphs`, 4 commits, NOT pushed)
+`DeviceOp::{execute,collect,into_output}` → **`&self`** (the op-tree IS reusable).
+`Input::Concrete(Cell<T>)` (= `Arc<Mutex<Option<T>>>`); `resolve(&self)` **lends**
+the buffer + records the cell in a per-run ledger on `ExecutionContext`.
+`sync(&self)/wait_on(&self)` → **`Checkout<Output>`**: `Deref`/`DerefMut` to read;
+on **drop** returns the output to the lending cell **iff exactly one lent cell
+matches `Output`'s type** (unambiguous in-place single-buffer case) — re-arming `g`.
+`into_inner()` severs the return. **Busy** = a lent cell found empty on a 2nd
+`resolve` → runtime Err. **Reseed** = entry leaves keep their source & re-emit:
+`upload` reads `src` by ref (re-creates buffer each run → `upload→…→download`
+idempotent), `value` holds `T` by-value (clone per run), `Write*`/`ImageUpload`
+read by ref (no keep-alive — `&self` outlives the whole `sync`). One-shot leaves
+(`lift`/`usm_slice`/host seams/`profiled`) use `Mutex<Option<_>>` with a clear
+re-run Err. **Kernel macro** `execute` rewritten to borrow `&self.kernel` /
+copy `self.spec` (Copy) / deref scalars / lend slice+image args (images now route
+through `Input<I>` too); `profile_cb` is `Mutex<Option<…>>` taken once.
+PROOF: `tests/tier2/tests/graph_reuse.rs` 6/6 on pocl (idempotent ×3 / multi-output
+/ into_inner / busy+re-arm / download-consume boundary). Lib + collatz green;
+fmt+clippy+doc clean on claspr+macros. **Old tier1/tier2 suites left BROKEN
+(expect `sync→Output`, now `Checkout`) — NOT migrated, by plan.**
+Decisions taken (not in spec): re-arm only when a single lent cell matches
+`Output` type (multi-input same-typed kernels like `add(a,b,out)` don't auto-re-arm
+— safe: their cells stay empty → "busy"; read via `into_inner`); `submit_on`/
+`submit_value_on`/`run` left `self`-consuming (don't return `Checkout`); host-seam/
+profiled/lift/usm reuse deferred (one-shot, out of step-(a) scope).
+NEXT: migrate the ~175 old tests to `Checkout` (sweep `.sync()?`→`.sync()?` + read
+through deref / `into_inner`); then step (b) slots.
+
 ### ✅ PROMOTED TO MAIN 2026-06-24: eager struct-graph cutover (72 commits)
 
 `eager-cutover` fast-forwarded onto `main` at `6d76fe2` (linear history, no merge
