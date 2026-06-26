@@ -579,11 +579,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // output edge (a kernel writes in place to its buffer args).
                 record_arg_stmts.push(quote! {
                     {
-                        let __claspr_concrete = match ::claspr::Input::concrete(#pname) {
-                            ::core::option::Option::Some(__d) =>
-                                ::core::option::Option::Some(
-                                    ::claspr::KernelSliceReadArg::record_handle(__d)?,
-                                ),
+                        let __claspr_concrete = match ::claspr::Input::with_concrete(
+                            #pname,
+                            |__d| ::claspr::KernelSliceReadArg::record_handle(__d),
+                        ) {
+                            ::core::option::Option::Some(__r) =>
+                                ::core::option::Option::Some(__r?),
                             ::core::option::Option::None => ::core::option::Option::None,
                         };
                         let __claspr_cell = ::claspr::Input::pipe_cell_id(#pname);
@@ -634,8 +635,19 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
 
                 host_names.push(pname.clone());
                 method_params.push(quote! { #pname: #iid_tt });
-                arg_types.push(iid_tt.clone());
-                op_field_init.push(quote! { #pname });
+                // Store the image in an `Input` cell (like a slice) so
+                // `execute(&self)` can LEND it for a run and return it to the
+                // cell via the `Checkout`. Images are never pipe-fed (there is no
+                // `ToInput` for them), so this is always a `Concrete` cell — but
+                // routing through `Input` gives uniform lend-and-return + the same
+                // deps-threading the slices use.
+                arg_types.push(quote! { ::claspr::Input<#iid_tt> });
+                op_field_init.push(quote! { ::claspr::Input::from(#pname) });
+                let deps_ident = quote::format_ident!("__claspr_imgdeps{}", image_gen_idx - 1);
+                input_resolve_eager.push(quote! {
+                    let (#pname, #deps_ident) = ::claspr::Input::resolve(#pname, ec)?;
+                });
+                input_deps_idents.push(quote! { #deps_ident });
                 op_arg_pass.push(quote! { &#pname });
                 output_names.push(pname.clone());
                 output_types.push(iid_tt);
@@ -645,7 +657,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 method_params.push(quote! { #pname: #ty });
                 arg_types.push(ty.clone());
                 op_field_init.push(quote! { #pname });
-                op_arg_pass.push(quote! { #pname });
+                // execute borrows `&self.args`, so a scalar arg is bound as
+                // `&#ty`; deref it (scalars are `Copy`) to pass by value to
+                // `LaunchOp`. Slice/image args are rebound to owned values by
+                // their `.resolve(ec)` / deref, so they pass `&#pname`.
+                op_arg_pass.push(quote! { *#pname });
 
                 // Record path: set the scalar's raw bytes as the next kernel arg.
                 record_arg_stmts.push(quote! {
@@ -856,15 +872,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 }
 
                 fn execute(
-                    self,
+                    &self,
                     ec: &::claspr::ExecutionContext<'_>,
                     _mode: ::claspr::ExecMode,
                 ) -> ::claspr::Result<()> {
-                    let Op {
-                        kernel, spec, args, deps, profile_cb, ctx: _,
-                        #( #op_pipe_fields ),*
-                    } = self;
-                    let #op_args_tuple_pat = args;
+                    // BORROW the op (reusable). Destructure `&self.args`; resolve
+                    // LENDS each buffer from its `Input` cell / upstream pipe.
+                    let #op_args_tuple_pat = &self.args;
                     #(#input_resolve_eager)*
                     // Validate cross-context match for every caller-added dep
                     // (`.after()` / `.after_all()`) against the running queue's
@@ -872,7 +886,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     // CL_INVALID_CONTEXT at enqueue. Chain-supplied input deps
                     // come from the same ExecutionContext upstream, so they
                     // don't need re-checking.
-                    for ev in &deps {
+                    for ev in &self.deps {
                         ::claspr::assert_same_context(
                             ev,
                             ::claspr::Launcher::cl_queue(ec),
@@ -880,27 +894,26 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         );
                     }
                     let mut raw_deps: ::std::vec::Vec<::claspr::cl_event> =
-                        deps.iter().map(|e| e.get()).collect();
+                        self.deps.iter().map(|e| e.get()).collect();
                     #(
                         raw_deps.extend(#input_deps_idents.iter().map(|d| d.as_ref().get()));
                     )*
+                    let profile_cb = self.profile_cb.lock().unwrap().take();
                     let event = ::claspr::LaunchOp::new(
                         ec,
-                        &kernel,
-                        spec,
+                        &self.kernel,
+                        self.spec,
                         #op_launch_args_tuple,
                     )
                     .with_state(raw_deps, profile_cb)
                     .submit()?;
-                    ::core::mem::drop(deps);
-                    ::core::mem::drop(kernel);
                     // ONE enqueue → one completion event. Wrap once, then clone
                     // the `Dep` (Arc<Event>) onto EACH element pipe so whichever
                     // element(s) flow downstream carry the wait-list, and the
                     // terminal reconstruct gathers from all.
                     let __claspr_dep = ::claspr::wrap_event(event);
                     #(
-                        #op_pipe_fields.put(
+                        self.#op_pipe_fields.put(
                             #output_names,
                             ::std::vec![::core::clone::Clone::clone(&__claspr_dep)],
                         );
@@ -909,13 +922,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 }
 
                 fn collect(
-                    self,
+                    &self,
                     ec: &::claspr::ExecutionContext<'_>,
                     mode: ::claspr::ExecMode,
                 ) -> ::claspr::Result<(Self::Output, ::claspr::Deps)> {
-                    // Grab the element pipes before consuming `self`, then
-                    // scatter via `execute`, then drain + reconstruct the tuple,
-                    // gathering deps (the terminal `into_output` waits on them).
+                    // Clone the element pipes (cheap Arc), scatter via `execute`
+                    // (&self), then drain + reconstruct the tuple, gathering deps
+                    // (the terminal `into_output` waits on them).
                     #(
                         let #op_pipe_fields = ::core::clone::Clone::clone(&self.#op_pipe_fields);
                     )*
@@ -953,23 +966,22 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 }
 
                 fn execute(
-                    self,
+                    &self,
                     ec: &::claspr::ExecutionContext<'_>,
                     _mode: ::claspr::ExecMode,
                 ) -> ::claspr::Result<()> {
-                    let Op {
-                        kernel, spec, args, deps, profile_cb, ctx: _, __claspr_out,
-                    } = self;
-                    // Resolve each slice Input → (buffer, upstream Deps); a pipe
-                    // here is expected (it's an upstream op's output). Scalars
-                    // pass through unchanged.
-                    let #op_args_tuple_pat = args;
+                    // BORROW the op — it stays intact so the graph is reusable.
+                    // Destructure `&self.args` (each `#pname` binds `&arg`);
+                    // resolve LENDS each slice/image buffer from its `Input` cell
+                    // (or upstream pipe), rebinding `#pname` to the owned value for
+                    // the run. Scalars stay `&#ty` (deref'd at the launch tuple).
+                    let #op_args_tuple_pat = &self.args;
                     #(#input_resolve_eager)*
                     // Validate cross-context match for every caller-added dep
                     // (`.after()` / `.after_all()`) against the running queue's
                     // context — a clear panic instead of a cryptic
                     // CL_INVALID_CONTEXT at enqueue.
-                    for ev in &deps {
+                    for ev in &self.deps {
                         ::claspr::assert_same_context(
                             ev,
                             ::claspr::Launcher::cl_queue(ec),
@@ -978,23 +990,24 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     }
                     // Wait-list = caller-added deps + every input's events.
                     let mut raw_deps: ::std::vec::Vec<::claspr::cl_event> =
-                        deps.iter().map(|e| e.get()).collect();
+                        self.deps.iter().map(|e| e.get()).collect();
                     #(
                         raw_deps.extend(#input_deps_idents.iter().map(|d| d.as_ref().get()));
                     )*
+                    // `spec` is `Copy`; `kernel` borrowed; profiling cb taken
+                    // one-shot (a reused run launches without re-profiling).
+                    let profile_cb = self.profile_cb.lock().unwrap().take();
                     let event = ::claspr::LaunchOp::new(
                         ec,
-                        &kernel,
-                        spec,
+                        &self.kernel,
+                        self.spec,
                         #op_launch_args_tuple,
                     )
                     .with_state(raw_deps, profile_cb)
                     .submit()?;
-                    ::core::mem::drop(deps);
-                    ::core::mem::drop(kernel);
-                    // Move the output buffer(s) into the pipe with this op's
-                    // completion event as the downstream wait-list.
-                    __claspr_out.put(
+                    // Move the (lent) output buffer(s) into the pipe with this
+                    // op's completion event as the downstream wait-list.
+                    self.__claspr_out.put(
                         #output_expr,
                         ::std::vec![::claspr::wrap_event(event)],
                     );
@@ -1093,7 +1106,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     spec: ::claspr::IntoLaunchSpec::into_launch_spec(grid),
                     args: #op_args_tuple_init,
                     deps: ::std::vec::Vec::new(),
-                    profile_cb: ::core::option::Option::None,
+                    profile_cb: ::std::sync::Mutex::new(::core::option::Option::None),
                     ctx: ::core::clone::Clone::clone(&self.__claspr_ctx),
                     #op_out_field_init,
                 }
@@ -1117,7 +1130,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 /// handles aren't, and a borrowed `&Event` can't outlive
                 /// its source binding once the Op is moved.
                 pub deps: ::std::vec::Vec<::claspr::Event>,
-                pub profile_cb: ::core::option::Option<::claspr::ProfileCb>,
+                /// One-shot profiling callback behind a `Mutex` so
+                /// `execute(&self)` can take it without consuming the
+                /// (reusable) Op. A `FnOnce`, so a reused graph runs
+                /// without re-profiling — fetch a fresh callback per build
+                /// if you need timing on every run.
+                pub profile_cb: ::std::sync::Mutex<
+                    ::core::option::Option<::claspr::ProfileCb>,
+                >,
                 /// Carried `Context` so the no-arg `.wait()` /
                 /// `.submit()` terminals can submit on its default
                 /// in-order queue without taking an explicit
@@ -1157,8 +1177,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         + ::core::marker::Send
                         + 'static,
                 {
-                    self.profile_cb = ::core::option::Option::Some(
-                        ::std::boxed::Box::new(cb),
+                    self.profile_cb = ::std::sync::Mutex::new(
+                        ::core::option::Option::Some(::std::boxed::Box::new(cb)),
                     );
                     self
                 }
