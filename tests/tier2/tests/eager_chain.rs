@@ -39,7 +39,7 @@ fn linear_chain_upload_kernel_download() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("kernels load");
 
-    let result: Vec<u32> = upload(vec![0u32; N])
+    let result = upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, FILL_VALUE))
         .and_then(download)
         .sync(&ctx)
@@ -71,7 +71,7 @@ fn three_slice_kernel_op_threads_tuple_output() {
     let b = upload(vec![4u32; N]).sync(&ctx).expect("upload b");
     let out = alloc_zero::<u32>(N).sync(&ctx).expect("alloc out");
 
-    let result: Vec<u32> = kernels
+    let result = kernels
         .add_u32([N], a, b, out)
         .and_then(|(_a, _b, out)| download(out))
         .sync(&ctx)
@@ -89,7 +89,7 @@ fn bundle_feeds_multi_arg_kernel() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("kernels load");
 
-    let result: Vec<u32> = bundle3(
+    let result = bundle3(
         upload(vec![3u32; N]),
         upload(vec![4u32; N]),
         alloc_zero::<u32>(N),
@@ -112,7 +112,7 @@ fn kernel_op_chains_two_kernels() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("kernels load");
 
-    let result: Vec<u32> = upload(vec![0u32; N])
+    let result = upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 5))
         .and_then(|buf| kernels.scale_u32([N], buf, 7))
         .and_then(download)
@@ -133,7 +133,7 @@ fn value_passthrough() {
         .and_then(|n| value(n.wrapping_mul(2)))
         .sync(&ctx)
         .expect("value chain");
-    assert_eq!(out, 86);
+    assert_eq!(*out, 86);
 }
 
 /// chain.rs::upload_accepts_arc_source_caller_retains_clone — Arc<[T]> upload
@@ -145,7 +145,7 @@ fn upload_accepts_arc_source_caller_retains_clone() {
     let shared: Arc<[u32]> = Arc::from(vec![7u32; N]);
     let kept_by_caller = Arc::clone(&shared);
 
-    let result: Vec<u32> = upload(Arc::clone(&shared))
+    let result = upload(Arc::clone(&shared))
         .and_then(download)
         .sync(&ctx)
         .expect("arc upload");
