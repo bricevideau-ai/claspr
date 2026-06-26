@@ -1303,6 +1303,9 @@ where
     type Output = U::Output;
     // The chain's downstream handle is the tail op's handle.
     type Handle = U::Handle;
+    // The chain's terminal checkout shape is the tail op's: a multi-output tail
+    // (bundle*, arc_split, CopyTo pair) yields its tuple/array of `Checkout`s.
+    type Checkouts = U::Checkouts;
 
     fn output_pipe(&self) -> Pipe<U::Output> {
         self.next.output_pipe()
@@ -1350,6 +1353,30 @@ where
             deps.extend(src_deps);
         }
         Ok((value, deps))
+    }
+
+    fn gather_checkouts(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(Self::Checkouts, Deps)>
+    where
+        Self: Sized,
+        Self::Output: Send + 'static,
+        Self::Checkouts: FromCheckout<Self::Output>,
+    {
+        // Mirror `collect`: delegate to the tail so a multi-output `next` builds
+        // its per-element `Checkout` tuple via its OWN `gather_checkouts` override
+        // (the default single-pipe drain reads `output_pipe`, which a multi-output
+        // op never fills → "op produced no output"). Source pipelines; tail takes
+        // the terminal `mode`. Same orphaned-source-deps threading as `collect`.
+        let src_pipe = self.source.output_pipe();
+        self.source.execute(ec, ExecMode::Pipelined)?;
+        let (checkouts, mut deps) = self.next.gather_checkouts(ec, mode)?;
+        if let Some((_discarded, src_deps)) = src_pipe.take() {
+            deps.extend(src_deps);
+        }
+        Ok((checkouts, deps))
     }
 
     fn describe(&self, out: &mut Vec<String>) {
