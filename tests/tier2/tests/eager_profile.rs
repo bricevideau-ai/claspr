@@ -31,7 +31,7 @@ fn profile_chain_fires_callback_when_profiling_on() {
 
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let (tx, rx) = std::sync::mpsc::channel();
-    upload(vec![0u32; N])
+    let _checkout = upload(vec![0u32; N])
         .and_then(|buf| kernels.fill_u32([N], buf, 7))
         .profiled(move |info| {
             tx.send(info).expect("send profiling info");
@@ -60,6 +60,7 @@ fn profile_chain_errors_when_profiling_off() {
     let err = value(())
         .profiled(|_| panic!("callback must not fire when profiling is off"))
         .sync(&ctx)
+        .map(|_| ())
         .expect_err("expected ProfilingDisabled");
     assert!(matches!(err, claspr::Error::ProfilingDisabled), "{err:?}");
 }

@@ -86,7 +86,8 @@ fn forward_pass_carries_scalar_state_via_bundle() {
             Ok(())
         })
         .sync(&ctx)
-        .expect("stateful forward pass");
+        .expect("stateful forward pass")
+        .into_inner();
     let final_sum = *sum_cell.lock().unwrap();
     assert_eq!(final_sum, 60 * N as u32); // 10 * 2 * 3 = 60
     assert_eq!(step, 2);
@@ -106,7 +107,7 @@ fn mpsc_three_producers_into_single_combine() {
         upload(vec![0u32; N]),
     );
 
-    let result: Vec<u32> = producers
+    let result = producers
         .and_then(|(a, b, out)| kernels.add_u32([N], a, b, out))
         .and_then(|(_a, _b, out)| kernels.scale_u32([N], out, 5))
         .and_then(download)

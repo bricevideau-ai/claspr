@@ -79,7 +79,11 @@ fn tier1_svm_copy_length_mismatch_errors() {
     let src = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc src");
     let dst = MappedSlice::<u32>::alloc_zero(&ctx, N / 2).expect("alloc dst");
 
-    let err = src.copy_to(dst).sync(&ctx).expect_err("length mismatch");
+    let err = src
+        .copy_to(dst)
+        .sync(&ctx)
+        .map(|_| ())
+        .expect_err("length mismatch");
     assert!(
         matches!(err, claspr::Error::LengthMismatch { src: 64, dst: 32 }),
         "got {err:?}",
@@ -224,6 +228,7 @@ fn tier2_mapped_slice_filled_surfaces_svm_not_available() {
     let err = mapped_alloc_uninit::<u32>(N)
         .and_then(|u| fill_mapped_uninit(u, 0u32))
         .sync(&ctx)
+        .map(|_| ())
         .expect_err("expected SvmNotAvailable");
     assert!(matches!(err, claspr::Error::SvmNotAvailable), "got {err:?}",);
 }

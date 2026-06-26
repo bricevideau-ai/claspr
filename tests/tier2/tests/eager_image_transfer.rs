@@ -39,12 +39,12 @@ fn image2d_round_trip() {
     const H: u32 = 4;
     let pixels: Vec<u32> = (0..(W * H)).map(|i| 0xCAFE_0000 | i).collect();
 
-    let result: Vec<u32> = image_upload::<Image2D<ReadWrite, R32Uint>>(pixels.clone(), (W, H))
+    let result = image_upload::<Image2D<ReadWrite, R32Uint>>(pixels.clone(), (W, H))
         .and_then(image_download::<Image2D<ReadWrite, R32Uint>>)
         .sync(&ctx)
         .expect("chain");
 
-    assert_eq!(result, pixels);
+    assert_eq!(*result, pixels);
 }
 
 /// `Image1D` round-trip — confirms the `u32` Dims path (no tuple wrap).
@@ -54,12 +54,12 @@ fn image1d_round_trip() {
     const W: u32 = 16;
     let pixels: Vec<u32> = (0..W).map(|i| i * 13 + 5).collect();
 
-    let result: Vec<u32> = image_upload::<Image1D<ReadWrite, R32Uint>>(pixels.clone(), W)
+    let result = image_upload::<Image1D<ReadWrite, R32Uint>>(pixels.clone(), W)
         .and_then(image_download::<Image1D<ReadWrite, R32Uint>>)
         .sync(&ctx)
         .expect("chain");
 
-    assert_eq!(result, pixels);
+    assert_eq!(*result, pixels);
 }
 
 /// `Image3D` round-trip — confirms the `(u32, u32, u32)` Dims path.
@@ -71,12 +71,12 @@ fn image3d_round_trip() {
     const D: u32 = 2;
     let pixels: Vec<u32> = (0..(W * H * D)).map(|i| i + 1000).collect();
 
-    let result: Vec<u32> = image_upload::<Image3D<ReadWrite, R32Uint>>(pixels.clone(), (W, H, D))
+    let result = image_upload::<Image3D<ReadWrite, R32Uint>>(pixels.clone(), (W, H, D))
         .and_then(image_download::<Image3D<ReadWrite, R32Uint>>)
         .sync(&ctx)
         .expect("chain");
 
-    assert_eq!(result, pixels);
+    assert_eq!(*result, pixels);
 }
 
 /// `Image1DArray` round-trip — confirms the `(u32, u32)` Dims path for the
@@ -88,13 +88,12 @@ fn image1d_array_round_trip() {
     const LAYERS: u32 = 3;
     let pixels: Vec<u32> = (0..(W * LAYERS)).map(|i| 0xA000 + i).collect();
 
-    let result: Vec<u32> =
-        image_upload::<Image1DArray<ReadWrite, R32Uint>>(pixels.clone(), (W, LAYERS))
-            .and_then(image_download::<Image1DArray<ReadWrite, R32Uint>>)
-            .sync(&ctx)
-            .expect("chain");
+    let result = image_upload::<Image1DArray<ReadWrite, R32Uint>>(pixels.clone(), (W, LAYERS))
+        .and_then(image_download::<Image1DArray<ReadWrite, R32Uint>>)
+        .sync(&ctx)
+        .expect("chain");
 
-    assert_eq!(result, pixels);
+    assert_eq!(*result, pixels);
 }
 
 /// `Image2DArray` round-trip — confirms the `(u32, u32, u32)` Dims path for the
@@ -107,11 +106,10 @@ fn image2d_array_round_trip() {
     const LAYERS: u32 = 2;
     let pixels: Vec<u32> = (0..(W * H * LAYERS)).map(|i| 0xB000 + i).collect();
 
-    let result: Vec<u32> =
-        image_upload::<Image2DArray<ReadWrite, R32Uint>>(pixels.clone(), (W, H, LAYERS))
-            .and_then(image_download::<Image2DArray<ReadWrite, R32Uint>>)
-            .sync(&ctx)
-            .expect("chain");
+    let result = image_upload::<Image2DArray<ReadWrite, R32Uint>>(pixels.clone(), (W, H, LAYERS))
+        .and_then(image_download::<Image2DArray<ReadWrite, R32Uint>>)
+        .sync(&ctx)
+        .expect("chain");
 
-    assert_eq!(result, pixels);
+    assert_eq!(*result, pixels);
 }

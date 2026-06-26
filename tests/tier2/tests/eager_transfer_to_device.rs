@@ -84,7 +84,7 @@ fn transfer_to_device_completes_in_chain() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let result: Vec<u32> = upload(vec![5u32; N])
+    let result = upload(vec![5u32; N])
         .and_then(|buf| transfer_to_device_at(buf, 1))
         .and_then(move |buf| kernels_ref.scale_u32([N], buf, 4).on_device_at(1))
         .and_then(download)
@@ -104,7 +104,7 @@ fn transfer_then_on_device_matches_scenario_14_shape() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let result: Vec<u32> = upload(vec![1u32; N])
+    let result = upload(vec![1u32; N])
         .and_then(|buf| transfer_to_device_at(buf, 0))
         .and_then(move |buf| kernels_ref.scale_u32([N], buf, 2).on_device_at(0))
         .and_then(|buf| transfer_to_device_at(buf, 1))

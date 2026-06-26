@@ -80,7 +80,7 @@ fn on_device_routes_chain_to_devices_from_context() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let result: Vec<u32> = upload(vec![1u32; N])
+    let result = upload(vec![1u32; N])
         .and_then(move |buf| kernels_ref.scale_u32([N], buf, 3).on_device_at(0))
         .and_then(move |buf| kernels_ref.scale_u32([N], buf, 4).on_device_at(1))
         .and_then(download)
@@ -112,7 +112,10 @@ fn on_device_preserves_host_error_slot_across_routing() {
             })
         });
 
-    let err = chain.sync(&ctx).expect_err("expected branch B error");
+    let err = chain
+        .sync(&ctx)
+        .map(|_| ())
+        .expect_err("expected branch B error");
     assert!(
         matches!(&err, Error::Build { log } if log == "routed-chain abort"),
         "got {err:?}",
@@ -128,7 +131,7 @@ fn on_device_bundle_runs_branches_on_distinct_devices() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let (a, b): (Vec<u32>, Vec<u32>) = bundle2(
+    let (a, b) = bundle2(
         upload(vec![1u32; N])
             .and_then(move |buf| kernels_ref.scale_u32([N], buf, 7).on_device_at(0))
             .and_then(download),
@@ -163,7 +166,7 @@ fn and_then_pipe_dep_same_device_raw() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
-    let out: Vec<u32> = upload(vec![1u32; N])
+    let out = upload(vec![1u32; N])
         // Upstream write: buffer becomes all 3s. Its completion event rides the
         // pipe handed to the downstream.
         .and_then(|buf| kernels_ref.scale_u32([N], buf, 3))

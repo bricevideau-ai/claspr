@@ -53,7 +53,8 @@ fn and_then_host_error_stops_chain_immediately() {
             c2.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })
-        .sync(&ctx);
+        .sync(&ctx)
+        .map(|_| ());
 
     assert!(
         matches!(&result, Err(Error::Build { log }) if log == "abort"),
@@ -80,7 +81,8 @@ fn error_after_some_device_work_still_propagates() {
                 log: "post-kernel abort".to_string(),
             })
         })
-        .sync(&ctx);
+        .sync(&ctx)
+        .map(|_| ());
     let err = result.expect_err("expected error");
     assert!(
         matches!(&err, Error::Build { log } if log == "post-kernel abort"),
@@ -101,7 +103,8 @@ fn nested_chain_error_does_not_skip_outer_terminator() {
                 })
             })
         })
-        .sync(&ctx);
+        .sync(&ctx)
+        .map(|_| ());
     assert!(
         matches!(&result, Err(Error::Build { log }) if log == "nested"),
         "got {result:?}",
