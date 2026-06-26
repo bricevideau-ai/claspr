@@ -152,10 +152,7 @@ fn device_slice_copy_length_mismatch_errors() {
     let result = eager_copy_to(src, dst)
         .and_then(|(_src, dst)| download(dst))
         .sync(&ctx);
-    // `expect_err` needs the Ok type (`Checkout<Vec<u32>>`) to be `Debug`; drop it.
-    let err = result
-        .map(|_| ())
-        .expect_err("copy of mismatched lengths should error");
+    let err = result.expect_err("copy of mismatched lengths should error");
     assert!(
         matches!(err, Error::LengthMismatch { src: 10, dst: 5 }),
         "expected LengthMismatch {{ src: 10, dst: 5 }}, got {err:?}",

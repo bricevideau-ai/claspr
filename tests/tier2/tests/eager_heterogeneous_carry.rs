@@ -49,10 +49,8 @@ fn bundle_mixes_pipe_and_value_scalar_arrives_by_value() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("kernels");
 
-    // The terminal op is the outer `and_then` (single output), so its result is
-    // ONE `Checkout<(Vec<u32>, u32)>` — not a tuple of checkouts. Deref and bind
-    // the inner pair by reference.
-    let result = upload(vec![0u32; N])
+    // Multi-output tail (`bundle!`) → a tuple of per-output `Checkout`s.
+    let (out, carried) = upload(vec![0u32; N])
         .and_then(|buf| bundle!(ks.fill_u32([N], buf, 7), value(42u32)))
         // `buf` is a Pipe<DeviceSlice>, `scalar` is a u32 BY VALUE — this binding
         // would not type-check if the bundle handed a Pipe<u32> here.
@@ -65,7 +63,6 @@ fn bundle_mixes_pipe_and_value_scalar_arrives_by_value() {
         .and_then(|(buf, scalar)| bundle!(download(buf), value(scalar)))
         .sync(&ctx)
         .expect("mixed pipe+scalar bundle");
-    let (out, carried) = &result;
 
     assert!(out.iter().all(|&v| v == 7), "fill 7 * scale 1 = 7");
     assert_eq!(
@@ -82,7 +79,7 @@ fn carried_scalar_is_computed_on_in_chain() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("kernels");
 
-    let result = upload(vec![1u32; N])
+    let (out, step) = upload(vec![1u32; N])
         .and_then(|buf| bundle!(ks.scale_u32([N], buf, 2), value(0u32)))
         .and_then(|(buf, step)| {
             // step: u32 — `step + 1` is a build-time host computation.
@@ -92,7 +89,6 @@ fn carried_scalar_is_computed_on_in_chain() {
         .and_then(|(buf, step)| bundle!(download(buf), value(step)))
         .sync(&ctx)
         .expect("counter chain");
-    let (out, step) = &result;
 
     assert!(out.iter().all(|&v| v == 8), "1 * 2 * 2 * 2 = 8");
     assert_eq!(*step, 2, "0 -> +1 -> +1 = 2, computed in-chain");
@@ -125,7 +121,7 @@ fn bare_pipe_is_an_op_in_a_bundle() {
     let out = claspr::DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("out");
 
     // add_u32 has a 3-pipe handle (a, b, out); take `out` BARE into a bundle.
-    let result = bundle!(
+    let (summed, tag) = bundle!(
         ks.fill_u32([N], a, 3),
         ks.fill_u32([N], b, 4),
         ks.fill_u32([N], out, 0)
@@ -135,7 +131,6 @@ fn bare_pipe_is_an_op_in_a_bundle() {
     .and_then(|(out, tag)| bundle!(download(out), value(tag)))
     .sync(&ctx)
     .expect("bare-pipe-in-bundle");
-    let (summed, tag) = &result;
 
     assert!(summed.iter().all(|&v| v == 7), "3 + 4 = 7");
     assert_eq!(*tag, 99);

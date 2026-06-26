@@ -112,10 +112,7 @@ fn on_device_preserves_host_error_slot_across_routing() {
             })
         });
 
-    let err = chain
-        .sync(&ctx)
-        .map(|_| ())
-        .expect_err("expected branch B error");
+    let err = chain.sync(&ctx).expect_err("expected branch B error");
     assert!(
         matches!(&err, Error::Build { log } if log == "routed-chain abort"),
         "got {err:?}",

@@ -61,7 +61,6 @@ fn and_then_host_error_propagates() {
     let err = value(())
         .and_then_host(|()| -> claspr::Result<()> { Err(claspr::Error::SvmNotAvailable) })
         .sync(&ctx)
-        .map(|_| ())
         .expect_err("expected error");
     assert!(matches!(err, claspr::Error::SvmNotAvailable), "got {err:?}",);
 }

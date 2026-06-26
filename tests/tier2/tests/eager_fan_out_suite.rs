@@ -85,8 +85,6 @@ fn fan_out_propagates_child_error() {
         })
     })
     .sync(&ctx)
-    // `expect_err` needs the Ok type (`Checkout<Vec<u32>>`) to be `Debug`; drop it.
-    .map(|_| ())
     .expect_err("fan_out should surface child error");
     assert!(
         matches!(&err, Error::Build { log } if log == "injected failure"),

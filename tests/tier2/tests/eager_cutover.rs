@@ -310,8 +310,8 @@ fn arc_split_read_only_fan_out() {
     // Shared, read-only input: 0,1,2,…,N-1.
     let src: Vec<u32> = (0..N as u32).collect();
 
-    // Terminal is the `and_then` (single output): one `Checkout<(Vec, Vec)>`.
-    let result = arc_split::<2, _>(arced(upload(src.clone())))
+    // Multi-output tail (`bundle2`) → a tuple of per-output `Checkout`s.
+    let (out_a, out_b) = arc_split::<2, _>(arced(upload(src.clone())))
         .and_then(|[a, b]| {
             // Each branch owns one Arc clone of the SAME device buffer and reads
             // it (read-only kernel arg) into its own private destination.
@@ -327,7 +327,6 @@ fn arc_split_read_only_fan_out() {
         })
         .sync(&ctx)
         .expect("arc_split fan-out");
-    let (out_a, out_b) = &result;
 
     assert_eq!(*out_a, src, "branch a saw the shared input");
     assert_eq!(*out_b, src, "branch b saw the shared input");
@@ -465,13 +464,10 @@ fn eager_and_then_host() {
 fn eager_and_then_host_error_propagates() {
     let Some(ctx) = ctx() else { return };
 
-    // Drop the Ok payload (`Checkout<Vec<u32>>` is not `Debug`) so the error is
-    // both matchable and debug-printable below.
     let res = upload(vec![1u32; N])
         .and_then_host(|_slice: &mut [u32]| Err(claspr::Error::SvmNotAvailable))
         .and_then(download)
-        .sync(&ctx)
-        .map(|_| ());
+        .sync(&ctx);
 
     assert!(
         matches!(res, Err(claspr::Error::SvmNotAvailable)),

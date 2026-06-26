@@ -60,7 +60,6 @@ fn profile_chain_errors_when_profiling_off() {
     let err = value(())
         .profiled(|_| panic!("callback must not fire when profiling is off"))
         .sync(&ctx)
-        .map(|_| ())
         .expect_err("expected ProfilingDisabled");
     assert!(matches!(err, claspr::Error::ProfilingDisabled), "{err:?}");
 }

@@ -71,9 +71,7 @@ fn arc_split_propagates_branch_error() {
             .and_then(|_p| value(0u32)),
     );
 
-    // `expect_err` needs the Ok type to be `Debug`; the success arm is a tuple of
-    // `Checkout`s (not `Debug`), so drop it before asserting the error.
-    let err = chain.sync(&ctx).map(|_| ()).expect_err("branch B errored");
+    let err = chain.sync(&ctx).expect_err("branch B errored");
     assert!(
         matches!(&err, Error::Build { log } if log == "branch B aborted"),
         "got {err:?}",
