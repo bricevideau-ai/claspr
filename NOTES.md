@@ -9,6 +9,34 @@ items resolve.
 
 ## Active
 
+### ✅ STEP (a) follow-up 2026-06-26 — copy-in-reused-graph re-arm + Init→Uninit downgrade (`Rehome`)
+
+Branch `replayable-graphs` @ `afdb1d4` (pushed). Closed a real step-(a) gap: a
+concrete-buffer `eager_copy_to` in a reused graph did NOT re-arm its src/dst
+cells (CopyTo2 deposited outputs with `put`, home=None) → second `sync` errored
+"graph busy". Fix generalized the home channel from `Option<Cell<T>>` to a
+type-erased **`Rehome<Out>` trait** (`BoxedHome<Out> = Box<dyn Rehome<Out>>`):
+- `impl Rehome<T> for Cell<T>` = identity (every in-place/kernel path, unchanged).
+- `DowngradeRehome<U, Init>{ cell, wrap: fn(Init)->U }` returns a copy's **Init**
+  output into its weaker **Uninit** cell. KEY INSIGHT (Brice): Init is the
+  STRONGER capability (read+write); forgetting it to write-only Uninit is always
+  SOUND — the copy already did the write that earns Uninit→Init, so handing the
+  same buffer back for the next run to overwrite is correct.
+- All THREE Uninit families downgrade-rehome (none left `home=None`):
+  DeviceSliceUninit/MappedSliceUninit via trivial `from_init` private-field
+  re-wrap; **USMSliceUninit** via `from_init` = address-preserving
+  `Vec<T>→Vec<MaybeUninit<T>>` reinterpret (ManuallyDrop to skip USMSlice's
+  wait-on-drop; the copy already completed). "Needs internal `unsafe`" ≠ unsound —
+  it's the SAFE direction, strictly safer than `assume_init`'s existing reverse.
+- CopyTo2 `execute` threads each input cell as a typed home via a `CopyHome<Out>`
+  per-family helper (src = identity, dst = identity-or-downgrade).
+Test `copy_reuse_flaw.rs` 3/3 (incl USM, runs on pocl fine-grain SVM); graph_reuse
+7/7; copy/svm/usm regressions green. STILL `home=None` (correct): pipe-fed copy
+inputs (producer re-mints each run). Process lesson reinforced: background agents
+here are fire-and-forget (no SendMessage) — correct a stray agent by killing it,
+fix small gaps post-hoc yourself, never spawn a helper against a running agent
+(it contends the build lock).
+
 ### ✅ STEP (a) LANDED 2026-06-26 — reusable `g.sync()` (own-the-buffers; no slots yet)
 
 Branch `replayable-graphs` @ `b35e390` (pushed, not merged to main). The op-tree
