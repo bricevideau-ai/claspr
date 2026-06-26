@@ -9,6 +9,84 @@ items resolve.
 
 ## Active
 
+### ⭐ REUSABLE GRAPH MODEL — agreed design (2026-06-26, brainstormed w/ Brice). THIS SUPERSEDES the record/replay framing below.
+
+Branch `replayable-graphs` built `record()`/`replay()`/`RecordedGraph` as a
+SEPARATE reusable object (commits fd68c0c…2bd92a5). **Wrong reusable object.**
+Brice's model: **`g` (the op-tree) IS the reusable graph**; `sync()` is the
+verb; the awkward record-borrow-drop-consume dance is the symptom of getting it
+wrong. The layers-1/2 code (software IR + segment partition + CB FFI loader) is
+SALVAGE — it moves UNDER `g.sync()` as an invisible cache. `RecordedGraph` /
+`record()` / `replay()` as a public surface goes away.
+
+**The model (op-tree-is-g, no wrapper):**
+```
+g = upload(vec).and_then(|b| ks.scal(b, 2.0));   // self-contained
+let out = g.sync(&ctx)?;  /* use out */          // reusable: call sync again
+let out = g.sync(&ctx)?;
+```
+
+1. **Cell = Pipe.** An `Input`/edge is an interior-mutable cell
+   (`Arc<Mutex<Option<resource>>>` — literally what `Pipe` already is). One
+   concept unifies four origins by initial state: **owned** buffer (full) /
+   **`slot!(Tag)`** (empty) / **internal edge** (filled at run) / **output**
+   (drained to checkout). "A slot IS the same pipe as an internal edge" — now
+   literally true.
+
+2. **Checkout (runtime).** `sync(&self) -> Checkout<Output>`: assert every input
+   cell full (else runtime Err "Tag unbound"), replay, drain outputs into the
+   Checkout; on Checkout **drop** the resources RETURN to `g`'s cells (re-arming
+   it). While checked out, `g` can't run (empty cell → runtime block). This one
+   mechanism gives BOTH "no parallel use of g" AND safe shared-subgraph
+   composition. Must support **multiple outputs** (`Checkout<(A,B,..)>`,
+   per-element return). Consuming terminals are Checkout-hosted: `co.read(&mut
+   v)` does the device read AND returns the buffer to `g` (consume-by-value ==
+   return-on-drop — the feature, not the blocker). `into_inner()` severs the
+   return (keep the buffer; `g`'s cell stays empty / re-allocs next run).
+
+3. **Slots: typed tuple-struct tags, runtime presence, order-free, curry.**
+   `slots! { Buf: DeviceSlice<u32> }` → `pub struct Buf(pub DeviceSlice<u32>)` +
+   `impl Tag`. Build a hole with `slot!(Buf)`. Bind with **`Buf(value)`** (plain
+   tuple-struct construction — NO fn_traits, the thing that killed the old
+   `B(&b)`; carries any type incl vectors). `g.call(Buf(b)).call(W(w))` folds a
+   `TypeId→resource` table (order-free, curryable, partial OK); completeness
+   checked at `sync` (runtime). Binding MOVES the value into the cell, recovered
+   via checkout (share read-only via `Arc<DeviceSlice>`). Typed = per-tag value
+   type checked at compile time; NEVER set-algebra (that HList/turbofish/dedup
+   pain is why compile-time-set was abandoned). `call` returns a composable
+   `DeviceOp` node → a single-output `g.call()` is usable as a kernel arg /
+   chain node, so graphs COMPOSE:
+   `g2 = ks.scal(slot!(X),3.0).and_then(|b| bundle2(b, g.call())).and_then(|(a,b)| ks.add(a,b))`.
+
+4. **Alloc rule (resolves compounding):** read-only (`Frozen`/`ReadOnly`)
+   buffers alloc **once**; mutable buffers **re-seed each run** via a software
+   reset segment (the user's `upload` op IS the reset — host-writes land in a
+   software segment naturally). So `upload(vec)→kernels→download` is **idempotent
+   by construction**; the marker decides. Reuse-reset (NOT realloc) keeps cl_mems
+   stable → cached CB stays valid across runs.
+
+5. **Replay = convex-segment plan (CB is the cherry).** Don't gate the IR on
+   today's CB features. Partition the command list into **convex** segments
+   (a resource can't leave and re-enter a CB — guaranteed FREE by eager
+   move-semantics: linear single-owner dataflow, no back-edges). CB-able ops
+   (ndrange/fill/copy/barrier) → cached `cl_khr_command_buffer` enqueues;
+   everything else (host writes/resets, download, SVM fill, and_then_host,
+   map/unmap) → software segment (enqueue, fresh events per run). Events bridge
+   segments; sync-points stay internal to each CB. Mutable-dispatch
+   (`clUpdateMutableCommandsKHR`, kernel args only) is a LATER segment kind for
+   rebinding-different-buffers — not needed for own-the-buffers reuse.
+
+**Validity guarantees (the deliverable):** types / markers / single-writer /
+acyclic = **compile-time** (survive untouched — why op-tree-is-g matters, no
+`dyn` boxing). concurrent-use / checkout / slot-completeness = **runtime**.
+Per-tag value type = compile-time; tag *presence* = runtime.
+
+**Build order:** (a) cell-ify `Input` + `sync`→`Checkout` (own-the-buffers reuse,
+multi-output, no slots) → (b) `slot!`/`Tag(v)`/`call` table + completeness →
+(c) segment plan (software + immutable CB, salvage layers 1/2 under sync) →
+(d) mutable-dispatch segment for different-buffer rebind. Open soft spot: exact
+shape of what a slotted graph hands back post-sync (bound buffers via checkout).
+
 ### ✅ PROMOTED TO MAIN 2026-06-24: eager struct-graph cutover (72 commits)
 
 `eager-cutover` fast-forwarded onto `main` at `6d76fe2` (linear history, no merge
