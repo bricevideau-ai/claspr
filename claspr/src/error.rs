@@ -52,6 +52,13 @@ pub enum Error {
     /// then downcast to `&str` / `String`. The backtrace is lost, as
     /// is usual when a panic crosses a `catch_unwind` boundary.
     HostPanic(String),
+    /// A reusable graph was `sync`'d while one of its typed slots
+    /// (built with `slot!(Tag)`) is still unbound — completeness is
+    /// checked at run time. The string is the tag's `type_name`; bind
+    /// it with `g.call(Tag(value))` before `sync`. (Also surfaced if a
+    /// bound slot's buffer is still lent to a live `Checkout` — the
+    /// graph is busy on that slot.)
+    SlotUnbound(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -73,6 +80,12 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "I/O: {e}"),
             Error::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
             Error::HostPanic(msg) => write!(f, "host closure panicked: {msg}"),
+            Error::SlotUnbound(tag) => write!(
+                f,
+                "eager graph: slot `{tag}` is unbound — bind it with \
+                 `g.call(Tag(value))` before sync (or a previous Checkout is still \
+                 holding its buffer)"
+            ),
         }
     }
 }

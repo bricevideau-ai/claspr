@@ -231,6 +231,41 @@ cells across runs (the heuristic case). Lib+collatz green; fmt/clippy(-D)/doc cl
 Deferred (consistent boundary, read via `into_inner`): home re-arm through copy
 (retyped outputs), OnDevice routing, and bundle branches.
 
+#### ✅ STEP (b) LANDED 2026-06-26 (branch `typed-slots`, NOT committed — staged for review)
+`slots! { Buf: DeviceSlice<u32>, … }` → `pub struct Buf(pub DeviceSlice<u32>)` +
+`impl Tag for Buf { type Value = …; fn into_value(self){ self.0 } }`. `Tag`
+(`Sized+'static`, `Value: Send+'static`) is the identity key via `TypeId`. NO
+set-algebra: per-tag value type = compile-time, presence = runtime (checked at
+sync). `slot!(Buf)` = `SlotHandle::<Buf>::new()` (fresh empty `Cell`); plugs into
+KERNEL-ARG positions via a `ToInput<E, Buf=Tag::Value>` impl (the primary site,
+tested). **`Input<T>` gained a 3rd arm** `Slot{id:TypeId, name:&'static str,
+cell:Cell<T>}`; once bound it lends/re-arms EXACTLY like `Concrete` (shared
+`lend_from_cell` helper) — a bound graph re-runs (Checkout returns to the slot
+cell on drop). Empty cell at resolve → new `Error::SlotUnbound(&'static str)`
+(carries `type_name::<Tag>()`). `g.call(Tag(v)) -> &Self`: builds a `SlotBinder`
+{id, boxed value} and folds it via new `DeviceOp::bind_slots(&self, &mut
+SlotBinder)` (default no-op) — overridden on `AndThen` (recurse, short-circuit on
+`is_consumed`) + the kernel macro op (BOTH single- AND multi-output impls — easy
+to miss the 2nd!). Each `call` carries one tag → order-free/curryable/partial
+falls out; binding MOVES into the first matching cell; a 2nd `call(Tag(other))`
+rebinds. PROOF: `tests/tier2/tests/graph_slots.rs` 5/5 on pocl (bind+data /
+order-free / re-run / unbound-Err / rebind). graph_reuse 7/7 + eager_chain/
+buffer_ops regress green; full tier2 builds; claspr build+clippy(-D)+doc(-D)+fmt
+clean. **DEFERRED w/ TODO**: (1) `call` returns `&self` (serves `.call().sync()`
++ chained binds); the composable single-output `g.call()` as a kernel arg /
+`bundle2(b, g.call())` nesting (NOTES §3) waits on step (c). (2) `slot!` in
+`Into<Input<_>>` positions (download/fill/write/copy) needs explicit
+`SlotHandle::into_slot_input()` — a direct `From<SlotHandle> for Input<Value>`
+collides with the blanket `From<T> for Input<T>` (coherence: `Value` could ==
+`SlotHandle`). (3) `bind_slots` overridden only on AndThen + kernels; other
+`Input`-leaves (download/fill/copy/bundle) keep the no-op default → a slot there
+stays unbound (caught loudly at sync). ALSO FIXED HERE: the `safety_compile_fail`
+fixture `fill_on_frozen.stderr` golden drifted (`buffer.rs:485`→`501`) — the
+replayable-graphs merge grew `buffer.rs` (byte_len/RecordableBuffer/from_init) but
+that one golden wasn't re-blessed at promotion, so it fails on `main`/`origin/main`
+too (CI would catch it). Re-blessed on this branch; **main needs the same one-line
+bless** (track separately).
+
 ### ✅ PROMOTED TO MAIN 2026-06-24: eager struct-graph cutover (72 commits)
 
 `eager-cutover` fast-forwarded onto `main` at `6d76fe2` (linear history, no merge

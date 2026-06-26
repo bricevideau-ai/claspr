@@ -257,3 +257,61 @@ macro_rules! usm_slice {
         $crate::usm_slice::<_>(::std::vec![$($v),*])
     };
 }
+
+// ── Typed slots (reusable-graph holes) ─────────────────────────────────────
+
+/// Declare one or more typed [`Tag`](crate::Tag)s for reusable-graph slots.
+///
+/// ```ignore
+/// slots! { Buf: DeviceSlice<u32>, W: DeviceSlice<f32> }
+/// ```
+///
+/// expands, per entry, to a public tuple struct plus its [`Tag`](crate::Tag) impl:
+///
+/// ```ignore
+/// pub struct Buf(pub DeviceSlice<u32>);
+/// impl ::claspr::Tag for Buf { type Value = DeviceSlice<u32>; /* into_value = self.0 */ }
+/// ```
+///
+/// The tag type is the identity key (matched by `TypeId`); its `Value` is the one
+/// buffer type the tag carries (compile-time fixed). Build a hole for a tag with
+/// [`slot!`](crate::slot)`(Buf)` and bind it with **plain tuple-struct
+/// construction** — `g.call(Buf(b))` — no `Fn`/`fn_traits`.
+#[macro_export]
+macro_rules! slots {
+    // Trailing comma + at least one entry.
+    ( $( $name:ident : $val:ty ),+ $(,)? ) => {
+        $(
+            #[doc = concat!("Reusable-graph slot tag carrying a `", stringify!($val), "`.")]
+            #[doc = ""]
+            #[doc = "Build a hole with [`slot!`](crate::slot)`(...)`; bind with `g.call(Self(value))`."]
+            pub struct $name(pub $val);
+
+            impl $crate::Tag for $name {
+                type Value = $val;
+                fn into_value(self) -> $val {
+                    self.0
+                }
+            }
+        )+
+    };
+}
+
+/// Build an unbound typed graph hole for a [`Tag`](crate::Tag) declared with
+/// [`slots!`](crate::slots). `slot!(Buf)` plugs into any position a concrete
+/// buffer does (kernel args, `download`/`fill`/`write`/copy sources):
+///
+/// ```ignore
+/// slots! { Buf: DeviceSlice<u32> }
+/// let g = ks.scale([N], slot!(Buf), 2u32).and_then(download);
+/// let out = g.call(Buf(b)).sync(&ctx)?;   // bind, then run; re-runnable
+/// ```
+///
+/// Expands to [`SlotHandle::<Tag>::new()`](crate::SlotHandle::new) — a fresh empty
+/// cell filled by a later [`call`](crate::DeviceOpExt::call)`(Tag(value))`.
+#[macro_export]
+macro_rules! slot {
+    ( $tag:ty ) => {
+        $crate::SlotHandle::<$tag>::new()
+    };
+}

@@ -501,6 +501,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     let mut input_resolve_consuming: Vec<TokenStream2> = Vec::new();
     // The per-slice deps idents, merged into the kernel's wait-list at execute.
     let mut input_deps_idents: Vec<TokenStream2> = Vec::new();
+    // `bind_slots` body: one `try_bind_slot` per SLICE arg (scalars/images carry
+    // no `Input`). Folds a `call(Tag(v))` binder into any matching unbound slot.
+    let mut input_bind_slots: Vec<TokenStream2> = Vec::new();
+    // Destructure pattern for `bind_slots`: slice positions bind their name, every
+    // other position binds `_` (so non-slice args don't trip unused-var lints).
+    let mut bind_slot_pat_names: Vec<TokenStream2> = Vec::new();
     // Extra generics that live ONLY on the kernel METHOD signature, not on the
     // Op struct/impls: the per-slice `__claspr_S{n}: ToInput<elem, Buf=__D{n}>`
     // input generics. The Op is generic over `__D{n}` only (it stores
@@ -601,6 +607,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         ::claspr::Input::resolve_on(&#pname, launcher)?;
                 });
                 input_deps_idents.push(quote! { #deps_ident });
+                // `bind_slots`: `#pname` destructures to `&Input<__D>`; offer the
+                // binder to it (a matching unbound `slot!(Tag)` takes the value).
+                input_bind_slots.push(quote! {
+                    if !::claspr::SlotBinder::is_consumed(binder) {
+                        ::claspr::Input::try_bind_slot(#pname, binder);
+                    }
+                });
+                bind_slot_pat_names.push(quote! { #pname });
                 op_arg_pass.push(quote! { &#pname });
                 op_arg_pass_consuming.push(quote! { &#pname });
                 output_names.push(pname.clone());
@@ -687,9 +701,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 op_arg_pass_consuming.push(quote! { &#pname });
                 output_names.push(pname.clone());
                 output_types.push(iid_tt);
+                // Images carry no `Input` — not a slot position (bind ignores it).
+                bind_slot_pat_names.push(quote! { _ });
             }
             ParamRole::Scalar { name: pname, ty } => {
                 host_names.push(pname.clone());
+                bind_slot_pat_names.push(quote! { _ });
                 method_params.push(quote! { #pname: #ty });
                 arg_types.push(ty.clone());
                 op_field_init.push(quote! { #pname });
@@ -771,6 +788,9 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `op_args_tuple_pat` = destructure pattern at enqueue (plain names).
     let op_args_tuple_init = single_or_tuple(&op_field_init);
     let op_args_tuple_pat = single_or_tuple(&host_names);
+    // Like `op_args_tuple_pat`, but `_` in every non-slice position so `bind_slots`
+    // (which only touches slice `Input`s) doesn't bind unused names.
+    let bind_slots_args_pat = single_or_tuple(&bind_slot_pat_names);
     let op_launch_args_tuple = single_or_tuple(&op_arg_pass);
     // Image (consuming) launch tuple — scalars by value (the args tuple is moved).
     let op_launch_args_tuple_consuming = single_or_tuple(&op_arg_pass_consuming);
@@ -1065,6 +1085,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 fn describe(&self, out: &mut ::std::vec::Vec<::std::string::String>) {
                     out.push(::std::string::ToString::to_string(#kernel_name_lit));
                 }
+
+                fn bind_slots(&self, binder: &mut ::claspr::SlotBinder) {
+                    // Offer the `call(Tag(v))` binder to each buffer arg's `Input`;
+                    // a matching unbound `slot!(Tag)` takes the value. Scalars /
+                    // images carry no `Input` (bound to `_` in the pattern).
+                    let #bind_slots_args_pat = &self.args;
+                    #(#input_bind_slots)*
+                }
             }
         }
     } else {
@@ -1137,6 +1165,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
 
                 fn describe(&self, out: &mut ::std::vec::Vec<::std::string::String>) {
                     out.push(::std::string::ToString::to_string(#kernel_name_lit));
+                }
+
+                fn bind_slots(&self, binder: &mut ::claspr::SlotBinder) {
+                    // Offer the `call(Tag(v))` binder to each buffer arg's `Input`;
+                    // a matching unbound `slot!(Tag)` takes the value. Scalars /
+                    // images carry no `Input` (bound to `_` in the pattern).
+                    let #bind_slots_args_pat = &self.args;
+                    #(#input_bind_slots)*
                 }
             }
         }
