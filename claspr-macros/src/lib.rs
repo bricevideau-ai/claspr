@@ -491,6 +491,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `Input::resolve` (a pipe IS expected here — it's the upstream output).
     // `#pname` becomes the buffer; `#pname __claspr_deps` its wait-list events.
     let mut input_resolve_eager: Vec<TokenStream2> = Vec::new();
+    // Image (consuming) path: per-SLICE buffer resolve (one stmt per slice arg,
+    // NOT per image). The image kernel Op is single-shot/consuming, so its buffer
+    // args resolve via `Input::resolve` (value + deps, no home — nothing is
+    // returned to a cell). Image args are NOT resolved here at all (they were
+    // never routed through `Input`); the consuming execute passes them by value
+    // straight to `LaunchOp`. Built unconditionally but only emitted when
+    // `has_image_param`.
+    let mut input_resolve_consuming: Vec<TokenStream2> = Vec::new();
     // The per-slice deps idents, merged into the kernel's wait-list at execute.
     let mut input_deps_idents: Vec<TokenStream2> = Vec::new();
     // Extra generics that live ONLY on the kernel METHOD signature, not on the
@@ -501,6 +509,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     let mut method_params: Vec<TokenStream2> = Vec::new();
     let mut arg_types: Vec<TokenStream2> = Vec::new();
     let mut op_arg_pass: Vec<TokenStream2> = Vec::new();
+    // Image (consuming) path's launch-arg tuple. Identical to `op_arg_pass` for
+    // buffer/image args (`&#pname`, both rebind `#pname` to an owned value via
+    // resolve), but a SCALAR is owned here (the args tuple is MOVED, not borrowed),
+    // so it passes `#pname` by value — NOT `*#pname` (which the borrow-`&self.args`
+    // reusable path needs). Only emitted when `has_image_param`.
+    let mut op_arg_pass_consuming: Vec<TokenStream2> = Vec::new();
     let mut output_names: Vec<TokenStream2> = Vec::new();
     let mut output_types: Vec<TokenStream2> = Vec::new();
     // Per-output HOME idents (`__claspr_home{n}`), in output order. A kernel
@@ -577,8 +591,18 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     let (#pname, #deps_ident, #home_ident) =
                         ::claspr::Input::resolve_home(#pname, ec)?;
                 });
+                // Image (consuming) path: same buffer resolve but no home (the
+                // single-shot image Op hands every output back by value, nothing is
+                // re-armed). `#pname` here is the moved-out `Input<__D>`;
+                // `resolve_on` borrows it and builds a transient ExecutionContext
+                // from the launcher (the image terminal has no `ec` in scope).
+                input_resolve_consuming.push(quote! {
+                    let (#pname, #deps_ident) =
+                        ::claspr::Input::resolve_on(&#pname, launcher)?;
+                });
                 input_deps_idents.push(quote! { #deps_ident });
                 op_arg_pass.push(quote! { &#pname });
+                op_arg_pass_consuming.push(quote! { &#pname });
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
                 output_homes.push(quote! { #home_ident });
@@ -645,25 +669,24 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
 
                 host_names.push(pname.clone());
                 method_params.push(quote! { #pname: #iid_tt });
-                // Store the image in an `Input` cell (like a slice) so
-                // `execute(&self)` can LEND it for a run and return it to the
-                // cell via the `Checkout`. Images are never pipe-fed (there is no
-                // `ToInput` for them), so this is always a `Concrete` cell — but
-                // routing through `Input` gives uniform lend-and-return + the same
-                // deps-threading the slices use.
-                arg_types.push(quote! { ::claspr::Input<#iid_tt> });
-                op_field_init.push(quote! { ::claspr::Input::from(#pname) });
-                let deps_ident = quote::format_ident!("__claspr_imgdeps{}", image_gen_idx - 1);
-                let home_ident = quote::format_ident!("__claspr_imghome{}", image_gen_idx - 1);
-                input_resolve_eager.push(quote! {
-                    let (#pname, #deps_ident, #home_ident) =
-                        ::claspr::Input::resolve_home(#pname, ec)?;
-                });
-                input_deps_idents.push(quote! { #deps_ident });
+                // Images are NOT routed through the `'static` `Input`/cell/Checkout
+                // lend-and-return machinery (see the `image_consuming` block below):
+                // image arg types can carry borrows (e.g. `Image1DBufferView<'_, …>`)
+                // and the image generic `__claspr_I{n}` has no `'static` bound, so the
+                // cell path would reject them (E0310). Image kernels are single-shot,
+                // not reusable — the Op stores the image VALUE directly and a
+                // *consuming* `execute`/`wait`/`submit` moves it out and hands it back
+                // by value. A mixed image+buffer kernel still routes its BUFFER args
+                // through `Input<__D>` (those are `'static`) — only the image arg
+                // bypasses the cell path.
+                arg_types.push(quote! { #iid_tt });
+                op_field_init.push(quote! { #pname });
+                // Consuming execute moves the image out of the args tuple and passes
+                // it straight to `LaunchOp`; no resolve, no upstream deps, no home.
                 op_arg_pass.push(quote! { &#pname });
+                op_arg_pass_consuming.push(quote! { &#pname });
                 output_names.push(pname.clone());
                 output_types.push(iid_tt);
-                output_homes.push(quote! { #home_ident });
             }
             ParamRole::Scalar { name: pname, ty } => {
                 host_names.push(pname.clone());
@@ -675,6 +698,9 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // `LaunchOp`. Slice/image args are rebound to owned values by
                 // their `.resolve(ec)` / deref, so they pass `&#pname`.
                 op_arg_pass.push(quote! { *#pname });
+                // Image (consuming) path moves the args tuple out, so a scalar is
+                // owned (`#ty`) here — pass it by value directly (no deref).
+                op_arg_pass_consuming.push(quote! { #pname });
 
                 // Record path: set the scalar's raw bytes as the next kernel arg.
                 record_arg_stmts.push(quote! {
@@ -746,6 +772,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     let op_args_tuple_init = single_or_tuple(&op_field_init);
     let op_args_tuple_pat = single_or_tuple(&host_names);
     let op_launch_args_tuple = single_or_tuple(&op_arg_pass);
+    // Image (consuming) launch tuple — scalars by value (the args tuple is moved).
+    let op_launch_args_tuple_consuming = single_or_tuple(&op_arg_pass_consuming);
 
     // Output type / expression — bare for a single slice, tuple for
     // many, `()` for none. Same convention on both terminals
@@ -853,7 +881,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `Output` tuple by draining all element pipes, gather their deps, wait.
     // `op_out_destructure` was the `KernelOp::enqueue_into` field-ignore pattern;
     // that impl is gone (kernels are DeviceOp-only), so it's unused now.
-    let (op_out_field_decl, op_out_field_init, _op_out_destructure) = if multi_output {
+    let (op_out_field_decl, op_out_field_init, _op_out_destructure) = if has_image_param {
+        // Image kernels are single-shot/consuming and never deposit into an output
+        // pipe (no `DeviceOp` impl), so they carry no output-pipe field at all.
+        (quote! {}, quote! {}, quote! {})
+    } else if multi_output {
         let decls = op_pipe_fields
             .iter()
             .zip(output_types.iter())
@@ -869,27 +901,37 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
             .iter()
             .map(|f| quote! { #f: ::claspr::Pipe::new() });
         let ignores = op_pipe_fields.iter().map(|f| quote! { #f: _ });
+        // Lead with a comma so the call sites can append unconditionally and the
+        // image (no-field) branch can emit nothing without leaving a dangling comma.
         (
-            quote! { #(#decls),* },
-            quote! { #(#inits),* },
-            quote! { #(#ignores),* },
+            quote! { , #(#decls),* },
+            quote! { , #(#inits),* },
+            quote! { , #(#ignores),* },
         )
     } else {
         (
             quote! {
+                ,
                 /// Eager-graph output pipe: `DeviceOp::execute` deposits the
                 /// output buffer(s) + completion event here; downstream ops
                 /// grab a clone via `output_pipe()` at build time. Unused by
                 /// the Tier-1 terminals.
                 pub __claspr_out: ::claspr::Pipe<#output_ty>
             },
-            quote! { __claspr_out: ::claspr::Pipe::new() },
-            quote! { __claspr_out: _ },
+            quote! { , __claspr_out: ::claspr::Pipe::new() },
+            quote! { , __claspr_out: _ },
         )
     };
 
     // ── DeviceOp impl body — single vs multi output ──────────────────────
-    let eager_impl = if multi_output {
+    //
+    // Image kernels get NO `DeviceOp` impl: they are single-shot/consuming and use
+    // the dedicated `#image_terminal_methods` below instead of the reusable
+    // `&self`/Checkout path (whose `Input`/cell storage + `Output: 'static`
+    // terminal bound can't accept borrowed image views).
+    let eager_impl = if has_image_param {
+        quote! {}
+    } else if multi_output {
         // `Handle = (Pipe<D0>, Pipe<D1>, …)`; per-element scatter; reconstruct
         // in `into_output`. `output_pipe()` is unused on this path (the default
         // `into_output` is overridden), but the trait requires it — return a
@@ -1169,6 +1211,151 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         }
     };
 
+    // ── Tier 1 terminals (`submit`/`submit_on`/`wait`) ───────────────────
+    //
+    // Two shapes:
+    //
+    //  • Buffer/scalar kernels (no image): the Op is a reusable `DeviceOp`; the
+    //    terminals borrow `&self`, go through `DeviceOpExt::{submit_value_on,
+    //    wait_on}`, and hand the buffer(s) back via the `Checkout` lend-return
+    //    path (so `g` can be re-`sync`'d). Unchanged from the reusable rework.
+    //
+    //  • Image kernels: single-shot/consuming. The Op is NOT a `DeviceOp` (its
+    //    image arg can't satisfy the cell path's `Send + 'static`); the terminals
+    //    CONSUME `self`, move every arg out, resolve only the BUFFER args via
+    //    `Input::resolve` (images pass by value straight to `LaunchOp`), enqueue
+    //    once, and return the output BY VALUE — never touching `Checkout`, so a
+    //    borrowed `Image…View<'_>` output is fine. This restores the pre-reuse
+    //    image handling for the image branch only.
+    let terminal_methods = if has_image_param {
+        quote! {
+            /// Tier 1 non-blocking terminal — enqueue on the carried context's
+            /// default queue and return `(Output, Event)`. Consuming: an image
+            /// kernel is single-shot, not reusable.
+            pub fn submit(
+                self,
+            ) -> ::claspr::Result<(#output_ty, ::claspr::Event)> {
+                let ctx = ::core::clone::Clone::clone(&self.ctx);
+                self.submit_on(&ctx)
+            }
+
+            /// Tier 1 non-blocking terminal with an explicit launcher. Enqueues
+            /// the single launch on `launcher`'s queue and returns the output
+            /// (image / buffer / tuple) plus one chainable completion event.
+            pub fn submit_on<L>(
+                self,
+                launcher: &L,
+            ) -> ::claspr::Result<(#output_ty, ::claspr::Event)>
+            where
+                L: ::claspr::Launcher,
+            {
+                let (__claspr_out, __claspr_ev) = self.__claspr_run_image(launcher)?;
+                ::core::result::Result::Ok((__claspr_out, __claspr_ev))
+            }
+
+            /// Tier 1 blocking terminal — submit on the carried context's default
+            /// queue, wait on the completion event, and return the arg(s) by value.
+            pub fn wait(self) -> ::claspr::Result<#output_ty> {
+                let ctx = ::core::clone::Clone::clone(&self.ctx);
+                let (__claspr_out, __claspr_ev) = self.__claspr_run_image(&ctx)?;
+                ::claspr::Event::wait(&__claspr_ev).map_err(::claspr::Error::OpenCl)?;
+                ::core::result::Result::Ok(__claspr_out)
+            }
+
+            /// Shared one-shot enqueue for the image (consuming) path: move the
+            /// args out, resolve buffer args (images pass by value), launch once,
+            /// return `(Output, Event)`. NOT routed through `DeviceOp`/`Checkout`,
+            /// so a borrowed `Image…View<'_>` output is fine.
+            fn __claspr_run_image<L>(
+                self,
+                launcher: &L,
+            ) -> ::claspr::Result<(#output_ty, ::claspr::Event)>
+            where
+                L: ::claspr::Launcher + ?Sized,
+            {
+                let Op { kernel, spec, args, deps, profile_cb, ctx: _ } = self;
+                // Move each arg out of the tuple. Buffer args resolve (consuming —
+                // no home, nothing is returned to a cell); image args pass by value.
+                let #op_args_tuple_pat = args;
+                #(#input_resolve_consuming)*
+                // Validate caller-added deps (`.after()`/`.after_all()`) share the
+                // launcher's context — a clear panic instead of CL_INVALID_CONTEXT.
+                for ev in &deps {
+                    ::claspr::assert_same_context(
+                        ev,
+                        ::claspr::Launcher::cl_queue(launcher),
+                        concat!("kernel `", stringify!(#name), "` submit"),
+                    );
+                }
+                let mut raw_deps: ::std::vec::Vec<::claspr::cl_event> =
+                    deps.iter().map(|e| e.get()).collect();
+                #(
+                    raw_deps.extend(#input_deps_idents.iter().map(|d| d.as_ref().get()));
+                )*
+                let profile_cb = profile_cb.lock().unwrap().take();
+                let event = ::claspr::LaunchOp::new(
+                    launcher,
+                    &kernel,
+                    spec,
+                    #op_launch_args_tuple_consuming,
+                )
+                .with_state(raw_deps, profile_cb)
+                .submit()?;
+                ::core::result::Result::Ok((#output_expr, event))
+            }
+        }
+    } else {
+        quote! {
+            /// Tier 1 non-blocking terminal — enqueue on the
+            /// carried `Kernels`' context default queue and
+            /// return `(Output, Event)`.
+            pub fn submit(
+                self,
+            ) -> ::claspr::Result<(#output_ty, ::claspr::Event)> {
+                let ctx = ::core::clone::Clone::clone(&self.ctx);
+                self.submit_on(&ctx)
+            }
+
+            /// Tier 1 non-blocking terminal with an explicit
+            /// launcher — enqueue on `launcher`'s queue and
+            /// return `(Output, Event)` so the caller can keep
+            /// using the buffers and chain via `.after(event)`.
+            ///
+            /// The kernel `Op` is a `DeviceOp`; this runs its
+            /// `DeviceOp::collect` (the single enqueue) on the
+            /// launcher's queue and returns the output plus a
+            /// single completion event (a marker when the op
+            /// produced several, e.g. a multi-output kernel).
+            pub fn submit_on<L>(
+                self,
+                launcher: &L,
+            ) -> ::claspr::Result<(#output_ty, ::claspr::Event)>
+            where
+                L: ::claspr::Launcher,
+            {
+                // The kernel Op is a `DeviceOp`; `submit_value_on` runs its
+                // single enqueue on the launcher's queue and returns the
+                // output + one chainable completion event.
+                ::claspr::DeviceOpExt::submit_value_on(self, launcher)
+            }
+
+            /// Tier 1 blocking terminal — submit on the carried
+            /// `Kernels`' context default queue and wait on the
+            /// completion event. Returns the slice arg(s) so the
+            /// caller can keep using them.
+            pub fn wait(self) -> ::claspr::Result<#output_ty> {
+                let ctx = ::core::clone::Clone::clone(&self.ctx);
+                // The kernel Op is a `DeviceOp`; `wait_on` blocks and returns
+                // its `Checkouts` (one `Checkout` for a single-output kernel, a
+                // per-output tuple for a multi-output one). The Tier-1 contract
+                // hands the buffer(s) back BY VALUE, so `into_inner` severs each
+                // (this is a consuming terminal — the Op is dropped here).
+                let __claspr_checkouts = ::claspr::DeviceOpExt::wait_on(&self, &ctx)?;
+                ::core::result::Result::Ok(#wait_into_output)
+            }
+        }
+    };
+
     // `#[allow(clippy::too_many_arguments)]` — the wrapper's arg count
     // is determined by the kernel's declared signature, not user
     // choice, so a per-call `#[allow]` would burden every user.
@@ -1186,8 +1373,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     args: #op_args_tuple_init,
                     deps: ::std::vec::Vec::new(),
                     profile_cb: ::std::sync::Mutex::new(::core::option::Option::None),
-                    ctx: ::core::clone::Clone::clone(&self.__claspr_ctx),
-                    #op_out_field_init,
+                    ctx: ::core::clone::Clone::clone(&self.__claspr_ctx)
+                    #op_out_field_init
                 }
             }
         }
@@ -1222,8 +1409,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 /// in-order queue without taking an explicit
                 /// launcher. Cloned from `Kernels`'s context at
                 /// launcher-method emission time.
-                pub ctx: ::claspr::Context,
-                #op_out_field_decl,
+                pub ctx: ::claspr::Context
+                #op_out_field_decl
             }
 
             // Op is `Send` automatically — every field is Send. No
@@ -1262,53 +1449,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     self
                 }
 
-                /// Tier 1 non-blocking terminal — enqueue on the
-                /// carried `Kernels`' context default queue and
-                /// return `(Output, Event)`.
-                pub fn submit(
-                    self,
-                ) -> ::claspr::Result<(#output_ty, ::claspr::Event)> {
-                    let ctx = ::core::clone::Clone::clone(&self.ctx);
-                    self.submit_on(&ctx)
-                }
-
-                /// Tier 1 non-blocking terminal with an explicit
-                /// launcher — enqueue on `launcher`'s queue and
-                /// return `(Output, Event)` so the caller can keep
-                /// using the buffers and chain via `.after(event)`.
-                ///
-                /// The kernel `Op` is a `DeviceOp`; this runs its
-                /// `DeviceOp::collect` (the single enqueue) on the
-                /// launcher's queue and returns the output plus a
-                /// single completion event (a marker when the op
-                /// produced several, e.g. a multi-output kernel).
-                pub fn submit_on<L>(
-                    self,
-                    launcher: &L,
-                ) -> ::claspr::Result<(#output_ty, ::claspr::Event)>
-                where
-                    L: ::claspr::Launcher,
-                {
-                    // The kernel Op is a `DeviceOp`; `submit_value_on` runs its
-                    // single enqueue on the launcher's queue and returns the
-                    // output + one chainable completion event.
-                    ::claspr::DeviceOpExt::submit_value_on(self, launcher)
-                }
-
-                /// Tier 1 blocking terminal — submit on the carried
-                /// `Kernels`' context default queue and wait on the
-                /// completion event. Returns the slice arg(s) so the
-                /// caller can keep using them.
-                pub fn wait(self) -> ::claspr::Result<#output_ty> {
-                    let ctx = ::core::clone::Clone::clone(&self.ctx);
-                    // The kernel Op is a `DeviceOp`; `wait_on` blocks and returns
-                    // its `Checkouts` (one `Checkout` for a single-output kernel, a
-                    // per-output tuple for a multi-output one). The Tier-1 contract
-                    // hands the buffer(s) back BY VALUE, so `into_inner` severs each
-                    // (this is a consuming terminal — the Op is dropped here).
-                    let __claspr_checkouts = ::claspr::DeviceOpExt::wait_on(&self, &ctx)?;
-                    ::core::result::Result::Ok(#wait_into_output)
-                }
+                #terminal_methods
             }
 
             // ── Tier 2 (eager graph): DeviceOp ───────────────────────────

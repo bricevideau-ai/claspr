@@ -116,8 +116,11 @@ fn launch_runs_on_each_device_via_proc_macro_launcher() {
 
     let mut host_a = vec![0u32; N];
     let mut host_b = vec![0u32; N];
-    buf_a.read(&mut host_a).wait_on(&q_a).expect("read a");
-    buf_b.read(&mut host_b).wait_on(&q_b).expect("read b");
+    // `read(&mut dst)` fills the host slice as a side effect; the returned
+    // `Checkout` (the buffer handed back) is `#[must_use]` but unused here, so
+    // bind it to `_` per the Checkout-migration playbook.
+    let _ = buf_a.read(&mut host_a).wait_on(&q_a).expect("read a");
+    let _ = buf_b.read(&mut host_b).wait_on(&q_b).expect("read b");
     assert!(host_a.iter().all(|&v| v == 7));
     assert!(host_b.iter().all(|&v| v == 9));
 }
