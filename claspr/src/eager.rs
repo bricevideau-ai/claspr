@@ -4422,16 +4422,18 @@ impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<MappedSlice<T, M>>
         }))
     }
 }
-// USM uninit's backing is a `Vec<MaybeUninit<T>>` (not an `inner: USMSlice`), so
-// the Init→Uninit re-wrap isn't a plain private-field move — it would need a
-// same-layout `Vec` reinterpret (`unsafe`), which is beyond the safe re-wrap this
-// home channel uses. Left non-re-arming (home `None`, still safe): a USM-uninit
-// copy dst just reads via `into_inner`. Revisit if USM-uninit copy reuse is needed.
+// USM uninit's backing is a `Vec<MaybeUninit<T>>`, so its `from_init` is a
+// same-layout `Vec` reinterpret (Init→Uninit, the SAFE downgrade direction —
+// the inverse of `assume_init`, with no init assertion). It preserves the heap
+// address so the SVM pointer stays valid. Re-arms like the other two families.
 impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<USMSlice<T, M>>
     for USMSliceUninit<T, M>
 {
-    fn copy_home(_cell: Cell<Self>) -> Option<BoxedHome<USMSlice<T, M>>> {
-        None
+    fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<USMSlice<T, M>>> {
+        Some(Box::new(DowngradeRehome {
+            cell,
+            wrap: USMSliceUninit::from_init,
+        }))
     }
 }
 

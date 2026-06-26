@@ -16,7 +16,7 @@
 //!   re-wraps it as `DeviceSliceUninit` before storing.
 
 use claspr::eager::{DeviceOpExt, eager_copy_to};
-use claspr::{Context, DeviceSlice};
+use claspr::{Context, DeviceSlice, MappedSlice, SvmLevel, USMSlice};
 
 const N: usize = 16;
 
@@ -82,5 +82,35 @@ fn copy_uninit_dst_is_reusable() {
         let mut out = vec![0u32; N];
         co_dst.read(&mut out).wait().expect("read dst run2");
         assert_eq!(out, data, "run 2 uninit dst == src");
+    }
+}
+
+/// USM (fine-grain-system SVM) copy into a `USMSliceUninit` dst, reused. USM's
+/// uninit backing is a `Vec<MaybeUninit<T>>`, so the Init→Uninit downgrade is a
+/// same-layout `Vec` reinterpret (`USMSliceUninit::from_init`) rather than a
+/// private-field re-wrap — but it IS sound (the safe downgrade direction) and
+/// must re-arm just like Device/Mapped. Skips if the device lacks fine-grain SVM.
+#[test]
+fn usm_copy_uninit_dst_is_reusable() {
+    let Some(ctx) = ctx() else { return };
+    if ctx.svm_capability() != SvmLevel::FineSystem {
+        eprintln!("SKIP: device lacks fine-grain-system SVM (USM)");
+        return;
+    }
+
+    let data: Vec<u32> = (0..N as u32).map(|x| x + 200).collect();
+    let src = MappedSlice::<u32>::from_slice(&ctx, &data).expect("usm src alloc");
+    let dst = USMSlice::<u32>::alloc_uninit(&ctx, N).expect("usm uninit dst alloc");
+
+    let g = eager_copy_to(src, dst);
+
+    {
+        let _ = g.sync(&ctx).expect("first sync");
+    } // <- USM downgrade rehome returns the Init dst into the Cell<USMSliceUninit>.
+
+    {
+        let _ = g
+            .sync(&ctx)
+            .expect("second sync (USM uninit dst must downgrade-rehome, not busy)");
     }
 }

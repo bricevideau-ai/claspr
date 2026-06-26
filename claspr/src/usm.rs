@@ -250,6 +250,50 @@ impl<T, M: MemMode> USMSliceUninit<T, M> {
         }
     }
 
+    /// Downgrade an initialized [`USMSlice`] back to `USMSliceUninit` — the
+    /// inverse of [`assume_init`](Self::assume_init), and the SAFE direction:
+    /// `Init` is the stronger capability (read+write), so forgetting it to a
+    /// write-only `Uninit` is always sound (an Init buffer can be used wherever
+    /// an Uninit is expected). Used by the reuse home-channel to re-arm a
+    /// `Cell<USMSliceUninit>` after a copy wrote the buffer (which earned the
+    /// Uninit→Init transition; this hands the same allocation back for the next
+    /// run to overwrite).
+    ///
+    /// Mirrors `assume_init` in reverse to preserve the heap address — the SVM
+    /// pointer was taken from `data.as_ptr()` and must stay valid.
+    pub(crate) fn from_init(slice: USMSlice<T, M>) -> Self {
+        // `USMSlice: Drop` (it waits on in-flight events, then frees the Vec), so
+        // we can't move its fields out by value. Suppress its Drop with
+        // `ManuallyDrop` and read the fields out: the copy that produced this
+        // buffer already completed before the Checkout returned it, so there are
+        // no in-flight events to wait on, and we are REUSING the allocation, not
+        // freeing it.
+        let mut slice = std::mem::ManuallyDrop::new(slice);
+        // SAFETY: each field is read exactly once out of the ManuallyDrop'd slice
+        // (which is never dropped, so no double-free / use-after-read). `data` and
+        // `ctx` are moved out; `in_flight` (already drained) and `_mode` (ZST) are
+        // left to leak harmlessly inside the ManuallyDrop.
+        let data: Vec<T> = unsafe { std::ptr::read(&slice.data) };
+        let ctx = unsafe { std::ptr::read(&slice.ctx) };
+        // Drop in_flight explicitly (an empty Vec at this point) so nothing leaks.
+        unsafe { std::ptr::drop_in_place(&mut slice.in_flight) };
+        // SAFETY: `MaybeUninit<T>` has the same layout as `T`. Reinterpret the
+        // already-initialized `Vec<T>` as `Vec<MaybeUninit<T>>` (a DOWNGRADE — no
+        // init assertion needed, unlike `assume_init`'s upgrade), reusing the same
+        // allocation so the heap address (and any SVM pointer derived from it) is
+        // unchanged.
+        let mut data = std::mem::ManuallyDrop::new(data);
+        let ptr = data.as_mut_ptr() as *mut MaybeUninit<T>;
+        let len = data.len();
+        let cap = data.capacity();
+        let data_u: Vec<MaybeUninit<T>> = unsafe { Vec::from_raw_parts(ptr, len, cap) };
+        USMSliceUninit {
+            data: data_u,
+            ctx,
+            _mode: PhantomData,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.data.len()
     }
