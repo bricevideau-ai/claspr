@@ -30,16 +30,16 @@ fn ctx() -> Option<Context> {
 fn fan_out_preserves_input_order() {
     let Some(ctx) = ctx() else { return };
     let inputs: Vec<u32> = (0..8).collect();
-    let outputs: Vec<u32> = fan_out(inputs.clone(), |n| value(n.wrapping_mul(10)))
+    let outputs = fan_out(inputs.clone(), |n| value(n.wrapping_mul(10)))
         .sync(&ctx)
         .expect("fan_out");
-    assert_eq!(outputs, vec![0, 10, 20, 30, 40, 50, 60, 70]);
+    assert_eq!(*outputs, vec![0, 10, 20, 30, 40, 50, 60, 70]);
 }
 
 #[test]
 fn fan_out_over_empty_yields_empty_vec() {
     let Some(ctx) = ctx() else { return };
-    let outputs: Vec<u32> = fan_out(Vec::<u32>::new(), value)
+    let outputs = fan_out(Vec::<u32>::new(), value)
         .sync(&ctx)
         .expect("fan_out");
     assert!(outputs.is_empty());
@@ -53,7 +53,7 @@ fn fan_out_of_kernel_ops_runs_each_branch() {
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
     let fill_values: Vec<u32> = vec![100, 200, 300, 400];
-    let outputs: Vec<Vec<u32>> = fan_out(fill_values.clone(), move |val| {
+    let outputs = fan_out(fill_values.clone(), move |val| {
         upload(vec![0u32; N])
             .and_then(move |buf| kernels_ref.fill_u32([N], buf, val))
             .and_then(download)
@@ -85,6 +85,8 @@ fn fan_out_propagates_child_error() {
         })
     })
     .sync(&ctx)
+    // `expect_err` needs the Ok type (`Checkout<Vec<u32>>`) to be `Debug`; drop it.
+    .map(|_| ())
     .expect_err("fan_out should surface child error");
     assert!(
         matches!(&err, Error::Build { log } if log == "injected failure"),

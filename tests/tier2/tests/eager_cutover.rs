@@ -56,7 +56,7 @@ fn alloc_then_fill_syncs() {
 fn upload_fill_download_roundtrip() {
     let Some(ctx) = ctx() else { return };
 
-    let out: Vec<u32> = upload(vec![1u32; N])
+    let out = upload(vec![1u32; N])
         .and_then(|b| fill(b, 9u32))
         .and_then(download)
         .sync(&ctx)
@@ -79,7 +79,7 @@ fn kernel_composes_in_eager_graph() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("kernels");
 
-    let out: Vec<u32> = upload(vec![0u32; N])
+    let out = upload(vec![0u32; N])
         .and_then(|b| ks.fill_u32([N], b, 7u32))
         .and_then(|b| ks.scale_u32([N], b, 3u32))
         .and_then(download)
@@ -101,7 +101,7 @@ fn eager_kernel_concrete_head() {
     let ks = kernels::kernels(&ctx).expect("kernels");
     let buf = claspr::DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("buf");
 
-    let out: Vec<u32> = ks
+    let out = ks
         .fill_u32([N], buf, 5u32)
         .and_then(download)
         .sync(&ctx)
@@ -120,12 +120,12 @@ fn upload_download_preserves_data() {
     let Some(ctx) = ctx() else { return };
 
     let src: Vec<u32> = (0..N as u32).collect();
-    let out: Vec<u32> = upload(src.clone())
+    let out = upload(src.clone())
         .and_then(download)
         .sync(&ctx)
         .expect("sync");
 
-    assert_eq!(out, src, "round-trip preserves data");
+    assert_eq!(*out, src, "round-trip preserves data");
 }
 
 /// A longer fill chain: each fill threads the prior fill's event as its
@@ -156,8 +156,8 @@ fn value_and_arced() {
     let Some(ctx) = ctx() else { return };
 
     // value: pure host value through the graph.
-    let n: u32 = value(42u32).sync(&ctx).expect("value");
-    assert_eq!(n, 42);
+    let n = value(42u32).sync(&ctx).expect("value");
+    assert_eq!(*n, 42);
 
     // arced: wrap an uploaded buffer in Arc.
     let shared = arced(upload(vec![5u32; N])).sync(&ctx).expect("arced");
@@ -209,7 +209,7 @@ fn bundles_join_branches() {
     let (x, y, z) = bundle3(value(1u32), value(2u32), value(3u32))
         .sync(&ctx)
         .expect("bundle3");
-    assert_eq!((x, y, z), (1, 2, 3));
+    assert_eq!((*x, *y, *z), (1, 2, 3));
 }
 
 /// `fan_out`: one op per input (builder runs eagerly over the inputs), joined.
@@ -217,10 +217,10 @@ fn bundles_join_branches() {
 fn fan_out_homogeneous() {
     let Some(ctx) = ctx() else { return };
 
-    let vals: Vec<u32> = fan_out(vec![10u32, 20, 30], value)
+    let vals = fan_out(vec![10u32, 20, 30], value)
         .sync(&ctx)
         .expect("fan_out");
-    assert_eq!(vals, vec![10, 20, 30]);
+    assert_eq!(*vals, vec![10, 20, 30]);
 }
 
 /// fan_out of real device work: fill N buffers to distinct values, download all.
@@ -228,7 +228,7 @@ fn fan_out_homogeneous() {
 fn fan_out_device_work() {
     let Some(ctx) = ctx() else { return };
 
-    let outs: Vec<Vec<u32>> = fan_out(vec![1u32, 2u32, 3u32], |v| {
+    let outs = fan_out(vec![1u32, 2u32, 3u32], |v| {
         upload(vec![0u32; 8])
             .and_then(move |b| fill(b, v))
             .and_then(download)
@@ -259,7 +259,7 @@ fn multi_output_kernel_element_select() {
     let b = upload(vec![4u32; N]).sync(&ctx).expect("upload b");
     let out = alloc_zero::<u32>(N).sync(&ctx).expect("alloc out");
 
-    let result: Vec<u32> = ks
+    let result = ks
         .add_u32([N], a, b, out)
         .and_then(|(_a, _b, out)| download(out))
         .sync(&ctx)
@@ -310,7 +310,8 @@ fn arc_split_read_only_fan_out() {
     // Shared, read-only input: 0,1,2,…,N-1.
     let src: Vec<u32> = (0..N as u32).collect();
 
-    let (out_a, out_b) = arc_split::<2, _>(arced(upload(src.clone())))
+    // Terminal is the `and_then` (single output): one `Checkout<(Vec, Vec)>`.
+    let result = arc_split::<2, _>(arced(upload(src.clone())))
         .and_then(|[a, b]| {
             // Each branch owns one Arc clone of the SAME device buffer and reads
             // it (read-only kernel arg) into its own private destination.
@@ -326,9 +327,10 @@ fn arc_split_read_only_fan_out() {
         })
         .sync(&ctx)
         .expect("arc_split fan-out");
+    let (out_a, out_b) = &*result;
 
-    assert_eq!(out_a, src, "branch a saw the shared input");
-    assert_eq!(out_b, src, "branch b saw the shared input");
+    assert_eq!(*out_a, src, "branch a saw the shared input");
+    assert_eq!(*out_b, src, "branch b saw the shared input");
 }
 
 /// `arc_split` as the TERMINAL: with no downstream `and_then`, `.sync()`
@@ -343,7 +345,8 @@ fn arc_split_terminal_array() {
         .sync(&ctx)
         .expect("arc_split terminal");
 
-    // All three are clones of the one Arc the source produced.
+    // All three are clones of the one Arc the source produced. Deref each
+    // `Checkout<Arc<…>>` to its `Arc` for the pointer comparison.
     assert!(
         std::sync::Arc::ptr_eq(&a, &b),
         "a and b share one allocation"
@@ -373,10 +376,18 @@ fn arc_split_terminal_array() {
 fn device_copy_eager() {
     let Some(ctx) = ctx() else { return };
 
-    let src = upload(vec![7u32; N]).sync(&ctx).expect("upload src");
-    let dst = alloc_zero::<u32>(N).sync(&ctx).expect("alloc dst");
+    // `into_inner` to concrete buffers: `eager_copy_to`'s `Src: CopyTo<Dst>` bound
+    // can't infer the marker from a `Checkout` (multiple `From<Checkout<…>>` impls).
+    let src = upload(vec![7u32; N])
+        .sync(&ctx)
+        .expect("upload src")
+        .into_inner();
+    let dst = alloc_zero::<u32>(N)
+        .sync(&ctx)
+        .expect("alloc dst")
+        .into_inner();
 
-    let result: Vec<u32> = eager_copy_to(src, dst)
+    let result = eager_copy_to(src, dst)
         .and_then(|(_src, dst)| download(dst))
         .sync(&ctx)
         .expect("sync");
@@ -398,7 +409,7 @@ fn device_copy_eager() {
 fn eager_and_then() {
     let Some(ctx) = ctx() else { return };
 
-    let out: Vec<u32> = upload(vec![1u32; N])
+    let out = upload(vec![1u32; N])
         .and_then(|buf| fill(buf, 9u32))
         .and_then(download)
         .sync(&ctx)
@@ -420,7 +431,7 @@ fn eager_and_then() {
 fn eager_and_then_host() {
     let Some(ctx) = ctx() else { return };
 
-    let out: Vec<u32> = upload(vec![1u32; N])
+    let out = upload(vec![1u32; N])
         .and_then_host(|slice: &mut [u32]| {
             for x in slice.iter_mut() {
                 *x += 1;
@@ -454,10 +465,13 @@ fn eager_and_then_host() {
 fn eager_and_then_host_error_propagates() {
     let Some(ctx) = ctx() else { return };
 
+    // Drop the Ok payload (`Checkout<Vec<u32>>` is not `Debug`) so the error is
+    // both matchable and debug-printable below.
     let res = upload(vec![1u32; N])
         .and_then_host(|_slice: &mut [u32]| Err(claspr::Error::SvmNotAvailable))
         .and_then(download)
-        .sync(&ctx);
+        .sync(&ctx)
+        .map(|_| ());
 
     assert!(
         matches!(res, Err(claspr::Error::SvmNotAvailable)),
@@ -516,7 +530,7 @@ fn eager_on_device() {
 
     // Two fill stages, each routed to a distinct device from the context, then
     // download. Device identity resolved by index at execute (portable idiom).
-    let out: Vec<u32> = upload(vec![0u32; N])
+    let out = upload(vec![0u32; N])
         .and_then(|buf| fill(buf, 3u32).on_device_at(0))
         .and_then(|buf| fill(buf, 7u32).on_device_at(1))
         .and_then(download)

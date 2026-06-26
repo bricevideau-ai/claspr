@@ -35,7 +35,7 @@ fn bundle2_pure_values() {
     let (a, b) = bundle2(value(11u32), value(22u32))
         .sync(&ctx)
         .expect("bundle2");
-    assert_eq!((a, b), (11, 22));
+    assert_eq!((*a, *b), (11, 22));
 }
 
 #[test]
@@ -46,9 +46,9 @@ fn bundle3_pure_values() {
     let (a, b, c) = bundle3(value("one"), value(2u32), value(3.0f32))
         .sync(&ctx)
         .expect("bundle3");
-    assert_eq!(a, "one");
-    assert_eq!(b, 2);
-    assert_eq!(c, 3.0);
+    assert_eq!(*a, "one");
+    assert_eq!(*b, 2);
+    assert_eq!(*c, 3.0);
 }
 
 #[test]
@@ -83,7 +83,7 @@ fn fan_out_homogeneous_kernels() {
     let kernels_ref = &kernels;
 
     let values: Vec<u32> = (0..4).collect();
-    let outs: Vec<Vec<u32>> = fan_out(values.clone(), move |v| {
+    let outs = fan_out(values.clone(), move |v| {
         upload(vec![0u32; N])
             .and_then(move |buf| kernels_ref.fill_u32([N], buf, v))
             .and_then(download)

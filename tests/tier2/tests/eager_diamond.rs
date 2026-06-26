@@ -60,7 +60,7 @@ fn diamond_shares_single_cl_mem_via_arc_device_slice() {
     let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
-    let result: Vec<u32> = arc_split::<2, _>(arced(upload(vec![5u32; N])))
+    let result = arc_split::<2, _>(arced(upload(vec![5u32; N])))
         .and_then(|[s1, s2]| {
             let ks = &kernels;
             bundle3(
@@ -114,10 +114,10 @@ fn arc_device_slice_refcount_holds_until_last_branch_finishes() {
     // four branches download and we select after sync, which keeps all four
     // Arc clones live until every kernel finishes, satisfying the refcount
     // assertion identically.)
-    // The nested-bundle terminal output type, named to keep the destructure
-    // clippy-clean (type_complexity).
-    type FanOutputs = (Vec<u32>, (Vec<u32>, (Vec<u32>, Vec<u32>)));
-    let (a, (_b, (_c, _d))): FanOutputs = arc_split::<4, _>(arced(upload(vec![7u32; N])))
+    // The terminal op is the `and_then` (single output), so its result is ONE
+    // `Checkout<(Vec, (Vec, (Vec, Vec)))>` wrapping the whole reconstructed nested
+    // tuple — not a tuple of checkouts. Deref and read branch A (the `.0` slot).
+    let result = arc_split::<4, _>(arced(upload(vec![7u32; N])))
         .and_then(|[s1, s2, s3, s4]| {
             let ks = &kernels;
             // out = shared(7) + [0; N] = 7 on every branch. Nested
@@ -137,6 +137,7 @@ fn arc_device_slice_refcount_holds_until_last_branch_finishes() {
         })
         .sync(&ctx)
         .expect("4-way fan chain");
+    let (a, _rest) = &*result;
 
     assert!(a.iter().all(|&v| v == 7));
     assert_eq!(ctx.error_count(), 0);

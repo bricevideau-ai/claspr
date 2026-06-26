@@ -23,17 +23,17 @@ fn vec_method_form_matches_free_fn() {
     let inputs: Vec<u32> = (0..8).collect();
 
     // Free-fn form.
-    let free: Vec<u32> = fan_out(inputs.clone(), |i| value(i.wrapping_mul(2)))
+    let free = fan_out(inputs.clone(), |i| value(i.wrapping_mul(2)))
         .sync(&ctx)
         .expect("free-fn fan_out");
 
     // Method form — delegates to the same free fn.
-    let method: Vec<u32> = inputs
+    let method = inputs
         .clone()
         .fan_out(|i| value(i.wrapping_mul(2)))
         .sync(&ctx)
         .expect("method fan_out");
 
-    assert_eq!(free, method);
-    assert_eq!(method, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+    assert_eq!(*free, *method);
+    assert_eq!(*method, vec![0, 2, 4, 6, 8, 10, 12, 14]);
 }

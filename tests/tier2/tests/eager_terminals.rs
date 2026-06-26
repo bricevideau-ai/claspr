@@ -28,7 +28,7 @@ fn wait_on_explicit_queue_runs_graph() {
     let device = Device::any().expect("device");
     let queue = Queue::<InOrder>::on_device(&ctx, &device).expect("queue");
 
-    let out: Vec<u32> = upload(vec![0u32; N])
+    let out = upload(vec![0u32; N])
         .and_then(|buf| fill(buf, 9u32))
         .and_then(download)
         .wait_on(&queue)
@@ -46,7 +46,7 @@ fn wait_on_kernel_chain() {
     let queue = Queue::<InOrder>::on_device(&ctx, &device).expect("queue");
     let kernels = kernels::kernels(&ctx).expect("kernels");
 
-    let out: Vec<u32> = upload(vec![0u32; N])
+    let out = upload(vec![0u32; N])
         .and_then(|b| kernels.fill_u32([N], b, 7u32))
         .and_then(|b| kernels.scale_u32([N], b, 3u32))
         .and_then(download)
@@ -79,7 +79,7 @@ fn submit_on_returns_completion_event() {
 fn sync_matches_wait_on() {
     let Some(ctx) = ctx() else { return };
 
-    let via_sync: Vec<u32> = upload(vec![3u32; N])
+    let via_sync = upload(vec![3u32; N])
         .and_then(|buf| fill(buf, 4u32))
         .and_then(download)
         .sync(&ctx)
