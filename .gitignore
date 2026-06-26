@@ -13,3 +13,8 @@ Cargo.lock.*
 *.swp
 *.ppm
 spikes/**/Cargo.lock
+# scratch/ holds throwaway C reproducers (pocl event-race work). Keep the
+# .c sources + diagnosis .md, ignore the compiled (extensionless) binaries.
+/scratch/*
+!/scratch/*.c
+!/scratch/*.md
