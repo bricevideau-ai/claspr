@@ -336,8 +336,8 @@ impl<T> Input<T> {
         }
     }
 
-    /// Resolve to `(value, upstream Deps)` against a bare [`Launcher`] (building a
-    /// transient [`ExecutionContext`] internally), for callers OUTSIDE this crate
+    /// Resolve to `(value, upstream Deps)` against a bare [`Launcher`](crate::Launcher)
+    /// (building a transient [`ExecutionContext`] internally), for callers OUTSIDE this crate
     /// that have a launcher but cannot construct an `ExecutionContext` (which is
     /// crate-private). Used by the `#[kernel]` proc-macro's **image (consuming)**
     /// terminal: an image kernel is single-shot and not a [`DeviceOp`], so its
