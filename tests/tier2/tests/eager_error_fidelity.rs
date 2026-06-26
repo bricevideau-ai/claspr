@@ -41,6 +41,7 @@ fn panic_in_host_closure_surfaces_host_panic() {
     let err = value(())
         .and_then_host(|()| -> claspr::Result<()> { panic!("boom-{}", 42) })
         .sync(&ctx)
+        .map(|_| ())
         .expect_err("expected error");
     match err {
         Error::HostPanic(msg) => assert!(msg.contains("boom-42"), "msg was {msg:?}"),
@@ -72,7 +73,10 @@ fn first_writer_wins_when_bundle_branches_both_fail() {
         })
     });
     let right = value(()).and_then_host(|()| -> claspr::Result<()> { Err(Error::SvmNotAvailable) });
-    let err = bundle2(left, right).sync(&ctx).expect_err("expected error");
+    let err = bundle2(left, right)
+        .sync(&ctx)
+        .map(|_| ())
+        .expect_err("expected error");
     let acceptable = matches!(&err, Error::Build { log } if log == "left-arm")
         || matches!(err, Error::SvmNotAvailable);
     assert!(
