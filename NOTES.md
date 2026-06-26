@@ -9,6 +9,57 @@ items resolve.
 
 ## Active
 
+### ✅ STEP (a) LANDED 2026-06-26 — reusable `g.sync()` (own-the-buffers; no slots yet)
+
+Branch `replayable-graphs` @ `b35e390` (pushed, not merged to main). The op-tree
+IS the reusable graph; the design below is REALITY now for step (a). What shipped:
+
+- **`DeviceOp::execute(&self)`** — borrowing, non-consuming (was `self`). `Input`
+  is a lend-and-return **cell** (`Cell<T> = Arc<Mutex<Option<T>>>`); `resolve`
+  lends the buffer, the run's `Checkout` returns it on drop → `g` re-arms. The
+  kernel proc-macro's `execute` was rewritten to borrow (`&self.kernel`, copy
+  `LaunchSpec`, lend args).
+- **`sync(&self)/wait_on(&self) -> Result<Checkout<…>>`**. `Checkout<O>`:
+  Deref/DerefMut, `into_inner` (sever), return-on-drop (re-arm), busy-error on a
+  second `sync` while a buffer is still checked out, + `Debug`/`PartialEq`/
+  `PartialEq<O>` passthrough, + transparent as a kernel arg/`ToInput` and
+  `.read()/.copy_to()` directly. So one-shot call sites mostly DON'T need
+  `into_inner` — borrow via Deref; `into_inner` only to take an owned value by
+  move (`Arc::new`, store, return).
+- **Per-output checkouts**: multi-output terminals return a TUPLE
+  `(Checkout<A>, Checkout<B>, …)`, each with its OWN home cell, via
+  **home-carried-in-pipe** provenance (the cell travels with the value through
+  the pipe — typed, no `Any`, no cl_mem heuristic). Same-typed multi-buffer
+  kernels (`add(a,b,out)`) re-arm every cell correctly. `AndThen` delegates
+  `gather_checkouts` to its tail (mirrors `collect`).
+- **Alloc rule**: read-only buffers persist; mutable re-seed each run (the
+  `upload` op re-mints), so `upload→kernels→download` is idempotent across
+  repeated `sync` (verified ×3 no-compounding).
+- **Images**: kept on the one-shot CONSUMING path (borrowed image views aren't
+  `'static`, can't be cells). NOT a recordability limit — image reuse is a
+  slots-era feature; the CB image commands exist (`clCommandFillImageKHR`,
+  `clCommandCopy{Image,BufferToImage,ImageToBuffer}KHR`, all in opencl-sys 0.6.1)
+  to record an OWNED image later. `Input::resolve_on(&self, launcher)` added for
+  the image terminal (builds a transient EC from a bare Launcher).
+
+Tests: graph_reuse 7/7 (idempotent reseed, multi-output, into_inner, busy-guard,
+add-3-buffers re-arm). Full tier1+tier2 migrated to Checkout (47 files) +
+examples; review agent confirmed ZERO assertion/semantic regressions. Green on
+pocl; fmt/clippy/doc `-D warnings` clean. Known non-issues: 2 pocl 3D/array
+`write_image` gaps (pre-existing, fail identically at HEAD); ui_test compile-fail
+must run via `cargo test --test <name>` (isolated) not batched `-p` (multiple
+`claspr` rlibs confuse its rlib discovery — pre-existing).
+
+DEFERRED to later steps (design below): **(b) slots** (`slot!(Tag)`/`Tag(value)`/
+`call` runtime bind-table + typed tags → rebind different buffers per run);
+**(c) convex-segment replay** (software + cached `cl_khr_command_buffer`); **(d)
+mutable-dispatch** + image reuse. The layer-1/2 record/CB code from the earlier
+`record.rs` (commits fd68c0c…2bd92a5) still exists on the branch as salvage for
+(c) — it is NOT wired under `sync()` yet (step (a) replays by re-walking
+`execute(&self)`, no CB). Process lesson: engine-touching agents must be
+SEQUENCED, not fanned out — parallel runs against a moving base caused a
+stale-base merge tangle + a shared-file collision this session.
+
 ### ⭐ REUSABLE GRAPH MODEL — agreed design (2026-06-26, brainstormed w/ Brice). THIS SUPERSEDES the record/replay framing below.
 
 Branch `replayable-graphs` built `record()`/`replay()`/`RecordedGraph` as a
