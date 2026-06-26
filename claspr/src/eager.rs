@@ -199,7 +199,7 @@ impl<T: Send + 'static> DeviceOp for Pipe<T> {
 /// out — a second `sync` would find them gone. So `Concrete` holds its value in
 /// an interior-mutable cell (`Arc<Mutex<Option<T>>>`, the same shape as a
 /// [`Pipe`]). [`resolve`](Input::resolve) **lends** the value out of the cell for
-/// the duration of one run; the run's [`Checkout`](crate::Checkout) returns it to
+/// the duration of one run; the run's [`Checkout`] returns it to
 /// the cell on drop, re-arming `g`. A caller-owned buffer is thus lent (not
 /// copied — [`DeviceSlice`] is deliberately not `Clone`) and comes back.
 pub enum Input<T> {
@@ -227,7 +227,7 @@ impl<T> Input<T> {
     ///
     /// The lent value is taken OUT of the `Concrete` cell here; the cell stays
     /// empty for the rest of the run. It is returned by the run's `Checkout` on
-    /// drop (see [`Checkout`](crate::Checkout)).
+    /// drop (see [`Checkout`]).
     ///
     /// `T: Send + 'static` so the lent cell can be recorded type-erased in the
     /// run's ledger for return — every buffer type that flows here satisfies it.
@@ -460,7 +460,7 @@ pub trait DeviceOp: Send {
     ///
     /// **Borrows `&self`** — the op is NOT consumed, so the graph it belongs to is
     /// reusable: a terminal can `execute` it again after the previous run's
-    /// [`Checkout`](crate::Checkout) has returned the lent resources to their
+    /// [`Checkout`] has returned the lent resources to their
     /// cells. Leaves that mint fresh values each run (`upload`/`alloc_zero`/
     /// `value`) re-seed from a retained source; leaves over a caller-owned
     /// [`Concrete`](Input::Concrete) input lend the buffer (returned on `Checkout`
@@ -506,6 +506,11 @@ pub trait DeviceOp: Send {
     /// (which dispatches to the right per-op gather) then waits once on the
     /// returned deps. This is the seam that lets [`sync`](DeviceOpExt::sync) be
     /// arity-agnostic. Ops never override this — they override `collect`.
+    ///
+    /// Takes `&self` (not `self`): in the reusable-graph model the op is borrowed,
+    /// not consumed (the name predates the model — it "produces the output", it no
+    /// longer consumes the op).
+    #[allow(clippy::wrong_self_convention)]
     fn into_output(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
     where
         Self: Sized,
@@ -868,7 +873,8 @@ impl<T: DeviceOp> DeviceOpExt for T {}
 ///
 /// A graph (`g`) is reusable: `g.sync(&ctx)` enqueues its commands, waits, and
 /// returns a `Checkout` holding the output. While the `Checkout` is alive you can
-/// read (and mutate) the output via [`Deref`]/[`DerefMut`]. Any caller-owned
+/// read (and mutate) the output via [`Deref`](std::ops::Deref) /
+/// [`DerefMut`](std::ops::DerefMut). Any caller-owned
 /// buffer the run **lent** (a [`Concrete`](Input::Concrete) input) is held by the
 /// `Checkout` for return: on **drop** it deposits the output back into the lending
 /// cell, **re-arming** `g` for another `sync`. A second `sync` that needs a
@@ -1285,7 +1291,11 @@ impl<O> ErasedDeviceOp<O::Output> for O
 where
     O: DeviceOp,
 {
-    fn collect_erased(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(O::Output, Deps)> {
+    fn collect_erased(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(O::Output, Deps)> {
         self.collect(ec, mode)
     }
 
