@@ -88,7 +88,9 @@ fn run(ctx: Context) -> claspr::Result<()> {
     // "reduce after pipeline" the cleanest shape is just `.sync()`
     // then sum on the host. (An in-chain reduction would use
     // `.and_then_host(...)` with an `Arc<Mutex<_>>` capture.)
-    let downloaded: Vec<u32> = upload(input)
+    // `downloaded` stays a `Checkout<Vec<u32>>`; we only borrow it (`.iter()`),
+    // so Deref handles it — no `into_inner` needed.
+    let downloaded = upload(input)
         .and_then(|buf| kernels.linear([N], buf, W1, B1))
         .and_then(|buf| kernels.relu_threshold([N], buf, THRESHOLD))
         .and_then(|buf| kernels.linear([N], buf, W2, B2))

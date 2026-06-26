@@ -116,7 +116,8 @@ fn run(ctx: Context) -> claspr::Result<()> {
     // device buffers and BATCHES × N × 4 bytes of redundant
     // host→device DMA. With the share-on-device pattern: one alloc,
     // one DMA, N branches read from the same `cl_mem`.
-    let weights_dev: Arc<claspr::DeviceSlice<u32>> = Arc::new(upload(weights).sync(&ctx)?);
+    let weights_dev: Arc<claspr::DeviceSlice<u32>> =
+        Arc::new(upload(weights).sync(&ctx)?.into_inner());
 
     // The full fan_out chain: each branch uploads ONLY its own input
     // buffer, then runs `elem_mul` against the shared weights, then
@@ -126,7 +127,8 @@ fn run(ctx: Context) -> claspr::Result<()> {
     // into the chain, but the new signature only does in-place
     // mutation — for pure reductions, host sum after `.sync()` is the
     // natural shape.)
-    let downloaded: Vec<Vec<u32>> = fan_out(inputs.clone(), move |input| {
+    // `downloaded` stays a `Checkout<Vec<Vec<u32>>>`; only borrowed below.
+    let downloaded = fan_out(inputs.clone(), move |input| {
         // Cheap Arc::clone — both pointers refer to the same `cl_mem`.
         let weights_ref = Arc::clone(&weights_dev);
         upload(input)

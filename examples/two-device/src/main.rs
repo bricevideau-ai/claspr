@@ -111,9 +111,11 @@ fn run() -> claspr::Result<bool> {
     let mut out0 = vec![0u32; half];
     let mut out1 = vec![0u32; N - half];
     let mut mirror_out = vec![0u32; half];
+    // Read-backs land in the host `out*` vecs; keep the buffer Checkouts so we can
+    // still query `buf0`/`buf1` below (`.len()` via Deref — no `into_inner`).
     let buf0 = buf0.read(&mut out0).wait_on(&q0)?;
     let buf1 = buf1.read(&mut out1).wait_on(&q1)?;
-    mirror.read(&mut mirror_out).wait_on(&q1)?;
+    let _ = mirror.read(&mut mirror_out).wait_on(&q1)?;
 
     assert_eq!(out0, inputs[..half], "buf0 round-trip mismatch");
     assert_eq!(out1, inputs[half..], "buf1 round-trip mismatch");
