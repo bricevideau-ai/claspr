@@ -327,7 +327,7 @@ fn arc_split_read_only_fan_out() {
         })
         .sync(&ctx)
         .expect("arc_split fan-out");
-    let (out_a, out_b) = &*result;
+    let (out_a, out_b) = &result;
 
     assert_eq!(*out_a, src, "branch a saw the shared input");
     assert_eq!(*out_b, src, "branch b saw the shared input");

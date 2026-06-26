@@ -1252,6 +1252,28 @@ impl<O> std::ops::DerefMut for Checkout<O> {
     }
 }
 
+// Pass-through `Debug`/`PartialEq` over the held output, so a `Checkout<O>` reads
+// like its `O` in `assert_eq!`/`{:?}` (tests + user diagnostics) without an
+// explicit deref. Mirrors how `Deref` makes read methods transparent.
+impl<O: std::fmt::Debug> std::fmt::Debug for Checkout<O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<O: PartialEq> PartialEq for Checkout<O> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+// Compare a `Checkout<O>` directly against an `O` (the common `assert_eq!(co, v)`).
+impl<O: PartialEq> PartialEq<O> for Checkout<O> {
+    fn eq(&self, other: &O) -> bool {
+        **self == *other
+    }
+}
+
 // ── AndThen: source then next; next eagerly built over source's pipe ───
 
 /// If `src_pipe` still holds a value (the `and_then` closure discarded the

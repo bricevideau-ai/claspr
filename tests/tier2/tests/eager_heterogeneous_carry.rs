@@ -65,7 +65,7 @@ fn bundle_mixes_pipe_and_value_scalar_arrives_by_value() {
         .and_then(|(buf, scalar)| bundle!(download(buf), value(scalar)))
         .sync(&ctx)
         .expect("mixed pipe+scalar bundle");
-    let (out, carried) = &*result;
+    let (out, carried) = &result;
 
     assert!(out.iter().all(|&v| v == 7), "fill 7 * scale 1 = 7");
     assert_eq!(
@@ -92,7 +92,7 @@ fn carried_scalar_is_computed_on_in_chain() {
         .and_then(|(buf, step)| bundle!(download(buf), value(step)))
         .sync(&ctx)
         .expect("counter chain");
-    let (out, step) = &*result;
+    let (out, step) = &result;
 
     assert!(out.iter().all(|&v| v == 8), "1 * 2 * 2 * 2 = 8");
     assert_eq!(*step, 2, "0 -> +1 -> +1 = 2, computed in-chain");
@@ -135,7 +135,7 @@ fn bare_pipe_is_an_op_in_a_bundle() {
     .and_then(|(out, tag)| bundle!(download(out), value(tag)))
     .sync(&ctx)
     .expect("bare-pipe-in-bundle");
-    let (summed, tag) = &*result;
+    let (summed, tag) = &result;
 
     assert!(summed.iter().all(|&v| v == 7), "3 + 4 = 7");
     assert_eq!(*tag, 99);

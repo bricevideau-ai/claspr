@@ -137,7 +137,8 @@ fn arc_device_slice_refcount_holds_until_last_branch_finishes() {
         })
         .sync(&ctx)
         .expect("4-way fan chain");
-    let (a, _rest) = &*result;
+    // Multi-output terminal tail → a tuple of per-output checkouts.
+    let (a, _rest) = &result;
 
     assert!(a.iter().all(|&v| v == 7));
     assert_eq!(ctx.error_count(), 0);

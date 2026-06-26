@@ -102,13 +102,13 @@ fn piped_copy_to_method() {
         .wait_on(&ctx)
         .expect("dst alloc")
         .into_inner();
-    // Terminal is the `and_then` (single output): one `Checkout<(src, dst)>`.
-    // `into_inner` to own the pair so `dst` can feed the downstream `download`.
+    // Multi-output tail (`copy_to` → `(src, dst)`): a tuple of per-output
+    // checkouts; `into_inner` the dst so it can feed the downstream `download`.
     let (_src, dst) = upload(data.clone())
         .and_then(|src| src.copy_to(dst))
         .sync(&ctx)
-        .expect("upload + piped copy_to")
-        .into_inner();
+        .expect("upload + piped copy_to");
+    let dst = dst.into_inner();
     // The copy landed in dst: download it and compare to the original data.
     let back = download(dst).sync(&ctx).expect("download dst");
     assert_eq!(*back, data);

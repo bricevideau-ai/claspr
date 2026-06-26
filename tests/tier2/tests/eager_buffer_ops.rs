@@ -127,12 +127,12 @@ fn device_slice_copy_returns_both_buffers() {
         .sync(&ctx)
         .expect("alloc dst")
         .into_inner();
-    // Terminal is the `and_then` (single output): one `Checkout<(Vec, Vec)>`.
-    let result = eager_copy_to(src, dst)
+    // Terminal tail is multi-output (`bundle2`): a tuple of per-output checkouts
+    // `(Checkout<Vec>, Checkout<Vec>)`.
+    let (src_out, dst_out) = eager_copy_to(src, dst)
         .and_then(|(src, dst)| bundle2(download(src), download(dst)))
         .sync(&ctx)
         .expect("copy + both downloads");
-    let (src_out, dst_out) = &*result;
     assert_eq!(*src_out, src_data, "src unchanged after copy");
     assert_eq!(*dst_out, src_data, "dst received src's bytes");
 }
