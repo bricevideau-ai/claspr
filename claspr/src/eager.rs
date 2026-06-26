@@ -336,6 +336,26 @@ impl<T> Input<T> {
         }
     }
 
+    /// Resolve to `(value, upstream Deps)` against a bare [`Launcher`] (building a
+    /// transient [`ExecutionContext`] internally), for callers OUTSIDE this crate
+    /// that have a launcher but cannot construct an `ExecutionContext` (which is
+    /// crate-private). Used by the `#[kernel]` proc-macro's **image (consuming)**
+    /// terminal: an image kernel is single-shot and not a [`DeviceOp`], so its
+    /// buffer args resolve here directly rather than through `execute(&self)`.
+    ///
+    /// Like [`resolve`](Self::resolve), this **lends** the value out of the cell;
+    /// the image terminal consumes the Op and hands the value back by value, so
+    /// nothing is returned to the cell — that's expected (single-shot).
+    pub fn resolve_on<L>(&self, launcher: &L) -> Result<(T, Deps)>
+    where
+        T: Send + 'static,
+        L: crate::Launcher + ?Sized,
+    {
+        let device = launcher.context().device().clone();
+        let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
+        self.resolve(&ec)
+    }
+
     /// If this is a `Concrete` input, return its lending cell so a run's
     /// `Checkout` can deposit the (possibly transformed-in-place) value back into
     /// it on drop, re-arming the graph. A `Pipe` input has no home cell (its
