@@ -672,8 +672,7 @@ impl_image_enqueue!(Image1DBuffer, |s| [s.width as usize, 1, 1]);
 /// Recover the owning [`Context`] from a concrete-head image-op input, or a
 /// clear "pipe-fed" error for the no-launcher concrete-head terminals.
 fn concrete_image_ctx<I: ImageEnqueue>(img: &Input<I>) -> Result<Context> {
-    img.concrete()
-        .map(|i| i.enqueue_ctx().clone())
+    img.with_concrete(|i| i.enqueue_ctx().clone())
         .ok_or(Error::NotSupported(
             "concrete-head terminal (wait/submit) on a pipe-fed image op — use \
              wait_on(&ctx) / sync(&ctx) for piped (graph) inputs",
@@ -706,7 +705,7 @@ impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (mut img, deps) = self.img.resolve(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let data = self.data.as_ptr() as *const std::ffi::c_void;
@@ -756,7 +755,8 @@ impl<I: ImageEnqueue, E: Send + Sync> ImageWrite<'_, I, E> {
 pub struct ImageRead<'a, I: ImageEnqueue, E> {
     img: Input<I>,
     region: [usize; 3],
-    dst: &'a mut [E],
+    // Behind a `Mutex` so `execute(&self)` can take the `&mut [E]` it reads into.
+    dst: std::sync::Mutex<&'a mut [E]>,
     out: Pipe<I>,
 }
 
@@ -771,10 +771,11 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (img, deps) = self.img.resolve(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
-        let dst = self.dst.as_mut_ptr() as *mut std::ffi::c_void;
+        let mut dst_guard = self.dst.lock().unwrap();
+        let dst = dst_guard.as_mut_ptr() as *mut std::ffi::c_void;
         match mode {
             ExecMode::Blocking => {
                 read_image_enqueue(img.image_ref(), ec, self.region, dst, true, &raw)?;
@@ -838,7 +839,7 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         (self.src_pipe.clone(), self.dst_pipe.clone())
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (src, src_deps) = self.src.resolve(ec)?;
         let (mut dst, dst_deps) = self.dst.resolve(ec)?;
         let mut raw: Vec<crate::cl_event> = src_deps.iter().map(|d| d.as_ref().get()).collect();
@@ -852,7 +853,7 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         Ok(())
     }
 
-    fn collect(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<((Src, Dst), Deps)> {
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<((Src, Dst), Deps)> {
         let src_pipe = self.src_pipe.clone();
         let dst_pipe = self.dst_pipe.clone();
         self.execute(ec, mode)?;
@@ -911,7 +912,7 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (mut img, deps) = self.img.resolve(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let pattern = self.pattern;
@@ -1133,7 +1134,7 @@ fn image_read_op<'a, I: ImageEnqueue, T>(
     Ok(ImageRead {
         img: image.into(),
         region,
-        dst,
+        dst: std::sync::Mutex::new(dst),
         out: Pipe::new(),
     })
 }
@@ -1154,7 +1155,7 @@ fn image_read_bytes_op<'a, I: ImageEnqueue>(
     Ok(ImageRead {
         img: image.into(),
         region,
-        dst,
+        dst: std::sync::Mutex::new(dst),
         out: Pipe::new(),
     })
 }

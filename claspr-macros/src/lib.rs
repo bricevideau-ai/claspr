@@ -487,10 +487,6 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // slices wrap via `ToInput::to_input()` (→ `Input<__D>`), scalars verbatim.
     // Distinct from `host_names` (the destructure pattern at enqueue).
     let mut op_field_init: Vec<TokenStream2> = Vec::new();
-    // Per-slice resolution stmts run after the enqueue destructure: rebind each
-    // slice's `Input<__D>` to a concrete buffer (`.resolve_concrete()?`). A pipe
-    // here is unreachable on the Tier-1 path (errors clearly if it ever isn't).
-    let mut input_resolve: Vec<TokenStream2> = Vec::new();
     // Eager path: rebind each slice's `Input<__D>` to `(buffer, deps)` via
     // `Input::resolve` (a pipe IS expected here — it's the upstream output).
     // `#pname` becomes the buffer; `#pname __claspr_deps` its wait-list events.
@@ -566,11 +562,6 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 method_params.push(quote! { #pname: #iid_tt });
                 arg_types.push(quote! { ::claspr::Input<#gid_tt> });
                 op_field_init.push(quote! { ::claspr::ToInput::to_input(#pname) });
-                // Tier-1 enqueue: resolve the `Input` to a concrete buffer,
-                // then pass it by ref to LaunchOp (same as before).
-                input_resolve.push(quote! {
-                    let #pname = ::claspr::Input::resolve_concrete(#pname)?;
-                });
                 // Eager path: resolve to (buffer, deps); collect the deps ident
                 // (named by the slice index so it's a valid, unique ident).
                 let deps_ident = quote::format_ident!("__claspr_deps{}", slice_gen_idx - 1);

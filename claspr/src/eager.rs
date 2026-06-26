@@ -39,7 +39,7 @@ use crate::transfer::UploadSource;
 use crate::{
     Buffer, Context, DeviceSlice, DeviceSliceUninit, Error, Fillable, HostReadable, HostUploadable,
     HostWritable, MappedSlice, MappedSliceUninit, MemMode, ReadWrite, Result, USMSlice,
-    USMSliceUninit, register_drop_callback,
+    USMSliceUninit,
 };
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -90,6 +90,15 @@ pub trait DeviceEnqueue: Send + Sized {
     /// Enqueue against `ec` with `deps` as the wait-list; return `(value, Deps)`.
     fn run(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)>;
 }
+
+// ── Cell<T>: interior-mutable resource slot (the reusable-graph primitive) ──
+
+/// An interior-mutable slot holding (or temporarily not holding) a resource.
+/// The unifying primitive of the reusable graph: a [`Pipe`] is a cell that
+/// also carries [`Deps`]; a [`Concrete`](Input::Concrete) input is a cell that
+/// is *lent* during a run and *returned* on `Checkout` drop. `Arc` so a run can
+/// hold a clone to deposit the value back home.
+pub type Cell<T> = Arc<Mutex<Option<T>>>;
 
 // ── Pipe<T> + Input<T>: the graph edge ─────────────────────────────────
 
@@ -167,7 +176,7 @@ impl<T: Send + 'static> DeviceOp for Pipe<T> {
         self.clone()
     }
 
-    fn execute(self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // No work: the value is deposited by the upstream producer, and
         // `output_pipe()` already aliases this same cell, so `collect` reads it
         // directly. (Unlike `Forward`, there is no resolve-and-re-deposit step —
@@ -182,18 +191,32 @@ impl<T: Send + 'static> DeviceOp for Pipe<T> {
 
 /// An op argument: a concrete value known at build, or a [`Pipe`] filled by an
 /// upstream op at execute time.
+///
+/// ## Reusable-graph model: the `Concrete` arm is a **cell**
+///
+/// For the op-tree to be a *reusable* graph (`g.sync()` callable repeatedly), an
+/// op's [`execute`](DeviceOp::execute) takes `&self` and must NOT move its inputs
+/// out — a second `sync` would find them gone. So `Concrete` holds its value in
+/// an interior-mutable cell (`Arc<Mutex<Option<T>>>`, the same shape as a
+/// [`Pipe`]). [`resolve`](Input::resolve) **lends** the value out of the cell for
+/// the duration of one run; the run's [`Checkout`](crate::Checkout) returns it to
+/// the cell on drop, re-arming `g`. A caller-owned buffer is thus lent (not
+/// copied — [`DeviceSlice`] is deliberately not `Clone`) and comes back.
 pub enum Input<T> {
-    /// Bound at construction (e.g. a caller-owned buffer passed directly).
-    Concrete(T),
+    /// Bound at construction (e.g. a caller-owned buffer passed directly). Held
+    /// in an interior-mutable cell so `resolve(&self)` can lend it and the run's
+    /// `Checkout` can return it (re-arming the graph).
+    Concrete(Cell<T>),
     /// Deferred — produced by an upstream op, moved out of the shared cell.
     Pipe(Pipe<T>),
 }
 
 impl<T> Input<T> {
-    /// Resolve to `(value, upstream Deps)` at execute time (consuming it). A
-    /// concrete value is an **entry leaf** — a chain head with no upstream — so
-    /// it normally carries no events. The ONE exception is the host-seam start
-    /// gate: when `ec` has a `start` event set
+    /// Resolve to `(value, upstream Deps)` for ONE run, **lending** (not
+    /// consuming) — `&self`, so the op survives for a re-run. A concrete value is
+    /// an **entry leaf** — a chain head with no upstream — so it normally carries
+    /// no events. The ONE exception is the host-seam start gate: when `ec` has a
+    /// `start` event set
     /// (only for chains that [`contains_host_seam`](DeviceOp::contains_host_seam)),
     /// the entry leaf threads that one event into its wait-list so its enqueue
     /// waits on the gate — the whole graph is committed before any of it runs.
@@ -201,22 +224,33 @@ impl<T> Input<T> {
     /// command's wait-list.) A pipe is NOT an entry leaf — its producer is
     /// already transitively gated — so the [`Pipe`](Input::Pipe) arm is
     /// unchanged.
-    pub fn resolve(self, ec: &ExecutionContext<'_>) -> Result<(T, Deps)> {
+    ///
+    /// The lent value is taken OUT of the `Concrete` cell here; the cell stays
+    /// empty for the rest of the run. It is returned by the run's `Checkout` on
+    /// drop (see [`return_to`](Input::return_to)).
+    pub fn resolve(&self, ec: &ExecutionContext<'_>) -> Result<(T, Deps)> {
         match self {
-            Input::Concrete(v) => match ec.start_dep() {
-                // Retain the start event independently: `ec` owns the original
-                // handle for the whole enqueue; this `Dep`'s `Event::drop` will
-                // `clReleaseEvent` its own ref, so we balance it with a retain.
-                Some(raw) => {
-                    // SAFETY: `raw` is a live cl_event owned by the terminal for
-                    // the duration of the enqueue; retaining bumps its refcount,
-                    // balanced by the wrapped `Event`'s Drop.
-                    unsafe { opencl3::event::retain_event(raw) }
-                        .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
-                    Ok((v, vec![wrap_event(crate::Event::new(raw))]))
+            Input::Concrete(cell) => {
+                let v = cell.lock().unwrap().take().ok_or(Error::NotSupported(
+                    "eager graph: a concrete input was already lent and not \
+                     returned — a graph is `sync`'d while a previous `Checkout` is \
+                     still alive (the graph is busy)",
+                ))?;
+                match ec.start_dep() {
+                    // Retain the start event independently: `ec` owns the original
+                    // handle for the whole enqueue; this `Dep`'s `Event::drop`
+                    // will `clReleaseEvent` its own ref, balanced by a retain.
+                    Some(raw) => {
+                        // SAFETY: `raw` is a live cl_event owned by the terminal
+                        // for the duration of the enqueue; retaining bumps its
+                        // refcount, balanced by the wrapped `Event`'s Drop.
+                        unsafe { opencl3::event::retain_event(raw) }
+                            .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
+                        Ok((v, vec![wrap_event(crate::Event::new(raw))]))
+                    }
+                    None => Ok((v, Deps::new())),
                 }
-                None => Ok((v, Deps::new())),
-            },
+            }
             Input::Pipe(p) => p.take().ok_or(Error::NotSupported(
                 "eager graph: upstream pipe was not filled before downstream ran \
                  — internal ordering bug",
@@ -224,29 +258,40 @@ impl<T> Input<T> {
         }
     }
 
-    /// Borrow the concrete value, or `None` if this is a pipe. Used by the
-    /// concrete-head no-launcher terminals (`wait`/`submit` on a buffer verb op)
-    /// to recover the owning context from the buffer before consuming the op — a
-    /// pipe-fed op has no concrete buffer to read a context from, so those
-    /// terminals error clearly ("use `wait_on(&ctx)`").
-    pub fn concrete(&self) -> Option<&T> {
+    /// If this is a `Concrete` input, return its lending cell so a run's
+    /// `Checkout` can deposit the (possibly transformed-in-place) value back into
+    /// it on drop, re-arming the graph. A `Pipe` input has no home cell (its
+    /// producer re-mints the value each run) — returns `None`.
+    pub fn return_cell(&self) -> Option<Cell<T>> {
         match self {
-            Input::Concrete(v) => Some(v),
+            Input::Concrete(cell) => Some(Arc::clone(cell)),
             Input::Pipe(_) => None,
         }
     }
 
-    /// Resolve to a concrete value, erroring if this is a pipe. Used by the
-    /// concrete-head terminal path, where a pipe is unreachable (a pipe only
-    /// exists inside an eager `and_then` closure — a context that never calls
-    /// the concrete-head terminals). The `(value, Deps)` form is the graph path.
-    pub fn resolve_concrete(self) -> Result<T> {
+    /// Borrow the concrete value via a clone of its cell, or `None` if this is a
+    /// pipe. Used by the concrete-head no-launcher terminals (`wait`/`submit`) to
+    /// recover the owning context from the buffer before running — a pipe-fed op
+    /// has no concrete buffer, so those terminals error clearly.
+    ///
+    /// Returns a [`Cell`] handle (not a borrow) because the value lives behind a
+    /// `Mutex`; callers `.lock()` it to read the buffer. `None` ⇒ pipe-fed.
+    pub fn concrete_cell(&self) -> Option<Cell<T>> {
         match self {
-            Input::Concrete(v) => Ok(v),
-            Input::Pipe(_) => Err(Error::NotSupported(
-                "kernel: a pipe input reached the Tier-1 path — use the eager \
-                 `.and_then`/`.sync` terminals for piped (graph) inputs",
-            )),
+            Input::Concrete(cell) => Some(Arc::clone(cell)),
+            Input::Pipe(_) => None,
+        }
+    }
+
+    /// Read a `Concrete` input's value by reference (the value is parked in its
+    /// cell — locked, not lent), mapping it via `f`. `None` if this is a pipe
+    /// input or the value is currently lent out (mid-run). Used by the record
+    /// walk and the concrete-head context-recovery helpers, which only need to
+    /// inspect the buffer's handle/byte-len without taking it.
+    pub fn with_concrete<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        match self {
+            Input::Concrete(cell) => cell.lock().unwrap().as_ref().map(f),
+            Input::Pipe(_) => None,
         }
     }
 
@@ -263,7 +308,7 @@ impl<T> Input<T> {
 
 impl<T> From<T> for Input<T> {
     fn from(v: T) -> Self {
-        Input::Concrete(v)
+        Input::Concrete(Arc::new(Mutex::new(Some(v))))
     }
 }
 
@@ -312,7 +357,7 @@ macro_rules! impl_to_input_concrete {
         {
             type Buf = $crate::$buf<E, M>;
             fn to_input(self) -> Input<$crate::$buf<E, M>> {
-                Input::Concrete(self)
+                Input::from(self)
             }
         }
     };
@@ -330,7 +375,7 @@ where
 {
     type Buf = std::sync::Arc<DeviceSlice<E, M>>;
     fn to_input(self) -> Input<std::sync::Arc<DeviceSlice<E, M>>> {
-        Input::Concrete(self)
+        Input::from(self)
     }
 }
 
@@ -400,14 +445,23 @@ pub trait DeviceOp: Send {
     /// (so a downstream closure gets `Pipe<Output>`). Combinators override.
     fn handle(&self) -> Self::Handle;
 
-    /// Run the op: resolve inputs, enqueue, **move** the result + its events
-    /// into the output pipe. Returns `()` — the value lives in the pipe.
+    /// Run the op for ONE run: **lend** inputs (take from their cells / upstream
+    /// pipes for the duration of the run), enqueue, deposit the result + its
+    /// events into the output pipe. Returns `()` — the value lives in the pipe.
+    ///
+    /// **Borrows `&self`** — the op is NOT consumed, so the graph it belongs to is
+    /// reusable: a terminal can `execute` it again after the previous run's
+    /// [`Checkout`](crate::Checkout) has returned the lent resources to their
+    /// cells. Leaves that mint fresh values each run (`upload`/`alloc_zero`/
+    /// `value`) re-seed from a retained source; leaves over a caller-owned
+    /// [`Concrete`](Input::Concrete) input lend the buffer (returned on `Checkout`
+    /// drop). One-shot leaves (host seams) run once and error on a second run.
     ///
     /// `mode` is [`ExecMode::Blocking`] only when this op is the chain terminal
     /// (see [`ExecMode`]); composite ops forward `Pipelined` to their upstream
     /// children and `mode` to the tail. A leaf with no native blocking enqueue
     /// ignores `mode`.
-    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()>;
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()>;
 
     /// Run this op as a **(sub)terminal** and yield `(Output, Deps)` **without
     /// waiting** on the completion events.
@@ -426,7 +480,7 @@ pub trait DeviceOp: Send {
     ///   `output_pipe().take()` — is exactly the nested-multi-output bug).
     /// - The terminals [`into_output`](Self::into_output) (blocking) and the
     ///   async `run` wrap `collect` and decide *when* to wait.
-    fn collect(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
     where
         Self: Sized,
     {
@@ -443,7 +497,7 @@ pub trait DeviceOp: Send {
     /// (which dispatches to the right per-op gather) then waits once on the
     /// returned deps. This is the seam that lets [`sync`](DeviceOpExt::sync) be
     /// arity-agnostic. Ops never override this — they override `collect`.
-    fn into_output(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
+    fn into_output(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
     where
         Self: Sized,
     {
@@ -547,7 +601,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     {
         AndThenHost {
             source: self,
-            f: Some(f),
+            f: Mutex::new(Some(f)),
             out: Pipe::new(),
         }
     }
@@ -567,7 +621,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     {
         AndThenHostWithContext {
             source: self,
-            f: Some(f),
+            f: Mutex::new(Some(f)),
             out: Pipe::new(),
         }
     }
@@ -838,7 +892,7 @@ where
         self.next.handle()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         // Source is always upstream → must pipeline (its output feeds `next`).
         // Only the tail inherits the caller's `mode` (Blocking iff terminal).
         // Capture the source's output pipe BEFORE moving it, so we can thread any
@@ -851,7 +905,7 @@ where
         Ok(())
     }
 
-    fn collect(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(U::Output, Deps)>
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(U::Output, Deps)>
     where
         Self: Sized,
     {
@@ -916,7 +970,9 @@ where
 /// resource (a `DeviceSlice` etc.), use [`lift`] instead — it keeps the default
 /// `Pipe` handle (a buffer can't and shouldn't be computed on at build).
 pub struct Value<T: Send> {
-    v: Option<T>,
+    // Held by value (not `Option`): `T: Clone`, so each run re-emits a fresh
+    // clone and the source is never drained — the graph is reusable + idempotent.
+    v: T,
     out: Pipe<T>,
 }
 
@@ -929,7 +985,7 @@ pub struct Value<T: Send> {
 /// (`lift`).
 pub fn value<T: Send + Clone + 'static>(v: T) -> Value<T> {
     Value {
-        v: Some(v),
+        v,
         out: Pipe::new(),
     }
 }
@@ -944,19 +1000,14 @@ impl<T: Send + Clone + 'static> DeviceOp for Value<T> {
     }
 
     fn handle(&self) -> Self::Handle {
-        // Clone the value out for the downstream closure; `execute` still has its
-        // own copy (in `self.v`) to deposit into the pipe for the terminal path.
-        self.v
-            .clone()
-            .expect("Value::handle after execute — internal eager bug")
+        // Clone the value out for the downstream closure; `self.v` keeps its own
+        // copy for `execute` (which clones again each run — idempotent).
+        self.v.clone()
     }
 
-    fn execute(mut self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let v = self
-            .v
-            .take()
-            .expect("Value::execute called twice — internal eager bug");
-        self.out.put(v, Deps::new());
+    fn execute(&self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // Re-emit a fresh clone every run — never drains the source.
+        self.out.put(self.v.clone(), Deps::new());
         Ok(())
     }
 
@@ -981,7 +1032,11 @@ impl<T: Send + Clone + 'static> DeviceOp for Value<T> {
 /// is a `Pipe` (the value flows; you don't read it until execute). For a `Clone`
 /// host value you want to compute on downstream, use [`value`] (by-value handle).
 pub struct Lift<T: Send> {
-    v: Option<T>,
+    // One-shot: a non-`Clone` owned resource can't be re-emitted, so a `Lift`
+    // chain head runs once; a second `sync` errors clearly. (For a reusable
+    // chain head over a caller-owned buffer, pass it as a `Concrete` input to a
+    // buffer verb — that lends-and-returns. `Lift` is the move-in-once form.)
+    v: Mutex<Option<T>>,
     out: Pipe<T>,
 }
 
@@ -990,7 +1045,7 @@ pub struct Lift<T: Send> {
 /// non-`Clone` owned resources).
 pub fn lift<T: Send + 'static>(v: T) -> Lift<T> {
     Lift {
-        v: Some(v),
+        v: Mutex::new(Some(v)),
         out: Pipe::new(),
     }
 }
@@ -1007,11 +1062,12 @@ impl<T: Send + 'static> DeviceOp for Lift<T> {
         self.out.clone()
     }
 
-    fn execute(mut self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let v = self
-            .v
-            .take()
-            .expect("Lift::execute called twice — internal eager bug");
+    fn execute(&self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        let v = self.v.lock().unwrap().take().ok_or(Error::NotSupported(
+            "eager graph: a `lift`ed resource was already consumed — `lift` is a \
+             move-in-once chain head and can't drive a reused graph; pass a \
+             caller-owned buffer as a concrete input instead",
+        ))?;
         self.out.put(v, Deps::new());
         Ok(())
     }
@@ -1063,7 +1119,7 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Resolve the upstream value + its events and re-deposit unchanged — no
         // device work; deps threaded through so ordering/termination is intact.
         let (v, deps) = self.input.resolve(ec)?;
@@ -1087,11 +1143,7 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
 /// which already reconstructs any arity down to a single `Output`, so even a
 /// multi-output inner op erases cleanly to a single-output `DeviceDynOp`.
 trait ErasedDeviceOp<T>: Send {
-    fn collect_erased(
-        self: Box<Self>,
-        ec: &ExecutionContext<'_>,
-        mode: ExecMode,
-    ) -> Result<(T, Deps)>;
+    fn collect_erased(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(T, Deps)>;
 
     fn describe_erased(&self, out: &mut Vec<String>);
 
@@ -1105,12 +1157,8 @@ impl<O> ErasedDeviceOp<O::Output> for O
 where
     O: DeviceOp,
 {
-    fn collect_erased(
-        self: Box<Self>,
-        ec: &ExecutionContext<'_>,
-        mode: ExecMode,
-    ) -> Result<(O::Output, Deps)> {
-        (*self).collect(ec, mode)
+    fn collect_erased(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(O::Output, Deps)> {
+        self.collect(ec, mode)
     }
 
     fn describe_erased(&self, out: &mut Vec<String>) {
@@ -1152,7 +1200,7 @@ where
 /// downstream sees one `Pipe<tuple>`. For the conditional-graph use case (arms
 /// agreeing on one `Output`) that is exactly right.
 pub struct DeviceDynOp<'op, T> {
-    inner: Option<Box<dyn ErasedDeviceOp<T> + 'op>>,
+    inner: Box<dyn ErasedDeviceOp<T> + 'op>,
     out: Pipe<T>,
 }
 
@@ -1165,7 +1213,7 @@ impl<'op, T: Send + 'static> DeviceDynOp<'op, T> {
         O: DeviceOp<Output = T> + 'op,
     {
         DeviceDynOp {
-            inner: Some(Box::new(op)),
+            inner: Box::new(op),
             out: Pipe::new(),
         }
     }
@@ -1182,32 +1230,25 @@ impl<T: Send + 'static> DeviceOp for DeviceDynOp<'_, T> {
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         // Gather the erased inner op (any arity → one value + deps) and deposit
         // into our own pipe, so the default collect/into_output/handle path treats
         // this as an ordinary single-output leaf. The inner op observes `mode`
         // (it is the real terminal work when this DeviceDynOp is the chain tail).
-        let inner = self
-            .inner
-            .take()
-            .expect("DeviceDynOp::execute called twice — internal eager bug");
-        let (v, deps) = inner.collect_erased(ec, mode)?;
+        // `&self`: the inner op runs by reference, so an erased arm is reusable.
+        let (v, deps) = self.inner.collect_erased(ec, mode)?;
         self.out.put(v, deps);
         Ok(())
     }
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("dyn_op{".into());
-        if let Some(inner) = &self.inner {
-            inner.describe_erased(out);
-        }
+        self.inner.describe_erased(out);
         out.push("}".into());
     }
 
     fn contains_host_seam(&self) -> bool {
-        self.inner
-            .as_ref()
-            .is_some_and(|inner| inner.contains_host_seam_erased())
+        self.inner.contains_host_seam_erased()
     }
 }
 
@@ -1247,7 +1288,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Gather the source via `collect` (reconstructs any arity — a bundle
         // source fills element pipes, not output_pipe), then wrap in Arc.
         let (v, deps) = self.source.collect(ec, ExecMode::Pipelined)?;
@@ -1330,7 +1371,7 @@ where
         self.outs.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Gather the source via `collect` (any arity), then scatter a clone of
         // its value + events into every branch pipe (Arc::clone is a cheap
         // refcount bump; Deps clone shares the same producer events).
@@ -1341,7 +1382,7 @@ where
         Ok(())
     }
 
-    fn collect(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
     where
         Self: Sized,
     {
@@ -1459,7 +1500,7 @@ macro_rules! impl_eager_bundle {
                 ( $(self.$field.handle(),)+ )
             }
 
-            fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+            fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
                 // Each branch pipelines (independent). We `collect` the branch —
                 // NOT `branch.execute` — so a branch that is *itself* multi-output
                 // (a nested bundle, arc_split, the copy pair) runs its own gather
@@ -1477,7 +1518,7 @@ macro_rules! impl_eager_bundle {
                 Ok(())
             }
 
-            fn collect(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
+            fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
             where
                 Self: Sized,
             {
@@ -1649,7 +1690,7 @@ impl<U: DeviceOp> DeviceOp for FanOut<U> {
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // `collect` each branch op (not `execute`) so a multi-output branch runs
         // its own gather and yields one reconstructed value + deps — `self.pipes`
         // (captured single output pipes) are empty for such branches. The pipes
@@ -1658,7 +1699,7 @@ impl<U: DeviceOp> DeviceOp for FanOut<U> {
         let n = self.ops.len();
         let mut branch_deps: Vec<Deps> = Vec::with_capacity(n);
         let mut outputs: Vec<U::Output> = Vec::with_capacity(n);
-        for op in self.ops {
+        for op in &self.ops {
             let (v, d) = op.collect(ec, ExecMode::Pipelined)?;
             outputs.push(v);
             branch_deps.push(d);
@@ -1727,7 +1768,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // alloc_zero is synchronous internally; no in-flight event, mode N/A.
         let buf = DeviceSlice::<T, M>::alloc_zero(ec.context(), self.len)?;
         self.out.put(buf, Deps::new());
@@ -1753,8 +1794,7 @@ where
 /// or a clear "pipe-fed" error for the no-launcher concrete-head terminals.
 fn concrete_buf_ctx<T, M: MemMode>(buf: &Input<DeviceSlice<T, M>>) -> Result<Context> {
     use crate::Buffer;
-    buf.concrete()
-        .map(|b| b.ctx().clone())
+    buf.with_concrete(|b| b.ctx().clone())
         .ok_or(Error::NotSupported(
             "concrete-head terminal (wait/submit) on a pipe-fed buffer op — use \
          wait_on(&ctx) / sync(&ctx) for piped (graph) inputs",
@@ -1765,8 +1805,7 @@ fn concrete_buf_ctx<T, M: MemMode>(buf: &Input<DeviceSlice<T, M>>) -> Result<Con
 /// concrete-head [`Input<MappedSlice>`], or a clear "pipe-fed" error.
 fn concrete_svm_ctx<T, M: MemMode>(buf: &Input<MappedSlice<T, M>>) -> Result<Context> {
     use crate::Buffer;
-    buf.concrete()
-        .map(|b| b.ctx().clone())
+    buf.with_concrete(|b| b.ctx().clone())
         .ok_or(Error::NotSupported(
             "concrete-head terminal (wait/submit) on a pipe-fed SVM op — use \
          wait_on(&ctx) / sync(&ctx) for piped (graph) inputs",
@@ -1793,7 +1832,7 @@ where
         use opencl3::memory::ClMem;
         // Resolve the buffer: this op's concrete input (chain head) or the
         // upstream producer's output (mid-chain, in-place fill).
-        let concrete = self.buf.concrete().map(|b| BufHandle {
+        let concrete = self.buf.with_concrete(|b| BufHandle {
             mem: MemRef::Buffer(b.buffer().get()),
             byte_len: b.byte_len(),
         });
@@ -1842,7 +1881,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (mut buf, deps) = self.buf.resolve(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // Fill has no native CL_BLOCKING flag (it's always enqueue + optional
@@ -1896,7 +1935,11 @@ where
 /// from_slice path: works for any marker, one synchronous create, no in-flight
 /// event.)
 pub struct Upload<T: Copy, M: MemMode = ReadWrite> {
-    src: Option<UploadSource<T>>,
+    // Held by value (not `Option`): the host source is RETAINED so every run
+    // re-creates a fresh buffer from it (`CL_MEM_COPY_HOST_PTR`). This is the
+    // "mutable buffers re-seed each run" rule — `upload(v)…download` is
+    // idempotent by construction (the upload op re-writes its source each run).
+    src: UploadSource<T>,
     out: Pipe<DeviceSlice<T, M>>,
 }
 
@@ -1927,7 +1970,7 @@ where
 {
     let _ = marker; // witness only — fixes M, zero-sized, no runtime use.
     Upload {
-        src: Some(src.into()),
+        src: src.into(),
         out: Pipe::new(),
     }
 }
@@ -1947,14 +1990,11 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // from_slice (CL_MEM_COPY_HOST_PTR) is a synchronous create — no
-        // in-flight event, mode N/A.
-        let src = self
-            .src
-            .take()
-            .expect("Upload::execute called twice — internal eager bug");
-        let buf = DeviceSlice::<T, M>::from_slice(ec.context(), src.as_slice())?;
+        // in-flight event, mode N/A. Reads `self.src` BY REFERENCE so the source
+        // is retained and the buffer re-seeds on every run (idempotent reuse).
+        let buf = DeviceSlice::<T, M>::from_slice(ec.context(), self.src.as_slice())?;
         self.out.put(buf, Deps::new());
         Ok(())
     }
@@ -2000,7 +2040,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve(ec)?;
         let mut host = vec![T::default(); buf.len()];
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
@@ -2061,7 +2101,10 @@ where
 /// destination repeatedly.
 pub struct ReadInto<'d, T, M: MemMode = ReadWrite> {
     buf: Input<DeviceSlice<T, M>>,
-    dst: &'d mut [T],
+    // Behind a `Mutex` so `execute(&self)` can get the `&mut [T]` it needs to
+    // read into. The caller slice is borrowed for `'d`; re-runs read into the
+    // same destination (overwriting it).
+    dst: Mutex<&'d mut [T]>,
     out: Pipe<DeviceSlice<T, M>>,
 }
 
@@ -2077,7 +2120,7 @@ where
 {
     ReadInto {
         buf: buf.into(),
-        dst,
+        dst: Mutex::new(dst),
         out: Pipe::new(),
     }
 }
@@ -2097,18 +2140,19 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let mut dst = self.dst.lock().unwrap();
         match mode {
             // Terminal: native blocking read — `dst` is valid on return, no event.
             ExecMode::Blocking => {
-                crate::buffer::read_buffer_enqueue(&buf, ec, self.dst, true, &raw)?;
+                crate::buffer::read_buffer_enqueue(&buf, ec, &mut dst, true, &raw)?;
                 self.out.put(buf, Deps::new());
             }
             // Pipelined: non-blocking; the event gates `dst` being valid.
             ExecMode::Pipelined => {
-                let event = crate::buffer::read_buffer_enqueue(&buf, ec, self.dst, false, &raw)?;
+                let event = crate::buffer::read_buffer_enqueue(&buf, ec, &mut dst, false, &raw)?;
                 self.out.put(buf, vec![wrap_event(event)]);
             }
         }
@@ -2230,7 +2274,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve(ec)?;
         // Resolve the target device (concrete, or by index into the running
         // context's device list) before resolving its queue.
@@ -2304,7 +2348,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (uninit, deps) = self.uninit.resolve(ec)?;
         // SAFETY: the fill below writes every byte; downstream gates on the
         // returned fill event (Pipelined) or the driver waits (Blocking).
@@ -2370,7 +2414,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (uninit, deps) = self.uninit.resolve(ec)?;
         // SAFETY: the SVM fill below writes every byte.
         let buf = unsafe { uninit.assume_init() };
@@ -2436,7 +2480,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Pure host op — no event; forward the upstream deps unchanged.
         let (uninit, deps) = self.uninit.resolve(ec)?;
         let buf = uninit.fill_into(self.value);
@@ -2458,7 +2502,8 @@ where
 /// return, so `src` drops normally at end of `execute`.
 pub struct WriteDeviceUninit<T, M: MemMode> {
     uninit: Input<DeviceSliceUninit<T, M>>,
-    src: Option<UploadSource<T>>,
+    // Retained by value; read by reference each run (see `WriteDevice::src`).
+    src: UploadSource<T>,
     out: Pipe<DeviceSlice<T, M>>,
 }
 
@@ -2474,7 +2519,7 @@ where
 {
     WriteDeviceUninit {
         uninit: uninit.into(),
-        src: Some(src.into()),
+        src: src.into(),
         out: Pipe::new(),
     }
 }
@@ -2494,27 +2539,26 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (uninit, deps) = self.uninit.resolve(ec)?;
-        let src = self
-            .src
-            .take()
-            .expect("WriteDeviceUninit::execute called twice — internal eager bug");
         // SAFETY: the write below covers every byte; downstream gates on the
         // returned write event (Pipelined) or the driver waits (Blocking).
         let mut buf = unsafe { uninit.assume_init() };
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         match mode {
             ExecMode::Blocking => {
-                crate::buffer::write_buffer_enqueue(&mut buf, ec, src.as_slice(), true, &raw)?;
-                // Blocking write completed — `src` drops at end of execute.
+                crate::buffer::write_buffer_enqueue(&mut buf, ec, self.src.as_slice(), true, &raw)?;
                 self.out.put(buf, Deps::new());
             }
             ExecMode::Pipelined => {
-                let event =
-                    crate::buffer::write_buffer_enqueue(&mut buf, ec, src.as_slice(), false, &raw)?;
-                // Keep-alive: drop the host source when CL_COMPLETE fires.
-                register_drop_callback(&event, Box::new(src))?;
+                // `self.src` is valid for the whole `sync` — no keep-alive needed.
+                let event = crate::buffer::write_buffer_enqueue(
+                    &mut buf,
+                    ec,
+                    self.src.as_slice(),
+                    false,
+                    &raw,
+                )?;
                 self.out.put(buf, vec![wrap_event(event)]);
             }
         }
@@ -2540,7 +2584,12 @@ where
 /// (`CL_BLOCKING`) instead, mirroring [`WriteDeviceUninit`].
 pub struct WriteDevice<T, M: MemMode = ReadWrite> {
     buf: Input<DeviceSlice<T, M>>,
-    src: Option<UploadSource<T>>,
+    // Retained by value (not `Option`): the host source is read BY REFERENCE each
+    // run (re-seed). `&self` outlives the whole `sync` (the terminal waits before
+    // returning), so the source stays valid across the async write window — the
+    // former per-run `register_drop_callback` keep-alive is unnecessary now that
+    // the op lives in the reusable graph rather than being moved into an executor.
+    src: UploadSource<T>,
     out: Pipe<DeviceSlice<T, M>>,
 }
 
@@ -2555,7 +2604,7 @@ where
 {
     WriteDevice {
         buf: buf.into(),
-        src: Some(src.into()),
+        src: src.into(),
         out: Pipe::new(),
     }
 }
@@ -2575,25 +2624,25 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (mut buf, deps) = self.buf.resolve(ec)?;
-        let src = self
-            .src
-            .take()
-            .expect("WriteDevice::execute called twice — internal eager bug");
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         match mode {
             ExecMode::Blocking => {
-                crate::buffer::write_buffer_enqueue(&mut buf, ec, src.as_slice(), true, &raw)?;
-                // Blocking write completed — `src` drops at end of execute.
+                crate::buffer::write_buffer_enqueue(&mut buf, ec, self.src.as_slice(), true, &raw)?;
                 self.out.put(buf, Deps::new());
             }
             ExecMode::Pipelined => {
-                let event =
-                    crate::buffer::write_buffer_enqueue(&mut buf, ec, src.as_slice(), false, &raw)?;
-                // Keep-alive: drop the host source when CL_COMPLETE fires (the
-                // runtime is done reading the host heap exactly then).
-                register_drop_callback(&event, Box::new(src))?;
+                // Non-blocking write; `self.src` stays valid for the whole `sync`
+                // (the op lives in the graph; the terminal waits before returning),
+                // so no per-run keep-alive callback is needed.
+                let event = crate::buffer::write_buffer_enqueue(
+                    &mut buf,
+                    ec,
+                    self.src.as_slice(),
+                    false,
+                    &raw,
+                )?;
                 self.out.put(buf, vec![wrap_event(event)]);
             }
         }
@@ -2633,7 +2682,8 @@ where
 /// [`WriteDeviceUninit`].
 pub struct WriteMappedUninit<T, M: MemMode> {
     uninit: Input<MappedSliceUninit<T, M>>,
-    src: Option<UploadSource<T>>,
+    // Retained by value; read by reference each run (see `WriteDevice::src`).
+    src: UploadSource<T>,
     out: Pipe<MappedSlice<T, M>>,
 }
 
@@ -2649,7 +2699,7 @@ where
 {
     WriteMappedUninit {
         uninit: uninit.into(),
-        src: Some(src.into()),
+        src: src.into(),
         out: Pipe::new(),
     }
 }
@@ -2669,26 +2719,21 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (uninit, deps) = self.uninit.resolve(ec)?;
-        let src = self
-            .src
-            .take()
-            .expect("WriteMappedUninit::execute called twice — internal eager bug");
         // SAFETY: the SVM write below covers every byte.
         let buf = unsafe { uninit.assume_init() };
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // SVM write is always a non-blocking enqueue (no native CL_BLOCKING flag);
         // Blocking waits on the returned event here, Pipelined threads it
-        // downstream and keeps `src` alive via register_drop_callback.
-        let event = crate::mapped::svm_write_enqueue(&buf, ec, src.as_slice(), &raw)?;
+        // downstream. `self.src` is valid for the whole `sync` — no keep-alive.
+        let event = crate::mapped::svm_write_enqueue(&buf, ec, self.src.as_slice(), &raw)?;
         match mode {
             ExecMode::Blocking => {
                 event.wait().map_err(Error::OpenCl)?;
                 self.out.put(buf, Deps::new());
             }
             ExecMode::Pipelined => {
-                register_drop_callback(&event, Box::new(src))?;
                 self.out.put(buf, vec![wrap_event(event)]);
             }
         }
@@ -2742,7 +2787,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve(ec)?;
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // SVM fill is always a non-blocking enqueue (no native CL_BLOCKING flag);
@@ -2798,7 +2843,8 @@ where
 /// (`CL_COMPLETE`). The `Blocking` terminal waits on that same event.
 pub struct WriteMapped<T, M: MemMode = ReadWrite> {
     buf: Input<MappedSlice<T, M>>,
-    src: Option<UploadSource<T>>,
+    // Retained by value; read by reference each run (see `WriteDevice::src`).
+    src: UploadSource<T>,
     out: Pipe<MappedSlice<T, M>>,
 }
 
@@ -2812,7 +2858,7 @@ where
 {
     WriteMapped {
         buf: buf.into(),
-        src: Some(src.into()),
+        src: src.into(),
         out: Pipe::new(),
     }
 }
@@ -2832,25 +2878,19 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve(ec)?;
-        let src = self
-            .src
-            .take()
-            .expect("WriteMapped::execute called twice — internal eager bug");
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // SVM write is always a non-blocking enqueue; Blocking waits on the event
-        // here, Pipelined threads it downstream and keeps `src` alive past it.
-        let event = crate::mapped::svm_write_enqueue(&buf, ec, src.as_slice(), &raw)?;
+        // here, Pipelined threads it downstream. `self.src` is valid for the whole
+        // `sync` — no keep-alive callback needed.
+        let event = crate::mapped::svm_write_enqueue(&buf, ec, self.src.as_slice(), &raw)?;
         match mode {
             ExecMode::Blocking => {
                 event.wait().map_err(Error::OpenCl)?;
-                // Write completed — `src` drops at end of execute.
                 self.out.put(buf, Deps::new());
             }
             ExecMode::Pipelined => {
-                // Keep-alive: drop the host source when CL_COMPLETE fires.
-                register_drop_callback(&event, Box::new(src))?;
                 self.out.put(buf, vec![wrap_event(event)]);
             }
         }
@@ -2890,7 +2930,8 @@ where
 /// enqueue, deps pass through (mode N/A) — mirrors [`Upload`].
 pub struct WriteUsmUninit<T: Copy, M: MemMode> {
     uninit: Input<USMSliceUninit<T, M>>,
-    src: Option<UploadSource<T>>,
+    // Retained by value; read by reference each run (see `WriteDevice::src`).
+    src: UploadSource<T>,
     out: Pipe<USMSlice<T, M>>,
 }
 
@@ -2906,7 +2947,7 @@ where
 {
     WriteUsmUninit {
         uninit: uninit.into(),
-        src: Some(src.into()),
+        src: src.into(),
         out: Pipe::new(),
     }
 }
@@ -2926,15 +2967,10 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Host memcpy via Tier-1 helper; Err on length mismatch propagates.
         let (uninit, deps) = self.uninit.resolve(ec)?;
-        let src = self
-            .src
-            .take()
-            .expect("WriteUsmUninit::execute called twice — internal eager bug");
-        let buf = uninit.write_from(src.as_slice())?;
-        // src drops at end of execute — memcpy is done, no async keep-alive.
+        let buf = uninit.write_from(self.src.as_slice())?;
         self.out.put(buf, deps);
         Ok(())
     }
@@ -2954,7 +2990,9 @@ where
 /// input); construction is pure host code (`USMSlice::new`) — no enqueue, no
 /// event (mode N/A). Mirrors [`Upload`]'s synchronous-create shape.
 pub struct UsmSlice<T, M: MemMode = ReadWrite> {
-    data: Option<Vec<T>>,
+    // One-shot: the host `Vec` is moved into the `USMSlice` (USM IS host memory),
+    // so a `usm_slice(data)` chain head runs once; a second `sync` errors.
+    data: Mutex<Option<Vec<T>>>,
     out: Pipe<USMSlice<T, M>>,
 }
 
@@ -2978,7 +3016,7 @@ where
 {
     let _ = marker;
     UsmSlice {
-        data: Some(data),
+        data: Mutex::new(Some(data)),
         out: Pipe::new(),
     }
 }
@@ -2998,12 +3036,12 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // USMSlice::new is pure host code — no in-flight event, mode N/A.
-        let data = self
-            .data
-            .take()
-            .expect("UsmSlice::execute called twice — internal eager bug");
+        let data = self.data.lock().unwrap().take().ok_or(Error::NotSupported(
+            "eager graph: a `usm_slice` host Vec was already consumed — \
+             `usm_slice` is a move-in-once chain head and can't drive a reused graph",
+        ))?;
         let slice = USMSlice::new(ec.context(), data)?;
         self.out.put(slice, Deps::new());
         Ok(())
@@ -3066,7 +3104,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // alloc_uninit is pure host code — no in-flight event, mode N/A.
         let uninit = USMSlice::<T, M>::alloc_uninit(ec.context(), self.len)?;
         self.out.put(uninit, Deps::new());
@@ -3132,7 +3170,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // alloc_uninit is pure host code — no in-flight event, mode N/A.
         let uninit = DeviceSlice::<T, M>::alloc_uninit(ec.context(), self.len)?;
         self.out.put(uninit, Deps::new());
@@ -3198,7 +3236,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // alloc_uninit is pure host code; on a no-SVM device it returns
         // `SvmNotAvailable` here (at execute → surfaces at the terminal).
         let uninit = MappedSlice::<T, M>::alloc_uninit(ec.context(), self.len)?;
@@ -3224,7 +3262,10 @@ where
 /// the write event fires via `register_drop_callback`. Mirrors [`Upload`]
 /// (chain-entry) but carries a write event because the enqueue is non-blocking.
 pub struct ImageUploadEager<I: ImageHostTransfer> {
-    pixels: Option<Vec<I::Pixel>>,
+    // Retained by value; read by reference each run (re-seed). `&self` outlives
+    // the whole `sync`, so the host pixels stay valid across the async write —
+    // no per-run keep-alive callback needed.
+    pixels: Vec<I::Pixel>,
     dims: I::Dims,
     out: Pipe<I>,
     _ty: PhantomData<fn() -> I>,
@@ -3237,7 +3278,7 @@ where
     I::Pixel: Send + 'static,
 {
     ImageUploadEager {
-        pixels: Some(pixels),
+        pixels,
         dims,
         out: Pipe::new(),
         _ty: PhantomData,
@@ -3259,26 +3300,21 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Image write has no native CL_BLOCKING flag we want here — always a
         // non-blocking enqueue, mode ignored; the chain terminal waits.
-        let pixels = self
-            .pixels
-            .take()
-            .expect("ImageUploadEager::execute called twice — internal eager bug");
         let mut img = I::alloc(ec.context(), self.dims)?;
         let region = img.enqueue_region();
-        // Source leaf: no upstream Input, so no wait-list to thread.
+        // Source leaf: no upstream Input, so no wait-list to thread. `self.pixels`
+        // stays valid for the whole `sync`, so no keep-alive callback is needed.
         let event = crate::image::write_image_enqueue(
             img.image_mut(),
             ec,
             region,
-            pixels.as_ptr() as *const std::ffi::c_void,
+            self.pixels.as_ptr() as *const std::ffi::c_void,
             false,
             &[],
         )?;
-        // Keep-alive: the runtime reads from `pixels` until the write fires.
-        register_drop_callback(&event, Box::new(pixels))?;
         self.out.put(img, vec![wrap_event(event)]);
         Ok(())
     }
@@ -3327,7 +3363,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Image read enqueued non-blocking; the chain terminal waits, mode ignored.
         let (img, deps) = self.img.resolve(ec)?;
         let pixel_count = img.pixel_count();
@@ -3404,7 +3440,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve(ec)?;
         // Delegate to the old op's verbatim map body (map/unmap is always
         // non-blocking — mode ignored).
@@ -3457,7 +3493,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve(ec)?;
         let (view, out_deps) = buf.acquire_host_view_read().run(ec, deps)?;
         self.out.put(view, out_deps);
@@ -3510,7 +3546,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (view, deps) = self.view.resolve(ec)?;
         let (buf, out_deps) = view.release_to_device().run(ec, deps)?;
         self.out.put(buf, out_deps);
@@ -3560,7 +3596,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve(ec)?;
         let (view, out_deps) = buf.acquire_host_view().run(ec, deps)?;
         self.out.put(view, out_deps);
@@ -3611,7 +3647,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (buf, deps) = self.buf.resolve(ec)?;
         let (view, out_deps) = buf.acquire_host_view_read().run(ec, deps)?;
         self.out.put(view, out_deps);
@@ -3664,7 +3700,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         let (view, deps) = self.view.resolve(ec)?;
         let (buf, out_deps) = view.release_to_device().run(ec, deps)?;
         self.out.put(buf, out_deps);
@@ -3785,7 +3821,7 @@ where
         (self.src_pipe.clone(), self.dst_pipe.clone())
     }
 
-    fn execute(self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Resolve both inputs → (buffer, upstream Deps). Either may be a pipe
         // (upstream output) or concrete. Combine their wait-lists.
         let (src, src_deps) = self.src.resolve(ec)?;
@@ -3807,7 +3843,7 @@ where
         Ok(())
     }
 
-    fn collect(self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
     where
         Self: Sized,
     {
@@ -3842,9 +3878,9 @@ where
     fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
         // `record_handle` comes from the `RecordableBuffer` bound on Src/Dst.
         // Resolve src + dst (own concrete buffer, or upstream producer edge).
-        let src_concrete = self.src.concrete().map(|b| b.record_handle());
+        let src_concrete = self.src.with_concrete(|b| b.record_handle());
         let (src_h, src_w) = ctx.resolve_input(src_concrete, self.src.pipe_cell_id())?;
-        let dst_concrete = self.dst.concrete().map(|b| b.record_handle());
+        let dst_concrete = self.dst.with_concrete(|b| b.record_handle());
         let (dst_h, dst_w) = ctx.resolve_input(dst_concrete, self.dst.pipe_cell_id())?;
         // The copy moves `min(src,dst)` bytes (both equal in practice).
         let size = src_h.byte_len.min(dst_h.byte_len);
@@ -4079,7 +4115,7 @@ where
         self.out.clone()
     }
 
-    fn execute(self, parent: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    fn execute(&self, parent: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         // Resolve the target device (concrete, or by index into the running
         // context's device list) before anything else; the rest is unchanged.
         let device = match &self.target {
@@ -4148,7 +4184,7 @@ where
     S::Output: crate::mappable::Mappable,
 {
     source: S,
-    f: Option<F>,
+    f: Mutex<Option<F>>,
     out: Pipe<S::Output>,
 }
 
@@ -4159,7 +4195,7 @@ where
     S::Output: crate::mappable::Mappable,
 {
     source: S,
-    f: Option<F>,
+    f: Mutex<Option<F>>,
     out: Pipe<S::Output>,
 }
 
@@ -4406,14 +4442,15 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Gather the source via `collect` (any arity — a bundle source fills
         // element pipes, not output_pipe).
         let (value, deps) = self.source.collect(ec, ExecMode::Pipelined)?;
-        let f = self
-            .f
-            .take()
-            .expect("AndThenHost::execute called twice — internal eager bug");
+        let f = self.f.lock().unwrap().take().ok_or(Error::NotSupported(
+            "eager graph: an `and_then_host` closure was already consumed — a host \
+             seam is a one-shot `FnOnce`, so a graph containing one can't be reused \
+             (step-(a) limitation; reuse covers pure-device graphs)",
+        ))?;
         let (out_value, out_deps) = run_host_seam::<S::Output, F>(value, deps, ec, f)?;
         self.out.put(out_value, out_deps);
         Ok(())
@@ -4447,13 +4484,14 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Gather the source via `collect` (any arity).
         let (value, deps) = self.source.collect(ec, ExecMode::Pipelined)?;
-        let f = self
-            .f
-            .take()
-            .expect("AndThenHostWithContext::execute called twice — internal eager bug");
+        let f = self.f.lock().unwrap().take().ok_or(Error::NotSupported(
+            "eager graph: an `and_then_host_with_context` closure was already \
+             consumed — a host seam is a one-shot `FnOnce`, so a graph containing \
+             one can't be reused (step-(a) limitation)",
+        ))?;
         // Move a `Context` clone (cheap, Arc-backed, 'static) into the worker
         // closure so it can call `f(&context, view)`; the view borrow is supplied
         // by the seam. The closure is Send + 'static (context + f both are).
@@ -4490,7 +4528,7 @@ where
 /// source op still ran — profiling is a host side-effect, not data flow).
 pub struct Profiled<S: DeviceOp, F> {
     source: S,
-    cb: Option<F>,
+    cb: Mutex<Option<F>>,
     out: Pipe<S::Output>,
 }
 
@@ -4507,7 +4545,7 @@ pub trait DeviceProfileExt: DeviceOp + Sized {
     {
         Profiled {
             source: self,
-            cb: Some(cb),
+            cb: Mutex::new(Some(cb)),
             out: Pipe::new(),
         }
     }
@@ -4530,7 +4568,7 @@ where
         self.out.clone()
     }
 
-    fn execute(mut self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         use crate::Launcher;
         // Gather the source via `collect` (any arity).
         let (value, source_deps) = self.source.collect(ec, ExecMode::Pipelined)?;
@@ -4551,14 +4589,11 @@ where
         // `source_deps` keeps the underlying cl_events alive across the
         // enqueue; safe to drop after.
         drop(source_deps);
-        crate::register_profiling_callback(
-            &marker,
-            Box::new(
-                self.cb
-                    .take()
-                    .expect("Profiled::execute called twice — internal eager bug"),
-            ),
-        )?;
+        let cb = self.cb.lock().unwrap().take().ok_or(Error::NotSupported(
+            "eager graph: a `.profiled()` callback was already consumed — the \
+             profiling callback is a one-shot `FnOnce` and can't drive a reused graph",
+        ))?;
+        crate::register_profiling_callback(&marker, Box::new(cb))?;
         // The marker becomes this op's completion event for downstream
         // chaining (it subsumes the source's events).
         self.out.put(value, vec![wrap_event(marker)]);
