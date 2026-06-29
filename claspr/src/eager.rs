@@ -127,19 +127,19 @@ pub trait Tag: Sized + 'static {
 
     /// Unwrap the tuple-struct binding `Tag(value)` to its value (moved). The
     /// [`slots!`](crate::slots) macro emits this as `self.0`; it is the only way
-    /// [`call`](DeviceOpExt::call) can pull the value out of a generic `Tg` wrapper
+    /// [`bind`](DeviceOpExt::bind) can pull the value out of a generic `Tg` wrapper
     /// (a generic tuple-struct field is not nameable).
     fn into_value(self) -> Self::Value;
 }
 
-/// A type-erased carrier for one `call(Tag(value))` binding, folded into a graph's
+/// A type-erased carrier for one `bind(Tag(value))` binding, folded into a graph's
 /// slot cells by [`bind_slots`](DeviceOp::bind_slots).
 ///
 /// Carries the tag's [`TypeId`] and the boxed value (`Box<dyn Any>` over the tag's
 /// `Value`). The binding **MOVES**: each [`Input::Slot`] whose `id` matches takes
 /// the value (downcast back to its concrete type) into its cell, then clears the
 /// binder so a second matching cell sees nothing — a single buffer is single-owner,
-/// so a tag fills at most one slot occurrence per `call`.
+/// so a tag fills at most one slot occurrence per `bind`.
 pub struct SlotBinder {
     id: TypeId,
     /// `None` once a matching slot consumed it. `Box<dyn Any + Send>` holds the
@@ -149,7 +149,7 @@ pub struct SlotBinder {
 
 impl SlotBinder {
     /// Build a binder for tag `Tg` carrying `value` (moved). Use via
-    /// [`DeviceOpExt::call`].
+    /// [`DeviceOpExt::bind`].
     pub fn new<Tg: Tag>(value: Tg::Value) -> Self {
         SlotBinder {
             id: TypeId::of::<Tg>(),
@@ -158,7 +158,7 @@ impl SlotBinder {
     }
 
     /// Whether the binding has already been deposited into a matching slot cell.
-    /// `bind_slots` walks short-circuit on this (one `call` binds one cell), and
+    /// `bind_slots` walks short-circuit on this (one `bind` binds one cell), and
     /// the kernel-op codegen checks it before each arg.
     pub fn is_consumed(&self) -> bool {
         self.value.is_none()
@@ -362,7 +362,7 @@ pub enum Input<T> {
     /// Deferred — produced by an upstream op, moved out of the shared cell.
     Pipe(Pipe<T>),
     /// An **unbound typed slot** — a hole built with [`slot!`](crate::slot)`(Tag)`.
-    /// The `cell` starts EMPTY; it is filled by a later [`call`](DeviceOpExt::call)`(Tag(value))`
+    /// The `cell` starts EMPTY; it is filled by a later [`bind`](DeviceOpExt::bind)`(Tag(value))`
     /// that walks the graph and deposits a matching value (see
     /// [`bind_slots`](DeviceOp::bind_slots)). Once filled, it lends + re-arms
     /// exactly like a [`Concrete`](Input::Concrete) cell (the run's `Checkout`
@@ -376,7 +376,7 @@ pub enum Input<T> {
         id: TypeId,
         /// `type_name::<Tag>()` — for the "slot `<name>` unbound" error only.
         name: &'static str,
-        /// Empty until a matching `call(Tag(value))` deposits the value; then it
+        /// Empty until a matching `bind(Tag(value))` deposits the value; then it
         /// behaves as a `Concrete` cell (lend + return-on-`Checkout`-drop).
         cell: Cell<T>,
     },
@@ -561,9 +561,9 @@ impl<T> Input<T> {
     /// (or rebindable) [`Slot`](Input::Slot) whose `id` matches the binder's tag.
     ///
     /// Used by [`bind_slots`](DeviceOp::bind_slots) as the graph is walked by
-    /// [`call`](DeviceOpExt::call). On a match the binder's boxed value is downcast
+    /// [`bind`](DeviceOpExt::bind). On a match the binder's boxed value is downcast
     /// back to `T` and **moved** into the slot's cell (overwriting any prior bind —
-    /// a second `call(Tag(other))` rebinds), then the binder is marked consumed so a
+    /// a second `bind(Tag(other))` rebinds), then the binder is marked consumed so a
     /// later same-tag slot in the same walk is left alone (a single buffer is
     /// single-owner). Non-matching arms / tags are a no-op.
     pub fn try_bind_slot(&self, binder: &mut SlotBinder)
@@ -582,7 +582,7 @@ impl<T> Input<T> {
         match boxed.downcast::<T>() {
             Ok(v) => {
                 // Bind / rebind: MOVE the value into the cell. A prior value (an
-                // earlier `call`'s buffer) is dropped here.
+                // earlier `bind`'s buffer) is dropped here.
                 *cell.lock().unwrap() = Some(*v);
             }
             // Type mismatch is impossible: a tag's `TypeId` (the matched `id`) pins
@@ -613,7 +613,7 @@ impl<T> From<Pipe<T>> for Input<T> {
 /// args, `download`/`fill`/`write`/copy sources, …). It carries the tag's
 /// [`TypeId`] + `type_name` and a fresh empty [`Cell`]; converting it (via
 /// [`From`] / [`ToInput`]) yields an [`Input::Slot`] sharing that cell, which a
-/// later [`call`](DeviceOpExt::call)`(Tag(value))` fills.
+/// later [`bind`](DeviceOpExt::bind)`(Tag(value))` fills.
 ///
 /// `PhantomData<fn() -> Tg>` keeps the handle `Send`/`Sync` regardless of `Tg`
 /// (the tag type is a pure marker — never stored).
@@ -985,19 +985,19 @@ pub trait DeviceOp: Send {
     fn describe(&self, out: &mut Vec<String>);
 
     /// Fold one [`SlotBinder`] into this op's [`slot!`](crate::slot) cells —
-    /// the per-op half of [`call`](DeviceOpExt::call)`(Tag(value))`.
+    /// the per-op half of [`bind`](DeviceOpExt::bind)`(Tag(value))`.
     ///
     /// Walks the op's own [`Input`] fields, calling
     /// [`try_bind_slot`](Input::try_bind_slot) on each so a matching unbound slot
     /// takes the (moved) value; combinators recurse into their children
     /// (mirroring [`describe`](Self::describe)). The default is a **no-op** — most
-    /// leaves hold no slot, and `call` simply finds nothing to bind. Ops that
+    /// leaves hold no slot, and `bind` simply finds nothing to bind. Ops that
     /// accept buffer args (kernels, `download`/`fill`/`write`/copy, the bundles)
     /// override this to visit their inputs.
     ///
-    /// Order-free + curryable falls out of this being one binder per `call`: each
-    /// `call` deposits ONE tag's value into the first matching cell, independent of
-    /// other tags / call order; completeness is only enforced later at
+    /// Order-free + curryable falls out of this being one binder per `bind`: each
+    /// `bind` deposits ONE tag's value into the first matching cell, independent of
+    /// other tags / bind order; completeness is only enforced later at
     /// [`sync`](DeviceOpExt::sync). A short-circuit on
     /// [`is_consumed`](SlotBinder::is_consumed) lets a walk stop early once the
     /// value has landed.
@@ -1123,15 +1123,15 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// Bind one typed slot of this reusable graph: deposit `tag`'s value into the
     /// graph's matching [`slot!`](crate::slot) cell. Returns `&self` so binds
     /// **chain** and the graph is then `sync`'d:
-    /// `g.call(Buf(b)).call(W(w)).sync(&ctx)?`.
+    /// `g.bind(Buf(b)).bind(W(w)).sync(&ctx)?`.
     ///
-    /// **Order-free + curryable + partial.** Each `call` carries exactly one tag,
-    /// folded independently of the others, so `g.call(Buf(b)).call(W(w))` and
-    /// `g.call(W(w)).call(Buf(b))` are equivalent, and a subset is allowed —
+    /// **Order-free + curryable + partial.** Each `bind` carries exactly one tag,
+    /// folded independently of the others, so `g.bind(Buf(b)).bind(W(w))` and
+    /// `g.bind(W(w)).bind(Buf(b))` are equivalent, and a subset is allowed —
     /// completeness (every slot bound) is enforced only at
     /// [`sync`](Self::sync)/[`wait_on`](Self::wait_on) (runtime), where an unbound
     /// slot is [`Error::SlotUnbound`]. Binding **MOVES**
-    /// the value into the cell; a second `call(Tag(other))` rebinds (the previous
+    /// the value into the cell; a second `bind(Tag(other))` rebinds (the previous
     /// buffer drops). After a run, the run's [`Checkout`] returns the buffer to the
     /// slot cell on drop (same machinery as a concrete head), so a bound graph is
     /// re-runnable.
@@ -1142,12 +1142,12 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// it; a slot placed in an op that does not yet override `bind_slots` simply
     /// stays unbound (caught at `sync`).
     ///
-    /// TODO(step b→c): `call` returns `&self`, which serves the `g.call(...).sync()`
+    /// TODO(step b→c): `bind` returns `&self`, which serves the `g.bind(...).sync()`
     /// path and chained binds. The fully-composable form — a single-output
-    /// `g.call()` usable as a kernel arg / `bundle2(b, g.call())` nesting (NOTES
+    /// `g.bind()` usable as a kernel arg / `bundle2(b, g.bind())` nesting (NOTES
     /// "Closure-free graph model", §3) — is deferred to the segment-plan step; it
     /// needs a node that re-exposes the bound graph's output pipe.
-    fn call<Tg: Tag>(&self, tag: Tg) -> &Self {
+    fn bind<Tg: Tag>(&self, tag: Tg) -> &Self {
         // Unwrap the tuple-struct binding `Tag(value)` to its value (the wrapper is
         // a pure move-carrier — only `TypeId::of::<Tg>()` matters for matching),
         // box it into a `Tg`-keyed binder, and fold it into the graph's slot cells.
@@ -1757,7 +1757,7 @@ where
 
     fn bind_slots(&self, binder: &mut SlotBinder) {
         // Walk source then next (execution order). Stop early once the value has
-        // landed in a matching slot — a single `call` binds one cell.
+        // landed in a matching slot — a single `bind` binds one cell.
         self.source.bind_slots(binder);
         if binder.is_consumed() {
             return;

@@ -55,7 +55,7 @@ pub enum Error {
     /// A reusable graph was `sync`'d while one of its typed slots
     /// (built with `slot!(Tag)`) is still unbound — completeness is
     /// checked at run time. The string is the tag's `type_name`; bind
-    /// it with `g.call(Tag(value))` before `sync`. (Also surfaced if a
+    /// it with `g.bind(Tag(value))` before `sync`. (Also surfaced if a
     /// bound slot's buffer is still lent to a live `Checkout` — the
     /// graph is busy on that slot.)
     SlotUnbound(&'static str),
@@ -83,7 +83,7 @@ impl fmt::Display for Error {
             Error::SlotUnbound(tag) => write!(
                 f,
                 "eager graph: slot `{tag}` is unbound — bind it with \
-                 `g.call(Tag(value))` before sync (or a previous Checkout is still \
+                 `g.bind(Tag(value))` before sync (or a previous Checkout is still \
                  holding its buffer)"
             ),
         }

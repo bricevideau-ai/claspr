@@ -79,7 +79,7 @@ must run via `cargo test --test <name>` (isolated) not batched `-p` (multiple
 `claspr` rlibs confuse its rlib discovery — pre-existing).
 
 DEFERRED to later steps (design below): **(b) slots** (`slot!(Tag)`/`Tag(value)`/
-`call` runtime bind-table + typed tags → rebind different buffers per run);
+`bind` runtime bind-table + typed tags → rebind different buffers per run);
 **(c) convex-segment replay** (software + cached `cl_khr_command_buffer`); **(d)
 mutable-dispatch** + image reuse. NOTE: `record.rs` (commits fd68c0c…2bd92a5)
 is NOT dead salvage — it's a LIVE, TESTED public surface: `g.record()?` →
@@ -134,15 +134,15 @@ let out = g.sync(&ctx)?;
    `slots! { Buf: DeviceSlice<u32> }` → `pub struct Buf(pub DeviceSlice<u32>)` +
    `impl Tag`. Build a hole with `slot!(Buf)`. Bind with **`Buf(value)`** (plain
    tuple-struct construction — NO fn_traits, the thing that killed the old
-   `B(&b)`; carries any type incl vectors). `g.call(Buf(b)).call(W(w))` folds a
+   `B(&b)`; carries any type incl vectors). `g.bind(Buf(b)).bind(W(w))` folds a
    `TypeId→resource` table (order-free, curryable, partial OK); completeness
    checked at `sync` (runtime). Binding MOVES the value into the cell, recovered
    via checkout (share read-only via `Arc<DeviceSlice>`). Typed = per-tag value
    type checked at compile time; NEVER set-algebra (that HList/turbofish/dedup
-   pain is why compile-time-set was abandoned). `call` returns a composable
-   `DeviceOp` node → a single-output `g.call()` is usable as a kernel arg /
+   pain is why compile-time-set was abandoned). `bind` returns a composable
+   `DeviceOp` node → a single-output `g.bind()` is usable as a kernel arg /
    chain node, so graphs COMPOSE:
-   `g2 = ks.scal(slot!(X),3.0).and_then(|b| bundle2(b, g.call())).and_then(|(a,b)| ks.add(a,b))`.
+   `g2 = ks.scal(slot!(X),3.0).and_then(|b| bundle2(b, g.bind())).and_then(|(a,b)| ks.add(a,b))`.
 
 4. **Alloc rule (resolves compounding):** read-only (`Frozen`/`ReadOnly`)
    buffers alloc **once**; mutable buffers **re-seed each run** via a software
@@ -168,7 +168,7 @@ acyclic = **compile-time** (survive untouched — why op-tree-is-g matters, no
 Per-tag value type = compile-time; tag *presence* = runtime.
 
 **Build order:** (a) cell-ify `Input` + `sync`→`Checkout` (own-the-buffers reuse,
-multi-output, no slots) → (b) `slot!`/`Tag(v)`/`call` table + completeness →
+multi-output, no slots) → (b) `slot!`/`Tag(v)`/`bind` table + completeness →
 (c) segment plan (software + immutable CB, salvage layers 1/2 under sync) →
 (d) mutable-dispatch segment for different-buffer rebind. Open soft spot: exact
 shape of what a slotted graph hands back post-sync (bound buffers via checkout).
@@ -242,18 +242,18 @@ tested). **`Input<T>` gained a 3rd arm** `Slot{id:TypeId, name:&'static str,
 cell:Cell<T>}`; once bound it lends/re-arms EXACTLY like `Concrete` (shared
 `lend_from_cell` helper) — a bound graph re-runs (Checkout returns to the slot
 cell on drop). Empty cell at resolve → new `Error::SlotUnbound(&'static str)`
-(carries `type_name::<Tag>()`). `g.call(Tag(v)) -> &Self`: builds a `SlotBinder`
+(carries `type_name::<Tag>()`). `g.bind(Tag(v)) -> &Self`: builds a `SlotBinder`
 {id, boxed value} and folds it via new `DeviceOp::bind_slots(&self, &mut
 SlotBinder)` (default no-op) — overridden on `AndThen` (recurse, short-circuit on
 `is_consumed`) + the kernel macro op (BOTH single- AND multi-output impls — easy
-to miss the 2nd!). Each `call` carries one tag → order-free/curryable/partial
-falls out; binding MOVES into the first matching cell; a 2nd `call(Tag(other))`
+to miss the 2nd!). Each `bind` carries one tag → order-free/curryable/partial
+falls out; binding MOVES into the first matching cell; a 2nd `bind(Tag(other))`
 rebinds. PROOF: `tests/tier2/tests/graph_slots.rs` 5/5 on pocl (bind+data /
 order-free / re-run / unbound-Err / rebind). graph_reuse 7/7 + eager_chain/
 buffer_ops regress green; full tier2 builds; claspr build+clippy(-D)+doc(-D)+fmt
-clean. **DEFERRED w/ TODO**: (1) `call` returns `&self` (serves `.call().sync()`
-+ chained binds); the composable single-output `g.call()` as a kernel arg /
-`bundle2(b, g.call())` nesting (NOTES §3) waits on step (c). (2) `slot!` in
+clean. **DEFERRED w/ TODO**: (1) `bind` returns `&self` (serves `.bind().sync()`
++ chained binds); the composable single-output `g.bind()` as a kernel arg /
+`bundle2(b, g.bind())` nesting (NOTES §3) waits on step (c). (2) `slot!` in
 `Into<Input<_>>` positions (download/fill/write/copy) needs explicit
 `SlotHandle::into_slot_input()` — a direct `From<SlotHandle> for Input<Value>`
 collides with the blanket `From<T> for Input<T>` (coherence: `Value` could ==

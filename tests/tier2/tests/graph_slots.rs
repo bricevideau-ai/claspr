@@ -1,14 +1,14 @@
-//! Typed-slots proof test (step (b): `slots!` / `slot!` / `g.call(Tag(v))`).
+//! Typed-slots proof test (step (b): `slots!` / `slot!` / `g.bind(Tag(v))`).
 //!
 //! A reusable graph can carry **unbound typed holes** — `slot!(Tag)` — that plug
 //! into the same positions a concrete buffer does (here: kernel buffer args).
-//! `g.call(Tag(value))` folds a `TypeId → resource` binding into the graph's slot
+//! `g.bind(Tag(value))` folds a `TypeId → resource` binding into the graph's slot
 //! cells (order-free, curryable, partial). Completeness is enforced only at
 //! `sync` (runtime): an unbound slot is `Error::SlotUnbound`. After a run the
 //! Checkout returns the buffer to its slot cell (re-arm), so a bound graph
 //! re-runs. These tests lock the five properties from the step-(b) spec:
 //!
-//! (a) `slot!` + `g.call(Tag(v)).sync()` produces correct data.
+//! (a) `slot!` + `g.bind(Tag(v)).sync()` produces correct data.
 //! (b) order-free — both bind orders give the same result.
 //! (c) re-run a bound graph twice (the slot re-arms like a concrete cell).
 //! (d) an unbound slot makes `sync` return the "slot unbound" `Err`.
@@ -49,7 +49,7 @@ fn seeded(ctx: &Context, v: u32) -> DeviceSlice<u32> {
         .expect("seed")
 }
 
-/// (a) `slot!(Buf)` in a kernel arg position; `g.call(Buf(b)).sync()` runs the
+/// (a) `slot!(Buf)` in a kernel arg position; `g.bind(Buf(b)).sync()` runs the
 /// graph over the bound buffer and produces the expected data.
 #[test]
 fn slot_bind_then_sync_produces_data() {
@@ -60,7 +60,7 @@ fn slot_bind_then_sync_produces_data() {
     let g = ks.scale_u32([N], slot!(Buf), 2u32).and_then(download);
 
     let b = seeded(&ctx, 3); // 3 * 2 = 6
-    let out = g.call(Buf(b)).sync(&ctx).expect("bound sync");
+    let out = g.bind(Buf(b)).sync(&ctx).expect("bound sync");
     assert!(
         out.iter().all(|&v| v == 6),
         "scale(slot=3, 2) should be 6, got {:?}",
@@ -68,8 +68,8 @@ fn slot_bind_then_sync_produces_data() {
     );
 }
 
-/// (b) Binding is **order-free**: `call(A).call(B).call(Out)` and the reverse
-/// order produce the same result. Each `call` carries one tag, folded
+/// (b) Binding is **order-free**: `bind(A).bind(B).bind(Out)` and the reverse
+/// order produce the same result. Each `bind` carries one tag, folded
 /// independently.
 #[test]
 fn slot_bind_is_order_free() {
@@ -80,9 +80,9 @@ fn slot_bind_is_order_free() {
     // sync yields (Checkout<a>, Checkout<b>, Checkout<out>). Read `out`.
     let forward = ks.add_u32([N], slot!(A), slot!(B), slot!(Out));
     let (_a, _b, out_co) = forward
-        .call(A(seeded(&ctx, 2)))
-        .call(B(seeded(&ctx, 5)))
-        .call(Out(seeded(&ctx, 0)))
+        .bind(A(seeded(&ctx, 2)))
+        .bind(B(seeded(&ctx, 5)))
+        .bind(Out(seeded(&ctx, 0)))
         .sync(&ctx)
         .expect("forward-order sync");
     let mut r1 = vec![0u32; N];
@@ -92,9 +92,9 @@ fn slot_bind_is_order_free() {
     // Same graph shape, reverse bind order — identical result.
     let reverse = ks.add_u32([N], slot!(A), slot!(B), slot!(Out));
     let (_a, _b, out_co) = reverse
-        .call(Out(seeded(&ctx, 0)))
-        .call(B(seeded(&ctx, 5)))
-        .call(A(seeded(&ctx, 2)))
+        .bind(Out(seeded(&ctx, 0)))
+        .bind(B(seeded(&ctx, 5)))
+        .bind(A(seeded(&ctx, 2)))
         .sync(&ctx)
         .expect("reverse-order sync");
     let mut r2 = vec![0u32; N];
@@ -120,7 +120,7 @@ fn bound_slot_graph_reruns() {
 
     let b = seeded(&ctx, 3);
     // Run 1: 3 -> 6. Drop the Checkout to re-arm the slot.
-    let co1 = g.call(Buf(b)).sync(&ctx).expect("run 1");
+    let co1 = g.bind(Buf(b)).sync(&ctx).expect("run 1");
     drop(co1);
 
     // Run 2 (already bound, slot re-armed): 6 -> 12, in place.
@@ -141,7 +141,7 @@ fn unbound_slot_sync_errors() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    // Never `call`'d — the slot stays empty.
+    // Never `bind`'d — the slot stays empty.
     let g = ks.scale_u32([N], slot!(Buf), 2u32).and_then(download);
 
     let err = g.sync(&ctx).expect_err("unbound slot must error at sync");
@@ -156,7 +156,7 @@ fn unbound_slot_sync_errors() {
     }
 
     // The same graph runs once bound — proves the slot, not the graph, was at fault.
-    let out = g.call(Buf(seeded(&ctx, 4))).sync(&ctx).expect("now bound");
+    let out = g.bind(Buf(seeded(&ctx, 4))).sync(&ctx).expect("now bound");
     assert!(
         out.iter().all(|&v| v == 8),
         "4 * 2 = 8, got {:?}",
@@ -164,7 +164,7 @@ fn unbound_slot_sync_errors() {
     );
 }
 
-/// (e) A second `call(Tag(other))` **rebinds** the slot to a different buffer; the
+/// (e) A second `bind(Tag(other))` **rebinds** the slot to a different buffer; the
 /// new buffer's data drives the result (the previous binding is replaced).
 #[test]
 fn rebind_slot_uses_new_buffer() {
@@ -174,7 +174,7 @@ fn rebind_slot_uses_new_buffer() {
     let g = ks.scale_u32([N], slot!(Buf), 2u32).and_then(download);
 
     // First binding: 3 -> 6.
-    let first = g.call(Buf(seeded(&ctx, 3))).sync(&ctx).expect("first bind");
+    let first = g.bind(Buf(seeded(&ctx, 3))).sync(&ctx).expect("first bind");
     assert!(
         first.iter().all(|&v| v == 6),
         "first buffer: 3 * 2 = 6, got {:?}",
@@ -184,7 +184,7 @@ fn rebind_slot_uses_new_buffer() {
 
     // Rebind to a DIFFERENT buffer (seeded 10): 10 -> 20. The first buffer (whose
     // consumed-by-download cell is empty anyway) is replaced by this call.
-    let second = g.call(Buf(seeded(&ctx, 10))).sync(&ctx).expect("rebind");
+    let second = g.bind(Buf(seeded(&ctx, 10))).sync(&ctx).expect("rebind");
     assert!(
         second.iter().all(|&v| v == 20),
         "rebound buffer: 10 * 2 = 20, got {:?}",

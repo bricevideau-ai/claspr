@@ -276,7 +276,7 @@ macro_rules! usm_slice {
 /// The tag type is the identity key (matched by `TypeId`); its `Value` is the one
 /// buffer type the tag carries (compile-time fixed). Build a hole for a tag with
 /// [`slot!`](crate::slot)`(Buf)` and bind it with **plain tuple-struct
-/// construction** — `g.call(Buf(b))` — no `Fn`/`fn_traits`.
+/// construction** — `g.bind(Buf(b))` — no `Fn`/`fn_traits`.
 #[macro_export]
 macro_rules! slots {
     // Trailing comma + at least one entry.
@@ -284,7 +284,7 @@ macro_rules! slots {
         $(
             #[doc = concat!("Reusable-graph slot tag carrying a `", stringify!($val), "`.")]
             #[doc = ""]
-            #[doc = "Build a hole with [`slot!`](crate::slot)`(...)`; bind with `g.call(Self(value))`."]
+            #[doc = "Build a hole with [`slot!`](crate::slot)`(...)`; bind with `g.bind(Self(value))`."]
             pub struct $name(pub $val);
 
             impl $crate::Tag for $name {
@@ -304,11 +304,11 @@ macro_rules! slots {
 /// ```ignore
 /// slots! { Buf: DeviceSlice<u32> }
 /// let g = ks.scale([N], slot!(Buf), 2u32).and_then(download);
-/// let out = g.call(Buf(b)).sync(&ctx)?;   // bind, then run; re-runnable
+/// let out = g.bind(Buf(b)).sync(&ctx)?;   // bind, then run; re-runnable
 /// ```
 ///
 /// Expands to [`SlotHandle::<Tag>::new()`](crate::SlotHandle::new) — a fresh empty
-/// cell filled by a later [`call`](crate::DeviceOpExt::call)`(Tag(value))`.
+/// cell filled by a later [`bind`](crate::DeviceOpExt::bind)`(Tag(value))`.
 #[macro_export]
 macro_rules! slot {
     ( $tag:ty ) => {
