@@ -491,6 +491,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `Input::resolve` (a pipe IS expected here — it's the upstream output).
     // `#pname` becomes the buffer; `#pname __claspr_deps` its wait-list events.
     let mut input_resolve_eager: Vec<TokenStream2> = Vec::new();
+    // SCALAR slot READS, emitted BEFORE the buffer/image lends in execute. A scalar
+    // read is a pure clone (no cell mutation), so resolving the non-resource slots
+    // first means an UNBOUND scalar errors (`SlotUnbound`) before any buffer is
+    // lent — keeping a failed completeness check from stranding a buffer slot in
+    // `Lent` (which would read as unbound on the next run). The grid is resolved
+    // inline at `LaunchOp` for the same reason it's read late: it touches no buffer.
+    let mut scalar_resolve_eager: Vec<TokenStream2> = Vec::new();
     // The per-buffer/image deps idents, merged into the kernel's wait-list at
     // execute.
     let mut input_deps_idents: Vec<TokenStream2> = Vec::new();
@@ -589,9 +596,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 });
                 input_deps_idents.push(quote! { #deps_ident });
                 // `bind_slots`: `#pname` destructures to `&Input<__D>`; offer the
-                // binder to it (a matching unbound `slot!(Tag)` takes the value).
+                // binder to it. A move-only binder stops once consumed; a fan-out
+                // binder (e.g. a shared `Arc<DeviceSlice>`) visits EVERY site so one
+                // bind fills all matching slots.
                 input_bind_slots.push(quote! {
-                    if !::claspr::SlotBinder::is_consumed(binder) {
+                    if ::claspr::SlotBinder::is_fanout(binder)
+                        || !::claspr::SlotBinder::is_consumed(binder)
+                    {
                         ::claspr::Input::try_bind_slot(#pname, binder);
                     }
                 });
@@ -687,9 +698,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 input_deps_idents.push(quote! { #deps_ident });
                 // `bind_slots`: an image arg is a real slot position too — offer the
                 // binder so a matching unbound `slot!(Tag)` (Tag::Value = image)
-                // takes the value, just like a slice arg.
+                // takes the value, just like a slice arg. Fan-out-aware: visit every
+                // site for a clone-able binder, stop once consumed for a move-only.
                 input_bind_slots.push(quote! {
-                    if !::claspr::SlotBinder::is_consumed(binder) {
+                    if ::claspr::SlotBinder::is_fanout(binder)
+                        || !::claspr::SlotBinder::is_consumed(binder)
+                    {
                         ::claspr::Input::try_bind_slot(#pname, binder);
                     }
                 });
@@ -700,25 +714,61 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 output_homes.push(quote! { #home_ident });
             }
             ParamRole::Scalar { name: pname, ty } => {
-                host_names.push(pname.clone());
-                bind_slot_pat_names.push(quote! { _ });
-                method_params.push(quote! { #pname: #ty });
-                arg_types.push(ty.clone());
-                op_field_init.push(quote! { #pname });
-                // execute borrows `&self.args`, so a scalar arg is bound as
-                // `&#ty`; deref it (scalars are `Copy`) to pass by value to
-                // `LaunchOp`. Slice/image args are rebound to owned values by
-                // their `resolve_home(ec)`, so they pass `&#pname`.
-                op_arg_pass.push(quote! { *#pname });
+                // A scalar arg is now a NON-RESOURCE slot position: the method
+                // accepts either a plain value OR a `slot!(Tag)`, via a method-only
+                // generic `__claspr_SS{n}: Into<ScalarInput<#ty>>`. The Op stores
+                // `ScalarInput<#ty>` (two-state: `Concrete(v)` for a literal,
+                // `Slot{..}` for a hole). At execute the value is READ (cloned) — a
+                // bound slot persists across replays for free; an unbound one is
+                // `SlotUnbound`. This is the simple 2-state path — NOT the 4-state
+                // resource machine (no lend/rehome/sever, no Checkout).
+                let ssid = quote::format_ident!("__claspr_SS{}", arg_gen_idx);
+                arg_gen_idx += 1;
+                // `Into<ScalarInput<#ty>>` (not a projected-`Val` trait) so a bare
+                // integer literal still infers the kernel's scalar type — e.g.
+                // `fill_u32([N], buf, 5)` resolves `5: u32`.
+                let ssbound: TokenStream2 =
+                    quote! { #ssid: ::core::convert::Into<::claspr::ScalarInput<#ty>> };
+                method_only_generics.push((quote! { #ssid }, ssbound));
 
-                // Record path: set the scalar's raw bytes as the next kernel arg.
+                host_names.push(pname.clone());
+                // A scalar slot is a real bind position (bound by name, not `_`).
+                bind_slot_pat_names.push(quote! { #pname });
+                method_params.push(quote! { #pname: #ssid });
+                arg_types.push(quote! { ::claspr::ScalarInput<#ty> });
+                op_field_init.push(quote! { ::core::convert::Into::into(#pname) });
+                // Eager path: READ the scalar value (clone) for this run, rebinding
+                // `#pname` to the owned `#ty`. `Concrete` clones its literal; a bound
+                // `Slot` clones its value; an unbound slot is `SlotUnbound`. Resolved
+                // BEFORE buffers (pure read, no lend) so an unbound scalar can't
+                // strand a buffer slot mid-execute.
+                scalar_resolve_eager.push(quote! {
+                    let #pname: #ty = ::claspr::ScalarInput::read(#pname)?;
+                });
+                // The resolved owned value is passed BY VALUE to the launch tuple
+                // (`KernelArg` is impl'd for the bare scalar type).
+                op_arg_pass.push(quote! { #pname });
+                // `bind_slots`: a scalar slot is a bind position too — offer the
+                // binder to its `ScalarInput` (a matching `slot!(Tag)` takes/clones
+                // the value, fanning out across sites for the shared case).
+                input_bind_slots.push(quote! {
+                    if ::claspr::SlotBinder::is_fanout(binder)
+                        || !::claspr::SlotBinder::is_consumed(binder)
+                    {
+                        ::claspr::ScalarInput::try_bind_slot(#pname, binder);
+                    }
+                });
+
+                // Record path: read the scalar's resolved value, then set its raw
+                // bytes as the next kernel arg. `#pname` is `&ScalarInput<#ty>`.
                 record_arg_stmts.push(quote! {
                     {
+                        let __claspr_scalar: #ty = ::claspr::ScalarInput::read(#pname)?;
                         // SAFETY: `#ty` scalar args are `Copy` POD passed by value
-                        // to the kernel; read its bytes. `#pname` is `&#ty` here.
+                        // to the kernel; read the resolved value's bytes.
                         let __claspr_bytes = unsafe {
                             ::core::slice::from_raw_parts(
-                                (#pname as *const #ty) as *const u8,
+                                (&__claspr_scalar as *const #ty) as *const u8,
                                 ::core::mem::size_of::<#ty>(),
                             )
                         };
@@ -780,10 +830,22 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `op_args_tuple_pat` = destructure pattern at enqueue (plain names).
     let op_args_tuple_init = single_or_tuple(&op_field_init);
     let op_args_tuple_pat = single_or_tuple(&host_names);
-    // Like `op_args_tuple_pat`, but `_` in every scalar position so `bind_slots`
-    // (which only touches buffer/image `Input`s) doesn't bind unused names.
+    // Destructure pattern for `bind_slots`: buffer/image/scalar positions all bind
+    // their name (each is a real bind position now — buffers/images via `Input`,
+    // scalars via `ScalarInput`).
     let bind_slots_args_pat = single_or_tuple(&bind_slot_pat_names);
     let op_launch_args_tuple = single_or_tuple(&op_arg_pass);
+
+    // The GRID is a bind position too (`slot!(Grid)`): offer the binder to
+    // `self.spec` in every `bind_slots` body, fan-out-aware so one `bind(Grid(g))`
+    // fills the grid slot at every dispatch site across a graph.
+    let grid_bind_slot: TokenStream2 = quote! {
+        if ::claspr::SlotBinder::is_fanout(binder)
+            || !::claspr::SlotBinder::is_consumed(binder)
+        {
+            ::claspr::ScalarInput::try_bind_slot(&self.spec, binder);
+        }
+    };
 
     // Output type / expression — bare for a single slice, tuple for
     // many, `()` for none. Same convention on both terminals
@@ -974,6 +1036,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     // BORROW the op (reusable). Destructure `&self.args`; resolve
                     // LENDS each buffer from its `Input` cell / upstream pipe.
                     let #op_args_tuple_pat = &self.args;
+                    // Resolve NON-resource slots (grid + scalars) FIRST — a pure
+                    // read, no lend — so an unbound scalar/grid errors before any
+                    // buffer is lent (a failed completeness check must not strand a
+                    // buffer slot in `Lent`).
+                    let __claspr_spec: ::claspr::LaunchSpec =
+                        ::claspr::ScalarInput::read(&self.spec)?;
+                    #(#scalar_resolve_eager)*
                     #(#input_resolve_eager)*
                     // Validate cross-context match for every caller-added dep
                     // (`.after()` / `.after_all()`) against the running queue's
@@ -997,7 +1066,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     let event = ::claspr::LaunchOp::new(
                         ec,
                         &self.kernel,
-                        self.spec,
+                        __claspr_spec,
                         #op_launch_args_tuple,
                     )
                     .with_state(raw_deps, profile_cb)
@@ -1072,11 +1141,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 }
 
                 fn bind_slots(&self, binder: &mut ::claspr::SlotBinder) {
-                    // Offer the `call(Tag(v))` binder to each buffer arg's `Input`;
-                    // a matching unbound `slot!(Tag)` takes the value. Scalars /
-                    // images carry no `Input` (bound to `_` in the pattern).
+                    // Offer the `call(Tag(v))` binder to every bind position: each
+                    // buffer/image arg (its `Input`), each scalar arg (its
+                    // `ScalarInput`), AND the grid (`self.spec`). A matching
+                    // `slot!(Tag)` takes (move-only) or clones (fan-out) the value.
                     let #bind_slots_args_pat = &self.args;
                     #(#input_bind_slots)*
+                    #grid_bind_slot
                 }
 
                 fn reclaim_undelivered(&self) {
@@ -1121,6 +1192,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     // (or upstream pipe), rebinding `#pname` to the owned value for
                     // the run. Scalars stay `&#ty` (deref'd at the launch tuple).
                     let #op_args_tuple_pat = &self.args;
+                    // Resolve NON-resource slots (grid + scalars) FIRST — a pure
+                    // read, no lend — so an unbound scalar/grid errors before any
+                    // buffer is lent (a failed completeness check must not strand a
+                    // buffer slot in `Lent`).
+                    let __claspr_spec: ::claspr::LaunchSpec =
+                        ::claspr::ScalarInput::read(&self.spec)?;
+                    #(#scalar_resolve_eager)*
                     #(#input_resolve_eager)*
                     // Validate cross-context match for every caller-added dep
                     // (`.after()` / `.after_all()`) against the running queue's
@@ -1145,7 +1223,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     let event = ::claspr::LaunchOp::new(
                         ec,
                         &self.kernel,
-                        self.spec,
+                        __claspr_spec,
                         #op_launch_args_tuple,
                     )
                     .with_state(raw_deps, profile_cb)
@@ -1168,11 +1246,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 }
 
                 fn bind_slots(&self, binder: &mut ::claspr::SlotBinder) {
-                    // Offer the `call(Tag(v))` binder to each buffer arg's `Input`;
-                    // a matching unbound `slot!(Tag)` takes the value. Scalars /
-                    // images carry no `Input` (bound to `_` in the pattern).
+                    // Offer the `call(Tag(v))` binder to every bind position: each
+                    // buffer/image arg (its `Input`), each scalar arg (its
+                    // `ScalarInput`), AND the grid (`self.spec`). A matching
+                    // `slot!(Tag)` takes (move-only) or clones (fan-out) the value.
                     let #bind_slots_args_pat = &self.args;
                     #(#input_bind_slots)*
+                    #grid_bind_slot
                 }
             }
         }
@@ -1223,11 +1303,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     // the edge-map, scalars from bytes), accumulating handles+waits.
                     let #op_args_tuple_pat = &self.args;
                     #(#record_arg_stmts)*
+                    // Resolve the (possibly slot-bound) grid for this record.
+                    let __claspr_spec: ::claspr::LaunchSpec =
+                        ::claspr::ScalarInput::read(&self.spec)?;
                     // Record the ND-range over the arg-set kernel.
                     let __claspr_global: ::std::vec::Vec<usize> =
-                        ::claspr::LaunchSpec::global(&self.spec).to_vec();
+                        ::claspr::LaunchSpec::global(&__claspr_spec).to_vec();
                     let __claspr_local: ::std::vec::Vec<usize> =
-                        ::claspr::LaunchSpec::local(&self.spec)
+                        ::claspr::LaunchSpec::local(&__claspr_spec)
                             .map(|l| l.to_vec())
                             .unwrap_or_default();
                     // SAFETY: kernel valid + args set above; retained by the ctx.
@@ -1315,12 +1398,18 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
             #[allow(clippy::too_many_arguments)]
             #vis fn #name #method_gen_decl (
                 &self,
-                grid: impl ::claspr::IntoLaunchSpec,
+                // The GRID is a non-resource slot position too: accepts an
+                // `IntoLaunchSpec` literal (`[N]`, `([W],[L])`, …) OR a
+                // `slot!(Grid)` whose `Tag::Value = LaunchSpec`, both via
+                // `Into<ScalarInput<LaunchSpec>>`. Stored as
+                // `ScalarInput<LaunchSpec>` (read at execute), so the same graph can
+                // re-dispatch at a DIFFERENT grid across replays.
+                grid: impl ::core::convert::Into<::claspr::ScalarInput<::claspr::LaunchSpec>>,
                 #(#method_params),*
             ) -> #op_mod_ident::Op #gen_use {
                 #op_mod_ident::Op {
                     kernel: self.kernel(#kernel_name_lit),
-                    spec: ::claspr::IntoLaunchSpec::into_launch_spec(grid),
+                    spec: ::core::convert::Into::into(grid),
                     args: #op_args_tuple_init,
                     deps: ::std::vec::Vec::new(),
                     profile_cb: ::std::sync::Mutex::new(::core::option::Option::None),
@@ -1340,7 +1429,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 /// Owned and never aliased, so `clSetKernelArg` on it
                 /// can't race with any other launch.
                 pub kernel: ::claspr::Kernel,
-                pub spec: ::claspr::LaunchSpec,
+                /// The launch geometry as a NON-resource slot: `Concrete(spec)` for
+                /// a literal grid, or `Slot{..}` for a `slot!(Grid)`. Read (cloned)
+                /// at execute, so a bound grid persists across replays and can be
+                /// re-`mutate_bind`'d to re-dispatch at a different extent.
+                pub spec: ::claspr::ScalarInput<::claspr::LaunchSpec>,
                 pub args: #op_args_tuple_ty,
                 /// Caller-added wait-list events. Owned so the Op is
                 /// `Send` across executor threads — raw `cl_event`

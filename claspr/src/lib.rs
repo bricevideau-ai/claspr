@@ -166,13 +166,13 @@ pub use eager::{
     AndThenHost, AndThenHostWithContext, ArcSplit, BindAll, BindMode, Cell, Checkout, CopyTo2, Dep,
     Deps, DeviceDynOp, DeviceEnqueue, DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt,
     Download, ExecMode, FanOut, Fill, FillMapped, FromCheckout, ImageDownloadEager,
-    ImageUploadEager, Input, OnDevice, Pipe, ReadInto, SlotBinder, SlotCell, SlotEq, SlotHandle,
-    SlotState, Tag, ToInput, TransferToDevice, Upload, WriteDevice, WriteMapped, arc_split, arced,
-    bundle2, bundle3, bundle4, bundle5, bundle6, bundle7, bundle8, bundle9, bundle10, bundle11,
-    bundle12, bundle13, bundle14, bundle15, bundle16, deps_as_events, deps_into_single_event,
-    eager_copy_to, fan_out, fill_mapped, forward, image_download, image_upload, lift, read_into,
-    rehome_consumed, transfer_to_device, transfer_to_device_at, value, wrap_event, write,
-    write_mapped,
+    ImageUploadEager, Input, OnDevice, Pipe, ReadInto, ScalarInput, ScalarSlotCell,
+    ScalarSlotState, SlotBinder, SlotCell, SlotEq, SlotHandle, SlotState, SlotValue, Tag, ToInput,
+    TransferToDevice, Upload, WriteDevice, WriteMapped, arc_split, arced, bundle2, bundle3,
+    bundle4, bundle5, bundle6, bundle7, bundle8, bundle9, bundle10, bundle11, bundle12, bundle13,
+    bundle14, bundle15, bundle16, deps_as_events, deps_into_single_event, eager_copy_to, fan_out,
+    fill_mapped, forward, image_download, image_upload, lift, read_into, rehome_consumed,
+    transfer_to_device, transfer_to_device_at, value, wrap_event, write, write_mapped,
 };
 
 // Stage-3 proc-macro frontend.

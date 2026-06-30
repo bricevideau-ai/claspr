@@ -155,6 +155,38 @@ pub enum SlotState<T> {
 /// The four-state cell shared by a [`SlotHandle`] and its [`Input::Slot`].
 pub type SlotCell<T> = Arc<Mutex<SlotState<T>>>;
 
+// ── ScalarSlotState: the TWO-state cell for non-resource (scalar/launch) slots ─
+
+/// The simple, **two-state** cell for a NON-resource slot — a scalar kernel arg
+/// (`slot!(Factor)` in a `factor: u32` position) or a launch geometry
+/// (`slot!(Grid)` in the grid position).
+///
+/// A non-resource slot is fundamentally different from the four-state
+/// [`SlotState`] resource machine. Its value is `Copy`/`Clone`, has no `cl_mem`,
+/// and is **never handed back to the user** — there is no [`Checkout`], no
+/// lend/rehome/sever. At execute it is just **read** (cloned) into the launch, NOT
+/// taken/emptied, so it naturally persists across replays and is trivially
+/// re-readable. That removes the entire `Lent`/`Severed` half of the resource
+/// machine: a non-resource slot is only ever `Unbound` (completeness error at
+/// [`sync`](DeviceOpExt::sync)) or `Bound(value)` (read on every run).
+///
+/// Bind idempotency is by **value equality** ([`SlotEq`] over the scalar value /
+/// [`LaunchSpec`](crate::LaunchSpec) geometry), not handle identity: `bind(Factor(2))` twice is a
+/// no-op, `bind(Factor(9))` over a bound `Factor(2)` is a
+/// [`SlotConflict`](Error::SlotConflict) under `Set`, and `mutate_bind` overwrites.
+pub enum ScalarSlotState<V> {
+    /// **Virgin** — never bound. Resolved (read at execute) it is
+    /// [`Error::SlotUnbound`]; both verbs fill it.
+    Unbound,
+    /// Holds the value, **read (cloned) on every run** — never emptied. A bound
+    /// scalar/launch slot persists across replays for free.
+    Bound(V),
+}
+
+/// The two-state cell shared by a non-resource [`SlotHandle`] (built from
+/// `slot!(Tag)` in a scalar / launch position) and its [`ScalarInput::Slot`].
+pub type ScalarSlotCell<V> = Arc<Mutex<ScalarSlotState<V>>>;
+
 // ── SlotEq: "same buffer object" for the bind idempotency check ─────────────
 
 /// Pointer-identity equality for the [`bind`](DeviceOpExt::bind) idempotency
@@ -216,6 +248,149 @@ where
     }
 }
 
+// ── SlotEq for non-resource (scalar / launch) slot values ───────────────────
+//
+// A scalar or launch slot is NOT a buffer — it has no `cl_mem` handle, so its
+// `bind` idempotency leg is by **value equality** (`PartialEq`), not handle
+// identity. Two equal scalar bindings (`Factor(2)` twice) are an idempotent
+// no-op; a different one (`Factor(9)` over a bound `Factor(2)`) is a
+// `SlotConflict` under `Set`. This is the value-equality contract the
+// non-resource slot path needs — the same `SlotEq` trait, a different (and for a
+// `Copy` POD, cheaper) notion of "same".
+
+/// Value-equality [`SlotEq`] for the built-in scalar kernel-arg types: a scalar
+/// slot's "same binding" is byte/value equality (it has no buffer handle).
+macro_rules! impl_slot_eq_scalar {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl SlotEq for $t {
+                fn slot_eq(&self, other: &Self) -> bool {
+                    self == other
+                }
+            }
+        )*
+    };
+}
+impl_slot_eq_scalar!(i8, u8, i16, u16, i32, u32, i64, u64);
+// Floats compare bitwise so `NaN`-vs-`NaN` and `-0.0`-vs-`0.0` are decided
+// deterministically (a slot binding is "the same bytes I gave you", not IEEE
+// numeric equality) — and it sidesteps the `clippy::float_cmp` lint.
+impl SlotEq for f32 {
+    fn slot_eq(&self, other: &Self) -> bool {
+        self.to_bits() == other.to_bits()
+    }
+}
+impl SlotEq for f64 {
+    fn slot_eq(&self, other: &Self) -> bool {
+        self.to_bits() == other.to_bits()
+    }
+}
+
+/// Value-equality [`SlotEq`] for a launch-geometry slot: two specs are "the same"
+/// iff they dispatch identically (same global size, same local size, same
+/// dimensionality). [`LaunchSpec`](crate::LaunchSpec) is not `PartialEq`, so this
+/// compares its observable geometry.
+impl SlotEq for crate::LaunchSpec {
+    fn slot_eq(&self, other: &Self) -> bool {
+        self.dims() == other.dims()
+            && self.global() == other.global()
+            && self.local() == other.local()
+    }
+}
+
+// ── SlotValue: the shared-fill (clone-into-every-cell) capability ───────────
+
+/// Whether a tag's value can be **fanned out** — cloned into *every* matching
+/// slot cell by a single [`bind`](DeviceOpExt::bind) — and, if so, how.
+///
+/// This is the trait that resolves the shared-slot design fork (one tag, many
+/// positions, one bind fills ALL) WITHOUT forcing `Clone` on every value type:
+///
+/// - A **clone-able** value (a `Copy` scalar, a [`LaunchSpec`](crate::LaunchSpec),
+///   an `Arc<DeviceSlice>` read-only buffer) reports
+///   [`fill_clone`](SlotValue::fill_clone)`= Some(..)`: the [`SlotBinder`] fan-out
+///   leg clones it into each matching cell, so `slot!(W)` used at N sites is all
+///   filled by one `bind(W(v))`.
+/// - A **move-only** value (a bare [`DeviceSlice`] / [`MappedSlice`] /
+///   [`USMSlice`]) — which can't be in two cells at once — reports
+///   `fill_clone = None`. The binder then keeps its TAKE-ONCE move path: the first
+///   matching cell takes the value (single owner), so move-only single-site buffer
+///   slots behave **exactly as before** (no `Clone` bound forced on them, no
+///   regression). A move-only tag used at >1 site simply fills its first site and
+///   leaves the rest unbound — caught at `sync` as [`Error::SlotUnbound`], the
+///   honest "you can't share a move-only buffer" diagnostic.
+///
+/// `bind`/`mutate_bind` require `Tg::Value: SlotValue`. The trait is a small,
+/// **explicit** surface (NOT a `Clone` blanket — that would coherence-conflict
+/// with the move-only buffer impls, since Rust can't prove a buffer family is
+/// `!Clone`). Two helper macros populate it:
+/// - `impl_slot_value_clone!` for the fan-out (clone-able) value types — every
+///   `Copy` scalar, [`LaunchSpec`](crate::LaunchSpec), and `Arc<DeviceSlice>`.
+/// - `impl_slot_value_move!` for the move-only buffer families.
+pub trait SlotValue: Sized + Send + 'static {
+    /// Produce a boxed clone for filling **one** matching cell, or `None` if this
+    /// value is move-only (the binder then moves the single value into the first
+    /// matching cell — take-once). `Some(..)` enables the fill-all fan-out.
+    fn fill_clone(&self) -> Option<Box<dyn Any + Send>>;
+}
+
+/// Implement [`SlotValue`] for a **clone-able** value type — the fan-out path: one
+/// `bind` clones the value into every matching cell. Used for `Copy` scalars,
+/// [`LaunchSpec`](crate::LaunchSpec), and the read-only shared `Arc<DeviceSlice>`.
+macro_rules! impl_slot_value_clone {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl SlotValue for $t {
+                fn fill_clone(&self) -> Option<Box<dyn Any + Send>> {
+                    Some(Box::new(::core::clone::Clone::clone(self)))
+                }
+            }
+        )*
+    };
+}
+
+// The built-in scalar kernel-arg types — clone-able (`Copy`), so a scalar slot
+// fans out across sites. A user `#[repr(C)] Copy` scalar opts in the same way it
+// opts into `ScalarArg`: a `SlotValue`-aware extension of `scalar_arg!` is the
+// eventual sugar; for now a one-line `impl SlotValue` suffices.
+impl_slot_value_clone!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
+// The launch geometry as a single fan-out-able value.
+impl_slot_value_clone!(crate::LaunchSpec);
+
+/// `Arc<DeviceSlice>` is the read-only shared-buffer value: `Arc::clone` fans the
+/// SAME `cl_mem` out to every matching cell (the move-only-buffer-sharing path).
+impl<E, M> SlotValue for std::sync::Arc<DeviceSlice<E, M>>
+where
+    E: Send + Sync + 'static,
+    M: MemMode,
+{
+    fn fill_clone(&self) -> Option<Box<dyn Any + Send>> {
+        Some(Box::new(std::sync::Arc::clone(self)))
+    }
+}
+
+/// Implement [`SlotValue`] for a **move-only** buffer family: it can't be cloned
+/// into two cells, so it reports `None` (take-once move into the first matching
+/// cell). This is the single-site buffer-slot path, unchanged from before the
+/// shared-slot generalisation.
+macro_rules! impl_slot_value_move {
+    ($buf:ident) => {
+        impl<E, M> SlotValue for $crate::$buf<E, M>
+        where
+            E: Send + 'static,
+            M: $crate::MemMode,
+        {
+            fn fill_clone(&self) -> Option<Box<dyn Any + Send>> {
+                // Move-only: no clone. The binder takes the single value once.
+                None
+            }
+        }
+    };
+}
+impl_slot_value_move!(DeviceSlice);
+impl_slot_value_move!(MappedSlice);
+impl_slot_value_move!(USMSlice);
+
 // ── Typed slots: per-tag value type compile-time, presence runtime ─────────
 
 /// A compile-time **tag** naming a typed hole in a reusable graph. The tag *type*
@@ -270,32 +445,57 @@ pub enum BindMode {
 /// tag's `Value`), report whether they name the same buffer (handle identity).
 type SlotEqFn = Box<dyn Fn(&dyn Any, &dyn Any) -> bool + Send>;
 
+/// The type-erased clone-for-fill a [`SlotBinder`] captures when its value is a
+/// **fan-out** ([`SlotValue::fill_clone`]`= Some`) type: given the binder's boxed
+/// value (`&dyn Any` over the tag's `Value`), produce a fresh boxed clone to
+/// deposit into one matching cell. `None` on the binder means the value is
+/// move-only (take-once).
+type SlotCloneFn = Box<dyn Fn(&dyn Any) -> Option<Box<dyn Any + Send>> + Send>;
+
 /// A type-erased carrier for one `bind`/`mutate_bind` binding, folded into a
 /// graph's slot cells by [`bind_slots`](DeviceOp::bind_slots).
 ///
 /// Carries the tag's [`TypeId`], the [`BindMode`], the boxed value (`Box<dyn Any>`
 /// over the tag's `Value`), a type-erased [`SlotEq`] comparator (captured at `bind`
-/// time where `Tg::Value: SlotEq` is known), and an `outcome` slot threaded out of
-/// the fold (the verb-2×2 verdict). The tag `type_name` for diagnostics lives on
-/// the matched [`Input::Slot`] itself (the error sites read it there).
+/// time where `Tg::Value: SlotEq` is known), a type-erased [`SlotValue`] clone
+/// hook (captured the same way), and an `outcome` slot threaded out of the fold
+/// (the verb-2×2 verdict). The tag `type_name` for diagnostics lives on the
+/// matched [`Input::Slot`] itself (the error sites read it there).
 ///
-/// The binding **MOVES**: the first [`Input::Slot`] whose `id` matches applies the
-/// 2×2 against its [`SlotState`] (filling / no-op / overwriting, or recording a
-/// conflict / checked-out error into `outcome`), then clears the binder so a second
-/// matching cell sees nothing — a single buffer is single-owner, so a tag fills at
-/// most one slot occurrence per `bind`.
+/// ## Fill-all vs take-once — the shared-slot mechanism
+///
+/// How the binding lands depends on whether the value can be cloned
+/// ([`SlotValue::fill_clone`], captured into `clone`):
+///
+/// - **Fan-out (clone-able value):** a `Copy` scalar, [`LaunchSpec`](crate::LaunchSpec), or
+///   `Arc<DeviceSlice>`. The binder clones the value into **every** matching cell
+///   and is NEVER consumed — so `slot!(W)` used at N positions is all set by one
+///   `bind(W(v))`. The walk runs to completion (no early stop on
+///   [`is_consumed`](SlotBinder::is_consumed)).
+/// - **Take-once (move-only value):** a bare [`DeviceSlice`] / [`MappedSlice`] /
+///   [`USMSlice`]. A buffer is single-owner, so the FIRST matching cell MOVES the
+///   value out and the binder is consumed — identical to the pre-generalisation
+///   behaviour, so single-site move-only buffer slots are unchanged. (A move-only
+///   tag at >1 site fills only its first; the rest stay unbound → `SlotUnbound` at
+///   sync — the honest "you can't share a move-only buffer" diagnostic.)
 pub struct SlotBinder {
     id: TypeId,
     mode: BindMode,
-    /// `None` once a matching slot consumed it. `Box<dyn Any + Send>` holds the
-    /// tag's `Value` by value.
+    /// The boxed value (`Box<dyn Any + Send>` over the tag's `Value`). For a
+    /// **fan-out** binding it stays `Some` for the whole walk (each cell gets a
+    /// clone via [`clone`](Self::clone)); for a **move-only** binding it is
+    /// `take()`n into the first matching cell (then `None` = consumed).
     value: Option<Box<dyn Any + Send>>,
-    /// Pointer-identity comparison for the `bind` idempotency leg: given the
-    /// currently-`Bound` value and the new value (both as `&dyn Any` over
-    /// `Tg::Value`), reports whether they name the same buffer ([`SlotEq`]).
-    /// Captured at construction so the generic, `SlotEq`-free
+    /// Pointer-identity (buffer) OR value (scalar/launch) comparison for the `bind`
+    /// idempotency leg: given the currently-`Bound` value and the new value (both
+    /// as `&dyn Any` over `Tg::Value`), reports whether they are the "same" binding
+    /// ([`SlotEq`]). Captured at construction so the generic, `SlotEq`-free
     /// [`try_bind_slot`](Input::try_bind_slot) can invoke it.
     eq: SlotEqFn,
+    /// The fan-out clone hook ([`SlotValue::fill_clone`]). Returns `Some(box)` to
+    /// fill a cell WITHOUT consuming the binder (clone-able → fill-all), or `None`
+    /// to signal move-only (the binder then `take`s its single value once).
+    clone: SlotCloneFn,
     /// The verdict of applying this binder, threaded out of the type-erased fold.
     /// `Ok(())` until a matching slot records a conflict / checked-out error.
     outcome: Result<()>,
@@ -305,12 +505,13 @@ impl SlotBinder {
     /// Build a binder for tag `Tg` carrying `value` (moved), in [`BindMode`]
     /// `mode`. Use via [`DeviceOpExt::bind`] / [`DeviceOpExt::mutate_bind`].
     ///
-    /// `Tg::Value: SlotEq` so the idempotency comparator can be captured here (the
-    /// generic [`try_bind_slot`](Input::try_bind_slot) the macro calls carries no
-    /// such bound).
+    /// `Tg::Value: SlotEq` so the idempotency comparator can be captured here, and
+    /// `Tg::Value: SlotValue` so the fan-out clone hook can be too (both are
+    /// erased; the generic [`try_bind_slot`](Input::try_bind_slot) the macro calls
+    /// carries neither bound).
     pub fn new<Tg: Tag>(value: Tg::Value, mode: BindMode) -> Self
     where
-        Tg::Value: SlotEq,
+        Tg::Value: SlotEq + SlotValue,
     {
         SlotBinder {
             id: TypeId::of::<Tg>(),
@@ -328,13 +529,43 @@ impl SlotBinder {
                     _ => false,
                 }
             }),
+            clone: Box::new(|v: &dyn Any| {
+                // `v` is the binder's `Box<dyn Any>` over `Tg::Value`. Clone-able
+                // values (scalars/launch/Arc) yield `Some(box)` (fan-out fill);
+                // move-only buffers yield `None` (take-once).
+                v.downcast_ref::<Tg::Value>()
+                    .and_then(|val| <Tg::Value as SlotValue>::fill_clone(val))
+            }),
             outcome: Ok(()),
         }
     }
 
+    /// Produce a boxed clone of this binder's value for filling **one** cell, if the
+    /// value is a fan-out (clone-able) type. `None` ⇒ move-only (take-once path).
+    /// The binder stays armed either way; the caller decides whether to also
+    /// [`take`](Self::take_value) the value (move path).
+    fn fill_clone(&self) -> Option<Box<dyn Any + Send>> {
+        self.value.as_deref().and_then(|v| (self.clone)(v))
+    }
+
+    /// Take the binder's value out (the move-only, take-once path), marking it
+    /// consumed. Returns `None` if already taken.
+    fn take_value(&mut self) -> Option<Box<dyn Any + Send>> {
+        self.value.take()
+    }
+
+    /// Whether this binder fans out (clone into every matching cell, never
+    /// consumed) rather than moving once. Drives the `bind_slots` walk: a fan-out
+    /// binder must visit ALL cells (no early `is_consumed` stop).
+    pub fn is_fanout(&self) -> bool {
+        self.fill_clone().is_some()
+    }
+
     /// Whether the binding has already been deposited into (or rejected by) a
-    /// matching slot cell. `bind_slots` walks short-circuit on this (one `bind`
-    /// binds one cell), and the kernel-op codegen checks it before each arg.
+    /// matching slot cell — only ever `true` for a **move-only** (take-once)
+    /// binding once its single value has been moved out. A **fan-out** binding is
+    /// never consumed (it clones into every cell), so this stays `false`; walks
+    /// must gate early-stop on `!is_fanout() && is_consumed()`.
     pub fn is_consumed(&self) -> bool {
         self.value.is_none()
     }
@@ -1005,10 +1236,13 @@ impl<T> Input<T> {
     ///
     /// Equality is **buffer-handle identity** ([`SlotEq`], via the binder's captured
     /// comparator) — "the same buffer object", not byte-equal contents. After
-    /// applying (or rejecting) the binder is marked consumed so a later same-tag slot
-    /// in the same walk is left alone (a single buffer is single-owner). Errors are
-    /// threaded out via [`SlotBinder::outcome`]. Non-matching arms / tags are a
-    /// no-op.
+    /// applying (or rejecting) a **move-only** binder is marked consumed so a later
+    /// same-tag slot in the same walk is left alone (a single buffer is
+    /// single-owner). A **fan-out** binder (clone-able value — scalar / launch /
+    /// `Arc<DeviceSlice>`) is NOT consumed: it CLONES into this cell and stays armed
+    /// so every matching cell is filled by the one `bind` (the shared-slot path).
+    /// Errors are threaded out via [`SlotBinder::outcome`]. Non-matching arms / tags
+    /// are a no-op.
     pub fn try_bind_slot(&self, binder: &mut SlotBinder)
     where
         T: Send + 'static,
@@ -1019,18 +1253,37 @@ impl<T> Input<T> {
         if *id != binder.id {
             return;
         }
-        let Some(boxed) = binder.value.take() else {
-            return; // already consumed (or rejected) by an earlier matching slot
-        };
-        // Downcast the boxed value back to `T`. Type mismatch is impossible — a
-        // tag's `TypeId` (the matched `id`) pins its `Value` type, and the slot's
-        // `T == Tag::Value`. If it ever fired, put it back so a correctly-typed
-        // slot can still see it rather than silently swallowing the bind.
-        let new = match boxed.downcast::<T>() {
-            Ok(v) => *v,
-            Err(boxed) => {
-                binder.value = Some(boxed);
-                return;
+        // A move-only binder is consumed after its single value lands; bail. A
+        // fan-out binder never sets `value = None`, so it keeps filling cells.
+        if binder.value.is_none() {
+            return;
+        }
+
+        // Produce the value to deposit (only when we will actually fill): a fan-out
+        // binder CLONES (so it can fill the next cell too); a move-only binder TAKES
+        // its single value. `provide` is called at most once per cell, lazily, so an
+        // idempotent no-op / conflict / sever-reject path costs no clone or move.
+        // Returns `None` only on the impossible downcast mismatch (TypeId already
+        // pinned `T == Tag::Value`).
+        let fanout = binder.is_fanout();
+        let provide = |binder: &mut SlotBinder| -> Option<T> {
+            let boxed = if fanout {
+                // Clone into THIS cell; the binder stays armed for the rest.
+                binder.fill_clone()?
+            } else {
+                // Move the single value out; the binder is now consumed.
+                binder.take_value()?
+            };
+            match boxed.downcast::<T>() {
+                Ok(v) => Some(*v),
+                // Downcast can't fail (TypeId matched). If it ever did and we had
+                // TAKEN the value, put it back so a correctly-typed slot can see it.
+                Err(boxed) => {
+                    if !fanout {
+                        binder.value = Some(boxed);
+                    }
+                    None
+                }
             }
         };
 
@@ -1039,39 +1292,55 @@ impl<T> Input<T> {
             // Virgin — never bound. Both verbs fill it (a `bind` is the slot's
             // first declaration).
             SlotState::Unbound => {
-                *guard = SlotState::Bound(new);
+                if let Some(new) = provide(binder) {
+                    *guard = SlotState::Bound(new);
+                }
             }
             // Severed — was bound, the caller took its value via `into_inner`.
-            // Re-providing a buffer is a *change*, not a first declaration: the
+            // Re-providing a value is a *change*, not a first declaration: the
             // set-once `bind` rejects it (it must not silently re-fill a slot whose
             // value the caller deliberately extracted); only `mutate_bind` re-arms.
+            // (A non-resource scalar/launch slot never reaches `Severed` — it is
+            // never lent/checked-out — so this arm is buffer-only in practice.)
             SlotState::Severed => match binder.mode {
                 BindMode::Set => {
                     binder.outcome = Err(Error::SlotSevered(name));
                 }
                 BindMode::Mutate => {
-                    *guard = SlotState::Bound(new);
+                    if let Some(new) = provide(binder) {
+                        *guard = SlotState::Bound(new);
+                    }
                 }
             },
             SlotState::Bound(cur) => match binder.mode {
                 BindMode::Set => {
-                    // Idempotent on the SAME buffer object; conflict on a different
-                    // one. Equality is the binder's captured `SlotEq` comparator
-                    // (handle identity), applied to `cur` vs `new` as `&dyn Any`.
-                    if (binder.eq)(cur as &dyn Any, &new as &dyn Any) {
-                        // no-op: the caller re-handed us the buffer we already hold.
+                    // Idempotent on the SAME value (buffer handle identity, or scalar
+                    // value equality); conflict on a different one. Equality is the
+                    // binder's captured `SlotEq` comparator, applied to `cur` vs the
+                    // binder's value as `&dyn Any` — WITHOUT consuming the value, so
+                    // an idempotent no-op neither clones nor moves.
+                    let same = binder
+                        .value
+                        .as_deref()
+                        .map(|v| (binder.eq)(cur as &dyn Any, v))
+                        .unwrap_or(false);
+                    if same {
+                        // no-op: the caller re-handed us the value we already hold.
                     } else {
                         binder.outcome = Err(Error::SlotConflict(name));
                     }
                 }
                 BindMode::Mutate => {
-                    // Overwrite: the prior buffer drops here.
-                    *guard = SlotState::Bound(new);
+                    // Overwrite: the prior value drops here.
+                    if let Some(new) = provide(binder) {
+                        *guard = SlotState::Bound(new);
+                    }
                 }
             },
-            // The buffer is in the caller's hands (a live `Checkout`). Re-binding
+            // The value is in the caller's hands (a live `Checkout`). Re-binding
             // would let the Checkout's drop rehome the OLD buffer over the NEW one
-            // — a silent clobber — so BOTH verbs hard-error.
+            // — a silent clobber — so BOTH verbs hard-error. (Buffer slots only;
+            // non-resource slots are never `Lent`.)
             SlotState::Lent => {
                 binder.outcome = Err(Error::SlotCheckedOut(name));
             }
@@ -1090,6 +1359,146 @@ impl<T> From<Pipe<T>> for Input<T> {
         Input::Pipe(p)
     }
 }
+
+// ── ScalarInput<V>: a non-resource (scalar / launch) kernel input ───────────
+
+/// A by-value kernel input that can be a plain literal OR an unbound non-resource
+/// slot — the scalar/launch analogue of [`Input<T>`] (which is for move-only
+/// resources: buffers / images).
+///
+/// Two states, mirroring how a scalar reaches a kernel:
+/// - [`Concrete`](ScalarInput::Concrete): a plain value passed at build (the
+///   common case — `scale_u32([N], buf, 2u32)` stores `Concrete(2)`).
+/// - [`Slot`](ScalarInput::Slot): an unbound `slot!(Tag)` hole, filled by a later
+///   [`bind`](DeviceOpExt::bind)`(Tag(value))`. Its cell is the **two-state**
+///   [`ScalarSlotCell`] — `Unbound`/`Bound` only, NO resource machine.
+///
+/// At execute the value is **read (cloned)**, never lent: [`read`](Self::read)
+/// returns `V` by clone for both arms, so a bound slot is re-read on every replay
+/// (no re-bind needed) and a `Concrete` literal is reusable too. `V: Clone` is the
+/// one bound the by-value path needs (every scalar / [`LaunchSpec`](crate::LaunchSpec) satisfies it).
+pub enum ScalarInput<V> {
+    /// A plain value bound at construction.
+    Concrete(V),
+    /// An unbound (or later-bound) non-resource slot — `slot!(Tag)` in a scalar /
+    /// launch position. `id`/`name` are the tag's `TypeId`/`type_name` for matching
+    /// and diagnostics; `cell` is the two-state [`ScalarSlotCell`].
+    Slot {
+        /// `TypeId::of::<Tag>()` — the bind-matching key.
+        id: TypeId,
+        /// `type_name::<Tag>()` — for the unbound-slot / conflict diagnostics.
+        name: &'static str,
+        /// Two-state cell: [`Unbound`](ScalarSlotState::Unbound) until a matching
+        /// bind deposits the value ([`Bound`](ScalarSlotState::Bound)).
+        cell: ScalarSlotCell<V>,
+    },
+}
+
+impl<V: Clone> ScalarInput<V> {
+    /// **Read** the value for one run (clone — NOT lend, NOT take): a `Concrete`
+    /// clones its stored value; a `Slot` clones its [`Bound`](ScalarSlotState::Bound)
+    /// value or, while [`Unbound`](ScalarSlotState::Unbound), is
+    /// [`Error::SlotUnbound`] (the completeness check, fired at execute). The cell
+    /// is left intact, so the next replay re-reads the same value for free.
+    pub fn read(&self) -> Result<V> {
+        match self {
+            ScalarInput::Concrete(v) => Ok(v.clone()),
+            ScalarInput::Slot { name, cell, .. } => match &*cell.lock().unwrap() {
+                ScalarSlotState::Bound(v) => Ok(v.clone()),
+                ScalarSlotState::Unbound => Err(Error::SlotUnbound(name)),
+            },
+        }
+    }
+}
+
+impl<V: Send + 'static> ScalarInput<V> {
+    /// Apply a [`SlotBinder`] to this non-resource input, IFF it is a
+    /// [`Slot`](ScalarInput::Slot) whose `id` matches the binder's tag — the
+    /// two-state analogue of [`Input::try_bind_slot`].
+    ///
+    /// | state       | [`Set`](BindMode::Set)                       | [`Mutate`](BindMode::Mutate) |
+    /// |-------------|----------------------------------------------|------------------------------|
+    /// | `Unbound`   | fill → `Bound`                               | fill → `Bound`               |
+    /// | `Bound`, `==` | no-op (idempotent, value equality)         | overwrite                    |
+    /// | `Bound`, `!=` | record [`SlotConflict`](Error::SlotConflict) | overwrite                  |
+    ///
+    /// There is no `Lent`/`Severed` row: a scalar/launch value is never lent or
+    /// severed (it is read by clone, never handed out), so the resource-machine
+    /// errors ([`SlotCheckedOut`](Error::SlotCheckedOut) /
+    /// [`SlotSevered`](Error::SlotSevered)) cannot arise here. Equality is by
+    /// **value** ([`SlotEq`] over the scalar / [`LaunchSpec`](crate::LaunchSpec)).
+    ///
+    /// Fan-out is automatic: a scalar/launch value is clone-able
+    /// ([`SlotValue::fill_clone`]`= Some`), so the binder clones into this cell and
+    /// stays armed — one `bind(Grid(g))` fills EVERY `slot!(Grid)` site.
+    pub fn try_bind_slot(&self, binder: &mut SlotBinder) {
+        let ScalarInput::Slot { id, name, cell } = self else {
+            return;
+        };
+        if *id != binder.id {
+            return;
+        }
+        if binder.value.is_none() {
+            return; // a consumed move-only binder (never happens for a clone-able
+            // scalar value, but keeps the guard uniform with the resource path).
+        }
+
+        // Same fan-out-vs-move discipline as `Input::try_bind_slot`, but a scalar
+        // value is always clone-able, so this is effectively always the clone path.
+        let fanout = binder.is_fanout();
+        let provide = |binder: &mut SlotBinder| -> Option<V> {
+            let boxed = if fanout {
+                binder.fill_clone()?
+            } else {
+                binder.take_value()?
+            };
+            match boxed.downcast::<V>() {
+                Ok(v) => Some(*v),
+                Err(boxed) => {
+                    if !fanout {
+                        binder.value = Some(boxed);
+                    }
+                    None
+                }
+            }
+        };
+
+        let mut guard = cell.lock().unwrap();
+        match &*guard {
+            ScalarSlotState::Unbound => {
+                if let Some(new) = provide(binder) {
+                    *guard = ScalarSlotState::Bound(new);
+                }
+            }
+            ScalarSlotState::Bound(cur) => match binder.mode {
+                BindMode::Set => {
+                    // Idempotent on an equal value; conflict on a different one.
+                    let same = binder
+                        .value
+                        .as_deref()
+                        .map(|v| (binder.eq)(cur as &dyn Any, v))
+                        .unwrap_or(false);
+                    if same {
+                        // no-op: the caller re-handed us the value we already hold.
+                    } else {
+                        binder.outcome = Err(Error::SlotConflict(name));
+                    }
+                }
+                BindMode::Mutate => {
+                    if let Some(new) = provide(binder) {
+                        *guard = ScalarSlotState::Bound(new);
+                    }
+                }
+            },
+        }
+    }
+}
+
+// `ScalarInput<V>` is built from a plain value / grid literal / `slot!(Tag)` via
+// the per-type `From` impls under "ToScalarInput" below (NOT a blanket `From<V>`,
+// which would coherence-clash with the `SlotHandle` conversion). The macro routes
+// scalar / grid positions through `Into<ScalarInput<#ty>>`, which preserves
+// integer-literal inference (`fill_u32([N], buf, 5)` infers `5: u32`).
 
 // ── SlotHandle: the value a `slot!(Tag)` produces ──────────────────────────
 
@@ -1128,6 +1537,21 @@ impl<Tg: Tag> SlotHandle<Tg> {
             id: self.id,
             name: self.name,
             cell: self.cell,
+        }
+    }
+
+    /// Consume the handle into a non-resource [`ScalarInput::Slot`] (a scalar /
+    /// launch position). The handle's four-state [`SlotCell`] is the resource
+    /// machinery a scalar slot does NOT need, so it is dropped here and a fresh
+    /// **two-state** [`ScalarSlotCell`] is minted in its place; only the tag's
+    /// `id`/`name` carry over. (The wasted `Arc` alloc keeps `slot!(Tag)` uniform
+    /// across buffer and scalar positions — a single spelling, dispatched by the
+    /// position's `ToInput` vs `ToScalarInput` trait.)
+    fn into_scalar_input(self) -> ScalarInput<Tg::Value> {
+        ScalarInput::Slot {
+            id: self.id,
+            name: self.name,
+            cell: Arc::new(Mutex::new(ScalarSlotState::Unbound)),
         }
     }
 }
@@ -1217,6 +1641,94 @@ where
     type Buf = Tg::Value;
     fn to_input(self) -> Input<Tg::Value> {
         self.into_input()
+    }
+}
+
+// ── ToScalarInput: a non-resource (scalar / launch) arg, value-or-slot ──────
+//
+// The scalar / launch-arg analogue of [`ToInput`]. The macro-emitted kernel
+// method takes each SCALAR arg (and the GRID) as `impl Into<ScalarInput<#ty>>`
+// and stores the resulting `ScalarInput<#ty>`. Two source shapes convert in:
+//   - a plain value (`u32`, a grid literal `[N]`, …) → `Concrete`.
+//   - a `slot!(Tag)` (`SlotHandle<Tg>`) → an unbound two-state `Slot`.
+// so BOTH `scale_u32([N], buf, 2u32)` and `scale_u32([N], buf, slot!(Factor))`
+// type-check in the scalar position, and both `kernels.k([N], …)` and
+// `kernels.k(slot!(Grid), …)` in the grid position.
+//
+// The bound is `Into<ScalarInput<#ty>>` (NOT a custom trait with a projected
+// `Val`): an `Into<Target>` bound drives integer-literal inference — a bare `5` in
+// `fill_u32([N], buf, 5)` resolves to `u32` because `From<u32> for
+// ScalarInput<u32>` is the only `From` whose source unifies with `{integer}`. A
+// projected-associated-type trait (`ToScalarInput<Val = u32>`) would NOT — the
+// literal defaults to `i32` first and then fails the `Val` check.
+//
+// Per-type `From` impls (NOT a blanket `From<V>`) keep them disjoint from the
+// `SlotHandle<Tg>` conversion under coherence (a `SlotHandle` is never a plain
+// scalar value / grid literal).
+
+/// A `slot!(Tag)` in a scalar / launch position → an unbound two-state
+/// [`ScalarInput::Slot`]. Distinct nominal source type from the per-value `From`
+/// impls below, so the two stay disjoint under coherence.
+impl<Tg> From<SlotHandle<Tg>> for ScalarInput<Tg::Value>
+where
+    Tg: Tag,
+{
+    fn from(handle: SlotHandle<Tg>) -> Self {
+        handle.into_scalar_input()
+    }
+}
+
+/// `From<scalar> for ScalarInput<scalar>` — a plain value in a scalar position →
+/// [`ScalarInput::Concrete`]. Per-type (not a `impl<V>` blanket) so it stays
+/// disjoint from the `SlotHandle<Tg>` conversion. A user `#[repr(C)] Copy` scalar
+/// opts in with the same one-liner (alongside its [`ScalarArg`](crate::ScalarArg) /
+/// [`SlotValue`] / [`SlotEq`] impls).
+macro_rules! impl_from_scalar_input_value {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl From<$t> for ScalarInput<$t> {
+                fn from(v: $t) -> Self {
+                    ScalarInput::Concrete(v)
+                }
+            }
+        )*
+    };
+}
+impl_from_scalar_input_value!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64);
+
+/// `From<grid-literal> for ScalarInput<LaunchSpec>` — a launch-geometry literal
+/// (`[N]`, `([W], [L])`, a [`LaunchSpec`](crate::LaunchSpec)) → a
+/// [`ScalarInput::Concrete`] over the built [`LaunchSpec`](crate::LaunchSpec). Converts the geometry
+/// to its canonical form so a `slot!(Grid)` (carrying a `LaunchSpec`) and a literal
+/// grid share one resolved type. Per-type over the
+/// [`IntoLaunchSpec`](crate::IntoLaunchSpec) literal shapes, disjoint from
+/// `SlotHandle`.
+macro_rules! impl_from_scalar_input_grid {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl From<$t> for ScalarInput<crate::LaunchSpec> {
+                fn from(g: $t) -> Self {
+                    ScalarInput::Concrete(crate::IntoLaunchSpec::into_launch_spec(g))
+                }
+            }
+        )*
+    };
+}
+impl_from_scalar_input_grid!(
+    [usize; 1],
+    [usize; 2],
+    [usize; 3],
+    ([usize; 1], [usize; 1]),
+    ([usize; 2], [usize; 2]),
+    ([usize; 3], [usize; 3]),
+);
+// `LaunchSpec` itself: the reflexive value path (and what a bound `slot!(Grid)`
+// carries). Kept out of the macro above so it doesn't collide with the std
+// reflexive `From<T> for T` (here source = target = `ScalarInput<LaunchSpec>`? no —
+// source is `LaunchSpec`, target `ScalarInput<LaunchSpec>`, so it's a normal impl).
+impl From<crate::LaunchSpec> for ScalarInput<crate::LaunchSpec> {
+    fn from(spec: crate::LaunchSpec) -> Self {
+        ScalarInput::Concrete(spec)
     }
 }
 
@@ -1688,7 +2200,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// needs a node that re-exposes the bound graph's output pipe.
     fn bind<Tg: Tag>(&self, tag: Tg) -> Result<&Self>
     where
-        Tg::Value: SlotEq,
+        Tg::Value: SlotEq + SlotValue,
     {
         self.fold_bind::<Tg>(tag.into_value(), BindMode::Set)
     }
@@ -1717,7 +2229,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// implemented here.
     fn mutate_bind<Tg: Tag>(&self, tag: Tg) -> Result<&Self>
     where
-        Tg::Value: SlotEq,
+        Tg::Value: SlotEq + SlotValue,
     {
         self.fold_bind::<Tg>(tag.into_value(), BindMode::Mutate)
     }
@@ -1729,7 +2241,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// surface the verb-2×2 verdict ([`SlotBinder::outcome`]).
     fn fold_bind<Tg: Tag>(&self, value: Tg::Value, mode: BindMode) -> Result<&Self>
     where
-        Tg::Value: SlotEq,
+        Tg::Value: SlotEq + SlotValue,
     {
         let mut binder = SlotBinder::new::<Tg>(value, mode);
         self.bind_slots(&mut binder);
@@ -2047,7 +2559,7 @@ macro_rules! impl_bind_all_tuple {
     ($($name:ident),+ $(,)?) => {
         impl<$($name),+> BindAll for ($($name,)+)
         where
-            $( $name: Tag, $name::Value: SlotEq, )+
+            $( $name: Tag, $name::Value: SlotEq + SlotValue, )+
         {
             #[allow(non_snake_case)]
             fn bind_all<Op: DeviceOp>(self, g: &Op) -> Result<()> {
@@ -2440,10 +2952,12 @@ where
     }
 
     fn bind_slots(&self, binder: &mut SlotBinder) {
-        // Walk source then next (execution order). Stop early once the value has
-        // landed in a matching slot — a single `bind` binds one cell.
+        // Walk source then next (execution order). A move-only binder stops once its
+        // single value has landed (one `bind` binds one cell); a fan-out binder
+        // (clone-able value — scalar / launch / `Arc`) NEVER stops, so one `bind`
+        // fills EVERY matching cell across both subtrees (the shared-slot path).
         self.source.bind_slots(binder);
-        if binder.is_consumed() {
+        if !binder.is_fanout() && binder.is_consumed() {
             return;
         }
         self.next.bind_slots(binder);

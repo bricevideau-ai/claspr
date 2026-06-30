@@ -9,6 +9,44 @@ items resolve.
 
 ## Active
 
+### ✅ Slot generalization: scalar + launch + shared slots — 2026-06-30 (branch `typed-slots`, UNCOMMITTED)
+
+`slot!(Tag)` now fills THREE new positions beyond buffer/image kernel args:
+
+- **(A) scalar args** — `slot!(Factor)` in a `factor: u32` position. NON-resource:
+  rides a new TWO-state cell `ScalarSlotState{Unbound,Bound}` (`eager.rs`), value
+  read (cloned) at execute (never lent/severed → no `Checkout`, no 4-state machine),
+  idempotency by VALUE equality (`SlotEq` for scalars = `==` / float `to_bits`).
+- **(B) launch args** — `slot!(Grid)` in the grid position, `Tag::Value =
+  LaunchSpec`. Same 2-state path; re-dispatch the same graph at a different extent.
+- **(C) shared slots** — one tag, many sites, ONE bind fills ALL. `SlotBinder` now
+  carries a `SlotValue` clone hook: clone-able values (scalar / `LaunchSpec` /
+  `Arc<DeviceSlice>`) FAN OUT (clone into every matching cell, binder never
+  consumed); move-only buffers stay TAKE-ONCE (first cell moves, binder consumed) —
+  so move-only single-site buffer slots are unchanged (no `Clone` forced). `SlotValue`
+  is an explicit per-type surface (NOT a `Clone` blanket — would coherence-clash
+  with move-only buffer impls). Walk short-circuits gated on `!is_fanout() &&
+  is_consumed()`.
+
+New types (`eager.rs`): `ScalarSlotState`/`ScalarSlotCell`, `ScalarInput<V>`
+(`Concrete`/`Slot`, `read()`+`try_bind_slot`), `SlotValue`. Macro (`claspr-macros`):
+scalar args → `impl Into<ScalarInput<#ty>>` (the `Into` bound preserves bare-literal
+inference, e.g. `fill_u32([N], buf, 5)` infers `5: u32`); grid → `impl
+Into<ScalarInput<LaunchSpec>>` stored as `ScalarInput<LaunchSpec>` on `Op.spec`.
+Per-type `From` impls for scalar values + grid literals + `SlotHandle<Tg>`.
+Non-resource (scalar/grid) slots are READ BEFORE buffers lend in execute, so a failed
+completeness check can't strand a buffer slot in `Lent`. `launch.rs`: `From<[usize;N]>
+for LaunchSpec`.
+
+Tests: new `tests/tier2/tests/slot_generalization.rs` (9 tests, all green). Full
+tier2 sweep green; `safety_compile_fail` 9/9; `image_compile_fail` 11/11. (The two
+`image_dispatch` failures on this box are the PRE-EXISTING PoCL 6.0 `write_imagei`
+linker bug — verified identical on baseline, unrelated.)
+
+DEFERRED: user `#[repr(C)] Copy` scalar types need manual `SlotValue`+`SlotEq`+`From<T>
+for ScalarInput<T>` impls (a `scalar_slot_arg!` sugar macro is the obvious follow-up,
+mirroring `scalar_arg!`). Whole-`LaunchSpec`-as-one-tag only (no per-dimension slot).
+
 ### ✅ Double-buffering (ping-pong) integration test — 2026-06-30 (branch `typed-slots`, UNCOMMITTED, staged)
 
 New `tests/tier2/tests/double_buffering.rs` — the canonical `mutate_bind` test.

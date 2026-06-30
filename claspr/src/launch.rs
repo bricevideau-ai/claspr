@@ -514,6 +514,26 @@ impl IntoLaunchSpec for LaunchSpec {
     }
 }
 
+// `From` conversions for the global-only shapes, so a `LaunchSpec` value is easy
+// to mint where one is needed by value (e.g. binding a `slot!(Grid)` whose
+// `Tag::Value = LaunchSpec`: `Grid(LaunchSpec::from([N]))`). These mirror the
+// `IntoLaunchSpec` array impls.
+impl From<[usize; 1]> for LaunchSpec {
+    fn from(g: [usize; 1]) -> Self {
+        g.into_launch_spec()
+    }
+}
+impl From<[usize; 2]> for LaunchSpec {
+    fn from(g: [usize; 2]) -> Self {
+        g.into_launch_spec()
+    }
+}
+impl From<[usize; 3]> for LaunchSpec {
+    fn from(g: [usize; 3]) -> Self {
+        g.into_launch_spec()
+    }
+}
+
 impl IntoLaunchSpec for [usize; 1] {
     fn into_launch_spec(self) -> LaunchSpec {
         LaunchSpec {
