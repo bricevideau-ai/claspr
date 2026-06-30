@@ -101,7 +101,7 @@ pub mod transfer;
 pub use access::{
     DeviceScratch, FillStrategy, Fillable, Frozen, HostAccess, HostReadOnly, HostReadable,
     HostUploadable, HostWritable, KernelAccess, KernelReadable, KernelWritable, MemMode, ReadOnly,
-    ReadWrite, RuntimeFillable, WriteOnly,
+    ReadWrite, RuntimeFillable, UploadReseed, WriteOnly,
 };
 pub use buffer::{
     Buffer, DeviceMapMutOp, DeviceMapOp, DeviceMapReadPending, DeviceMapWritePending,
@@ -171,7 +171,8 @@ pub use eager::{
     bundle2, bundle3, bundle4, bundle5, bundle6, bundle7, bundle8, bundle9, bundle10, bundle11,
     bundle12, bundle13, bundle14, bundle15, bundle16, deps_as_events, deps_into_single_event,
     eager_copy_to, fan_out, fill_mapped, forward, image_download, image_upload, lift, read_into,
-    transfer_to_device, transfer_to_device_at, value, wrap_event, write, write_mapped,
+    rehome_consumed, transfer_to_device, transfer_to_device_at, value, wrap_event, write,
+    write_mapped,
 };
 
 // Stage-3 proc-macro frontend.

@@ -1093,6 +1093,21 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     let #bind_slots_args_pat = &self.args;
                     #(#input_bind_slots)*
                 }
+
+                fn reclaim_undelivered(&self) {
+                    // Drain + rehome every element pipe that an `and_then` closure
+                    // DISCARDED (kept only some outputs): each undelivered homed
+                    // buffer returns to its origin cell so the reused graph's
+                    // upstream re-lends it next run. Pipes already drained by a
+                    // terminal Checkout / downstream consumer are no-ops.
+                    #(
+                        if let ::core::option::Option::Some((__v, _d, __h)) =
+                            self.#op_pipe_fields.take_home()
+                        {
+                            ::claspr::rehome_consumed(__v, __h);
+                        }
+                    )*
+                }
             }
         }
     } else {

@@ -383,6 +383,25 @@ pub trait Rehome<Out>: Send {
 /// `Input` / `Checkout` signatures stay readable.
 pub type BoxedHome<Out> = Box<dyn Rehome<Out>>;
 
+/// Return a buffer CONSUMED by an op (read into a host `Vec`, never carried onward
+/// in a pipe) to its home, or release it if homeless. The general
+/// [`PipePayload`] drop handles values that flow THROUGH a pipe; a consuming op
+/// (e.g. [`download`]) instead splits the buffer from its output value, so it
+/// rehomes the buffer directly here. `home == None` ⇒ a minted buffer with no
+/// origin cell, which simply drops (releasing its `cl_mem`).
+///
+/// `pub` + `#[doc(hidden)]`: the `#[kernel]` proc-macro emits
+/// `::claspr::rehome_consumed(...)` inside the *user's* crate for multi-output
+/// kernels' `reclaim_undelivered`, so it must be reachable cross-crate. Not part
+/// of the stable surface.
+#[doc(hidden)]
+pub fn rehome_consumed<T>(buf: T, home: Option<BoxedHome<T>>) {
+    if let Some(home) = home {
+        home.rehome(buf);
+    }
+    // else: homeless → `buf` drops here, releasing it.
+}
+
 /// Identity rehome: an output returns to a cell of its own type (the in-place
 /// case — fill/scale/kernel-buffer-arg/copy's same-typed sides). This is the
 /// behaviour the old `Option<Cell<T>>` home had, now expressed through the trait.
@@ -395,57 +414,41 @@ impl<T: Send> Rehome<T> for Cell<T> {
 }
 
 /// The return home for a **slot** input — distinct from the concrete
-/// [`Cell<T>: Rehome`] home because the slot's tri-state needs all three exits.
+/// [`Cell<T>: Rehome`] home because the slot's tri-state needs two distinct exits.
 ///
 /// A slot cell is the tri-state [`SlotCell<T>`]; while a run is in flight it sits
 /// in [`Lent`](SlotState::Lent). This home owns a clone of that cell and resolves
-/// the three terminal transitions:
-/// - [`rehome`](Rehome::rehome) (Checkout drop, re-arm): `Lent → Bound(value)`.
+/// the two terminal transitions:
+/// - [`rehome`](Rehome::rehome) (Checkout drop OR undelivered/consumed buffer,
+///   re-arm): `Lent → Bound(value)`. Under "homeless is never legitimate", a slot
+///   buffer that is produced and not handed out — including the
+///   [`download`]-consumed case (the device buffer is returned even though the
+///   output is a host `Vec`) — is RETURNED to its slot with a stable handle, NOT
+///   severed. This rehome fires from the general [`PipePayload`] drop, from
+///   [`Checkout`] drop, or directly from a consuming op via
+///   [`rehome_consumed`] — one and only one, because [`BoxedHome`] is not `Clone`.
 /// - [`sever`](Rehome::sever) (`into_inner`, keep the value): `Lent → Unbound`.
-/// - **dropped without firing** (the lent buffer was CONSUMED downstream — e.g. a
-///   `download` that turns the buffer into a host `Vec`, so its pipe carries no
-///   home back to the slot): `Lent → Unbound`. Without this, a consumed slot would
-///   be stuck in `Lent` forever and any later `bind`/`mutate_bind` would wrongly
-///   report [`Error::SlotCheckedOut`]. Handled by the [`Drop`] impl, which fires
-///   ONLY when neither `rehome` nor `sever` ran (`fired == false`).
+///   The ONLY path that empties a slot cell.
 ///
-/// (A concrete `Cell` needs none of this: its empty state is overloaded, so its
-/// `sever` is a no-op and a dropped concrete home is fine. The slot's third state
-/// is exactly what distinguishes "checked out" from "consumed / never bound".)
+/// (A concrete `Cell` needs no `sever` override: its empty state is overloaded, so
+/// its `sever` is a no-op. The slot's third state is what distinguishes "checked
+/// out / re-armable" from "severed / never bound" — and there is now no
+/// drop-without-firing fallback: the general payload-drop rule rehomes any
+/// undelivered slot buffer, so a slot is never left stuck in `Lent`.)
 struct SlotHome<T> {
     cell: SlotCell<T>,
-    /// Set once `rehome`/`sever` has resolved the state, so the `Drop` fallback
-    /// does not stomp it. A `Box<Self>`'s method takes ownership and then the box
-    /// drops, running `Drop` after the method body — the flag tells `Drop` the
-    /// transition already happened.
-    fired: bool,
 }
 
 impl<T: Send> Rehome<T> for SlotHome<T> {
-    fn rehome(mut self: Box<Self>, value: T) {
-        // Re-arm: the lent buffer (possibly transformed in place) comes back.
+    fn rehome(self: Box<Self>, value: T) {
+        // Re-arm: the lent buffer (possibly transformed in place, or consumed into
+        // a host Vec by a download whose home channel still carries it back) comes
+        // back to its slot with a STABLE handle.
         *self.cell.lock().unwrap() = SlotState::Bound(value);
-        self.fired = true;
     }
-    fn sever(mut self: Box<Self>) {
+    fn sever(self: Box<Self>) {
         // The caller kept the value (`into_inner`); the slot is genuinely empty.
         *self.cell.lock().unwrap() = SlotState::Unbound;
-        self.fired = true;
-    }
-}
-
-impl<T> Drop for SlotHome<T> {
-    fn drop(&mut self) {
-        // Fallback ONLY when neither rehome nor sever ran: the lent buffer was
-        // consumed downstream (its pipe carried no home back here), so the slot is
-        // genuinely empty again — `Lent → Unbound`. Guarded by `fired` so the
-        // post-method drop of a `rehome`/`sever`'d home is a no-op.
-        if !self.fired {
-            let mut guard = self.cell.lock().unwrap();
-            if matches!(&*guard, SlotState::Lent) {
-                *guard = SlotState::Unbound;
-            }
-        }
     }
 }
 
@@ -478,10 +481,45 @@ pub struct Pipe<T> {
 /// Most producers mint fresh values, so home defaults to `None`: [`Pipe::put`]
 /// stores `None`, and the home-carrying [`Pipe::put_home`] /
 /// [`Pipe::take_home`] are used only on the in-place paths and at the terminal.
+///
+/// ## "Homeless is never legitimate": rehome on undelivered drop
+///
+/// A payload OWNS its home, and its [`Drop`] is the general enforcement of the
+/// invariant: if a payload still holds BOTH a value AND a home when it drops —
+/// i.e. the value was produced mid-graph but never handed onward (no downstream
+/// op moved it out, no terminal built a [`Checkout`] from it) — the value is a
+/// homed buffer about to be released. That is exactly what the invariant
+/// forbids: the `Drop` instead [`rehome`](Rehome::rehome)s it to its origin
+/// cell, so a reused graph re-runs with the SAME backing handle.
+///
+/// Both `value` and `home` are `Option` so the move-out drains
+/// ([`take_home`](Pipe::take_home) for the value-AND-home transfer; an upstream
+/// in-place op forwarding via [`put_home`](Pipe::put_home)) can pull them out
+/// in place, leaving the emptied payload to drop as a harmless no-op. The
+/// **disarm signal is "home moved out"**: once a payload's home is `None` (it
+/// was forwarded into the next payload, or into a `Checkout`), its `Drop` does
+/// nothing — the new owner is now responsible for the eventual rehome. Because
+/// [`BoxedHome`] is not `Clone`, the home lives in exactly one place at a time,
+/// so the rehome fires from exactly one drop — never double.
 struct PipePayload<T> {
-    value: T,
+    value: Option<T>,
     deps: Deps,
     home: Option<BoxedHome<T>>,
+}
+
+impl<T> Drop for PipePayload<T> {
+    fn drop(&mut self) {
+        // The invariant's catch-all: a value produced mid-graph but never
+        // delivered (no downstream `take_home`, no terminal `Checkout`) and still
+        // carrying a home must be RETURNED to its origin cell, not released. If the
+        // home was already moved out (forwarded downstream / into a Checkout), this
+        // is a no-op — the new owner now owns the rehome obligation.
+        if let (Some(value), Some(home)) = (self.value.take(), self.home.take()) {
+            home.rehome(value);
+        }
+        // else: a homeless payload (minted, nothing to return) or one whose value
+        // and/or home were already drained — nothing to rehome.
+    }
 }
 
 impl<T> Clone for Pipe<T> {
@@ -516,8 +554,14 @@ impl<T> Pipe<T> {
     /// on `Checkout` drop (re-arming the graph). Used by in-place ops, which pass
     /// their input's home THROUGH to the output, and by the terminal builders.
     pub fn put_home(&self, v: T, deps: Deps, home: Option<BoxedHome<T>>) {
+        // Overwriting the cell drops any previous payload first. That previous
+        // payload's `Drop` fires the rehome IF it still held an undelivered
+        // value+home — the correct behaviour for a pipe re-deposited without its
+        // prior value having been drained (it shouldn't happen on the live paths,
+        // but the invariant holds regardless). The freshly stored payload arms the
+        // new (value, home) pair for the next drain or its own drop.
         *self.cell.lock().unwrap() = Some(PipePayload {
-            value: v,
+            value: Some(v),
             deps,
             home,
         });
@@ -533,11 +577,19 @@ impl<T> Pipe<T> {
     /// in-place op uses it (via [`resolve_home`](Input::resolve_home)) to thread
     /// the home; the terminal uses it to build the `Checkout` with the right home.
     pub fn take_home(&self) -> Option<(T, Deps, Option<BoxedHome<T>>)> {
-        self.cell
-            .lock()
-            .unwrap()
-            .take()
-            .map(|p| (p.value, p.deps, p.home))
+        // Move the whole payload out of the cell, then drain its `value` + `home`
+        // in place. `PipePayload` has a `Drop`, so it cannot be destructured
+        // by-move; `.take()` on the two `Option` fields leaves the husk to drop as
+        // a no-op (both now `None`). The home is MOVED to the caller — the payload
+        // no longer owns it, so its `Drop` won't re-fire the rehome (single owner,
+        // `BoxedHome: !Clone`). `deps` is `Default`, swapped out cheaply.
+        self.cell.lock().unwrap().take().map(|mut p| {
+            let value = p
+                .value
+                .take()
+                .expect("PipePayload drained twice — internal bug");
+            (value, std::mem::take(&mut p.deps), p.home.take())
+        })
     }
 
     /// Stable identity of this pipe's storage cell — the graph-edge key. Two
@@ -723,7 +775,6 @@ impl<T> Input<T> {
         };
         let home: Option<BoxedHome<T>> = Some(Box::new(SlotHome {
             cell: Arc::clone(cell),
-            fired: false,
         }));
         Self::thread_start_gate(v, ec, home)
     }
@@ -841,9 +892,36 @@ impl<T> Input<T> {
         match self {
             Input::Slot { cell, .. } => Some(Box::new(SlotHome {
                 cell: Arc::clone(cell),
-                fired: false,
             })),
             Input::Concrete(_) | Input::Pipe(_) => None,
+        }
+    }
+
+    /// Build a copy output's return [`BoxedHome`] from THIS input, output-typed to
+    /// `Out` (the post-copy buffer type, which may differ from the input `T` for an
+    /// `Uninit → Init` dst). Unifies the concrete and slot copy-operand paths under
+    /// the home invariant:
+    /// - [`Concrete`](Input::Concrete): `T`'s [`CopyHome::copy_home`] (identity, or
+    ///   the `Uninit → Init` downgrade re-wrap).
+    /// - [`Slot`](Input::Slot): `T`'s [`CopyHome::copy_slot_home`] (a tri-state
+    ///   [`SlotHome`] — re-arms `Lent → Bound`, severs on `into_inner`). This is the
+    ///   wiring of the formerly-dead [`slot_home`](Self::slot_home), now generalised
+    ///   through `CopyHome` so it threads even when the copy retypes the output.
+    /// - [`Pipe`](Input::Pipe): `None` — the upstream producer owns the value's
+    ///   provenance; a copy doesn't re-mint it.
+    ///
+    /// The threaded home rides the output element pipe; the general
+    /// [`PipePayload`] drop (or the terminal [`Checkout`] drop) fires the rehome,
+    /// so a copy-positioned slot/concrete cell re-arms with a stable handle across
+    /// `g.sync()` replays.
+    fn copy_input_home<Out>(&self) -> Option<BoxedHome<Out>>
+    where
+        T: CopyHome<Out> + Send + 'static,
+    {
+        match self {
+            Input::Concrete(cell) => <T as CopyHome<Out>>::copy_home(Arc::clone(cell)),
+            Input::Slot { cell, .. } => <T as CopyHome<Out>>::copy_slot_home(Arc::clone(cell)),
+            Input::Pipe(_) => None,
         }
     }
 
@@ -1382,6 +1460,43 @@ pub trait DeviceOp: Send {
         let _ = binder;
     }
 
+    /// Return any of this op's **own output values that were produced but never
+    /// delivered** to their home cells — the "undelivered drop" half of the home
+    /// invariant for MID-graph producers.
+    ///
+    /// ## Why this exists
+    ///
+    /// When an [`and_then`](DeviceOpExt::and_then) closure discards some of a
+    /// multi-output source's handles (e.g. `kernel(a, b, out).and_then(|(_a, _b,
+    /// out)| download(out))` keeps only `out`), the kernel still DEPOSITS `a`/`b`
+    /// into their element pipes at execute. Nothing downstream drains them, so —
+    /// without this — those homed buffers would sit in the pipe cells until the
+    /// NEXT run's `put_home` overwrites them. That is too late: the next run's
+    /// UPSTREAM producer (e.g. the [`upload`] that minted `a`) re-lends from its
+    /// home cell at the START of the run, before the kernel re-executes, and finds
+    /// it still empty → spurious graph-busy.
+    ///
+    /// So at the END of each run [`AndThen`] calls `reclaim_undelivered` on its
+    /// source, which drains each of the op's output pipes ([`Pipe::take_home`]);
+    /// dropping the drained `(value, home)` fires the rehome (the value returns to
+    /// its origin cell with a stable handle, or drops if homeless). Idempotent and
+    /// cheap when the pipes are already empty (the consumed / single-output case).
+    ///
+    /// Default: drain the single [`output_pipe`](Self::output_pipe). Multi-output
+    /// ops (the macro-emitted kernels, [`CopyTo2`]) override to drain each element
+    /// pipe. A consuming/transforming leaf whose output has no home (download's Vec,
+    /// host-views) is a no-op in effect — `take_home` yields `home == None`.
+    fn reclaim_undelivered(&self) {
+        // Drain the output pipe and fire the rehome explicitly: `take_home` moves
+        // `value` + `home` OUT of the `PipePayload` (so its `Drop` no longer
+        // rehomes), so we must call `rehome_consumed` ourselves. `None` (already
+        // drained downstream, or never produced) is a no-op; `home == None` (a
+        // minted/transformed output) just releases the value.
+        if let Some((value, _deps, home)) = self.output_pipe().take_home() {
+            rehome_consumed(value, home);
+        }
+    }
+
     /// Whether this op (transitively) contains an `and_then_host` /
     /// `and_then_host_with_context` host seam — a node whose worker thread can
     /// complete a downstream-gating user event with a **negative** status on
@@ -1651,6 +1766,12 @@ pub trait DeviceOpExt: DeviceOp + Sized {
                 // the cl_event cascade (`Error::OpenCl(-1)`). Prefer the stash.
                 Err(cascade) => Err(ec.take_host_error().unwrap_or(cascade)),
                 Ok((checkouts, deps)) => {
+                    // Mop up the run's UNDELIVERED intermediates (multi-output
+                    // values an `and_then` closure discarded): return each homed
+                    // buffer to its origin cell now, so the NEXT run's upstream
+                    // re-lend finds it. The terminal's OWN output was already drained
+                    // into `checkouts`, so this only touches intermediates.
+                    self.reclaim_undelivered();
                     // Blocking-mode leaves already waited inline, but pipelined
                     // upstream stages (and kernels, which have no native blocking
                     // enqueue) carry events here — wait on them so every command is
@@ -1708,6 +1829,9 @@ pub trait DeviceOpExt: DeviceOp + Sized {
                 return Err(ec.take_host_error().unwrap_or(setup_err));
             }
         };
+        // Mop up undelivered intermediates (see the fast-path note) so a reused
+        // graph re-arms its upstream cells.
+        self.reclaim_undelivered();
 
         // Wait on the chain's completion events (NOT clFinish — clFinish on a
         // terminated command is the pocl hang). A negative `proceed` from a
@@ -2282,6 +2406,17 @@ where
             return;
         }
         self.next.bind_slots(binder);
+    }
+
+    fn reclaim_undelivered(&self) {
+        // Mop up undelivered intermediates across the WHOLE subtree: the source's
+        // outputs that `next` discarded (its element pipes), plus any intermediates
+        // nested in source or next. Draining an already-consumed pipe (the normal
+        // case) is a no-op (`take_home` yields `None`). The chain's own delivered
+        // output lives in `next`'s output pipe, already drained by the terminal's
+        // `gather_checkouts` before this runs → its `reclaim` is also a no-op.
+        self.source.reclaim_undelivered();
+        self.next.reclaim_undelivered();
     }
 
     fn contains_host_seam(&self) -> bool {
@@ -3336,18 +3471,40 @@ where
     }
 }
 
-// ── Leaf: upload (host → device, alloc + CL_MEM_COPY_HOST_PTR) ──────────
+// ── Leaf: upload (host → device, alloc-once + persistent home) ──────────
 
-/// Allocate a `DeviceSlice<T, M>` and bake `src` into it at creation
-/// (`CL_MEM_COPY_HOST_PTR`). A chain-entry leaf — no upstream input. (Uses the
-/// from_slice path: works for any marker, one synchronous create, no in-flight
-/// event.)
+/// Allocate a `DeviceSlice<T, M>` ONCE, seed it from `src`, and hand it a
+/// **persistent home** so the SAME `cl_mem` is reused across `g.sync()` replays
+/// (the home invariant: "homeless is never legitimate" — even an upload-minted
+/// buffer carries a home). A chain-entry leaf — no upstream input.
+///
+/// ## Stable handle + access-mode reseed
+///
+/// The buffer is allocated on the FIRST run (`from_slice`, `CL_MEM_COPY_HOST_PTR`)
+/// into a persistent [`Cell`] this op owns; that cell is the buffer's home, so a
+/// run's `Checkout` / `PipePayload` drop returns the SAME buffer to it. On replay
+/// the buffer is re-lent from the cell (not re-minted), and whether its contents
+/// are refreshed is decided by the marker via
+/// [`UploadReseed::RESEED_ON_REPLAY`](crate::UploadReseed):
+/// - **kernel-writable** (`ReadWrite`, …): re-seed the host source into the SAME
+///   buffer each run — `upload(RW) → scale → download` stays idempotent (no
+///   compounding) over a stable handle.
+/// - **kernel read-only** (`ReadOnly`, `Frozen`): seed once on run 1; skip the
+///   host write on replays (the kernel never mutated it).
+///
+/// If a previous run's `Checkout` is still alive (the buffer is lent out), the
+/// cell is empty AND it has already been seeded → a second `sync` is **graph-busy**
+/// (same contract as a concrete-head cell).
 pub struct Upload<T: Copy, M: MemMode = ReadWrite> {
-    // Held by value (not `Option`): the host source is RETAINED so every run
-    // re-creates a fresh buffer from it (`CL_MEM_COPY_HOST_PTR`). This is the
-    // "mutable buffers re-seed each run" rule — `upload(v)…download` is
-    // idempotent by construction (the upload op re-writes its source each run).
+    // The host source, RETAINED for the seed-once write and any reseed-on-replay.
     src: UploadSource<T>,
+    // The persistent device buffer's home cell: allocated once (first run), then
+    // re-lent + re-armed across replays so the `cl_mem` handle stays stable. Empty
+    // while lent (busy if already seeded); `None`-on-take is the lend.
+    buf: Cell<DeviceSlice<T, M>>,
+    // Whether the buffer has ever been allocated/seeded. Distinguishes "first run
+    // → alloc" (cell empty, not seeded) from "lent out → busy" (cell empty, seeded).
+    seeded: Arc<Mutex<bool>>,
     out: Pipe<DeviceSlice<T, M>>,
 }
 
@@ -3355,8 +3512,8 @@ pub struct Upload<T: Copy, M: MemMode = ReadWrite> {
 /// **default [`ReadWrite`] marker** — the overwhelming common case, so no
 /// turbofish: `upload(vec![1u32, 2, 3])`. For a non-default marker use
 /// [`upload_as`] with a marker witness (`upload_as(src, Frozen)`); both paths
-/// go through `from_slice` (`CL_MEM_COPY_HOST_PTR`), the only constructor that
-/// can build an immutable `Frozen`/`ReadOnly` buffer.
+/// allocate once via `from_slice` (`CL_MEM_COPY_HOST_PTR`), the only constructor
+/// that can build an immutable `Frozen`/`ReadOnly` buffer.
 pub fn upload<T, S>(src: S) -> Upload<T, ReadWrite>
 where
     T: Copy + Send + Sync + 'static,
@@ -3369,16 +3526,18 @@ where
 /// `marker` witness — no turbofish: `upload_as(src, Frozen)` /
 /// `upload_as(src, ReadOnly)`. `T`/`S` infer from `src`, `M` from the witness.
 /// The default-marker shorthand is [`upload`]. Like `upload`, backed by
-/// `from_slice` (`CL_MEM_COPY_HOST_PTR`).
+/// `from_slice` (`CL_MEM_COPY_HOST_PTR`) on the first run.
 pub fn upload_as<T, M, S>(src: S, marker: M) -> Upload<T, M>
 where
     T: Copy + Send + Sync + 'static,
-    M: MemMode + Send + 'static,
+    M: crate::UploadReseed + Send + 'static,
     S: Into<UploadSource<T>>,
 {
     let _ = marker; // witness only — fixes M, zero-sized, no runtime use.
     Upload {
         src: src.into(),
+        buf: Arc::new(Mutex::new(None)),
+        seeded: Arc::new(Mutex::new(false)),
         out: Pipe::new(),
     }
 }
@@ -3386,7 +3545,7 @@ where
 impl<T, M> DeviceOp for Upload<T, M>
 where
     T: Copy + Send + Sync + 'static,
-    M: MemMode + Send + 'static,
+    M: crate::UploadReseed + Send + 'static,
 {
     type Output = DeviceSlice<T, M>;
 
@@ -3399,11 +3558,54 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // from_slice (CL_MEM_COPY_HOST_PTR) is a synchronous create — no
-        // in-flight event, mode N/A. Reads `self.src` BY REFERENCE so the source
-        // is retained and the buffer re-seeds on every run (idempotent reuse).
-        let buf = DeviceSlice::<T, M>::from_slice(ec.context(), self.src.as_slice())?;
-        self.out.put(buf, Deps::new());
+        // The buffer is allocated ONCE and lives in `self.buf` across runs; its home
+        // is that very cell, so a run's Checkout / PipePayload drop returns the SAME
+        // `cl_mem` here. Three cases, decided by the cell + the `seeded` flag:
+        let mut seeded = self.seeded.lock().unwrap();
+        let lent = self.buf.lock().unwrap().take();
+        let buf = match (lent, *seeded) {
+            // First run: never seeded → alloc + seed via from_slice
+            // (CL_MEM_COPY_HOST_PTR, synchronous create, no in-flight event).
+            (None, false) => {
+                let buf = DeviceSlice::<T, M>::from_slice(ec.context(), self.src.as_slice())?;
+                *seeded = true;
+                buf
+            }
+            // Replay: the buffer is back in the cell. Re-lend it; re-seed the host
+            // source IF the marker is kernel-writable (it may have been mutated in
+            // place last run) — keeping `upload(RW) → … → download` idempotent. A
+            // kernel read-only marker (ReadOnly/Frozen) skips the write: its bytes
+            // never changed device-side, seed-once suffices.
+            (Some(mut buf), _) => {
+                if M::RESEED_ON_REPLAY {
+                    // Synchronous host write back into the SAME buffer (stable
+                    // handle). No upstream deps — upload is a chain head.
+                    crate::buffer::write_buffer_enqueue(
+                        &mut buf,
+                        ec,
+                        self.src.as_slice(),
+                        true,
+                        &[],
+                    )?;
+                }
+                buf
+            }
+            // Cell empty but already seeded: the buffer is lent out (a prior run's
+            // Checkout is still alive) → graph-busy, the concrete-cell contract.
+            (None, true) => {
+                return Err(Error::NotSupported(
+                    "eager graph: an upload buffer was already lent and not returned \
+                     — a graph is `sync`'d while a previous `Checkout` is still alive \
+                     (the graph is busy)",
+                ));
+            }
+        };
+        // The home is this op's persistent cell (identity rehome): the buffer is
+        // returned here on Checkout / PipePayload drop, re-arming the upload with a
+        // STABLE handle. So a downstream consume (download) rehomes it here, not the
+        // releasing drop.
+        let home: Option<BoxedHome<DeviceSlice<T, M>>> = Some(Box::new(Arc::clone(&self.buf)));
+        self.out.put_home(buf, Deps::new(), home);
         Ok(())
     }
 
@@ -3449,7 +3651,16 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve(ec)?;
+        // "Homeless is never legitimate": download CONSUMES the device buffer into
+        // a host `Vec`, but the buffer itself still has a home (a user-allocated
+        // concrete cell, a slot, or an upload-minted persistent cell). Resolve WITH
+        // the home so the device buffer is RETURNED to its origin — the same
+        // `cl_mem` is reused on replay — rather than released. The OUTPUT pipe
+        // carries the `Vec` with NO home: the Vec is the user's result, it has no
+        // origin cell. (`ReadInto` is the in-place template; here the buffer's home
+        // and the output value diverge, so the rehome happens here, not via the
+        // output pipe.)
+        let (buf, deps, home) = self.buf.resolve_home(ec)?;
         let mut host = vec![T::default(); buf.len()];
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         match mode {
@@ -3458,11 +3669,17 @@ where
             // `ReadOp::wait_on`; restores parity for `…download().sync()`.
             ExecMode::Blocking => {
                 crate::buffer::read_buffer_enqueue(&buf, ec, &mut host, true, &raw)?;
+                rehome_consumed(buf, home);
                 self.out.put(host, Deps::new());
             }
-            // Pipelined: non-blocking; the event gates the Vec being valid.
+            // Pipelined: non-blocking; the event gates the Vec being valid. The
+            // read is enqueued before we rehome, but the rehome only re-arms the
+            // origin CELL (deposits the buffer handle for the NEXT run); the
+            // in-flight read still holds the live `cl_mem` via the OpenCL queue, so
+            // returning the handle to its cell here does not race the read.
             ExecMode::Pipelined => {
                 let event = crate::buffer::read_buffer_enqueue(&buf, ec, &mut host, false, &raw)?;
+                rehome_consumed(buf, home);
                 self.out.put(host, vec![wrap_event(event)]);
             }
         }
@@ -5179,8 +5396,21 @@ impl<A: Send, B: Send> CopyOutputs for (A, B) {
 /// (possibly weaker-typed) input cell of type `Self`. `None` when this family
 /// can't soundly express the return.
 pub trait CopyHome<Out>: Sized {
-    /// The home that returns an `Out` into a `Cell<Self>` on `Checkout` drop.
+    /// The home that returns an `Out` into a concrete `Cell<Self>` on `Checkout`
+    /// drop (or `PipePayload` drop).
     fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<Out>>;
+
+    /// The home that returns an `Out` into a **slot** `SlotCell<Self>` — the
+    /// tri-state analogue used when a copy operand is a `slot!(Tag)` directly
+    /// (scenario 6). Re-arms `Lent → Bound` on rehome and severs `Lent → Unbound`
+    /// on `into_inner`. Default `None`: a slot's value type is always an `Init`
+    /// buffer (`Tag::Value`), so only the identity `CopyHome` impls (`Self == Out`)
+    /// override this; the `Uninit → Init` downgrade impls keep the default (an
+    /// uninit buffer is never a slot value, so the path is unreachable).
+    fn copy_slot_home(cell: SlotCell<Self>) -> Option<BoxedHome<Out>> {
+        let _ = cell;
+        None
+    }
 }
 
 /// Rehome that DOWNGRADES an `Init` buffer back into a `Cell<Uninit-wrapper>`.
@@ -5198,11 +5428,17 @@ impl<U: Send, Init: Send> Rehome<Init> for DowngradeRehome<U, Init> {
 }
 
 // Identity homes: src is never retyped, and an Init→Init dst is identity too.
+// `copy_slot_home` returns the tri-state `SlotHome` so a `slot!()` copy operand
+// re-arms its slot (`Lent → Bound`) on rehome / severs (`Lent → Unbound`) on
+// `into_inner` — exactly like a slot in a kernel-arg position.
 impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<DeviceSlice<T, M>>
     for DeviceSlice<T, M>
 {
     fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<DeviceSlice<T, M>>> {
         Some(Box::new(cell))
+    }
+    fn copy_slot_home(cell: SlotCell<Self>) -> Option<BoxedHome<DeviceSlice<T, M>>> {
+        Some(Box::new(SlotHome { cell }))
     }
 }
 impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<MappedSlice<T, M>>
@@ -5211,10 +5447,16 @@ impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<MappedSlice<T, M>>
     fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<MappedSlice<T, M>>> {
         Some(Box::new(cell))
     }
+    fn copy_slot_home(cell: SlotCell<Self>) -> Option<BoxedHome<MappedSlice<T, M>>> {
+        Some(Box::new(SlotHome { cell }))
+    }
 }
 impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<USMSlice<T, M>> for USMSlice<T, M> {
     fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<USMSlice<T, M>>> {
         Some(Box::new(cell))
+    }
+    fn copy_slot_home(cell: SlotCell<Self>) -> Option<BoxedHome<USMSlice<T, M>>> {
+        Some(Box::new(SlotHome { cell }))
     }
 }
 
@@ -5272,20 +5514,103 @@ where
     dst_pipe: Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
 }
 
-/// Build an eager copy leaf. `src` / `dst` may each be a concrete buffer or an
-/// upstream [`Pipe`]. Output is `(src, dst)` (an `Uninit` dst comes back `Init`
-/// — the copy wrote every byte). See [`CopyTo2`].
-pub fn eager_copy_to<Src, Dst>(
-    src: impl Into<Input<Src>>,
-    dst: impl Into<Input<Dst>>,
-) -> CopyTo2<Src, Dst>
+/// A value usable as a [`eager_copy_to`] **operand**: a concrete buffer, an
+/// upstream [`Pipe`], a [`Checkout`], or a [`slot!`](crate::slot)`(Tag)` hole. It
+/// resolves to an `Input<Buf>` over the concrete buffer family `Buf` the copy
+/// then drives (via `Buf: CopyTo<…>`).
+///
+/// ## Why a dedicated trait (not `Into<Input<Buf>>`)
+///
+/// `SlotHandle<Tg>` cannot impl `Into<Input<Tg::Value>>` — the blanket
+/// `From<T> for Input<T>` blocks it under coherence (the compiler can't rule out
+/// `Tg::Value == SlotHandle<Tg>`). `CopyOperand` is a distinct nominal trait with
+/// no such clash, so a slot plugs straight into a copy operand position
+/// (`eager_copy_to(slot!(Src), slot!(Dst))`) exactly as it already does in a
+/// kernel-arg position via [`ToInput`]. Concrete buffers / pipes / checkouts route
+/// through their existing `Into<Input<_>>` conversions.
+pub trait CopyOperand<Buf> {
+    /// Resolve into the copy's input edge over the concrete buffer type `Buf`.
+    fn into_copy_input(self) -> Input<Buf>;
+}
+
+// A slot plugs into a copy operand position, mirroring its kernel-arg `ToInput`.
+impl<Tg: Tag> CopyOperand<Tg::Value> for SlotHandle<Tg> {
+    fn into_copy_input(self) -> Input<Tg::Value> {
+        self.into_input()
+    }
+}
+
+// A `Pipe<Buf>` (upstream producer's output edge) → a deferred input. Per-type
+// (not a blanket over `Into<Input<_>>`) so it stays disjoint from the `SlotHandle`
+// impl — a blanket would collide because the compiler can't rule out
+// `Tg::Value == SlotHandle<Tg>`.
+impl<Buf> CopyOperand<Buf> for Pipe<Buf> {
+    fn into_copy_input(self) -> Input<Buf> {
+        Input::Pipe(self)
+    }
+}
+
+/// Implement [`CopyOperand`] for a concrete buffer family + its `Checkout`
+/// wrapper (each a distinct nominal type, disjoint from the slot/pipe impls).
+macro_rules! impl_copy_operand_concrete {
+    ($buf:ident) => {
+        impl<E, M> CopyOperand<$crate::$buf<E, M>> for $crate::$buf<E, M>
+        where
+            M: $crate::MemMode,
+        {
+            fn into_copy_input(self) -> Input<$crate::$buf<E, M>> {
+                Input::from(self)
+            }
+        }
+        impl<E, M> CopyOperand<$crate::$buf<E, M>> for Checkout<$crate::$buf<E, M>>
+        where
+            M: $crate::MemMode,
+            E: Send,
+        {
+            // Severs the return and feeds the inner buffer as a concrete input
+            // (same as the `ToInput`/`From` Checkout paths).
+            fn into_copy_input(self) -> Input<$crate::$buf<E, M>> {
+                Input::from(self.into_inner())
+            }
+        }
+    };
+}
+impl_copy_operand_concrete!(DeviceSlice);
+impl_copy_operand_concrete!(MappedSlice);
+impl_copy_operand_concrete!(USMSlice);
+
+// The Uninit dst families are valid copy *destinations* (never a slot value), so
+// they need a concrete + checkout operand impl too.
+macro_rules! impl_copy_operand_uninit {
+    ($buf:ident) => {
+        impl<E, M> CopyOperand<$crate::$buf<E, M>> for $crate::$buf<E, M>
+        where
+            M: $crate::MemMode,
+        {
+            fn into_copy_input(self) -> Input<$crate::$buf<E, M>> {
+                Input::from(self)
+            }
+        }
+    };
+}
+impl_copy_operand_uninit!(DeviceSliceUninit);
+impl_copy_operand_uninit!(MappedSliceUninit);
+impl_copy_operand_uninit!(USMSliceUninit);
+
+/// Build an eager copy leaf. `src` / `dst` may each be a concrete buffer, an
+/// upstream [`Pipe`], a [`Checkout`], or a [`slot!`](crate::slot)`(Tag)` hole (see
+/// [`CopyOperand`]). Output is `(src, dst)` (an `Uninit` dst comes back `Init` —
+/// the copy wrote every byte). See [`CopyTo2`].
+pub fn eager_copy_to<Src, Dst, S, D>(src: S, dst: D) -> CopyTo2<Src, Dst>
 where
     Src: CopyTo<Dst>,
     <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
+    S: CopyOperand<Src>,
+    D: CopyOperand<Dst>,
 {
     CopyTo2 {
-        src: src.into(),
-        dst: dst.into(),
+        src: src.into_copy_input(),
+        dst: dst.into_copy_input(),
         src_pipe: Pipe::new(),
         dst_pipe: Pipe::new(),
     }
@@ -5331,28 +5656,16 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // Grab each CONCRETE input's lending cell BEFORE resolving so we can
-        // thread it as the output's return home (re-arming `g` on Checkout drop).
-        // A pipe-fed input has no concrete cell → `None` (its producer re-mints
-        // the value each run; propagating a retyped pipe home is a later step).
-        // Concrete cells route through `CopyHome` (identity, or the Uninit→Init
-        // downgrade). NOTE: a slot used DIRECTLY as a copy src/dst does not yet
-        // thread its tri-state `SlotHome` here — the copy output type
-        // (`CopyOutputs::Src/Dst`) differs from the slot's input type, so a
-        // `SlotHome<Src>` would need the same input→output type bridge `CopyHome`
-        // gives concrete cells (`slot_home` exists for that follow-up). Slots are
-        // kernel-arg-positioned in practice (the tested site); a copy-positioned
-        // slot stays `Lent` after one run (caught loudly as graph-busy on
-        // re-`sync`, never silently). Routing it lands alongside the segment-plan
-        // step.
-        let src_home = self
-            .src
-            .return_cell()
-            .and_then(<Src as CopyHome<_>>::copy_home);
-        let dst_home = self
-            .dst
-            .return_cell()
-            .and_then(<Dst as CopyHome<_>>::copy_home);
+        // Build each input's output-typed return home BEFORE resolving, so we can
+        // thread it onto the output element pipe (re-arming `g` on Checkout /
+        // PipePayload drop). `copy_input_home` unifies all three arms under the home
+        // invariant: a CONCRETE cell routes through `CopyHome::copy_home` (identity,
+        // or the `Uninit → Init` downgrade re-wrap); a SLOT routes through
+        // `CopyHome::copy_slot_home` (a tri-state `SlotHome` — re-arms `Lent →
+        // Bound`, severs on `into_inner`), closing the former copy-slot gap; a
+        // pipe-fed input has `None` (its upstream producer owns the provenance).
+        let src_home = self.src.copy_input_home();
+        let dst_home = self.dst.copy_input_home();
         // Resolve both inputs → (buffer, upstream Deps). Either may be a pipe
         // (upstream output) or concrete. Combine their wait-lists.
         let (src, src_deps) = self.src.resolve(ec)?;
@@ -5404,8 +5717,10 @@ where
         mode: ExecMode,
     ) -> Result<(Self::Checkouts, Deps)> {
         // Drain each element pipe with its own home → a tuple of independent
-        // Checkouts. (Copy threads no home, so both are `None`; the per-output
-        // shape is still correct — each side is its own guard.)
+        // Checkouts. Each output carries the home `execute` threaded (concrete cell,
+        // slot, or `None` for a pipe), so the two sides re-arm independently:
+        // dropping one side's Checkout rehomes it while `into_inner` on the other
+        // severs only that side (scenario 11).
         let src_pipe = self.src_pipe.clone();
         let dst_pipe = self.dst_pipe.clone();
         self.execute(ec, mode)?;
@@ -5427,6 +5742,30 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("copy_to".into());
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // A copy's src/dst may each be a `slot!()` operand; offer the binder to
+        // both (execution order: src then dst), short-circuiting once it lands.
+        // Non-slot (concrete / pipe) inputs are a no-op in `try_bind_slot`.
+        self.src.try_bind_slot(binder);
+        if binder.is_consumed() {
+            return;
+        }
+        self.dst.try_bind_slot(binder);
+    }
+
+    fn reclaim_undelivered(&self) {
+        // Two element pipes (src, dst). Drain + rehome each undelivered side so a
+        // copy whose output is partly discarded (e.g. `…and_then(|(src, _dst)| …)`)
+        // returns the dropped side's buffer to its origin cell. Already-drained
+        // pipes (delivered to a terminal Checkout / consumed downstream) are no-ops.
+        if let Some((v, _d, home)) = self.src_pipe.take_home() {
+            rehome_consumed(v, home);
+        }
+        if let Some((v, _d, home)) = self.dst_pipe.take_home() {
+            rehome_consumed(v, home);
+        }
     }
 }
 
@@ -5574,6 +5913,7 @@ impl<T, M: MemMode> Pipe<MappedSlice<T, M>> {
     where
         MappedSlice<T, M>: crate::CopyTo<Dst>,
         <<MappedSlice<T, M> as crate::CopyTo<Dst>>::Op as DeviceEnqueue>::Output: CopyOutputs,
+        Dst: CopyOperand<Dst>,
     {
         eager_copy_to(self, dst)
     }

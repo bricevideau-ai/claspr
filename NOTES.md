@@ -9,6 +9,33 @@ items resolve.
 
 ## Active
 
+### ✅ "Homeless is never legitimate" home invariant — 2026-06-29 (branch `typed-slots`, UNCOMMITTED, staged)
+
+Every lent buffer (user-alloc AND upload-minted) carries a home; the graph never
+releases a homed buffer — it REHOMES it. `tests/tier2/tests/home_invariant.rs`
+1,2,3,5,6 green (+7,8,9,10); 4 (WriteOnly) and 11 stay ignored.
+- `PipePayload{value: Option<T>, home}` + **`Drop`**: an undelivered payload
+  (value+home present) rehomes on drop. `take_home` drains both in place (no
+  destructure-by-move); home moved out = disarmed (single owner, `BoxedHome:
+  !Clone`).
+- `Download::execute` → `resolve_home` + `rehome_consumed(buf, home)` (buffer back
+  to cell, Vec out homeless). `concrete_consumed_by_download` test flipped to the
+  new rehome behaviour.
+- `Upload`: alloc-ONCE into a persistent `Cell` + `seeded` flag; replay re-lends
+  the SAME `cl_mem`; `UploadReseed::RESEED_ON_REPLAY` (writable=reseed,
+  RO/Frozen=seed-once). Lent+seeded ⇒ busy.
+- `reclaim_undelivered` (DeviceOp method; AndThen recurses, kernel-macro + CopyTo2
+  drain element pipes) called post-gather in `wait_on` — returns multi-output
+  intermediates an `and_then` discarded BEFORE next run's upstream re-lend.
+- Slot-as-copy-operand: `CopyOperand` trait (per-family + `SlotHandle`) →
+  `eager_copy_to(slot!(A), slot!(B))` type-checks; `CopyHome::copy_slot_home`
+  wires the formerly-dead `slot_home` through `Input::copy_input_home`; CopyTo2
+  gained `bind_slots`. `SlotHome` lost its `Drop`/`fired` fallback (general
+  payload-drop rehomes; consumed slot now `Lent→Bound`, not `Lent→Unbound`).
+- DEFERRED (scenario 11): re-sync after `into_inner`-severing a CONCRETE copy dst
+  needs re-ALLOC of that side, which needs sever-vs-busy disambiguation (tri-state)
+  on a user copy cell — out of scope. Per-side independent homes themselves work.
+
 ### ✅ STEP (a) follow-up 2026-06-26 — copy-in-reused-graph re-arm + Init→Uninit downgrade (`Rehome`)
 
 Branch `replayable-graphs` @ `afdb1d4` (pushed). Closed a real step-(a) gap: a

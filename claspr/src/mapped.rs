@@ -418,6 +418,7 @@ impl<T, M: MemMode> MappedSlice<T, M> {
         Self: crate::CopyTo<Dst>,
         <<Self as crate::CopyTo<Dst>>::Op as crate::eager::DeviceEnqueue>::Output:
             crate::eager::CopyOutputs,
+        Dst: crate::eager::CopyOperand<Dst>,
     {
         crate::eager::eager_copy_to(self, dst)
     }

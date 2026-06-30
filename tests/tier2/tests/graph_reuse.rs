@@ -243,11 +243,14 @@ fn second_sync_while_checked_out_is_busy_error() {
     assert!(rb.iter().all(|&v| v == 4), "got {:?}", &rb[..8]);
 }
 
-/// A concrete buffer lent into a one-shot consume (`download`) — after the
-/// Checkout drops, the buffer is gone (download dropped it), so re-arm leaves the
-/// cell empty and a second sync errors. Documents the boundary.
+/// A concrete buffer downloaded into a host `Vec` is REHOMED, not released —
+/// "homeless is never legitimate". `download` reads the device buffer into a Vec
+/// but returns the device buffer to its origin cell, so a reused `download` graph
+/// re-runs over the SAME backing handle. (Pre-invariant, `download` discarded the
+/// home and dropped the buffer, leaving the cell empty → second sync errored. This
+/// test was updated to the new, correct rehome-on-consume behaviour.)
 #[test]
-fn concrete_consumed_by_download_is_not_rearmable() {
+fn concrete_consumed_by_download_is_rehomed() {
     let Some(ctx) = ctx() else { return };
 
     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N)
@@ -256,17 +259,20 @@ fn concrete_consumed_by_download_is_not_rearmable() {
         .wait()
         .expect("seed");
 
-    // fill(buf, 9) already done on host side; now a graph that downloads buf.
+    // A graph that downloads buf. The device buffer is rehomed on the run's drop
+    // (its output is a host Vec; the buffer itself returns to its concrete cell).
     let g = download::<u32, _>(buf);
     let out = g.sync(&ctx).expect("download once");
     assert!(out.iter().all(|&v| v == 9));
     drop(out);
 
-    // The buffer was consumed by download (its cell got no buffer back — the
-    // output is a host Vec, not the buffer), so a second run finds the cell empty.
-    let again = g.sync(&ctx);
+    // The buffer was RETURNED to its cell, so a second run reads the SAME buffer
+    // again (no fresh alloc, no "busy").
+    let again = g
+        .sync(&ctx)
+        .expect("a downloaded concrete buffer re-arms via rehome; second sync works");
     assert!(
-        again.is_err(),
-        "a concrete buffer consumed by download can't re-arm; second sync errors"
+        again.iter().all(|&v| v == 9),
+        "second download reads the rehomed buffer: still 9"
     );
 }

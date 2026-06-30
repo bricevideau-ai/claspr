@@ -90,9 +90,6 @@ slots! {
 //    runs; seed-skip-on-replay is not implemented.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "RED: upload mints a fresh buffer each run (no home, new cl_mem, \
-            eager.rs:3401); ReadOnly operand handle not stable, seed-once skip \
-            not implemented."]
 fn upload_readonly_kernel_download_x3_stable_handle() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
@@ -143,8 +140,6 @@ fn upload_readonly_kernel_download_x3_stable_handle() {
 //    the buffer is gone after run 1.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "RED: download discards the home and drops the buffer (eager.rs:3452); \
-            the user-alloc cell is not re-armed → run 2 errors busy, handle not stable."]
 fn user_alloc_scale_download_x3_rehomed_stable() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
@@ -179,32 +174,36 @@ fn user_alloc_scale_download_x3_rehomed_stable() {
 //    RED: upload mints a fresh buffer each run (new handle); download releases.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "RED: upload re-mints a fresh cl_mem each run (no persistent home, \
-            eager.rs:3401); handle not stable across replays."]
 fn upload_readwrite_scale_download_x3_reseed_stable() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     // Default upload marker is ReadWrite. Re-seeds 3 each run; ×5 = 15 each run.
     let probe = upload(vec![3u32; N]).and_then(|b| ks.scale_u32([N], b, 5u32));
-    // Keep c1 ALIVE (do not consume it) through run 2. This defeats cl_mem handle
-    // RECYCLING: if upload re-mints, run 2's buffer is a DIFFERENT live object —
-    // the freed-then-reused-address trick can't happen while c1 still holds the
-    // old buffer, so a distinct handle is observable rather than masked.
+    // Keep c1 ALIVE (do not consume it) through the next sync. The persistent
+    // upload home is LENT while c1 holds it, so a second sync is graph-BUSY — the
+    // invariant in action (the buffer is not re-minted; it lives in exactly one
+    // place, currently c1's hands).
     let c1 = probe.sync(&ctx).expect("probe 1");
     let h0 = handle_of(&*c1);
 
-    // With a proper persistent home, a second sync while c1 is alive would be
-    // graph-busy (the home is lent), and a later re-run after c1 drops must reuse
-    // h0. TODAY upload re-mints a fresh buffer, so this sync SUCCEEDS with a
-    // DISTINCT live handle: the invariant ("same stable handle") is violated.
-    let c2 = probe.sync(&ctx).expect("probe 2");
+    // A second sync while c1 is alive must be graph-busy (the home is lent), NOT a
+    // fresh re-mint with a distinct handle.
+    assert!(
+        probe.sync(&ctx).is_err(),
+        "upload(ReadWrite) home is lent while c1 is alive → second sync must be busy"
+    );
+
+    // Drop c1 → the buffer rehomes to the persistent upload cell. A re-run must
+    // reuse the SAME stable handle (re-seeded into the SAME cl_mem, not re-minted).
+    drop(c1);
+    let c2 = probe.sync(&ctx).expect("probe 2 after c1 dropped");
     assert_eq!(
         handle_of(&*c2),
         h0,
         "upload(ReadWrite) must re-seed into the SAME stable handle (not re-mint)"
     );
-    drop((c1, c2));
+    drop(c2);
 
     // And through the full Vec-producing consuming terminal.
     let g = upload(vec![3u32; N])
@@ -289,9 +288,6 @@ fn upload_writeonly_kernel_download_x3_stable() {
 //    empty → "graph busy".
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "RED: download discards the home and releases the buffer \
-            (eager.rs:3452); the concrete cell is not re-armed → second sync \
-            errors 'busy' (cf. graph_reuse::concrete_consumed_by_download_is_not_rearmable)."]
 fn user_alloc_download_directly_x2_rehomed() {
     let Some(ctx) = ctx() else { return };
 
@@ -331,9 +327,6 @@ fn user_alloc_download_directly_x2_rehomed() {
 //      `Lent` after run 1 → second sync is graph-busy. This is THE copy-slot gap.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "RED(no-API): slot!() is a SlotHandle, not CopyTo, so a slot copy \
-            operand doesn't type-check (copy.rs); ALSO copy threads no home for \
-            slot operands (eager.rs:5339-5347) → would stay Lent → busy."]
 fn copy_slot_src_and_slot_dst_x2_both_rehome() {
     let Some(ctx) = ctx() else { return };
 
@@ -341,19 +334,14 @@ fn copy_slot_src_and_slot_dst_x2_both_rehome() {
     let _src = DeviceSlice::<u32>::from_slice(&ctx, &data).expect("src");
     let _dst = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("dst");
 
-    // RED(no-API): the intended shape; does NOT compile today (SlotHandle: !CopyTo).
-    // Re-enable once a slot is accepted as a copy operand AND its SlotHome is
-    // threaded through `CopyTo2::execute`.
-    /*
     let hs = handle_of(&_src);
     let hd = handle_of(&_dst);
 
-    // Both copy operands are SLOTS, bound before the run.
-    let g = eager_copy_to(slot!(Src), slot!(Dst))
-        .bind(Src(_src))
-        .expect("bind Src")
-        .bind(Dst(_dst))
-        .expect("bind Dst");
+    // Both copy operands are SLOTS, bound before the run. `bind` returns `&Self`,
+    // so the copy op must live in a `let` (it can't be a temporary).
+    let g = eager_copy_to(slot!(Src), slot!(Dst));
+    g.bind(Src(_src)).expect("bind Src");
+    g.bind(Dst(_dst)).expect("bind Dst");
 
     {
         let (co_s, co_d) = g.sync(&ctx).expect("copy run 1");
@@ -369,9 +357,6 @@ fn copy_slot_src_and_slot_dst_x2_both_rehome() {
     let mut out = vec![0u32; N];
     co_d.read(&mut out).wait().expect("read dst run2");
     assert_eq!(out, data, "run 2 dst == src");
-    */
-    let _ = (slot!(Src), slot!(Dst)); // witness the slot tags the scenario needs.
-    panic!("RED(no-API): slot copy operands do not type-check; copy-slot home gap");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -574,10 +559,13 @@ fn homed_buffer_dropped_mid_graph_rearms_same_handle() {
 //     sever/re-arm + re-alloc story is settled.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "RED: per-side independence — severing the dst (into_inner) while \
-            re-arming the src must leave src re-syncable with a stable handle; \
-            a severed concrete dst cell goes empty so the re-sync needs the dst \
-            re-bound/re-alloced (not yet specified for concrete copy sides)."]
+#[ignore = "DEFERRED: per-side independent homes now work (src re-arms, dst severs \
+            independently — the home-invariant core landed), but re-SYNCing after \
+            severing a CONCRETE copy dst requires re-ALLOCATING that side. A bare \
+            concrete `Cell` can't distinguish 'severed (→ re-alloc)' from 'lent / \
+            busy (→ error)' — that needs the tri-state disambiguation the upload \
+            cell got, extended to user copy cells. Out of scope for the home \
+            invariant; the per-side independence it asserts is otherwise satisfied."]
 fn multi_output_copy_independence() {
     let Some(ctx) = ctx() else { return };
 

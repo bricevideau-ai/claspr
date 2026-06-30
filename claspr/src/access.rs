@@ -173,6 +173,52 @@ pub trait MemMode: KernelAccess + HostAccess {
 
 impl<T: KernelAccess + HostAccess> MemMode for T {}
 
+/// Whether a reused [`upload`](crate::eager::upload) buffer carrying this marker
+/// must be **re-seeded** with its host source on every replay (`true`), or seeded
+/// only once on the first run (`false`).
+///
+/// Under the home invariant, `upload` allocates a buffer ONCE and hands it a
+/// persistent home so the SAME `cl_mem` returns across `g.sync()` replays. This
+/// const answers whether the host contents must be re-written each run:
+/// - **`true`** (kernel-WRITABLE markers: [`ReadWrite`], [`HostReadOnly`],
+///   [`DeviceScratch`], and [`WriteOnly`]): a kernel may have mutated the buffer
+///   in place on the previous run, so the host source is re-written every run —
+///   keeping `upload(RW) → scale → download` idempotent (no compounding) over a
+///   stable handle.
+/// - **`false`** (kernel read-only markers: [`ReadOnly`], [`Frozen`]): the kernel
+///   never writes the buffer, so its first-run contents persist — seed once, skip
+///   the host write on replays.
+///
+/// A standalone per-marker trait (not a `MemMode` associated const) because
+/// `MemMode` is blanket-implemented for every `KernelAccess + HostAccess`, so it
+/// cannot carry per-marker values; `RESEED_ON_REPLAY` mirrors the
+/// [`KernelWritable`] split exactly, but is stated per marker so it stays a plain
+/// `const` lookup at the upload site.
+pub trait UploadReseed: MemMode {
+    /// See the trait docs.
+    const RESEED_ON_REPLAY: bool;
+}
+// Kernel-writable markers re-seed each run (the kernel may have mutated them).
+impl UploadReseed for ReadWrite {
+    const RESEED_ON_REPLAY: bool = true;
+}
+impl UploadReseed for HostReadOnly {
+    const RESEED_ON_REPLAY: bool = true;
+}
+impl UploadReseed for DeviceScratch {
+    const RESEED_ON_REPLAY: bool = true;
+}
+impl UploadReseed for WriteOnly {
+    const RESEED_ON_REPLAY: bool = true;
+}
+// Kernel read-only markers seed once (their contents never change device-side).
+impl UploadReseed for ReadOnly {
+    const RESEED_ON_REPLAY: bool = false;
+}
+impl UploadReseed for Frozen {
+    const RESEED_ON_REPLAY: bool = false;
+}
+
 // ── Kernel-side classification traits ──────────────────────────────
 //
 // These split the [`KernelAccess`] trait by *what kernels can do* with
