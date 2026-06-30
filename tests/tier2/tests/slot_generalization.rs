@@ -334,24 +334,42 @@ fn shared_scalar_slot_fans_out() {
 
 /// (7) **Shared launch slot (one tag, two dispatch sites)** — the motivating case.
 /// Two `global_id_u32` dispatches in one graph, both via `slot!(Grid)`. One
-/// `bind(Grid(g))` sets BOTH; both dispatch at the bound extent.
+/// `bind(Grid(g))` sets BOTH; both dispatch at the bound extent — and we surface
+/// BOTH sites' output buffers from the SINGLE fanned graph and assert each.
+///
+/// The composition is two NESTED `and_then`s ending on a `bundle2` of `forward`s,
+/// rather than `and_then(|_a| siteB)` (which discards site A's buffer and only
+/// returns B). The reason is a hard constraint: `bind_slots` recurses through the
+/// `AndThen` spine (source then next — see `AndThen::bind_slots`) but a `bundle`'s
+/// `bind_slots` is the default NO-OP (the macro-generated `Bundle*` impl never
+/// overrides it). So a `slot!(Grid)` placed *inside* a bundle branch is never
+/// reached by `bind` → `SlotUnbound` at sync. Both dispatch sites must therefore
+/// stay on the AndThen spine (one as the outer source, one as the inner source);
+/// only their already-CONCRETE output pipes — no slots left — are joined by the
+/// terminal `bundle2(forward(a), forward(b))`, which carries both buffers out.
 #[test]
 fn shared_launch_slot_fans_out() {
+    use claspr::eager::{bundle2, forward};
+
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     const SENTINEL: u32 = 0xDEAD_BEEF;
     let half = N / 2;
 
-    // Two independent dispatch sites sharing ONE grid slot, joined by `and_then`.
-    // Each writes its own buffer; the second carries through to the terminal.
+    // Two dispatch sites sharing ONE grid slot, both on the `and_then` spine so
+    // the fan-out binder reaches both. The inner closure captures site A's output
+    // pipe (`a`) and joins it with site B's via `bundle2(forward(a), forward(b))`,
+    // so the SINGLE terminal yields BOTH buffers as a `(Checkout, Checkout)` tuple.
     let g = ks
         .global_id_u32(slot!(Grid), slot!(BufA))
-        .and_then(|_a| ks.global_id_u32(slot!(Grid), slot!(BufB)));
+        .and_then(move |a| {
+            ks.global_id_u32(slot!(Grid), slot!(BufB))
+                .and_then(move |b| bundle2(forward(a), forward(b)))
+        });
 
-    // ONE bind of Grid fills BOTH sites at [N/2]. The terminal yields the SECOND
-    // site's buffer (B).
-    let b_co = g
+    // ONE bind of Grid fills BOTH sites at [N/2]; the bundle delivers both outputs.
+    let (a_co, b_co) = g
         .bind(Grid(LaunchSpec::from([half])))
         .expect("one bind fills both Grid sites")
         .bind(BufA(seeded(&ctx, SENTINEL)))
@@ -360,9 +378,25 @@ fn shared_launch_slot_fans_out() {
         .expect("bind B")
         .sync(&ctx)
         .expect("sync shared grid");
+
+    // Both buffers come straight out of the one fanned graph — no proxy re-run.
+    let mut ra = vec![0u32; N];
     let mut rb = vec![0u32; N];
+    a_co.read(&mut ra).wait().expect("read A");
     b_co.read(&mut rb).wait().expect("read B");
-    // Site B dispatched at [N/2]: prefix written, suffix sentinel.
+
+    // Site A dispatched at [N/2]: prefix written to its gids, suffix kept sentinel.
+    assert!(
+        (0..half).all(|i| ra[i] == i as u32),
+        "shared grid: site A prefix written, got {:?}",
+        &ra[..8]
+    );
+    assert!(
+        (half..N).all(|i| ra[i] == SENTINEL),
+        "shared grid: site A suffix untouched (so it dispatched at the bound [N/2])"
+    );
+
+    // Site B dispatched at [N/2] too: same prefix/suffix shape from the same bind.
     assert!(
         (0..half).all(|i| rb[i] == i as u32),
         "shared grid: site B prefix written, got {:?}",
@@ -373,30 +407,27 @@ fn shared_launch_slot_fans_out() {
         "shared grid: site B suffix untouched (so it dispatched at the bound [N/2])"
     );
 
-    // To prove site A ALSO took the bound grid (not just B), run a single-site
-    // graph at the same bound and compare: a fresh A-only dispatch at [N/2] must
-    // produce the SAME prefix/suffix shape that the shared bind implied for A.
-    let solo = ks.global_id_u32(slot!(Grid), slot!(BufA));
-    let a_co = solo
-        .bind(Grid(LaunchSpec::from([half])))
-        .expect("bind grid solo")
-        .bind(BufA(seeded(&ctx, SENTINEL)))
-        .expect("bind A solo")
-        .sync(&ctx)
-        .expect("sync solo A");
-    let mut ra = vec![0u32; N];
-    a_co.read(&mut ra).wait().expect("read A solo");
+    // Belt-and-braces: both sites took the SAME bound grid, so their buffers match.
     assert_eq!(
         ra, rb,
-        "both Grid sites dispatch identically at the bound grid"
+        "both Grid sites dispatched identically at the one bound grid"
     );
 }
 
 /// (8) **Shared move-only buffer via Arc.** `Tag::Value = Arc<DeviceSlice>` used
 /// read-only at TWO kernel sites; ONE `bind(Shared(arc))` fans the SAME `cl_mem`
-/// out (Arc::clone) to both. Each site adds the shared operand into its own out.
+/// out (Arc::clone) to both. Each site adds the shared operand into its own out —
+/// and we surface BOTH sites' out buffers from the SINGLE fanned graph and assert
+/// each == 12, so each site provably saw BOTH shared operands.
+///
+/// Same spine constraint as the launch test (7): `bind_slots` recurses the
+/// `AndThen` spine but NOT into bundle branches, so both `add` sites stay on the
+/// spine (outer source, inner source) and only their concrete out pipes are joined
+/// by the terminal `bundle2(forward(out_a), forward(out_b))`.
 #[test]
 fn shared_arc_buffer_fans_out() {
+    use claspr::eager::{bundle2, forward};
+
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
@@ -404,17 +435,23 @@ fn shared_arc_buffer_fans_out() {
     // Two `add` sites, each reading the SAME two Arc operands (Shared=7, SharedB=5)
     // and writing its own out buffer. `add_u32`'s two read operands accept
     // `Arc<DeviceSlice>`, so both operand slots are clone-able → one bind each fans
-    // out across both sites. The second site carries through to the terminal.
+    // out across both sites. Both sites are on the `and_then` spine so the fan-out
+    // binder reaches both; the inner closure captures site A's out pipe (`oa`, the
+    // `.2` of its `(a, b, out)` handle) and joins it with site B's via
+    // `bundle2(forward(oa), forward(ob))` so the SINGLE terminal yields BOTH outs.
     let shared = Arc::new(seeded(&ctx, 7));
     let shared_b = Arc::new(seeded(&ctx, 5));
 
     let g = ks
         .add_u32([N], slot!(Shared), slot!(SharedB), slot!(OutA))
-        .and_then(|(_s, _b, _o)| ks.add_u32([N], slot!(Shared), slot!(SharedB), slot!(OutB)));
+        .and_then(move |(_a, _b, oa)| {
+            ks.add_u32([N], slot!(Shared), slot!(SharedB), slot!(OutB))
+                .and_then(move |(_a2, _b2, ob)| bundle2(forward(oa), forward(ob)))
+        });
 
-    // ONE bind of each Arc operand fills BOTH add sites (Arc::clone fan-out). The
-    // terminal is the second `add`, yielding its (a, b, out) Checkout tuple.
-    let (_sb, _bb, out_b) = g
+    // ONE bind of each Arc operand fills BOTH add sites (Arc::clone fan-out); the
+    // bundle delivers both outs as a `(Checkout, Checkout)` tuple.
+    let (out_a, out_b) = g
         .bind(Shared(Arc::clone(&shared)))
         .expect("one bind fills both Shared sites")
         .bind(SharedB(Arc::clone(&shared_b)))
@@ -425,34 +462,25 @@ fn shared_arc_buffer_fans_out() {
         .expect("bind outB")
         .sync(&ctx)
         .expect("sync two-site");
+
+    // Both out buffers come straight out of the one fanned graph — no proxy re-run.
+    let mut ra = vec![0u32; N];
     let mut rb = vec![0u32; N];
+    out_a.read(&mut ra).wait().expect("read A");
     out_b.read(&mut rb).wait().expect("read B");
-    // Site B (the terminal) computed 7 + 5 = 12 — only possible if BOTH its operand
-    // slots were filled by the single bind that also fed site A.
+
+    // Site A computed 7 + 5 = 12 — only possible if BOTH its operand slots were
+    // filled by the single bind that also fed site B.
+    assert!(
+        ra.iter().all(|&v| v == 12),
+        "shared Arc operands fanned to site A: 7 + 5 = 12, got {:?}",
+        &ra[..8]
+    );
+    // Site B likewise — both shared operands reached the terminal site.
     assert!(
         rb.iter().all(|&v| v == 12),
         "shared Arc operands fanned to site B: 7 + 5 = 12, got {:?}",
         &rb[..8]
-    );
-
-    // Confirm site A ran too (its OutA was consumed/written) by re-running a
-    // single-site graph with the same operands and matching the result shape.
-    let solo = ks.add_u32([N], slot!(Shared), slot!(SharedB), slot!(OutA));
-    let (_s, _b, out_a) = solo
-        .bind(Shared(Arc::clone(&shared)))
-        .expect("bind shared solo")
-        .bind(SharedB(Arc::clone(&shared_b)))
-        .expect("bind sharedB solo")
-        .bind(OutA(seeded(&ctx, 0)))
-        .expect("bind outA solo")
-        .sync(&ctx)
-        .expect("sync solo A");
-    let mut ra = vec![0u32; N];
-    out_a.read(&mut ra).wait().expect("read A solo");
-    assert!(
-        ra.iter().all(|&v| v == 12),
-        "single-site sanity with the same Arc operands: 7 + 5 = 12, got {:?}",
-        &ra[..8]
     );
 }
 
