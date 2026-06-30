@@ -20,7 +20,8 @@
 //!   `eager.rs:3401`, mints a FRESH `from_slice` buffer each run → new handle,
 //!   no home.)
 //! - `into_inner()` (user keeps the value) is the ONLY path that empties /
-//!   severs a cell.
+//!   severs a cell. For a SLOT it lands in `Severed` (not virgin `Unbound`): a
+//!   later set-once `bind` is `SlotSevered` and only `mutate_bind` re-arms it.
 //! - A homed buffer dropped mid-graph (produced, never delivered) returns to
 //!   the graph.
 //!
@@ -35,7 +36,7 @@
 
 use claspr::eager::{DeviceOpExt, download, eager_copy_to, upload, upload_as};
 use claspr::image::format::R32Uint;
-use claspr::{Context, DeviceSlice, Image2D, MemRef, ReadOnly, RecordableBuffer, WriteOnly};
+use claspr::{Context, DeviceSlice, Error, Image2D, MemRef, ReadOnly, RecordableBuffer, WriteOnly};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
 
@@ -371,10 +372,13 @@ fn copy_slot_src_and_slot_dst_x2_both_rehome() {
 // ───────────────────────────────────────────────────────────────────────────
 // 7. cross-graph hand-off.
 //    g produces a buffer; co = g.bind(...).sync(); v = download(co); v.sync().
-//    Invariant: g is left re-armable (slot severed to Unbound, so a fresh
-//    g.bind(Buf(other)).sync() works) AND v's Vec is correct (b's scaled data).
-//    This PASSES today: feeding a Checkout to `download` severs the slot
-//    (into_inner → SlotHome::sever → Lent→Unbound), so a fresh bind works.
+//    Invariant: g is left re-armable (slot severed, so re-arming via
+//    g.mutate_bind(Buf(other)).sync() works) AND v's Vec is correct (b's scaled
+//    data). Feeding a Checkout to `download` severs the slot (into_inner →
+//    SlotHome::sever → Lent→Severed). Re-arming a SEVERED slot is the
+//    `mutate_bind`-only path: a plain set-once `bind` there is `SlotSevered`
+//    (the 4th-state contract — re-providing a buffer is a change, not a first
+//    declaration).
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
 fn cross_graph_handoff_severs_and_rearms() {
@@ -388,7 +392,7 @@ fn cross_graph_handoff_severs_and_rearms() {
     let co = g.bind(Buf(b)).expect("bind").sync(&ctx).expect("g run");
 
     // Hand `co` to a second graph that downloads it. Feeding a Checkout as a
-    // `download` input severs g's slot (into_inner → Lent→Unbound).
+    // `download` input severs g's slot (into_inner → Lent→Severed).
     let v = download(co);
     let out = v.sync(&ctx).expect("download co");
     assert!(
@@ -397,11 +401,12 @@ fn cross_graph_handoff_severs_and_rearms() {
         &out[..8]
     );
 
-    // g's slot was SEVERED → a fresh bind of a DIFFERENT buffer succeeds.
+    // g's slot was SEVERED → a plain `bind` now rejects (SlotSevered); re-arm via
+    // `mutate_bind` of a DIFFERENT buffer.
     let other = seeded(&ctx, 5); // 5*2 = 10
     let co2 = g
-        .bind(Buf(other))
-        .expect("g re-armable: fresh bind after sever")
+        .mutate_bind(Buf(other))
+        .expect("g re-armable after sever via mutate_bind")
         .sync(&ctx)
         .expect("g re-run");
     let mut rb = vec![0u32; N];
@@ -412,9 +417,9 @@ fn cross_graph_handoff_severs_and_rearms() {
 // ───────────────────────────────────────────────────────────────────────────
 // 8. cross-graph as kernel arg.
 //    Feed co (a produced buffer) as a kernel arg to a second graph, run it,
-//    then re-bind the first graph's slot and re-run. Both produce correct data.
-//    PASSES today: feeding co as a kernel arg severs g1's slot; g1 re-arms via
-//    a fresh bind.
+//    then re-arm the first graph's severed slot and re-run. Both produce correct
+//    data. Feeding co as a kernel arg severs g1's slot (Lent→Severed); g1 re-arms
+//    via `mutate_bind` (a plain `bind` after sever is `SlotSevered`).
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
 fn cross_graph_as_kernel_arg() {
@@ -441,11 +446,12 @@ fn cross_graph_as_kernel_arg() {
         &r2[..8]
     );
 
-    // g1's slot was severed by feeding co into g2 → re-bind + re-run works.
+    // g1's slot was severed by feeding co into g2 → re-arm via mutate_bind +
+    // re-run works (a plain `bind` after sever is `SlotSevered`).
     let other = seeded(&ctx, 7); // 7*3 = 21
     let co3 = g1
-        .bind(Buf(other))
-        .expect("g1 re-armable after its buffer was consumed by g2")
+        .mutate_bind(Buf(other))
+        .expect("g1 re-armable after its buffer was consumed by g2 (mutate_bind)")
         .sync(&ctx)
         .expect("g1 re-run");
     let mut r3 = vec![0u32; N];
@@ -456,10 +462,11 @@ fn cross_graph_as_kernel_arg() {
 // ───────────────────────────────────────────────────────────────────────────
 // 9. slot rehome vs sever.
 //    (a) bind→sync→drop(checkout)→re-sync reuses same handle (rehome).
-//    (b) bind→sync→into_inner→bind(different)→sync works and uses the NEW
-//        buffer (sever path).
-//    PASSES today (this is the locked slot re-arm/sever behaviour; we add the
-//    handle-identity assertion on top).
+//    (b) bind→sync→into_inner→mutate_bind(different)→sync works and uses the NEW
+//        buffer (sever path). After sever the slot is `Severed`, so re-arming is
+//        the `mutate_bind`-only path (a plain `bind` there is `SlotSevered`).
+//    Locked slot re-arm/sever behaviour; we add the handle-identity assertion on
+//    top.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
 fn slot_rehome_vs_sever_handle_identity() {
@@ -482,8 +489,8 @@ fn slot_rehome_vs_sever_handle_identity() {
     );
     drop(co2);
 
-    // (b) sever: into_inner keeps the value → slot Unbound; a fresh bind of a
-    //     DIFFERENT buffer is used (its handle drives the run), and the result
+    // (b) sever: into_inner keeps the value → slot Severed; re-arm via mutate_bind
+    //     of a DIFFERENT buffer (its handle drives the run), and the result
     //     follows it.
     let kept = g.sync(&ctx).expect("run b0").into_inner();
     let kept_h = handle_of(&kept);
@@ -498,8 +505,8 @@ fn slot_rehome_vs_sever_handle_identity() {
     let other = seeded(&ctx, 9);
     let h_other = handle_of(&other);
     let co3 = g
-        .bind(Buf(other))
-        .expect("fresh bind after sever")
+        .mutate_bind(Buf(other))
+        .expect("re-arm after sever via mutate_bind")
         .sync(&ctx)
         .expect("run b1");
     assert_eq!(
@@ -554,27 +561,26 @@ fn homed_buffer_dropped_mid_graph_rearms_same_handle() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 11. multi-output copy independence.
-//     copy producing (Checkout<Src>, Checkout<Dst>); drop one, into_inner the
-//     other; assert src re-armed (handle stable, re-sync works) and dst severed
-//     (independent).
-//     RED: with CONCRETE src/dst this re-arms today, BUT the asymmetric
-//     "into_inner one side severs ONLY that side, the other re-arms" requires
-//     the per-output home to be independent AND the src cell to re-arm with a
-//     stable handle while the dst cell is severed — combined with a re-sync that
-//     re-allocates the severed dst. A concrete severed cell goes empty, so a
-//     re-sync of the severed side is "busy" unless the dst is re-bound. We
-//     express it the way it SHOULD read and ignore until the per-side
-//     sever/re-arm + re-alloc story is settled.
+// 11. multi-output copy independence — through the SLOT path.
+//     A multi-output copy `(Checkout<Src>, Checkout<Dst>)` whose dst is a
+//     `slot!(Dst)` (so the 4-state slot machine governs it). Drop the src
+//     Checkout (rehome → src re-arms with a STABLE handle) and `into_inner` the
+//     dst Checkout (→ the dst slot is `Severed`). Assert the two sides are
+//     INDEPENDENT:
+//       - the severed dst rejects a plain `bind` (`SlotSevered`) but re-arms via
+//         `mutate_bind` of a NEW dst, and a re-sync then copies into it;
+//       - src is re-armed (same handle) across that re-sync — it was untouched by
+//         the dst sever.
+//
+//     This replaces the previously-ignored CONCRETE-dst form. With a concrete
+//     copy dst, a severed cell goes empty and a bare `Cell` can't tell "severed
+//     (→ re-alloc)" from "lent / busy (→ error)" — the reason it was deferred.
+//     Routing the dst through a `slot!` gives exactly that disambiguation (the
+//     `Severed` state), and the just-landed `eager_copy_to(src, slot!(Dst))`
+//     copy-slot path (commits 3e0b4af / a298392) threads its `SlotHome`, so the
+//     scenario is now expressible and PASSES — hence un-ignored.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "DEFERRED: per-side independent homes now work (src re-arms, dst severs \
-            independently — the home-invariant core landed), but re-SYNCing after \
-            severing a CONCRETE copy dst requires re-ALLOCATING that side. A bare \
-            concrete `Cell` can't distinguish 'severed (→ re-alloc)' from 'lent / \
-            busy (→ error)' — that needs the tri-state disambiguation the upload \
-            cell got, extended to user copy cells. Out of scope for the home \
-            invariant; the per-side independence it asserts is otherwise satisfied."]
 fn multi_output_copy_independence() {
     let Some(ctx) = ctx() else { return };
 
@@ -582,28 +588,56 @@ fn multi_output_copy_independence() {
     let src = DeviceSlice::<u32>::from_slice(&ctx, &data).expect("src");
     let dst = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("dst");
     let hs = handle_of(&src);
+    let hd = handle_of(&dst);
 
-    let g = eager_copy_to(src, dst);
+    // Concrete src + SLOT dst: the dst is governed by the 4-state slot machine.
+    let g = eager_copy_to(src, slot!(Dst));
+    g.bind(Dst(dst)).expect("bind dst slot");
 
     let (co_src, co_dst) = g.sync(&ctx).expect("copy run 1");
     assert_eq!(handle_of(&*co_src), hs, "src handle stable run 1");
-    // Drop src (re-arm), into_inner dst (sever + keep).
+    assert_eq!(handle_of(&*co_dst), hd, "dst (slot) handle stable run 1");
+
+    // Drop src (rehome → re-arm), into_inner dst (sever its slot + keep value).
     drop(co_src);
     let kept_dst = co_dst.into_inner();
     let mut out = vec![0u32; N];
+    // `read` consumes the kept dst buffer (releasing it).
     kept_dst.read(&mut out).wait().expect("read kept dst");
     assert_eq!(out, data, "kept dst holds the copied data");
 
-    // src must be re-armed with a STABLE handle; dst was severed (independent).
-    // A re-sync exercises src's re-arm. The severed dst cell is empty, so the
-    // engine must re-allocate it (the spec for a severed copy side) rather than
-    // error busy.
-    let (co_src2, _co_dst2) = g
+    // The dst slot is SEVERED → a plain `bind` rejects; only `mutate_bind` re-arms.
+    match g.bind(Dst(DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("d2"))) {
+        Ok(_) => panic!("plain bind on a severed copy-dst slot must error"),
+        Err(Error::SlotSevered(n)) => assert!(
+            n.contains("Dst"),
+            "expected SlotSevered naming Dst, got {n:?}"
+        ),
+        Err(other) => panic!("expected SlotSevered on severed dst bind, got {other:?}"),
+    }
+
+    // Re-arm the severed dst with a NEW buffer via mutate_bind, then re-sync. src
+    // must re-arm with its STABLE handle (independent of the dst sever); the new
+    // dst is copied into and holds src's data.
+    let dst2 = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("dst2");
+    let hd2 = handle_of(&dst2);
+    g.mutate_bind(Dst(dst2))
+        .expect("mutate_bind re-arms the severed copy-dst slot");
+
+    let (co_src2, co_dst2) = g
         .sync(&ctx)
-        .expect("copy run 2: src re-armed, dst re-allocated after sever");
+        .expect("copy run 2: src re-armed, dst re-armed via mutate_bind");
     assert_eq!(
         handle_of(&*co_src2),
         hs,
         "src side independent: re-armed with the same handle after dst severed"
     );
+    assert_eq!(
+        handle_of(&*co_dst2),
+        hd2,
+        "dst side: the mutate_bound NEW buffer drives run 2"
+    );
+    let mut out2 = vec![0u32; N];
+    co_dst2.read(&mut out2).wait().expect("read dst2");
+    assert_eq!(out2, data, "run 2 copied src into the re-armed dst");
 }

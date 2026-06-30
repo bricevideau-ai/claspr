@@ -75,6 +75,17 @@ pub enum Error {
     /// [`into_inner`](crate::Checkout::into_inner) (severing it) before
     /// re-binding.
     SlotCheckedOut(&'static str),
+    /// A `g.bind(Tag(value))` (the set-once verb) targeted a slot that was
+    /// **severed** — its value was previously extracted via
+    /// [`into_inner`](crate::Checkout::into_inner) (the caller kept the buffer).
+    /// A severed slot is empty, but NOT virgin: it was once bound, so re-providing
+    /// a buffer is a *change*, not a first declaration. The set-once `bind`
+    /// therefore rejects it (it would silently re-fill a slot whose value the
+    /// caller deliberately took); the string is the tag's `type_name`. Use
+    /// [`mutate_bind`](crate::DeviceOpExt::mutate_bind) to re-arm it with a new
+    /// buffer. (Contrast [`SlotUnbound`](Error::SlotUnbound), the virgin /
+    /// never-bound case, which `bind` DOES fill.)
+    SlotSevered(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -111,6 +122,11 @@ impl fmt::Display for Error {
                 f,
                 "eager graph: slot `{tag}` is currently checked out; drop the \
                  Checkout (or call into_inner) before re-binding"
+            ),
+            Error::SlotSevered(tag) => write!(
+                f,
+                "eager graph: slot `{tag}` was severed (its value was taken via \
+                 into_inner); use `mutate_bind` to re-arm it with a new buffer"
             ),
         }
     }

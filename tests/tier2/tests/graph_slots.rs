@@ -12,19 +12,22 @@
 //! | Bound, `==`   | no-op (idempotent)       | overwrite                  |
 //! | Bound, `≠`    | `Err(SlotConflict)`      | overwrite                  |
 //! | Lent          | `Err(SlotCheckedOut)`    | `Err(SlotCheckedOut)`      |
+//! | Severed       | `Err(SlotSevered)`       | fill (re-arm)              |
 //!
 //! Equality is **buffer-handle identity** (`SlotEq`), not byte-equal contents.
 //! Completeness (every slot bound) is enforced only at `sync` (runtime): an
-//! unbound slot is `Error::SlotUnbound`. After a run the Checkout returns the
-//! buffer to its slot cell (re-arm `Lent → Bound`), so a bound graph re-runs;
-//! `into_inner` severs it (`Lent → Unbound`). These tests lock the matrix plus the
-//! kept step-(b) properties:
+//! unbound (or severed) slot is `Error::SlotUnbound`. After a run the Checkout
+//! returns the buffer to its slot cell (re-arm `Lent → Bound`), so a bound graph
+//! re-runs; `into_inner` severs it (`Lent → Severed`) — a state a set-once `bind`
+//! rejects (`SlotSevered`) and only `mutate_bind` re-arms. These tests lock the
+//! matrix plus the kept step-(b) properties:
 //!
 //! (a) `slot!` + `g.bind(Tag(v))?.sync()` produces correct data.
 //! (b) order-free — chained `bind`s AND the tuple `call((A,B,Out))`.
 //! (c) re-run a bound graph twice (the slot re-arms like a concrete cell).
 //! (d) an unbound slot makes `sync` return the "slot unbound" `Err`.
-//! (e) the verb 2×2: idempotent bind, conflict, mutate, checked-out, sever.
+//! (e) the verb 2×2: idempotent bind, conflict, mutate, checked-out, sever
+//!     (`bind` after sever rejects with `SlotSevered`; `mutate_bind` re-arms).
 
 use claspr::eager::{DeviceOpExt, download};
 use claspr::{Context, DeviceSlice, Error};
@@ -376,11 +379,17 @@ fn bind_while_checked_out_errors() {
     );
 }
 
-/// (e5) **`into_inner` severs the slot to `Unbound`.** After a run, taking the
-/// value out (rather than re-arming) leaves the slot genuinely empty — so a fresh
-/// `bind` of a DIFFERENT buffer succeeds (no conflict, since severed).
+/// (e5) **`into_inner` severs the slot to `Severed`.** After a run, taking the
+/// value out (rather than re-arming) leaves the slot SEVERED — empty, but NOT
+/// virgin: it was once bound and the caller deliberately kept its value. So the
+/// set-once `bind` of a DIFFERENT buffer is now `Err(SlotSevered)` (re-providing a
+/// buffer is a CHANGE, not a first declaration); only `mutate_bind` may re-arm it,
+/// and the NEW buffer then drives the result.
+///
+/// (This replaces the old `into_inner_severs_slot_to_unbound`, which asserted a
+/// plain `bind` after sever SUCCEEDS — the bug the 4th `Severed` state fixes.)
 #[test]
-fn into_inner_severs_slot_to_unbound() {
+fn into_inner_severs_slot_then_bind_rejected_mutate_rearms() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
@@ -388,24 +397,72 @@ fn into_inner_severs_slot_to_unbound() {
 
     let a = seeded(&ctx, 3);
     let co = g.bind(Buf(a)).expect("bind a").sync(&ctx).expect("run");
-    // Sever: keep the value, leave the slot `Unbound` (NOT `Lent`, NOT re-armed).
+    // Sever: keep the value, leave the slot `Severed` (NOT `Lent`, NOT re-armed,
+    // NOT virgin-`Unbound`).
     let kept = co.into_inner();
     drop(kept);
 
-    // A fresh `bind` to a DIFFERENT buffer must succeed — the slot is Unbound, so
-    // there is no value to conflict with.
+    // (a) A set-once `bind` of a DIFFERENT buffer must now REJECT — the slot is
+    // Severed, so re-providing a buffer is a change, not a first declaration.
+    let err = bind_err(
+        g.bind(Buf(seeded(&ctx, 99))),
+        "bind after sever must error (slot is Severed, not virgin)",
+    );
+    assert!(
+        matches!(err, Error::SlotSevered(n) if n.contains("Buf")),
+        "expected SlotSevered from bind after sever, got {err:?}"
+    );
+
+    // (b) `mutate_bind` of a DIFFERENT buffer re-arms the severed slot, and the
+    // NEW buffer drives the result.
     let out = g
-        .bind(Buf(seeded(&ctx, 7)))
-        .expect("bind after sever must succeed (slot is Unbound, no conflict)")
+        .mutate_bind(Buf(seeded(&ctx, 7)))
+        .expect("mutate_bind re-arms a severed slot")
         .sync(&ctx)
-        .expect("run after sever");
+        .expect("run after re-arm");
     let mut rb = vec![0u32; N];
     out.read(&mut rb).wait().expect("read");
     assert!(
         rb.iter().all(|&v| v == 14),
-        "post-sever bind's buffer drives the result: 7 * 2 = 14, got {:?}",
+        "post-sever mutate_bind's buffer drives the result: 7 * 2 = 14, got {:?}",
         &rb[..8]
     );
+}
+
+/// (e5b) **Regressions guarding the new `Severed` state.** Two properties that the
+/// 4th state must NOT have broken or conflated:
+/// - A **virgin** (`Unbound`) slot still accepts a plain set-once `bind` (adding
+///   `Severed` must not turn the virgin-fill path into a rejection).
+/// - A **severed** slot with NO new bind, re-sync'd, surfaces as
+///   `Error::SlotUnbound` (a severed slot has nothing to lend — it must ERROR, not
+///   silently run an empty slot).
+#[test]
+fn virgin_bind_ok_and_severed_resync_without_rebind_errors() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    let g = ks.scale_u32([N], slot!(Buf), 2u32);
+
+    // Virgin path: a plain `bind` on a never-bound slot fills it and runs.
+    let co = g
+        .bind(Buf(seeded(&ctx, 4)))
+        .expect("virgin slot accepts a plain bind")
+        .sync(&ctx)
+        .expect("run over virgin-bound slot");
+    // Sever it (keep the value), leaving the slot `Severed`.
+    let kept = co.into_inner();
+    drop(kept);
+
+    // Severed + NO rebind: lending a severed slot has nothing to hand the run, so
+    // a re-sync must ERROR (SlotUnbound), not silently run.
+    match g.sync(&ctx) {
+        Ok(_) => panic!("re-sync of a severed slot with no rebind must error"),
+        Err(Error::SlotUnbound(n)) => assert!(
+            n.contains("Buf"),
+            "expected SlotUnbound naming Buf, got name {n:?}"
+        ),
+        Err(other) => panic!("expected SlotUnbound on severed-no-rebind sync, got {other:?}"),
+    }
 }
 
 /// (e6) A **conflicting element inside a `call`** errors (the multi-fill inherits

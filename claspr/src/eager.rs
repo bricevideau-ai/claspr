@@ -101,20 +101,20 @@ pub trait DeviceEnqueue: Send + Sized {
 /// hold a clone to deposit the value back home.
 pub type Cell<T> = Arc<Mutex<Option<T>>>;
 
-// ── SlotState<T>: the tri-state slot cell ──────────────────────────────────
+// ── SlotState<T>: the four-state slot cell ─────────────────────────────────
 
-/// The cell behind an [`Input::Slot`] — a **three-state** resource holder, the
+/// The cell behind an [`Input::Slot`] — a **four-state** resource holder, the
 /// distinction a bare `Option<T>` cannot make.
 ///
 /// A concrete head's [`Cell<T>`] only ever needs `Some`/`None` (full / lent),
 /// because "the cell is empty" unambiguously means "a run lent it and a still-live
 /// `Checkout` owes it back" (the graph is busy). A SLOT, though, can be empty for
-/// **two different reasons**, and the verb 2×2 ([`bind`](DeviceOpExt::bind) /
+/// **three different reasons**, and the verb 2×2 ([`bind`](DeviceOpExt::bind) /
 /// [`mutate_bind`](DeviceOpExt::mutate_bind)) must tell them apart at bind time:
 ///
-/// - [`Unbound`](SlotState::Unbound) — never filled (or severed by
-///   [`into_inner`](Checkout::into_inner)). A `bind`/`mutate_bind` here simply
-///   fills it; resolving it is [`Error::SlotUnbound`].
+/// - [`Unbound`](SlotState::Unbound) — **virgin**: never filled. A `bind` here is
+///   the slot's first declaration, so both verbs simply fill it; resolving it is
+///   [`Error::SlotUnbound`].
 /// - [`Bound`](SlotState::Bound) — holds a buffer, ready to lend. `bind` is
 ///   idempotent if the new value is the *same* buffer ([`SlotEq`]) and
 ///   [`Error::SlotConflict`] otherwise; `mutate_bind` overwrites.
@@ -123,22 +123,36 @@ pub type Cell<T> = Arc<Mutex<Option<T>>>;
 ///   [`Error::SlotCheckedOut`] for BOTH verbs: the value is in the caller's hands,
 ///   and the Checkout's drop will rehome the OLD buffer over any new one — a
 ///   silent clobber. The caller must drop the Checkout (re-arm → `Bound`) or
-///   `into_inner` it (sever → `Unbound`) first.
+///   `into_inner` it (sever → `Severed`) first.
+/// - [`Severed`](SlotState::Severed) — **was bound, then its value was taken** via
+///   [`into_inner`](Checkout::into_inner). The slot is empty like `Unbound`, but
+///   NOT virgin: re-providing a buffer is a *change*, not a first declaration. So
+///   the set-once `bind` is [`Error::SlotSevered`] (it must not silently re-fill a
+///   slot whose value the caller deliberately extracted); only `mutate_bind` may
+///   re-arm it (→ `Bound`). Resolving it is [`Error::SlotUnbound`] (nothing to
+///   lend, same as virgin). This is the state that fixes the old `into_inner`
+///   bug, where `Lent → Unbound` let a plain `bind` wrongly succeed after sever.
 ///
-/// The three transitions live at: lend (`Bound → Lent`, `Input::lend_slot`),
-/// rehome on Checkout drop (`Lent → Bound`, `SlotHome::rehome`), and sever on
-/// `into_inner` (`Lent → Unbound`, `SlotHome::sever`).
+/// The four transitions live at: lend (`Bound → Lent`, `Input::lend_slot`),
+/// rehome on Checkout drop (`Lent → Bound`, `SlotHome::rehome`), sever on
+/// `into_inner` (`Lent → Severed`, `SlotHome::sever`), and `mutate_bind` re-arming
+/// a severed slot (`Severed → Bound`, `Input::try_bind_slot`).
 pub enum SlotState<T> {
-    /// Never bound (or severed) — the slot is genuinely empty.
+    /// **Virgin** — never bound. The slot is genuinely empty and a `bind` is its
+    /// first declaration (both verbs fill it).
     Unbound,
     /// Holds a buffer ready to lend on the next run.
     Bound(T),
     /// The buffer is lent to a live `Checkout`; the slot is empty *because a run
     /// is in flight*, NOT because it was never bound.
     Lent,
+    /// **Was bound, value taken** — the caller extracted the buffer via
+    /// [`into_inner`](Checkout::into_inner). Empty like `Unbound`, but a set-once
+    /// `bind` rejects it ([`Error::SlotSevered`]); only `mutate_bind` re-arms it.
+    Severed,
 }
 
-/// The tri-state cell shared by a [`SlotHandle`] and its [`Input::Slot`].
+/// The four-state cell shared by a [`SlotHandle`] and its [`Input::Slot`].
 pub type SlotCell<T> = Arc<Mutex<SlotState<T>>>;
 
 // ── SlotEq: "same buffer object" for the bind idempotency check ─────────────
@@ -328,13 +342,14 @@ impl SlotBinder {
     /// Take the verb-2×2 verdict out of the binder after the fold. `Ok(())` if the
     /// binding landed (or was a clean idempotent no-op), else the
     /// [`SlotConflict`](Error::SlotConflict) / [`SlotCheckedOut`](Error::SlotCheckedOut)
-    /// that a matching slot recorded.
+    /// / [`SlotSevered`](Error::SlotSevered) that a matching slot recorded.
     pub fn outcome(&self) -> Result<()> {
         match &self.outcome {
             Ok(()) => Ok(()),
-            // Both error arms are `&'static str`-carrying, so a cheap copy.
+            // Every error arm is `&'static str`-carrying, so a cheap copy.
             Err(Error::SlotConflict(n)) => Err(Error::SlotConflict(n)),
             Err(Error::SlotCheckedOut(n)) => Err(Error::SlotCheckedOut(n)),
+            Err(Error::SlotSevered(n)) => Err(Error::SlotSevered(n)),
             // No other error is ever recorded into a binder.
             Err(_) => unreachable!("SlotBinder only records slot-bind errors"),
         }
@@ -370,9 +385,13 @@ pub trait Rehome<Out>: Send {
     /// [`Checkout::into_inner`], where the caller KEEPS the value. For a concrete
     /// [`Cell`] this is a no-op (its cell is already empty, which correctly reads
     /// "busy / re-allocate next run"). For a [`slot`](SlotState) cell this is the
-    /// `Lent → Unbound` transition: the value is gone for good, so the slot must
-    /// read genuinely empty (not stuck in `Lent`) — otherwise a later
-    /// `bind`/`mutate_bind` would wrongly see [`Error::SlotCheckedOut`].
+    /// `Lent → Severed` transition: the value is gone for good, so the slot must
+    /// read empty (not stuck in `Lent`) — otherwise a later `bind`/`mutate_bind`
+    /// would wrongly see [`Error::SlotCheckedOut`]. It lands in
+    /// [`Severed`](SlotState::Severed), NOT [`Unbound`](SlotState::Unbound): a
+    /// severed slot was once bound, so a set-once `bind` must reject it
+    /// ([`Error::SlotSevered`]) rather than silently re-fill — only `mutate_bind`
+    /// may re-arm it.
     ///
     /// Default: no-op (the concrete-cell behaviour). Slots override it.
     fn sever(self: Box<Self>) {}
@@ -414,9 +433,10 @@ impl<T: Send> Rehome<T> for Cell<T> {
 }
 
 /// The return home for a **slot** input — distinct from the concrete
-/// [`Cell<T>: Rehome`] home because the slot's tri-state needs two distinct exits.
+/// [`Cell<T>: Rehome`] home because the slot's four-state cell needs two distinct
+/// exits.
 ///
-/// A slot cell is the tri-state [`SlotCell<T>`]; while a run is in flight it sits
+/// A slot cell is the four-state [`SlotCell<T>`]; while a run is in flight it sits
 /// in [`Lent`](SlotState::Lent). This home owns a clone of that cell and resolves
 /// the two terminal transitions:
 /// - [`rehome`](Rehome::rehome) (Checkout drop OR undelivered/consumed buffer,
@@ -427,12 +447,17 @@ impl<T: Send> Rehome<T> for Cell<T> {
 ///   severed. This rehome fires from the general [`PipePayload`] drop, from
 ///   [`Checkout`] drop, or directly from a consuming op via
 ///   [`rehome_consumed`] — one and only one, because [`BoxedHome`] is not `Clone`.
-/// - [`sever`](Rehome::sever) (`into_inner`, keep the value): `Lent → Unbound`.
-///   The ONLY path that empties a slot cell.
+/// - [`sever`](Rehome::sever) (`into_inner`, keep the value): `Lent → Severed`.
+///   The ONLY path that empties a slot cell. It lands in
+///   [`Severed`](SlotState::Severed) (NOT [`Unbound`](SlotState::Unbound)): the
+///   slot was once bound and the caller took its value, so a set-once `bind` must
+///   reject it ([`Error::SlotSevered`]) rather than silently re-fill — only
+///   `mutate_bind` re-arms it.
 ///
 /// (A concrete `Cell` needs no `sever` override: its empty state is overloaded, so
-/// its `sever` is a no-op. The slot's third state is what distinguishes "checked
-/// out / re-armable" from "severed / never bound" — and there is now no
+/// its `sever` is a no-op. The slot's third/fourth states are what distinguish
+/// "checked out / re-armable" (`Lent`) from "severed / value taken" (`Severed`)
+/// from "virgin / never bound" (`Unbound`) — and there is now no
 /// drop-without-firing fallback: the general payload-drop rule rehomes any
 /// undelivered slot buffer, so a slot is never left stuck in `Lent`.)
 struct SlotHome<T> {
@@ -447,8 +472,10 @@ impl<T: Send> Rehome<T> for SlotHome<T> {
         *self.cell.lock().unwrap() = SlotState::Bound(value);
     }
     fn sever(self: Box<Self>) {
-        // The caller kept the value (`into_inner`); the slot is genuinely empty.
-        *self.cell.lock().unwrap() = SlotState::Unbound;
+        // The caller kept the value (`into_inner`); the slot is empty but NOT
+        // virgin — it lands in `Severed`, so a set-once `bind` rejects it
+        // (`Error::SlotSevered`) and only `mutate_bind` may re-arm it.
+        *self.cell.lock().unwrap() = SlotState::Severed;
     }
 }
 
@@ -667,8 +694,9 @@ pub enum Input<T> {
     /// [`bind_slots`](DeviceOp::bind_slots)), moving it to [`Bound`](SlotState::Bound).
     ///
     /// Unlike a [`Concrete`](Input::Concrete) cell (a bare `Option`, full/lent), a
-    /// slot is the **tri-state** [`SlotCell`] so the verb 2×2 can tell
-    /// [`Unbound`](SlotState::Unbound) ("never filled / severed") from
+    /// slot is the **four-state** [`SlotCell`] so the verb 2×2 can tell
+    /// [`Unbound`](SlotState::Unbound) ("virgin / never filled") and
+    /// [`Severed`](SlotState::Severed) ("value taken via `into_inner`") from
     /// [`Lent`](SlotState::Lent) ("checked out, run in flight"). It still lends +
     /// re-arms like a concrete cell on the happy path: lend takes
     /// `Bound → Lent`, the run's `Checkout` drop returns `Lent → Bound`, so a
@@ -742,15 +770,16 @@ impl<T> Input<T> {
         Self::thread_start_gate(v, ec, home)
     }
 
-    /// Lend the value out of a **slot** [`SlotCell`]: the tri-state analogue of
+    /// Lend the value out of a **slot** [`SlotCell`]: the multi-state analogue of
     /// [`lend_from_cell`](Self::lend_from_cell). Transitions
-    /// [`Bound(v) → Lent`](SlotState::Lent) and hands `v` to the run; an
-    /// [`Unbound`](SlotState::Unbound) slot is [`Error::SlotUnbound`] (never bound);
-    /// a [`Lent`](SlotState::Lent) slot is the graph-busy case — a previous run's
-    /// `Checkout` still holds the buffer — and also surfaces as `SlotUnbound`
-    /// (whose message covers both). The home is a [`SlotHome`] so the run's
-    /// `Checkout` drop re-arms `Lent → Bound` and `into_inner` severs
-    /// `Lent → Unbound`.
+    /// [`Bound(v) → Lent`](SlotState::Lent) and hands `v` to the run; any empty
+    /// state ([`Unbound`](SlotState::Unbound) "never bound" or
+    /// [`Severed`](SlotState::Severed) "value taken via `into_inner`") is
+    /// [`Error::SlotUnbound`] (nothing to lend); a [`Lent`](SlotState::Lent) slot is
+    /// the graph-busy case — a previous run's `Checkout` still holds the buffer —
+    /// and also surfaces as `SlotUnbound` (whose message covers all three). The
+    /// home is a [`SlotHome`] so the run's `Checkout` drop re-arms `Lent → Bound`
+    /// and `into_inner` severs `Lent → Severed`.
     fn lend_slot(
         cell: &SlotCell<T>,
         ec: &ExecutionContext<'_>,
@@ -759,14 +788,15 @@ impl<T> Input<T> {
     where
         T: Send + 'static,
     {
-        // `Bound(v) → Lent`, take `v`; anything else (Unbound / already Lent) is
-        // the "unbound or busy" error.
+        // `Bound(v) → Lent`, take `v`; anything else (Unbound / Severed / already
+        // Lent) is the "nothing to lend" error.
         let v = {
             let mut guard = cell.lock().unwrap();
             match std::mem::replace(&mut *guard, SlotState::Lent) {
                 SlotState::Bound(v) => v,
                 // Restore the prior state before erroring (we tentatively wrote
                 // `Lent` above; put it back so the slot is unchanged on failure).
+                // `Unbound`/`Severed`/`Lent` all surface as `SlotUnbound`.
                 other => {
                     *guard = other;
                     return Err(Error::SlotUnbound(name));
@@ -856,7 +886,7 @@ impl<T> Input<T> {
     /// If this input is a [`Concrete`](Input::Concrete) head, return its lending
     /// [`Cell`] so a run's `Checkout` can deposit the (possibly transformed-in-place /
     /// Uninit→Init-downgraded) value back into it on drop, re-arming the graph. A
-    /// `Pipe` has no home cell, and a `Slot`'s home is the tri-state
+    /// `Pipe` has no home cell, and a `Slot`'s home is the four-state
     /// `SlotHome` (not a plain `Cell`) — both return `None` here; a slot threads
     /// its home via [`slot_home`](Self::slot_home).
     pub fn return_cell(&self) -> Option<Cell<T>> {
@@ -866,10 +896,10 @@ impl<T> Input<T> {
         }
     }
 
-    /// If this input is a bound [`Slot`](Input::Slot), build its tri-state return
+    /// If this input is a bound [`Slot`](Input::Slot), build its four-state return
     /// [`BoxedHome`] (a `SlotHome`) so an in-place op (e.g. a copy with a slot
     /// src/dst) re-arms `Lent → Bound` on `Checkout` drop and severs `Lent →
-    /// Unbound` on `into_inner`. `None` for concrete (use
+    /// Severed` on `into_inner`. `None` for concrete (use
     /// [`return_cell`](Self::return_cell) + `CopyHome`, which also handles the
     /// Uninit downgrade) and pipes.
     pub fn slot_home(&self) -> Option<BoxedHome<T>>
@@ -890,7 +920,7 @@ impl<T> Input<T> {
     /// the home invariant:
     /// - [`Concrete`](Input::Concrete): `T`'s [`CopyHome::copy_home`] (identity, or
     ///   the `Uninit → Init` downgrade re-wrap).
-    /// - [`Slot`](Input::Slot): `T`'s [`CopyHome::copy_slot_home`] (a tri-state
+    /// - [`Slot`](Input::Slot): `T`'s [`CopyHome::copy_slot_home`] (a four-state
     ///   [`SlotHome`] — re-arms `Lent → Bound`, severs on `into_inner`). This is the
     ///   wiring of the formerly-dead [`slot_home`](Self::slot_home), now generalised
     ///   through `CopyHome` so it threads even when the copy retypes the output.
@@ -920,7 +950,7 @@ impl<T> Input<T> {
     ///
     /// Returns a [`Cell`] handle (not a borrow) because the value lives behind a
     /// `Mutex`; callers `.lock()` it to read the buffer. `None` ⇒ pipe-fed or slot.
-    /// (A slot's tri-state cell isn't a plain `Cell`; slot-headed graphs run through
+    /// (A slot's four-state cell isn't a plain `Cell`; slot-headed graphs run through
     /// the launcher terminals, not the concrete-head `wait`/`submit`.)
     pub fn concrete_cell(&self) -> Option<Cell<T>> {
         match self {
@@ -937,12 +967,12 @@ impl<T> Input<T> {
     pub fn with_concrete<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
         match self {
             Input::Concrete(cell) => cell.lock().unwrap().as_ref().map(f),
-            // A slot is readable by-ref only while `Bound`; `Unbound`/`Lent` map
-            // to `None` (the same "no concrete value to inspect" the empty
-            // concrete cell gives).
+            // A slot is readable by-ref only while `Bound`; every empty state
+            // (`Unbound`/`Severed`/`Lent`) maps to `None` (the same "no concrete
+            // value to inspect" the empty concrete cell gives).
             Input::Slot { cell, .. } => match &*cell.lock().unwrap() {
                 SlotState::Bound(v) => Some(f(v)),
-                SlotState::Unbound | SlotState::Lent => None,
+                SlotState::Unbound | SlotState::Severed | SlotState::Lent => None,
             },
             Input::Pipe(_) => None,
         }
@@ -971,6 +1001,7 @@ impl<T> Input<T> {
     /// | `Bound`, `==`    | no-op (idempotent)                 | overwrite                    |
     /// | `Bound`, `!=`    | record [`SlotConflict`](Error::SlotConflict) | overwrite          |
     /// | `Lent`           | record [`SlotCheckedOut`](Error::SlotCheckedOut) | (same)         |
+    /// | `Severed`        | record [`SlotSevered`](Error::SlotSevered) | fill → `Bound`        |
     ///
     /// Equality is **buffer-handle identity** ([`SlotEq`], via the binder's captured
     /// comparator) — "the same buffer object", not byte-equal contents. After
@@ -1005,10 +1036,23 @@ impl<T> Input<T> {
 
         let mut guard = cell.lock().unwrap();
         match &*guard {
-            // Empty / fresh — both verbs fill it.
+            // Virgin — never bound. Both verbs fill it (a `bind` is the slot's
+            // first declaration).
             SlotState::Unbound => {
                 *guard = SlotState::Bound(new);
             }
+            // Severed — was bound, the caller took its value via `into_inner`.
+            // Re-providing a buffer is a *change*, not a first declaration: the
+            // set-once `bind` rejects it (it must not silently re-fill a slot whose
+            // value the caller deliberately extracted); only `mutate_bind` re-arms.
+            SlotState::Severed => match binder.mode {
+                BindMode::Set => {
+                    binder.outcome = Err(Error::SlotSevered(name));
+                }
+                BindMode::Mutate => {
+                    *guard = SlotState::Bound(new);
+                }
+            },
             SlotState::Bound(cur) => match binder.mode {
                 BindMode::Set => {
                     // Idempotent on the SAME buffer object; conflict on a different
@@ -1608,7 +1652,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// hard error on a *conflicting* one (the verb 2×2 — see
     /// [`try_bind_slot`](Input::try_bind_slot)):
     ///
-    /// - slot [`Unbound`](SlotState::Unbound) → fill it.
+    /// - slot [`Unbound`](SlotState::Unbound) (virgin) → fill it.
     /// - slot [`Bound`](SlotState::Bound) to the SAME buffer object
     ///   ([`SlotEq`] handle identity) → no-op (re-handing the buffer you already
     ///   gave is fine).
@@ -1617,6 +1661,10 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// - slot [`Lent`](SlotState::Lent) (its buffer is checked out to a live
     ///   [`Checkout`]) → [`Error::SlotCheckedOut`] (re-binding would clobber the
     ///   value in the caller's hands).
+    /// - slot [`Severed`](SlotState::Severed) (its value was taken via
+    ///   [`into_inner`](Checkout::into_inner)) → [`Error::SlotSevered`]:
+    ///   re-providing a buffer is a *change*, not a first declaration, so the
+    ///   set-once verb rejects it. Use [`mutate_bind`](Self::mutate_bind) to re-arm.
     ///
     /// **Order-free + curryable + partial.** Each `bind` carries exactly one tag,
     /// folded independently, so `g.bind(Buf(b))?.bind(W(w))?` and the reverse are
@@ -1647,11 +1695,14 @@ pub trait DeviceOpExt: DeviceOp + Sized {
 
     /// **Set/change** bind of one typed slot — the mutating sibling of
     /// [`bind`](Self::bind). Overwrites a [`Bound`](SlotState::Bound) slot (to the
-    /// same OR a different buffer) and fills an [`Unbound`](SlotState::Unbound) one;
-    /// returns `Result<&Self>` so it chains. Unlike `bind`, it does NOT require a
-    /// prior bind and never reports [`SlotConflict`](Error::SlotConflict) — so the
-    /// loop case `for x in xs { g.mutate_bind(Buf(x))?.sync(&ctx)?; }` works without
-    /// peeling the first iteration.
+    /// same OR a different buffer), fills an [`Unbound`](SlotState::Unbound) (virgin)
+    /// one, AND re-arms a [`Severed`](SlotState::Severed) one (a slot whose value was
+    /// taken via [`into_inner`](Checkout::into_inner)); returns `Result<&Self>` so it
+    /// chains. Unlike `bind`, it does NOT require a prior bind and never reports
+    /// [`SlotConflict`](Error::SlotConflict) or [`SlotSevered`](Error::SlotSevered) —
+    /// so the loop case `for x in xs { g.mutate_bind(Buf(x))?.sync(&ctx)?; }` works
+    /// without peeling the first iteration, and re-arming after `into_inner` is the
+    /// `mutate_bind`-only path.
     ///
     /// The one case it STILL rejects is [`Lent`](SlotState::Lent) — a slot whose
     /// buffer is currently checked out — with [`Error::SlotCheckedOut`]: changing a
@@ -2088,12 +2139,15 @@ impl<O: Send> Checkout<O> {
     /// Permanently extract the output, **severing** the lend-return: the home
     /// cell stays empty, so the graph re-allocates (or errors "busy") for that
     /// input next run. Use when you want to keep the buffer rather than hand it
-    /// back to `g`.
+    /// back to `g`. For a SLOT this lands in [`Severed`](SlotState::Severed): a
+    /// later set-once `bind` is [`Error::SlotSevered`] (re-providing a buffer is a
+    /// change, not a first declaration), and only `mutate_bind` re-arms it.
     pub fn into_inner(mut self) -> O {
         // Sever the home (does NOT deposit the value): a concrete cell stays
-        // empty (no-op), a SLOT cell transitions `Lent → Unbound` so a later
-        // `bind` sees a genuinely-empty slot rather than a stuck `Lent`
-        // (`Error::SlotCheckedOut`). Then take the value out for the caller.
+        // empty (no-op), a SLOT cell transitions `Lent → Severed` so a later
+        // set-once `bind` sees a severed (not virgin, not stuck-`Lent`) slot and
+        // rejects it (`Error::SlotSevered`); `mutate_bind` re-arms it. Then take
+        // the value out for the caller.
         if let Some(home) = self.home.take() {
             home.sever();
         }
@@ -5388,8 +5442,8 @@ pub trait CopyHome<Out>: Sized {
     fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<Out>>;
 
     /// The home that returns an `Out` into a **slot** `SlotCell<Self>` — the
-    /// tri-state analogue used when a copy operand is a `slot!(Tag)` directly
-    /// (scenario 6). Re-arms `Lent → Bound` on rehome and severs `Lent → Unbound`
+    /// four-state analogue used when a copy operand is a `slot!(Tag)` directly
+    /// (scenario 6). Re-arms `Lent → Bound` on rehome and severs `Lent → Severed`
     /// on `into_inner`. Default `None`: a slot's value type is always an `Init`
     /// buffer (`Tag::Value`), so only the identity `CopyHome` impls (`Self == Out`)
     /// override this; the `Uninit → Init` downgrade impls keep the default (an
@@ -5415,8 +5469,8 @@ impl<U: Send, Init: Send> Rehome<Init> for DowngradeRehome<U, Init> {
 }
 
 // Identity homes: src is never retyped, and an Init→Init dst is identity too.
-// `copy_slot_home` returns the tri-state `SlotHome` so a `slot!()` copy operand
-// re-arms its slot (`Lent → Bound`) on rehome / severs (`Lent → Unbound`) on
+// `copy_slot_home` returns the four-state `SlotHome` so a `slot!()` copy operand
+// re-arms its slot (`Lent → Bound`) on rehome / severs (`Lent → Severed`) on
 // `into_inner` — exactly like a slot in a kernel-arg position.
 impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<DeviceSlice<T, M>>
     for DeviceSlice<T, M>
@@ -5648,7 +5702,7 @@ where
         // PipePayload drop). `copy_input_home` unifies all three arms under the home
         // invariant: a CONCRETE cell routes through `CopyHome::copy_home` (identity,
         // or the `Uninit → Init` downgrade re-wrap); a SLOT routes through
-        // `CopyHome::copy_slot_home` (a tri-state `SlotHome` — re-arms `Lent →
+        // `CopyHome::copy_slot_home` (a four-state `SlotHome` — re-arms `Lent →
         // Bound`, severs on `into_inner`), closing the former copy-slot gap; a
         // pipe-fed input has `None` (its upstream producer owns the provenance).
         let src_home = self.src.copy_input_home();

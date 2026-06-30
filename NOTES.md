@@ -9,6 +9,36 @@ items resolve.
 
 ## Active
 
+### ✅ 4th slot state `Severed` — `bind` after `into_inner` rejected, `mutate_bind` re-arms — 2026-06-30 (branch `typed-slots`, UNCOMMITTED, staged)
+
+`SlotState` is now 4-state: `{ Unbound (virgin), Bound(T), Lent, Severed }`. Fixes
+the bug where `into_inner` did `Lent → Unbound`, letting a set-once `bind` of a
+DIFFERENT buffer silently re-fill a slot whose value the user deliberately took.
+- `into_inner`/`SlotHome::sever`: `Lent → Severed` (was `→ Unbound`).
+- `try_bind_slot` Severed arm: `bind` (Set) → `Error::SlotSevered`; `mutate_bind`
+  (Mutate) → fill → `Bound`. Virgin `Unbound` unchanged (both fill).
+- `lend_slot`: Severed lends as `Error::SlotUnbound` (nothing to lend, like virgin).
+- `with_concrete`: Severed reads `None` (no value to inspect).
+- New `Error::SlotSevered(&'static str)` in error.rs + Display. ALSO added to
+  `SlotBinder::outcome()` (an `Error`-matching site — its `unreachable!()` panicked
+  until the arm was added; not a `SlotState` match, so easy to miss).
+- Tests: graph_slots `into_inner_severs_slot_to_unbound` → renamed/flipped to
+  `into_inner_severs_slot_then_bind_rejected_mutate_rearms` (bind→SlotSevered,
+  mutate_bind re-arms); new `virgin_bind_ok_and_severed_resync_without_rebind_errors`
+  (virgin-bind regression + severed-no-rebind sync → SlotUnbound).
+- home_invariant: scenarios 7/8/9b flipped `bind`-after-sever → `mutate_bind`
+  (they relied on the OLD wrong behavior). Scenario 11
+  (`multi_output_copy_independence`) UN-IGNORED: rewritten to route copy dst
+  through `slot!(Dst)` (concrete src + slot dst via the landed
+  `eager_copy_to(src, slot!(Dst))` path), drop src (re-arm), into_inner dst
+  (→ Severed), assert dst bind→SlotSevered + mutate_bind re-arms + per-side
+  independence (src same handle). **ZERO ignored in home_invariant now.**
+- DoD: build/clippy(`-D warnings`)/doc(`-D warnings`)/fmt all clean; full tier2
+  serial green (graph_slots 11/11, home_invariant 11/11, graph_reuse 7/7,
+  copy_reuse_flaw 3/3, record_replay 9/9); safety_compile_fail 9/9 +
+  image_compile_fail 11/11 (clean rlibs first). Arc/Weak same-buffer-recovery
+  relaxation intentionally NOT added (Severed unconditionally rejects bind).
+
 ### ✅ Image kernels are reusable `DeviceOp`s (un-forked) — 2026-06-29 (branch `typed-slots`, UNCOMMITTED, staged)
 
 Un-forked the image one-shot/consuming path: image kernel args now ride the SAME
