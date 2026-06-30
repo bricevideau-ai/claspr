@@ -9,6 +9,21 @@ items resolve.
 
 ## Active
 
+### ✅ Double-buffering (ping-pong) integration test — 2026-06-30 (branch `typed-slots`, UNCOMMITTED, staged)
+
+New `tests/tier2/tests/double_buffering.rs` — the canonical `mutate_bind` test.
+K=4 iterations of `out = in + 1` via `add_u32(slot!(In), slot!(Ones), slot!(Out))`
+with a persistent all-`1`s `ones` operand (bound once; its Checkout just `drop`ped
+each step → slot re-arms `Lent→Bound`, reused). The In/Out swap is the load-bearing
+part: `into_inner()` both (keep buffers, slots → `Severed`), then crossed
+`mutate_bind` (a plain `bind` here is `SlotSevered` — the swap is ONLY expressible
+via mutate). Tests: `double_buffer_ping_pong_computes_and_handles_stable` (asserts
+final = INITIAL+K = 14, AND in/out handles ∈ {hA,hB} & distinct each step — exactly
+two cl_mem recycled, no per-step alloc); `double_buffer_plain_bind_after_sever_rejected`
+(plain `bind` on both severed In/Out → `Error::SlotSevered`). Runs on the existing
+`sync()` reuse path; no command-buffer backend. DoD: build/clippy(`-D warnings`)/fmt
+clean; 2/2 green; graph_slots 11/11, home_invariant 11/11, graph_reuse 7/7 regression.
+
 ### ✅ 4th slot state `Severed` — `bind` after `into_inner` rejected, `mutate_bind` re-arms — 2026-06-30 (branch `typed-slots`, UNCOMMITTED, staged)
 
 `SlotState` is now 4-state: `{ Unbound (virgin), Bound(T), Lent, Severed }`. Fixes
