@@ -266,15 +266,33 @@ macro_rules! usm_slice {
 /// slots! { Buf: DeviceSlice<u32>, W: DeviceSlice<f32> }
 /// ```
 ///
-/// expands, per entry, to a public tuple struct plus its [`Tag`](crate::Tag) impl:
+/// expands, per entry, to a **source-generic** public tuple struct plus its
+/// [`Tag`](crate::Tag) impl (keyed on `Tag<KeyMarker>` — a per-tag type
+/// independent of the source `S`):
 ///
 /// ```ignore
-/// pub struct Buf(pub DeviceSlice<u32>);
-/// impl ::claspr::Tag for Buf { type Value = DeviceSlice<u32>; /* into_value = self.0 */ }
+/// pub struct Buf<S = DeviceSlice<u32>>(pub S);   // S = the binding SOURCE
+/// impl<S> ::claspr::Tag for Buf<S>
+/// where S: ::claspr::IntoBound<DeviceSlice<u32>> + 'static {
+///     type Value = DeviceSlice<u32>;
+///     type Key   = Buf<::claspr::KeyMarker>;   // stable matching identity
+///     fn into_value(self) -> DeviceSlice<u32> { self.0.into_bound() }
+/// }
 /// ```
 ///
-/// The tag type is the identity key (matched by `TypeId`); its `Value` is the one
-/// buffer type the tag carries (compile-time fixed). Build a hole for a tag with
+/// The tag is generic over its *source* so ONE constructor spelling accepts both
+/// forms with no `.into()`:
+/// - `Buf(b)` — a raw buffer/scalar (`S = Value`, identity
+///   [`IntoBound`](crate::IntoBound)).
+/// - `Buf(co)` — a [`Checkout`](crate::Checkout) over the value (`S =
+///   Checkout<Value>`), which **severs** the Checkout's source home (`Lent →
+///   Severed`) and the target slot **adopts** the buffer. This is the one-line
+///   double-buffer swap `g.mutate_call((In(out_co), Out(in_co)))`.
+///
+/// The `Key` marker (not `Buf<S>` itself, whose `TypeId` would vary with `S`) is
+/// the identity matched against a slot, so a `Checkout`-built binding matches a
+/// `slot!(Buf)` (built from the default `Buf<Value>`). Its `Value` is the one
+/// buffer/scalar type the tag carries (compile-time fixed). Build a hole with
 /// [`slot!`](crate::slot)`(Buf)` and bind it with **plain tuple-struct
 /// construction** — `g.bind(Buf(b))` — no `Fn`/`fn_traits`.
 #[macro_export]
@@ -284,13 +302,25 @@ macro_rules! slots {
         $(
             #[doc = concat!("Reusable-graph slot tag carrying a `", stringify!($val), "`.")]
             #[doc = ""]
-            #[doc = "Build a hole with [`slot!`](crate::slot)`(...)`; bind with `g.bind(Self(value))`."]
-            pub struct $name(pub $val);
+            #[doc = "Build a hole with [`slot!`](crate::slot)`(...)`; bind with"]
+            #[doc = "`g.bind(Self(value))` (raw) or `g.bind(Self(checkout))`"]
+            #[doc = "(sever-and-adopt). The type param `S` is the binding SOURCE"]
+            #[doc = "and defaults to the carried value type."]
+            pub struct $name<S = $val>(pub S);
 
-            impl $crate::Tag for $name {
+            impl<S> $crate::Tag for $name<S>
+            where
+                S: $crate::IntoBound<$val> + 'static,
+            {
                 type Value = $val;
+                // The matching key is `$name<KeyMarker>` — a distinct type per tag
+                // (the ident differs) yet INDEPENDENT of the source `S`, so a
+                // `Checkout`-built binding (`$name<Checkout<Value>>`) matches a
+                // `slot!($name)` (`$name<Value>`). `KeyMarker` is a shared ZST and
+                // its `type_name` still contains the tag ident for diagnostics.
+                type Key = $name<$crate::KeyMarker>;
                 fn into_value(self) -> $val {
-                    self.0
+                    $crate::IntoBound::into_bound(self.0)
                 }
             }
         )+

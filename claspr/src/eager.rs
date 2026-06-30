@@ -393,17 +393,19 @@ impl_slot_value_move!(USMSlice);
 
 // ── Typed slots: per-tag value type compile-time, presence runtime ─────────
 
-/// A compile-time **tag** naming a typed hole in a reusable graph. The tag *type*
-/// is the identity key (matched by [`TypeId`] at bind time); its [`Value`](Tag::Value)
-/// is the one buffer type that tag carries — fixed at compile time, so a `slot!(Buf)`
-/// and a `Buf(value)` binding are checked against the same type without any
-/// turbofish.
+/// A compile-time **tag** naming a typed hole in a reusable graph. The tag's
+/// [`Key`](Tag::Key) is the identity (matched by [`TypeId`] at bind time); its
+/// [`Value`](Tag::Value) is the one buffer type that tag carries — fixed at compile
+/// time, so a `slot!(Buf)` and a `Buf(value)` binding are checked against the same
+/// type without any turbofish.
 ///
-/// Declared via the [`slots!`](crate::slots) macro, which emits a `pub struct
-/// Tag(pub Value)` tuple struct (binding is plain tuple-struct construction —
-/// `Buf(value)`, no `Fn`/`fn_traits` games) and this trait impl. The struct value
-/// is never inspected; only `TypeId::of::<Tag>()` is, so the wrapper is a pure
-/// move-the-value carrier.
+/// Declared via the [`slots!`](crate::slots) macro, which emits a **source-generic**
+/// `pub struct Tag<S = Value>(pub S)` tuple struct (binding is plain tuple-struct
+/// construction — `Buf(value)` for a raw value, `Buf(checkout)` for a sever-and-adopt
+/// [`Checkout`], no `Fn`/`fn_traits` games) and this trait impl. The struct value is
+/// inspected only through [`into_value`](Tag::into_value) (which runs [`IntoBound`]:
+/// identity for a raw value, `into_inner`/sever for a `Checkout`); matching keys on
+/// `TypeId::of::<Key>()`, which is the SAME for every source `S`.
 ///
 /// Tag *presence* (was every slot bound?) is a **runtime** property, checked at
 /// [`sync`](DeviceOpExt::sync) by walking the graph's slot cells — deliberately
@@ -415,12 +417,73 @@ pub trait Tag: Sized + 'static {
     /// input.
     type Value: Send + 'static;
 
-    /// Unwrap the tuple-struct binding `Tag(value)` to its value (moved). The
-    /// [`slots!`](crate::slots) macro emits this as `self.0`; it is the only way
+    /// The **stable matching identity** of this tag, independent of the *source*
+    /// the binding was built from. A tag is now a tuple struct that is GENERIC over
+    /// its source (`Tag<S>` — `S = Value` for the raw `Tag(buf)` form, `S =
+    /// Checkout<Value>` for the new sever-and-adopt `Tag(co)` form), so
+    /// `TypeId::of::<Tag<S>>()` would differ between the two source variants and a
+    /// `Checkout`-built binding would fail to match a `slot!(Tag)` (built from the
+    /// default `Tag<Value>`). `Key` is the per-tag NON-generic marker (the same for
+    /// every `S`), so `slot!` and every `bind` form key on `TypeId::of::<Key>()` and
+    /// match regardless of source. The [`slots!`](crate::slots) macro emits one
+    /// zero-size `Key` marker per tag; its `type_name` (which contains the tag's
+    /// ident) is reused for the slot diagnostics.
+    type Key: 'static;
+
+    /// Unwrap the tag binding `Tag(source)` to its [`Value`](Tag::Value) (moved),
+    /// converting the source: a raw value passes through; a [`Checkout`] is
+    /// `into_inner`'d — which **severs** its source home (`Lent → Severed`) and
+    /// adopts the buffer into the target slot. The [`slots!`](crate::slots) macro
+    /// emits this as `self.0.into_bound()` ([`IntoBound`]); it is the only way
     /// [`bind`](DeviceOpExt::bind) can pull the value out of a generic `Tg` wrapper
     /// (a generic tuple-struct field is not nameable).
     fn into_value(self) -> Self::Value;
 }
+
+/// Conversion from a slot **binding source** to the tag's
+/// [`Value`](Tag::Value) — the trait that lets a tag constructor accept EITHER a
+/// raw buffer/scalar OR a [`Checkout`] over it, with no `.into()` at the call site.
+///
+/// Two impls:
+/// - identity (`impl IntoBound<V> for V`): a raw value binds as before — no source
+///   home, nothing to sever.
+/// - [`Checkout<V>`](Checkout): `into_bound` calls [`into_inner`](Checkout::into_inner),
+///   which **severs** the Checkout's source slot home (`Lent → Severed`) and hands
+///   the raw buffer to the target slot to adopt. This is the EXPLICIT-sever path —
+///   binding a finished run's output into a (usually different) slot, e.g. the
+///   double-buffer swap `g.mutate_call((In(out_co), Out(in_co)))`.
+///
+/// The two impls do not overlap: `Checkout<X>` matches the blanket as
+/// `IntoBound<Checkout<X>>` and the Checkout impl as `IntoBound<X>` — different
+/// trait type-params, so coherence is satisfied. No `Clone` is required (the
+/// identity impl moves; the Checkout impl moves out of `into_inner`), so move-only
+/// buffers are unaffected.
+pub trait IntoBound<V> {
+    /// Resolve this binding source to the tag's value (severing a `Checkout`).
+    fn into_bound(self) -> V;
+}
+
+impl<V> IntoBound<V> for V {
+    fn into_bound(self) -> V {
+        self
+    }
+}
+
+impl<V: Send> IntoBound<V> for Checkout<V> {
+    fn into_bound(self) -> V {
+        // Severs the Checkout's source home (Lent → Severed) and returns the buffer
+        // for the target slot to adopt — the explicit sever-and-adopt path.
+        self.into_inner()
+    }
+}
+
+/// The shared zero-size marker the [`slots!`](crate::slots) macro plugs into a
+/// tag's source slot to form its [`Key`](Tag::Key): `Tag<KeyMarker>` is a distinct
+/// `'static` type per tag (the tag ident differs) yet independent of the *binding
+/// source* `S`. Keying the bind-match on `TypeId::of::<Tag<KeyMarker>>()` (rather
+/// than `TypeId::of::<Tag<S>>()`) is what lets a `Checkout`-built binding
+/// (`Tag<Checkout<Value>>`) match a `slot!(Tag)` (`Tag<Value>`). Never constructed.
+pub struct KeyMarker;
 
 /// Which verb of the set-binding 2×2 a [`SlotBinder`] carries — the leg that
 /// decides what happens when a matching slot is already [`Bound`](SlotState::Bound).
@@ -526,7 +589,7 @@ impl SlotBinder {
         Tg::Value: SlotEq + SlotValue,
     {
         SlotBinder {
-            id: TypeId::of::<Tg>(),
+            id: TypeId::of::<Tg::Key>(),
             mode,
             value: Some(Box::new(value)),
             eq: Box::new(|bound: &dyn Any, new: &dyn Any| {
@@ -1557,8 +1620,8 @@ impl<Tg: Tag> SlotHandle<Tg> {
     /// [`slot!`](crate::slot) macro spelling (`slot!(Buf)`).
     pub fn new() -> Self {
         SlotHandle {
-            id: TypeId::of::<Tg>(),
-            name: type_name::<Tg>(),
+            id: TypeId::of::<Tg::Key>(),
+            name: type_name::<Tg::Key>(),
             cell: Arc::new(Mutex::new(SlotState::Unbound)),
             _tag: PhantomData,
         }
@@ -2268,10 +2331,12 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     }
 
     /// Shared body of [`bind`](Self::bind) / [`mutate_bind`](Self::mutate_bind):
-    /// unwrap the tuple-struct binding `Tag(value)` to its value (the wrapper is a
-    /// pure move-carrier — only `TypeId::of::<Tg>()` matters for matching), box it
-    /// into a `Tg`-keyed binder in `mode`, fold it into the graph's slot cells, and
-    /// surface the verb-2×2 verdict ([`SlotBinder::outcome`]).
+    /// resolve the tag binding `Tag(source)` to its value via [`into_value`](Tag::into_value)
+    /// (raw passes through; a [`Checkout`] is `into_inner`'d — severing its source
+    /// home), box it into a binder keyed on `TypeId::of::<Tg::Key>()` in `mode`, fold
+    /// it into the graph's slot cells, and surface the verb-2×2 verdict
+    /// ([`SlotBinder::outcome`]). Callers pass the already-resolved value (the tag's
+    /// `into_value` runs at the `bind`/`call` site).
     fn fold_bind<Tg: Tag>(&self, value: Tg::Value, mode: BindMode) -> Result<&Self>
     where
         Tg::Value: SlotEq + SlotValue,
@@ -2285,7 +2350,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         // Checked only when `outcome` is Ok: a conflict/sever already counts as a
         // match (the tag IS present), so it errors above, not here.
         if binder.matched() == 0 {
-            return Err(Error::SlotNoSuchTag(type_name::<Tg>()));
+            return Err(Error::SlotNoSuchTag(type_name::<Tg::Key>()));
         }
         Ok(self)
     }
@@ -2605,15 +2670,26 @@ macro_rules! impl_bind_all_tuple {
             #[allow(non_snake_case)]
             fn bind_all<Op: DeviceOp>(self, g: &Op) -> Result<()> {
                 let ($($name,)+) = self;
-                // `?` gives all-or-nothing-in-order: first conflict / checked-out
-                // stops the fold. `fold_bind` is the shared single-slot path.
-                $( g.fold_bind::<$name>($name.into_value(), BindMode::Set)?; )+
+                // PHASE 1 — resolve EVERY element's source first (`into_value`):
+                // a `Checkout` source severs its home HERE, before any fold. This is
+                // what makes the crossed swap `call((In(out_co), Out(in_co)))` work —
+                // both Checkouts are severed (both source slots Severed) BEFORE either
+                // target slot is touched, so neither rebind hits a still-`Lent` slot
+                // (`SlotCheckedOut`). A raw value's `into_value` is a no-op move.
+                $( let $name = $name.into_value(); )+
+                // PHASE 2 — fold each resolved value. `?` keeps all-or-nothing-in-order
+                // (first conflict / checked-out stops the fold).
+                $( g.fold_bind::<$name>($name, BindMode::Set)?; )+
                 Ok(())
             }
             #[allow(non_snake_case)]
             fn mutate_all<Op: DeviceOp>(self, g: &Op) -> Result<()> {
                 let ($($name,)+) = self;
-                $( g.fold_bind::<$name>($name.into_value(), BindMode::Mutate)?; )+
+                // Two-phase as in `bind_all`: sever all Checkout sources first, then
+                // fold — so the one-line crossed `mutate_call` swap re-binds into
+                // already-Severed slots rather than still-Lent ones.
+                $( let $name = $name.into_value(); )+
+                $( g.fold_bind::<$name>($name, BindMode::Mutate)?; )+
                 Ok(())
             }
         }

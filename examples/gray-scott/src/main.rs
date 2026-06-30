@@ -26,10 +26,10 @@
 //! Rather than fuse the whole step into one dispatch, the update is
 //! operator-FACTORED into two reusable device kernels:
 //!
-//! - [`gpu::laplacian`] — reads ONE field, writes its 5-point periodic Laplacian
+//! - `gpu::laplacian` — reads ONE field, writes its 5-point periodic Laplacian
 //!   into a scratch buffer. It is dispatched **TWICE per step** — once for `U`
 //!   (→ `lap_u`) and once for `V` (→ `lap_v`). **Same kernel, two sites.**
-//! - [`gpu::combine`] — reads `(u_in, v_in, lap_u, lap_v)` and writes
+//! - `gpu::combine` — reads `(u_in, v_in, lap_u, lap_v)` and writes
 //!   `(u_out, v_out)` via the reaction terms, applying the diffusion + feed/kill.
 //!
 //! So the per-step graph `g` is a genuine **three-dispatch DAG** — `lap_u`,
@@ -67,15 +67,16 @@
 //!    both edges are carried by the pipe threading, not by extra slots.
 //!
 //! 4. **Double-buffering** — `U` and `V` each ping-pong between two device
-//!    buffers. After a step we `into_inner()` all four output Checkouts to KEEP
-//!    their buffers (severing the slots, `Lent → Severed`), then re-bind them
-//!    *crossed* in ONE [`mutate_call`](claspr::DeviceOpExt::mutate_call): this
-//!    step's `*Out` becomes next step's `*In`, and the now-stale `*In` becomes
-//!    next step's scratch `*Out`. The crossed re-bind MUST go through the
-//!    `mutate` verb — a plain `bind` on a severed slot is `Error::SlotSevered`
-//!    (the canonical ping-pong rule from `tests/tier2/tests/double_buffering.rs`,
-//!    here doubled across the two field pairs and issued as one 4-tuple
-//!    `mutate_call`).
+//!    buffers. After a step we re-bind the four output Checkouts *crossed* in ONE
+//!    [`mutate_call`](claspr::DeviceOpExt::mutate_call), binding each Checkout
+//!    DIRECTLY into a slot: binding a Checkout SEVERS its source home (`Lent →
+//!    Severed`) and the target slot ADOPTS the buffer — so the swap is the crossing
+//!    in one line, no manual `into_inner()`. This step's `*Out` becomes next step's
+//!    `*In`, and the now-stale `*In` becomes next step's scratch `*Out`. The
+//!    crossed re-bind MUST go through the `mutate` verb — a plain `bind` on a
+//!    severed slot is `Error::SlotSevered` (the canonical ping-pong rule from
+//!    `tests/tier2/tests/double_buffering.rs`, here doubled across the two field
+//!    pairs and issued as one 4-tuple `mutate_call`).
 //!
 //! 5. **Scalar slots** — `F` and `k` are `slot!` SCALAR slots (non-resource,
 //!    `Copy`, value-equality, never handed back as Checkouts). Bound once up
@@ -150,7 +151,7 @@ mod gpu {
 
     /// 5-point Laplacian of a flat `W*H` field at cell `(x, y)` with periodic
     /// boundaries: `left + right + up + down - 4*center`. Pure helper called by
-    /// the [`laplacian`] kernel.
+    /// the `laplacian` kernel.
     pub fn laplacian_at(field: &[f32], x: u32, y: u32, w: u32, h: u32) -> f32 {
         let idx = |xx: u32, yy: u32| (yy * w + xx) as usize;
         let center = field[idx(x, y)];
@@ -451,22 +452,15 @@ fn run(
             final_v = read_field(&v_out_co)?;
         }
 
-        // SWAP for the next step — unless this was the final step. `into_inner`
-        // keeps each buffer AND severs its slot (Lent → Severed). The freshly
-        // written `*Out` becomes next step's `*In`; the stale `*In` becomes next
-        // step's scratch `*Out`. Crossed re-bind ⇒ MUST be the `mutate` verb;
-        // ONE `mutate_call` rebinds all four field slots together.
+        // SWAP for the next step — unless this was the final step. Binding a
+        // `Checkout` into a slot SEVERS its source home (Lent → Severed) and the
+        // target slot ADOPTS the buffer, so the swap is the crossing read DIRECTLY:
+        // the freshly written `*Out` Checkout becomes next step's `*In`, the stale
+        // `*In` Checkout becomes next step's scratch `*Out` — no manual
+        // `into_inner()`. Crossed re-bind into Severed slots ⇒ the `mutate` verb;
+        // ONE `mutate_call` rebinds all four field slots together, in one line.
         if step_idx + 1 < total {
-            let next_u_in = u_out_co.into_inner();
-            let next_v_in = v_out_co.into_inner();
-            let next_u_out = u_in_co.into_inner();
-            let next_v_out = v_in_co.into_inner();
-            g.mutate_call((
-                UIn(next_u_in),
-                VIn(next_v_in),
-                UOut(next_u_out),
-                VOut(next_v_out),
-            ))?;
+            g.mutate_call((UIn(u_out_co), VIn(v_out_co), UOut(u_in_co), VOut(v_in_co)))?;
         }
         Ok(())
     };

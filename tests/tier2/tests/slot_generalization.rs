@@ -53,6 +53,21 @@ slots! {
     // Zero-match `bind` regression: a tag the graph DOES use vs one it does NOT.
     Present: u32,
     Absent: u32,
+    // Sever-and-adopt: a source slot (yields a Checkout) and a distinct target slot
+    // the Checkout is bound INTO.
+    Src: DeviceSlice<u32>,
+    Dst: DeviceSlice<u32>,
+}
+
+/// The stable identity of a buffer's backing memory (raw `cl_mem`/SVM pointer as a
+/// `usize`), for `==` across runs. Reads through `RecordableBuffer::record_handle()`
+/// — works on a bare `DeviceSlice` and (via `Deref`) on a live `Checkout`.
+fn handle_of<B: claspr::RecordableBuffer>(b: &B) -> usize {
+    use claspr::MemRef;
+    match b.record_handle().mem {
+        MemRef::Buffer(m) => m as usize,
+        MemRef::Svm(p) => p as usize,
+    }
 }
 
 /// Extract the [`Error`] from a `bind`/`mutate_bind` result, asserting it failed.
@@ -628,5 +643,68 @@ fn fan_out_across_bundle_branches() {
         rb.iter().all(|&v| v == 18),
         "branch B: 6 * 3 = 18 (got the SAME K from the single bind), got {:?}",
         &rb[..8]
+    );
+}
+
+// ── (E) Bind a Checkout into a slot — sever source, adopt into target ─────────
+
+/// (13) **Bind a `Checkout` into a slot — sever-and-adopt.** A `Checkout` produced
+/// by one graph's run is bound DIRECTLY into a slot of another graph (no manual
+/// `into_inner`). Binding a Checkout:
+/// - **severs** the Checkout's SOURCE home (`Lent → Severed`) — so a later set-once
+///   `bind` on that source slot is `Error::SlotSevered`, and
+/// - hands the raw buffer to the TARGET slot, which **adopts** it normally.
+///
+/// We assert all three: the source slot is severed, the target ran with the adopted
+/// buffer producing correct data, and the buffer is the SAME `cl_mem` object (the
+/// Checkout's buffer was moved, not copied).
+#[test]
+fn bind_checkout_into_slot_severs_source_adopts_target() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // SOURCE graph: scale `slot!(Src)` by 2. One run yields a Checkout<DeviceSlice>
+    // whose home is the Src slot (Lent while the Checkout is alive).
+    let src_graph = ks.scale_u32([N], slot!(Src), 2u32);
+    let co = src_graph
+        .bind(Src(seeded(&ctx, 5))) // 5 * 2 = 10
+        .expect("bind Src")
+        .sync(&ctx)
+        .expect("source run");
+    let src_handle = handle_of(&*co); // identity of the buffer the Checkout holds
+
+    // TARGET graph: scale `slot!(Dst)` by 3. Bind the Checkout DIRECTLY into Dst —
+    // this severs Src's home and Dst adopts the buffer (no `into_inner` at the call).
+    let dst_graph = ks.scale_u32([N], slot!(Dst), 3u32);
+    let dst_co = dst_graph
+        .bind(Dst(co)) // <-- Checkout bound into a slot: sever + adopt
+        .expect("bind Checkout into Dst (sever-and-adopt)")
+        .sync(&ctx)
+        .expect("target run");
+
+    // (a) The SOURCE slot is now Severed: a plain set-once `bind` on it must error
+    //     `SlotSevered` (the Checkout's home was severed by the bind above).
+    let err = bind_err(
+        src_graph.bind(Src(seeded(&ctx, 1))),
+        "Src must be Severed after its Checkout was bound away",
+    );
+    assert!(
+        matches!(err, Error::SlotSevered(n) if n.contains("Src")),
+        "expected SlotSevered naming Src, got {err:?}"
+    );
+
+    // (b) The TARGET ran with the adopted buffer: 10 * 3 = 30, and it is the SAME
+    //     cl_mem the Checkout carried (moved, not copied).
+    assert_eq!(
+        handle_of(&*dst_co),
+        src_handle,
+        "Dst must hold the SAME buffer the Checkout carried (adopt = move, not copy)"
+    );
+    let mut r = vec![0u32; N];
+    dst_co.read(&mut r).wait().expect("read Dst result");
+    assert!(
+        r.iter().all(|&v| v == 30),
+        "adopted buffer (was 10) scaled by 3 = 30, got {:?}",
+        &r[..8]
     );
 }

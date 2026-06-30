@@ -180,6 +180,86 @@ fn double_buffer_ping_pong_computes_and_handles_stable() {
     );
 }
 
+/// The **one-line swap**: identical ping-pong to the test above, but the crossed
+/// re-bind binds the `Checkout`s DIRECTLY into the slots — `mutate_call((In(out_co),
+/// Out(in_co)))` — with NO manual `into_inner()`. Binding a `Checkout` into a slot
+/// severs the Checkout's source home (`Lent → Severed`) and the target slot adopts
+/// the buffer, so the four-line extract-then-rebind collapses to one crossing.
+///
+/// Proves the ergonomic end-to-end: it computes the SAME `initial + K` AND recycles
+/// the SAME two `cl_mem` objects (handles stay the fixed `{hA, hB}` pair).
+#[test]
+fn double_buffer_one_line_swap_computes_and_handles_stable() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    const INITIAL: u32 = 10;
+    const K: usize = 4;
+
+    let a = seeded(&ctx, INITIAL);
+    let b = seeded(&ctx, 0);
+    let ones = seeded(&ctx, 1);
+
+    let ha = handle_of(&a);
+    let hb = handle_of(&b);
+    assert_ne!(ha, hb, "A and B must be distinct buffers to begin with");
+
+    let g = ks.add_u32([N], slot!(In), slot!(Ones), slot!(Out));
+
+    // Step 0: set-once on the virgin slots.
+    g.call((In(a), Ones(ones), Out(b))).expect("call step 0");
+
+    let (mut in_co, mut ones_co, mut out_co) = g.sync(&ctx).expect("step 0 sync");
+    let mut steps_done = 1usize;
+
+    for step in 0..K {
+        let h_in = handle_of(&*in_co);
+        let h_out = handle_of(&*out_co);
+        assert!(
+            (h_in == ha || h_in == hb) && (h_out == ha || h_out == hb),
+            "step {step}: in/out handles must be drawn from {{hA,hB}} \
+             (in={h_in:#x}, out={h_out:#x}, hA={ha:#x}, hB={hb:#x})"
+        );
+        assert_ne!(
+            h_in, h_out,
+            "step {step}: ping-pong must read and write DIFFERENT buffers"
+        );
+
+        if step + 1 == K {
+            break;
+        }
+
+        // The `ones` operand never changes: drop re-arms its slot (Lent → Bound).
+        drop(ones_co);
+
+        // THE ONE-LINE CROSSING. Bind the Checkouts directly: each severs its
+        // source slot (Lent → Severed) and the target slot adopts the buffer. The
+        // prior `out` becomes the next `in`; the prior `in` becomes the next `out`.
+        // `mutate_call` because both targets are Severed (a set-once `call` would be
+        // `Error::SlotSevered`).
+        g.mutate_call((In(out_co), Out(in_co)))
+            .expect("one-line crossed mutate_call");
+
+        let next = g.sync(&ctx).expect("swap-step sync");
+        in_co = next.0;
+        ones_co = next.1;
+        out_co = next.2;
+        steps_done += 1;
+    }
+
+    assert_eq!(steps_done, K, "ran exactly K steps");
+
+    let want = INITIAL + K as u32;
+    let mut result = vec![0u32; N];
+    out_co.read(&mut result).wait().expect("read final result");
+    assert!(
+        result.iter().all(|&v| v == want),
+        "after K={K} one-line-swap steps of +1 over {INITIAL}, every cell must be \
+         {want}; got {:?}",
+        &result[..8]
+    );
+}
+
 /// Locks WHY `mutate_bind` is required: after one step + `into_inner` of both
 /// In/Out, a PLAIN `bind` (set-once) on either slot returns `Err(SlotSevered)`.
 /// This proves the ping-pong swap genuinely needs `mutate_bind` — `bind` cannot
