@@ -5,6 +5,7 @@ members = [
     "claspr-build",
     "claspr-macros",
     "examples/collatz",
+    "examples/gray-scott",
     "examples/raymarch",
     "examples/mandelbrot-kernel",
     "examples/sobel-kernel",

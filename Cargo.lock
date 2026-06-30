@@ -743,6 +743,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gray-scott-example"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+ "claspr-build",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
