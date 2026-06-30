@@ -9,6 +9,30 @@ items resolve.
 
 ## Active
 
+### ✅ Feed-a-`Checkout`-forward now LENDS (not severs) — 2026-06-30 (branch `typed-slots`, UNCOMMITTED, staged)
+
+Feeding a `Checkout` from graph A as a plain INPUT to a second graph B used to
+SEVER A's home (`Input::from(self.into_inner())` → slot `Lent→Severed` / concrete
+cell emptied) — A was permanently broken. FIX (`eager.rs`): the implicit
+feed-as-input path (`ToInput`/`From<Checkout>`/`Arc` variant, ~1860–1940) now
+LENDS via a new `Checkout::into_value_and_home()` (moves `(value, home)` out
+WITHOUT firing sever/rehome — drains both `Option`s so the Checkout's own Drop
+short-circuits) + new `Input::lent(value, home)` (pre-loads a `Pipe` with
+`put_home`, wraps `Input::Pipe`). The home rides B exactly like any internal edge
+(`resolve_home`'s Pipe arm threads it; B's terminal Checkout / undelivered drop
+rehomes it to A), so A stays `Lent`/busy while B holds the buffer, then returns
+on B's drop → A re-runs by plain `sync()` (no `mutate_bind`). Composes
+transitively (A→B→C→…, home threads pipe→pipe, returns at the FINAL drop).
+`into_inner()` UNCHANGED = explicit take-it-out (still severs). NOT touched:
+bind-Checkout-into-slot (`IntoBound`) = sever+adopt (role change), and
+`CopyOperand for Checkout` still severs (out of scope; flag for follow-up if
+copy-src/dst should also lend). Tests: flipped `home_invariant.rs` 7/8 to
+`cross_graph_handoff_lends_and_returns` / `cross_graph_as_kernel_arg_lends_and_returns`
+(LEND semantics: busy-while-held, return-on-drop, plain re-`sync`) + new
+`into_inner_still_severs` + `checkout_lend_transitive` (A→B→C→download). Full
+tier2 0 failures, tier1 green except the 2 baseline image_dispatch pocl fails,
+gray-scott builds+runs+smoke.
+
 ### ✅ Two slot-binding bugs fixed — 2026-06-30 (branch `typed-slots`, UNCOMMITTED, staged)
 
 - **Bug 1 (bundle branches dropped slot binds):** `Bundle*` inherited the no-op

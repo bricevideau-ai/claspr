@@ -1452,6 +1452,38 @@ impl<T> From<Pipe<T>> for Input<T> {
     }
 }
 
+impl<T> Input<T> {
+    /// Build an input that **lends** an already-produced value while carrying its
+    /// existing return `home` ONWARD — the vehicle for feeding a [`Checkout`] from
+    /// graph A forward as a borrow input to a second graph B.
+    ///
+    /// A plain [`From<T>`](Input::from) input is a fresh `Concrete` cell with NO
+    /// home: when B drops it, the value is released and A is left broken. Instead
+    /// this pre-loads a [`Pipe`] with `(value, deps, home)` via
+    /// [`put_home`](Pipe::put_home), then wraps it as [`Input::Pipe`]. The home —
+    /// A's still-`Lent` cell — thus rides B's graph exactly like any internal edge:
+    /// [`resolve_home`](Self::resolve_home)'s `Pipe` arm hands the home through to
+    /// B's ops, and B's terminal `Checkout` (or an undelivered
+    /// [`PipePayload`] drop) fires the rehome, RETURNING the value to A and
+    /// re-arming it for a plain `g_a.sync()`.
+    ///
+    /// A pre-filled pipe resolves correctly even as a LEAF input (no producer runs
+    /// before it): its payload is already present, so the first
+    /// [`take_home`](Pipe::take_home) just drains it. And because the home threads
+    /// pipe → pipe through B (and onward to C, …) by the same machinery, the lend
+    /// composes transitively — the value returns to A only at the FINAL drop of the
+    /// whole chain.
+    ///
+    /// `home == None` (the source Checkout carried no home — minted/consumed) is
+    /// fine: the value simply rides the pipe with nothing to return, identical to a
+    /// homeless mint.
+    fn lent(value: T, home: Option<BoxedHome<T>>) -> Self {
+        let pipe = Pipe::new();
+        pipe.put_home(value, Deps::new(), home);
+        Input::Pipe(pipe)
+    }
+}
+
 // ── ScalarInput<V>: a non-resource (scalar / launch) kernel input ───────────
 
 /// A by-value kernel input that can be a plain literal OR an unbound non-resource
@@ -1834,10 +1866,20 @@ impl From<crate::LaunchSpec> for ScalarInput<crate::LaunchSpec> {
 // `.into_inner()`:
 //   let b = x.fill(7).wait()?;          // b: Checkout<DeviceSlice>
 //   ks.scale([N], b, 3) …               // fed directly as a kernel arg
-// Consuming the `Checkout` extracts the inner buffer (severing the return — the
-// same effect as `into_inner`) and feeds it as a concrete `Input`. Distinct
-// nominal type from the bare families and `Pipe<D>`, so it stays disjoint under
-// coherence.
+//
+// Feeding a `Checkout` from graph A forward as a borrow input to a SECOND graph B
+// **LENDS** it — it does NOT sever A. The Checkout's home (pointing into A's
+// still-`Lent` cell) rides INTO B via a pre-loaded pipe
+// ([`Input::lent`]/[`Checkout::into_value_and_home`]): A stays BUSY for as long as
+// B holds the buffer (a second `g_a.sync()` errors busy, never silently re-runs),
+// and when B's terminal `Checkout` (or an undelivered drop) releases the value it
+// RETURNS to A, re-arming it for a plain `g_a.sync()` — no `mutate_bind`.
+// `.into_inner()` remains the explicit "take it out for good" verb (severs); only
+// this implicit feed-as-input path lends. Distinct nominal type from the bare
+// families and `Pipe<D>`, so it stays disjoint under coherence.
+//
+// CONTRAST: binding a Checkout INTO A SLOT (`IntoBound`) correctly SEVERS+ADOPTS —
+// the buffer changes role there; here it is only borrowed and returned.
 macro_rules! impl_to_input_checkout {
     ($buf:ident) => {
         impl<E, M> ToInput<E> for Checkout<$crate::$buf<E, M>>
@@ -1847,8 +1889,10 @@ macro_rules! impl_to_input_checkout {
         {
             type Buf = $crate::$buf<E, M>;
             fn to_input(self) -> Input<$crate::$buf<E, M>> {
-                // Sever the return and feed the inner buffer as a concrete input.
-                Input::from(self.into_inner())
+                // LEND: relocate the value + its home onto a pre-loaded pipe so the
+                // home rides into the consuming graph and returns to A on drop.
+                let (value, home) = self.into_value_and_home();
+                Input::lent(value, home)
             }
         }
 
@@ -1861,7 +1905,9 @@ macro_rules! impl_to_input_checkout {
             E: Send,
         {
             fn from(co: Checkout<$crate::$buf<E, M>>) -> Self {
-                Input::from(co.into_inner())
+                // LEND (see the `ToInput` twin above) — relocate value + home.
+                let (value, home) = co.into_value_and_home();
+                Input::lent(value, home)
             }
         }
     };
@@ -1870,7 +1916,8 @@ impl_to_input_checkout!(DeviceSlice);
 impl_to_input_checkout!(MappedSlice);
 impl_to_input_checkout!(USMSlice);
 
-// `Checkout<Arc<DeviceSlice<E, M>>>` — the shared-buffer arg, severed to its Arc.
+// `Checkout<Arc<DeviceSlice<E, M>>>` — the shared-buffer arg, LENT via its home
+// (see the macro above): A stays busy until B drops the Arc, then it rehomes.
 impl<E, M> ToInput<E> for Checkout<std::sync::Arc<DeviceSlice<E, M>>>
 where
     M: MemMode,
@@ -1878,7 +1925,8 @@ where
 {
     type Buf = std::sync::Arc<DeviceSlice<E, M>>;
     fn to_input(self) -> Input<std::sync::Arc<DeviceSlice<E, M>>> {
-        Input::from(self.into_inner())
+        let (value, home) = self.into_value_and_home();
+        Input::lent(value, home)
     }
 }
 
@@ -2783,6 +2831,33 @@ impl<O: Send> Checkout<O> {
         self.value
             .take()
             .expect("Checkout::into_inner after value already taken — internal bug")
+    }
+
+    /// **Lend** the output onward WITHOUT severing — the implicit
+    /// "feed a `Checkout` forward as a borrow input to a SECOND graph" path.
+    /// Unlike [`into_inner`](Self::into_inner) (which fires
+    /// [`sever`](Rehome::sever) → a slot goes `Lent → Severed`, a concrete cell is
+    /// left empty for good), this MOVES the `(value, home)` pair out intact: the
+    /// home is RELOCATED, not fired, so the origin cell stays `Lent` (busy) and the
+    /// value rides into the next graph carrying its return obligation. When that
+    /// value finally drops (the second graph's terminal `Checkout`, or an
+    /// undelivered [`PipePayload`] drop), the SAME home re-arms the origin cell
+    /// transparently — `g.sync()` again, NO `mutate_bind`.
+    ///
+    /// Suppressing this `Checkout`'s own `Drop` is automatic: we drain BOTH
+    /// `Option`s, so the subsequent drop sees `value == None` and returns early
+    /// (it never reaches `home.rehome` / never fires `sever`). The single home now
+    /// lives in the caller's pipe (`BoxedHome: !Clone`), so it fires exactly once.
+    pub(crate) fn into_value_and_home(mut self) -> (O, Option<BoxedHome<O>>) {
+        let value = self
+            .value
+            .take()
+            .expect("Checkout::into_value_and_home after value already taken — internal bug");
+        let home = self.home.take();
+        (value, home)
+        // `self` drops here: both `value` and `home` are now `None`, so the
+        // `Drop` impl's `let Some(value) = self.value.take() else { return }`
+        // short-circuits — no rehome, no sever. The home was MOVED, not fired.
     }
 }
 

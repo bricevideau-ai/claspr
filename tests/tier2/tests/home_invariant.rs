@@ -341,93 +341,216 @@ fn copy_slot_src_and_slot_dst_x2_both_rehome() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 7. cross-graph hand-off.
-//    g produces a buffer; co = g.bind(...).sync(); v = download(co); v.sync().
-//    Invariant: g is left re-armable (slot severed, so re-arming via
-//    g.mutate_bind(Buf(other)).sync() works) AND v's Vec is correct (b's scaled
-//    data). Feeding a Checkout to `download` severs the slot (into_inner →
-//    SlotHome::sever → Lent→Severed). Re-arming a SEVERED slot is the
-//    `mutate_bind`-only path: a plain set-once `bind` there is `SlotSevered`
-//    (the 4th-state contract — re-providing a buffer is a change, not a first
-//    declaration).
+// 7. cross-graph hand-off via `download` — LENDS and returns (NOT sever).
+//    g produces a buffer; co = g.bind(...).sync(); download(co).sync().
+//    Feeding a Checkout forward as a borrow input LENDS it: g's slot home rides
+//    into the second graph. `download` CONSUMES the value into a host Vec, but the
+//    device buffer is RETURNED to g's slot (via `rehome_consumed`) during the
+//    download run — so right after the download `sync()` returns, g re-runs via a
+//    plain `sync()` (NO `mutate_bind`) over the SAME handle. This is the corrected
+//    behaviour — the old test asserted the buggy sever path (into_inner).
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-fn cross_graph_handoff_severs_and_rearms() {
+fn cross_graph_handoff_lends_and_returns() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    // g: scale a slot buffer by 2, in place (no download → output IS the buffer).
-    let g = ks.scale_u32([N], slot!(Buf), 2u32);
+    // g: scale a slot buffer by 1 (idempotent), in place. Idempotent so a re-run
+    // over the SAME returned buffer is stable (proves rehome, not compounding).
+    let g = ks.scale_u32([N], slot!(Buf), 1u32);
 
-    let b = seeded(&ctx, 4); // 4*2 = 8
+    let b = seeded(&ctx, 8);
+    let h0 = handle_of(&b);
     let co = g.bind(Buf(b)).expect("bind").sync(&ctx).expect("g run");
 
-    // Hand `co` to a second graph that downloads it. Feeding a Checkout as a
-    // `download` input severs g's slot (into_inner → Lent→Severed).
+    // Hand `co` to a second graph that downloads it (consumes the value into a Vec,
+    // but the device buffer's home — g's `Lent` slot — rides the lend and is
+    // returned by the download).
     let v = download(co);
     let out = v.sync(&ctx).expect("download co");
     assert!(
         out.iter().all(|&x| x == 8),
-        "downloaded co holds b's scaled data: 4*2 = 8, got {:?}",
+        "downloaded co holds b's scaled data: 8*1 = 8, got {:?}",
         &out[..8]
     );
 
-    // g's slot was SEVERED → a plain `bind` now rejects (SlotSevered); re-arm via
-    // `mutate_bind` of a DIFFERENT buffer.
-    let other = seeded(&ctx, 5); // 5*2 = 10
+    // The device buffer was RETURNED to g's slot by the download (NOT severed) →
+    // g re-runs via a plain `sync()` (NO mutate_bind), over the SAME handle.
     let co2 = g
-        .mutate_bind(Buf(other))
-        .expect("g re-armable after sever via mutate_bind")
         .sync(&ctx)
-        .expect("g re-run");
+        .expect("g re-armable via plain sync after the lent buffer was returned by download");
+    assert_eq!(
+        handle_of(&*co2),
+        h0,
+        "lent buffer returned to g's slot with a STABLE handle (not severed/re-minted)"
+    );
     let mut rb = vec![0u32; N];
     co2.read(&mut rb).wait().expect("read");
-    assert!(rb.iter().all(|&x| x == 10), "re-bound buffer: 5*2 = 10");
+    assert!(rb.iter().all(|&x| x == 8), "re-armed buffer: 8*1 = 8");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 8. cross-graph as kernel arg.
-//    Feed co (a produced buffer) as a kernel arg to a second graph, run it,
-//    then re-arm the first graph's severed slot and re-run. Both produce correct
-//    data. Feeding co as a kernel arg severs g1's slot (Lent→Severed); g1 re-arms
-//    via `mutate_bind` (a plain `bind` after sever is `SlotSevered`).
+// 8. cross-graph as kernel arg — LENDS and returns (NOT sever).
+//    Feed co (a produced buffer) as a KERNEL ARG to a second graph whose terminal
+//    is the BUFFER itself (a `Checkout<DeviceSlice>`). g1's slot home rides into
+//    g2's result. While g2's result is ALIVE, g1 is BUSY (its slot is still
+//    `Lent`); a plain DROP of g2's result RETURNS the buffer to g1's slot,
+//    re-arming it for a plain `sync()` (NO mutate_bind). This is the corrected
+//    behaviour — the old test asserted the buggy sever path.
+//
+//    (Data correctness over g1's buffer is covered by scenario 7's download and by
+//    `checkout_lend_transitive`; here we pin the busy-while-held / return-on-drop
+//    lifetime, which requires a non-consuming terminal — a plain DROP, not the
+//    severing `read`/`into_inner`.)
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-fn cross_graph_as_kernel_arg() {
+fn cross_graph_as_kernel_arg_lends_and_returns() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    // g1: scale a slot buffer by 3 in place.
-    let g1 = ks.scale_u32([N], slot!(Buf), 3u32);
-    let b = seeded(&ctx, 2); // 2*3 = 6
+    // g1: scale a slot buffer by 1 (idempotent) in place.
+    let g1 = ks.scale_u32([N], slot!(Buf), 1u32);
+    let b = seeded(&ctx, 6);
+    let h0 = handle_of(&b);
     let co = g1
         .bind(Buf(b))
         .expect("bind g1")
         .sync(&ctx)
         .expect("g1 run");
 
-    // g2: feed `co` (holding [6;N]) as a kernel arg — scale by 2 → 12.
+    // g2: feed `co` as a kernel arg — scale by 2 (the terminal is the BUFFER, a
+    // Checkout). This LENDS g1's slot buffer into g2; g1 stays `Lent`/busy while
+    // g2's result is alive.
     let g2 = ks.scale_u32([N], co, 2u32);
     let out2 = g2.sync(&ctx).expect("g2 run");
-    let mut r2 = vec![0u32; N];
-    out2.read(&mut r2).wait().expect("read g2");
-    assert!(
-        r2.iter().all(|&x| x == 12),
-        "g2: 6*2 = 12, got {:?}",
-        &r2[..8]
+    assert_eq!(
+        handle_of(&*out2),
+        h0,
+        "g2 ran over g1's LENT buffer (same handle), not a fresh one"
     );
 
-    // g1's slot was severed by feeding co into g2 → re-arm via mutate_bind +
-    // re-run works (a plain `bind` after sever is `SlotSevered`).
-    let other = seeded(&ctx, 7); // 7*3 = 21
+    // g1 is busy (lent into g2) while out2 is alive → a second sync must error.
+    assert!(
+        g1.sync(&ctx).is_err(),
+        "g1 is lent into g2 while g2's result is alive → busy, NOT a silent re-run"
+    );
+
+    // Plain DROP of g2's result (NOT into_inner/read) → the lent buffer RETURNS to
+    // g1's slot, re-arming it.
+    drop(out2);
+
+    // g1 re-runs via a plain `sync()` (NO mutate_bind), over the SAME handle.
     let co3 = g1
-        .mutate_bind(Buf(other))
-        .expect("g1 re-armable after its buffer was consumed by g2 (mutate_bind)")
         .sync(&ctx)
-        .expect("g1 re-run");
+        .expect("g1 re-armable via plain sync after the lent buffer returned from g2");
+    assert_eq!(
+        handle_of(&*co3),
+        h0,
+        "lent buffer returned to g1's slot with a STABLE handle (not severed)"
+    );
     let mut r3 = vec![0u32; N];
     co3.read(&mut r3).wait().expect("read g1 rerun");
-    assert!(r3.iter().all(|&x| x == 21), "g1 re-run: 7*3 = 21");
+    // g2 scaled the SAME buffer ×2 IN PLACE (6 → 12) and it returned to g1 with
+    // those contents; g1's re-run scales ×1 (idempotent) → still 12. This also
+    // confirms g2 computed correctly over g1's lent buffer.
+    assert!(
+        r3.iter().all(|&x| x == 12),
+        "g1 re-run over returned buffer: 6*2*1 = 12"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 8b. into_inner STILL severs (the explicit take-it-out verb is unchanged).
+//     Contrast with 7/8: only the IMPLICIT feed-as-input path lends; calling
+//     `into_inner()` explicitly and feeding the RAW buffer still severs the slot
+//     (Lent → Severed), so a plain `bind` is `SlotSevered` and only `mutate_bind`
+//     re-arms it.
+// ───────────────────────────────────────────────────────────────────────────
+#[test]
+fn into_inner_still_severs() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    let g = ks.scale_u32([N], slot!(Buf), 2u32);
+    let b = seeded(&ctx, 4); // 4*2 = 8
+    let co = g.bind(Buf(b)).expect("bind").sync(&ctx).expect("g run");
+
+    // Explicitly TAKE the buffer out — this severs g's slot (Lent → Severed).
+    let raw = co.into_inner();
+    let mut rb = vec![0u32; N];
+    raw.read(&mut rb).wait().expect("read raw");
+    assert!(rb.iter().all(|&x| x == 8), "kept buffer holds 4*2 = 8");
+
+    // g's slot is SEVERED → a plain `bind` rejects; only `mutate_bind` re-arms.
+    match g.bind(Buf(seeded(&ctx, 1))) {
+        Ok(_) => panic!("plain bind on a severed slot must error"),
+        Err(Error::SlotSevered(n)) => {
+            assert!(
+                n.contains("Buf"),
+                "expected SlotSevered naming Buf, got {n:?}"
+            )
+        }
+        Err(other) => panic!("expected SlotSevered, got {other:?}"),
+    }
+    let other = seeded(&ctx, 5); // 5*2 = 10
+    let co2 = g
+        .mutate_bind(Buf(other))
+        .expect("g re-armable after into_inner via mutate_bind")
+        .sync(&ctx)
+        .expect("g re-run");
+    let mut r2 = vec![0u32; N];
+    co2.read(&mut r2).wait().expect("read");
+    assert!(r2.iter().all(|&x| x == 10), "re-bound buffer: 5*2 = 10");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 8c. transitive lend chain: A → B → C.
+//     Feed A's Checkout as a kernel arg to B, then B's Checkout as a kernel arg
+//     to C. A's slot home must ride the WHOLE chain and return to A only at the
+//     FINAL drop (C's result). A is busy until then; afterwards A re-runs via a
+//     plain `sync()` over the same handle.
+// ───────────────────────────────────────────────────────────────────────────
+#[test]
+fn checkout_lend_transitive() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // A: scale a slot buffer by 1 (idempotent) in place.
+    let g_a = ks.scale_u32([N], slot!(Buf), 1u32);
+    let b = seeded(&ctx, 3);
+    let h0 = handle_of(&b);
+    let co_a = g_a.bind(Buf(b)).expect("bind A").sync(&ctx).expect("A run");
+
+    // B: scale A's buffer by 2 → 6. C: scale B's result by 5 → 30.
+    let co_b = ks.scale_u32([N], co_a, 2u32).sync(&ctx).expect("B run");
+    let co_c = ks.scale_u32([N], co_b, 5u32).sync(&ctx).expect("C run");
+
+    // A is still busy: its home rode A → B → C and hasn't returned yet.
+    assert!(
+        g_a.sync(&ctx).is_err(),
+        "A is lent through the whole chain while C's result is alive → busy"
+    );
+
+    // Feed co_c forward ONE more hop into a download (D): the home rides A→B→C→D
+    // and D's download RETURNS the buffer all the way back to A's slot, while also
+    // reading the data out for the correctness check.
+    let rc = download(co_c).sync(&ctx).expect("download C result");
+    assert!(
+        rc.iter().all(|&x| x == 30),
+        "C: 3*1*2*5 = 30, got {:?}",
+        &rc[..8]
+    );
+
+    // The buffer has returned to A → A re-runs via a plain `sync()` (NO mutate_bind)
+    // over the SAME handle.
+    let co_a2 = g_a
+        .sync(&ctx)
+        .expect("A re-armable via plain sync after the transitive chain returned the buffer");
+    assert_eq!(
+        handle_of(&*co_a2),
+        h0,
+        "buffer returned to A's slot with a STABLE handle after the transitive chain"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
