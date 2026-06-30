@@ -9,6 +9,28 @@ items resolve.
 
 ## Active
 
+### ✅ `sync`/`wait_on` ATOMIC via `check_ready` pre-pass — 2026-06-30 (branch `typed-slots`, UNCOMMITTED, staged)
+
+Bug: `execute` LENDS each leaf's input (`Bound→Lent`) AND enqueues in the same
+call, walked depth-first, so an unsatisfiable LATER node left EARLIER cells `Lent`
+with no `Checkout` to re-arm → retry spuriously "busy". FIX: new read-only
+`DeviceOp::check_ready(&self) -> Result<()>` (default `Ok`), called ONCE at the top
+of `wait_on` BEFORE `gather_checkouts`/EC/start-gate. Mirrors `bind_slots`/`describe`
+recursion: combinators (`AndThen`, bundle, `FanOut`, `Arced`/`ArcSplit`,
+`OnDevice`/`Profiled`/host-seams, `DeviceDynOp` via `*_erased`) recurse children;
+leaves override to call new `Input::check_ready` (Concrete `is_some`, Slot `Bound`,
+**Pipe always-OK** — internal-edge filled at run OR pre-loaded lent already has
+payload) / `ScalarInput::check_ready`. Kernel macro emits it in both DeviceOp
+branches (`input_check_ready` + `grid_check_ready`). Same `Error` variant/message as
+`resolve_home` (so existing SlotUnbound tests unchanged; they now fire from
+check_ready). `execute`'s resolve_home checks kept as backstop. Tests:
+`tests/tier2/tests/sync_atomicity.rs` (4: later-unbound-leaves-early-untouched
+[bundle, concrete early, same-handle recovery]; later-Lent atomic+recover;
+ready-graph normal; identical-SlotUnbound). DoD all green (build/clippy/doc/fmt; full
+tier2 sweep 0 fail; safety 9/9 + image 11/11; gray-scott smoke; tier1 baseline
+2 image_dispatch pocl fails only). NOT applied to `run`(async)/`submit_on` terminals
+— same hole exists there, deferred (task scoped to sync/wait_on).
+
 ### ✅ Feed-a-`Checkout`-forward now LENDS (not severs) — 2026-06-30 (branch `typed-slots`, UNCOMMITTED, staged)
 
 Feeding a `Checkout` from graph A as a plain INPUT to a second graph B used to

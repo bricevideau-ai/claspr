@@ -1192,6 +1192,63 @@ impl<T> Input<T> {
         }
     }
 
+    /// **Read-only** pre-flight check: would [`resolve_home`](Self::resolve_home)
+    /// succeed on this input *right now*, WITHOUT lending / taking / mutating
+    /// anything? Returns the SAME [`Error`] variant + message `resolve_home` would
+    /// produce for an unsatisfiable input, or `Ok(())` if it is ready.
+    ///
+    /// This is the per-input half of the [`check_ready`](DeviceOp::check_ready)
+    /// atomicity guarantee: a graph terminal walks EVERY input's `check_ready`
+    /// before enqueuing any device work, so a failed `sync` leaves the graph
+    /// unchanged + re-runnable (no buffer left `Lent`, no command enqueued). It
+    /// must check the SAME conditions `resolve_home` errors on — and ONLY those —
+    /// so the early catch is identical to the (retained) execute-time backstop.
+    ///
+    /// - [`Concrete`](Input::Concrete): error iff the cell is empty (already lent
+    ///   to a live `Checkout` — the graph is busy). Inspect via `is_none()`; do NOT
+    ///   `take()`.
+    /// - [`Slot`](Input::Slot): OK iff [`Bound`](SlotState::Bound); any empty state
+    ///   ([`Unbound`](SlotState::Unbound)/[`Severed`](SlotState::Severed)/[`Lent`](SlotState::Lent))
+    ///   is [`Error::SlotUnbound`], exactly as `lend_slot` reports. Inspect via
+    ///   `matches!`; do NOT replace the state.
+    /// - [`Pipe`](Input::Pipe): **always OK** (deferred). A pipe is NEVER a pre-run
+    ///   completeness failure — it is either (a) an internal edge whose producer
+    ///   runs earlier in THIS graph and fills it at run time (empty now is normal),
+    ///   or (b) a pre-loaded LENT pipe (`Input::lent`) whose payload is ALREADY
+    ///   present (satisfiable). `resolve_home`'s Pipe arm CAN error ("upstream pipe
+    ///   was not filled") — but ONLY if an upstream producer FAILED mid-run; with
+    ///   `check_ready` having proved every LEAF input ready, no producer fails for a
+    ///   readiness reason, so that arm cannot fire as a pre-run completeness error.
+    ///   It stays as the execute-time internal-ordering backstop.
+    pub fn check_ready(&self) -> Result<()> {
+        match self {
+            Input::Concrete(cell) => {
+                if cell.lock().unwrap().is_some() {
+                    Ok(())
+                } else {
+                    // Same condition + message `lend_from_cell`'s `empty_err`
+                    // produces (a concrete input lent to a still-alive Checkout).
+                    Err(Error::NotSupported(
+                        "eager graph: a concrete input was already lent and not \
+                         returned — a graph is `sync`'d while a previous `Checkout` is \
+                         still alive (the graph is busy)",
+                    ))
+                }
+            }
+            // `Bound` lends; `Unbound`/`Severed`/`Lent` are all `SlotUnbound`
+            // (its message covers all three) — mirrors `lend_slot` exactly.
+            Input::Slot { name, cell, .. } => {
+                if matches!(&*cell.lock().unwrap(), SlotState::Bound(_)) {
+                    Ok(())
+                } else {
+                    Err(Error::SlotUnbound(name))
+                }
+            }
+            // Deferred — see the doc above: never a pre-run failure.
+            Input::Pipe(_) => Ok(()),
+        }
+    }
+
     // NOTE: `Input::resolve_on(&launcher)` — which built a transient
     // `ExecutionContext` so an image kernel's args could resolve outside an
     // `execute(&self)` — was removed when image kernels became reusable
@@ -1529,6 +1586,22 @@ impl<V: Clone> ScalarInput<V> {
             ScalarInput::Concrete(v) => Ok(v.clone()),
             ScalarInput::Slot { name, cell, .. } => match &*cell.lock().unwrap() {
                 ScalarSlotState::Bound(v) => Ok(v.clone()),
+                ScalarSlotState::Unbound => Err(Error::SlotUnbound(name)),
+            },
+        }
+    }
+
+    /// **Read-only** pre-flight check: would [`read`](Self::read) succeed right now,
+    /// WITHOUT cloning anything out? The non-resource half of the
+    /// [`check_ready`](DeviceOp::check_ready) atomicity walk. A `Concrete` value is
+    /// always ready; a `Slot` is ready iff [`Bound`](ScalarSlotState::Bound),
+    /// otherwise [`Error::SlotUnbound`] — the SAME error `read` returns for an
+    /// unbound scalar/launch slot (there is no `Lent`/`Severed` state for a scalar).
+    pub fn check_ready(&self) -> Result<()> {
+        match self {
+            ScalarInput::Concrete(_) => Ok(()),
+            ScalarInput::Slot { name, cell, .. } => match &*cell.lock().unwrap() {
+                ScalarSlotState::Bound(_) => Ok(()),
                 ScalarSlotState::Unbound => Err(Error::SlotUnbound(name)),
             },
         }
@@ -2147,6 +2220,50 @@ pub trait DeviceOp: Send {
         let _ = binder;
     }
 
+    /// **Atomicity pre-pass** — validate that EVERY input cell of the WHOLE
+    /// (sub)graph is satisfiable RIGHT NOW, WITHOUT executing / enqueuing / lending
+    /// anything. Called once by the terminals ([`wait_on`](DeviceOpExt::wait_on) →
+    /// [`sync`](DeviceOpExt::sync)) BEFORE the first
+    /// [`gather_checkouts`](Self::gather_checkouts)/[`execute`](Self::execute), so a
+    /// failed `sync` leaves the graph UNCHANGED + re-runnable.
+    ///
+    /// ## Why it exists (the atomicity hole it closes)
+    ///
+    /// [`execute`](Self::execute) interleaves resolution with enqueue: each leaf
+    /// [`resolve_home`](Input::resolve_home)s its input (which LENDS the buffer —
+    /// `Bound → Lent`) AND enqueues its device work in the same call, and the graph
+    /// is walked depth-first ([`AndThen::execute`](Self::execute) runs `source` then
+    /// `next`). So if a LATER node has an unsatisfiable input, EARLIER nodes have
+    /// already lent their buffers and enqueued — and the failing `sync` strands
+    /// those earlier cells `Lent` with no `Checkout` to re-arm them, so a retry
+    /// spuriously reports them busy. This walk proves all leaves ready FIRST; only
+    /// then does `execute` proceed, so nothing is touched on the failure path.
+    ///
+    /// ## Contract
+    ///
+    /// - **Read-only.** Inspect cells via `is_some()` / `matches!`; NEVER `take`,
+    ///   `replace`, lend, or enqueue. Coverage MUST match what
+    ///   [`execute`](Self::execute) actually resolves: every input a node's
+    ///   `execute` calls [`resolve_home`](Input::resolve_home)/[`resolve`](Input::resolve)/[`read`](ScalarInput::read)
+    ///   on, its `check_ready` must inspect (else the hole reopens).
+    /// - **Same error.** Produce the identical [`Error`] variant + message
+    ///   `resolve_home` would for the unsatisfiable input
+    ///   ([`Input::check_ready`]/[`ScalarInput::check_ready`] do this), so the early
+    ///   catch is indistinguishable from the retained execute-time backstop.
+    /// - **Pipes are deferred-OK** — see [`Input::check_ready`]: an internal-edge
+    ///   pipe is filled at run by an upstream producer (whose own leaves this walk
+    ///   already proved ready), and a pre-loaded lent pipe already carries its
+    ///   payload; neither is a pre-run completeness failure.
+    ///
+    /// Default: `Ok(())` — a leaf with no checkable input. Leaves that resolve
+    /// inputs override to check their [`Input`]/[`ScalarInput`] cells read-only;
+    /// combinators ([`AndThen`], `bundle*`, [`CopyTo2`]) recurse into their children
+    /// (mirroring [`describe`](Self::describe)/[`bind_slots`](Self::bind_slots)) so
+    /// coverage matches `execute`'s traversal.
+    fn check_ready(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Return any of this op's **own output values that were produced but never
     /// delivered** to their home cells — the "undelivered drop" half of the home
     /// invariant for MID-graph producers.
@@ -2454,6 +2571,16 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         Self::Output: Send + 'static,
         Self::Checkouts: FromCheckout<Self::Output>,
     {
+        // ATOMICITY PRE-PASS — validate that EVERY input cell of the whole graph is
+        // satisfiable BEFORE touching anything. This is the read-only mirror of the
+        // resolve_home checks `execute` does inline; running it FIRST means a graph
+        // with an unsatisfiable input (empty concrete cell / unbound-or-lent slot /
+        // unbound scalar) errors having LENT no buffer and ENQUEUED no command, so
+        // the graph is left unchanged + re-runnable. `execute`'s own resolve_home
+        // checks stay as the safety backstop. (Done before building `ExecutionContext`
+        // and the start gate — neither has run yet, so there is nothing to unwind.)
+        self.check_ready()?;
+
         let device = launcher.context().device().clone();
         let mut ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
 
@@ -3155,6 +3282,14 @@ where
         self.next.bind_slots(binder);
     }
 
+    fn check_ready(&self) -> Result<()> {
+        // Recurse source then next — the SAME traversal `execute`/`describe`/
+        // `bind_slots` use, so the pre-pass covers exactly the inputs `execute`
+        // resolves. Fail fast on the first unsatisfiable input.
+        self.source.check_ready()?;
+        self.next.check_ready()
+    }
+
     fn reclaim_undelivered(&self) {
         // Mop up undelivered intermediates across the WHOLE subtree: the source's
         // outputs that `next` discarded (its element pipes), plus any intermediates
@@ -3357,6 +3492,10 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.input.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("forward".into());
     }
@@ -3376,6 +3515,11 @@ trait ErasedDeviceOp<T>: Send {
     fn collect_erased(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(T, Deps)>;
 
     fn describe_erased(&self, out: &mut Vec<String>);
+
+    /// Forwards [`DeviceOp::check_ready`] through the erasure so a [`DeviceDynOp`]'s
+    /// atomicity pre-pass covers whichever concrete arm it wraps (the arm's inputs
+    /// are resolved by `collect_erased` at run, so they must be pre-checked too).
+    fn check_ready_erased(&self) -> Result<()>;
 
     /// Forwards [`DeviceOp::contains_host_seam`] through the erasure so a
     /// [`DeviceDynOp`] reports the right gate bit for whichever concrete arm it
@@ -3397,6 +3541,10 @@ where
 
     fn describe_erased(&self, out: &mut Vec<String>) {
         self.describe(out);
+    }
+
+    fn check_ready_erased(&self) -> Result<()> {
+        self.check_ready()
     }
 
     fn contains_host_seam_erased(&self) -> bool {
@@ -3475,6 +3623,10 @@ impl<T: Send + 'static> DeviceOp for DeviceDynOp<'_, T> {
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.inner.check_ready_erased()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("dyn_op{".into());
         self.inner.describe_erased(out);
@@ -3528,6 +3680,10 @@ where
         let (v, deps) = self.source.collect(ec, ExecMode::Pipelined)?;
         self.out.put(Arc::new(v), deps);
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.source.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -3667,6 +3823,10 @@ where
             .try_into()
             .unwrap_or_else(|_| unreachable!("arc_split drained exactly N branch pipes"));
         Ok((arr, all_deps))
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.source.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -3857,6 +4017,14 @@ macro_rules! impl_eager_bundle {
                 )+
             }
 
+            fn check_ready(&self) -> Result<()> {
+                // Recurse into EVERY branch — `execute` `collect`s each, so each
+                // branch's inputs are resolved and must be pre-checked. Fail-fast
+                // on the first unsatisfiable branch.
+                $(self.$field.check_ready()?;)+
+                Ok(())
+            }
+
             fn contains_host_seam(&self) -> bool {
                 // OR every branch: a host seam in any one of them must gate.
                 false $(|| self.$field.contains_host_seam())+
@@ -4018,6 +4186,14 @@ impl<U: DeviceOp> DeviceOp for FanOut<U> {
         }
         let joined = join_marker(ec, &branch_deps)?;
         self.out.put(outputs, joined);
+        Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        // `execute` `collect`s every branch op — pre-check each, fail-fast.
+        for op in &self.ops {
+            op.check_ready()?;
+        }
         Ok(())
     }
 
@@ -4211,6 +4387,10 @@ where
             }
         }
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.buf.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -4456,6 +4636,10 @@ where
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.buf.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("download".into());
     }
@@ -4553,6 +4737,10 @@ where
             }
         }
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.buf.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -4694,6 +4882,10 @@ where
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.buf.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("transfer_to_device".into());
     }
@@ -4765,6 +4957,10 @@ where
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.uninit.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("fill_device_uninit".into());
     }
@@ -4830,6 +5026,10 @@ where
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.uninit.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("fill_mapped_uninit".into());
     }
@@ -4883,6 +5083,10 @@ where
         let buf = uninit.fill_into(self.value);
         self.out.put(buf, deps);
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.uninit.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -4960,6 +5164,10 @@ where
             }
         }
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.uninit.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -5045,6 +5253,10 @@ where
             }
         }
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.buf.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -5138,6 +5350,10 @@ where
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.uninit.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("write_mapped_uninit".into());
     }
@@ -5201,6 +5417,10 @@ where
             }
         }
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.buf.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -5295,6 +5515,10 @@ where
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.buf.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("write_mapped".into());
     }
@@ -5371,6 +5595,10 @@ where
         let buf = uninit.write_from(self.src.as_slice())?;
         self.out.put(buf, deps);
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.uninit.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -5780,6 +6008,10 @@ where
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.img.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("image_download".into());
     }
@@ -5847,6 +6079,10 @@ where
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.buf.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("acquire_device_view".into());
     }
@@ -5896,6 +6132,10 @@ where
         let (view, out_deps) = buf.acquire_host_view_read().run(ec, deps)?;
         self.out.put(view, out_deps);
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.buf.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -5951,6 +6191,10 @@ where
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.view.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("release_device_view".into());
     }
@@ -5999,6 +6243,10 @@ where
         let (view, out_deps) = buf.acquire_host_view().run(ec, deps)?;
         self.out.put(view, out_deps);
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.buf.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -6052,6 +6300,10 @@ where
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.buf.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("acquire_mapped_view_read".into());
     }
@@ -6103,6 +6355,10 @@ where
         let (buf, out_deps) = view.release_to_device().run(ec, deps)?;
         self.out.put(buf, out_deps);
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.view.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -6525,6 +6781,13 @@ where
         self.dst.try_bind_slot(binder);
     }
 
+    fn check_ready(&self) -> Result<()> {
+        // Both operands are resolved in `execute` (src then dst) — check both,
+        // read-only, fail-fast on the first unsatisfiable one.
+        self.src.check_ready()?;
+        self.dst.check_ready()
+    }
+
     fn reclaim_undelivered(&self) {
         // Two element pipes (src, dst). Drain + rehome each undelivered side so a
         // copy whose output is partly discarded (e.g. `…and_then(|(src, _dst)| …)`)
@@ -6819,6 +7082,10 @@ where
         let (value, deps) = self.source.collect(&child, mode)?;
         self.out.put(value, deps);
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.source.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -7135,6 +7402,10 @@ where
         Ok(())
     }
 
+    fn check_ready(&self) -> Result<()> {
+        self.source.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         self.source.describe(out);
         out.push("and_then_host".into());
@@ -7179,6 +7450,10 @@ where
             run_host_seam::<S::Output, _>(value, deps, ec, move |view| f(&context, view))?;
         self.out.put(out_value, out_deps);
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.source.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -7277,6 +7552,10 @@ where
         // chaining (it subsumes the source's events).
         self.out.put(value, vec![wrap_event(marker)]);
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.source.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {

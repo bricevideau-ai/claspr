@@ -504,6 +504,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `bind_slots` body: one `try_bind_slot` per SLICE or IMAGE arg (scalars carry
     // no `Input`). Folds a `call(Tag(v))` binder into any matching unbound slot.
     let mut input_bind_slots: Vec<TokenStream2> = Vec::new();
+    // `check_ready` body: one read-only readiness check per arg (each buffer/image
+    // `Input` via `Input::check_ready`, each scalar `ScalarInput` via
+    // `ScalarInput::check_ready`). The atomicity pre-pass: every input `execute`
+    // would resolve is validated WITHOUT lending, so a failed `sync` strands no
+    // buffer in `Lent`. Coverage MUST mirror `input_resolve_eager` +
+    // `scalar_resolve_eager` + the grid read, or the atomicity hole reopens.
+    let mut input_check_ready: Vec<TokenStream2> = Vec::new();
     // Destructure pattern for `bind_slots`: buffer/image positions bind their name,
     // every scalar position binds `_` (so non-slot args don't trip unused-var lints).
     let mut bind_slot_pat_names: Vec<TokenStream2> = Vec::new();
@@ -606,6 +613,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         ::claspr::Input::try_bind_slot(#pname, binder);
                     }
                 });
+                // `check_ready`: read-only mirror of `input_resolve_eager` — this
+                // buffer arg is lent at execute, so its `Input` cell must be
+                // satisfiable BEFORE any work is enqueued.
+                input_check_ready.push(quote! {
+                    ::claspr::Input::check_ready(#pname)?;
+                });
                 bind_slot_pat_names.push(quote! { #pname });
                 op_arg_pass.push(quote! { &#pname });
                 output_names.push(pname.clone());
@@ -707,6 +720,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         ::claspr::Input::try_bind_slot(#pname, binder);
                     }
                 });
+                // `check_ready`: an image arg is lent at execute exactly like a
+                // slice arg → read-only validate its `Input` cell up front.
+                input_check_ready.push(quote! {
+                    ::claspr::Input::check_ready(#pname)?;
+                });
                 bind_slot_pat_names.push(quote! { #pname });
                 op_arg_pass.push(quote! { &#pname });
                 output_names.push(pname.clone());
@@ -757,6 +775,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     {
                         ::claspr::ScalarInput::try_bind_slot(#pname, binder);
                     }
+                });
+                // `check_ready`: a scalar slot is read at execute → read-only
+                // validate its `ScalarInput` (unbound is `SlotUnbound`).
+                input_check_ready.push(quote! {
+                    ::claspr::ScalarInput::check_ready(#pname)?;
                 });
 
                 // Record path: read the scalar's resolved value, then set its raw
@@ -845,6 +868,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         {
             ::claspr::ScalarInput::try_bind_slot(&self.spec, binder);
         }
+    };
+
+    // The GRID (`self.spec`) is READ at execute (a non-resource scalar slot), so
+    // `check_ready` must validate it too — read-only, mirroring `grid_bind_slot`.
+    let grid_check_ready: TokenStream2 = quote! {
+        ::claspr::ScalarInput::check_ready(&self.spec)?;
     };
 
     // Output type / expression — bare for a single slice, tuple for
@@ -1150,6 +1179,18 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     #grid_bind_slot
                 }
 
+                fn check_ready(&self) -> ::claspr::Result<()> {
+                    // Atomicity pre-pass: read-only validate EVERY input `execute`
+                    // resolves — each buffer/image `Input`, each scalar `ScalarInput`,
+                    // AND the grid — so an unsatisfiable arg errors with the SAME
+                    // variant `resolve_home`/`read` would, having lent nothing and
+                    // enqueued nothing. Coverage mirrors `execute`'s resolves exactly.
+                    let #bind_slots_args_pat = &self.args;
+                    #(#input_check_ready)*
+                    #grid_check_ready
+                    ::core::result::Result::Ok(())
+                }
+
                 fn reclaim_undelivered(&self) {
                     // Drain + rehome every element pipe that an `and_then` closure
                     // DISCARDED (kept only some outputs): each undelivered homed
@@ -1253,6 +1294,18 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     let #bind_slots_args_pat = &self.args;
                     #(#input_bind_slots)*
                     #grid_bind_slot
+                }
+
+                fn check_ready(&self) -> ::claspr::Result<()> {
+                    // Atomicity pre-pass: read-only validate EVERY input `execute`
+                    // resolves — each buffer/image `Input`, each scalar `ScalarInput`,
+                    // AND the grid — so an unsatisfiable arg errors with the SAME
+                    // variant `resolve_home`/`read` would, having lent nothing and
+                    // enqueued nothing. Coverage mirrors `execute`'s resolves exactly.
+                    let #bind_slots_args_pat = &self.args;
+                    #(#input_check_ready)*
+                    #grid_check_ready
+                    ::core::result::Result::Ok(())
                 }
             }
         }
