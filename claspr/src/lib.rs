@@ -163,15 +163,15 @@ pub use transfer::UploadSource;
 #[cfg(feature = "async-events")]
 pub use eager::DeviceChainFuture;
 pub use eager::{
-    AndThenHost, AndThenHostWithContext, ArcSplit, Cell, Checkout, CopyTo2, Dep, Deps, DeviceDynOp,
-    DeviceEnqueue, DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt, Download, ExecMode,
-    FanOut, Fill, FillMapped, FromCheckout, ImageDownloadEager, ImageUploadEager, Input, OnDevice,
-    Pipe, ReadInto, SlotBinder, SlotHandle, Tag, ToInput, TransferToDevice, Upload, WriteDevice,
-    WriteMapped, arc_split, arced, bundle2, bundle3, bundle4, bundle5, bundle6, bundle7, bundle8,
-    bundle9, bundle10, bundle11, bundle12, bundle13, bundle14, bundle15, bundle16, deps_as_events,
-    deps_into_single_event, eager_copy_to, fan_out, fill_mapped, forward, image_download,
-    image_upload, lift, read_into, transfer_to_device, transfer_to_device_at, value, wrap_event,
-    write, write_mapped,
+    AndThenHost, AndThenHostWithContext, ArcSplit, BindAll, BindMode, Cell, Checkout, CopyTo2, Dep,
+    Deps, DeviceDynOp, DeviceEnqueue, DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt,
+    Download, ExecMode, FanOut, Fill, FillMapped, FromCheckout, ImageDownloadEager,
+    ImageUploadEager, Input, OnDevice, Pipe, ReadInto, SlotBinder, SlotCell, SlotEq, SlotHandle,
+    SlotState, Tag, ToInput, TransferToDevice, Upload, WriteDevice, WriteMapped, arc_split, arced,
+    bundle2, bundle3, bundle4, bundle5, bundle6, bundle7, bundle8, bundle9, bundle10, bundle11,
+    bundle12, bundle13, bundle14, bundle15, bundle16, deps_as_events, deps_into_single_event,
+    eager_copy_to, fan_out, fill_mapped, forward, image_download, image_upload, lift, read_into,
+    transfer_to_device, transfer_to_device_at, value, wrap_event, write, write_mapped,
 };
 
 // Stage-3 proc-macro frontend.
@@ -233,6 +233,6 @@ pub mod prelude {
         device_slice_filled, device_slice_from_slice, download, slot, slots, upload,
     };
 
-    // ── Typed-slot tags ──
-    pub use crate::eager::{SlotHandle, Tag};
+    // ── Typed-slot tags + multi-fill ──
+    pub use crate::eager::{BindAll, SlotHandle, Tag};
 }

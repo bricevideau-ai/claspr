@@ -59,6 +59,22 @@ pub enum Error {
     /// bound slot's buffer is still lent to a live `Checkout` — the
     /// graph is busy on that slot.)
     SlotUnbound(&'static str),
+    /// A `g.bind(Tag(value))` (the set-once verb) targeted a slot that is
+    /// already bound to a **different** buffer. `bind` is idempotent on an
+    /// equal binding (same `cl_mem`) but rejects a conflicting one; the
+    /// string is the tag's `type_name`. Use
+    /// [`mutate_bind`](crate::DeviceOpExt::mutate_bind) to deliberately
+    /// change a bound slot's value.
+    SlotConflict(&'static str),
+    /// A `g.bind` / `g.mutate_bind` targeted a slot whose buffer is currently
+    /// **checked out** — lent to a live [`Checkout`](crate::Checkout) from an
+    /// in-flight run. The slot's value is in the caller's hands, so re-binding
+    /// it would silently clobber it (the Checkout's drop would rehome the old
+    /// buffer over the new). The string is the tag's `type_name`; drop the
+    /// `Checkout` (re-arming the slot) or call
+    /// [`into_inner`](crate::Checkout::into_inner) (severing it) before
+    /// re-binding.
+    SlotCheckedOut(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -85,6 +101,16 @@ impl fmt::Display for Error {
                 "eager graph: slot `{tag}` is unbound — bind it with \
                  `g.bind(Tag(value))` before sync (or a previous Checkout is still \
                  holding its buffer)"
+            ),
+            Error::SlotConflict(tag) => write!(
+                f,
+                "eager graph: slot `{tag}` is already bound to a different value; \
+                 use `mutate_bind` to change it"
+            ),
+            Error::SlotCheckedOut(tag) => write!(
+                f,
+                "eager graph: slot `{tag}` is currently checked out; drop the \
+                 Checkout (or call into_inner) before re-binding"
             ),
         }
     }

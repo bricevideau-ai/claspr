@@ -101,6 +101,107 @@ pub trait DeviceEnqueue: Send + Sized {
 /// hold a clone to deposit the value back home.
 pub type Cell<T> = Arc<Mutex<Option<T>>>;
 
+// ── SlotState<T>: the tri-state slot cell ──────────────────────────────────
+
+/// The cell behind an [`Input::Slot`] — a **three-state** resource holder, the
+/// distinction a bare `Option<T>` cannot make.
+///
+/// A concrete head's [`Cell<T>`] only ever needs `Some`/`None` (full / lent),
+/// because "the cell is empty" unambiguously means "a run lent it and a still-live
+/// `Checkout` owes it back" (the graph is busy). A SLOT, though, can be empty for
+/// **two different reasons**, and the verb 2×2 ([`bind`](DeviceOpExt::bind) /
+/// [`mutate_bind`](DeviceOpExt::mutate_bind)) must tell them apart at bind time:
+///
+/// - [`Unbound`](SlotState::Unbound) — never filled (or severed by
+///   [`into_inner`](Checkout::into_inner)). A `bind`/`mutate_bind` here simply
+///   fills it; resolving it is [`Error::SlotUnbound`].
+/// - [`Bound`](SlotState::Bound) — holds a buffer, ready to lend. `bind` is
+///   idempotent if the new value is the *same* buffer ([`SlotEq`]) and
+///   [`Error::SlotConflict`] otherwise; `mutate_bind` overwrites.
+/// - [`Lent`](SlotState::Lent) — its buffer is currently checked out to a live
+///   [`Checkout`] from an in-flight run. Re-binding here is
+///   [`Error::SlotCheckedOut`] for BOTH verbs: the value is in the caller's hands,
+///   and the Checkout's drop will rehome the OLD buffer over any new one — a
+///   silent clobber. The caller must drop the Checkout (re-arm → `Bound`) or
+///   `into_inner` it (sever → `Unbound`) first.
+///
+/// The three transitions live at: lend (`Bound → Lent`, `Input::lend_slot`),
+/// rehome on Checkout drop (`Lent → Bound`, `SlotHome::rehome`), and sever on
+/// `into_inner` (`Lent → Unbound`, `SlotHome::sever`).
+pub enum SlotState<T> {
+    /// Never bound (or severed) — the slot is genuinely empty.
+    Unbound,
+    /// Holds a buffer ready to lend on the next run.
+    Bound(T),
+    /// The buffer is lent to a live `Checkout`; the slot is empty *because a run
+    /// is in flight*, NOT because it was never bound.
+    Lent,
+}
+
+/// The tri-state cell shared by a [`SlotHandle`] and its [`Input::Slot`].
+pub type SlotCell<T> = Arc<Mutex<SlotState<T>>>;
+
+// ── SlotEq: "same buffer object" for the bind idempotency check ─────────────
+
+/// Pointer-identity equality for the [`bind`](DeviceOpExt::bind) idempotency
+/// check: does a new binding name the **same buffer object** as the one already
+/// bound?
+///
+/// This is deliberately NOT byte-equality of contents — `bind` is a set-*once*
+/// verb whose "no-op on equal" leg means "you re-handed me the buffer I already
+/// have", identified by its OpenCL handle (`cl_mem` for a [`DeviceSlice`], the SVM
+/// pointer for a [`MappedSlice`]/[`USMSlice`]). Two distinct buffers that happen to
+/// hold equal bytes still *conflict* under `bind` (use
+/// [`mutate_bind`](DeviceOpExt::mutate_bind) to swap one for the other).
+///
+/// Implemented for the buffer families via their
+/// [`RecordableBuffer`](crate::record::RecordableBuffer) handle (the same handle the
+/// record/replay walk keys on). Required by `bind`/`mutate_bind` on `Tg::Value`;
+/// slots are buffer-typed in practice, so only the buffer-family impls exist. A tag
+/// whose value type is not a buffer simply can't be `bind`'d (a compile error at the
+/// call site, not a silent fallback).
+pub trait SlotEq {
+    /// `true` iff `self` and `other` are the same underlying buffer object
+    /// (handle / pointer identity).
+    fn slot_eq(&self, other: &Self) -> bool;
+}
+
+/// Implement [`SlotEq`] for a buffer family by comparing its
+/// [`RecordableBuffer`](crate::record::RecordableBuffer) handle (`cl_mem` /
+/// SVM-pointer identity). Per-family (not a blanket over `RecordableBuffer`) so the
+/// trait stays a small, explicit surface tied to the families slots actually carry.
+macro_rules! impl_slot_eq {
+    ($buf:ident) => {
+        impl<E, M> SlotEq for $crate::$buf<E, M>
+        where
+            M: $crate::MemMode,
+        {
+            fn slot_eq(&self, other: &Self) -> bool {
+                use crate::record::{MemRef, RecordableBuffer};
+                match (self.record_handle().mem, other.record_handle().mem) {
+                    (MemRef::Buffer(a), MemRef::Buffer(b)) => a == b,
+                    (MemRef::Svm(a), MemRef::Svm(b)) => std::ptr::eq(a, b),
+                    // Different memory classes can never be the same object.
+                    _ => false,
+                }
+            }
+        }
+    };
+}
+impl_slot_eq!(DeviceSlice);
+impl_slot_eq!(MappedSlice);
+impl_slot_eq!(USMSlice);
+
+// A shared (read-only fan-out) `Arc<DeviceSlice>` slot compares its inner buffer.
+impl<E, M> SlotEq for std::sync::Arc<DeviceSlice<E, M>>
+where
+    M: MemMode,
+{
+    fn slot_eq(&self, other: &Self) -> bool {
+        (**self).slot_eq(&**other)
+    }
+}
+
 // ── Typed slots: per-tag value type compile-time, presence runtime ─────────
 
 /// A compile-time **tag** naming a typed hole in a reusable graph. The tag *type*
@@ -132,36 +233,111 @@ pub trait Tag: Sized + 'static {
     fn into_value(self) -> Self::Value;
 }
 
-/// A type-erased carrier for one `bind(Tag(value))` binding, folded into a graph's
-/// slot cells by [`bind_slots`](DeviceOp::bind_slots).
+/// Which verb of the set-binding 2×2 a [`SlotBinder`] carries — the leg that
+/// decides what happens when a matching slot is already [`Bound`](SlotState::Bound).
 ///
-/// Carries the tag's [`TypeId`] and the boxed value (`Box<dyn Any>` over the tag's
-/// `Value`). The binding **MOVES**: each [`Input::Slot`] whose `id` matches takes
-/// the value (downcast back to its concrete type) into its cell, then clears the
-/// binder so a second matching cell sees nothing — a single buffer is single-owner,
-/// so a tag fills at most one slot occurrence per `bind`.
+/// |               | `Set` ([`bind`](DeviceOpExt::bind))     | `Mutate` ([`mutate_bind`](DeviceOpExt::mutate_bind)) |
+/// |---------------|-----------------------------------------|------------------------------------------------------|
+/// | `Unbound`     | fill                                    | fill                                                 |
+/// | `Bound`, `==` | no-op (idempotent)                      | overwrite                                            |
+/// | `Bound`, `!=` | [`Error::SlotConflict`]                 | overwrite                                            |
+/// | `Lent`        | [`Error::SlotCheckedOut`]               | [`Error::SlotCheckedOut`]                            |
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BindMode {
+    /// `bind` — set-once: idempotent on an equal binding, conflict on a different
+    /// one.
+    Set,
+    /// `mutate_bind` — set/change: overwrite a bound slot (or fill an unbound one).
+    Mutate,
+}
+
+/// The type-erased [`SlotEq`] comparator a [`SlotBinder`] captures at construction:
+/// given the currently-`Bound` value and the new value (both `&dyn Any` over the
+/// tag's `Value`), report whether they name the same buffer (handle identity).
+type SlotEqFn = Box<dyn Fn(&dyn Any, &dyn Any) -> bool + Send>;
+
+/// A type-erased carrier for one `bind`/`mutate_bind` binding, folded into a
+/// graph's slot cells by [`bind_slots`](DeviceOp::bind_slots).
+///
+/// Carries the tag's [`TypeId`], the [`BindMode`], the boxed value (`Box<dyn Any>`
+/// over the tag's `Value`), a type-erased [`SlotEq`] comparator (captured at `bind`
+/// time where `Tg::Value: SlotEq` is known), and an `outcome` slot threaded out of
+/// the fold (the verb-2×2 verdict). The tag `type_name` for diagnostics lives on
+/// the matched [`Input::Slot`] itself (the error sites read it there).
+///
+/// The binding **MOVES**: the first [`Input::Slot`] whose `id` matches applies the
+/// 2×2 against its [`SlotState`] (filling / no-op / overwriting, or recording a
+/// conflict / checked-out error into `outcome`), then clears the binder so a second
+/// matching cell sees nothing — a single buffer is single-owner, so a tag fills at
+/// most one slot occurrence per `bind`.
 pub struct SlotBinder {
     id: TypeId,
+    mode: BindMode,
     /// `None` once a matching slot consumed it. `Box<dyn Any + Send>` holds the
     /// tag's `Value` by value.
     value: Option<Box<dyn Any + Send>>,
+    /// Pointer-identity comparison for the `bind` idempotency leg: given the
+    /// currently-`Bound` value and the new value (both as `&dyn Any` over
+    /// `Tg::Value`), reports whether they name the same buffer ([`SlotEq`]).
+    /// Captured at construction so the generic, `SlotEq`-free
+    /// [`try_bind_slot`](Input::try_bind_slot) can invoke it.
+    eq: SlotEqFn,
+    /// The verdict of applying this binder, threaded out of the type-erased fold.
+    /// `Ok(())` until a matching slot records a conflict / checked-out error.
+    outcome: Result<()>,
 }
 
 impl SlotBinder {
-    /// Build a binder for tag `Tg` carrying `value` (moved). Use via
-    /// [`DeviceOpExt::bind`].
-    pub fn new<Tg: Tag>(value: Tg::Value) -> Self {
+    /// Build a binder for tag `Tg` carrying `value` (moved), in [`BindMode`]
+    /// `mode`. Use via [`DeviceOpExt::bind`] / [`DeviceOpExt::mutate_bind`].
+    ///
+    /// `Tg::Value: SlotEq` so the idempotency comparator can be captured here (the
+    /// generic [`try_bind_slot`](Input::try_bind_slot) the macro calls carries no
+    /// such bound).
+    pub fn new<Tg: Tag>(value: Tg::Value, mode: BindMode) -> Self
+    where
+        Tg::Value: SlotEq,
+    {
         SlotBinder {
             id: TypeId::of::<Tg>(),
+            mode,
             value: Some(Box::new(value)),
+            eq: Box::new(|bound: &dyn Any, new: &dyn Any| {
+                match (
+                    bound.downcast_ref::<Tg::Value>(),
+                    new.downcast_ref::<Tg::Value>(),
+                ) {
+                    (Some(a), Some(b)) => a.slot_eq(b),
+                    // Downcast can't fail (TypeId already matched), but if it ever
+                    // did, treat as "different" → a Set verb conflicts rather than
+                    // silently no-ops.
+                    _ => false,
+                }
+            }),
+            outcome: Ok(()),
         }
     }
 
-    /// Whether the binding has already been deposited into a matching slot cell.
-    /// `bind_slots` walks short-circuit on this (one `bind` binds one cell), and
-    /// the kernel-op codegen checks it before each arg.
+    /// Whether the binding has already been deposited into (or rejected by) a
+    /// matching slot cell. `bind_slots` walks short-circuit on this (one `bind`
+    /// binds one cell), and the kernel-op codegen checks it before each arg.
     pub fn is_consumed(&self) -> bool {
         self.value.is_none()
+    }
+
+    /// Take the verb-2×2 verdict out of the binder after the fold. `Ok(())` if the
+    /// binding landed (or was a clean idempotent no-op), else the
+    /// [`SlotConflict`](Error::SlotConflict) / [`SlotCheckedOut`](Error::SlotCheckedOut)
+    /// that a matching slot recorded.
+    pub fn outcome(&self) -> Result<()> {
+        match &self.outcome {
+            Ok(()) => Ok(()),
+            // Both error arms are `&'static str`-carrying, so a cheap copy.
+            Err(Error::SlotConflict(n)) => Err(Error::SlotConflict(n)),
+            Err(Error::SlotCheckedOut(n)) => Err(Error::SlotCheckedOut(n)),
+            // No other error is ever recorded into a binder.
+            Err(_) => unreachable!("SlotBinder only records slot-bind errors"),
+        }
     }
 }
 
@@ -184,8 +360,22 @@ impl SlotBinder {
 /// `: Send` so the boxed home can travel through the graph alongside the value
 /// (every buffer that reaches the home channel is already `Send + 'static`).
 pub trait Rehome<Out>: Send {
-    /// Deposit `value` into the origin cell (consuming the boxed home).
+    /// Deposit `value` into the origin cell (consuming the boxed home) — the
+    /// re-arm path, fired by [`Checkout`] **drop**. For a concrete cell this fills
+    /// it; for a [`slot`](SlotState) cell this is the `Lent → Bound(value)`
+    /// transition.
     fn rehome(self: Box<Self>, value: Out);
+
+    /// **Sever** the return without depositing — fired by
+    /// [`Checkout::into_inner`], where the caller KEEPS the value. For a concrete
+    /// [`Cell`] this is a no-op (its cell is already empty, which correctly reads
+    /// "busy / re-allocate next run"). For a [`slot`](SlotState) cell this is the
+    /// `Lent → Unbound` transition: the value is gone for good, so the slot must
+    /// read genuinely empty (not stuck in `Lent`) — otherwise a later
+    /// `bind`/`mutate_bind` would wrongly see [`Error::SlotCheckedOut`].
+    ///
+    /// Default: no-op (the concrete-cell behaviour). Slots override it.
+    fn sever(self: Box<Self>) {}
 }
 
 /// A boxed, type-erased return home for an output of type `Out` — the home
@@ -199,6 +389,63 @@ pub type BoxedHome<Out> = Box<dyn Rehome<Out>>;
 impl<T: Send> Rehome<T> for Cell<T> {
     fn rehome(self: Box<Self>, value: T) {
         *self.lock().unwrap() = Some(value);
+    }
+    // `sever` keeps the default no-op: a concrete cell stays empty after
+    // `into_inner`, which already reads correctly (re-allocate / busy next run).
+}
+
+/// The return home for a **slot** input — distinct from the concrete
+/// [`Cell<T>: Rehome`] home because the slot's tri-state needs all three exits.
+///
+/// A slot cell is the tri-state [`SlotCell<T>`]; while a run is in flight it sits
+/// in [`Lent`](SlotState::Lent). This home owns a clone of that cell and resolves
+/// the three terminal transitions:
+/// - [`rehome`](Rehome::rehome) (Checkout drop, re-arm): `Lent → Bound(value)`.
+/// - [`sever`](Rehome::sever) (`into_inner`, keep the value): `Lent → Unbound`.
+/// - **dropped without firing** (the lent buffer was CONSUMED downstream — e.g. a
+///   `download` that turns the buffer into a host `Vec`, so its pipe carries no
+///   home back to the slot): `Lent → Unbound`. Without this, a consumed slot would
+///   be stuck in `Lent` forever and any later `bind`/`mutate_bind` would wrongly
+///   report [`Error::SlotCheckedOut`]. Handled by the [`Drop`] impl, which fires
+///   ONLY when neither `rehome` nor `sever` ran (`fired == false`).
+///
+/// (A concrete `Cell` needs none of this: its empty state is overloaded, so its
+/// `sever` is a no-op and a dropped concrete home is fine. The slot's third state
+/// is exactly what distinguishes "checked out" from "consumed / never bound".)
+struct SlotHome<T> {
+    cell: SlotCell<T>,
+    /// Set once `rehome`/`sever` has resolved the state, so the `Drop` fallback
+    /// does not stomp it. A `Box<Self>`'s method takes ownership and then the box
+    /// drops, running `Drop` after the method body — the flag tells `Drop` the
+    /// transition already happened.
+    fired: bool,
+}
+
+impl<T: Send> Rehome<T> for SlotHome<T> {
+    fn rehome(mut self: Box<Self>, value: T) {
+        // Re-arm: the lent buffer (possibly transformed in place) comes back.
+        *self.cell.lock().unwrap() = SlotState::Bound(value);
+        self.fired = true;
+    }
+    fn sever(mut self: Box<Self>) {
+        // The caller kept the value (`into_inner`); the slot is genuinely empty.
+        *self.cell.lock().unwrap() = SlotState::Unbound;
+        self.fired = true;
+    }
+}
+
+impl<T> Drop for SlotHome<T> {
+    fn drop(&mut self) {
+        // Fallback ONLY when neither rehome nor sever ran: the lent buffer was
+        // consumed downstream (its pipe carried no home back here), so the slot is
+        // genuinely empty again — `Lent → Unbound`. Guarded by `fired` so the
+        // post-method drop of a `rehome`/`sever`'d home is a no-op.
+        if !self.fired {
+            let mut guard = self.cell.lock().unwrap();
+            if matches!(&*guard, SlotState::Lent) {
+                *guard = SlotState::Unbound;
+            }
+        }
     }
 }
 
@@ -362,23 +609,34 @@ pub enum Input<T> {
     /// Deferred — produced by an upstream op, moved out of the shared cell.
     Pipe(Pipe<T>),
     /// An **unbound typed slot** — a hole built with [`slot!`](crate::slot)`(Tag)`.
-    /// The `cell` starts EMPTY; it is filled by a later [`bind`](DeviceOpExt::bind)`(Tag(value))`
-    /// that walks the graph and deposits a matching value (see
-    /// [`bind_slots`](DeviceOp::bind_slots)). Once filled, it lends + re-arms
-    /// exactly like a [`Concrete`](Input::Concrete) cell (the run's `Checkout`
-    /// returns the value to it on drop, so a bound graph is re-runnable). Resolved
-    /// while still empty, it is the runtime "slot unbound" error.
+    /// The `cell` starts [`Unbound`](SlotState::Unbound); a later
+    /// [`bind`](DeviceOpExt::bind)`(Tag(value))` / [`mutate_bind`](DeviceOpExt::mutate_bind)
+    /// walks the graph and deposits a matching value (see
+    /// [`bind_slots`](DeviceOp::bind_slots)), moving it to [`Bound`](SlotState::Bound).
+    ///
+    /// Unlike a [`Concrete`](Input::Concrete) cell (a bare `Option`, full/lent), a
+    /// slot is the **tri-state** [`SlotCell`] so the verb 2×2 can tell
+    /// [`Unbound`](SlotState::Unbound) ("never filled / severed") from
+    /// [`Lent`](SlotState::Lent) ("checked out, run in flight"). It still lends +
+    /// re-arms like a concrete cell on the happy path: lend takes
+    /// `Bound → Lent`, the run's `Checkout` drop returns `Lent → Bound`, so a
+    /// bound graph re-runs. Resolved while [`Unbound`](SlotState::Unbound) it is
+    /// [`Error::SlotUnbound`]; resolved while [`Lent`](SlotState::Lent) the graph
+    /// is busy on that slot (also `SlotUnbound`, message covers both).
     ///
     /// `id` is `TypeId::of::<Tag>()` (matched against a [`SlotBinder`]); `name` is
-    /// `type_name::<Tag>()`, carried solely for the unbound-slot diagnostic.
+    /// `type_name::<Tag>()`, carried for the unbound-slot diagnostic AND the
+    /// conflict / checked-out bind errors.
     Slot {
         /// `TypeId::of::<Tag>()` — the bind-matching key.
         id: TypeId,
-        /// `type_name::<Tag>()` — for the "slot `<name>` unbound" error only.
+        /// `type_name::<Tag>()` — for the slot diagnostics (unbound / conflict /
+        /// checked-out).
         name: &'static str,
-        /// Empty until a matching `bind(Tag(value))` deposits the value; then it
-        /// behaves as a `Concrete` cell (lend + return-on-`Checkout`-drop).
-        cell: Cell<T>,
+        /// Tri-state: [`Unbound`](SlotState::Unbound) until a matching bind
+        /// deposits the value ([`Bound`](SlotState::Bound)); [`Lent`](SlotState::Lent)
+        /// while a run holds it.
+        cell: SlotCell<T>,
     },
 }
 
@@ -410,12 +668,11 @@ impl<T> Input<T> {
         Ok((v, deps))
     }
 
-    /// Lend the value out of a [`Cell`] (the shared lending body of the
-    /// `Concrete` and `Slot` arms): take it (the cell stays empty for the run,
-    /// re-armed on `Checkout` drop), build its identity home (`Cell<T>: Rehome<T>`),
-    /// and thread the host-seam start gate if `ec` has one. `empty_err` is the
-    /// error to return when the cell is already empty (busy concrete vs. unbound
-    /// slot have distinct messages).
+    /// Lend the value out of a **concrete** [`Cell`]: take it (the cell stays
+    /// empty for the run, re-armed on `Checkout` drop), build its identity home
+    /// (`Cell<T>: Rehome<T>`), and thread the host-seam start gate if `ec` has one.
+    /// `empty_err` is the error to return when the cell is already empty (a graph
+    /// `sync`'d while a previous `Checkout` is still alive — busy).
     fn lend_from_cell(
         cell: &Cell<T>,
         ec: &ExecutionContext<'_>,
@@ -430,6 +687,59 @@ impl<T> Input<T> {
         // in-place op's output type equals the cell type → identity rehome
         // (`Cell<T>: Rehome<T>`).
         let home: Option<BoxedHome<T>> = Some(Box::new(Arc::clone(cell)));
+        Self::thread_start_gate(v, ec, home)
+    }
+
+    /// Lend the value out of a **slot** [`SlotCell`]: the tri-state analogue of
+    /// [`lend_from_cell`](Self::lend_from_cell). Transitions
+    /// [`Bound(v) → Lent`](SlotState::Lent) and hands `v` to the run; an
+    /// [`Unbound`](SlotState::Unbound) slot is [`Error::SlotUnbound`] (never bound);
+    /// a [`Lent`](SlotState::Lent) slot is the graph-busy case — a previous run's
+    /// `Checkout` still holds the buffer — and also surfaces as `SlotUnbound`
+    /// (whose message covers both). The home is a [`SlotHome`] so the run's
+    /// `Checkout` drop re-arms `Lent → Bound` and `into_inner` severs
+    /// `Lent → Unbound`.
+    fn lend_slot(
+        cell: &SlotCell<T>,
+        ec: &ExecutionContext<'_>,
+        name: &'static str,
+    ) -> Result<(T, Deps, Option<BoxedHome<T>>)>
+    where
+        T: Send + 'static,
+    {
+        // `Bound(v) → Lent`, take `v`; anything else (Unbound / already Lent) is
+        // the "unbound or busy" error.
+        let v = {
+            let mut guard = cell.lock().unwrap();
+            match std::mem::replace(&mut *guard, SlotState::Lent) {
+                SlotState::Bound(v) => v,
+                // Restore the prior state before erroring (we tentatively wrote
+                // `Lent` above; put it back so the slot is unchanged on failure).
+                other => {
+                    *guard = other;
+                    return Err(Error::SlotUnbound(name));
+                }
+            }
+        };
+        let home: Option<BoxedHome<T>> = Some(Box::new(SlotHome {
+            cell: Arc::clone(cell),
+            fired: false,
+        }));
+        Self::thread_start_gate(v, ec, home)
+    }
+
+    /// Attach the host-seam **start gate** to a freshly-lent value's wait-list (if
+    /// `ec` carries one), shared by the concrete and slot lend paths. Without a
+    /// gate the value is an entry leaf with an empty wait-list; with one its enqueue
+    /// waits on the gate so the whole graph commits before any of it runs.
+    fn thread_start_gate(
+        v: T,
+        ec: &ExecutionContext<'_>,
+        home: Option<BoxedHome<T>>,
+    ) -> Result<(T, Deps, Option<BoxedHome<T>>)>
+    where
+        T: Send + 'static,
+    {
         match ec.start_dep() {
             // Retain the start event independently: `ec` owns the original
             // handle for the whole enqueue; this `Dep`'s `Event::drop`
@@ -472,15 +782,12 @@ impl<T> Input<T> {
                      still alive (the graph is busy)",
                 ),
             ),
-            // A typed slot: once bound (cell full) it lends EXACTLY like a concrete
-            // cell — the run's `Checkout` returns the value to it on drop, so a
-            // bound graph re-runs. An EMPTY cell is the runtime "slot unbound"
-            // error (completeness check), carrying the tag's type name. (A slot
-            // that WAS bound but is currently lent out — a still-alive `Checkout` —
-            // also reads empty here; the error covers "unbound or graph busy".)
-            Input::Slot { name, cell, .. } => {
-                Self::lend_from_cell(cell, ec, Error::SlotUnbound(name))
-            }
+            // A typed slot: once `Bound` it lends like a concrete cell — `Bound →
+            // Lent`, and the run's `Checkout` drop returns `Lent → Bound`, so a
+            // bound graph re-runs. `Unbound` is the completeness error; `Lent`
+            // means a previous run's `Checkout` still holds the buffer (busy).
+            // Both surface as `SlotUnbound` (its message covers the two).
+            Input::Slot { name, cell, .. } => Self::lend_slot(cell, ec, name),
             Input::Pipe(p) => p.take_home().ok_or(Error::NotSupported(
                 "eager graph: upstream pipe was not filled before downstream ran \
                  — internal ordering bug",
@@ -508,29 +815,52 @@ impl<T> Input<T> {
         self.resolve(&ec)
     }
 
-    /// If this input has a lending cell (a `Concrete` head, or a bound `Slot`),
-    /// return it so a run's `Checkout` can deposit the (possibly transformed-in-place)
-    /// value back into it on drop, re-arming the graph. A `Pipe` input has no home
-    /// cell (its producer re-mints the value each run) — returns `None`.
+    /// If this input is a [`Concrete`](Input::Concrete) head, return its lending
+    /// [`Cell`] so a run's `Checkout` can deposit the (possibly transformed-in-place /
+    /// Uninit→Init-downgraded) value back into it on drop, re-arming the graph. A
+    /// `Pipe` has no home cell, and a `Slot`'s home is the tri-state
+    /// `SlotHome` (not a plain `Cell`) — both return `None` here; a slot threads
+    /// its home via [`slot_home`](Self::slot_home).
     pub fn return_cell(&self) -> Option<Cell<T>> {
         match self {
-            Input::Concrete(cell) | Input::Slot { cell, .. } => Some(Arc::clone(cell)),
-            Input::Pipe(_) => None,
+            Input::Concrete(cell) => Some(Arc::clone(cell)),
+            Input::Slot { .. } | Input::Pipe(_) => None,
+        }
+    }
+
+    /// If this input is a bound [`Slot`](Input::Slot), build its tri-state return
+    /// [`BoxedHome`] (a `SlotHome`) so an in-place op (e.g. a copy with a slot
+    /// src/dst) re-arms `Lent → Bound` on `Checkout` drop and severs `Lent →
+    /// Unbound` on `into_inner`. `None` for concrete (use
+    /// [`return_cell`](Self::return_cell) + `CopyHome`, which also handles the
+    /// Uninit downgrade) and pipes.
+    pub fn slot_home(&self) -> Option<BoxedHome<T>>
+    where
+        T: Send + 'static,
+    {
+        match self {
+            Input::Slot { cell, .. } => Some(Box::new(SlotHome {
+                cell: Arc::clone(cell),
+                fired: false,
+            })),
+            Input::Concrete(_) | Input::Pipe(_) => None,
         }
     }
 
     /// Borrow the concrete value via a clone of its cell, or `None` if this is a
-    /// pipe. Used by the concrete-head no-launcher terminals (`wait`/`submit`) to
-    /// recover the owning context from the buffer before running — a pipe-fed op
-    /// has no concrete buffer, so those terminals error clearly. A bound `Slot`
-    /// also has a cell (its value flows the same way).
+    /// pipe or a slot. Used by the concrete-head no-launcher terminals
+    /// (`wait`/`submit`) to recover the owning context from the buffer before
+    /// running — a pipe-fed op has no concrete buffer, so those terminals error
+    /// clearly.
     ///
     /// Returns a [`Cell`] handle (not a borrow) because the value lives behind a
-    /// `Mutex`; callers `.lock()` it to read the buffer. `None` ⇒ pipe-fed.
+    /// `Mutex`; callers `.lock()` it to read the buffer. `None` ⇒ pipe-fed or slot.
+    /// (A slot's tri-state cell isn't a plain `Cell`; slot-headed graphs run through
+    /// the launcher terminals, not the concrete-head `wait`/`submit`.)
     pub fn concrete_cell(&self) -> Option<Cell<T>> {
         match self {
-            Input::Concrete(cell) | Input::Slot { cell, .. } => Some(Arc::clone(cell)),
-            Input::Pipe(_) => None,
+            Input::Concrete(cell) => Some(Arc::clone(cell)),
+            Input::Slot { .. } | Input::Pipe(_) => None,
         }
     }
 
@@ -541,9 +871,14 @@ impl<T> Input<T> {
     /// helpers, which only need to inspect the buffer's handle/byte-len.
     pub fn with_concrete<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
         match self {
-            Input::Concrete(cell) | Input::Slot { cell, .. } => {
-                cell.lock().unwrap().as_ref().map(f)
-            }
+            Input::Concrete(cell) => cell.lock().unwrap().as_ref().map(f),
+            // A slot is readable by-ref only while `Bound`; `Unbound`/`Lent` map
+            // to `None` (the same "no concrete value to inspect" the empty
+            // concrete cell gives).
+            Input::Slot { cell, .. } => match &*cell.lock().unwrap() {
+                SlotState::Bound(v) => Some(f(v)),
+                SlotState::Unbound | SlotState::Lent => None,
+            },
             Input::Pipe(_) => None,
         }
     }
@@ -557,39 +892,80 @@ impl<T> Input<T> {
         }
     }
 
-    /// Try to deposit a [`SlotBinder`]'s value into this input, IFF it is an unbound
-    /// (or rebindable) [`Slot`](Input::Slot) whose `id` matches the binder's tag.
+    /// Apply a [`SlotBinder`]'s binding to this input, IFF it is a [`Slot`](Input::Slot)
+    /// whose `id` matches the binder's tag — running the verb 2×2 against the slot's
+    /// [`SlotState`].
     ///
     /// Used by [`bind_slots`](DeviceOp::bind_slots) as the graph is walked by
-    /// [`bind`](DeviceOpExt::bind). On a match the binder's boxed value is downcast
-    /// back to `T` and **moved** into the slot's cell (overwriting any prior bind —
-    /// a second `bind(Tag(other))` rebinds), then the binder is marked consumed so a
-    /// later same-tag slot in the same walk is left alone (a single buffer is
-    /// single-owner). Non-matching arms / tags are a no-op.
+    /// [`bind`](DeviceOpExt::bind) / [`mutate_bind`](DeviceOpExt::mutate_bind). On a
+    /// matching tag this resolves the state matrix:
+    ///
+    /// | state            | [`Set`](BindMode::Set)             | [`Mutate`](BindMode::Mutate) |
+    /// |------------------|------------------------------------|------------------------------|
+    /// | `Unbound`        | fill → `Bound`                     | fill → `Bound`               |
+    /// | `Bound`, `==`    | no-op (idempotent)                 | overwrite                    |
+    /// | `Bound`, `!=`    | record [`SlotConflict`](Error::SlotConflict) | overwrite          |
+    /// | `Lent`           | record [`SlotCheckedOut`](Error::SlotCheckedOut) | (same)         |
+    ///
+    /// Equality is **buffer-handle identity** ([`SlotEq`], via the binder's captured
+    /// comparator) — "the same buffer object", not byte-equal contents. After
+    /// applying (or rejecting) the binder is marked consumed so a later same-tag slot
+    /// in the same walk is left alone (a single buffer is single-owner). Errors are
+    /// threaded out via [`SlotBinder::outcome`]. Non-matching arms / tags are a
+    /// no-op.
     pub fn try_bind_slot(&self, binder: &mut SlotBinder)
     where
         T: Send + 'static,
     {
-        let Input::Slot { id, cell, .. } = self else {
+        let Input::Slot { id, name, cell } = self else {
             return;
         };
         if *id != binder.id {
             return;
         }
         let Some(boxed) = binder.value.take() else {
-            return; // already consumed by an earlier matching slot in this walk
+            return; // already consumed (or rejected) by an earlier matching slot
         };
-        match boxed.downcast::<T>() {
-            Ok(v) => {
-                // Bind / rebind: MOVE the value into the cell. A prior value (an
-                // earlier `bind`'s buffer) is dropped here.
-                *cell.lock().unwrap() = Some(*v);
+        // Downcast the boxed value back to `T`. Type mismatch is impossible — a
+        // tag's `TypeId` (the matched `id`) pins its `Value` type, and the slot's
+        // `T == Tag::Value`. If it ever fired, put it back so a correctly-typed
+        // slot can still see it rather than silently swallowing the bind.
+        let new = match boxed.downcast::<T>() {
+            Ok(v) => *v,
+            Err(boxed) => {
+                binder.value = Some(boxed);
+                return;
             }
-            // Type mismatch is impossible: a tag's `TypeId` (the matched `id`) pins
-            // its `Value` type at compile time, and the slot's `T == Tag::Value`. If
-            // it ever fired, put the value back so a correctly-typed slot can still
-            // see it rather than silently swallowing the bind.
-            Err(boxed) => binder.value = Some(boxed),
+        };
+
+        let mut guard = cell.lock().unwrap();
+        match &*guard {
+            // Empty / fresh — both verbs fill it.
+            SlotState::Unbound => {
+                *guard = SlotState::Bound(new);
+            }
+            SlotState::Bound(cur) => match binder.mode {
+                BindMode::Set => {
+                    // Idempotent on the SAME buffer object; conflict on a different
+                    // one. Equality is the binder's captured `SlotEq` comparator
+                    // (handle identity), applied to `cur` vs `new` as `&dyn Any`.
+                    if (binder.eq)(cur as &dyn Any, &new as &dyn Any) {
+                        // no-op: the caller re-handed us the buffer we already hold.
+                    } else {
+                        binder.outcome = Err(Error::SlotConflict(name));
+                    }
+                }
+                BindMode::Mutate => {
+                    // Overwrite: the prior buffer drops here.
+                    *guard = SlotState::Bound(new);
+                }
+            },
+            // The buffer is in the caller's hands (a live `Checkout`). Re-binding
+            // would let the Checkout's drop rehome the OLD buffer over the NEW one
+            // — a silent clobber — so BOTH verbs hard-error.
+            SlotState::Lent => {
+                binder.outcome = Err(Error::SlotCheckedOut(name));
+            }
         }
     }
 }
@@ -611,16 +987,17 @@ impl<T> From<Pipe<T>> for Input<T> {
 /// The build-time handle produced by [`slot!`](crate::slot)`(Tag)` — an UNBOUND
 /// typed hole that plugs into the same positions a concrete buffer does (kernel
 /// args, `download`/`fill`/`write`/copy sources, …). It carries the tag's
-/// [`TypeId`] + `type_name` and a fresh empty [`Cell`]; converting it (via
-/// [`From`] / [`ToInput`]) yields an [`Input::Slot`] sharing that cell, which a
-/// later [`bind`](DeviceOpExt::bind)`(Tag(value))` fills.
+/// [`TypeId`] + `type_name` and a fresh [`Unbound`](SlotState::Unbound)
+/// [`SlotCell`]; converting it (via [`From`] / [`ToInput`]) yields an
+/// [`Input::Slot`] sharing that cell, which a later
+/// [`bind`](DeviceOpExt::bind)`(Tag(value))` fills.
 ///
 /// `PhantomData<fn() -> Tg>` keeps the handle `Send`/`Sync` regardless of `Tg`
 /// (the tag type is a pure marker — never stored).
 pub struct SlotHandle<Tg: Tag> {
     id: TypeId,
     name: &'static str,
-    cell: Cell<Tg::Value>,
+    cell: SlotCell<Tg::Value>,
     _tag: PhantomData<fn() -> Tg>,
 }
 
@@ -631,12 +1008,12 @@ impl<Tg: Tag> SlotHandle<Tg> {
         SlotHandle {
             id: TypeId::of::<Tg>(),
             name: type_name::<Tg>(),
-            cell: Arc::new(Mutex::new(None)),
+            cell: Arc::new(Mutex::new(SlotState::Unbound)),
             _tag: PhantomData,
         }
     }
 
-    /// Consume the handle into its [`Input::Slot`] (shares the empty cell).
+    /// Consume the handle into its [`Input::Slot`] (shares the `Unbound` cell).
     fn into_input(self) -> Input<Tg::Value> {
         Input::Slot {
             id: self.id,
@@ -1120,40 +1497,122 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         }
     }
 
-    /// Bind one typed slot of this reusable graph: deposit `tag`'s value into the
-    /// graph's matching [`slot!`](crate::slot) cell. Returns `&self` so binds
-    /// **chain** and the graph is then `sync`'d:
-    /// `g.bind(Buf(b)).bind(W(w)).sync(&ctx)?`.
+    /// **Set-once** bind of one typed slot: deposit `tag`'s value into the graph's
+    /// matching [`slot!`](crate::slot) cell. Returns `Result<&Self>` so binds
+    /// **chain** through `?` and the graph is then `sync`'d:
+    /// `g.bind(Buf(b))?.bind(W(w))?.sync(&ctx)?`.
+    ///
+    /// **The set-once contract.** `bind` is idempotent on an *equal* binding and a
+    /// hard error on a *conflicting* one (the verb 2×2 — see
+    /// [`try_bind_slot`](Input::try_bind_slot)):
+    ///
+    /// - slot [`Unbound`](SlotState::Unbound) → fill it.
+    /// - slot [`Bound`](SlotState::Bound) to the SAME buffer object
+    ///   ([`SlotEq`] handle identity) → no-op (re-handing the buffer you already
+    ///   gave is fine).
+    /// - slot [`Bound`](SlotState::Bound) to a DIFFERENT buffer →
+    ///   [`Error::SlotConflict`]. Use [`mutate_bind`](Self::mutate_bind) to change it.
+    /// - slot [`Lent`](SlotState::Lent) (its buffer is checked out to a live
+    ///   [`Checkout`]) → [`Error::SlotCheckedOut`] (re-binding would clobber the
+    ///   value in the caller's hands).
     ///
     /// **Order-free + curryable + partial.** Each `bind` carries exactly one tag,
-    /// folded independently of the others, so `g.bind(Buf(b)).bind(W(w))` and
-    /// `g.bind(W(w)).bind(Buf(b))` are equivalent, and a subset is allowed —
-    /// completeness (every slot bound) is enforced only at
-    /// [`sync`](Self::sync)/[`wait_on`](Self::wait_on) (runtime), where an unbound
-    /// slot is [`Error::SlotUnbound`]. Binding **MOVES**
-    /// the value into the cell; a second `bind(Tag(other))` rebinds (the previous
-    /// buffer drops). After a run, the run's [`Checkout`] returns the buffer to the
-    /// slot cell on drop (same machinery as a concrete head), so a bound graph is
-    /// re-runnable.
+    /// folded independently, so `g.bind(Buf(b))?.bind(W(w))?` and the reverse are
+    /// equivalent, and a subset is allowed — *completeness* (every slot bound) is
+    /// enforced only at [`sync`](Self::sync)/[`wait_on`](Self::wait_on) (runtime),
+    /// where an unbound slot is [`Error::SlotUnbound`]. After a run, the run's
+    /// [`Checkout`] returns the buffer to the slot cell on drop (same machinery as a
+    /// concrete head), so a bound graph is re-runnable.
     ///
+    /// `Tg::Value: SlotEq` so the idempotency check can compare by buffer handle.
     /// The binding is dispatched via [`bind_slots`](DeviceOp::bind_slots), which
     /// walks the op-tree's [`Input`] fields. Ops that route buffer args through
     /// [`Input`] (kernels, `download`/`fill`/`write`/copy, the bundles) propagate
     /// it; a slot placed in an op that does not yet override `bind_slots` simply
     /// stays unbound (caught at `sync`).
     ///
-    /// TODO(step b→c): `bind` returns `&self`, which serves the `g.bind(...).sync()`
+    /// TODO(step b→c): `bind` returns `&Self`, which serves the `g.bind(...)?.sync()`
     /// path and chained binds. The fully-composable form — a single-output
     /// `g.bind()` usable as a kernel arg / `bundle2(b, g.bind())` nesting (NOTES
     /// "Closure-free graph model", §3) — is deferred to the segment-plan step; it
     /// needs a node that re-exposes the bound graph's output pipe.
-    fn bind<Tg: Tag>(&self, tag: Tg) -> &Self {
-        // Unwrap the tuple-struct binding `Tag(value)` to its value (the wrapper is
-        // a pure move-carrier — only `TypeId::of::<Tg>()` matters for matching),
-        // box it into a `Tg`-keyed binder, and fold it into the graph's slot cells.
-        let mut binder = SlotBinder::new::<Tg>(tag.into_value());
+    fn bind<Tg: Tag>(&self, tag: Tg) -> Result<&Self>
+    where
+        Tg::Value: SlotEq,
+    {
+        self.fold_bind::<Tg>(tag.into_value(), BindMode::Set)
+    }
+
+    /// **Set/change** bind of one typed slot — the mutating sibling of
+    /// [`bind`](Self::bind). Overwrites a [`Bound`](SlotState::Bound) slot (to the
+    /// same OR a different buffer) and fills an [`Unbound`](SlotState::Unbound) one;
+    /// returns `Result<&Self>` so it chains. Unlike `bind`, it does NOT require a
+    /// prior bind and never reports [`SlotConflict`](Error::SlotConflict) — so the
+    /// loop case `for x in xs { g.mutate_bind(Buf(x))?.sync(&ctx)?; }` works without
+    /// peeling the first iteration.
+    ///
+    /// The one case it STILL rejects is [`Lent`](SlotState::Lent) — a slot whose
+    /// buffer is currently checked out — with [`Error::SlotCheckedOut`]: changing a
+    /// value the caller is holding would let the `Checkout`'s drop rehome the old
+    /// buffer over the new (a silent clobber). Drop the `Checkout` (re-arm) or
+    /// `into_inner` it (sever) first.
+    ///
+    /// NOTE (step c/d): `mutate_bind` lands here as "overwrite the slot cell"
+    /// (`Bound → Bound`, or fill if `Unbound`). The `clUpdateMutableCommandsKHR`
+    /// in-place mutable-dispatch routing — reusing the same command buffer and only
+    /// re-pointing the arg — attaches at the **segment-plan** step; it is NOT
+    /// implemented here.
+    fn mutate_bind<Tg: Tag>(&self, tag: Tg) -> Result<&Self>
+    where
+        Tg::Value: SlotEq,
+    {
+        self.fold_bind::<Tg>(tag.into_value(), BindMode::Mutate)
+    }
+
+    /// Shared body of [`bind`](Self::bind) / [`mutate_bind`](Self::mutate_bind):
+    /// unwrap the tuple-struct binding `Tag(value)` to its value (the wrapper is a
+    /// pure move-carrier — only `TypeId::of::<Tg>()` matters for matching), box it
+    /// into a `Tg`-keyed binder in `mode`, fold it into the graph's slot cells, and
+    /// surface the verb-2×2 verdict ([`SlotBinder::outcome`]).
+    fn fold_bind<Tg: Tag>(&self, value: Tg::Value, mode: BindMode) -> Result<&Self>
+    where
+        Tg::Value: SlotEq,
+    {
+        let mut binder = SlotBinder::new::<Tg>(value, mode);
         self.bind_slots(&mut binder);
-        self
+        binder.outcome()?;
+        Ok(self)
+    }
+
+    /// **Fill several slots at once**, turbofish-free, each value self-tagging via
+    /// its tuple struct: `g.call((A(a), B(b), Out(o)))?.sync(&ctx)?`.
+    ///
+    /// Each element folds through the SAME single-slot [`bind`](Self::bind) path, so
+    /// `call` inherits the set-once contract exactly — idempotent on an equal
+    /// binding, [`SlotConflict`](Error::SlotConflict) on a conflicting one,
+    /// [`SlotCheckedOut`](Error::SlotCheckedOut) on a lent one. It is **all-or-nothing
+    /// per element in tuple order**: the first element to error stops the fold and
+    /// returns that error (any earlier elements have already been deposited — same
+    /// as the equivalent `?`-chained `bind`s). Tuple ORDER does not matter for
+    /// success (each binds its own tag). Implemented for tuples of [`Tag`]s, arity
+    /// 1..=8, via [`BindAll`].
+    fn call<Tags: BindAll>(&self, tags: Tags) -> Result<&Self> {
+        tags.bind_all(self)?;
+        Ok(self)
+    }
+
+    /// **Mutate several slots at once** — the mutating sibling of [`call`](Self::call).
+    /// Each element folds through the [`mutate_bind`](Self::mutate_bind) path, so it
+    /// inherits the set/change semantics (overwrite or fill; still
+    /// [`SlotCheckedOut`](Error::SlotCheckedOut) on a lent slot). All-or-nothing per
+    /// element in tuple order; order-free for success. See [`BindAll`].
+    ///
+    /// NOTE (step c/d): like [`mutate_bind`](Self::mutate_bind), the in-place
+    /// mutable-dispatch (`clUpdateMutableCommandsKHR`) routing attaches at the
+    /// segment-plan step and is not implemented here.
+    fn mutate_call<Tags: BindAll>(&self, tags: Tags) -> Result<&Self> {
+        tags.mutate_all(self)?;
+        Ok(self)
     }
 
     /// Run `self` to completion on `launcher`'s queue and hand back a
@@ -1399,6 +1858,61 @@ pub trait DeviceOpExt: DeviceOp + Sized {
 }
 impl<T: DeviceOp> DeviceOpExt for T {}
 
+// ── BindAll: fill a tuple of slots in one call (`g.call((A(a), B(b)))`) ──────
+
+/// A tuple of [`Tag`]s bindable in one [`call`](DeviceOpExt::call) /
+/// [`mutate_call`](DeviceOpExt::mutate_call). Each element self-tags via its tuple
+/// struct (`A(a)`, `B(b)`, …) — turbofish-free — and folds through the SAME
+/// single-slot [`bind`](DeviceOpExt::bind) / [`mutate_bind`](DeviceOpExt::mutate_bind)
+/// path, so the multi-fill inherits the verb 2×2 (set-once / set-change, conflict,
+/// checked-out) element-by-element.
+///
+/// **All-or-nothing in tuple order.** `bind_all` stops at the first element that
+/// errors and returns that error (earlier elements are already deposited — exactly
+/// the equivalent `?`-chained binds). Order does not matter for *success*: every
+/// element binds its own tag independently. Implemented for tuples of arity 1..=8
+/// (mirroring [`KernelArgs`](crate::KernelArgs)).
+pub trait BindAll {
+    /// Fold each element through [`bind`](DeviceOpExt::bind) (set-once).
+    fn bind_all<Op: DeviceOp>(self, g: &Op) -> Result<()>;
+    /// Fold each element through [`mutate_bind`](DeviceOpExt::mutate_bind) (set/change).
+    fn mutate_all<Op: DeviceOp>(self, g: &Op) -> Result<()>;
+}
+
+/// Implement [`BindAll`] for one tuple arity. Each element is a `Tag` whose `Value`
+/// is `SlotEq` (the buffer-handle equality the set-once leg needs).
+macro_rules! impl_bind_all_tuple {
+    ($($name:ident),+ $(,)?) => {
+        impl<$($name),+> BindAll for ($($name,)+)
+        where
+            $( $name: Tag, $name::Value: SlotEq, )+
+        {
+            #[allow(non_snake_case)]
+            fn bind_all<Op: DeviceOp>(self, g: &Op) -> Result<()> {
+                let ($($name,)+) = self;
+                // `?` gives all-or-nothing-in-order: first conflict / checked-out
+                // stops the fold. `fold_bind` is the shared single-slot path.
+                $( g.fold_bind::<$name>($name.into_value(), BindMode::Set)?; )+
+                Ok(())
+            }
+            #[allow(non_snake_case)]
+            fn mutate_all<Op: DeviceOp>(self, g: &Op) -> Result<()> {
+                let ($($name,)+) = self;
+                $( g.fold_bind::<$name>($name.into_value(), BindMode::Mutate)?; )+
+                Ok(())
+            }
+        }
+    };
+}
+impl_bind_all_tuple!(A);
+impl_bind_all_tuple!(A, B);
+impl_bind_all_tuple!(A, B, C);
+impl_bind_all_tuple!(A, B, C, D);
+impl_bind_all_tuple!(A, B, C, D, E);
+impl_bind_all_tuple!(A, B, C, D, E, F);
+impl_bind_all_tuple!(A, B, C, D, E, F, G);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H);
+
 // ── Checkout: runtime guard over one run's output ───────────────────────
 
 /// A runtime guard over the output of one reusable-graph run, returned by
@@ -1465,8 +1979,13 @@ impl<O: Send> Checkout<O> {
     /// input next run. Use when you want to keep the buffer rather than hand it
     /// back to `g`.
     pub fn into_inner(mut self) -> O {
-        // Drop the home WITHOUT returning (sever); take the value out.
-        self.home = None;
+        // Sever the home (does NOT deposit the value): a concrete cell stays
+        // empty (no-op), a SLOT cell transitions `Lent → Unbound` so a later
+        // `bind` sees a genuinely-empty slot rather than a stuck `Lent`
+        // (`Error::SlotCheckedOut`). Then take the value out for the caller.
+        if let Some(home) = self.home.take() {
+            home.sever();
+        }
         self.value
             .take()
             .expect("Checkout::into_inner after value already taken — internal bug")
@@ -4816,6 +5335,16 @@ where
         // thread it as the output's return home (re-arming `g` on Checkout drop).
         // A pipe-fed input has no concrete cell → `None` (its producer re-mints
         // the value each run; propagating a retyped pipe home is a later step).
+        // Concrete cells route through `CopyHome` (identity, or the Uninit→Init
+        // downgrade). NOTE: a slot used DIRECTLY as a copy src/dst does not yet
+        // thread its tri-state `SlotHome` here — the copy output type
+        // (`CopyOutputs::Src/Dst`) differs from the slot's input type, so a
+        // `SlotHome<Src>` would need the same input→output type bridge `CopyHome`
+        // gives concrete cells (`slot_home` exists for that follow-up). Slots are
+        // kernel-arg-positioned in practice (the tested site); a copy-positioned
+        // slot stays `Lent` after one run (caught loudly as graph-busy on
+        // re-`sync`, never silently). Routing it lands alongside the segment-plan
+        // step.
         let src_home = self
             .src
             .return_cell()

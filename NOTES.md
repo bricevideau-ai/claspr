@@ -266,6 +266,32 @@ that one golden wasn't re-blessed at promotion, so it fails on `main`/`origin/ma
 too (CI would catch it). Re-blessed on this branch; **main needs the same one-line
 bless** (track separately).
 
+#### step (b) follow-up — slot-binding verb 2×2 (branch `typed-slots`, UNCOMMITTED)
+Replaced the slot's `Cell<T>=Option` with **tri-state** `SlotState<T> {Unbound,
+Bound(T), Lent}` (`Input::Slot.cell: SlotCell<T>=Arc<Mutex<SlotState>>`; Concrete
+arm unchanged). Distinguishes never-bound from checked-out → enables the matrix.
+Transitions: lend `Bound→Lent` (`lend_slot`), Checkout-drop `Lent→Bound`
+(`SlotHome::rehome`), `into_inner` `Lent→Unbound` (`Rehome::sever`, new trait
+method, no-op on `Cell`), **dropped-unfired `Lent→Unbound`** (`SlotHome: Drop` w/
+`fired` flag — covers download-CONSUMED slots, else stuck Lent forever; this was
+the subtle bug). VERBS now return `Result<&Self>`: `bind` set-once (idempotent on
+==, `SlotConflict` on ≠), `mutate_bind` set/change (fills unbound, no
+SlotConflict), both `SlotCheckedOut` on Lent. `call((A(a),B(b),..))` /
+`mutate_call` = multi-fill via `BindAll` tuple trait arity 1..=8 (folds each thru
+the single-slot path, all-or-nothing in tuple order). Equality = **cl_mem/SVM
+handle identity** via new `SlotEq` trait (buffer families + `Arc<DeviceSlice>`),
+bound on `Tg::Value`; comparator captured into `SlotBinder` as type-erased
+`SlotEqFn` (try_bind_slot is generic, no SlotEq bound). Errors threaded out of the
+fold via `SlotBinder::outcome()` (binder gained `mode: BindMode`, `eq`, `outcome`).
+New errors `SlotConflict`/`SlotCheckedOut(&'static str)`. graph_slots.rs rewritten
+10/10 (matrix incl checked-out + sever); regress graph_reuse/copy_reuse_flaw/
+eager_chain/eager_buffer_ops green; build+clippy(-D)+doc(-D)+fmt clean on pocl.
+**NOT routed**: slot used DIRECTLY as copy src/dst (output type ≠ input type; needs
+CopyHome-style bridge — `Input::slot_home` exists for it) → stays Lent after 1 run,
+loud busy on re-sync. `mutate_*` is just cell-overwrite; clUpdateMutableCommandsKHR
+in-place dispatch is step c/d (segment-plan). bind still returns `&Self` (composable
+node deferred, same as step b).
+
 ### ✅ PROMOTED TO MAIN 2026-06-24: eager struct-graph cutover (72 commits)
 
 `eager-cutover` fast-forwarded onto `main` at `6d76fe2` (linear history, no merge

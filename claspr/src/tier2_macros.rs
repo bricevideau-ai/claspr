@@ -304,7 +304,7 @@ macro_rules! slots {
 /// ```ignore
 /// slots! { Buf: DeviceSlice<u32> }
 /// let g = ks.scale([N], slot!(Buf), 2u32).and_then(download);
-/// let out = g.bind(Buf(b)).sync(&ctx)?;   // bind, then run; re-runnable
+/// let out = g.bind(Buf(b))?.sync(&ctx)?;  // bind, then run; re-runnable
 /// ```
 ///
 /// Expands to [`SlotHandle::<Tag>::new()`](crate::SlotHandle::new) — a fresh empty
