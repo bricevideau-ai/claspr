@@ -1,6 +1,6 @@
-//! Home-on-payload invariant — RED spec for the reusable-graph engine fix.
+//! Home-on-payload invariant — the test catalog that locks it in.
 //!
-//! THE INVARIANT being specified here (most of it NOT yet implemented):
+//! THE INVARIANT pinned down here:
 //!
 //! > A buffer with a home is never destroyed by the graph; it is *returned*
 //! > ("rehomed") to its origin cell so the graph re-runs with a STABLE
@@ -9,30 +9,23 @@
 //!
 //! Consequences each test below pins down:
 //! - A consuming terminal (`download`) reads the device buffer into a host
-//!   `Vec` but must RETURN the device buffer to its home (NOT release it). On
-//!   replay the same `cl_mem` handle is reused. (TODAY `Download::execute` uses
-//!   `resolve` — discarding the home — then drops `buf`, releasing the cl_mem.
-//!   See `eager.rs:3452`. THE bug.)
+//!   `Vec` but RETURNS the device buffer to its home (NOT release it). On
+//!   replay the same `cl_mem` handle is reused.
 //! - `upload()`-minted buffers also acquire a persistent home (stable handle
 //!   across runs). Reseed-by-access-mode: ReadOnly/Frozen seed once (upload
 //!   skipped on replay), WriteOnly never seeds, ReadWrite re-seeds the SAME
-//!   data each run into the SAME handle. (TODAY `Upload::execute`,
-//!   `eager.rs:3401`, mints a FRESH `from_slice` buffer each run → new handle,
-//!   no home.)
+//!   data each run into the SAME handle.
 //! - `into_inner()` (user keeps the value) is the ONLY path that empties /
 //!   severs a cell. For a SLOT it lands in `Severed` (not virgin `Unbound`): a
 //!   later set-once `bind` is `SlotSevered` and only `mutate_bind` re-arms it.
 //! - A homed buffer dropped mid-graph (produced, never delivered) returns to
 //!   the graph.
 //!
-//! Scenarios that FAIL today are marked `#[ignore = "RED: <reason>"]`; the
-//! ignored set IS the spec the implementer must turn on. Scenarios that pass
-//! today are left active (green regression). Each asserts BOTH data correctness
-//! AND the handle invariant.
+//! Each scenario asserts BOTH data correctness AND the handle invariant.
 //!
 //! Handle identity is read via the public `RecordableBuffer::record_handle()`
 //! (re-exported from the crate root) — `BufHandle.mem` is a `MemRef::Buffer(cl_mem)`
-//! whose raw pointer is the stable identity key. No new accessor was needed.
+//! whose raw pointer is the stable identity key.
 
 use claspr::eager::{DeviceOpExt, download, eager_copy_to, upload, upload_as};
 use claspr::image::format::R32Uint;
@@ -81,15 +74,12 @@ slots! {
 
 // ───────────────────────────────────────────────────────────────────────────
 // 1. upload(ReadOnly) → kernel → download, ×3.
-//    Invariant: handle stable across runs; data correct each run; (future)
-//    upload work skipped after run 1.
+//    Invariant: handle stable across runs; data correct each run; upload work
+//    skipped after run 1.
 //    A ReadOnly buffer can only be a kernel READ operand (it isn't
 //    `KernelWritable`), so the kernel here is `add_u32(ro, ro, out)` — the
 //    ReadOnly upload buffer is the seed-once operand whose handle we pin; `out`
 //    holds 3+3 = 6.
-//    RED: upload mints a fresh `from_slice` buffer each run (new handle, no
-//    home, eager.rs:3401), so the ReadOnly operand's handle is NOT stable across
-//    runs; seed-skip-on-replay is not implemented.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
 fn upload_readonly_kernel_download_x3_stable_handle() {
@@ -137,9 +127,6 @@ fn upload_readonly_kernel_download_x3_stable_handle() {
 // 2. user-alloc → scale (in place) → download, ×3.
 //    Invariant: buffer rehomed, handle stable, data idempotent (same result
 //    each run, NOT compounding).
-//    RED: download releases the buffer (no home returned), so run 2 finds the
-//    concrete cell empty → "graph busy". And the handle can't be stable because
-//    the buffer is gone after run 1.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
 fn user_alloc_scale_download_x3_rehomed_stable() {
@@ -173,7 +160,6 @@ fn user_alloc_scale_download_x3_rehomed_stable() {
 // 3. upload(ReadWrite) → scale → download, ×3.
 //    Invariant: handle stable, contents RE-SEEDED each run (result identical
 //    each run — proves reset, no compounding).
-//    RED: upload mints a fresh buffer each run (new handle); download releases.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
 fn upload_readwrite_scale_download_x3_reseed_stable() {
@@ -234,12 +220,10 @@ fn upload_readwrite_scale_download_x3_reseed_stable() {
 //    so the only thing the reusable graph must guarantee is a stable rehomed
 //    handle across replays.
 //
-//    This was RED("no-API, DEFERRED") while image kernels were one-shot/consuming
-//    (not reusable `DeviceOp`s). With image args now riding the same
-//    `Input`/cell/`Checkout` lend-and-return path as slice args, the write-only
-//    image kernel Op IS a reusable `DeviceOp`: the allocated-once image is lent
-//    from its concrete cell each run and rehomed on the run's `Checkout` drop,
-//    keeping a stable `cl_mem`.
+//    Image args ride the same `Input`/cell/`Checkout` lend-and-return path as
+//    slice args, so the write-only image kernel Op is a reusable `DeviceOp`: the
+//    allocated-once image is lent from its concrete cell each run and rehomed on
+//    the run's `Checkout` drop, keeping a stable `cl_mem`.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
 fn upload_writeonly_kernel_download_x3_stable() {
@@ -294,8 +278,6 @@ fn upload_writeonly_kernel_download_x3_stable() {
 // 5. user-alloc → download directly, ×2.
 //    Invariant: after run 1 the buffer is rehomed (same handle), run 2 works
 //    without a fresh alloc.
-//    RED: download discards the home (eager.rs:3452) → run 2 finds the cell
-//    empty → "graph busy".
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
 fn user_alloc_download_directly_x2_rehomed() {
@@ -322,19 +304,8 @@ fn user_alloc_download_directly_x2_rehomed() {
 
 // ───────────────────────────────────────────────────────────────────────────
 // 6. copy with slot src AND slot dst, ×2.
-//    Invariant: both rehome (handles stable) — the copy-slot gap.
-//
-//    RED(no-API) + RED(engine): two layers.
-//    - no-API: `eager_copy_to(slot!(Src), slot!(Dst))` does not type-check — a
-//      `slot!` is a `SlotHandle<Tag>`, which is not `CopyTo<_>` (only the buffer
-//      families are, copy.rs). A slot can only sit in a KERNEL-arg position today,
-//      not a copy operand position. The intended shape is written below but
-//      neutralized so the file compiles.
-//    - engine: even once a slot is accepted as a copy operand, `CopyTo2::execute`
-//      (eager.rs:5348) only threads homes for CONCRETE src/dst (via
-//      `return_cell` + `CopyHome`); a slot's `return_cell()` is `None`, so its
-//      `SlotHome` is never threaded (eager.rs:5339-5347 comment) → the slot stays
-//      `Lent` after run 1 → second sync is graph-busy. This is THE copy-slot gap.
+//    Invariant: both operands are SLOTS; both rehome (handles stable) across the
+//    two runs.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
 fn copy_slot_src_and_slot_dst_x2_both_rehome() {
@@ -572,13 +543,11 @@ fn homed_buffer_dropped_mid_graph_rearms_same_handle() {
 //       - src is re-armed (same handle) across that re-sync — it was untouched by
 //         the dst sever.
 //
-//     This replaces the previously-ignored CONCRETE-dst form. With a concrete
-//     copy dst, a severed cell goes empty and a bare `Cell` can't tell "severed
-//     (→ re-alloc)" from "lent / busy (→ error)" — the reason it was deferred.
-//     Routing the dst through a `slot!` gives exactly that disambiguation (the
-//     `Severed` state), and the just-landed `eager_copy_to(src, slot!(Dst))`
-//     copy-slot path (commits 3e0b4af / a298392) threads its `SlotHome`, so the
-//     scenario is now expressible and PASSES — hence un-ignored.
+//     Why the dst is routed through a `slot!`: with a concrete copy dst, a
+//     severed cell goes empty and a bare `Cell` can't tell "severed (→ re-alloc)"
+//     from "lent / busy (→ error)". Routing the dst through a `slot!` gives
+//     exactly that disambiguation (the `Severed` state), and the
+//     `eager_copy_to(src, slot!(Dst))` copy-slot path threads its `SlotHome`.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
 fn multi_output_copy_independence() {
