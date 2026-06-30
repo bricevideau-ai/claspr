@@ -9,6 +9,26 @@ items resolve.
 
 ## Active
 
+### ✅ Two slot-binding bugs fixed — 2026-06-30 (branch `typed-slots`, UNCOMMITTED, staged)
+
+- **Bug 1 (bundle branches dropped slot binds):** `Bundle*` inherited the no-op
+  default `bind_slots`, so a `slot!` inside a bundle branch was never reached →
+  `SlotUnbound` at sync. FIX: `impl_eager_bundle!` now overrides `bind_slots` to
+  recurse into EVERY branch (mirrors `AndThen::bind_slots` fan-out discipline:
+  move-only stops on consume, fan-out fills all).
+- **Bug 2 (zero-match bind silently succeeded):** a `bind`/`call` of a tag that
+  matches NO cell now hard-errors `Error::SlotNoSuchTag` (new variant). Rule is
+  AT-LEAST-ONE. `SlotBinder.matched` counts every cell whose `id` matches (in
+  both `try_bind_slot` impls, before the consumed-guard), incl. idempotent-no-op /
+  conflict / sever (the tag IS present); `fold_bind` raises NoSuchTag iff outcome
+  Ok && matched==0. `call`/`mutate_call` get it free (per-element `fold_bind`).
+- Simplified tests 7+8 (`shared_launch_slot_fans_out`, `shared_arc_buffer_fans_out`)
+  from the nested-and_then + `bundle2(forward,forward)` workaround to natural
+  `bundle2(siteA, siteB)` (test 8 branches `.and_then(|(_,_,out)| forward(out))`
+  to stay single-output). +3 regressions: `slot_in_bundle_branch_is_bound`,
+  `bind_absent_tag_errors`, `fan_out_across_bundle_branches`. slot_generalization
+  12/12; full tier2 + tier1 green except the 2 baseline image_dispatch pocl fails.
+
 ### ✅ Slot generalization: scalar + launch + shared slots — 2026-06-30 (branch `typed-slots`, UNCOMMITTED)
 
 `slot!(Tag)` now fills THREE new positions beyond buffer/image kernel args:

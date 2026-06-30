@@ -50,6 +50,9 @@ slots! {
     OutB: DeviceSlice<u32>,
     // A move-only single-site buffer slot (regression — must NOT require Clone).
     MoveOnly: DeviceSlice<u32>,
+    // Zero-match `bind` regression: a tag the graph DOES use vs one it does NOT.
+    Present: u32,
+    Absent: u32,
 }
 
 /// Extract the [`Error`] from a `bind`/`mutate_bind` result, asserting it failed.
@@ -337,19 +340,19 @@ fn shared_scalar_slot_fans_out() {
 /// `bind(Grid(g))` sets BOTH; both dispatch at the bound extent — and we surface
 /// BOTH sites' output buffers from the SINGLE fanned graph and assert each.
 ///
-/// The composition is two NESTED `and_then`s ending on a `bundle2` of `forward`s,
-/// rather than `and_then(|_a| siteB)` (which discards site A's buffer and only
-/// returns B). The reason is a hard constraint: `bind_slots` recurses through the
-/// `AndThen` spine (source then next — see `AndThen::bind_slots`) but a `bundle`'s
-/// `bind_slots` is the default NO-OP (the macro-generated `Bundle*` impl never
-/// overrides it). So a `slot!(Grid)` placed *inside* a bundle branch is never
-/// reached by `bind` → `SlotUnbound` at sync. Both dispatch sites must therefore
-/// stay on the AndThen spine (one as the outer source, one as the inner source);
-/// only their already-CONCRETE output pipes — no slots left — are joined by the
-/// terminal `bundle2(forward(a), forward(b))`, which carries both buffers out.
+/// The composition is the NATURAL `bundle2(siteA, siteB)` — the two dispatch
+/// sites are the bundle's two branches directly, slots and all. This relies on
+/// `Bundle*::bind_slots` recursing into EVERY branch (mirroring
+/// `AndThen::bind_slots`): a `slot!(Grid)` placed *inside* a bundle branch IS now
+/// reached by `bind`, so one fan-out `bind(Grid(..))` fills both branches' grid
+/// cells. (Before that fix the bundle inherited the no-op default `bind_slots`,
+/// the slots stayed unbound, and `sync` errored `SlotUnbound` — which is exactly
+/// what `slot_in_bundle_branch_is_bound` below now regression-guards.) The
+/// bundle's `gather_checkouts` surfaces both branches' buffers as a
+/// `(Checkout, Checkout)` tuple directly.
 #[test]
 fn shared_launch_slot_fans_out() {
-    use claspr::eager::{bundle2, forward};
+    use claspr::eager::bundle2;
 
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
@@ -357,16 +360,14 @@ fn shared_launch_slot_fans_out() {
     const SENTINEL: u32 = 0xDEAD_BEEF;
     let half = N / 2;
 
-    // Two dispatch sites sharing ONE grid slot, both on the `and_then` spine so
-    // the fan-out binder reaches both. The inner closure captures site A's output
-    // pipe (`a`) and joins it with site B's via `bundle2(forward(a), forward(b))`,
-    // so the SINGLE terminal yields BOTH buffers as a `(Checkout, Checkout)` tuple.
-    let g = ks
-        .global_id_u32(slot!(Grid), slot!(BufA))
-        .and_then(move |a| {
-            ks.global_id_u32(slot!(Grid), slot!(BufB))
-                .and_then(move |b| bundle2(forward(a), forward(b)))
-        });
+    // Two dispatch sites sharing ONE grid slot, as the two branches of a bundle.
+    // The fan-out binder reaches both branches (Bundle::bind_slots recurses), so
+    // one `bind(Grid(..))` fills both sites; the bundle terminal yields BOTH
+    // buffers as a `(Checkout, Checkout)` tuple.
+    let g = bundle2(
+        ks.global_id_u32(slot!(Grid), slot!(BufA)),
+        ks.global_id_u32(slot!(Grid), slot!(BufB)),
+    );
 
     // ONE bind of Grid fills BOTH sites at [N/2]; the bundle delivers both outputs.
     let (a_co, b_co) = g
@@ -420,10 +421,13 @@ fn shared_launch_slot_fans_out() {
 /// and we surface BOTH sites' out buffers from the SINGLE fanned graph and assert
 /// each == 12, so each site provably saw BOTH shared operands.
 ///
-/// Same spine constraint as the launch test (7): `bind_slots` recurses the
-/// `AndThen` spine but NOT into bundle branches, so both `add` sites stay on the
-/// spine (outer source, inner source) and only their concrete out pipes are joined
-/// by the terminal `bundle2(forward(out_a), forward(out_b))`.
+/// Composition is the NATURAL `bundle2(siteA, siteB)` now that
+/// `Bundle*::bind_slots` recurses into every branch (like test 7). `add_u32` is
+/// multi-output (`(a, b, out)`), so each branch ends on `.and_then(|(_, _, out)|
+/// forward(out))` to project just its out buffer — keeping each branch
+/// single-output so the bundle's Checkouts are a clean `(Checkout, Checkout)` over
+/// the two out buffers. The shared-operand `slot!`s live *inside* the bundle
+/// branches; the fan-out binder reaches them through the bundle recursion.
 #[test]
 fn shared_arc_buffer_fans_out() {
     use claspr::eager::{bundle2, forward};
@@ -435,19 +439,17 @@ fn shared_arc_buffer_fans_out() {
     // Two `add` sites, each reading the SAME two Arc operands (Shared=7, SharedB=5)
     // and writing its own out buffer. `add_u32`'s two read operands accept
     // `Arc<DeviceSlice>`, so both operand slots are clone-able → one bind each fans
-    // out across both sites. Both sites are on the `and_then` spine so the fan-out
-    // binder reaches both; the inner closure captures site A's out pipe (`oa`, the
-    // `.2` of its `(a, b, out)` handle) and joins it with site B's via
-    // `bundle2(forward(oa), forward(ob))` so the SINGLE terminal yields BOTH outs.
+    // out across both branches. Each branch projects its out via `forward` so the
+    // bundle delivers both outs as a `(Checkout, Checkout)` tuple.
     let shared = Arc::new(seeded(&ctx, 7));
     let shared_b = Arc::new(seeded(&ctx, 5));
 
-    let g = ks
-        .add_u32([N], slot!(Shared), slot!(SharedB), slot!(OutA))
-        .and_then(move |(_a, _b, oa)| {
-            ks.add_u32([N], slot!(Shared), slot!(SharedB), slot!(OutB))
-                .and_then(move |(_a2, _b2, ob)| bundle2(forward(oa), forward(ob)))
-        });
+    let g = bundle2(
+        ks.add_u32([N], slot!(Shared), slot!(SharedB), slot!(OutA))
+            .and_then(|(_a, _b, oa)| forward(oa)),
+        ks.add_u32([N], slot!(Shared), slot!(SharedB), slot!(OutB))
+            .and_then(|(_a, _b, ob)| forward(ob)),
+    );
 
     // ONE bind of each Arc operand fills BOTH add sites (Arc::clone fan-out); the
     // bundle delivers both outs as a `(Checkout, Checkout)` tuple.
@@ -514,5 +516,117 @@ fn move_only_single_site_buffer_slot_unchanged() {
         r2.iter().all(|&v| v == 16),
         "in-place move-only slot compounds 4 -> 8 -> 16, got {:?}",
         &r2[..8]
+    );
+}
+
+// ── (D) Bundle branches carry slots (Bug 1) + zero-match bind errors (Bug 2) ──
+
+/// (10) **Regression: a `slot!` inside a `bundle2` branch IS bound.** This is the
+/// direct Bug-1 guard: before `Bundle*::bind_slots` recursed into its branches, a
+/// `slot!(Buf)` / `slot!(Factor)` placed inside a bundle branch was unreachable by
+/// `bind` (the bundle inherited the no-op default), so this graph would error
+/// `SlotUnbound` at `sync`. With the fix one `bind` of each tag reaches into the
+/// branch and the graph runs correctly. Branch B is a trivial second branch so the
+/// bundle is a *real* bundle (≥2 branches) while branch A holds the slots.
+#[test]
+fn slot_in_bundle_branch_is_bound() {
+    use claspr::eager::bundle2;
+
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // Branch A: scale a slot buffer by a slot factor. Branch B: an independent
+    // global_id write (its own concrete buffer, no slots) so the bundle has two
+    // real branches and A's slots live strictly *inside* a bundle branch.
+    let g = bundle2(
+        ks.scale_u32([N], slot!(Buf), slot!(Factor)),
+        ks.global_id_u32([N], seeded(&ctx, 0)),
+    );
+
+    // One bind of each tag must reach INTO branch A through the bundle.
+    let (a_co, _b_co) = g
+        .bind(Buf(seeded(&ctx, 3)))
+        .expect("bind Buf reaches into the bundle branch")
+        .bind(Factor(4u32))
+        .expect("bind Factor reaches into the bundle branch")
+        .sync(&ctx)
+        .expect("bundle-branch slots all bound → sync runs (would SlotUnbound before the fix)");
+
+    let mut ra = vec![0u32; N];
+    a_co.read(&mut ra).wait().expect("read A");
+    assert!(
+        ra.iter().all(|&v| v == 12),
+        "branch-A slots bound through the bundle: 3 * 4 = 12, got {:?}",
+        &ra[..8]
+    );
+}
+
+/// (11) **Regression: a `bind` of a tag matching ZERO cells is a hard error.**
+/// The graph uses only `slot!(Present)`; `bind(Absent(..))` matches no cell, so —
+/// per the AT-LEAST-ONE rule — it returns `Error::SlotNoSuchTag` naming `Absent`
+/// (rather than silently succeeding and only surfacing as `SlotUnbound` at sync).
+/// `bind(Present(..))` still succeeds (it matches its one cell).
+#[test]
+fn bind_absent_tag_errors() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // A graph whose ONLY scalar slot is `Present` (the buffer is concrete).
+    let g = ks.scale_u32([N], seeded(&ctx, 1), slot!(Present));
+
+    // Binding a tag the graph never uses → SlotNoSuchTag naming Absent.
+    let err = bind_err(
+        g.bind(Absent(7u32)),
+        "binding a tag absent from the graph must hard-error",
+    );
+    assert!(
+        matches!(err, Error::SlotNoSuchTag(n) if n.contains("Absent")),
+        "expected SlotNoSuchTag naming Absent, got {err:?}"
+    );
+
+    // The tag that IS present still binds cleanly.
+    g.bind(Present(2u32))
+        .expect("binding the present tag still succeeds");
+}
+
+/// (12) **Fan-out across two bundle branches, one bind.** The SAME `slot!(K)`
+/// appears in BOTH `bundle2` branches; one `bind(K(v))` (a clone-able scalar →
+/// fan-out) fills both — proving the bundle recursion visits EVERY branch, not
+/// just the first. Each branch scales its own seeded buffer by K; both outputs
+/// reflect the single bound K.
+#[test]
+fn fan_out_across_bundle_branches() {
+    use claspr::eager::bundle2;
+
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // Both branches read slot!(K); each has its own concrete buffer seeded
+    // differently (5 and 6) so the two outputs are distinct yet both ×K.
+    let g = bundle2(
+        ks.scale_u32([N], seeded(&ctx, 5), slot!(K)),
+        ks.scale_u32([N], seeded(&ctx, 6), slot!(K)),
+    );
+
+    // ONE bind of K must fan out into BOTH branches (no early stop at branch 1).
+    let (a_co, b_co) = g
+        .bind(K(3u32))
+        .expect("one bind of a fan-out scalar fills K in BOTH bundle branches")
+        .sync(&ctx)
+        .expect("both branches' K bound → sync runs");
+
+    let mut ra = vec![0u32; N];
+    let mut rb = vec![0u32; N];
+    a_co.read(&mut ra).wait().expect("read A");
+    b_co.read(&mut rb).wait().expect("read B");
+    assert!(
+        ra.iter().all(|&v| v == 15),
+        "branch A: 5 * 3 = 15 (got K from the single fan-out bind), got {:?}",
+        &ra[..8]
+    );
+    assert!(
+        rb.iter().all(|&v| v == 18),
+        "branch B: 6 * 3 = 18 (got the SAME K from the single bind), got {:?}",
+        &rb[..8]
     );
 }

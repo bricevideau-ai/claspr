@@ -86,6 +86,15 @@ pub enum Error {
     /// buffer. (Contrast [`SlotUnbound`](Error::SlotUnbound), the virgin /
     /// never-bound case, which `bind` DOES fill.)
     SlotSevered(&'static str),
+    /// A `g.bind(Tag(value))` / `g.mutate_bind` / `g.call(..)` targeted a tag that
+    /// matches **no slot at all** in this graph — a typo'd tag, or a tag that
+    /// belongs to a different graph. The bind matched zero cells; rather than
+    /// silently succeed (and surface — if at all — only as a later
+    /// [`SlotUnbound`](Error::SlotUnbound) at `sync`), it is a hard error at the
+    /// `bind` site. The string is the tag's `type_name`. The rule is AT-LEAST-ONE:
+    /// a fan-out tag (one tag at many sites) legitimately matches N≥1 cells, so
+    /// only ZERO matches is the error.
+    SlotNoSuchTag(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -127,6 +136,11 @@ impl fmt::Display for Error {
                 f,
                 "eager graph: slot `{tag}` was severed (its value was taken via \
                  into_inner); use `mutate_bind` to re-arm it with a new buffer"
+            ),
+            Error::SlotNoSuchTag(tag) => write!(
+                f,
+                "no slot for tag `{tag}` exists in this graph (typo, or the tag is \
+                 not used here)"
             ),
         }
     }

@@ -499,6 +499,18 @@ pub struct SlotBinder {
     /// The verdict of applying this binder, threaded out of the type-erased fold.
     /// `Ok(())` until a matching slot records a conflict / checked-out error.
     outcome: Result<()>,
+    /// How many cells with this tag's `id` the walk encountered — the "is this tag
+    /// PRESENT in the graph?" counter. Incremented by both
+    /// [`try_bind_slot`](Input::try_bind_slot) impls whenever a cell's `id` matches
+    /// the binder's, REGARDLESS of the per-state outcome (fill, idempotent no-op,
+    /// conflict, sever-reject, or a same-tag cell visited after a move-only binder
+    /// was already consumed). A zero count after the fold therefore means "no such
+    /// tag here" — a typo'd / unused tag — which [`fold_bind`](DeviceOpExt::fold_bind)
+    /// turns into [`Error::SlotNoSuchTag`] (the AT-LEAST-ONE rule; fan-out
+    /// legitimately matches N>=1 sites, so only zero is the error). A
+    /// conflict/sever still produces its own error via [`outcome`](Self::outcome),
+    /// so counting those as matches never masks them.
+    matched: usize,
 }
 
 impl SlotBinder {
@@ -537,6 +549,7 @@ impl SlotBinder {
                     .and_then(|val| <Tg::Value as SlotValue>::fill_clone(val))
             }),
             outcome: Ok(()),
+            matched: 0,
         }
     }
 
@@ -584,6 +597,15 @@ impl SlotBinder {
             // No other error is ever recorded into a binder.
             Err(_) => unreachable!("SlotBinder only records slot-bind errors"),
         }
+    }
+
+    /// How many cells carrying this binder's tag the fold encountered (see
+    /// [`matched`](Self::matched)). Zero ⇒ the tag is not present in this graph;
+    /// [`fold_bind`](DeviceOpExt::fold_bind) maps that to
+    /// [`Error::SlotNoSuchTag`]. Any positive count satisfies the AT-LEAST-ONE
+    /// rule (a fan-out tag legitimately matches every site it appears at).
+    pub fn matched(&self) -> usize {
+        self.matched
     }
 }
 
@@ -1253,6 +1275,13 @@ impl<T> Input<T> {
         if *id != binder.id {
             return;
         }
+        // The tag IS present at this site — record a match regardless of what the
+        // per-state arm below does (fill / idempotent no-op / conflict / sever /
+        // a same-tag cell reached after a move-only binder was already consumed).
+        // This is the "tag exists in the graph" counter that `fold_bind` reads to
+        // turn a ZERO-match `bind` into `SlotNoSuchTag`; a conflict/sever still
+        // surfaces via `binder.outcome`, so counting it here cannot mask it.
+        binder.matched += 1;
         // A move-only binder is consumed after its single value lands; bail. A
         // fan-out binder never sets `value = None`, so it keeps filling cells.
         if binder.value.is_none() {
@@ -1438,6 +1467,10 @@ impl<V: Send + 'static> ScalarInput<V> {
         if *id != binder.id {
             return;
         }
+        // The tag IS present at this scalar site — record the match before the
+        // consumed-binder guard, mirroring `Input::try_bind_slot`, so `fold_bind`
+        // sees a nonzero count even for a same-tag cell reached after consumption.
+        binder.matched += 1;
         if binder.value.is_none() {
             return; // a consumed move-only binder (never happens for a clone-able
             // scalar value, but keeps the guard uniform with the resource path).
@@ -2246,6 +2279,14 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         let mut binder = SlotBinder::new::<Tg>(value, mode);
         self.bind_slots(&mut binder);
         binder.outcome()?;
+        // AT-LEAST-ONE: a `bind` that matched ZERO cells is a hard error (typo'd
+        // tag, or a tag not used in THIS graph). Without this it would silently
+        // succeed here and only surface — if at all — as `SlotUnbound` at `sync`.
+        // Checked only when `outcome` is Ok: a conflict/sever already counts as a
+        // match (the tag IS present), so it errors above, not here.
+        if binder.matched() == 0 {
+            return Err(Error::SlotNoSuchTag(type_name::<Tg>()));
+        }
         Ok(self)
     }
 
@@ -3640,6 +3681,29 @@ macro_rules! impl_eager_bundle {
                 out.push(concat!(stringify!($name), "{").into());
                 $(self.$field.describe(out);)+
                 out.push("}".into());
+            }
+
+            fn bind_slots(&self, binder: &mut SlotBinder) {
+                // Recurse into EVERY branch — a `slot!(Tag)` placed inside any
+                // bundle branch must be reachable by `g.bind(Tag(v))`. Without
+                // this override the bundle would inherit the no-op default and
+                // silently skip its branches, leaving the slot `Unbound` until
+                // `sync` errors `SlotUnbound`.
+                //
+                // Fan-out discipline mirrors `AndThen::bind_slots`: a move-only
+                // binder stops once its single value has landed (one `bind` →
+                // one cell); a fan-out binder (clone-able value — scalar / launch
+                // / `Arc`) NEVER consumes, so one `bind` fills EVERY matching cell
+                // across all branches. We call each branch unconditionally; a
+                // consumed move-only binder no-ops at the next branch via its own
+                // `value.is_none()` guard (so the early-return below is purely an
+                // optimization, not a correctness requirement).
+                $(
+                    self.$field.bind_slots(binder);
+                    if !binder.is_fanout() && binder.is_consumed() {
+                        return;
+                    }
+                )+
             }
 
             fn contains_host_seam(&self) -> bool {
