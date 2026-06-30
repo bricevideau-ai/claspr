@@ -1,17 +1,15 @@
 error[E0277]: the trait bound `Image2D<ReadOnly, R32Uint>: KernelImage2DWriteArg<Uint>` is not satisfied
-  --> compile_fail/image/access_read_only_to_write.rs:12:52
+  --> compile_fail/image/access_read_only_to_write.rs:12:21
    |
 12 |     let _ = kernels.fill_pattern([4usize, 4usize], img, 4u32, 4u32);
-   |                     ------------                   ^^^ the trait `KernelImage2DWriteArg<Uint>` is not implemented for `Image2D<ReadOnly, R32Uint>`
-   |                     |
-   |                     required by a bound introduced by this call
+   |                     ^^^^^^^^^^^^ the trait `KernelImage2DWriteArg<Uint>` is not implemented for `Image2D<ReadOnly, R32Uint>`
    |
 help: the following other types implement trait `KernelImage2DWriteArg<SF>`
-  --> claspr/src/image.rs:1896:0
-  ::: claspr/src/image.rs:1897:29
+  --> claspr/src/image.rs:1920:0
+  ::: claspr/src/image.rs:1921:29
    |
    = note: `Image2D<WriteOnly, F>`
-  ::: claspr/src/image.rs:1905:29
+  ::: claspr/src/image.rs:1929:29
    |
    = note: `Image2D<ReadWrite, F>`
 note: required by a bound in `claspr_test_image_kernels::dim2_uint::Kernels::fill_pattern`

@@ -491,36 +491,23 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `Input::resolve` (a pipe IS expected here — it's the upstream output).
     // `#pname` becomes the buffer; `#pname __claspr_deps` its wait-list events.
     let mut input_resolve_eager: Vec<TokenStream2> = Vec::new();
-    // Image (consuming) path: per-SLICE buffer resolve (one stmt per slice arg,
-    // NOT per image). The image kernel Op is single-shot/consuming, so its buffer
-    // args resolve via `Input::resolve` (value + deps, no home — nothing is
-    // returned to a cell). Image args are NOT resolved here at all (they were
-    // never routed through `Input`); the consuming execute passes them by value
-    // straight to `LaunchOp`. Built unconditionally but only emitted when
-    // `has_image_param`.
-    let mut input_resolve_consuming: Vec<TokenStream2> = Vec::new();
-    // The per-slice deps idents, merged into the kernel's wait-list at execute.
+    // The per-buffer/image deps idents, merged into the kernel's wait-list at
+    // execute.
     let mut input_deps_idents: Vec<TokenStream2> = Vec::new();
-    // `bind_slots` body: one `try_bind_slot` per SLICE arg (scalars/images carry
+    // `bind_slots` body: one `try_bind_slot` per SLICE or IMAGE arg (scalars carry
     // no `Input`). Folds a `call(Tag(v))` binder into any matching unbound slot.
     let mut input_bind_slots: Vec<TokenStream2> = Vec::new();
-    // Destructure pattern for `bind_slots`: slice positions bind their name, every
-    // other position binds `_` (so non-slice args don't trip unused-var lints).
+    // Destructure pattern for `bind_slots`: buffer/image positions bind their name,
+    // every scalar position binds `_` (so non-slot args don't trip unused-var lints).
     let mut bind_slot_pat_names: Vec<TokenStream2> = Vec::new();
     // Extra generics that live ONLY on the kernel METHOD signature, not on the
-    // Op struct/impls: the per-slice `__claspr_S{n}: ToInput<elem, Buf=__D{n}>`
+    // Op struct/impls: the per-arg `__claspr_S{n}: ToInput[Image]<…, Buf=__D{n}>`
     // input generics. The Op is generic over `__D{n}` only (it stores
     // `Input<__D>`), so these would be "unused type parameter" errors there.
     let mut method_only_generics: Vec<(TokenStream2, TokenStream2)> = Vec::new();
     let mut method_params: Vec<TokenStream2> = Vec::new();
     let mut arg_types: Vec<TokenStream2> = Vec::new();
     let mut op_arg_pass: Vec<TokenStream2> = Vec::new();
-    // Image (consuming) path's launch-arg tuple. Identical to `op_arg_pass` for
-    // buffer/image args (`&#pname`, both rebind `#pname` to an owned value via
-    // resolve), but a SCALAR is owned here (the args tuple is MOVED, not borrowed),
-    // so it passes `#pname` by value — NOT `*#pname` (which the borrow-`&self.args`
-    // reusable path needs). Only emitted when `has_image_param`.
-    let mut op_arg_pass_consuming: Vec<TokenStream2> = Vec::new();
     let mut output_names: Vec<TokenStream2> = Vec::new();
     let mut output_types: Vec<TokenStream2> = Vec::new();
     // Per-output HOME idents (`__claspr_home{n}`), in output order. A kernel
@@ -540,11 +527,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // the `<__claspr_D0, __claspr_F0, __claspr_I0, ...>` +
     // `where`-equivalent inline bounds on every emitted impl block.
     let mut generics: Vec<(TokenStream2, TokenStream2)> = Vec::new();
-    // Per-kind counters so the `__claspr_D{n}` / `__claspr_F{n}` /
-    // `__claspr_I{n}` names stay stable per slice/image regardless
-    // of interleaving with other param kinds.
-    let mut slice_gen_idx = 0usize;
-    let mut image_gen_idx = 0usize;
+    // One shared counter across BOTH slice and image args. A slice and
+    // an image are now the SAME kind of reusable buffer arg — each gets
+    // a concrete generic `__claspr_D{n}` (flows to Output), a
+    // method-only input generic `__claspr_S{n}` (the `ToInput`/`ToInputImage`
+    // arg), and matching `__claspr_deps{n}` / `__claspr_home{n}` idents.
+    // Using a single counter keeps every generated ident unique even
+    // when slices and images interleave in the kernel signature.
+    let mut arg_gen_idx = 0usize;
 
     for input in &func.sig.inputs {
         let FnArg::Typed(pt) = input else {
@@ -566,9 +556,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 //   __claspr_I{n} — the METHOD ARG, `ToInput<elem, Buf=__D>`,
                 //     so it accepts a concrete buffer OR a `Pipe` of one with
                 //     __D inferred (no turbofish). The Op stores `Input<__D>`.
-                let gid = quote::format_ident!("__claspr_D{}", slice_gen_idx);
-                let sid = quote::format_ident!("__claspr_S{}", slice_gen_idx);
-                slice_gen_idx += 1;
+                let gid = quote::format_ident!("__claspr_D{}", arg_gen_idx);
+                let sid = quote::format_ident!("__claspr_S{}", arg_gen_idx);
+                let deps_ident = quote::format_ident!("__claspr_deps{}", arg_gen_idx);
+                let home_ident = quote::format_ident!("__claspr_home{}", arg_gen_idx);
+                arg_gen_idx += 1;
                 let gid_tt: TokenStream2 = quote! { #gid };
                 let iid_tt: TokenStream2 = quote! { #sid };
                 // Buffer bound by mutability: `&[T]` → KernelSliceReadArg<T>;
@@ -589,22 +581,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 arg_types.push(quote! { ::claspr::Input<#gid_tt> });
                 op_field_init.push(quote! { ::claspr::ToInput::to_input(#pname) });
                 // Eager path: resolve to (buffer, deps, home); collect the deps +
-                // home idents (named by the slice index so they're valid, unique
-                // idents). In-place write → the buffer's home threads to its output.
-                let deps_ident = quote::format_ident!("__claspr_deps{}", slice_gen_idx - 1);
-                let home_ident = quote::format_ident!("__claspr_home{}", slice_gen_idx - 1);
+                // home idents. In-place write → the buffer's home threads to its
+                // output pipe so the run's `Checkout` re-arms its concrete cell.
                 input_resolve_eager.push(quote! {
                     let (#pname, #deps_ident, #home_ident) =
                         ::claspr::Input::resolve_home(#pname, ec)?;
-                });
-                // Image (consuming) path: same buffer resolve but no home (the
-                // single-shot image Op hands every output back by value, nothing is
-                // re-armed). `#pname` here is the moved-out `Input<__D>`;
-                // `resolve_on` borrows it and builds a transient ExecutionContext
-                // from the launcher (the image terminal has no `ec` in scope).
-                input_resolve_consuming.push(quote! {
-                    let (#pname, #deps_ident) =
-                        ::claspr::Input::resolve_on(&#pname, launcher)?;
                 });
                 input_deps_idents.push(quote! { #deps_ident });
                 // `bind_slots`: `#pname` destructures to `&Input<__D>`; offer the
@@ -616,7 +597,6 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 });
                 bind_slot_pat_names.push(quote! { #pname });
                 op_arg_pass.push(quote! { &#pname });
-                op_arg_pass_consuming.push(quote! { &#pname });
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
                 output_homes.push(quote! { #home_ident });
@@ -658,51 +638,66 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 family,
                 access_segment,
             } => {
-                // One fresh generic per image param: the image
-                // generic, constrained to the matching
-                // `KernelImage<dim>D<Access>Arg<family>` trait. The
-                // family marker (`Uint`/`Sint`/`Float`) is a
-                // concrete type, not a generic — the runtime trait
-                // impls pick the right one based on the format `F`
-                // inside the user's `Image<dim>D<A, F>` via F's
-                // `SampledFamily` associated type. No separate
-                // `__claspr_F` generic is needed; that was an
-                // earlier shape that introduced an unused type
-                // parameter on the emitted Op struct.
+                // Image args ride the EXACT same reusable-buffer path as slice
+                // args — the image one-shot/consuming fork is gone. Two generics:
+                //   __claspr_D{n} — the concrete OWNING image type (flows to
+                //     Output), bounded by the matching `KernelImage<dim>D<Access>Arg<family>`
+                //     trait. That trait now requires `Send + 'static`, so an
+                //     owned image (`Image2D<…>` etc., which owns its `cl_mem`)
+                //     satisfies it and can live in an `Input` cell; the borrowed
+                //     `Image1DBufferView<'_, …>` does NOT impl it (it is not
+                //     `'static`) — that view was the only reason the fork existed.
+                //   __claspr_S{n} — the METHOD ARG, `ToInputImage<family, Buf=__D>`,
+                //     so it accepts an owned image OR a `Pipe`/`Checkout`/`slot!`
+                //     of one with __D inferred (no turbofish). The Op stores
+                //     `Input<__D>`. The family marker (`Uint`/`Sint`/`Float`) is a
+                //     concrete type pinned from the kernel's `type=` keyword — the
+                //     trait impls pick the right one via F's `SampledFamily`.
                 has_image_param = true;
-                let iid = quote::format_ident!("__claspr_I{}", image_gen_idx);
-                image_gen_idx += 1;
-                let iid_tt: TokenStream2 = quote! { #iid };
+                let gid = quote::format_ident!("__claspr_D{}", arg_gen_idx);
+                let sid = quote::format_ident!("__claspr_S{}", arg_gen_idx);
+                let deps_ident = quote::format_ident!("__claspr_deps{}", arg_gen_idx);
+                let home_ident = quote::format_ident!("__claspr_home{}", arg_gen_idx);
+                arg_gen_idx += 1;
+                let gid_tt: TokenStream2 = quote! { #gid };
+                let iid_tt: TokenStream2 = quote! { #sid };
 
                 let trait_name = quote::format_ident!("KernelImage{}{}Arg", dim, access_segment);
-
-                generics.push((
-                    iid_tt.clone(),
-                    quote! { #iid: ::claspr::#trait_name<#family> },
-                ));
+                let dbound: TokenStream2 = quote! { #gid: ::claspr::#trait_name<#family> };
+                let ibound: TokenStream2 =
+                    quote! { #sid: ::claspr::ToInputImage<#family, Buf = #gid> };
+                generics.push((gid_tt.clone(), dbound));
+                method_only_generics.push((iid_tt.clone(), ibound));
 
                 host_names.push(pname.clone());
+                // Method takes the `ToInputImage` arg; the Op stores `Input<__D>`.
                 method_params.push(quote! { #pname: #iid_tt });
-                // Images are NOT routed through the `'static` `Input`/cell/Checkout
-                // lend-and-return machinery (see the `image_consuming` block below):
-                // image arg types can carry borrows (e.g. `Image1DBufferView<'_, …>`)
-                // and the image generic `__claspr_I{n}` has no `'static` bound, so the
-                // cell path would reject them (E0310). Image kernels are single-shot,
-                // not reusable — the Op stores the image VALUE directly and a
-                // *consuming* `execute`/`wait`/`submit` moves it out and hands it back
-                // by value. A mixed image+buffer kernel still routes its BUFFER args
-                // through `Input<__D>` (those are `'static`) — only the image arg
-                // bypasses the cell path.
-                arg_types.push(quote! { #iid_tt });
-                op_field_init.push(quote! { #pname });
-                // Consuming execute moves the image out of the args tuple and passes
-                // it straight to `LaunchOp`; no resolve, no upstream deps, no home.
+                arg_types.push(quote! { ::claspr::Input<#gid_tt> });
+                op_field_init.push(quote! { ::claspr::ToInputImage::to_input_image(#pname) });
+                // Eager path: lend the image from its `Input` cell / upstream pipe,
+                // collecting deps + home. An image kernel writes in place to its
+                // image arg (and reads/writes it for ReadWrite), so the image IS
+                // the lent value and its home threads to the output pipe — the run's
+                // `Checkout` re-arms the SAME `cl_mem` on drop (stable handle across
+                // replays), exactly like an in-place slice kernel arg.
+                input_resolve_eager.push(quote! {
+                    let (#pname, #deps_ident, #home_ident) =
+                        ::claspr::Input::resolve_home(#pname, ec)?;
+                });
+                input_deps_idents.push(quote! { #deps_ident });
+                // `bind_slots`: an image arg is a real slot position too — offer the
+                // binder so a matching unbound `slot!(Tag)` (Tag::Value = image)
+                // takes the value, just like a slice arg.
+                input_bind_slots.push(quote! {
+                    if !::claspr::SlotBinder::is_consumed(binder) {
+                        ::claspr::Input::try_bind_slot(#pname, binder);
+                    }
+                });
+                bind_slot_pat_names.push(quote! { #pname });
                 op_arg_pass.push(quote! { &#pname });
-                op_arg_pass_consuming.push(quote! { &#pname });
                 output_names.push(pname.clone());
-                output_types.push(iid_tt);
-                // Images carry no `Input` — not a slot position (bind ignores it).
-                bind_slot_pat_names.push(quote! { _ });
+                output_types.push(gid_tt);
+                output_homes.push(quote! { #home_ident });
             }
             ParamRole::Scalar { name: pname, ty } => {
                 host_names.push(pname.clone());
@@ -713,11 +708,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // execute borrows `&self.args`, so a scalar arg is bound as
                 // `&#ty`; deref it (scalars are `Copy`) to pass by value to
                 // `LaunchOp`. Slice/image args are rebound to owned values by
-                // their `.resolve(ec)` / deref, so they pass `&#pname`.
+                // their `resolve_home(ec)`, so they pass `&#pname`.
                 op_arg_pass.push(quote! { *#pname });
-                // Image (consuming) path moves the args tuple out, so a scalar is
-                // owned (`#ty`) here — pass it by value directly (no deref).
-                op_arg_pass_consuming.push(quote! { #pname });
 
                 // Record path: set the scalar's raw bytes as the next kernel arg.
                 record_arg_stmts.push(quote! {
@@ -788,12 +780,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `op_args_tuple_pat` = destructure pattern at enqueue (plain names).
     let op_args_tuple_init = single_or_tuple(&op_field_init);
     let op_args_tuple_pat = single_or_tuple(&host_names);
-    // Like `op_args_tuple_pat`, but `_` in every non-slice position so `bind_slots`
-    // (which only touches slice `Input`s) doesn't bind unused names.
+    // Like `op_args_tuple_pat`, but `_` in every scalar position so `bind_slots`
+    // (which only touches buffer/image `Input`s) doesn't bind unused names.
     let bind_slots_args_pat = single_or_tuple(&bind_slot_pat_names);
     let op_launch_args_tuple = single_or_tuple(&op_arg_pass);
-    // Image (consuming) launch tuple — scalars by value (the args tuple is moved).
-    let op_launch_args_tuple_consuming = single_or_tuple(&op_arg_pass_consuming);
 
     // Output type / expression — bare for a single slice, tuple for
     // many, `()` for none. Same convention on both terminals
@@ -901,11 +891,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `Output` tuple by draining all element pipes, gather their deps, wait.
     // `op_out_destructure` was the `KernelOp::enqueue_into` field-ignore pattern;
     // that impl is gone (kernels are DeviceOp-only), so it's unused now.
-    let (op_out_field_decl, op_out_field_init, _op_out_destructure) = if has_image_param {
-        // Image kernels are single-shot/consuming and never deposit into an output
-        // pipe (no `DeviceOp` impl), so they carry no output-pipe field at all.
-        (quote! {}, quote! {}, quote! {})
-    } else if multi_output {
+    let (op_out_field_decl, op_out_field_init, _op_out_destructure) = if multi_output {
         let decls = op_pipe_fields
             .iter()
             .zip(output_types.iter())
@@ -945,13 +931,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
 
     // ── DeviceOp impl body — single vs multi output ──────────────────────
     //
-    // Image kernels get NO `DeviceOp` impl: they are single-shot/consuming and use
-    // the dedicated `#image_terminal_methods` below instead of the reusable
-    // `&self`/Checkout path (whose `Input`/cell storage + `Output: 'static`
-    // terminal bound can't accept borrowed image views).
-    let eager_impl = if has_image_param {
-        quote! {}
-    } else if multi_output {
+    // EVERY kernel (buffer and/or image) is a reusable `DeviceOp`. Image args now
+    // ride the same `Input`/cell/`Checkout` lend-and-return path as slice args
+    // (owned images are `Send + 'static`), so there is no image-specific branch —
+    // a kernel with image args is just a multi/single-output kernel whose output
+    // type(s) happen to be image types.
+    let eager_impl = if multi_output {
         // `Handle = (Pipe<D0>, Pipe<D1>, …)`; per-element scatter; reconstruct
         // in `into_output`. `output_pipe()` is unused on this path (the default
         // `into_output` is overridden), but the trait requires it — return a
@@ -1264,98 +1249,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
 
     // ── Tier 1 terminals (`submit`/`submit_on`/`wait`) ───────────────────
     //
-    // Two shapes:
-    //
-    //  • Buffer/scalar kernels (no image): the Op is a reusable `DeviceOp`; the
-    //    terminals borrow `&self`, go through `DeviceOpExt::{submit_value_on,
-    //    wait_on}`, and hand the buffer(s) back via the `Checkout` lend-return
-    //    path (so `g` can be re-`sync`'d). Unchanged from the reusable rework.
-    //
-    //  • Image kernels: single-shot/consuming. The Op is NOT a `DeviceOp` (its
-    //    image arg can't satisfy the cell path's `Send + 'static`); the terminals
-    //    CONSUME `self`, move every arg out, resolve only the BUFFER args via
-    //    `Input::resolve` (images pass by value straight to `LaunchOp`), enqueue
-    //    once, and return the output BY VALUE — never touching `Checkout`, so a
-    //    borrowed `Image…View<'_>` output is fine. This restores the pre-reuse
-    //    image handling for the image branch only.
-    let terminal_methods = if has_image_param {
-        quote! {
-            /// Tier 1 non-blocking terminal — enqueue on the carried context's
-            /// default queue and return `(Output, Event)`. Consuming: an image
-            /// kernel is single-shot, not reusable.
-            pub fn submit(
-                self,
-            ) -> ::claspr::Result<(#output_ty, ::claspr::Event)> {
-                let ctx = ::core::clone::Clone::clone(&self.ctx);
-                self.submit_on(&ctx)
-            }
-
-            /// Tier 1 non-blocking terminal with an explicit launcher. Enqueues
-            /// the single launch on `launcher`'s queue and returns the output
-            /// (image / buffer / tuple) plus one chainable completion event.
-            pub fn submit_on<L>(
-                self,
-                launcher: &L,
-            ) -> ::claspr::Result<(#output_ty, ::claspr::Event)>
-            where
-                L: ::claspr::Launcher,
-            {
-                let (__claspr_out, __claspr_ev) = self.__claspr_run_image(launcher)?;
-                ::core::result::Result::Ok((__claspr_out, __claspr_ev))
-            }
-
-            /// Tier 1 blocking terminal — submit on the carried context's default
-            /// queue, wait on the completion event, and return the arg(s) by value.
-            pub fn wait(self) -> ::claspr::Result<#output_ty> {
-                let ctx = ::core::clone::Clone::clone(&self.ctx);
-                let (__claspr_out, __claspr_ev) = self.__claspr_run_image(&ctx)?;
-                ::claspr::Event::wait(&__claspr_ev).map_err(::claspr::Error::OpenCl)?;
-                ::core::result::Result::Ok(__claspr_out)
-            }
-
-            /// Shared one-shot enqueue for the image (consuming) path: move the
-            /// args out, resolve buffer args (images pass by value), launch once,
-            /// return `(Output, Event)`. NOT routed through `DeviceOp`/`Checkout`,
-            /// so a borrowed `Image…View<'_>` output is fine.
-            fn __claspr_run_image<L>(
-                self,
-                launcher: &L,
-            ) -> ::claspr::Result<(#output_ty, ::claspr::Event)>
-            where
-                L: ::claspr::Launcher + ?Sized,
-            {
-                let Op { kernel, spec, args, deps, profile_cb, ctx: _ } = self;
-                // Move each arg out of the tuple. Buffer args resolve (consuming —
-                // no home, nothing is returned to a cell); image args pass by value.
-                let #op_args_tuple_pat = args;
-                #(#input_resolve_consuming)*
-                // Validate caller-added deps (`.after()`/`.after_all()`) share the
-                // launcher's context — a clear panic instead of CL_INVALID_CONTEXT.
-                for ev in &deps {
-                    ::claspr::assert_same_context(
-                        ev,
-                        ::claspr::Launcher::cl_queue(launcher),
-                        concat!("kernel `", stringify!(#name), "` submit"),
-                    );
-                }
-                let mut raw_deps: ::std::vec::Vec<::claspr::cl_event> =
-                    deps.iter().map(|e| e.get()).collect();
-                #(
-                    raw_deps.extend(#input_deps_idents.iter().map(|d| d.as_ref().get()));
-                )*
-                let profile_cb = profile_cb.lock().unwrap().take();
-                let event = ::claspr::LaunchOp::new(
-                    launcher,
-                    &kernel,
-                    spec,
-                    #op_launch_args_tuple_consuming,
-                )
-                .with_state(raw_deps, profile_cb)
-                .submit()?;
-                ::core::result::Result::Ok((#output_expr, event))
-            }
-        }
-    } else {
+    // ONE shape for every kernel (buffer and/or image): the Op is a reusable
+    // `DeviceOp`; the terminals borrow `&self`, go through
+    // `DeviceOpExt::{submit_value_on, wait_on}`, and hand the buffer/image(s)
+    // back via the `Checkout` lend-return path (so `g` can be re-`sync`'d).
+    // Image args are owned (`Send + 'static`) and ride the same path — there is
+    // no longer an image-specific consuming terminal.
+    let terminal_methods = {
         quote! {
             /// Tier 1 non-blocking terminal — enqueue on the
             /// carried `Kernels`' context default queue and

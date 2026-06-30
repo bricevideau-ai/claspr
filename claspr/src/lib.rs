@@ -119,7 +119,7 @@ pub use image::{
     KernelImage2DArrayReadWriteArg, KernelImage2DArrayWriteArg, KernelImage2DReadArg,
     KernelImage2DReadWriteArg, KernelImage2DWriteArg, KernelImage3DReadArg,
     KernelImage3DReadWriteArg, KernelImage3DWriteArg, KernelImageBufferReadArg,
-    KernelImageBufferReadWriteArg, KernelImageBufferWriteArg, format,
+    KernelImageBufferReadWriteArg, KernelImageBufferWriteArg, ToInputImage, format,
 };
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, KernelSliceArg, KernelSliceReadArg,

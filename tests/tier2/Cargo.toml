@@ -19,6 +19,8 @@ claspr-test-kernels = { path = "../kernels" }
 # full machinery.
 futures = { version = "0.3", default-features = false, features = ["executor", "std"] }
 ui_test = "0.30"
+# Write-only IMAGE kernel for the home-invariant no-seed scenario (scenario 4).
+claspr-test-image-kernels = { path = "../image-kernels" }
 
 # `ui_test` requires harness = false so its `fn main()` runs instead of cargo
 # looking for `#[test]`s. Mirrors `tests/tier1`'s `image_compile_fail`.

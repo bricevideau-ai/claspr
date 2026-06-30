@@ -9,11 +9,48 @@ items resolve.
 
 ## Active
 
+### ✅ Image kernels are reusable `DeviceOp`s (un-forked) — 2026-06-29 (branch `typed-slots`, UNCOMMITTED, staged)
+
+Un-forked the image one-shot/consuming path: image kernel args now ride the SAME
+`Input`/cell/`Checkout` lend-and-return machinery as slice args. No image
+special-casing left in the kernel macro.
+- `KernelImage*Arg` supertraits gained `+ 'static` (image.rs) → owned images
+  (`Image1D/2D/3D/1DArray/2DArray/1DBuffer`, each owns its `cl_mem`) qualify;
+  borrowed `Image1DBufferView<'_,…>` does NOT (it's `'a`) and lost its
+  `KernelImageBuffer*Arg` impls — the view was the SOLE reason for the fork.
+- New `ToInputImage<SF>` trait (image.rs, exported) = image twin of `ToInput<E>`:
+  impls for owned families + `Pipe` + `Checkout` + `SlotHandle`. `RecordableBuffer`
+  now impl'd for owned images (stable `cl_mem` handle accessor, for the
+  home-invariant assertion + future record).
+- Macro (`claspr-macros/src/lib.rs`): image arm == slice arm — `__claspr_D{n}`
+  concrete (flows to Output), `__claspr_S{n}: ToInputImage<family, Buf=__D>`,
+  `resolve_home`, home threaded to output pipe, `try_bind_slot` per image arg.
+  Shared `arg_gen_idx` counter (slices+images). `has_image_param` now gates ONLY
+  the `RecordableOp` impl (images not recordable yet). Removed the consuming
+  terminal (`__claspr_run_image`), `input_resolve_consuming`,
+  `op_*_consuming`. **`Input::resolve_on` removed** (its only caller was the
+  image consuming terminal — now dead).
+- Call-site update: `dim_buffer_view_of_slice` → `dim_buffer_owned_read_to_slice`
+  (owned `Image1DBuffer`, the reusable equivalent; the view-as-kernel-arg only
+  ever worked via the one-shot path). `view_access_mismatch` compile-fail fixture
+  re-pointed at owned `Image1DBuffer<ReadOnly>` (same access-mismatch intent).
+- `home_invariant.rs` scenario 4 (`upload_writeonly_kernel_download_x3_stable`)
+  UN-IGNORED: WRITE-ONLY `Image2D<WriteOnly,R32Uint>` + `dim2_uint::fill_pattern`,
+  alloc-once / never-seed / kernel-overwrites, asserts STABLE `cl_mem` + correct
+  data ×3. Now 10/11 green (only scenario 11 ignored). tier2 dev-dep on
+  `claspr-test-image-kernels` added.
+- DoD: build/clippy/doc(`-D warnings`)/fmt clean; full tier1+tier2 green; image
+  regressions identical to baseline (2 pocl `write_image` gaps remain). ui_test
+  goldens re-blessed (image_compile_fail) — MUST run with a clean `target/deps`
+  (stale duplicate `claspr` rlibs → spurious "multiple versions" failures; clean
+  with one rlib all pass). CB-cacheability of images: still future (out of scope).
+
 ### ✅ "Homeless is never legitimate" home invariant — 2026-06-29 (branch `typed-slots`, UNCOMMITTED, staged)
 
 Every lent buffer (user-alloc AND upload-minted) carries a home; the graph never
 releases a homed buffer — it REHOMES it. `tests/tier2/tests/home_invariant.rs`
-1,2,3,5,6 green (+7,8,9,10); 4 (WriteOnly) and 11 stay ignored.
+1,2,3,5,6 green (+7,8,9,10); 4 (WriteOnly image, un-forked 2026-06-29) now green
+too; only 11 stays ignored.
 - `PipePayload{value: Option<T>, home}` + **`Drop`**: an undelivered payload
   (value+home present) rehomes on drop. `take_home` drains both in place (no
   destructure-by-move); home moved out = disarmed (single owner, `BoxedHome:

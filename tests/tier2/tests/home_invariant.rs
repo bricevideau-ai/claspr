@@ -34,7 +34,8 @@
 //! whose raw pointer is the stable identity key. No new accessor was needed.
 
 use claspr::eager::{DeviceOpExt, download, eager_copy_to, upload, upload_as};
-use claspr::{Context, DeviceSlice, MemRef, ReadOnly, RecordableBuffer, WriteOnly};
+use claspr::image::format::R32Uint;
+use claspr::{Context, DeviceSlice, Image2D, MemRef, ReadOnly, RecordableBuffer, WriteOnly};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
 
@@ -216,68 +217,76 @@ fn upload_readwrite_scale_download_x3_reseed_stable() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 4. upload(WriteOnly) → kernel-writes → download, ×3.
-//    Invariant: handle stable; result depends only on kernel, not prior
-//    contents (WriteOnly never seeds — kernel overwrites).
+// 4. WRITE-ONLY image kernel (no-seed home path), ×3.
+//    Invariant: the image is allocated ONCE, never seeded, and a write-only
+//    image kernel (`dim2_uint::fill_pattern`) FULLY OVERWRITES it each run; its
+//    `cl_mem` handle is STABLE across 3 runs (rehomed, not re-minted) AND the
+//    data is correct each run.
 //
-//    RED(no-API): a `WriteOnly` buffer cannot be ANY of today's kernel slice
-//    args. `WriteOnly` is `KernelWritable` but NOT `KernelReadable`
-//    (access.rs:208-211); a read arg `&[T]` needs `KernelReadable`
-//    (launch.rs:160) and a `&mut [T]` arg needs `KernelReadable + KernelWritable`
-//    (launch.rs:176 — rust-gpu's `&mut [T]` always permits reads). So neither
-//    `fill_u32(&mut)` nor `add_u32(&[])` accepts a WriteOnly buffer; WriteOnly is
-//    images-only for buffers (access.rs §"marker set"). The body is written the
-//    way it SHOULD read once a write-only buffer kernel-arg path exists, but is
-//    neutralized so the file compiles. Once that exists, drop the `return` and the
-//    `_` aliases and re-enable. Also still RED on the engine side: upload re-mints
-//    each run (eager.rs:3401), no home, no seed-skip.
+//    Why an IMAGE, not a buffer: a `WriteOnly` BUFFER cannot be a kernel slice
+//    arg (`WriteOnly` is `KernelWritable` but NOT `KernelReadable`,
+//    access.rs:208-211; `&[T]` needs Readable and `&mut [T]` needs both,
+//    launch.rs:160/176). A `WriteOnly` IMAGE is the canonical write-only case —
+//    `Image2D<WriteOnly, _>` impls `KernelImage2DWriteArg`, matching the kernel's
+//    `image_access="write_only"` qualifier. This is exactly the no-seed home
+//    path: there is no upload, the image's contents are entirely kernel-produced,
+//    so the only thing the reusable graph must guarantee is a stable rehomed
+//    handle across replays.
+//
+//    This was RED("no-API, DEFERRED") while image kernels were one-shot/consuming
+//    (not reusable `DeviceOp`s). With image args now riding the same
+//    `Input`/cell/`Checkout` lend-and-return path as slice args, the write-only
+//    image kernel Op IS a reusable `DeviceOp`: the allocated-once image is lent
+//    from its concrete cell each run and rehomed on the run's `Checkout` drop,
+//    keeping a stable `cl_mem`.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-#[ignore = "RED(no-API, DEFERRED): the no-seed home path is unreachable today. \
-            WriteOnly is not a usable buffer kernel arg (access.rs:208-211, \
-            launch.rs:160/176 — KernelWritable-only, &mut [T] needs both); the \
-            intended exercise via a write-only IMAGE kernel is blocked because \
-            image kernels are one-shot/consuming, not reusable DeviceOps \
-            (eager.rs:801-802; borrowed image views aren't 'static, so no home/ \
-            cell). Re-enable once image kernels gain a reusable DeviceOp path. \
-            ALSO engine-RED: upload re-mints each run with no home (eager.rs:3401)."]
 fn upload_writeonly_kernel_download_x3_stable() {
     let Some(ctx) = ctx() else { return };
-    let _ks = kernels::kernels(&ctx).expect("load kernels");
-    let _ = WriteOnly; // witness the marker the scenario needs.
-
-    // RED(no-API): the following is the intended shape; it does NOT compile today
-    // because `WriteOnly` is not a `KernelSliceRead[Write]Arg`. Re-enable when a
-    // write-only buffer kernel-arg path lands.
-    /*
-    // fill_u32 overwrites every element with 0xAB regardless of prior contents —
-    // the WriteOnly buffer's seed never matters. Use a sentinel seed to prove it.
-    let probe = upload_as(vec![1u32; N], WriteOnly).and_then(|b| _ks.fill_u32([N], b, 0xABu32));
-    let c1 = probe.sync(&ctx).expect("probe 1");
-    let h0 = handle_of(&*c1);
-    let mut r1 = vec![0u32; N];
-    c1.read(&mut r1).wait().expect("read 1");
-    assert!(r1.iter().all(|&v| v == 0xAB), "kernel writes 0xAB");
-
-    let c2 = probe.sync(&ctx).expect("probe 2");
-    assert_eq!(handle_of(&*c2), h0, "WriteOnly buffer keeps a stable handle");
-    let mut r2 = vec![0u32; N];
-    c2.read(&mut r2).wait().expect("read 2");
-    assert!(
-        r2.iter().all(|&v| v == 0xAB),
-        "result depends only on the kernel, not prior contents, got {:?}",
-        &r2[..8]
-    );
-
-    let g = upload_as(vec![1u32; N], WriteOnly)
-        .and_then(|b| _ks.fill_u32([N], b, 0xABu32))
-        .and_then(download);
-    for run in 0..3 {
-        let out = g.sync(&ctx).unwrap_or_else(|e| panic!("run {run}: {e}"));
-        assert!(out.iter().all(|&v| v == 0xAB), "run {run}: 0xAB");
+    if !ctx.device().cl3().image_support().unwrap_or(false) {
+        eprintln!("SKIP: device has no image support");
+        return;
     }
-    */
-    panic!("RED(no-API): WriteOnly buffer kernel-arg path does not exist yet");
+    let _ = WriteOnly; // witness the marker the scenario exercises.
+    let iks = claspr_test_image_kernels::dim2_uint::kernels(&ctx).expect("load image kernels");
+
+    const W: u32 = 16;
+    const H: u32 = 8;
+
+    // Allocate the write-only image ONCE; it is never seeded. The kernel writes
+    // `(x + y*W)` at every pixel, so the result depends only on the kernel.
+    let img = Image2D::<WriteOnly, R32Uint>::alloc(&ctx, W, H).expect("alloc image");
+    let h0 = handle_of(&img); // the cl_mem the rehomed image MUST keep each run.
+
+    // The reusable graph: fill_pattern over the lent image. `g.sync()` runs it and
+    // hands back a `Checkout<Image2D<…>>`; dropping the Checkout rehomes the image
+    // to its concrete cell so the next run re-lends the SAME handle.
+    let g = iks.fill_pattern([W as usize, H as usize], img, W, H);
+
+    for run in 0..3 {
+        let co = g
+            .sync(&ctx)
+            .unwrap_or_else(|e| panic!("run {run}: write-only image graph must re-arm: {e}"));
+        assert_eq!(
+            handle_of(&*co),
+            h0,
+            "run {run}: write-only image must keep a STABLE cl_mem across runs (rehome, not re-mint)"
+        );
+        // Data correctness each run: read back through a fresh download terminal on
+        // the (still-lent) image, then drop `co` to rehome it for the next run.
+        let pixels: Vec<u32> = co.read_alloc().wait().expect("read back");
+        for y in 0..H {
+            for x in 0..W {
+                let got = pixels[(y * W + x) as usize];
+                let want = x + y * W;
+                assert_eq!(
+                    got, want,
+                    "run {run}: pixel ({x},{y}): got {got}, want {want}"
+                );
+            }
+        }
+        drop(co); // rehome the image to its concrete cell (re-arm), NOT release.
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -1645,6 +1645,30 @@ impl<A: KernelAccess, F: format::Format> KernelArg for Image3D<A, F> {
 //
 // All extend [`KernelArg`] so the underlying `clSetKernelArg`
 // plumbing is reused, and are sealed in this crate.
+//
+// ## Why `Send + 'static`
+//
+// The supertrait bound is `KernelArg + Send + 'static + Sealed`. The
+// `'static` is what lets an image kernel arg flow through the SAME
+// reusable-graph machinery a `DeviceSlice` arg does: the proc-macro
+// stores each image arg as an [`Input`](crate::eager::Input)`<I>`
+// (an `Arc<Mutex<Option<I>>>` cell), lends it for one run, and
+// returns it on the run's [`Checkout`](crate::eager::Checkout) drop —
+// re-arming the graph with a STABLE `cl_mem` handle. A cell of `I`
+// requires `I: 'static`. Every OWNING image type
+// ([`Image1D`]/[`Image2D`]/[`Image3D`]/[`Image1DArray`]/
+// [`Image2DArray`]/[`Image1DBuffer`]) is `'static` (it owns its
+// `cl_mem` via the opencl3 [`Image`] handle, released on `Drop`), so
+// they satisfy the bound and are first-class reusable kernel args.
+//
+// The borrowed [`Image1DBufferView<'a, …>`](Image1DBufferView)
+// deliberately is NOT `'static` (it carries a `'a` borrow of the
+// `DeviceSlice` it views), so it does NOT impl these traits — it
+// cannot be a reusable kernel arg. Upload a [`DeviceSlice`] and then
+// either pass the slice directly (`&[T]` arg) or allocate an owned
+// [`Image1DBuffer`] when the kernel needs `image1d_buffer_t`. The
+// view remains useful for its host-side accessors; it just can't sit
+// in a graph cell.
 
 mod kernel_image_arg_sealed {
     pub trait Sealed {}
@@ -1664,7 +1688,7 @@ mod kernel_image_arg_sealed {
 /// markers (`WriteOnly`, `ReadWrite`) are intentionally rejected —
 /// see the section comment above for the "exact-access" rationale.
 pub trait KernelImage1DReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -1676,7 +1700,7 @@ pub trait KernelImage1DReadArg<SF: format::SampledTypeFamily>:
 /// kernel side, but they don't need `ImageReadWrite` capability —
 /// the right choice for OpenCL 1.2 output kernels.
 pub trait KernelImage1DWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -1688,28 +1712,28 @@ pub trait KernelImage1DWriteArg<SF: format::SampledTypeFamily>:
 /// 2.0+ device support; the rust-gpu codegen auto-declares the
 /// capability when emitting any `ReadWrite OpTypeImage`.
 pub trait KernelImage1DReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
 /// Host-side counterpart for a kernel `&Image!(2D, type=...)`
 /// parameter — see [`KernelImage1DReadArg`] for details.
 pub trait KernelImage2DReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
 /// Host-side counterpart for a kernel `&mut Image!(2D, ...,
 /// access="write_only")` parameter — see [`KernelImage1DWriteArg`].
 pub trait KernelImage2DWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
 /// Host-side counterpart for a kernel `&mut Image!(2D, ...)`
 /// parameter — see [`KernelImage1DReadWriteArg`].
 pub trait KernelImage2DReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -1725,7 +1749,7 @@ pub trait KernelImage2DReadWriteArg<SF: format::SampledTypeFamily>:
 /// 1D image from a kernel and as raw bytes (or typed elements)
 /// through the buffer API.
 pub trait KernelImageBufferReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -1733,7 +1757,7 @@ pub trait KernelImageBufferReadArg<SF: format::SampledTypeFamily>:
 /// access="write_only")` parameter — see
 /// [`KernelImageBufferReadArg`] for the storage model.
 pub trait KernelImageBufferWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -1741,28 +1765,28 @@ pub trait KernelImageBufferWriteArg<SF: format::SampledTypeFamily>:
 /// parameter (kernel declared `ReadWrite`) — see
 /// [`KernelImageBufferReadArg`].
 pub trait KernelImageBufferReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
 /// Host-side counterpart for a kernel `&Image!(3D, type=...)`
 /// parameter — see [`KernelImage1DReadArg`].
 pub trait KernelImage3DReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
 /// Host-side counterpart for a kernel `&mut Image!(3D, ...,
 /// access="write_only")` parameter — see [`KernelImage1DWriteArg`].
 pub trait KernelImage3DWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
 /// Host-side counterpart for a kernel `&mut Image!(3D, ...)`
 /// parameter — see [`KernelImage1DReadWriteArg`].
 pub trait KernelImage3DReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -1778,7 +1802,7 @@ pub trait KernelImage3DReadWriteArg<SF: format::SampledTypeFamily>:
 /// `&Image!(1D, arrayed=true, type=...)` parameter — see
 /// [`KernelImage1DReadArg`].
 pub trait KernelImage1DArrayReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -1786,7 +1810,7 @@ pub trait KernelImage1DArrayReadArg<SF: format::SampledTypeFamily>:
 /// `&mut Image!(1D, arrayed=true, ..., access="write_only")`
 /// parameter — see [`KernelImage1DWriteArg`].
 pub trait KernelImage1DArrayWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -1794,7 +1818,7 @@ pub trait KernelImage1DArrayWriteArg<SF: format::SampledTypeFamily>:
 /// `&mut Image!(1D, arrayed=true, ...)` parameter — see
 /// [`KernelImage1DReadWriteArg`].
 pub trait KernelImage1DArrayReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -1802,7 +1826,7 @@ pub trait KernelImage1DArrayReadWriteArg<SF: format::SampledTypeFamily>:
 /// `&Image!(2D, arrayed=true, type=...)` parameter — see
 /// [`KernelImage1DReadArg`].
 pub trait KernelImage2DArrayReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -1810,7 +1834,7 @@ pub trait KernelImage2DArrayReadArg<SF: format::SampledTypeFamily>:
 /// `&mut Image!(2D, arrayed=true, ..., access="write_only")`
 /// parameter — see [`KernelImage1DWriteArg`].
 pub trait KernelImage2DArrayWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -1818,7 +1842,7 @@ pub trait KernelImage2DArrayWriteArg<SF: format::SampledTypeFamily>:
 /// `&mut Image!(2D, arrayed=true, ...)` parameter — see
 /// [`KernelImage1DReadWriteArg`].
 pub trait KernelImage2DArrayReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + kernel_image_arg_sealed::Sealed
+    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
 {
 }
 
@@ -2732,36 +2756,18 @@ impl<M: MemMode + Send, F: format::Format + Send + 'static> kernel_image_arg_sea
 {
 }
 
-// Per-(M, access-trait) impls. Same partial-order rules as the
-// owned form, but bridged via M's KernelAccess marker:
-//   - DeviceSlice<T, ReadOnly>  → view satisfies Read only
-//   - DeviceSlice<T, WriteOnly> → view satisfies Write only
-//   - DeviceSlice<T, ReadWrite> → view satisfies all three
-//
-// We list these as concrete-M impls (no blanket over generic M)
-// because the trait family is access-discriminated, not
-// MemMode-discriminated — coherence requires us to spell out the
-// (M, trait) pairs.
-impl<F: format::Format + Send + 'static> KernelImageBufferReadArg<F::SampledFamily>
-    for Image1DBufferView<'_, ReadOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
-    for Image1DBufferView<'_, WriteOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImageBufferReadArg<F::SampledFamily>
-    for Image1DBufferView<'_, ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
-    for Image1DBufferView<'_, ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImageBufferReadWriteArg<F::SampledFamily>
-    for Image1DBufferView<'_, ReadWrite, F>
-{
-}
+// NOTE: `Image1DBufferView<'a, …>` deliberately does NOT impl the
+// `KernelImageBuffer*Arg` traits anymore. Those traits now require
+// `'static` (so an image arg can flow through the reusable-graph
+// `Input`/cell/`Checkout` machinery, exactly like a `DeviceSlice`),
+// and the view carries a `'a` borrow of the slice it views — it is
+// not `'static`. A borrowed view as a kernel arg was the original
+// justification for the image one-shot/consuming fork; with images
+// now owned-in-cell, that fork is gone and the view simply isn't a
+// reusable kernel arg. To feed slice-backed storage to an
+// `image1d_buffer_t` kernel param, allocate an owned
+// [`Image1DBuffer`] (which owns its `cl_mem`); the view keeps its
+// host-side accessors for the non-kernel-arg cases.
 
 // ── Back-compat alias ───────────────────────────────────────────────
 
@@ -2774,3 +2780,142 @@ impl<F: format::Format + Send + 'static> KernelImageBufferReadWriteArg<F::Sample
 /// New code should spell the generic type directly to make the
 /// access mode + format explicit.
 pub type Image2DRgba8 = Image2D<ReadWrite, format::R8G8B8A8Uint>;
+
+// ── RecordableBuffer: stable cl_mem handle for owned images ─────────
+//
+// Mirrors the `DeviceSlice` impl in `launch.rs` — exposes the owning
+// image's backing `cl_mem` + byte length as a [`BufHandle`]. Two
+// callers want it:
+//   - the home-invariant tests, which read `record_handle().mem` as a
+//     stable identity key to assert an image's `cl_mem` is REHOMED
+//     (reused) across reusable-graph replays, not re-minted;
+//   - the record/replay path (future image support), symmetric with
+//     the slice families.
+// Every OWNING image type gets the impl (they each hold a `cl_mem` via
+// the opencl3 [`Image`]); the borrowed `Image1DBufferView` does not —
+// it shares the slice's `cl_mem`, whose handle is reachable through the
+// slice's own `RecordableBuffer` impl.
+
+/// `clEnqueue*Image` byte length of an opencl3 [`Image`] — its backing
+/// `cl_mem` size. Falls back to `0` only if `clGetMemObjectInfo` fails
+/// (it never does for a live image), which keeps the accessor
+/// infallible for the identity-key use.
+fn image_byte_len(image: &Image) -> usize {
+    image.size().unwrap_or(0)
+}
+
+macro_rules! impl_recordable_image {
+    ($ty:ident) => {
+        impl<A: KernelAccess, F: format::Format> crate::record::RecordableBuffer for $ty<A, F> {
+            fn record_handle(&self) -> crate::record::BufHandle {
+                crate::record::BufHandle {
+                    mem: crate::record::MemRef::Buffer(self.image.get()),
+                    byte_len: image_byte_len(&self.image),
+                }
+            }
+        }
+    };
+}
+impl_recordable_image!(Image1D);
+impl_recordable_image!(Image2D);
+impl_recordable_image!(Image3D);
+impl_recordable_image!(Image1DArray);
+impl_recordable_image!(Image2DArray);
+impl_recordable_image!(Image1DBuffer);
+
+// ── ToInputImage: a kernel IMAGE arg, concrete-or-pipe ──────────────
+//
+// The exact image-side twin of [`ToInput`](crate::eager::ToInput) (the
+// slice-arg conversion). The proc-macro emits each image kernel arg as
+// `impl ToInputImage<SF, Buf = __claspr_D{n}>` and stores the resulting
+// `Input<Buf>` in the Op — so an owned image, a `Pipe<image>` (upstream
+// output), a `Checkout<image>` (a previous run's result fed straight
+// in), or a `slot!(Tag where Tag::Value = image)` all plug into the
+// same image-arg position, with `Buf` inferred (no turbofish), exactly
+// as the slice families do.
+//
+// Keyed on the sampled-type-family marker `SF` rather than a slice
+// element so it stays a distinct nominal trait from `ToInput<E>` (no
+// coherence clash) and so the macro can pin `SF` to the kernel's
+// `type=` family. Per-shape impls (owned families + `Pipe` + `Checkout`
+// + `SlotHandle`), not a blanket, so they stay disjoint under
+// coherence — same discipline as `ToInput`.
+
+/// Image analogue of [`ToInput`](crate::eager::ToInput): convert a
+/// kernel image argument (owned image / `Pipe` / `Checkout` / `slot!`)
+/// into the [`Input`]`<Buf>` the reusable image kernel Op stores.
+/// `Buf` is the concrete owning image type, inferred from the
+/// argument; `SF` is the kernel's sampled-type family
+/// (`Uint`/`Sint`/`Float`), pinned by the proc-macro so a `Pipe`/`Checkout`
+/// of an image flows in without a turbofish.
+pub trait ToInputImage<SF: format::SampledTypeFamily> {
+    /// The concrete owning image type this arg resolves to — the macro
+    /// pins it as the Op's per-image generic and applies the matching
+    /// `KernelImage<dim>D<Access>Arg<SF>` bound to it.
+    type Buf;
+    /// Wrap as a concrete or piped [`Input`].
+    fn to_input_image(self) -> Input<Self::Buf>;
+}
+
+// A pipe of any image type → a deferred input. `SF` is unconstrained on
+// the pipe itself; the macro's `Buf = __D` + `__D: KernelImage…Arg<SF>`
+// ties it.
+impl<SF: format::SampledTypeFamily, D> ToInputImage<SF> for Pipe<D> {
+    type Buf = D;
+    fn to_input_image(self) -> Input<D> {
+        Input::Pipe(self)
+    }
+}
+
+/// Implement [`ToInputImage`] for one concrete owning image family.
+/// Per-family (not a blanket) so it stays disjoint from the `Pipe<D>`
+/// impl under coherence.
+macro_rules! impl_to_input_image_owned {
+    ($ty:ident) => {
+        impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
+            ToInputImage<F::SampledFamily> for $ty<A, F>
+        {
+            type Buf = $ty<A, F>;
+            fn to_input_image(self) -> Input<$ty<A, F>> {
+                Input::from(self)
+            }
+        }
+
+        // A `Checkout<image>` is usable wherever the bare image is — a
+        // reused-graph image output flows straight into the next launch
+        // without an explicit `into_inner()`. Consuming the `Checkout`
+        // severs its return and feeds the inner image as a concrete
+        // `Input`. Distinct nominal type → disjoint under coherence.
+        impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
+            ToInputImage<F::SampledFamily> for Checkout<$ty<A, F>>
+        {
+            type Buf = $ty<A, F>;
+            fn to_input_image(self) -> Input<$ty<A, F>> {
+                Input::from(self.into_inner())
+            }
+        }
+    };
+}
+impl_to_input_image_owned!(Image1D);
+impl_to_input_image_owned!(Image2D);
+impl_to_input_image_owned!(Image3D);
+impl_to_input_image_owned!(Image1DArray);
+impl_to_input_image_owned!(Image2DArray);
+impl_to_input_image_owned!(Image1DBuffer);
+
+// A `slot!(Tag)` whose `Tag::Value` is an owning image type plugs into
+// the image-arg position, mirroring the slice `SlotHandle` impl on
+// `ToInput`. The macro infers `Buf = Tag::Value` and applies the right
+// `KernelImage…Arg<SF>` bound to it. `SlotHandle<Tg>` is a distinct
+// nominal type from the bare families / `Pipe` / `Checkout`, so it
+// stays disjoint under coherence.
+impl<SF, Tg> ToInputImage<SF> for crate::eager::SlotHandle<Tg>
+where
+    SF: format::SampledTypeFamily,
+    Tg: crate::eager::Tag,
+{
+    type Buf = Tg::Value;
+    fn to_input_image(self) -> Input<Tg::Value> {
+        self.into_slot_input()
+    }
+}

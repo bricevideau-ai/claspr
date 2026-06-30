@@ -1,17 +1,15 @@
 error[E0277]: the trait bound `Image2D<WriteOnly, R32Float>: KernelImage2DReadArg<claspr::format::Float>` is not satisfied
-  --> compile_fail/image/access_write_only_to_read.rs:13:54
+  --> compile_fail/image/access_write_only_to_read.rs:13:21
    |
 13 |     let _ = kernels.copy_to_buffer([4usize, 4usize], img, out, 4u32, 4u32);
-   |                     --------------                   ^^^ the trait `KernelImage2DReadArg<claspr::format::Float>` is not implemented for `Image2D<WriteOnly, R32Float>`
-   |                     |
-   |                     required by a bound introduced by this call
+   |                     ^^^^^^^^^^^^^^ the trait `KernelImage2DReadArg<claspr::format::Float>` is not implemented for `Image2D<WriteOnly, R32Float>`
    |
 help: the following other types implement trait `KernelImage2DReadArg<SF>`
-  --> claspr/src/image.rs:1892:0
-  ::: claspr/src/image.rs:1893:28
+  --> claspr/src/image.rs:1916:0
+  ::: claspr/src/image.rs:1917:28
    |
    = note: `Image2D<ReadOnly, F>`
-  ::: claspr/src/image.rs:1901:29
+  ::: claspr/src/image.rs:1925:29
    |
    = note: `Image2D<ReadWrite, F>`
 note: required by a bound in `claspr_test_image_kernels::dim2_float::Kernels::copy_to_buffer`

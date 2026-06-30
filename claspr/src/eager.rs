@@ -846,25 +846,12 @@ impl<T> Input<T> {
         }
     }
 
-    /// Resolve to `(value, upstream Deps)` against a bare [`Launcher`](crate::Launcher)
-    /// (building a transient [`ExecutionContext`] internally), for callers OUTSIDE this crate
-    /// that have a launcher but cannot construct an `ExecutionContext` (which is
-    /// crate-private). Used by the `#[kernel]` proc-macro's **image (consuming)**
-    /// terminal: an image kernel is single-shot and not a [`DeviceOp`], so its
-    /// buffer args resolve here directly rather than through `execute(&self)`.
-    ///
-    /// Like [`resolve`](Self::resolve), this **lends** the value out of the cell;
-    /// the image terminal consumes the Op and hands the value back by value, so
-    /// nothing is returned to the cell — that's expected (single-shot).
-    pub fn resolve_on<L>(&self, launcher: &L) -> Result<(T, Deps)>
-    where
-        T: Send + 'static,
-        L: crate::Launcher + ?Sized,
-    {
-        let device = launcher.context().device().clone();
-        let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
-        self.resolve(&ec)
-    }
+    // NOTE: `Input::resolve_on(&launcher)` — which built a transient
+    // `ExecutionContext` so an image kernel's args could resolve outside an
+    // `execute(&self)` — was removed when image kernels became reusable
+    // `DeviceOp`s. Image args now lend through `resolve_home` from inside
+    // `execute` exactly like slice args, so the standalone launcher-resolve seam
+    // (the last piece of the image one-shot fork) has no remaining caller.
 
     /// If this input is a [`Concrete`](Input::Concrete) head, return its lending
     /// [`Cell`] so a run's `Checkout` can deposit the (possibly transformed-in-place /

@@ -290,33 +290,40 @@ fn dim_buffer_fill_pattern_r32_uint() {
     }
 }
 
-/// Image-buffer **view** over an existing `DeviceSlice`.
-/// Allocates a `DeviceSlice<u32, ReadWrite>` and seeds it via
-/// `from_slice`, constructs an `Image1DBufferView<'_, ReadWrite,
-/// R32Uint>` over it (no copy — shared cl_mem), and reads it
-/// through the image-buffer kernel. The kernel-read values
-/// should match the host-written ones byte-for-byte.
+/// Image-buffer read path through an OWNED `Image1DBuffer`.
+/// Seeds an owned `Image1DBuffer<ReadOnly, R32Uint>` with host
+/// data and reads it through the image-buffer kernel; the
+/// kernel-read values must match the host-written ones.
+///
+/// NOTE: this used to drive a borrowed `Image1DBufferView` over a
+/// `DeviceSlice` directly as the kernel arg. That borrowed view is
+/// NOT `'static`, so with image kernels now reusable `DeviceOp`s
+/// (image args ride the `Input`/cell/`Checkout` path, requiring
+/// `Send + 'static`), the view can no longer be a kernel arg — it
+/// was the sole reason for the old image one-shot fork. The owned
+/// `Image1DBuffer` is the reusable equivalent and proves the same
+/// `image1d_buffer_t` read path. The `Image1DBufferView` type
+/// itself (and its host-side accessors / borrow-check guarantees)
+/// stays covered by `dim_buffer_view_width_derived_from_slice_bytes`
+/// and the `view_*` compile-fail tests.
 #[test]
-fn dim_buffer_view_of_slice() {
+fn dim_buffer_owned_read_to_slice() {
     const N: u32 = 64;
     let Some(ctx) = ctx() else { return };
     let kernels = claspr_test_image_kernels::dim_buffer_uint::kernels(&ctx).unwrap();
 
-    // Host writes through the slice path.
+    // Seed an owned image-buffer with the same pattern the old view test used.
     let seed: Vec<u32> = (0..N).map(|x| x.wrapping_mul(13).wrapping_add(5)).collect();
-    let slice = DeviceSlice::<u32>::from_slice(&ctx, &seed).unwrap();
-
-    // No copy — the view shares the slice's cl_mem.
-    let view = Image1DBufferView::<ReadWrite, R32Uint>::view_of(&slice).unwrap();
-    assert_eq!(view.width(), N);
+    let img = Image1DBuffer::<ReadOnly, R32Uint>::alloc(&ctx, N).unwrap();
+    let img = img.write(&seed).wait().unwrap();
 
     // Output slice for the kernel to write into.
     let zeros = vec![0u32; N as usize];
     let out = DeviceSlice::<u32>::from_slice(&ctx, &zeros).unwrap();
 
-    // Kernel reads the view (as `image1d_buffer_t`), writes to out.
-    let (_view, out) = kernels
-        .copy_to_buffer([N as usize], view, out, N)
+    // Kernel reads the image-buffer (as `image1d_buffer_t`), writes to out.
+    let (_img, out) = kernels
+        .copy_to_buffer([N as usize], img, out, N)
         .wait()
         .unwrap();
 
@@ -324,14 +331,16 @@ fn dim_buffer_view_of_slice() {
     out.read(&mut result).wait().unwrap();
     assert_eq!(
         result, seed,
-        "kernel-read pixels through view should match host-seeded slice"
+        "kernel-read pixels through owned image-buffer should match host-seeded data"
     );
 }
 
-/// Image-buffer view over a slice with reinterpret: the slice
-/// is `DeviceSlice<u32>` but the view sees it as `R32Uint`
-/// (matching), exercising the byte-length arithmetic in
-/// `view_of` (16 u32 elements = 16 R32Uint pixels = 64 bytes).
+/// `Image1DBufferView` host-side accessor coverage (the view type
+/// is kept for its no-copy slice-aliasing + width-derivation, just
+/// not as a reusable kernel arg — see `dim_buffer_owned_read_to_slice`).
+/// The slice is `DeviceSlice<u32>` but the view sees it as `R32Uint`
+/// (matching), exercising the byte-length arithmetic in `view_of`
+/// (16 u32 elements = 16 R32Uint pixels = 64 bytes).
 #[test]
 fn dim_buffer_view_width_derived_from_slice_bytes() {
     const N: u32 = 16;

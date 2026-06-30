@@ -360,6 +360,7 @@ name = "claspr-tier2-tests"
 version = "0.0.0"
 dependencies = [
  "claspr",
+ "claspr-test-image-kernels",
  "claspr-test-kernels",
  "futures",
  "ui_test",
