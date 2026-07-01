@@ -158,6 +158,26 @@ let result: Vec<u32> = upload(input)
 
 `.sync(&ctx)` enqueues the whole chain on the per-device out-of-order queue, the OpenCL runtime overlaps stages, and host-side work (via `.and_then_host` / `.and_then_host_with_context`) slots in without serialising through the submitting thread. `.run(&ctx)` returns a `Future` for the same chain (feature `async-events`). Other combinators: `bundle!(a, b, c)` for heterogeneous parallel composition, `items.fan_out(|i| op)` for N-way homogeneous parallelism, `DeviceDynOp<T>` for type-erased branches, `.and_then_with_context(|ec, prev| op)` when the next step needs the running context, `.on_device(&dev)` / `transfer_to_device(buf, &dev)` for non-blocking cross-device pipelines, and lazy `device_slice_alloc_zero!(T, N)` / `mapped_slice_alloc_zero!(T, N)` / `usm_slice!(vec)` so temp buffers materialize at execute time. See `examples/async-pipeline` and `examples/batch-inference`. The `DeviceOp` trait and its `sync` / `wait` / `submit` terminal vocabulary are inspired by cuda-oxide's `DeviceOperation` / Rust-CUDA (see [Prior art](#prior-art-and-inspiration)).
 
+### Reusable graphs: typed slots and bind-by-name meta-kernels
+
+Because the graph is an eager, closure-free struct (not a lazy closure), it can be **built once, re-bound, and replayed**. `slots!` declares typed holes; `slot!(Tag)` plugs one in anywhere a concrete buffer / scalar / launch spec goes; then you `bind` values and `sync` — repeatedly:
+
+```rust
+use claspr::{slot, slots};
+use claspr::eager::{DeviceOpExt, download};
+
+slots! { Buf: DeviceSlice<u32>, Factor: u32 }
+
+let g = kernels.scale([N], slot!(Buf), slot!(Factor)).and_then(download);
+
+for x in inputs {                      // one graph, many runs
+    let out = g.mutate_call((Buf(upload_x), Factor(2)))  // (re)bind by name
+               .sync(&ctx)?;
+}
+```
+
+The bind surface is a small verb set: `bind` / `mutate_bind` (set-once / change, one slot) and `call` / `mutate_call` (a tuple, all-or-nothing). Their **consuming, infallible** siblings `call_move` / `bind_move` return the owned graph, so a whole reusable graph is usable *inside* an `.and_then` closure — the basis for composing one graph out of others. A slot's source can be a value (`Buf(x)`), a finished run's output (`Buf(checkout)` — sever-and-adopt, the double-buffer swap), or an upstream pipe (`Buf(pipe)` — the same constructor fed a `Pipe`, wiring the slot to another graph's output). This "bind-by-name meta-kernel" style lets you assemble a multi-dispatch graph, curry its invariants once with `bind_move`, and vary only the rotating buffers per step. `examples/gray-scott` is the flagship: a reaction-diffusion solver written two ways — a mutable-swap replay and a curried immutable compose — proven bit-identical.
+
 ## Workspace layout
 
 | Crate | Role |
@@ -172,6 +192,7 @@ let result: Vec<u32> = upload(input)
 | `examples/async-pipeline/` | Device-graph demo: upload → linear → relu → linear → download as one lazy chain. Inline `#[test]` validates device output against an identical host implementation. |
 | `examples/batch-inference/` | Device-graph fan-out: N independent batches in parallel via `fan_out`, sharing model weights through one `Arc<DeviceSlice>` (uploaded once, read-only in every branch). |
 | `examples/two-device/` | Multi-device API: `Context::for_devices()`, `Queue::on_device()`, cross-queue buffer `copy_to`, plus a sub-device partition fallback so it does something useful even on single-physical-device boxes. No kernel code. |
+| `examples/gray-scott/` | Reusable-graph flagship: a Gray-Scott reaction-diffusion solver built two ways over typed slots — `run_swap` (mutable-swap replay) and `run_immutable` (a curried bind-by-name meta-kernel composed with `call_move` / `bind_move`). An inline `#[test]` proves the two are bit-identical. Writes a `.ppm` of the final V field. |
 
 ## Running the examples
 
@@ -188,6 +209,9 @@ cargo run -p image-pipeline
 # Tier 2 chains
 cargo run -p async-pipeline-example
 cargo run -p batch-inference-example
+
+# Reusable-graph flagship: reaction-diffusion, two graph shapes, bit-identical
+cargo run -p gray-scott-example
 
 # Multi-device walk
 cargo run -p two-device-example

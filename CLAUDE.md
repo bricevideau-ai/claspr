@@ -24,6 +24,10 @@ examples/two-device/          multi-device routing (on_device_at /
                               transfer_to_device_at).
 examples/async-pipeline/      .run().await async-terminal demo.
 examples/batch-inference/     Tier 2 device-graph batch demo.
+examples/gray-scott/          reusable-graph flagship — reaction-diffusion
+                              with typed slots + bind-by-name meta-kernel
+                              (run_swap mutable-replay vs run_immutable
+                              curried compose, proven bit-identical).
 examples/spv-introspect/      SPIR-V introspection helper demo.
 
 tests/kernels, tests/image-kernels, tests/explicit-compile,
@@ -60,8 +64,25 @@ A claspr kernel can be packaged as its own library crate (`pub mod gpu`, build.r
 - **Pure kernel library** (mandelbrot-kernel, sobel-kernel today): exposes only typed launch handles. spirv-std imports inside the library's device module are cfg-gated to `target_arch = "spirv"` so consumers don't pay for spirv-std as a transitive dep. Helpers can't reference device-only types directly (the library's host build won't have those types in scope).
 - **Mixed kernel + host library** (raymarch is binary-shaped today; could be a library): exposes typed launch handles AND host-callable helpers (e.g., `pixel_color` for validation). Needs spirv-std as a *regular* host dep so types like `cl::Float3` are in scope on both sides. Cost: consumers pull spirv-std transitively. Benefit: full host parity.
 
+## Tier 2: the reusable device-operation graph (`claspr/src/eager.rs`)
+
+Every op implements the one `DeviceOp` trait, so it runs standalone (`.wait()`) or composes into an **eager, closure-free** graph via `.and_then` / `bundle!` / `fan_out`, with terminals `.sync(&ctx)` (blocking) / `.run(&ctx)` (Future). Builders run at *construction* over a build-time `Handle`, so the graph is a nested struct you can `describe()` without executing (unlike cuda-oxide's lazy-closure model — same vocabulary, different mental model).
+
+**Typed slots** make a graph *reusable* — build once, re-bind and replay:
+
+- `slots!{ Tag: Type, ... }` declares tag types; `slot!(Tag)` is an unbound hole usable anywhere a concrete buffer/scalar/`LaunchSpec` goes. A tag is generic over its binding *source*: `Tag<S = Value>(pub S)`.
+- **Bind verbs (2×2):** `bind` / `mutate_bind` (set-once / change, one tag, fluent `&Self`, eager errors) and `call` / `mutate_call` (a tuple of tags, all-or-nothing via a phase-0 probe before any sever).
+- **`SlotState` is 5-state:** `Unbound` → `Bound` → `Lent` (checked out) → `Severed` (value taken via `Checkout::into_inner`, only `mutate_bind` re-arms) — plus `FedByPipe(Pipe<T>)`, a slot wired to an upstream pipe.
+- **Home invariant:** a lent buffer always rehomes to its cell on `Checkout`/payload drop (never destroyed), so `cl_mem` handles stay stable across replays — the prerequisite for command-buffer caching (the next layer, tracked in `NOTES.md`). `sync`/`wait_on` are atomic: a read-only `check_ready` pre-pass validates every input cell before any enqueue.
+- **`call_move` / `bind_move`** are the *consuming, infallible* siblings of `call`: they return the owned graph (so the graph is usable as the bare `U` inside an `and_then` closure) and defer bind errors to `sync`'s `check_ready`. `bind_move` is `call_move` used for currying (partial-bind the invariants now, the rest later). Name convention: verb root first, modifier suffix (`bind_move`, `call_move` — matching `mutate_bind`).
+- **Unified tag constructor:** `Tag(value)` binds by value; `Tag(pipe)` wires the slot to an upstream pipe (`FedByPipe`). One constructor, two sources — there is **no separate `feed` verb** (a fluent `DeviceOpExt::feed::<Tg>` method exists internally but the tuple surface is just `Tag(pipe)`). The `slots!` macro emits three per-tag *concrete-source* `CallArg` impls (`$val`, `Checkout<$val>` value-bind; `Pipe<V>` pipe-feed gated on `V: RecordableBuffer`) — deliberately **not** an `impl<Tg: Tag> CallArg for Tg` blanket, which breaks cross-crate coherence for scalar-valued tags. Scalars (`f32`, `LaunchSpec`) stay value-only by construction: `F(pipe)` finds no `CallArg` and fails to compile (guarded by `tests/tier2/compile_fail/scalar_slot_fed_pipe.rs`).
+
+The `examples/gray-scott` flagship exercises the whole story: `run_swap` (mutable-swap replay, `mutate_call` mid-run reconfigure) and `run_immutable` (a curried two-closure meta-kernel — `get_meta_kernel` builds the DAG with all slots open + a `bundle4` output trim, `curried_kernel` `bind_move`s the invariants, then two `call_move`s compose the unrolled pair with the crossed rotation fed by name), proven bit-identical by `swap_and_immutable_agree_bit_for_bit`.
+
 ## Key files
 
+- `claspr/src/eager.rs` — the entire Tier 2 graph engine: `DeviceOp`/`DeviceOpExt`, all combinators, and the slot machinery (`SlotState`, `SlotBinder`, `Checkout`, `IntoBound`, `CallArg`/`CallArgs`, the bind/call/`call_move`/`bind_move`/`feed` verbs). Largest and most active surface for graph work.
+- `claspr/src/tier2_macros.rs` — the `slots!` / `slot!` macros, including the per-tag `Tag`, `IntoBound`, and `CallArg` impls (value + `Checkout` + `Pipe` sources) each tag emits.
 - `claspr-build/src/lib.rs` — both `compile()` (separate kernel crate) and `compile_from_host()` (single-source extraction) live here. The translation logic (`translate_and_inline`, `resolve_module_file`, `is_claspr_kernel_attr`, `is_claspr_device_attr`) is the most-likely-to-change surface as new kernel patterns surface; multi-file resolution rules also live there.
 - `claspr-macros/src/lib.rs` — `#[kernel]` + `#[device]`. The kernel signature → host wrapper translation lives in `classify_param`, `classify_image_param`, `slice_element_ty` (plus `parse_image_tokens`/`read_image_access_attr` for images). The device-on-mod injection (include! + `kernels()` fn) lives in the `device` proc-macro body.
 - `claspr/src/launch.rs` — `KernelArg` / `KernelArgs` / `LaunchSpec` / `IntoLaunchSpec`. Tuple impls are macro-emitted up to arity 8.
