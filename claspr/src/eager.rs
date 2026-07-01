@@ -825,7 +825,7 @@ impl SlotBinder {
         // appears AFTER an OK one), so it never lets the `AndThen`/bundle walk stop
         // early — it behaves like a fan-out even though it carries no value.
         //
-        // A pipe-feed binder also fans out — one `feed(Tag, pipe)` installs
+        // A pipe-feed binder also fans out — one `Tag(pipe)` installs
         // `FedByPipe` at EVERY site the tag appears (e.g. a `UIn` at both its
         // laplacian and combine positions), cloning the pipe per cell.
         self.probe || self.feed_pipe.is_some() || self.fill_clone().is_some()
@@ -3032,7 +3032,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     ///
     /// Returns `&Self` (fluent, fallible) — the sibling of [`bind`](Self::bind) for
     /// the pipe source. A feed inside a consuming `and_then`-composable tuple uses
-    /// the [`feed`] element constructor in [`call_move`](Self::call_move)
+    /// the unified `Tag(pipe)` constructor in [`call_move`](Self::call_move)
     /// instead (infallible, errors deferred to sync).
     fn feed<Tg: Tag>(&self, pipe: Pipe<Tg::Value>) -> Result<&Self> {
         let mut binder = SlotBinder::feed::<Tg>(pipe);
@@ -3050,8 +3050,8 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// Applies each element of `args` (a [`CallArgs`] tuple, arity 1..=8) to this
     /// graph, then returns the OWNED graph. Each element is INDEPENDENTLY either a
     /// **value tag** (`Buf(b)`, `Factor(2)` — folded through [`bind`](Self::bind)) or
-    /// a **pipe feed** ([`feed(Tag, pipe)`](feed) — folded through
-    /// [`feed`](Self::feed)), so a single tuple freely MIXES concrete binds and
+    /// a **pipe feed** (`Buf(pipe)` — the same tag constructor fed a `Pipe`, folded
+    /// through [`feed`](Self::feed)), so a single tuple freely MIXES concrete binds and
     /// upstream-pipe wiring (the crossed rotation visible in the arg list).
     ///
     /// ## Why consuming + infallible
@@ -3489,8 +3489,16 @@ impl_bind_all_tuple!(A, B, C, D, E, F, G, H);
 // ── CallArg / CallArgs: the mixed value-or-feed tuple for `call_move` ────────
 
 /// One element of a [`call_move`](DeviceOpExt::call_move) tuple — EITHER a **value
-/// tag** (`Buf(b)`, `Factor(2)`) that binds by value, OR a **pipe feed**
-/// ([`feed(Tag, pipe)`](feed)) that wires the tag's slot(s) to an upstream pipe.
+/// tag** (`Buf(b)`, `Factor(2)`) that binds by value, OR a **pipe feed** (`Buf(pipe)`
+/// — the SAME tag constructor fed a [`Pipe`] instead of a value) that wires the tag's
+/// slot(s) to an upstream pipe.
+///
+/// The two spellings share one surface: `Buf(x)` is a value-bind when `x` is a value
+/// (or [`Checkout`]) and a pipe-feed when `x` is a `Pipe<Buf::Value>`. The value-bind
+/// arm is the blanket `impl<Tg: Tag> CallArg for Tg`; the pipe-feed arm is the per-tag
+/// `impl CallArg for Tag<Pipe<..>>` the [`slots!`](crate::slots) macro emits (gated to
+/// buffer-valued tags via [`RecordableBuffer`](crate::record::RecordableBuffer), so a
+/// scalar `F(pipe)` does not compile).
 ///
 /// Applied **infallibly**: [`apply`](CallArg::apply) drops any bind error (an absent
 /// tag, a conflict, a checked-out slot) — the error surfaces later at
@@ -3501,50 +3509,29 @@ impl_bind_all_tuple!(A, B, C, D, E, F, G, H);
 pub trait CallArg {
     /// Apply this element's binding to graph `g`, INFALLIBLY (errors deferred to
     /// `sync`). A value tag folds through [`bind`](DeviceOpExt::bind) (set-once); a
-    /// [`Feed`] folds through [`feed`](DeviceOpExt::feed).
+    /// pipe-source tag folds through [`feed`](DeviceOpExt::feed).
     fn apply<Op: DeviceOp>(self, g: &Op);
 }
 
-/// A **value tag** binds by value (set-once [`bind`](DeviceOpExt::bind)). The bind
-/// error, if any, is DROPPED — deferred to `sync` (an unbound / conflicting slot
-/// surfaces there). Requires `Tg::Value: SlotEq + SlotValue`, the same bounds
-/// [`bind`](DeviceOpExt::bind) carries.
-impl<Tg> CallArg for Tg
-where
-    Tg: Tag,
-    Tg::Value: SlotEq + SlotValue,
-{
-    fn apply<Op: DeviceOp>(self, g: &Op) {
-        // Infallible: drop any bind error (deferred to sync's check_ready).
-        let _ = g.bind(self);
-    }
-}
-
-/// A **pipe feed** element of a [`call_move`](DeviceOpExt::call_move) tuple: tag `Tg`
-/// paired with the upstream [`Pipe<Tg::Value>`] its slot(s) should read. Built by the
-/// [`feed`] sugar; applying it installs [`SlotState::FedByPipe`] via
-/// [`DeviceOpExt::feed`].
-pub struct Feed<Tg: Tag>(Pipe<Tg::Value>);
-
-impl<Tg: Tag> CallArg for Feed<Tg> {
-    fn apply<Op: DeviceOp>(self, g: &Op) {
-        // Infallible: drop any feed error (an absent tag surfaces at sync).
-        let _ = g.feed::<Tg>(self.0);
-    }
-}
-
-/// **`feed(Tag, pipe)` sugar** — build a pipe-feed [`CallArg`] for tag `Tg`, for use
-/// as an element of a [`call_move`](DeviceOpExt::call_move) tuple. The first argument
-/// is the tag CONSTRUCTOR (`Buf` used as `fn(Value) -> Buf<Value>`), passed ONLY to
-/// infer `Tg` — it is never called. So `feed(UIn, upstream_pipe)` reads as "UIn is
-/// fed by `upstream_pipe`" right in the arg list, next to the plain value binds.
-pub fn feed<Tg: Tag>(_tag: fn(Tg::Value) -> Tg, pipe: Pipe<Tg::Value>) -> Feed<Tg> {
-    Feed(pipe)
-}
+// The concrete `CallArg` impls (value-bind for the raw-value and `Checkout` sources,
+// pipe-feed for the `Pipe` source) are emitted PER-TAG by the [`slots!`](crate::slots)
+// macro — NOT as an open `impl<Tg: Tag> CallArg for Tg` blanket. This is a
+// CROSS-CRATE COHERENCE requirement: an open blanket over `Tg: Tag` would collide with
+// the per-tag pipe impl `CallArg for $name<Pipe<V>>` for SCALAR-valued tags, because
+// the compiler must assume this (upstream) crate could later add both
+// `IntoBound<f32> for Pipe<f32>` (making `F<Pipe<f32>>: Tag`, matching the blanket) and
+// `RecordableBuffer for f32` (inhabiting the pipe impl) — a potential future overlap it
+// rejects TODAY. Emitting VALUE-bind on the two CONCRETE non-pipe sources
+// (`$name<$val>`, `$name<Checkout<$val>>`) instead makes the three source shapes
+// (`$val` / `Checkout` / `Pipe`) structurally disjoint type constructors that NO
+// upstream impl can ever unify — so the coherence holds unconditionally. The two
+// concrete value-bind arms exactly cover the two existing `IntoBound` sources (identity
+// `V` and `Checkout<V>`); there are no others.
 
 /// A tuple of [`CallArg`]s — the argument to [`call_move`](DeviceOpExt::call_move).
-/// Each element is INDEPENDENTLY a value tag or a [`Feed`], applied left-to-right,
-/// infallibly. Implemented for arities 1..=8 (mirroring [`BindAll`]).
+/// Each element is INDEPENDENTLY a value tag (`Buf(v)`) or a pipe feed (`Buf(pipe)`),
+/// applied left-to-right, infallibly. Implemented for arities 1..=8 (mirroring
+/// [`BindAll`]).
 pub trait CallArgs {
     /// Apply every element to `g` (infallibly, in tuple order).
     fn apply_all<Op: DeviceOp>(self, g: &Op);

@@ -334,6 +334,69 @@ macro_rules! slots {
                     $crate::IntoBound::source_cell_id(&self.0)
                 }
             }
+
+            // ── Unified `$name(x)` CallArg surface (value OR pipe, one ctor) ──
+            //
+            // These per-tag `CallArg` impls are what let a tag be used as an element
+            // of a [`call_move`](crate::DeviceOpExt::call_move) tuple. `$name(value)`
+            // and `$name(checkout)` BIND by value; `$name(pipe)` WIRES the slot to an
+            // upstream pipe (`SlotState::FedByPipe`) — the pipe-feed and value-bind
+            // spellings unified into ONE tag constructor (no separate `feed` verb).
+            //
+            // WHY per-tag CONCRETE sources (not an `impl<Tg: Tag> CallArg for Tg`
+            // blanket): cross-crate coherence. A blanket would collide with the pipe
+            // impl below for SCALAR-valued tags, since the compiler must assume the
+            // `claspr` crate could later add `IntoBound<$val> for Pipe<$val>` and
+            // `RecordableBuffer for $val` — a hypothetical future overlap it rejects
+            // now. Keying value-bind on the two CONCRETE non-pipe sources makes
+            // `$val` / `Checkout` / `Pipe` structurally disjoint type constructors
+            // that no upstream impl can unify. See the note by `CallArgs` in eager.rs.
+
+            // Value-bind, raw-value source (`$name(v)` => `$name<$val>`).
+            impl $crate::eager::CallArg for $name<$val>
+            where
+                $val: $crate::SlotEq + $crate::SlotValue,
+            {
+                fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
+                    // Infallible: drop any bind error (deferred to sync's check_ready).
+                    let _ = $crate::DeviceOpExt::bind(g, self);
+                }
+            }
+
+            // Value-bind, `Checkout` source (`$name(co)` => `$name<Checkout<$val>>`)
+            // — the sever-and-adopt bind.
+            impl $crate::eager::CallArg for $name<$crate::Checkout<$val>>
+            where
+                $val: $crate::SlotEq + $crate::SlotValue + ::core::marker::Send,
+            {
+                fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
+                    // Infallible: drop any bind error (deferred to sync's check_ready).
+                    let _ = $crate::DeviceOpExt::bind(g, self);
+                }
+            }
+
+            // Pipe-feed, `Pipe` source (`$name(pipe)` => `$name<Pipe<V>>`) — installs
+            // `SlotState::FedByPipe` at every site the tag appears.
+            //
+            // BUFFER-ONLY by construction: the `V: RecordableBuffer` bound sits on a
+            // TYPE PARAM (conditional existence, not a concrete trivial bound), and
+            // only device-buffer families impl `RecordableBuffer` — never scalars
+            // (`f32`) or `LaunchSpec`. So for a scalar/launch tag this impl is
+            // uninhabited: `F(pipe)` finds no `CallArg` and FAILS TO COMPILE, keeping
+            // scalar/launch slots value-only. The `$name<V>: Tag<Value = V>` bound
+            // pins `V` to the tag's value type (via the identity `IntoBound<V> for V`)
+            // and hands us the concrete tag to feed via [`DeviceOpExt::feed`].
+            impl<V> $crate::eager::CallArg for $name<$crate::Pipe<V>>
+            where
+                V: $crate::record::RecordableBuffer + ::core::marker::Send + 'static,
+                $name<V>: $crate::Tag<Value = V>,
+            {
+                fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
+                    // Infallible: drop any feed error (an absent tag surfaces at sync,
+                    // exactly as the value-bind `CallArg` folds through `bind`).
+                    let _ = $crate::DeviceOpExt::feed::<$name<V>>(g, self.0);
+                }
+            }
         )+
     };
 }
