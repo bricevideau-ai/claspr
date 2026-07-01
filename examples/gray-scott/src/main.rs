@@ -8,6 +8,38 @@
 //! reading a handful of shared scalar parameters, and (the punchline) producing
 //! a visibly *different* pattern the moment you retune those parameters mid-run.
 //!
+//! ## TWO execution strategies for the SAME computation (the thesis)
+//!
+//! The headline claim — *graphs as meta-kernels* — is proven here by running the
+//! **identical** Gray-Scott arithmetic through **two different graph shapes**,
+//! and asserting they agree to the bit. Both drive the same three device kernels
+//! (`laplacian` ×2 + `combine`); they differ only in how double-buffering is
+//! wired into the graph:
+//!
+//! - [`run_swap`] — the **mutable-swap** strategy. Build a graph for ONE step,
+//!   then re-bind its four field slots *crossed* between steps (`mutate_call`)
+//!   so the buffers ping-pong. The graph's buffer *handles change every step*;
+//!   the topology is one step and the rotation lives in per-step rebinding.
+//!   Replayed once per step (`STEPS` syncs).
+//!
+//! - [`run_immutable`] — the **immutable / unroll-by-2** strategy. Bake the
+//!   buffer rotation into the graph TOPOLOGY: compose the per-step subgraph WITH
+//!   ITSELF (step-k then step-k+1). Double-buffering rotates roles every step
+//!   (step k: read A write B; step k+1: read B write A), so after *two* steps
+//!   you are back to "current = A" — the two-step graph has **fixed buffer
+//!   roles/handles** and needs **NO per-step rebinding at all**. Its outer input
+//!   slots are bound ONCE (`call`) and it is replayed `STEPS/2` times via plain
+//!   `sync()`; the A↔B rotation is entirely internal, threaded as pipes. This is
+//!   the shape that would bake into a single immutable command buffer once
+//!   step-c (command-buffer caching) lands: no mutation between replays.
+//!
+//! Both start from the same initial condition and the same `(F, k)`, run the
+//! same number of steps, and their final `V` fields must be **bit-identical** —
+//! same arithmetic, same order, just a different graph geometry. That equality
+//! (asserted in the `#[test]`) is the proof that *unroll-by-period replay* and
+//! *mutable-swap replay* are two spellings of one meta-kernel. `main` runs both
+//! and prints whether they agree; each writes its own final frame.
+//!
 //! ## The computation
 //!
 //! Two scalar fields `U` and `V` live on a 2D periodic grid and co-evolve by
@@ -104,16 +136,19 @@
 //!
 //! ## Output
 //!
-//! Writes three PPM frames — `gray-scott-early.ppm`, `gray-scott-late.ppm`,
-//! `gray-scott-reconfigured.ppm` — showing pattern emergence then the mid-run
-//! retune. `V` is colorized on the HOST after `download` (a blue→teal→white
-//! ramp); no image kernel is involved.
+//! The **swap** variant writes three PPM frames — `gray-scott-early.ppm`,
+//! `gray-scott-late.ppm`, `gray-scott-reconfigured.ppm` — showing pattern
+//! emergence then the mid-run retune. The **immutable** variant writes
+//! `gray-scott-immutable.ppm` (its final `V` at the phase-1 regime). `V` is
+//! colorized on the HOST after read-back (a blue→teal→white ramp); no image
+//! kernel is involved.
 //!
 //! Run with
 //! `OCL_ICD_VENDORS=$HOME/local/pocl/etc/OpenCL/vendors cargo run -p gray-scott-example`.
-//! The `#[test]` at the bottom is the smoke test (short sim, asserts the field
-//! stays bounded, is NaN-free, and actually evolved away from the initial
-//! condition).
+//! It runs BOTH variants and prints whether the swap and immutable final `V`
+//! fields agree. The `#[test]` at the bottom is the smoke test (short sim,
+//! asserts the field stays bounded, NaN-free, and actually evolved away from the
+//! initial condition) PLUS the swap-vs-immutable equality proof.
 
 use claspr::eager::DeviceOpExt;
 use claspr::{Context, DeviceSlice, LaunchSpec};
@@ -317,9 +352,17 @@ fn read_field(field: &DeviceSlice<f32>) -> claspr::Result<Vec<f32>> {
     Ok(guard.to_vec())
 }
 
-/// Run the whole simulation. Returns the final `V` field (host) for the smoke
-/// test, and writes the PPM frames as it goes when `write_frames` is set.
-fn run(
+/// **Strategy 1: mutable-swap replay.** Build a graph for ONE step, then
+/// ping-pong its four field slots crossed each step via `mutate_call`. The
+/// graph's buffer handles change every step; the rotation lives in per-step
+/// rebinding. Returns the final `V` field (host) for the smoke test + equality
+/// proof, and writes the PPM frames as it goes when `write_frames` is set.
+///
+/// This is also the showcase for mid-run reconfigure: with `steps_phase2 > 0` it
+/// `mutate_bind`s a new `(F, k)` regime between the two phases and keeps stepping
+/// the SAME graph. Pass `steps_phase2 = 0` for a plain single-regime run (what
+/// the equality proof compares against [`run_immutable`]).
+fn run_swap(
     ctx: &Context,
     grid_w: usize,
     grid_h: usize,
@@ -507,6 +550,195 @@ fn run(
     Ok(final_v)
 }
 
+/// **Strategy 2: immutable / unroll-by-2 replay.** Same three kernels, same
+/// arithmetic — but the double-buffer rotation is baked into the graph TOPOLOGY
+/// instead of per-step rebinding, giving a graph with FIXED buffer handles that
+/// replays with ZERO mutation between iterations.
+///
+/// ## Why unroll-by-2 fixes the handles
+///
+/// Double-buffering rotates roles every step: step k reads A writes B, step k+1
+/// reads B writes A. A ONE-step graph therefore has handles that change each
+/// step (which is exactly why [`run_swap`] must `mutate_call` the four field
+/// slots crossed between steps). But compose the per-step subgraph WITH ITSELF —
+/// step-k THEN step-k+1 — and after those two steps "current" is back in A. The
+/// **two-step** graph has fixed buffer roles: its inputs are `(A_u, A_v)` and
+/// after running it "current" is again `(A_u, A_v)`. So it can be replayed
+/// `steps/2` times over the SAME handles with no rebinding at all — the shape
+/// that bakes cleanly into one immutable command buffer once step-c lands.
+///
+/// ## How the rotation is threaded (pipes, not slots)
+///
+/// The two-step graph is the per-step DAG composed with itself. Step 1's
+/// `combine` is 6-output — it threads ALL its buffer args forward as pipes,
+/// including its read-only inputs `(u_a, v_a)` passed through unchanged. So step
+/// 2 reads step 1's OUTPUT buffers `(u_b, v_b)` as its fields and writes back
+/// into step 1's INPUT buffers `(u_a, v_a)` — both arrive as pipes off step 1's
+/// `combine`, needing NO slots. Net over the pair: A→B then B→A = identity on
+/// roles.
+///
+/// Only the OUTER handles carry slots, bound ONCE with `call`: `Grid`, the
+/// initial fields `UIn`/`VIn` (= `u_a`/`v_a`, step 1's lap inputs), the step-1
+/// scratch targets `UOut`/`VOut` (= `u_b`/`v_b`), and the scalars `F`/`K`. There
+/// is deliberately **no `call` inside `and_then`** — the kernel builder methods
+/// already return owned ops and the inter-stage buffers thread as pipes, so
+/// composition uses those, not `call`.
+///
+/// ## Lap scratch: two independent sets
+///
+/// The two steps use SEPARATE lap scratch buffers (`lap_*1` for step 1,
+/// `lap_*2` for step 2). Reusing one set across the two steps within a single
+/// graph would make step 2's lap WRITE the very buffer step 1's `combine` READS,
+/// a write-after-read hazard the pure-dataflow (pipe) graph does not serialize —
+/// so two sets keep the two steps' Laplacians independent and correct. They are
+/// concrete buffers threaded as pipes (no slots), never rebound.
+///
+/// `steps` must be EVEN (the unroll period is 2). Returns the final `V` field.
+fn run_immutable(
+    ctx: &Context,
+    grid_w: usize,
+    grid_h: usize,
+    steps: usize,
+    feed: f32,
+    kill: f32,
+    write_frame: bool,
+) -> claspr::Result<Vec<f32>> {
+    assert_eq!(
+        grid_w * grid_h,
+        N,
+        "this helper is fixed to the W*H constants"
+    );
+    assert_eq!(steps % 2, 0, "unroll-by-2 requires an even step count");
+    let ks = gpu::kernels(ctx)?;
+
+    let (u0, v0) = initial_fields();
+
+    // Two device buffers per field. A holds the initial / period-boundary state;
+    // B is the intermediate (step-1 output). Over the two-step graph the roles
+    // are identity: read A → write B → read B → write A.
+    let u_a = seeded(ctx, u0)?;
+    let u_b = seeded(ctx, vec![0.0f32; N])?;
+    let v_a = seeded(ctx, v0)?;
+    let v_b = seeded(ctx, vec![0.0f32; N])?;
+
+    // Two INDEPENDENT lap scratch sets — one per unrolled step (see doc above).
+    let lap_u1 = seeded(ctx, vec![0.0f32; N])?;
+    let lap_v1 = seeded(ctx, vec![0.0f32; N])?;
+    let lap_u2 = seeded(ctx, vec![0.0f32; N])?;
+    let lap_v2 = seeded(ctx, vec![0.0f32; N])?;
+
+    // ── Build the TWO-step meta-kernel ONCE, INLINE. Six dispatches; fixed handles. ──
+    //   STEP 1 (read A, write B):
+    //     lap(UIn=u_a → lap_u1); lap(VIn=v_a → lap_v1);
+    //     combine(u_a, v_a, lap_u1, lap_v1 → UOut=u_b, VOut=v_b)
+    //   STEP 2 (read B, write A) — ALL operands are pipes off step-1 combine:
+    //     lap(u_b → lap_u2); lap(v_b → lap_v2);
+    //     combine(u_b, v_b, lap_u2, lap_v2 → u_a, v_a)
+    //
+    // Over the pair the buffer roles are identity (A→B→A) → fixed handles, NO
+    // per-step rebinding. The inter-step field buffers thread as pipes exactly
+    // like the intra-step lap→combine threading: step 1's `combine` is 6-output,
+    // so its inputs (u_a, v_a) pass through and become step 2's WRITE targets,
+    // while its outputs (u_b, v_b) become step 2's READ fields. Two independent
+    // lap scratch sets keep the two steps' Laplacians from aliasing.
+    //
+    // (Built inline: factoring this into a reusable `fn step(...) -> impl DeviceOp`
+    // is blocked by RPIT — the return would have to spell Output+Handle+Checkouts
+    // as three 6-tuples. A readable *inline* composition of graph values is the
+    // target of the `move`-call work; see NOTES / the move-call design task.)
+    let g =
+        ks.laplacian(slot!(Grid), slot!(UIn), lap_u1)
+            .and_then(move |(u_a_pipe, lap_u1_pipe)| {
+                ks.laplacian(slot!(Grid), slot!(VIn), lap_v1).and_then(
+                    move |(v_a_pipe, lap_v1_pipe)| {
+                        ks.combine(
+                            slot!(Grid),
+                            u_a_pipe,    // pipe: U field A
+                            v_a_pipe,    // pipe: V field A
+                            lap_u1_pipe, // pipe: U-Laplacian (step 1)
+                            lap_v1_pipe, // pipe: V-Laplacian (step 1)
+                            slot!(UOut), // = u_b
+                            slot!(VOut), // = v_b
+                            slot!(F),
+                            slot!(K),
+                        )
+                        // STEP 2 — composed with step 1's combine outputs, roles CROSSED.
+                        .and_then(
+                            move |(u_a2, v_a2, _lap_u1_done, _lap_v1_done, u_b_pipe, v_b_pipe)| {
+                                ks.laplacian(slot!(Grid), u_b_pipe, lap_u2).and_then(
+                                    move |(u_b2, lap_u2_pipe)| {
+                                        ks.laplacian(slot!(Grid), v_b_pipe, lap_v2).and_then(
+                                            move |(v_b2, lap_v2_pipe)| {
+                                                ks.combine(
+                                                    slot!(Grid),
+                                                    u_b2,        // pipe: U field B (read)
+                                                    v_b2,        // pipe: V field B (read)
+                                                    lap_u2_pipe, // pipe: U-Laplacian (step 2)
+                                                    lap_v2_pipe, // pipe: V-Laplacian (step 2)
+                                                    u_a2,        // pipe: write BACK into A
+                                                    v_a2,        // pipe: write BACK into A
+                                                    slot!(F),    // shared slots, fanned to
+                                                    slot!(K),    // BOTH combine sites
+                                                )
+                                            },
+                                        )
+                                    },
+                                )
+                            },
+                        )
+                    },
+                )
+            });
+
+    // Bind the OUTER slots ONCE via `call`. Grid + F + K fan out to BOTH steps'
+    // sites (shared slots). UIn/VIn/UOut/VOut are step-1 handles; step 2's
+    // operands are all internal pipes, so there is nothing else to bind. After
+    // this the graph is fully armed and replays with NO further binding.
+    g.call((
+        Grid(LaunchSpec::from([grid_w, grid_h])),
+        F(feed),
+        K(kill),
+        UIn(u_a),
+        VIn(v_a),
+        UOut(u_b),
+        VOut(v_b),
+    ))?;
+
+    // ── Replay the TWO-step graph steps/2 times via plain sync(). ───────────
+    // NO per-step rebinding: each `sync` runs both unrolled steps (A→B→A), and
+    // the returned Checkouts drop at end of iteration, re-arming every lent
+    // concrete cell to the SAME buffer — so the next `sync` reuses the identical
+    // handles. This is the whole point: an immutable graph replayed by period.
+    let pairs = steps / 2;
+    let mut final_v: Vec<f32> = Vec::new();
+    for p in 0..pairs {
+        // `combine` (step 2) is terminal: sync yields ITS six outputs
+        // (u_b, v_b, lap_u2, lap_v2, u_a, v_a) — the last two are the fresh A
+        // fields (this pair's result). Read V from the A output before drop.
+        let (_u_b_co, _v_b_co, _lap_u2_co, _lap_v2_co, _u_a_co, v_a_co) = g.sync(ctx)?;
+        if p + 1 == pairs {
+            final_v = read_field(&v_a_co)?;
+        }
+        // Checkouts drop here → re-arm the graph over the same handles. Next
+        // sync replays with zero rebinding.
+    }
+
+    if write_frame {
+        claspr::write_ppm_rgba8(
+            "gray-scott-immutable.ppm",
+            W as u32,
+            H as u32,
+            &colorize_v(&final_v),
+        )?;
+        println!(
+            "wrote frame gray-scott-immutable.ppm ({steps} steps @ F={feed}, k={kill}, \
+             unroll-by-2, {pairs} replays, no rebinding)"
+        );
+    }
+
+    Ok(final_v)
+}
+
 fn main() -> claspr::Result<()> {
     let ctx = match Context::any() {
         Ok(c) => c,
@@ -515,12 +747,46 @@ fn main() -> claspr::Result<()> {
             return Ok(());
         }
     };
+
+    // ── Variant 1: the mutable-swap showcase (with a mid-run reconfigure). ───
     println!(
-        "gray-scott: {W}x{H} grid (2D dispatch), {} phase-1 + {} phase-2 steps; the per-step \
-         THREE-dispatch graph (lap_u, lap_v, combine) is built ONCE and replayed (meta-kernel).",
+        "gray-scott [swap]: {W}x{H} grid (2D dispatch), {} phase-1 + {} phase-2 steps; the \
+         per-step THREE-dispatch graph (lap_u, lap_v, combine) is built ONCE and replayed, \
+         ping-ponging four field slots each step (meta-kernel, mutable-swap replay).",
         STEPS_PHASE1, STEPS_PHASE2
     );
-    run(&ctx, W, H, STEPS_PHASE1, STEPS_PHASE2, STEPS_EARLY, true)?;
+    run_swap(&ctx, W, H, STEPS_PHASE1, STEPS_PHASE2, STEPS_EARLY, true)?;
+
+    // ── Variant 2: the immutable / unroll-by-2 form (same math, fixed graph). ─
+    // Run it at the SAME phase-1 regime for the SAME number of steps as swap's
+    // phase 1, so the two are directly comparable — then prove they agree.
+    println!(
+        "gray-scott [immutable]: SAME computation via a TWO-step graph (step-k THEN step-k+1) \
+         whose buffer roles are IDENTITY over the pair — bound ONCE with call, replayed {}/2 \
+         times via plain sync() with ZERO per-step rebinding (unroll-by-period replay).",
+        STEPS_PHASE1
+    );
+    let imm_v = run_immutable(&ctx, W, H, STEPS_PHASE1, F1, K1, true)?;
+
+    // The equality proof at full scale: a single-regime swap run of the SAME
+    // steps/params must match the immutable run to the bit.
+    let swap_v = run_swap(&ctx, W, H, STEPS_PHASE1, 0, STEPS_PHASE1 + 1, false)?;
+    let agree = swap_v == imm_v;
+    println!(
+        "gray-scott: swap vs immutable final V over {} steps @ (F={F1}, k={K1}): {}",
+        STEPS_PHASE1,
+        if agree {
+            "BIT-IDENTICAL — the two graph shapes are one meta-kernel".to_string()
+        } else {
+            let max_abs = swap_v
+                .iter()
+                .zip(&imm_v)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            format!("differ (max |Δ| = {max_abs:e})")
+        }
+    );
+
     println!("gray-scott: done");
     Ok(())
 }
@@ -539,9 +805,9 @@ mod tests {
             return;
         };
 
-        // Reuse the full constants (grid is fixed to W*H in `run`), but only a
-        // handful of steps in each phase — enough to move V off zero.
-        let final_v = run(&ctx, W, H, 120, 120, 60, false).expect("run gray-scott smoke");
+        // Reuse the full constants (grid is fixed to W*H in `run_swap`), but only
+        // a handful of steps in each phase — enough to move V off zero.
+        let final_v = run_swap(&ctx, W, H, 120, 120, 60, false).expect("run gray-scott smoke");
 
         let sum_v: f64 = final_v.iter().map(|&x| x as f64).sum();
         let any_nan = final_v.iter().any(|x| x.is_nan());
@@ -557,6 +823,64 @@ mod tests {
         assert!(
             sum_v > 1.0,
             "V must grow from the ~0 initial condition (the reaction ran); sum_v={sum_v}"
+        );
+    }
+
+    /// **The thesis proof.** The two graph shapes — mutable-swap replay
+    /// ([`run_swap`], one-step graph re-bound crossed each step) and immutable
+    /// unroll-by-2 replay ([`run_immutable`], two-step graph, fixed handles, no
+    /// rebinding) — are the SAME arithmetic in the SAME order. From the SAME
+    /// initial condition, SAME `(F, k)`, and SAME (even) step count, their final
+    /// `V` fields must be **bit-identical**. That equality is the proof that
+    /// unroll-by-period replay == mutable-swap replay: one meta-kernel, two
+    /// execution strategies.
+    #[test]
+    fn swap_and_immutable_agree_bit_for_bit() {
+        let Ok(ctx) = Context::any() else {
+            eprintln!("SKIP: no OpenCL device");
+            return;
+        };
+
+        // A short EVEN-length single-regime sim under both strategies.
+        const STEPS: usize = 120;
+
+        // Swap: single regime (phase2 = 0), no frames, no reconfigure.
+        let swap_v = run_swap(&ctx, W, H, STEPS, 0, STEPS + 1, false).expect("run swap variant");
+        // Immutable: same steps / params, no frame.
+        let imm_v = run_immutable(&ctx, W, H, STEPS, F1, K1, false).expect("run immutable variant");
+
+        // Both must have evolved off the ~0 initial V and be NaN-free.
+        assert!(
+            !swap_v.iter().any(|x| x.is_nan()),
+            "swap V must be NaN-free"
+        );
+        assert!(
+            !imm_v.iter().any(|x| x.is_nan()),
+            "immutable V must be NaN-free"
+        );
+        let swap_sum: f64 = swap_v.iter().map(|&x| x as f64).sum();
+        let imm_sum: f64 = imm_v.iter().map(|&x| x as f64).sum();
+        assert!(swap_sum > 1.0, "swap V must evolve from ~0; sum={swap_sum}");
+        assert!(
+            imm_sum > 1.0,
+            "immutable V must evolve from ~0; sum={imm_sum}"
+        );
+
+        // THE equality: same math, same order, different graph geometry.
+        assert_eq!(
+            swap_v.len(),
+            imm_v.len(),
+            "both variants produce a W*H field"
+        );
+        let max_abs = swap_v
+            .iter()
+            .zip(&imm_v)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(
+            swap_v, imm_v,
+            "swap and immutable final V must be BIT-IDENTICAL (same arithmetic, same order); \
+             max |Δ| = {max_abs:e}"
         );
     }
 }
