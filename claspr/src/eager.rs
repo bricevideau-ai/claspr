@@ -101,10 +101,15 @@ pub trait DeviceEnqueue: Send + Sized {
 /// hold a clone to deposit the value back home.
 pub type Cell<T> = Arc<Mutex<Option<T>>>;
 
-// ── SlotState<T>: the four-state slot cell ─────────────────────────────────
+// ── SlotState<T>: the five-state slot cell ─────────────────────────────────
 
-/// The cell behind an [`Input::Slot`] — a **four-state** resource holder, the
+/// The cell behind an [`Input::Slot`] — a **five-state** resource holder, the
 /// distinction a bare `Option<T>` cannot make.
+///
+/// The first four states form the eager value-bind machine (`Unbound` / `Bound` /
+/// `Lent` / `Severed`); the fifth, [`FedByPipe`](SlotState::FedByPipe), wires the
+/// slot to an upstream pipe instead of a value (the [`feed`](DeviceOpExt::feed)
+/// verb) and behaves like [`Input::Pipe`] at run time.
 ///
 /// A concrete head's [`Cell<T>`] only ever needs `Some`/`None` (full / lent),
 /// because "the cell is empty" unambiguously means "a run lent it and a still-live
@@ -150,6 +155,32 @@ pub enum SlotState<T> {
     /// [`into_inner`](Checkout::into_inner). Empty like `Unbound`, but a set-once
     /// `bind` rejects it ([`Error::SlotSevered`]); only `mutate_bind` re-arms it.
     Severed,
+    /// **Fed by an upstream pipe** — the slot's value is produced by an UPSTREAM op
+    /// each run and delivered through this [`Pipe`], NOT bound eagerly to a buffer.
+    ///
+    /// This is the fifth slot state and the engine half of the
+    /// [`feed`](DeviceOpExt::feed) verb: it lets a `slot!(Tag)` declared in one
+    /// subgraph be wired to an upstream [`Handle`](DeviceOp::Handle) (a build-time
+    /// [`Pipe`]) at compose time, so a downstream stage READS whatever an upstream
+    /// stage produced without a concrete buffer ever being named. It is how the
+    /// crossed double-buffer rotation is expressed as *data* in the arg list.
+    ///
+    /// At run time it behaves exactly like [`Input::Pipe`], NOT like a bound slot:
+    ///
+    /// - `Input::lend_slot` DRAINS the pipe (which the producer filled
+    ///   earlier THIS run) via [`Pipe::take_home`], carrying the upstream deps + home
+    ///   onward — and LEAVES the `FedByPipe` variant in place so the slot RE-ARMS on
+    ///   the next replay (the upstream refills the pipe each run). This mirrors the
+    ///   [`Input::Pipe`] arm of [`resolve_home`](Input::resolve_home) exactly.
+    /// - [`check_ready`](Input::check_ready) treats it as *satisfied-by-upstream*
+    ///   (deferred, like [`Input::Pipe`]) — NEVER [`Error::SlotUnbound`], even though
+    ///   it is not [`Bound`](SlotState::Bound).
+    ///
+    /// A `FedByPipe` slot is never `Bound`/`Lent`/`Severed` under normal use, so the
+    /// bind-time verb-2×2 arms for it are inert-but-spelled (a value bind onto a
+    /// pipe-fed slot is a misuse the spike never performs; see
+    /// [`try_bind_slot`](Input::try_bind_slot)).
+    FedByPipe(Pipe<T>),
 }
 
 /// The four-state cell shared by a [`SlotHandle`] and its [`Input::Slot`].
@@ -634,6 +665,16 @@ pub struct SlotBinder {
     /// held by an EXTERNAL live Checkout and stays `Lent` at fold time
     /// ([`Error::SlotCheckedOut`]). Empty for every non-probe binder.
     severable_cells: Vec<usize>,
+    /// **The pipe to install for a pipe-fed bind** ([`feed`](SlotBinder::feed)).
+    /// When `Some`, this binder installs [`SlotState::FedByPipe`] into every matching
+    /// cell (draining the boxed `Pipe<Tg::Value>` via `downcast_ref` +
+    /// [`Pipe::clone`]) INSTEAD of a value — the bind-slot-to-pipe path. It is a
+    /// fan-out install ([`is_fanout`](Self::is_fanout) reports `true`): the pipe is
+    /// cloned into EVERY site the tag appears (e.g. a `UIn` used at both a laplacian
+    /// and a combine position). `None` for every ordinary value / probe binder. Its
+    /// presence is mutually exclusive with a `value` (a feed binder carries no
+    /// value; its `eq`/`clone` are inert dummies).
+    feed_pipe: Option<Box<dyn Any + Send>>,
 }
 
 impl SlotBinder {
@@ -675,6 +716,32 @@ impl SlotBinder {
             matched: 0,
             probe: false,
             severable_cells: Vec::new(),
+            feed_pipe: None,
+        }
+    }
+
+    /// **Build a pipe-feeding binder** for tag `Tg`, carrying `pipe` (boxed,
+    /// type-erased). The [`bind_slots`](DeviceOp::bind_slots) walk deposits
+    /// [`SlotState::FedByPipe`] into EVERY matching cell (fan-out: the pipe is
+    /// [`Pipe::clone`]d per cell). No `SlotEq`/`SlotValue` bound is needed — the
+    /// install is unconditional and needs neither a value comparator nor a fan-out
+    /// clone hook (the `eq`/`clone` fields are inert dummies, exactly as for a
+    /// [`probe`](Self::probe)). Used by [`DeviceOpExt::feed`].
+    fn feed<Tg: Tag>(pipe: Pipe<Tg::Value>) -> Self {
+        SlotBinder {
+            id: TypeId::of::<Tg::Key>(),
+            // `Mutate` so a re-`feed` (a graph fed a second time) re-installs cleanly;
+            // the actual install ignores `mode` (it is unconditional over state), but
+            // `Mutate` is the honest label for "overwrite the slot's source".
+            mode: BindMode::Mutate,
+            value: None,
+            eq: Box::new(|_, _| false),
+            clone: Box::new(|_| None),
+            outcome: Ok(()),
+            matched: 0,
+            probe: false,
+            severable_cells: Vec::new(),
+            feed_pipe: Some(Box::new(pipe)),
         }
     }
 
@@ -701,6 +768,7 @@ impl SlotBinder {
             matched: 0,
             probe: true,
             severable_cells,
+            feed_pipe: None,
         }
     }
 
@@ -756,7 +824,11 @@ impl SlotBinder {
         // A probe visits EVERY matching cell (it must catch a checked-out cell that
         // appears AFTER an OK one), so it never lets the `AndThen`/bundle walk stop
         // early — it behaves like a fan-out even though it carries no value.
-        self.probe || self.fill_clone().is_some()
+        //
+        // A pipe-feed binder also fans out — one `feed(Tag, pipe)` installs
+        // `FedByPipe` at EVERY site the tag appears (e.g. a `UIn` at both its
+        // laplacian and combine positions), cloning the pipe per cell.
+        self.probe || self.feed_pipe.is_some() || self.fill_clone().is_some()
     }
 
     /// Whether the binding has already been deposited into (or rejected by) a
@@ -1246,6 +1318,24 @@ impl<T> Input<T> {
     where
         T: Send + 'static,
     {
+        // A pipe-fed slot behaves like `Input::Pipe` — DRAIN the upstream pipe
+        // (which the producer filled earlier THIS run) via `take_home`, LEAVING the
+        // `FedByPipe` variant in place so the slot re-arms for the next replay (the
+        // upstream refills the pipe each run). The value + deps + home come straight
+        // from the pipe payload, exactly as the `Input::Pipe` arm of `resolve_home`
+        // — no start gate is threaded here (the upstream producer already gated its
+        // own enqueue, and its events flow onward as the drained `Deps`).
+        {
+            let guard = cell.lock().unwrap();
+            if let SlotState::FedByPipe(pipe) = &*guard {
+                let pipe = pipe.clone();
+                drop(guard);
+                return pipe.take_home().ok_or(Error::NotSupported(
+                    "eager graph: upstream pipe for a FedByPipe slot was not filled \
+                     before downstream ran — internal ordering bug",
+                ));
+            }
+        }
         // `Bound(v) → Lent`, take `v`; anything else (Unbound / Severed / already
         // Lent) is the "nothing to lend" error.
         let v = {
@@ -1254,7 +1344,8 @@ impl<T> Input<T> {
                 SlotState::Bound(v) => v,
                 // Restore the prior state before erroring (we tentatively wrote
                 // `Lent` above; put it back so the slot is unchanged on failure).
-                // `Unbound`/`Severed`/`Lent` all surface as `SlotUnbound`.
+                // `Unbound`/`Severed`/`Lent`/`FedByPipe` (the last handled above)
+                // all surface as `SlotUnbound`.
                 other => {
                     *guard = other;
                     return Err(Error::SlotUnbound(name));
@@ -1377,15 +1468,16 @@ impl<T> Input<T> {
                     ))
                 }
             }
-            // `Bound` lends; `Unbound`/`Severed`/`Lent` are all `SlotUnbound`
-            // (its message covers all three) — mirrors `lend_slot` exactly.
-            Input::Slot { name, cell, .. } => {
-                if matches!(&*cell.lock().unwrap(), SlotState::Bound(_)) {
-                    Ok(())
-                } else {
+            // `Bound` lends; `FedByPipe` is satisfied-by-upstream (deferred, like
+            // `Input::Pipe` — never a pre-run failure); `Unbound`/`Severed`/`Lent`
+            // are all `SlotUnbound` (its message covers all three) — mirrors
+            // `lend_slot` exactly.
+            Input::Slot { name, cell, .. } => match &*cell.lock().unwrap() {
+                SlotState::Bound(_) | SlotState::FedByPipe(_) => Ok(()),
+                SlotState::Unbound | SlotState::Severed | SlotState::Lent => {
                     Err(Error::SlotUnbound(name))
                 }
-            }
+            },
             // Deferred — see the doc above: never a pre-run failure.
             Input::Pipe(_) => Ok(()),
         }
@@ -1514,7 +1606,12 @@ impl<T> Input<T> {
             // value to inspect" the empty concrete cell gives).
             Input::Slot { cell, .. } => match &*cell.lock().unwrap() {
                 SlotState::Bound(v) => Some(f(v)),
-                SlotState::Unbound | SlotState::Severed | SlotState::Lent => None,
+                // `FedByPipe` has no concrete value to inspect (deferred) — like
+                // `Pipe`.
+                SlotState::Unbound
+                | SlotState::Severed
+                | SlotState::Lent
+                | SlotState::FedByPipe(_) => None,
             },
             Input::Pipe(_) => None,
         }
@@ -1586,8 +1683,13 @@ impl<T> Input<T> {
             let cell_id = Arc::as_ptr(cell) as usize;
             match &*cell.lock().unwrap() {
                 // Both verbs fill a virgin / re-arm a bound cell → OK. `Set` on
-                // `Bound` is the value-dependent residual (treated OK here).
-                SlotState::Unbound | SlotState::Bound(_) => {}
+                // `Bound` is the value-dependent residual (treated OK here). A
+                // `FedByPipe` cell is treated like `Bound` for a value-bind probe: a
+                // value bind over it would overwrite under `Mutate` / conflict-ish
+                // under `Set`, but the spike never value-binds a pipe-fed slot, so it
+                // is inert here (a `feed` binder, which is the only writer of this
+                // state, is never a probe).
+                SlotState::Unbound | SlotState::Bound(_) | SlotState::FedByPipe(_) => {}
                 // `Set` rejects a severed slot; `Mutate` re-arms it.
                 SlotState::Severed => {
                     if binder.mode == BindMode::Set {
@@ -1603,6 +1705,22 @@ impl<T> Input<T> {
                 }
             }
             // A probe never consumes: return so the walk visits the next cell too.
+            return;
+        }
+
+        // PIPE-FEED install (the `feed` verb). Deposit `FedByPipe(pipe.clone())` into
+        // THIS cell — a fan-out, so every matching site is fed. Unconditional over
+        // the current state: the common case installs onto a virgin (`Unbound`) slot
+        // freshly built by the subgraph; re-feeding an already-`FedByPipe` cell (a
+        // graph fed a second time) just re-installs the same-or-new pipe. `Lent`
+        // should not occur (a pipe-fed slot is never lent to a `Checkout`), but
+        // overwriting it is still sound — the pipe is drained fresh next run. Handled
+        // BEFORE the `value.is_none()` early-bail below (a feed binder carries no
+        // value, so it would otherwise be misread as "consumed" and skip every cell).
+        if let Some(boxed) = &binder.feed_pipe {
+            if let Some(pipe) = boxed.downcast_ref::<Pipe<T>>() {
+                *cell.lock().unwrap() = SlotState::FedByPipe(pipe.clone());
+            }
             return;
         }
 
@@ -1697,6 +1815,21 @@ impl<T> Input<T> {
             SlotState::Lent => {
                 binder.outcome = Err(Error::SlotCheckedOut(name));
             }
+            // A value bind onto a pipe-fed slot. `Set` conflicts (the slot is
+            // already sourced by an upstream pipe); `Mutate` overwrites the pipe
+            // source with the value. The spike never value-binds a pipe-fed slot, so
+            // this arm is inert in practice — present only for exhaustiveness +
+            // correctness (a value bind should not silently no-op over a live feed).
+            SlotState::FedByPipe(_) => match binder.mode {
+                BindMode::Set => {
+                    binder.outcome = Err(Error::SlotConflict(name));
+                }
+                BindMode::Mutate => {
+                    if let Some(new) = provide(binder) {
+                        *guard = SlotState::Bound(new);
+                    }
+                }
+            },
         }
     }
 }
@@ -2882,6 +3015,92 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         Ok(self)
     }
 
+    /// **Wire tag `Tg`'s slot(s) to an upstream pipe** — the bind-slot-to-pipe verb.
+    ///
+    /// Instead of binding a concrete value, install [`SlotState::FedByPipe`] at every
+    /// site tag `Tg` appears, so the slot READS whatever an UPSTREAM op produced into
+    /// `pipe` (a build-time [`Handle`](DeviceOp::Handle) / [`Pipe<Tg::Value>`]) each
+    /// run. At run time the slot DRAINS that pipe (the producer filled it earlier the
+    /// same run) and RE-ARMS every replay — see [`SlotState::FedByPipe`]. This is how
+    /// a `slot!(Tag)` in one subgraph is late-bound to an upstream stage's output at
+    /// compose time — the crossed double-buffer rotation expressed as data.
+    ///
+    /// No `SlotEq`/`SlotValue` bound is needed (the install is unconditional). Fans
+    /// out like a shared-slot value bind: one `feed` fills ALL of the tag's sites.
+    /// Errors [`SlotNoSuchTag`](Error::SlotNoSuchTag) if the tag is absent from the
+    /// graph (the AT-LEAST-ONE rule, exactly as [`fold_bind`](Self::fold_bind)).
+    ///
+    /// Returns `&Self` (fluent, fallible) — the sibling of [`bind`](Self::bind) for
+    /// the pipe source. A feed inside a consuming `and_then`-composable tuple uses
+    /// the [`feed`] element constructor in [`call_move`](Self::call_move)
+    /// instead (infallible, errors deferred to sync).
+    fn feed<Tg: Tag>(&self, pipe: Pipe<Tg::Value>) -> Result<&Self> {
+        let mut binder = SlotBinder::feed::<Tg>(pipe);
+        self.bind_slots(&mut binder);
+        binder.outcome()?;
+        if binder.matched() == 0 {
+            return Err(Error::SlotNoSuchTag(Tg::NAME));
+        }
+        Ok(self)
+    }
+
+    /// **Consuming, INFALLIBLE, mixed value-or-feed bind** — the compose-in-`and_then`
+    /// sibling of the fluent [`call`](Self::call).
+    ///
+    /// Applies each element of `args` (a [`CallArgs`] tuple, arity 1..=8) to this
+    /// graph, then returns the OWNED graph. Each element is INDEPENDENTLY either a
+    /// **value tag** (`Buf(b)`, `Factor(2)` — folded through [`bind`](Self::bind)) or
+    /// a **pipe feed** ([`feed(Tag, pipe)`](feed) — folded through
+    /// [`feed`](Self::feed)), so a single tuple freely MIXES concrete binds and
+    /// upstream-pipe wiring (the crossed rotation visible in the arg list).
+    ///
+    /// ## Why consuming + infallible
+    ///
+    /// It returns owned `Self`, so it (a) chains further (`.call_move(..).and_then(..)`)
+    /// AND (b) is usable INSIDE an [`and_then`](Self::and_then) closure as the bare
+    /// `U: DeviceOp` that `FnOnce(Handle) -> U` requires. A *fallible*
+    /// `-> Result<Self>` would force the closure to return `Result<U>`, which
+    /// `and_then` does NOT accept — it would need a whole fallible-`and_then`
+    /// variant. `call_move` returns bare `Self` and fits `and_then` directly.
+    ///
+    /// ## DEFERRED bind errors — the trade
+    ///
+    /// **`call_move` gives up the EAGER errors the fluent [`call`](Self::call) gives.**
+    /// Because it is infallible, an absent tag, a
+    /// [`SlotConflict`](Error::SlotConflict), or a [`SlotCheckedOut`](Error::SlotCheckedOut)
+    /// is DROPPED at the call site (see [`CallArg::apply`]) and surfaces only LATER,
+    /// at [`sync`](Self::sync) — as [`SlotUnbound`](Error::SlotUnbound) /
+    /// [`SlotNoSuchTag`](Error::SlotNoSuchTag) from the [`check_ready`](DeviceOp::check_ready)
+    /// completeness pass, with NOTHING enqueued (the atomicity guarantee holds:
+    /// `check_ready` runs before any device work). This is SOUND — a typo'd or
+    /// missing bind cannot silently run wrong data; it fails closed at sync. But it
+    /// is a real trade: use the fluent [`call`](Self::call) / [`mutate_call`](Self::mutate_call)
+    /// (fallible, `&Self`, EAGER `SlotConflict`/`SlotNoSuchTag`, phase-0 probe) for
+    /// the fluent-then-sync path; use `call_move` for the compose-in-`and_then` path.
+    ///
+    /// ## Partial binds (currying)
+    ///
+    /// `call_move` binds ONLY the tags in `args` and leaves the rest of the graph's
+    /// slots as they are (`Unbound` / `FedByPipe`-able for a later `call_move`). So it
+    /// is naturally a PARTIAL bind — [`bind_move`](Self::bind_move) is exactly this
+    /// method under a currying-flavoured name (bind a subset now, the rest later).
+    /// Any slot still unbound at `sync` errors there (deferred, as above).
+    fn call_move<T: CallArgs>(self, args: T) -> Self {
+        args.apply_all(&self);
+        self
+    }
+
+    /// **Partial [`call_move`](Self::call_move) — currying.** Bind a SUBSET of the
+    /// graph's slots now (via a [`CallArgs`] tuple), leaving the rest open for a
+    /// later `call_move` / `bind_move` / `feed`. This IS [`call_move`](Self::call_move)
+    /// (same consuming, infallible, deferred-error, mixed value-or-feed body) — a
+    /// distinct name only to read as "bind part now" at a currying call site. Slots
+    /// left unbound after the final bind error at `sync` (deferred), same as
+    /// `call_move`.
+    fn bind_move<T: CallArgs>(self, args: T) -> Self {
+        self.call_move(args)
+    }
+
     /// Run `self` to completion on `launcher`'s queue and hand back a
     /// [`Checkout`] guard over its output (forward path; no replay). Blocks once,
     /// here, on the terminal op's events — the only wait in the graph.
@@ -3266,6 +3485,92 @@ impl_bind_all_tuple!(A, B, C, D, E);
 impl_bind_all_tuple!(A, B, C, D, E, F);
 impl_bind_all_tuple!(A, B, C, D, E, F, G);
 impl_bind_all_tuple!(A, B, C, D, E, F, G, H);
+
+// ── CallArg / CallArgs: the mixed value-or-feed tuple for `call_move` ────────
+
+/// One element of a [`call_move`](DeviceOpExt::call_move) tuple — EITHER a **value
+/// tag** (`Buf(b)`, `Factor(2)`) that binds by value, OR a **pipe feed**
+/// ([`feed(Tag, pipe)`](feed)) that wires the tag's slot(s) to an upstream pipe.
+///
+/// Applied **infallibly**: [`apply`](CallArg::apply) drops any bind error (an absent
+/// tag, a conflict, a checked-out slot) — the error surfaces later at
+/// [`sync`](DeviceOpExt::sync) via [`check_ready`](DeviceOp::check_ready) instead.
+/// This is the trade [`call_move`](DeviceOpExt::call_move) makes to be infallible +
+/// consuming (usable as the bare `U` an [`and_then`](DeviceOpExt::and_then) closure
+/// requires); see that method's doc for the full rationale.
+pub trait CallArg {
+    /// Apply this element's binding to graph `g`, INFALLIBLY (errors deferred to
+    /// `sync`). A value tag folds through [`bind`](DeviceOpExt::bind) (set-once); a
+    /// [`Feed`] folds through [`feed`](DeviceOpExt::feed).
+    fn apply<Op: DeviceOp>(self, g: &Op);
+}
+
+/// A **value tag** binds by value (set-once [`bind`](DeviceOpExt::bind)). The bind
+/// error, if any, is DROPPED — deferred to `sync` (an unbound / conflicting slot
+/// surfaces there). Requires `Tg::Value: SlotEq + SlotValue`, the same bounds
+/// [`bind`](DeviceOpExt::bind) carries.
+impl<Tg> CallArg for Tg
+where
+    Tg: Tag,
+    Tg::Value: SlotEq + SlotValue,
+{
+    fn apply<Op: DeviceOp>(self, g: &Op) {
+        // Infallible: drop any bind error (deferred to sync's check_ready).
+        let _ = g.bind(self);
+    }
+}
+
+/// A **pipe feed** element of a [`call_move`](DeviceOpExt::call_move) tuple: tag `Tg`
+/// paired with the upstream [`Pipe<Tg::Value>`] its slot(s) should read. Built by the
+/// [`feed`] sugar; applying it installs [`SlotState::FedByPipe`] via
+/// [`DeviceOpExt::feed`].
+pub struct Feed<Tg: Tag>(Pipe<Tg::Value>);
+
+impl<Tg: Tag> CallArg for Feed<Tg> {
+    fn apply<Op: DeviceOp>(self, g: &Op) {
+        // Infallible: drop any feed error (an absent tag surfaces at sync).
+        let _ = g.feed::<Tg>(self.0);
+    }
+}
+
+/// **`feed(Tag, pipe)` sugar** — build a pipe-feed [`CallArg`] for tag `Tg`, for use
+/// as an element of a [`call_move`](DeviceOpExt::call_move) tuple. The first argument
+/// is the tag CONSTRUCTOR (`Buf` used as `fn(Value) -> Buf<Value>`), passed ONLY to
+/// infer `Tg` — it is never called. So `feed(UIn, upstream_pipe)` reads as "UIn is
+/// fed by `upstream_pipe`" right in the arg list, next to the plain value binds.
+pub fn feed<Tg: Tag>(_tag: fn(Tg::Value) -> Tg, pipe: Pipe<Tg::Value>) -> Feed<Tg> {
+    Feed(pipe)
+}
+
+/// A tuple of [`CallArg`]s — the argument to [`call_move`](DeviceOpExt::call_move).
+/// Each element is INDEPENDENTLY a value tag or a [`Feed`], applied left-to-right,
+/// infallibly. Implemented for arities 1..=8 (mirroring [`BindAll`]).
+pub trait CallArgs {
+    /// Apply every element to `g` (infallibly, in tuple order).
+    fn apply_all<Op: DeviceOp>(self, g: &Op);
+}
+
+/// Implement [`CallArgs`] for one tuple arity. Each element is any [`CallArg`]
+/// (value tag OR feed), so the tuple is freely MIXED.
+macro_rules! impl_call_args_tuple {
+    ($($name:ident),+ $(,)?) => {
+        impl<$($name: CallArg),+> CallArgs for ($($name,)+) {
+            #[allow(non_snake_case)]
+            fn apply_all<Op: DeviceOp>(self, g: &Op) {
+                let ($($name,)+) = self;
+                $( $name.apply(g); )+
+            }
+        }
+    };
+}
+impl_call_args_tuple!(A);
+impl_call_args_tuple!(A, B);
+impl_call_args_tuple!(A, B, C);
+impl_call_args_tuple!(A, B, C, D);
+impl_call_args_tuple!(A, B, C, D, E);
+impl_call_args_tuple!(A, B, C, D, E, F);
+impl_call_args_tuple!(A, B, C, D, E, F, G);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H);
 
 // ── Checkout: runtime guard over one run's output ───────────────────────
 
