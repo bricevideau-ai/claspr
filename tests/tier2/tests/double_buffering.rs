@@ -33,13 +33,14 @@
 //! ## Handle stability (exactly two buffers)
 //!
 //! A correct ping-pong recycles exactly the SAME two `cl_mem` objects across all
-//! steps — the buffers swap roles but the set `{hA, hB}` is invariant; nothing is
-//! re-allocated per step. We capture `handle_of(A)` and `handle_of(B)` up front
-//! and assert that on every step the in/out handles are drawn from exactly that
-//! pair and are distinct from each other. (Both A and B stay live across the loop
-//! via `into_inner`, so their handles are stable identities — no cl_mem recycling
-//! confound.) This runs entirely on the existing `sync()` reuse path; no
-//! command-buffer backend is involved.
+//! steps — the buffers swap roles but nothing is re-allocated per step. We capture
+//! `handle_of(A)` and `handle_of(B)` up front and assert that on every step each
+//! of the in/out handles is drawn from the fixed pair `{hA, hB}` and the two are
+//! distinct from each other — together those two checks pin the ping-pong to
+//! recycling exactly those two `cl_mem`s (no per-step alloc). (Both A and B stay
+//! live across the loop via `into_inner`, so their handles are stable identities —
+//! no cl_mem recycling confound.) This runs entirely on the existing `sync()`
+//! reuse path; no command-buffer backend is involved.
 
 use claspr::eager::DeviceOpExt;
 use claspr::{Context, DeviceSlice, Error, MemRef, RecordableBuffer};

@@ -1,11 +1,11 @@
-//! Reuse-flaw regression: a concrete-buffer `eager_copy_to` sitting in a reused
-//! graph must re-arm BOTH its src and dst cells on `Checkout` drop, so a second
-//! `sync` succeeds instead of erroring "graph busy".
+//! Copy-in-a-reused-graph re-arming: a concrete-buffer `eager_copy_to` sitting in
+//! a reused graph re-arms BOTH its src and dst cells on `Checkout` drop, so a
+//! second `sync` succeeds instead of erroring "graph busy".
 //!
-//! Before the home-in-pipe `Rehome` generalization, `CopyTo2::execute` deposited
-//! its outputs with `Pipe::put` (home = `None`), so neither buffer returned to
-//! its lending cell on drop and the second `sync` found an empty cell → busy
-//! error. The fix threads each input cell as a typed return home:
+//! The mechanism under test is the home-in-pipe `Rehome`: on `Checkout` drop each
+//! output returns to its lending cell, rather than being deposited home-less with
+//! `Pipe::put` (which would leave an empty cell and make the second `sync` fail
+//! "busy"). Each input cell is threaded as a typed return home:
 //!
 //! - **SRC** is not retyped by the copy (`CopyOutputs::Src == Src`) → identity
 //!   rehome (the cell takes its own buffer back).
