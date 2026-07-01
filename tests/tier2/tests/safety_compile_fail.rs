@@ -26,6 +26,10 @@
 //!   `and_then_host` closure (HRTB `for<'a> FnOnce(View<'a>) -> Result<()>`).
 //! - `host_view_outlives_release` — use-after-move on
 //!   `DeviceSliceHostView::release_to_device(self)`.
+//! - `scalar_slot_fed_pipe` — a SCALAR slot tag (`F: f32`) fed a `Pipe`
+//!   (`F(pipe)`) must be rejected: the unified `Tag(pipe)` pipe-feed `CallArg`
+//!   arm is gated to buffer-valued tags (`RecordableBuffer`), so `F<Pipe<f32>>`
+//!   has no `CallArg`. Guards the buffer/scalar asymmetry of the feed unify.
 //!
 //! A second `compile_pass` config (`Mode::Pass`) runs `compile_pass/sanity.rs`:
 //! a known-good unified-API `DeviceOp` chain that MUST compile. It is the

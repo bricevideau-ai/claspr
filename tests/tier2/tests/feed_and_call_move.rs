@@ -1,5 +1,6 @@
-//! Engine-level proof for the `feed` / `call_move` / `bind_move` verbs and the
-//! [`SlotState::FedByPipe`] slot state (promoted from spike #194).
+//! Engine-level proof for the unified `Tag(value)`/`Tag(pipe)` constructor,
+//! `call_move` / `bind_move`, and the [`SlotState::FedByPipe`] slot state (promoted
+//! from spike #194).
 //!
 //! Three interlocking pieces are exercised here:
 //!
@@ -8,17 +9,19 @@
 //!   bind error to `sync` (an absent / unbound tag surfaces there as
 //!   `SlotUnbound`/`SlotNoSuchTag`, with nothing enqueued — the atomicity guarantee).
 //!   Contrast the fluent `call`, which errors EAGERLY.
-//! - **`feed`** — wire a `slot!(Tag)` to an UPSTREAM pipe (a build-time `Handle`), so
-//!   the slot reads whatever the upstream produced each run, installing
-//!   `SlotState::FedByPipe`. The fed slot resolves DEFERRED (drains the pipe at run
-//!   time) and RE-ARMS every replay (the upstream refills the pipe).
+//! - **the unified tag constructor** — `Tag(value)` binds a slot by value; the SAME
+//!   `Tag(pipe)` (fed a `Pipe` instead of a value) WIRES a `slot!(Tag)` to an UPSTREAM
+//!   pipe (a build-time `Handle`), installing `SlotState::FedByPipe` so the slot reads
+//!   whatever the upstream produced each run. The fed slot resolves DEFERRED (drains
+//!   the pipe at run time) and RE-ARMS every replay (the upstream refills the pipe).
+//!   There is no separate `feed(Tag, pipe)` verb — the pipe source IS the tag ctor.
 //! - **`bind_move`** — `call_move` used for currying (bind a subset now, the rest
 //!   later); it IS `call_move` under a currying-flavoured name.
 //!
 //! Uses the portable `add_u32` (3-output) / `scale_u32` (in-place, single-output)
 //! test kernels — NOT gray-scott.
 
-use claspr::eager::{DeviceOpExt, Pipe, download, feed, upload};
+use claspr::eager::{DeviceOpExt, Pipe, download, upload};
 use claspr::{Context, DeviceSlice, Error};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
@@ -111,8 +114,9 @@ fn call_move_defers_absent_tag_to_sync() {
     }
 }
 
-/// (3) Wire a downstream slot to an UPSTREAM pipe via `feed`; the slot resolves from
-/// the pipe, and re-running the graph RE-ARMS the fed slot (same result each replay).
+/// (3) Wire a downstream slot to an UPSTREAM pipe via the `Tag(pipe)` constructor; the
+/// slot resolves from the pipe, and re-running RE-ARMS the fed slot (same result each
+/// replay).
 ///
 /// The upstream is a MINT (`upload` re-seeds a fresh buffer each run) then a ×2
 /// scale, producing a buffer into its Handle pipe; the downstream `scale_u32(slot!
@@ -132,7 +136,7 @@ fn feed_slot_from_pipe_resolves_deferred_and_rearms() {
         .and_then(|up_pipe: Pipe<DeviceSlice<u32>>| {
             // Downstream reads the upstream buffer via the fed slot, scales ×3.
             ks.scale_u32([N], slot!(Dst), 3u32)
-                .call_move((feed(Dst, up_pipe),)) // Dst := FedByPipe(up_pipe)
+                .call_move((Dst(up_pipe),)) // Dst := FedByPipe(up_pipe)
                 .and_then(download)
         });
 
@@ -171,7 +175,7 @@ fn feed_slot_check_ready_ok() {
         .call_move((Buf(seeded(&ctx, 1)),)) // 1 -> 4
         .and_then(|up_pipe: Pipe<DeviceSlice<u32>>| {
             ks.scale_u32([N], slot!(Dst), 1u32) // ×1: pass-through, isolates readiness
-                .call_move((feed(Dst, up_pipe),))
+                .call_move((Dst(up_pipe),))
                 .and_then(download)
         });
 
@@ -208,7 +212,7 @@ fn crossed_feed_swap() {
                     // `add_u32`'s Handle is a 3-tuple of pipes; destructure to the
                     // `out` pipe and download it.
                     ks.add_u32([N], slot!(A), slot!(B), slot!(Out))
-                        .call_move((feed(A, pipe_x), feed(B, pipe_y), Out(seed_out)))
+                        .call_move((A(pipe_x), B(pipe_y), Out(seed_out)))
                         .and_then(|(_a, _b, out)| download(out))
                 })
         });

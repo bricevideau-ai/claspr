@@ -580,7 +580,8 @@ fn run_swap(
 /// ## The composition model: a curried, bind-by-name meta-kernel
 ///
 /// The per-step subgraph is captured ONCE as a pair of curried closures over the
-/// new `claspr::eager` verbs (`call_move` / `bind_move` / `feed`):
+/// `claspr::eager` verbs (`call_move` / `bind_move`) and the unified `Tag(value)`/
+/// `Tag(pipe)` slot constructor:
 ///
 /// - **`get_meta_kernel(ks, lap_u, lap_v)`** builds the raw three-dispatch DAG
 ///   (`lap_u`, `lap_v`, `combine`) with ALL SEVEN input slots left OPEN
@@ -601,10 +602,10 @@ fn run_swap(
 ///   `call_move((UIn(u_a), VIn(v_a), UOut(u_b), VOut(v_b)))` — read A, write B.
 /// - STEP 2, inside the `and_then`, wires the SAME four slots to step 1's output
 ///   PIPES with the rotation VISIBLE in the arg list:
-///   `call_move((feed(UIn, u_b), feed(VIn, v_b), feed(UOut, u_a), feed(VOut, v_a)))`
-///   — read B, write back into A. `feed(Tag, pipe)` installs
+///   `call_move((UIn(u_b), VIn(v_b), UOut(u_a), VOut(v_a)))` — read B, write back
+///   into A. The SAME tag constructor fed a pipe (`Tag(pipe)`) installs
 ///   `SlotState::FedByPipe`, so each slot DRAINS its upstream pipe every run and
-///   re-arms on the next replay.
+///   re-arms on the next replay — no separate `feed` verb.
 ///
 /// `call_move` is CONSUMING + INFALLIBLE: it returns the owned graph (so it is
 /// usable as the bare `U` inside an `and_then` closure) and DEFERS any bind
@@ -630,7 +631,7 @@ fn run_immutable(
     kill_rate: f32,
     write_frame: bool,
 ) -> claspr::Result<Vec<f32>> {
-    use claspr::eager::{bundle4, feed};
+    use claspr::eager::bundle4;
 
     assert_eq!(
         grid_w * grid_h,
@@ -708,18 +709,18 @@ fn run_immutable(
 
     // ── Build the TWO-step meta-kernel by composing `curried_kernel` with itself. ──
     //   STEP 1 (read A, write B): value-bind the four field slots to concrete bufs.
-    //   STEP 2 (read B, write A): FEED the same four slots from step-1's output
-    //     pipes — the crossed rotation is VISIBLE right in the `feed(...)` args.
+    //   STEP 2 (read B, write A): feed the same four slots from step-1's output
+    //     pipes — the crossed rotation is VISIBLE right in the `Tag(pipe)` args.
     // Over the pair the buffer roles are identity (A→B→A), so the graph is bound
     // ONCE at build and replays with NO per-step rebinding.
     let g = curried_kernel(&ks, lap_u1, lap_v1)
         .call_move((UIn(u_a), VIn(v_a), UOut(u_b), VOut(v_b)))
         .and_then(move |(u_a, v_a, u_b, v_b)| {
             curried_kernel(&ks, lap_u2, lap_v2).call_move((
-                feed(UIn, u_b),  // read B
-                feed(VIn, v_b),  // read B
-                feed(UOut, u_a), // write back into A
-                feed(VOut, v_a), // write back into A
+                UIn(u_b),  // read B
+                VIn(v_b),  // read B
+                UOut(u_a), // write back into A
+                VOut(v_a), // write back into A
             ))
         });
 
