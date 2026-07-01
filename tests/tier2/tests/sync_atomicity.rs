@@ -30,11 +30,16 @@
 //!  5. IMAGE atomicity (BLOCKER B1) — the image leaf ops carry the same
 //!     `check_ready` pre-pass: a busy image cell is caught atomically (nothing
 //!     lent / enqueued) and the op re-runs with a stable handle once it re-arms.
+//!  6. ASYNC-terminal atomicity (review S1) — the non-blocking / async terminals
+//!     (`submit_on`, `submit_value_on`, `run`) now run the SAME `check_ready`
+//!     pre-pass as `sync`/`wait_on`, so an unsatisfiable input errors before any
+//!     command is enqueued (they previously had NO atomicity protection). Covered
+//!     via `submit_on` — the three share the one missing-`check_ready` fix.
 
 use claspr::eager::{DeviceOpExt, bundle2};
 use claspr::image::format::R32Uint;
 use claspr::record::{MemRef, RecordableBuffer};
-use claspr::{Context, DeviceSlice, Error, Image2D, WriteOnly};
+use claspr::{Context, DeviceSlice, Error, Image2D, InOrder, Queue, WriteOnly};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
 
@@ -333,4 +338,44 @@ fn busy_image_cell_caught_by_check_ready_and_recovers() {
         "fill pattern survives, got {:?}",
         &pixels[..4]
     );
+}
+
+/// (6) ASYNC-terminal atomicity (review S1) — a graph with an UNBOUND slot driven
+/// via the non-blocking `submit_on` terminal must error `SlotUnbound` from the same
+/// `check_ready` pre-pass `sync`/`wait_on` run, WITHOUT enqueuing anything. Before
+/// the fix the async / non-blocking terminals skipped the pre-pass entirely, so an
+/// unsatisfiable input would only abort AFTER earlier nodes had enqueued + lent
+/// their buffers.
+///
+/// The kernel launcher's inherent `submit_on` delegates to
+/// [`DeviceOpExt::submit_value_on`] (hence the `(Output, Event)` return), so this
+/// exercises the `submit_value_on` arm of the S1 fix directly; the plain
+/// `DeviceOpExt::submit_on` and `run` share the identical one-line pre-pass.
+///
+/// Recovery proof: after the failed attempt, a fresh fully-bound graph submits fine
+/// — nothing was stranded (the failed attempt lent / enqueued nothing).
+#[test]
+fn unbound_slot_errors_at_submit_on_without_enqueue() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let queue = Queue::<InOrder>::on_device(&ctx, ctx.device()).expect("queue");
+
+    // A single-node graph over an UNBOUND slot. `submit_on` consumes `self`, so
+    // re-run against a freshly built graph after the failure.
+    let g = ks.scale_u32([N], slot!(Missing), 2u32);
+    let err = g
+        .submit_on(&queue)
+        .expect_err("unbound slot must error at submit_on (async atomicity)");
+    assert!(
+        matches!(&err, Error::SlotUnbound(n) if n.contains("Missing")),
+        "expected SlotUnbound naming Missing from submit_on, got {err:?}"
+    );
+
+    // Recover: a fresh, fully-bound graph submits fine — nothing was stranded.
+    let bound = seeded(&ctx, 5);
+    let g2 = ks.scale_u32([N], bound, 2u32);
+    let (_out, event) = g2
+        .submit_on(&queue)
+        .expect("bound graph must submit after the failed unbound attempt");
+    event.wait().expect("submitted work completes");
 }

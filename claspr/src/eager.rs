@@ -2739,6 +2739,8 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// (you get a completion [`Event`](crate::Event) to chain, not a raw stream).
     fn submit_on<L: crate::Launcher + ?Sized>(self, launcher: &L) -> Result<crate::Event> {
         use crate::Launcher;
+        // Atomicity pre-pass: validate all inputs before any enqueue, mirroring wait_on.
+        self.check_ready()?;
         let device = launcher.context().device().clone();
         let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
         // Gather non-blocking (Pipelined); a host-seam setup error surfaces here.
@@ -2760,6 +2762,8 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         self,
         launcher: &L,
     ) -> Result<(Self::Output, crate::Event)> {
+        // Atomicity pre-pass: validate all inputs before any enqueue, mirroring wait_on.
+        self.check_ready()?;
         let device = launcher.context().device().clone();
         let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
         let (output, deps) = self.collect(&ec, ExecMode::Pipelined)?;
@@ -7699,6 +7703,14 @@ where
     Op::Output: Unpin,
 {
     use crate::EventFutureExt;
+
+    // Atomicity pre-pass: validate all inputs before any enqueue, mirroring wait_on.
+    // Surfaced SYNCHRONOUSLY here (before the queue is acquired and any command is
+    // enqueued), returned as an eager `Errored` future so the caller sees an
+    // unsatisfiable-input error at `run()` time, not at poll/await.
+    if let Err(e) = chain.check_ready() {
+        return DeviceChainFuture::Errored(Some(e));
+    }
 
     // 1. Pick the per-device default OOO queue (same as `sync`).
     let device = context.device().clone();
