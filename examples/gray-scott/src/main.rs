@@ -223,9 +223,9 @@ mod gpu {
     /// `(u_in, v_in)` plus their precomputed Laplacians `(lap_u, lap_v)` and
     /// writes the next fields `(u_out, v_out)`. This single dispatch advances
     /// BOTH fields from the same-step inputs (so it is numerically identical to a
-    /// fused step). The two scalars `(feed, kill)` are scalar slots — bound once,
-    /// re-read each replay, and `mutate_bind`-ed mid-run to reconfigure the
-    /// meta-kernel.
+    /// fused step). The two scalars `(feed_rate, kill_rate)` are scalar slots —
+    /// bound once, re-read each replay, and `mutate_bind`-ed mid-run to
+    /// reconfigure the meta-kernel.
     ///
     /// Six buffer args + two scalar args = 8 = the `KernelArgs` ceiling exactly,
     /// which is why `Du`/`Dv` are compile-time consts rather than args.
@@ -239,8 +239,8 @@ mod gpu {
         #[spirv(cross_workgroup)] lap_v: &[f32],
         #[spirv(cross_workgroup)] u_out: &mut [f32],
         #[spirv(cross_workgroup)] v_out: &mut [f32],
-        feed: f32,
-        kill: f32,
+        feed_rate: f32,
+        kill_rate: f32,
     ) {
         let x = id.x as u32;
         let y = id.y as u32;
@@ -253,8 +253,8 @@ mod gpu {
         let v = v_in[i];
         let uvv = u * v * v;
 
-        let u_next = u + DT * (DU * lap_u[i] - uvv + feed * (1.0 - u));
-        let v_next = v + DT * (DV * lap_v[i] + uvv - (feed + kill) * v);
+        let u_next = u + DT * (DU * lap_u[i] - uvv + feed_rate * (1.0 - u));
+        let v_next = v + DT * (DV * lap_v[i] + uvv - (feed_rate + kill_rate) * v);
 
         u_out[i] = u_next;
         v_out[i] = v_next;
@@ -577,12 +577,39 @@ fn run_swap(
 /// `combine`, needing NO slots. Net over the pair: A→B then B→A = identity on
 /// roles.
 ///
-/// Only the OUTER handles carry slots, bound ONCE with `call`: `Grid`, the
-/// initial fields `UIn`/`VIn` (= `u_a`/`v_a`, step 1's lap inputs), the step-1
-/// scratch targets `UOut`/`VOut` (= `u_b`/`v_b`), and the scalars `F`/`K`. There
-/// is deliberately **no `call` inside `and_then`** — the kernel builder methods
-/// already return owned ops and the inter-stage buffers thread as pipes, so
-/// composition uses those, not `call`.
+/// ## The composition model: a curried, bind-by-name meta-kernel
+///
+/// The per-step subgraph is captured ONCE as a pair of curried closures over the
+/// new `claspr::eager` verbs (`call_move` / `bind_move` / `feed`):
+///
+/// - **`get_meta_kernel(ks, lap_u, lap_v)`** builds the raw three-dispatch DAG
+///   (`lap_u`, `lap_v`, `combine`) with ALL SEVEN input slots left OPEN
+///   (`Grid`, `F`, `K`, `UIn`, `VIn`, `UOut`, `VOut`). It then `.and_then`s a
+///   **4-of-6 output TRIM** that re-exposes just the four FIELD buffers
+///   `(UIn, VIn, UOut, VOut)` as a clean `bundle4` Handle — dropping the two
+///   lap-scratch pipes the composition never reads, so the compose closure
+///   destructures a tidy `|(u_a, v_a, u_b, v_b)|` and not a 6-tuple with
+///   `_lap` placeholders.
+/// - **`curried_kernel(ks, lap_u, lap_v)`** partially binds the invariants that
+///   never rotate — the launch `Grid` and the reaction scalars `F`/`K` — via
+///   `bind_move`, leaving ONLY the four field slots open for the step-specific
+///   `call_move` at the call site.
+///
+/// `step` is then two `curried_kernel` calls composed:
+///
+/// - STEP 1 binds the four field slots to CONCRETE buffers by value:
+///   `call_move((UIn(u_a), VIn(v_a), UOut(u_b), VOut(v_b)))` — read A, write B.
+/// - STEP 2, inside the `and_then`, wires the SAME four slots to step 1's output
+///   PIPES with the rotation VISIBLE in the arg list:
+///   `call_move((feed(UIn, u_b), feed(VIn, v_b), feed(UOut, u_a), feed(VOut, v_a)))`
+///   — read B, write back into A. `feed(Tag, pipe)` installs
+///   `SlotState::FedByPipe`, so each slot DRAINS its upstream pipe every run and
+///   re-arms on the next replay.
+///
+/// `call_move` is CONSUMING + INFALLIBLE: it returns the owned graph (so it is
+/// usable as the bare `U` inside an `and_then` closure) and DEFERS any bind
+/// error to `sync`'s readiness check. There is no per-step rebinding: the pair
+/// is bound once at build and replayed `steps/2` times via plain `sync()`.
 ///
 /// ## Lap scratch: two independent sets
 ///
@@ -591,7 +618,7 @@ fn run_swap(
 /// graph would make step 2's lap WRITE the very buffer step 1's `combine` READS,
 /// a write-after-read hazard the pure-dataflow (pipe) graph does not serialize —
 /// so two sets keep the two steps' Laplacians independent and correct. They are
-/// concrete buffers threaded as pipes (no slots), never rebound.
+/// concrete buffers passed by arg into each `get_meta_kernel` call, never rebound.
 ///
 /// `steps` must be EVEN (the unroll period is 2). Returns the final `V` field.
 fn run_immutable(
@@ -599,10 +626,12 @@ fn run_immutable(
     grid_w: usize,
     grid_h: usize,
     steps: usize,
-    feed: f32,
-    kill: f32,
+    feed_rate: f32,
+    kill_rate: f32,
     write_frame: bool,
 ) -> claspr::Result<Vec<f32>> {
+    use claspr::eager::{bundle4, feed};
+
     assert_eq!(
         grid_w * grid_h,
         N,
@@ -615,7 +644,10 @@ fn run_immutable(
 
     // Two device buffers per field. A holds the initial / period-boundary state;
     // B is the intermediate (step-1 output). Over the two-step graph the roles
-    // are identity: read A → write B → read B → write A.
+    // are identity: read A → write B → read B → write A. Minted up front and
+    // MOVED into the compose closure — the closures must NOT borrow `ctx` (which
+    // `sync(&ctx)` needs); the kernel ops clone the context internally, so the
+    // graph they build owns everything it needs.
     let u_a = seeded(ctx, u0)?;
     let u_b = seeded(ctx, vec![0.0f32; N])?;
     let v_a = seeded(ctx, v0)?;
@@ -627,82 +659,69 @@ fn run_immutable(
     let lap_u2 = seeded(ctx, vec![0.0f32; N])?;
     let lap_v2 = seeded(ctx, vec![0.0f32; N])?;
 
-    // ── Build the TWO-step meta-kernel ONCE, INLINE. Six dispatches; fixed handles. ──
-    //   STEP 1 (read A, write B):
-    //     lap(UIn=u_a → lap_u1); lap(VIn=v_a → lap_v1);
-    //     combine(u_a, v_a, lap_u1, lap_v1 → UOut=u_b, VOut=v_b)
-    //   STEP 2 (read B, write A) — ALL operands are pipes off step-1 combine:
-    //     lap(u_b → lap_u2); lap(v_b → lap_v2);
-    //     combine(u_b, v_b, lap_u2, lap_v2 → u_a, v_a)
+    // ── The per-step subgraph as TWO curried closures (bind-by-name meta-kernel). ──
     //
-    // Over the pair the buffer roles are identity (A→B→A) → fixed handles, NO
-    // per-step rebinding. The inter-step field buffers thread as pipes exactly
-    // like the intra-step lap→combine threading: step 1's `combine` is 6-output,
-    // so its inputs (u_a, v_a) pass through and become step 2's WRITE targets,
-    // while its outputs (u_b, v_b) become step 2's READ fields. Two independent
-    // lap scratch sets keep the two steps' Laplacians from aliasing.
-    //
-    // (Built inline: factoring this into a reusable `fn step(...) -> impl DeviceOp`
-    // is blocked by RPIT — the return would have to spell Output+Handle+Checkouts
-    // as three 6-tuples. A readable *inline* composition of graph values is the
-    // target of the `move`-call work; see NOTES / the move-call design task.)
-    let g =
-        ks.laplacian(slot!(Grid), slot!(UIn), lap_u1)
-            .and_then(move |(u_a_pipe, lap_u1_pipe)| {
-                ks.laplacian(slot!(Grid), slot!(VIn), lap_v1).and_then(
-                    move |(v_a_pipe, lap_v1_pipe)| {
+    // `get_meta_kernel` builds the raw three-dispatch DAG with ALL SEVEN input
+    // slots OPEN, then TRIMS `combine`'s six-output handle down to the four FIELD
+    // buffers via a `bundle4` re-expose — so the compose site destructures a clean
+    // `|(u_a, v_a, u_b, v_b)|` with no lap-scratch placeholders. It takes `ks` +
+    // its two lap-scratch buffers by arg (fresh per call); the returned graph does
+    // NOT borrow `ks` (the launchers clone the context/kernels internally).
+    let get_meta_kernel = |ks: &gpu::Kernels, lap_u, lap_v| {
+        ks.laplacian(slot!(Grid), slot!(UIn), lap_u)
+            .and_then(move |(u_in, lap_u_pipe)| {
+                ks.laplacian(slot!(Grid), slot!(VIn), lap_v)
+                    .and_then(move |(v_in, lap_v_pipe)| {
                         ks.combine(
                             slot!(Grid),
-                            u_a_pipe,    // pipe: U field A
-                            v_a_pipe,    // pipe: V field A
-                            lap_u1_pipe, // pipe: U-Laplacian (step 1)
-                            lap_v1_pipe, // pipe: V-Laplacian (step 1)
-                            slot!(UOut), // = u_b
-                            slot!(VOut), // = v_b
+                            u_in,       // pipe: U field (read)
+                            v_in,       // pipe: V field (read)
+                            lap_u_pipe, // pipe: U-Laplacian
+                            lap_v_pipe, // pipe: V-Laplacian
+                            slot!(UOut),
+                            slot!(VOut),
                             slot!(F),
                             slot!(K),
                         )
-                        // STEP 2 — composed with step 1's combine outputs, roles CROSSED.
+                        // 4-of-6 TRIM: `combine`'s handle is 6 pipes
+                        // (u_in, v_in, lap_u, lap_v, u_out, v_out); re-expose ONLY the
+                        // four FIELD pipes so the caller sees `(u_in, v_in, u_out, v_out)`.
                         .and_then(
-                            move |(u_a2, v_a2, _lap_u1_done, _lap_v1_done, u_b_pipe, v_b_pipe)| {
-                                ks.laplacian(slot!(Grid), u_b_pipe, lap_u2).and_then(
-                                    move |(u_b2, lap_u2_pipe)| {
-                                        ks.laplacian(slot!(Grid), v_b_pipe, lap_v2).and_then(
-                                            move |(v_b2, lap_v2_pipe)| {
-                                                ks.combine(
-                                                    slot!(Grid),
-                                                    u_b2,        // pipe: U field B (read)
-                                                    v_b2,        // pipe: V field B (read)
-                                                    lap_u2_pipe, // pipe: U-Laplacian (step 2)
-                                                    lap_v2_pipe, // pipe: V-Laplacian (step 2)
-                                                    u_a2,        // pipe: write BACK into A
-                                                    v_a2,        // pipe: write BACK into A
-                                                    slot!(F),    // shared slots, fanned to
-                                                    slot!(K),    // BOTH combine sites
-                                                )
-                                            },
-                                        )
-                                    },
-                                )
+                            |(u_in, v_in, _lap_u, _lap_v, u_out, v_out)| {
+                                bundle4(u_in, v_in, u_out, v_out)
                             },
                         )
-                    },
-                )
-            });
+                    })
+            })
+    };
 
-    // Bind the OUTER slots ONCE via `call`. Grid + F + K fan out to BOTH steps'
-    // sites (shared slots). UIn/VIn/UOut/VOut are step-1 handles; step 2's
-    // operands are all internal pipes, so there is nothing else to bind. After
-    // this the graph is fully armed and replays with NO further binding.
-    g.call((
-        Grid(LaunchSpec::from([grid_w, grid_h])),
-        F(feed),
-        K(kill),
-        UIn(u_a),
-        VIn(v_a),
-        UOut(u_b),
-        VOut(v_b),
-    ))?;
+    // `curried_kernel` partially binds the INVARIANTS that never rotate — `Grid`,
+    // `F`, `K` — via `bind_move`, leaving ONLY the four field slots open for the
+    // step-specific `call_move` at the call site.
+    let curried_kernel = |ks: &gpu::Kernels, lap_u, lap_v| {
+        get_meta_kernel(ks, lap_u, lap_v).bind_move((
+            F(feed_rate),
+            K(kill_rate),
+            Grid(LaunchSpec::from([grid_w, grid_h])),
+        ))
+    };
+
+    // ── Build the TWO-step meta-kernel by composing `curried_kernel` with itself. ──
+    //   STEP 1 (read A, write B): value-bind the four field slots to concrete bufs.
+    //   STEP 2 (read B, write A): FEED the same four slots from step-1's output
+    //     pipes — the crossed rotation is VISIBLE right in the `feed(...)` args.
+    // Over the pair the buffer roles are identity (A→B→A), so the graph is bound
+    // ONCE at build and replays with NO per-step rebinding.
+    let g = curried_kernel(&ks, lap_u1, lap_v1)
+        .call_move((UIn(u_a), VIn(v_a), UOut(u_b), VOut(v_b)))
+        .and_then(move |(u_a, v_a, u_b, v_b)| {
+            curried_kernel(&ks, lap_u2, lap_v2).call_move((
+                feed(UIn, u_b),  // read B
+                feed(VIn, v_b),  // read B
+                feed(UOut, u_a), // write back into A
+                feed(VOut, v_a), // write back into A
+            ))
+        });
 
     // ── Replay the TWO-step graph steps/2 times via plain sync(). ───────────
     // NO per-step rebinding: each `sync` runs both unrolled steps (A→B→A), and
@@ -712,10 +731,11 @@ fn run_immutable(
     let pairs = steps / 2;
     let mut final_v: Vec<f32> = Vec::new();
     for p in 0..pairs {
-        // `combine` (step 2) is terminal: sync yields ITS six outputs
-        // (u_b, v_b, lap_u2, lap_v2, u_a, v_a) — the last two are the fresh A
-        // fields (this pair's result). Read V from the A output before drop.
-        let (_u_b_co, _v_b_co, _lap_u2_co, _lap_v2_co, _u_a_co, v_a_co) = g.sync(ctx)?;
+        // Step 2's trimmed `bundle4` is terminal: sync yields its FOUR field
+        // Checkouts (u_in, v_in, u_out, v_out) = (u_b, v_b, u_a, v_a) — the last
+        // two are the fresh A fields (this pair's result). Read V from the A
+        // output (`v_out` = v_a) before drop.
+        let (_u_b_co, _v_b_co, _u_a_co, v_a_co) = g.sync(ctx)?;
         if p + 1 == pairs {
             final_v = read_field(&v_a_co)?;
         }
@@ -731,7 +751,7 @@ fn run_immutable(
             &colorize_v(&final_v),
         )?;
         println!(
-            "wrote frame gray-scott-immutable.ppm ({steps} steps @ F={feed}, k={kill}, \
+            "wrote frame gray-scott-immutable.ppm ({steps} steps @ F={feed_rate}, k={kill_rate}, \
              unroll-by-2, {pairs} replays, no rebinding)"
         );
     }
