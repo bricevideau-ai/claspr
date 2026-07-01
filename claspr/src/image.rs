@@ -724,6 +724,13 @@ impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
         Ok(())
     }
 
+    /// Atomicity pre-pass mirror of the slice ops: read-only readiness of the
+    /// lent image cell, so a busy/unsatisfiable image op is caught before any
+    /// earlier lending op enqueues (see [`Input::check_ready`]).
+    fn check_ready(&self) -> Result<()> {
+        self.img.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("image_write".into());
     }
@@ -789,6 +796,13 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
             }
         }
         Ok(())
+    }
+
+    /// Atomicity pre-pass mirror of the slice ops: read-only readiness of the
+    /// lent image cell, so a busy/unsatisfiable image op is caught before any
+    /// earlier lending op enqueues (see [`Input::check_ready`]).
+    fn check_ready(&self) -> Result<()> {
+        self.img.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -898,6 +912,14 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         ))
     }
 
+    /// Atomicity pre-pass mirror of the slice ops: read-only readiness of BOTH
+    /// lent image cells (src then dst), so a busy/unsatisfiable operand is caught
+    /// before any earlier lending op enqueues (see [`Input::check_ready`]).
+    fn check_ready(&self) -> Result<()> {
+        self.src.check_ready()?;
+        self.dst.check_ready()
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("image_copy".into());
     }
@@ -961,6 +983,13 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
         )?;
         self.out.put_home(img, vec![wrap_event(event)], home);
         Ok(())
+    }
+
+    /// Atomicity pre-pass mirror of the slice ops: read-only readiness of the
+    /// lent image cell, so a busy/unsatisfiable image op is caught before any
+    /// earlier lending op enqueues (see [`Input::check_ready`]).
+    fn check_ready(&self) -> Result<()> {
+        self.img.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {

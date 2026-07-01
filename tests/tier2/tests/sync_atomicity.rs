@@ -26,11 +26,15 @@
 //!     untouched, graph recovers once the live `Checkout` drops;
 //!  3. a fully-ready multi-node graph runs normally and produces correct data;
 //!  4. the early-caught error is `SlotUnbound`, identical to the old execute-time
-//!     failure.
+//!     failure;
+//!  5. IMAGE atomicity (BLOCKER B1) — the image leaf ops carry the same
+//!     `check_ready` pre-pass: a busy image cell is caught atomically (nothing
+//!     lent / enqueued) and the op re-runs with a stable handle once it re-arms.
 
 use claspr::eager::{DeviceOpExt, bundle2};
+use claspr::image::format::R32Uint;
 use claspr::record::{MemRef, RecordableBuffer};
-use claspr::{Context, DeviceSlice, Error};
+use claspr::{Context, DeviceSlice, Error, Image2D, WriteOnly};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
 
@@ -64,6 +68,16 @@ fn seeded(ctx: &Context, v: u32) -> DeviceSlice<u32> {
 /// SAME `cl_mem` survived a failed-then-retried `sync` (it was never lent away).
 fn handle_of(buf: &DeviceSlice<u32>) -> usize {
     match buf.record_handle().mem {
+        MemRef::Buffer(mem) => mem as usize,
+        MemRef::Svm(p) => p as usize,
+    }
+}
+
+/// Image twin of [`handle_of`] — the `cl_mem` behind an image (images implement
+/// `RecordableBuffer`), for asserting the SAME image survived a failed-then-
+/// retried `sync`.
+fn img_handle_of(img: &Image2D<WriteOnly, R32Uint>) -> usize {
+    match img.record_handle().mem {
         MemRef::Buffer(mem) => mem as usize,
         MemRef::Svm(p) => p as usize,
     }
@@ -231,4 +245,92 @@ fn early_caught_error_is_identical_slot_unbound() {
         ),
         other => panic!("expected Error::SlotUnbound, got {other:?}"),
     }
+}
+
+/// (5) IMAGE atomicity (BLOCKER B1) — the four image leaf ops (`ImageWrite`,
+/// `ImageRead`, `ImageCopy`, `ImageFill`) now carry the same read-only
+/// `check_ready` pre-pass as the slice ops. Before the fix they inherited the
+/// no-op `DeviceOp` default, so a busy/unsatisfiable image cell sailed past the
+/// pre-pass: in a multi-node graph an earlier lending op would be enqueued + lent
+/// and THEN the image op would error, stranding the earlier buffer `Lent`.
+///
+/// This is the image twin of (2) [`checked_out_cell_in_later_node_is_atomic`],
+/// realised on a single `image.fill` leaf op (the image leaf builders take an
+/// owned concrete image, so their `Input` is a concrete cell — exactly the cell
+/// the override inspects). Run 1's `Checkout` HOLDS the image (its concrete cell
+/// is now empty/lent); while it is alive a re-`sync` must error via
+/// `ImageFill::check_ready` → [`Input::check_ready`] — the SAME
+/// `NotSupported("…already lent…")` the execute-time backstop produces — WITHOUT
+/// re-lending or enqueuing. After the `Checkout` drops the cell re-arms and the
+/// op re-runs with the SAME `cl_mem` (never stranded by the failed attempt).
+///
+/// (The cross-node "earlier branch untouched" half of the guarantee is already
+/// locked down for the shared `Input`/`Bundle` machinery by (1)/(2); image leaf
+/// ops ride that exact machinery — a `bundle2(…, image_op)`'s `check_ready`
+/// recurses every branch, and the image branch now reports busy there too. A
+/// recoverable bundle variant with a concrete image *leaf* op is not separately
+/// expressible because the image leaf builders are concrete-only (no slot form)
+/// and a concrete bundle branch does not re-arm after a *successful* run — so a
+/// busy-then-recover bundle cannot recover regardless of this fix. The single-op
+/// form above exercises the override on the same concrete cell with full
+/// recovery.)
+#[test]
+fn busy_image_cell_caught_by_check_ready_and_recovers() {
+    let Some(ctx) = ctx() else { return };
+    if !ctx.device().cl3().image_support().unwrap_or(false) {
+        eprintln!("SKIP: device has no image support");
+        return;
+    }
+
+    const W: u32 = 8;
+    const H: u32 = 4;
+    let img = Image2D::<WriteOnly, R32Uint>::alloc(&ctx, W, H).expect("alloc image");
+    let img_handle = img_handle_of(&img);
+
+    // In-place `image.fill`, NO download: the run's Checkout HOLDS the image, so
+    // its concrete `Input` cell is left empty/lent — the busy state the override
+    // must catch on the next sync.
+    let g = img.fill([0xABCD_0000u32, 0, 0, 0]);
+
+    // Run 1: the image fills and is checked out (its cell is now empty/lent).
+    let co1 = g.sync(&ctx).expect("run 1: ready image op must sync");
+    assert_eq!(
+        img_handle_of(&co1),
+        img_handle,
+        "run 1 must lend the SAME cl_mem"
+    );
+
+    // Run 2 (Checkout still alive → image cell busy). `ImageFill::check_ready`
+    // must report the busy concrete cell atomically — nothing lent, nothing
+    // enqueued. Without the override this op inherited the no-op default and the
+    // busy cell would slip past the pre-pass.
+    // (`Checkout<Image2D>` isn't `Debug`, so match the Ok side rather than
+    // `expect_err`.)
+    let Err(err) = g.sync(&ctx) else {
+        panic!("a busy (checked-out) image cell must error at sync");
+    };
+    assert!(
+        matches!(&err, Error::NotSupported(m) if m.contains("already lent")),
+        "expected NotSupported(\"…already lent…\") for the busy image cell, got {err:?}"
+    );
+
+    // Recover: drop the live Checkout → the concrete image cell re-arms.
+    drop(co1);
+
+    // Run 3: the cell is full again; `sync` runs and the image is the SAME cl_mem
+    // — the failed run 2 neither severed nor re-lent it.
+    let co3 = g
+        .sync(&ctx)
+        .expect("recovered sync — the image cell must re-arm after the live Checkout drops");
+    assert_eq!(
+        img_handle_of(&co3),
+        img_handle,
+        "image must re-arm to the SAME cl_mem across the failed attempt"
+    );
+    let pixels: Vec<u32> = co3.read_alloc().wait().expect("read back");
+    assert!(
+        pixels.iter().all(|&v| v == 0xABCD_0000),
+        "fill pattern survives, got {:?}",
+        &pixels[..4]
+    );
 }
