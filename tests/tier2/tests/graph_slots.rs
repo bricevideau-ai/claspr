@@ -200,9 +200,13 @@ fn unbound_slot_sync_errors() {
     let err = g.sync(&ctx).expect_err("unbound slot must error at sync");
     match err {
         Error::SlotUnbound(name) => {
+            // Clean tag ident only — exactly `Buf`, with no internal `<KeyMarker>`
+            // source suffix leaking into user-facing text (review issue S3). This
+            // slot name flows from `SlotHandle::new` (the primary leak site).
+            assert_eq!(name, "Buf", "unbound-slot error should name exactly `Buf`");
             assert!(
-                name.contains("Buf"),
-                "unbound-slot error should name the tag (`Buf`), got {name:?}"
+                !name.contains("KeyMarker") && !name.contains('<'),
+                "no KeyMarker / generic suffix in slot error, got {name:?}"
             );
         }
         other => panic!("expected Error::SlotUnbound, got {other:?}"),

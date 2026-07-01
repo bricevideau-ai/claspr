@@ -312,12 +312,16 @@ macro_rules! slots {
             where
                 S: $crate::IntoBound<$val> + 'static,
             {
+                // Clean display name for slot-error diagnostics: exactly the tag
+                // ident (`"Buf"`), with NO `<KeyMarker>` suffix. Matching is by
+                // `Key`'s TypeId (below) and is fully independent of this string.
+                const NAME: &'static str = stringify!($name);
                 type Value = $val;
                 // The matching key is `$name<KeyMarker>` — a distinct type per tag
                 // (the ident differs) yet INDEPENDENT of the source `S`, so a
                 // `Checkout`-built binding (`$name<Checkout<Value>>`) matches a
-                // `slot!($name)` (`$name<Value>`). `KeyMarker` is a shared ZST and
-                // its `type_name` still contains the tag ident for diagnostics.
+                // `slot!($name)` (`$name<Value>`). `KeyMarker` is a shared ZST used
+                // ONLY for TypeId matching (the display name is `NAME`, above).
                 type Key = $name<$crate::KeyMarker>;
                 fn into_value(self) -> $val {
                     $crate::IntoBound::into_bound(self.0)

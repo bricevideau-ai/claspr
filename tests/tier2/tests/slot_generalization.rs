@@ -594,10 +594,20 @@ fn bind_absent_tag_errors() {
         g.bind(Absent(7u32)),
         "binding a tag absent from the graph must hard-error",
     );
-    assert!(
-        matches!(err, Error::SlotNoSuchTag(n) if n.contains("Absent")),
-        "expected SlotNoSuchTag naming Absent, got {err:?}"
-    );
+    match &err {
+        Error::SlotNoSuchTag(n) => {
+            // The diagnostic is the CLEAN tag ident — exactly `Absent`, with no
+            // internal `<KeyMarker>` source suffix leaking into user-facing text
+            // (review issue S3).
+            assert_eq!(*n, "Absent", "SlotNoSuchTag should name exactly `Absent`");
+            assert!(
+                !n.contains("KeyMarker"),
+                "no `KeyMarker` in slot error: {n:?}"
+            );
+            assert!(!n.contains('<'), "no generic suffix in slot error: {n:?}");
+        }
+        other => panic!("expected SlotNoSuchTag naming Absent, got {other:?}"),
+    }
 
     // The tag that IS present still binds cleanly.
     g.bind(Present(2u32))

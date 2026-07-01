@@ -41,7 +41,7 @@ use crate::{
     HostWritable, MappedSlice, MappedSliceUninit, MemMode, ReadWrite, Result, USMSlice,
     USMSliceUninit,
 };
-use std::any::{Any, TypeId, type_name};
+use std::any::{Any, TypeId};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
@@ -412,6 +412,14 @@ impl_slot_value_move!(USMSlice);
 /// NOT compile-time set-algebra (the abandoned HList approach). Only the per-tag
 /// *value type* is compile-time.
 pub trait Tag: Sized + 'static {
+    /// The clean, human-readable identifier of this tag for slot-error diagnostics
+    /// — just the tag ident (e.g. `"Buf"`), NOT `type_name::<Key>()` (which would
+    /// leak the internal `<KeyMarker>` source suffix into user-facing text). The
+    /// [`slots!`](crate::slots) macro sets this to `stringify!($name)`. It is a
+    /// display string ONLY; tag *matching* is by [`TypeId::of::<Key>()`](Tag::Key),
+    /// which is wholly independent of this name.
+    const NAME: &'static str;
+
     /// The buffer type this tag carries. `Send + 'static` so it can flow through
     /// the same [`Cell`]/[`Checkout`] lend-and-return machinery as a concrete
     /// input.
@@ -426,8 +434,9 @@ pub trait Tag: Sized + 'static {
     /// default `Tag<Value>`). `Key` is the per-tag NON-generic marker (the same for
     /// every `S`), so `slot!` and every `bind` form key on `TypeId::of::<Key>()` and
     /// match regardless of source. The [`slots!`](crate::slots) macro emits one
-    /// zero-size `Key` marker per tag; its `type_name` (which contains the tag's
-    /// ident) is reused for the slot diagnostics.
+    /// zero-size `Key` marker per tag; it is used ONLY for `TypeId`-based matching.
+    /// The human-readable slot diagnostics use [`NAME`](Tag::NAME) instead, so no
+    /// internal `<KeyMarker>` suffix ever leaks into user-facing error text.
     type Key: 'static;
 
     /// Unwrap the tag binding `Tag(source)` to its [`Value`](Tag::Value) (moved),
@@ -522,8 +531,8 @@ type SlotCloneFn = Box<dyn Fn(&dyn Any) -> Option<Box<dyn Any + Send>> + Send>;
 /// over the tag's `Value`), a type-erased [`SlotEq`] comparator (captured at `bind`
 /// time where `Tg::Value: SlotEq` is known), a type-erased [`SlotValue`] clone
 /// hook (captured the same way), and an `outcome` slot threaded out of the fold
-/// (the verb-2×2 verdict). The tag `type_name` for diagnostics lives on the
-/// matched [`Input::Slot`] itself (the error sites read it there).
+/// (the verb-2×2 verdict). The tag's [`NAME`](Tag::NAME) for diagnostics lives on
+/// the matched [`Input::Slot`] itself (the error sites read it there).
 ///
 /// ## Fill-all vs take-once — the shared-slot mechanism
 ///
@@ -1020,14 +1029,14 @@ pub enum Input<T> {
     /// [`Error::SlotUnbound`]; resolved while [`Lent`](SlotState::Lent) the graph
     /// is busy on that slot (also `SlotUnbound`, message covers both).
     ///
-    /// `id` is `TypeId::of::<Tag>()` (matched against a [`SlotBinder`]); `name` is
-    /// `type_name::<Tag>()`, carried for the unbound-slot diagnostic AND the
-    /// conflict / checked-out bind errors.
+    /// `id` is `TypeId::of::<Tag::Key>()` (matched against a [`SlotBinder`]); `name`
+    /// is [`Tag::NAME`] (the clean tag ident), carried for the unbound-slot
+    /// diagnostic AND the conflict / checked-out bind errors.
     Slot {
-        /// `TypeId::of::<Tag>()` — the bind-matching key.
+        /// `TypeId::of::<Tag::Key>()` — the bind-matching key.
         id: TypeId,
-        /// `type_name::<Tag>()` — for the slot diagnostics (unbound / conflict /
-        /// checked-out).
+        /// [`Tag::NAME`] (the clean tag ident) — for the slot diagnostics (unbound /
+        /// conflict / checked-out).
         name: &'static str,
         /// Tri-state: [`Unbound`](SlotState::Unbound) until a matching bind
         /// deposits the value ([`Bound`](SlotState::Bound)); [`Lent`](SlotState::Lent)
@@ -1562,12 +1571,14 @@ pub enum ScalarInput<V> {
     /// A plain value bound at construction.
     Concrete(V),
     /// An unbound (or later-bound) non-resource slot — `slot!(Tag)` in a scalar /
-    /// launch position. `id`/`name` are the tag's `TypeId`/`type_name` for matching
-    /// and diagnostics; `cell` is the two-state [`ScalarSlotCell`].
+    /// launch position. `id`/`name` are the tag's `TypeId::of::<Tag::Key>()` /
+    /// [`Tag::NAME`] for matching and diagnostics; `cell` is the two-state
+    /// [`ScalarSlotCell`].
     Slot {
-        /// `TypeId::of::<Tag>()` — the bind-matching key.
+        /// `TypeId::of::<Tag::Key>()` — the bind-matching key.
         id: TypeId,
-        /// `type_name::<Tag>()` — for the unbound-slot / conflict diagnostics.
+        /// [`Tag::NAME`] (the clean tag ident) — for the unbound-slot / conflict
+        /// diagnostics.
         name: &'static str,
         /// Two-state cell: [`Unbound`](ScalarSlotState::Unbound) until a matching
         /// bind deposits the value ([`Bound`](ScalarSlotState::Bound)).
@@ -1706,7 +1717,7 @@ impl<V: Send + 'static> ScalarInput<V> {
 /// The build-time handle produced by [`slot!`](crate::slot)`(Tag)` — an UNBOUND
 /// typed hole that plugs into the same positions a concrete buffer does (kernel
 /// args, `download`/`fill`/`write`/copy sources, …). It carries the tag's
-/// [`TypeId`] + `type_name` and a fresh [`Unbound`](SlotState::Unbound)
+/// [`TypeId`] + [`NAME`](Tag::NAME) and a fresh [`Unbound`](SlotState::Unbound)
 /// [`SlotCell`]; converting it (via [`From`] / [`ToInput`]) yields an
 /// [`Input::Slot`] sharing that cell, which a later
 /// [`bind`](DeviceOpExt::bind)`(Tag(value))` fills.
@@ -1726,7 +1737,10 @@ impl<Tg: Tag> SlotHandle<Tg> {
     pub fn new() -> Self {
         SlotHandle {
             id: TypeId::of::<Tg::Key>(),
-            name: type_name::<Tg::Key>(),
+            // Match-key TypeId is `Tg::Key`; the display name is the clean tag ident
+            // (`Tg::NAME`) — NOT `type_name::<Tg::Key>()`, which would leak the
+            // internal `<KeyMarker>` source suffix into user-facing slot errors.
+            name: Tg::NAME,
             cell: Arc::new(Mutex::new(SlotState::Unbound)),
             _tag: PhantomData,
         }
@@ -2515,7 +2529,9 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         // Checked only when `outcome` is Ok: a conflict/sever already counts as a
         // match (the tag IS present), so it errors above, not here.
         if binder.matched() == 0 {
-            return Err(Error::SlotNoSuchTag(type_name::<Tg::Key>()));
+            // Clean tag ident (`Tg::NAME`), not `type_name::<Tg::Key>()` — the
+            // latter would leak the internal `<KeyMarker>` suffix into the message.
+            return Err(Error::SlotNoSuchTag(Tg::NAME));
         }
         Ok(self)
     }
