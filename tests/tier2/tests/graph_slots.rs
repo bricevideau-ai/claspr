@@ -513,3 +513,174 @@ fn call_with_conflicting_element_errors() {
         "expected SlotConflict on A, got {err:?}"
     );
 }
+
+// ── B2: all-or-nothing (probe before sever) ─────────────────────────────────
+//
+// `call`/`mutate_call` are two-phase: PHASE 1 severs EVERY `Checkout` source
+// (`into_value`), PHASE 2 folds. Before the phase-0 probe, a failure in phase 2 —
+// or even a zero-match on the FIRST element — had ALREADY severed all sources.
+// The probe (a read-only dry run over the SAME `bind_slots` walk, run BEFORE any
+// `into_value`) makes the covered failures all-or-nothing: an absent tag, an
+// externally-checked-out target, and a `Set`-onto-severed slot now return their
+// error having severed / mutated NOTHING.
+//
+// The oracle for "a source was NOT severed": a `Checkout` sourced from a slot
+// graph re-arms its slot on DROP (`Lent → Bound`). When the probe rejects, the
+// tuple's Checkouts (moved into `mutate_call`) drop un-severed at the failed
+// call's exit, so their source graphs re-`sync` cleanly. Had they been severed
+// (`Lent → Severed`), the source's next `sync` would be `Err(SlotUnbound)`.
+
+/// A single-output, re-armable source graph: `scale_u32(slot!(TAG), 1)` in place.
+/// `sync` yields ONE `Checkout` whose home is the TAG slot's cell — dropping it
+/// re-arms the slot, `into_inner`/binding-it-elsewhere severs it. `factor = 1`
+/// leaves the data unchanged so the buffer's contents stay meaningful across the
+/// sever-and-adopt swap.
+macro_rules! scale_src {
+    ($ks:expr, $tag:ident) => {
+        $ks.scale_u32([N], slot!($tag), 1u32)
+    };
+}
+
+/// B2 (1): a `mutate_call` whose FIRST element's tag is ABSENT from the target
+/// graph must error `SlotNoSuchTag` WITHOUT severing ANY source. Both source
+/// graphs must still `sync` afterward (their slots were re-armed on the dropped
+/// Checkouts, NOT severed). This is the egregious "sever everything then
+/// SlotNoSuchTag" bug the probe closes.
+#[test]
+fn call_absent_tag_does_not_sever_other_sources() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // Two independent source graphs producing co_a (home = ga's A slot) and
+    // co_b (home = gb's B slot); both slots are `Lent` while the Checkouts live.
+    let ga = scale_src!(ks, A);
+    let gb = scale_src!(ks, B);
+    let co_a = ga
+        .call((A(seeded(&ctx, 7)),))
+        .expect("bind A")
+        .sync(&ctx)
+        .expect("ga sync");
+    let co_b = gb
+        .call((B(seeded(&ctx, 9)),))
+        .expect("bind B")
+        .sync(&ctx)
+        .expect("gb sync");
+
+    // Target graph carries `Buf` — NEITHER A NOR B. `mutate_call((A(co_a),
+    // B(co_b)))` must reject on the FIRST (absent) element, A.
+    let g = ks.scale_u32([N], slot!(Buf), 2u32);
+    let err = bind_err(
+        g.mutate_call((A(co_a), B(co_b))),
+        "mutate_call with an absent first tag must error",
+    );
+    assert!(
+        matches!(err, Error::SlotNoSuchTag(n) if n.contains("A")),
+        "expected SlotNoSuchTag(A), got {err:?}"
+    );
+
+    // The proof: NEITHER source was severed. Both source graphs re-`sync`
+    // cleanly (their slots re-armed `Lent → Bound` on the dropped Checkouts).
+    // A severed slot would make these `Err(SlotUnbound)`.
+    let co_a2 = ga
+        .sync(&ctx)
+        .expect("ga re-sync — A slot must be re-armed, not severed");
+    let co_b2 = gb
+        .sync(&ctx)
+        .expect("gb re-sync — B slot must be re-armed, not severed");
+    drop(co_a2);
+    drop(co_b2);
+}
+
+/// B2 (2): a `mutate_call` whose element targets a slot that is CHECKED OUT by an
+/// UNRELATED live `Checkout` (NOT one of this tuple's elements) must error
+/// `SlotCheckedOut` WITHOUT severing the OTHER tuple element's source. The probe
+/// distinguishes "Lent by a tuple Checkout (a crossed swap → OK)" from "Lent by
+/// an external Checkout (→ SlotCheckedOut)" via the tuple's severable-cell ids.
+#[test]
+fn call_checked_out_element_does_not_sever_others() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // Target graph with two slots A and B; sync once with both bound. Keep the
+    // A Checkout ALIVE (external) so A stays `Lent`; re-arm B (drop its Checkout).
+    let g = ks.add_u32([N], slot!(A), slot!(B), slot!(Out));
+    let (a_live, b_co, out_co) = g
+        .call((A(seeded(&ctx, 1)), B(seeded(&ctx, 2)), Out(seeded(&ctx, 0))))
+        .expect("initial bind")
+        .sync(&ctx)
+        .expect("initial sync");
+    drop(b_co); // B re-arms (Lent → Bound); `a_live` stays alive → A stays Lent.
+    drop(out_co); // Out re-arms too.
+
+    // An independent source graph producing co_b (home = gb's B slot), Lent.
+    let gb = scale_src!(ks, B);
+    let co_b = gb
+        .call((B(seeded(&ctx, 5)),))
+        .expect("bind gb B")
+        .sync(&ctx)
+        .expect("gb sync");
+
+    // `mutate_call((A(seeded), B(co_b)))` on g: A is Lent by the EXTERNAL
+    // `a_live` (its cell id is NOT among the tuple's severable cells), so the
+    // probe rejects with SlotCheckedOut(A) BEFORE phase 1 severs co_b.
+    let err = bind_err(
+        g.mutate_call((A(seeded(&ctx, 3)), B(co_b))),
+        "mutate_call onto an externally-checked-out slot must error",
+    );
+    assert!(
+        matches!(err, Error::SlotCheckedOut(n) if n.contains("A")),
+        "expected SlotCheckedOut(A) from the external checkout, got {err:?}"
+    );
+
+    // The proof: co_b's source (gb) was NOT severed — it re-`sync`s cleanly.
+    let co_b2 = gb
+        .sync(&ctx)
+        .expect("gb re-sync — B slot must be re-armed, not severed");
+    drop(co_b2);
+    drop(a_live);
+}
+
+/// B2 (3): a focused restatement of the crossed-swap oracle — `mutate_call`'s
+/// crossed rebind over two slots that are BOTH `Lent`, each by a Checkout IN THE
+/// SAME tuple, succeeds (the probe recognises the swap and passes it). This is the
+/// case the probe must NOT over-reject; `double_buffering` exercises the full
+/// ping-pong, this locks the single crossing in isolation.
+#[test]
+fn mutate_call_crossed_swap_over_lent_by_tuple_checkout_succeeds() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // add_u32(In, Ones, Out): out = in + ones. Two data slots (In, Out) plus a
+    // shared operand (B reused as "ones").
+    let g = ks.add_u32([N], slot!(A), slot!(B), slot!(Out));
+    let (in_co, ones_co, out_co) = g
+        .call((
+            A(seeded(&ctx, 10)),
+            B(seeded(&ctx, 1)),
+            Out(seeded(&ctx, 0)),
+        ))
+        .expect("bind step0")
+        .sync(&ctx)
+        .expect("sync step0");
+    // Now A and Out slots are Lent (held by in_co / out_co — both in the swap
+    // tuple below). Re-arm the shared operand.
+    drop(ones_co);
+
+    // THE CROSSED SWAP over Lent-by-tuple-checkout: A adopts the old Out, Out
+    // adopts the old In. Both targets are `Lent`; the probe sees each target's
+    // cell id IS in the tuple's severable set (the crossing Checkouts sever them
+    // in phase 1) → OK, not SlotCheckedOut.
+    g.mutate_call((A(out_co), Out(in_co)))
+        .expect("crossed mutate_call over Lent-by-tuple-checkout must succeed");
+
+    let (_a2, _ones2, out2) = g.sync(&ctx).expect("sync after swap");
+    let mut result = vec![0u32; N];
+    out2.read(&mut result).wait().expect("read post-swap");
+    // Step 0 computed out = 10 + 1 = 11. After the swap A = old Out (=11),
+    // Out = old In (=10); step 1 computes out = 11 + 1 = 12.
+    assert!(
+        result.iter().all(|&v| v == 12),
+        "post-swap add should be 11 + 1 = 12, got {:?}",
+        &result[..8]
+    );
+}

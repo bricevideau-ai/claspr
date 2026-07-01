@@ -277,6 +277,7 @@ macro_rules! usm_slice {
 ///     type Value = DeviceSlice<u32>;
 ///     type Key   = Buf<::claspr::KeyMarker>;   // stable matching identity
 ///     fn into_value(self) -> DeviceSlice<u32> { self.0.into_bound() }
+///     fn source_cell_id(&self) -> Option<usize> { self.0.source_cell_id() }
 /// }
 /// ```
 ///
@@ -325,6 +326,12 @@ macro_rules! slots {
                 type Key = $name<$crate::KeyMarker>;
                 fn into_value(self) -> $val {
                     $crate::IntoBound::into_bound(self.0)
+                }
+                fn source_cell_id(&self) -> ::core::option::Option<usize> {
+                    // Read-only: a raw-value source returns `None`; a `Checkout`
+                    // source returns the slot cell its `into_inner` will sever —
+                    // the `call`/`mutate_call` phase-0 crossed-swap recogniser.
+                    $crate::IntoBound::source_cell_id(&self.0)
                 }
             }
         )+

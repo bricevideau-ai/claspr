@@ -447,6 +447,18 @@ pub trait Tag: Sized + 'static {
     /// [`bind`](DeviceOpExt::bind) can pull the value out of a generic `Tg` wrapper
     /// (a generic tuple-struct field is not nameable).
     fn into_value(self) -> Self::Value;
+
+    /// The **slot-cell id this tag's source will sever** when [`into_value`](Self::into_value)
+    /// runs ([`Arc::as_ptr`] as `usize`), or `None` if it severs nothing. Read-only —
+    /// does NOT consume the tag. A raw-value tag returns `None`; a `Checkout`-sourced
+    /// tag returns the id of the slot cell its `into_inner` will sever. The
+    /// [`slots!`](crate::slots) macro emits this as `self.0.source_cell_id()`
+    /// ([`IntoBound::source_cell_id`]).
+    ///
+    /// It feeds the `call`/`mutate_call` phase-0 probe: the tuple's Checkout-sourced
+    /// elements contribute their ids so the probe can recognise a crossed swap (a
+    /// `Lent` target the tuple itself will sever) versus an external checkout.
+    fn source_cell_id(&self) -> Option<usize>;
 }
 
 /// Conversion from a slot **binding source** to the tag's
@@ -470,6 +482,17 @@ pub trait Tag: Sized + 'static {
 pub trait IntoBound<V> {
     /// Resolve this binding source to the tag's value (severing a `Checkout`).
     fn into_bound(self) -> V;
+
+    /// The **slot-cell id this source will sever** ([`Arc::as_ptr`] as `usize`) when
+    /// `into_bound` runs, or `None` if it severs nothing. Read-only — does NOT
+    /// consume. A raw value severs nothing (`None`); a [`Checkout`] returns the id of
+    /// the slot cell its `into_inner` will sever. Feeds the `call`/`mutate_call`
+    /// phase-0 probe's severable-cells set (the crossed-swap recogniser).
+    ///
+    /// Default `None` covers the identity (raw-value) impl.
+    fn source_cell_id(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl<V> IntoBound<V> for V {
@@ -483,6 +506,11 @@ impl<V: Send> IntoBound<V> for Checkout<V> {
         // Severs the Checkout's source home (Lent → Severed) and returns the buffer
         // for the target slot to adopt — the explicit sever-and-adopt path.
         self.into_inner()
+    }
+
+    fn source_cell_id(&self) -> Option<usize> {
+        // The slot cell this Checkout's `into_inner` will sever in phase 1.
+        self.home_cell_id()
     }
 }
 
@@ -583,6 +611,29 @@ pub struct SlotBinder {
     /// conflict/sever still produces its own error via [`outcome`](Self::outcome),
     /// so counting those as matches never masks them.
     matched: usize,
+    /// **Probe (read-only) mode.** When `true`, [`try_bind_slot`](Input::try_bind_slot)
+    /// does NOT fill / take / replace any cell — it only INSPECTS state and records
+    /// [`matched`](Self::matched) + [`outcome`](Self::outcome), so the whole
+    /// `bind_slots` walk becomes a dry run. This is the phase-0 pre-check that makes
+    /// [`call`](DeviceOpExt::call) / [`mutate_call`](DeviceOpExt::mutate_call)
+    /// all-or-nothing: it proves every tuple element CAN bind (present + a state the
+    /// verb handles) BEFORE any `into_value` severs a `Checkout` source. A probe
+    /// binder carries NO value (its `value`/`eq`/`clone` are inert dummies).
+    ///
+    /// A probe binder reports [`is_fanout`](Self::is_fanout)`== true` so the
+    /// [`AndThen`]/bundle walks visit EVERY matching cell (a valueless binder would
+    /// otherwise read "consumed" and stop after the first subtree, missing a later
+    /// checked-out cell).
+    probe: bool,
+    /// The set of slot-cell identities ([`Arc::as_ptr`] as `usize`) that phase 1 WILL
+    /// sever — one per [`Checkout`]-sourced element in the SAME `call`/`mutate_call`
+    /// tuple (a raw-value element contributes nothing). Consulted ONLY in
+    /// [`probe`](Self::probe) mode: a `Lent` target whose cell id is in this set is
+    /// held by a tuple Checkout, so phase 1 turns it `Lent → Severed` before the
+    /// fold — the crossed double-buffer swap. A `Lent` target NOT in this set is
+    /// held by an EXTERNAL live Checkout and stays `Lent` at fold time
+    /// ([`Error::SlotCheckedOut`]). Empty for every non-probe binder.
+    severable_cells: Vec<usize>,
 }
 
 impl SlotBinder {
@@ -622,6 +673,65 @@ impl SlotBinder {
             }),
             outcome: Ok(()),
             matched: 0,
+            probe: false,
+            severable_cells: Vec::new(),
+        }
+    }
+
+    /// Build a **read-only probe** binder for tag `Tg` in [`BindMode`] `mode`,
+    /// carrying no value — the phase-0 dry run of [`call`](DeviceOpExt::call) /
+    /// [`mutate_call`](DeviceOpExt::mutate_call). `severable_cells` is the set of
+    /// slot-cell ids ([`Arc::as_ptr`] as `usize`) that phase 1 will sever (one per
+    /// `Checkout`-sourced tuple element); a `Lent` target in that set is a crossed
+    /// swap (OK), one outside it is an external checkout ([`Error::SlotCheckedOut`]).
+    ///
+    /// The `value`/`eq`/`clone` fields are inert dummies: probe mode never calls
+    /// `provide`/`fill_clone`/`eq` (it inspects state only), so they are never read.
+    /// No `SlotEq`/`SlotValue` bound is needed here — the read-only probe compares
+    /// nothing and clones nothing.
+    fn probe<Tg: Tag>(mode: BindMode, severable_cells: Vec<usize>) -> Self {
+        SlotBinder {
+            id: TypeId::of::<Tg::Key>(),
+            mode,
+            // Inert: probe mode inspects state only; these are never invoked.
+            value: None,
+            eq: Box::new(|_, _| false),
+            clone: Box::new(|_| None),
+            outcome: Ok(()),
+            matched: 0,
+            probe: true,
+            severable_cells,
+        }
+    }
+
+    /// Whether this binder is a read-only [`probe`](Self::probe) (phase-0 dry run).
+    fn is_probe(&self) -> bool {
+        self.probe
+    }
+
+    /// Predict the outcome of the verb 2×2 on a target that is currently
+    /// [`Lent`](SlotState::Lent), for a probe over cell `cell_id`. A `Lent` cell held
+    /// by a tuple `Checkout` (`cell_id ∈ severable_cells`) becomes
+    /// [`Severed`](SlotState::Severed) in phase 1, so the verb then sees `Severed`
+    /// ([`Set`](BindMode::Set) → [`SlotSevered`](Error::SlotSevered);
+    /// [`Mutate`](BindMode::Mutate) → re-arm, OK). A `Lent` cell held by an EXTERNAL
+    /// checkout stays `Lent` at fold time → [`SlotCheckedOut`](Error::SlotCheckedOut)
+    /// for both verbs. Returns the [`Error`] to record, or `Ok(())` if the verb will
+    /// succeed post-sever. `name` is the tag's display name for the error.
+    fn probe_lent(&self, cell_id: usize, name: &'static str) -> Result<()> {
+        if self.severable_cells.contains(&cell_id) {
+            // Phase 1 will sever this cell (Lent → Severed) — a crossed swap.
+            match self.mode {
+                // Mutate re-arms a Severed slot: OK.
+                BindMode::Mutate => Ok(()),
+                // Set rejects a Severed slot (re-arming is a change, not a first
+                // declaration) — the honest post-sever verdict.
+                BindMode::Set => Err(Error::SlotSevered(name)),
+            }
+        } else {
+            // Held by an external live Checkout — stays Lent at fold; both verbs
+            // hard-error rather than clobber a value in the caller's hands.
+            Err(Error::SlotCheckedOut(name))
         }
     }
 
@@ -643,7 +753,10 @@ impl SlotBinder {
     /// consumed) rather than moving once. Drives the `bind_slots` walk: a fan-out
     /// binder must visit ALL cells (no early `is_consumed` stop).
     pub fn is_fanout(&self) -> bool {
-        self.fill_clone().is_some()
+        // A probe visits EVERY matching cell (it must catch a checked-out cell that
+        // appears AFTER an OK one), so it never lets the `AndThen`/bundle walk stop
+        // early — it behaves like a fan-out even though it carries no value.
+        self.probe || self.fill_clone().is_some()
     }
 
     /// Whether the binding has already been deposited into (or rejected by) a
@@ -720,6 +833,21 @@ pub trait Rehome<Out>: Send {
     ///
     /// Default: no-op (the concrete-cell behaviour). Slots override it.
     fn sever(self: Box<Self>) {}
+
+    /// The **stable identity of the slot cell** this home would sever, as
+    /// [`Arc::as_ptr`] cast to `usize` — or `None` if severing this home does not
+    /// empty a slot cell (a concrete [`Cell`] home, whose `sever` is a no-op).
+    ///
+    /// Used by [`Checkout`]'s home-id accessor to feed the `call`/`mutate_call`
+    /// phase-0 probe's severable-cells set: the probe recognises a crossed
+    /// double-buffer swap by matching a `Lent` target slot's cell id against the ids
+    /// of the tuple Checkouts that will sever it in phase 1. Only the slot-cell home
+    /// returns `Some`.
+    ///
+    /// Default: `None` (concrete-cell homes never sever a slot).
+    fn home_cell_id(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// A boxed, type-erased return home for an output of type `Out` — the home
@@ -801,6 +929,11 @@ impl<T: Send> Rehome<T> for SlotHome<T> {
         // virgin — it lands in `Severed`, so a set-once `bind` rejects it
         // (`Error::SlotSevered`) and only `mutate_bind` may re-arm it.
         *self.cell.lock().unwrap() = SlotState::Severed;
+    }
+    fn home_cell_id(&self) -> Option<usize> {
+        // The identity of THIS slot's cell — matched by the `call`/`mutate_call`
+        // probe against a `Lent` target to recognise the crossed swap.
+        Some(Arc::as_ptr(&self.cell) as usize)
     }
 }
 
@@ -1438,6 +1571,41 @@ impl<T> Input<T> {
         // turn a ZERO-match `bind` into `SlotNoSuchTag`; a conflict/sever still
         // surfaces via `binder.outcome`, so counting it here cannot mask it.
         binder.matched += 1;
+
+        // PROBE (read-only) — the phase-0 dry run of `call`/`mutate_call`. Inspect
+        // this cell's state WITHOUT filling / taking / replacing, recording the
+        // verdict the phase-2 fold WOULD produce on the POST-sever state (a `Lent`
+        // cell that a tuple `Checkout` will sever is predicted as `Severed`; see
+        // `probe_lent`). It records into `binder.outcome` exactly like the real fold,
+        // so `fold_probe` surfaces the first error having severed / mutated NOTHING.
+        // The value-equality leg of `Set` on a `Bound` cell is the ONE case a probe
+        // cannot decide (the value lives in an unsevered `Checkout`) — a probe treats
+        // `Bound` as OK and lets phase 2 catch a genuine `SlotConflict`; that is the
+        // documented residual (see `call`/`mutate_call` docs).
+        if binder.is_probe() {
+            let cell_id = Arc::as_ptr(cell) as usize;
+            match &*cell.lock().unwrap() {
+                // Both verbs fill a virgin / re-arm a bound cell → OK. `Set` on
+                // `Bound` is the value-dependent residual (treated OK here).
+                SlotState::Unbound | SlotState::Bound(_) => {}
+                // `Set` rejects a severed slot; `Mutate` re-arms it.
+                SlotState::Severed => {
+                    if binder.mode == BindMode::Set {
+                        binder.outcome = Err(Error::SlotSevered(name));
+                    }
+                }
+                // Post-sever prediction: tuple-held → Severed (Set fails / Mutate
+                // OK); external-held → stays Lent (both fail SlotCheckedOut).
+                SlotState::Lent => {
+                    if let Err(e) = binder.probe_lent(cell_id, name) {
+                        binder.outcome = Err(e);
+                    }
+                }
+            }
+            // A probe never consumes: return so the walk visits the next cell too.
+            return;
+        }
+
         // A move-only binder is consumed after its single value lands; bail. A
         // fan-out binder never sets `value = None`, so it keeps filling cells.
         if binder.value.is_none() {
@@ -1677,6 +1845,16 @@ impl<V: Send + 'static> ScalarInput<V> {
         // consumed-binder guard, mirroring `Input::try_bind_slot`, so `fold_bind`
         // sees a nonzero count even for a same-tag cell reached after consumption.
         binder.matched += 1;
+
+        // PROBE (read-only): a scalar/launch slot is only ever `Unbound` or `Bound`
+        // (never `Lent`/`Severed` — it is read by clone, never lent or severed), so
+        // presence (`matched`, recorded above) is the whole probe verdict here. `Set`
+        // on a `Bound` scalar is the same value-dependent residual as a resource slot
+        // (treated OK; phase 2 catches a genuine `SlotConflict`).
+        if binder.is_probe() {
+            return;
+        }
+
         if binder.value.is_none() {
             return; // a consumed move-only binder (never happens for a clone-able
             // scalar value, but keeps the guard uniform with the resource path).
@@ -2563,18 +2741,75 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         Ok(self)
     }
 
+    /// **Read-only probe** — would a [`fold_bind`](Self::fold_bind) of tag `Tg` in
+    /// `mode` SUCCEED right now, WITHOUT filling / severing / mutating ANYTHING?
+    /// The phase-0 dry run behind [`call`](Self::call) / [`mutate_call`](Self::mutate_call)'s
+    /// all-or-nothing guarantee: it drives the SAME [`bind_slots`](DeviceOp::bind_slots)
+    /// walk with a value-less probe [`SlotBinder`], so it covers exactly the cells the
+    /// real fold would touch — but only INSPECTS state.
+    ///
+    /// `severable_cells` is the set of slot-cell ids ([`Arc::as_ptr`] as `usize`)
+    /// that phase 1 WILL sever — one per [`Checkout`]-sourced element in the same
+    /// tuple. It lets the probe predict a crossed swap: a `Lent` target in that set
+    /// becomes [`Severed`](SlotState::Severed) before the fold ([`Mutate`](BindMode::Mutate)
+    /// re-arms it → OK), while a `Lent` target held by an EXTERNAL live `Checkout`
+    /// stays `Lent` → [`Error::SlotCheckedOut`].
+    ///
+    /// Returns the SAME error the fold would ([`SlotNoSuchTag`](Error::SlotNoSuchTag)
+    /// on absent, [`SlotCheckedOut`](Error::SlotCheckedOut) on external-lent,
+    /// [`SlotSevered`](Error::SlotSevered) on `Set` of a severed / to-be-severed
+    /// slot), with ONE documented exception: the value-dependent
+    /// [`SlotConflict`](Error::SlotConflict) of a `Set` onto an already-`Bound`
+    /// (different) slot is NOT pre-caught — the value is inside an unsevered
+    /// `Checkout` and the probe never severs to read it. Only `Tg: Tag` is required
+    /// (no `SlotEq`/`SlotValue`, no `'static` value bound), so it does not hit the
+    /// value-comparison lifetime constraints the real fold carries.
+    fn probe_bind<Tg: Tag>(&self, mode: BindMode, severable_cells: &[usize]) -> Result<()> {
+        let mut binder = SlotBinder::probe::<Tg>(mode, severable_cells.to_vec());
+        self.bind_slots(&mut binder);
+        binder.outcome()?;
+        // AT-LEAST-ONE, checked read-only up front — this is the "sever everything
+        // then SlotNoSuchTag" bug's pre-catch: an absent tag errors here, having
+        // touched nothing.
+        if binder.matched() == 0 {
+            return Err(Error::SlotNoSuchTag(Tg::NAME));
+        }
+        Ok(())
+    }
+
     /// **Fill several slots at once**, turbofish-free, each value self-tagging via
     /// its tuple struct: `g.call((A(a), B(b), Out(o)))?.sync(&ctx)?`.
     ///
     /// Each element folds through the SAME single-slot [`bind`](Self::bind) path, so
     /// `call` inherits the set-once contract exactly — idempotent on an equal
     /// binding, [`SlotConflict`](Error::SlotConflict) on a conflicting one,
-    /// [`SlotCheckedOut`](Error::SlotCheckedOut) on a lent one. It is **all-or-nothing
-    /// per element in tuple order**: the first element to error stops the fold and
-    /// returns that error (any earlier elements have already been deposited — same
-    /// as the equivalent `?`-chained `bind`s). Tuple ORDER does not matter for
-    /// success (each binds its own tag). Implemented for tuples of [`Tag`]s, arity
-    /// 1..=8, via [`BindAll`].
+    /// [`SlotCheckedOut`](Error::SlotCheckedOut) on a lent one.
+    ///
+    /// ## All-or-nothing (probe before sever)
+    ///
+    /// A phase-0 [`probe_bind`](Self::probe_bind) dry run vets EVERY element BEFORE
+    /// any [`into_value`](Tag::into_value) severs a `Checkout` source, so the common
+    /// failures leave the graph AND every source untouched (nothing severed, nothing
+    /// mutated):
+    /// - **absent tag** → [`SlotNoSuchTag`](Error::SlotNoSuchTag),
+    /// - **lent by an external checkout** → [`SlotCheckedOut`](Error::SlotCheckedOut),
+    /// - **`Set` onto a severed / to-be-severed slot** → [`SlotSevered`](Error::SlotSevered).
+    ///
+    /// This replaces the former "each element severs up front, then `?`-chained
+    /// folds" behaviour, which could sever every source AND then error (e.g. an
+    /// absent tag severed all Checkouts and *then* returned `SlotNoSuchTag`).
+    ///
+    /// **One documented residual.** The probe cannot decide the value-dependent
+    /// [`SlotConflict`](Error::SlotConflict) of a `Set` onto an already-`Bound`
+    /// (DIFFERENT) slot — the conflicting value is inside an unsevered `Checkout` the
+    /// probe never severs to read. That conflict still fires in phase 2, AFTER phase 1
+    /// may have severed OTHER elements' sources. It is a misuse case (`bind` is
+    /// set-once; re-binding a bound slot to a different buffer is the error) and does
+    /// not touch the motivating paths — the crossed swap uses `mutate` (no
+    /// `SlotConflict` leg), and absent-tag / checked-out are fully all-or-nothing.
+    ///
+    /// Tuple ORDER does not matter for success (each binds its own tag). Implemented
+    /// for tuples of [`Tag`]s, arity 1..=8, via [`BindAll`].
     fn call<Tags: BindAll>(&self, tags: Tags) -> Result<&Self> {
         tags.bind_all(self)?;
         Ok(self)
@@ -2583,8 +2818,24 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// **Mutate several slots at once** — the mutating sibling of [`call`](Self::call).
     /// Each element folds through the [`mutate_bind`](Self::mutate_bind) path, so it
     /// inherits the set/change semantics (overwrite or fill; still
-    /// [`SlotCheckedOut`](Error::SlotCheckedOut) on a lent slot). All-or-nothing per
-    /// element in tuple order; order-free for success. See [`BindAll`].
+    /// [`SlotCheckedOut`](Error::SlotCheckedOut) on a slot lent to an EXTERNAL
+    /// checkout).
+    ///
+    /// ## Fully all-or-nothing (probe before sever)
+    ///
+    /// Like [`call`](Self::call), a phase-0 [`probe_bind`](Self::probe_bind) vets
+    /// every element BEFORE any source is severed — but `mutate` has no
+    /// [`SlotConflict`](Error::SlotConflict) leg (it overwrites), so `mutate_call` has
+    /// NO residual: an absent tag ([`SlotNoSuchTag`](Error::SlotNoSuchTag)) or an
+    /// external-checkout target ([`SlotCheckedOut`](Error::SlotCheckedOut)) errors
+    /// with the graph AND every source left untouched.
+    ///
+    /// The crossed double-buffer swap `mutate_call((In(out_co), Out(in_co)))` passes
+    /// the probe: after a sync `In`/`Out` are `Lent`, but their leases are held by the
+    /// tuple's own Checkouts (`out_co`/`in_co`), whose cell ids the probe collects —
+    /// so it predicts phase 1 will sever both (`Lent → Severed`) and that the two
+    /// `mutate` rebinds then re-arm cleanly, rather than misreading `Lent` as an
+    /// external [`SlotCheckedOut`](Error::SlotCheckedOut).
     ///
     /// NOTE (step c/d): like [`mutate_bind`](Self::mutate_bind), the in-place
     /// mutable-dispatch (`clUpdateMutableCommandsKHR`) routing attaches at the
@@ -2869,16 +3120,82 @@ impl<T: DeviceOp> DeviceOpExt for T {}
 /// path, so the multi-fill inherits the verb 2×2 (set-once / set-change, conflict,
 /// checked-out) element-by-element.
 ///
-/// **All-or-nothing in tuple order.** `bind_all` stops at the first element that
-/// errors and returns that error (earlier elements are already deposited — exactly
-/// the equivalent `?`-chained binds). Order does not matter for *success*: every
-/// element binds its own tag independently. Implemented for tuples of arity 1..=8
-/// (mirroring [`KernelArgs`](crate::KernelArgs)).
+/// **All-or-nothing (probe before sever).** A phase-0 read-only
+/// [`probe_bind`](DeviceOpExt::probe_bind) vets EVERY element BEFORE any
+/// [`into_value`](Tag::into_value) severs a `Checkout` source — so an absent tag
+/// ([`SlotNoSuchTag`](Error::SlotNoSuchTag)), an externally-checked-out target
+/// ([`SlotCheckedOut`](Error::SlotCheckedOut)), or a `Set`-onto-severed slot
+/// ([`SlotSevered`](Error::SlotSevered)) leaves the graph AND every source
+/// UNTOUCHED. This is stronger than the old "sever every source up front, THEN
+/// `?`-chained fold", which could sever all Checkouts and then error.
+///
+/// **One residual, `bind_all` only.** The value-dependent
+/// [`SlotConflict`](Error::SlotConflict) of a `Set` onto an already-`Bound`
+/// (different) slot cannot be pre-caught (the value is inside an unsevered
+/// `Checkout`); it fires in phase 2 after phase 1 may have severed OTHER sources.
+/// It is a set-once misuse case. `mutate_all` has no `SlotConflict` leg, so it is
+/// FULLY all-or-nothing. Order does not matter for *success*: every element binds
+/// its own tag independently. Implemented for tuples of arity 1..=8 (mirroring
+/// [`KernelArgs`](crate::KernelArgs)). See the `bind_all_body!` macro for the three
+/// phases (probe → sever → fold).
 pub trait BindAll {
     /// Fold each element through [`bind`](DeviceOpExt::bind) (set-once).
     fn bind_all<Op: DeviceOp>(self, g: &Op) -> Result<()>;
     /// Fold each element through [`mutate_bind`](DeviceOpExt::mutate_bind) (set/change).
     fn mutate_all<Op: DeviceOp>(self, g: &Op) -> Result<()>;
+}
+
+/// The shared three-phase body of [`BindAll::bind_all`] / [`BindAll::mutate_all`],
+/// parameterised on the [`BindMode`]. Splitting it out keeps the two verbs a single
+/// source of truth for the all-or-nothing sequence.
+///
+/// - **PHASE 0 — probe (read-only, severs NOTHING).** First gather the
+///   `severable_cells` set: the slot-cell id every `Checkout`-sourced element will
+///   sever in phase 1 ([`Tag::source_cell_id`]; a raw value contributes `None`).
+///   Then [`probe_bind`](DeviceOpExt::probe_bind) EVERY element against `g` with that
+///   set. A probe drives the real `bind_slots` walk but only INSPECTS state, so if
+///   ANY element is absent ([`SlotNoSuchTag`](Error::SlotNoSuchTag)), held by an
+///   external checkout ([`SlotCheckedOut`](Error::SlotCheckedOut)), or `Set`-onto-a-
+///   severed slot ([`SlotSevered`](Error::SlotSevered)), we return that error HERE —
+///   having severed / mutated NOTHING. This closes the "`into_value` severs every
+///   source, THEN the fold errors" hole. (A crossed swap's `Lent` targets are in
+///   `severable_cells`, so the probe passes them; see [`SlotBinder::probe_lent`].)
+///
+///   The ONE residual the probe cannot pre-catch is a `Set` (bind) onto an already-
+///   `Bound`-DIFFERENT slot ([`SlotConflict`](Error::SlotConflict)): the conflicting
+///   value lives inside an unsevered `Checkout` and the probe never severs to read
+///   it. Such a conflict still fires in phase 2 — after phase 1 may have severed
+///   OTHER elements' sources. This is a misuse case (`bind` is set-once; re-binding
+///   an already-bound slot to a different buffer is the error), and it never affects
+///   the motivating paths (the crossed swap uses `mutate`, absent-tag / checked-out
+///   are fully covered). `mutate` has no `SlotConflict` leg, so `mutate_call` is
+///   fully all-or-nothing.
+///
+/// - **PHASE 1 — sever all sources (`into_value`).** With the probe having proved
+///   every element bindable, resolve each source: a `Checkout` severs its home
+///   HERE (`Lent → Severed`), before any fold. This is what makes the crossed swap
+///   `mutate_call((In(out_co), Out(in_co)))` work — both source slots are `Severed`
+///   BEFORE either target is rebound, so neither rebind hits a still-`Lent` slot.
+///
+/// - **PHASE 2 — fold each resolved value.** `?` keeps first-error-stops semantics;
+///   with phase 0 already vetted, the only error phase 2 can now surface is the
+///   documented `Set`/`SlotConflict` residual.
+macro_rules! bind_all_body {
+    ($g:ident, $mode:expr, $($name:ident),+) => {{
+        // PHASE 0a — the crossed-swap recogniser: which slot cells phase 1 will
+        // sever (Checkout sources contribute their home cell id; raw values `None`).
+        // Read-only — `source_cell_id` borrows, never consumes.
+        let severable: Vec<usize> =
+            [ $( $name.source_cell_id() ),+ ].into_iter().flatten().collect();
+        // PHASE 0b — probe EVERY element (read-only). Any failure returns here
+        // having severed / mutated NOTHING (the all-or-nothing guarantee).
+        $( $g.probe_bind::<$name>($mode, &severable)?; )+
+        // PHASE 1 — sever all Checkout sources first (see macro doc).
+        $( let $name = $name.into_value(); )+
+        // PHASE 2 — fold each resolved value; `?` stops at the first (now only the
+        // residual Set/SlotConflict) error.
+        $( $g.fold_bind::<$name>($name, $mode)?; )+
+    }};
 }
 
 /// Implement [`BindAll`] for one tuple arity. Each element is a `Tag` whose `Value`
@@ -2892,26 +3209,13 @@ macro_rules! impl_bind_all_tuple {
             #[allow(non_snake_case)]
             fn bind_all<Op: DeviceOp>(self, g: &Op) -> Result<()> {
                 let ($($name,)+) = self;
-                // PHASE 1 — resolve EVERY element's source first (`into_value`):
-                // a `Checkout` source severs its home HERE, before any fold. This is
-                // what makes the crossed swap `call((In(out_co), Out(in_co)))` work —
-                // both Checkouts are severed (both source slots Severed) BEFORE either
-                // target slot is touched, so neither rebind hits a still-`Lent` slot
-                // (`SlotCheckedOut`). A raw value's `into_value` is a no-op move.
-                $( let $name = $name.into_value(); )+
-                // PHASE 2 — fold each resolved value. `?` keeps all-or-nothing-in-order
-                // (first conflict / checked-out stops the fold).
-                $( g.fold_bind::<$name>($name, BindMode::Set)?; )+
+                bind_all_body!(g, BindMode::Set, $($name),+);
                 Ok(())
             }
             #[allow(non_snake_case)]
             fn mutate_all<Op: DeviceOp>(self, g: &Op) -> Result<()> {
                 let ($($name,)+) = self;
-                // Two-phase as in `bind_all`: sever all Checkout sources first, then
-                // fold — so the one-line crossed `mutate_call` swap re-binds into
-                // already-Severed slots rather than still-Lent ones.
-                $( let $name = $name.into_value(); )+
-                $( g.fold_bind::<$name>($name, BindMode::Mutate)?; )+
+                bind_all_body!(g, BindMode::Mutate, $($name),+);
                 Ok(())
             }
         }
@@ -2993,6 +3297,20 @@ impl<O: Send> Checkout<O> {
     /// back to `g`. For a SLOT this lands in [`Severed`](SlotState::Severed): a
     /// later set-once `bind` is [`Error::SlotSevered`] (re-providing a buffer is a
     /// change, not a first declaration), and only `mutate_bind` re-arms it.
+    /// The **identity of the slot cell this checkout's home will sever**
+    /// ([`Arc::as_ptr`] as `usize`), or `None` if the home is a concrete cell / there
+    /// is nothing to return. Read-only: it does NOT consume, sever, or peek the
+    /// value.
+    ///
+    /// Feeds the `call`/`mutate_call` phase-0 probe: an element built from
+    /// `Tag(checkout)` contributes this id to the probe's `severable_cells`, so a
+    /// `Lent` target slot the probe finds can be recognised as "held by a tuple
+    /// Checkout that phase 1 will sever" (a crossed swap) versus "held by an external
+    /// live Checkout" (a real [`Error::SlotCheckedOut`]).
+    pub(crate) fn home_cell_id(&self) -> Option<usize> {
+        self.home.as_ref().and_then(|h| h.home_cell_id())
+    }
+
     pub fn into_inner(mut self) -> O {
         // Sever the home (does NOT deposit the value): a concrete cell stays
         // empty (no-op), a SLOT cell transitions `Lent → Severed` so a later
