@@ -1165,6 +1165,24 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     ::core::result::Result::Ok((( #(#output_names),* ), __claspr_deps))
                 }
 
+                #[allow(clippy::type_complexity)]
+                fn collect_home(
+                    &self,
+                    ec: &::claspr::ExecutionContext<'_>,
+                    mode: ::claspr::ExecMode,
+                ) -> ::claspr::Result<(
+                    Self::Output,
+                    ::claspr::Deps,
+                    ::core::option::Option<::claspr::eager::BoxedHome<Self::Output>>,
+                )> {
+                    // Multi-output kernel: each output's home rides its own
+                    // `Checkout` (via `gather_checkouts`), not one collapsed tuple
+                    // home. Nested as a bundle branch it collapses to `home == None`.
+                    // Delegate to `collect`.
+                    let (__claspr_v, __claspr_deps) = self.collect(ec, mode)?;
+                    ::core::result::Result::Ok((__claspr_v, __claspr_deps, ::core::option::Option::None))
+                }
+
                 fn gather_checkouts(
                     &self,
                     ec: &::claspr::ExecutionContext<'_>,

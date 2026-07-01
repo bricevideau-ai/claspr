@@ -2356,6 +2356,43 @@ pub trait DeviceOp: Send {
             .ok_or(Error::NotSupported("eager graph: op produced no output"))
     }
 
+    /// Home-preserving analog of [`collect`](Self::collect): run this op as a
+    /// (sub)terminal and yield `(Output, Deps, home)` — the SAME value+deps as
+    /// `collect`, plus the return [`home`](BoxedHome) so a caller-owned buffer
+    /// re-arms its origin cell on `Checkout` drop.
+    ///
+    /// Used by a [`bundle!`](crate::bundle) to thread each *single-output*
+    /// branch's home into its per-element [`Checkout`] (mirroring the linear
+    /// [`gather_checkouts`](Self::gather_checkouts) path), so a reusable bundle
+    /// over caller-owned buffers returns them to their cells and re-runs.
+    ///
+    /// Default (single-output ops): `execute`, drain
+    /// [`output_pipe`](Self::output_pipe) WITH its home ([`Pipe::take_home`]) —
+    /// the home an in-place op ([`fill`]/`scale`/copy-dst/…) threaded through.
+    ///
+    /// **Multi-output ops** (whose storage is per-element pipes, so their single
+    /// `output_pipe` is never filled) override this to delegate to their own
+    /// [`collect`](Self::collect) and return `home == None`: a `Vec`/tuple output
+    /// is ONE value with ONE home slot but N branch homes, so those homes can't
+    /// ride a single collapsed slot (the same boundary [`FanOut`] documents).
+    /// Nesting a multi-output op as a bundle branch therefore still collapses its
+    /// homes to `None` — only single-output branches re-arm.
+    #[allow(clippy::type_complexity)]
+    fn collect_home(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(Self::Output, Deps, Option<BoxedHome<Self::Output>>)>
+    where
+        Self: Sized,
+        Self::Output: Send + 'static,
+    {
+        let out = self.output_pipe();
+        self.execute(ec, mode)?;
+        out.take_home()
+            .ok_or(Error::NotSupported("eager graph: op produced no output"))
+    }
+
     /// Run this op as the **chain terminal** and yield its [`Output`](Self::Output),
     /// having waited on its completion events per `mode`.
     ///
@@ -3606,6 +3643,30 @@ where
         Ok((value, deps))
     }
 
+    #[allow(clippy::type_complexity)]
+    fn collect_home(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(U::Output, Deps, Option<BoxedHome<U::Output>>)>
+    where
+        Self: Sized,
+        U::Output: Send + 'static,
+    {
+        // Mirror `collect`, but preserve the tail's return home so an
+        // `and_then`-terminated chain nested as a bundle branch (e.g.
+        // `upload(buf).and_then(|b| fill(b, v))`) re-arms its caller buffer. The
+        // home is the tail's — the source pipelines and its orphaned deps thread
+        // in exactly as in `collect`.
+        let src_pipe = self.source.output_pipe();
+        self.source.execute(ec, ExecMode::Pipelined)?;
+        let (value, mut deps, home) = self.next.collect_home(ec, mode)?;
+        if let Some((_discarded, src_deps)) = src_pipe.take() {
+            deps.extend(src_deps);
+        }
+        Ok((value, deps, home))
+    }
+
     fn gather_checkouts(
         &self,
         ec: &ExecutionContext<'_>,
@@ -4165,6 +4226,18 @@ where
         Ok((arr, all_deps))
     }
 
+    #[allow(clippy::type_complexity)]
+    fn collect_home(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(Self::Output, Deps, Option<BoxedHome<Self::Output>>)> {
+        // Multi-output (`[T; N]` fan-out of read-only Arc clones): no single
+        // collapsed home. Delegate to `collect`; `home == None`.
+        let (value, deps) = self.collect(ec, mode)?;
+        Ok((value, deps, None))
+    }
+
     fn gather_checkouts(
         &self,
         ec: &ExecutionContext<'_>,
@@ -4260,7 +4333,14 @@ macro_rules! impl_eager_bundle {
             $name { $($field,)+ $($pf,)+ }
         }
 
-        impl<$($ty: DeviceOp),+> DeviceOp for $name<$($ty),+> {
+        impl<$($ty: DeviceOp),+> DeviceOp for $name<$($ty),+>
+        where
+            // Each branch's output must be `'static` so its return home (a
+            // `BoxedHome`, i.e. `Box<dyn Rehome + 'static>`) can ride the branch
+            // pipe in `execute`/`collect_home` — the seam that re-arms a bundle
+            // over caller-owned buffers. Buffer outputs are always `'static`.
+            $(<$ty as DeviceOp>::Output: 'static,)+
+        {
             type Output = ( $(<$ty as DeviceOp>::Output,)+ );
             // A tuple of each branch's OWN build-time handle (NOT forced to a
             // pipe). For a buffer-producing branch that handle defaults to
@@ -4271,12 +4351,15 @@ macro_rules! impl_eager_bundle {
             // composite handle. Composing per-branch handles (rather than
             // flattening to pipes) is what carries computable host values down.
             type Handle = ( $(<$ty as DeviceOp>::Handle,)+ );
-            // Per-branch Checkouts: one independent `Checkout` per branch output.
-            // (Branch values arrive via each branch's `collect`, which collapses
-            // any nested arity to a single value with no home, so a bundle's
-            // Checkouts carry `None` homes in step (a) — the per-branch SHAPE is
-            // what this fixes; home re-arm through a bundle is deferred, the same
-            // boundary as copy/OnDevice.)
+            // Per-branch Checkouts: one independent `Checkout` per branch output,
+            // each carrying its own return home. A SINGLE-OUTPUT branch over a
+            // caller-owned buffer (fill/scale/copy-dst) threads its lent buffer's
+            // home through `$pf` (via `collect_home`/`put_home` in `execute`), so
+            // dropping that branch's `Checkout` re-arms its origin cell and the
+            // bundle re-runs (reusable). A branch that is *itself* multi-output
+            // collapses to a single value with `home == None` (N branch homes
+            // can't ride one collapsed slot — see `collect_home`/`FanOut`), so
+            // only single-output branches re-arm through a bundle.
             type Checkouts = ( $(Checkout<<$ty as DeviceOp>::Output>,)+ );
 
             fn output_pipe(&self) -> Pipe<Self::Output> {
@@ -4294,19 +4377,27 @@ macro_rules! impl_eager_bundle {
             }
 
             fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-                // Each branch pipelines (independent). We `collect` the branch —
+                // Each branch pipelines (independent). We `collect_home` the branch —
                 // NOT `branch.execute` — so a branch that is *itself* multi-output
                 // (a nested bundle, arc_split, the copy pair) runs its own gather
                 // and yields a single reconstructed value; we then deposit that
                 // value into the branch's `$pf` pipe. This keeps `$pf` filled
                 // uniformly for both consumers of a bundle: the mid-graph
                 // `handle()` (a downstream `and_then` reading `$pf`) and the
-                // terminal `collect` below. (For a single-output branch, `$pf`
-                // is the branch's own output pipe; `collect` drains it and we put
-                // it straight back — a cheap round-trip.)
+                // terminal `collect`/`gather_checkouts` below. (For a single-output
+                // branch, `$pf` is the branch's own output pipe; `collect_home`
+                // drains it and we put it straight back — a cheap round-trip.)
+                //
+                // `collect_home` (vs the old `collect`) carries the branch's return
+                // HOME through `$pf` via `put_home`, so a bundle over caller-owned
+                // buffers re-arms each buffer's origin cell on its `Checkout` drop
+                // (a REUSABLE bundle). A single-output in-place branch (fill/scale/
+                // copy-dst) threads its lent buffer's home; a multi-output branch
+                // collapses to `None` (N homes can't ride one collapsed value —
+                // documented on `collect_home` / `FanOut`).
                 $(
-                    let (v, d) = self.$field.collect(ec, ExecMode::Pipelined)?;
-                    self.$pf.put(v, d);
+                    let (v, d, home) = self.$field.collect_home(ec, ExecMode::Pipelined)?;
+                    self.$pf.put_home(v, d, home);
                 )+
                 Ok(())
             }
@@ -4330,6 +4421,21 @@ macro_rules! impl_eager_bundle {
                 },)+ );
                 let joined = join_marker(ec, &branch_deps)?;
                 Ok((outputs, joined))
+            }
+
+            #[allow(clippy::type_complexity)]
+            fn collect_home(
+                &self,
+                ec: &ExecutionContext<'_>,
+                mode: ExecMode,
+            ) -> Result<(Self::Output, Deps, Option<BoxedHome<Self::Output>>)> {
+                // A bundle is multi-output: its per-branch homes ride each branch's
+                // own `Checkout` (built in `gather_checkouts`), NOT one collapsed
+                // tuple home. So when a bundle is itself a bundle branch it collapses
+                // to a single value with `home == None` — nesting-multi-output does
+                // not re-arm (documented on `collect_home`). Delegate to `collect`.
+                let (value, deps) = self.collect(ec, mode)?;
+                Ok((value, deps, None))
             }
 
             fn gather_checkouts(
@@ -4481,6 +4587,27 @@ macro_rules! bundle {
 /// Eager fan-out: build one op per input (the builder `f` runs at construction
 /// — eager — over the known input list), run them independently, join via a
 /// marker. Output is `Vec<U::Output>`.
+///
+/// ## Limitation: branches over caller-owned buffers do NOT re-arm
+///
+/// Unlike [`bundle!`](crate::bundle) (whose per-branch [`Checkout`] tuple carries
+/// each branch's return [`home`](BoxedHome), so a bundle over caller-owned
+/// buffers re-runs — see [`collect_home`](DeviceOp::collect_home)), `FanOut`
+/// collapses its `N` branch outputs into ONE `Vec<U::Output>` value with a
+/// **single** home slot on its output pipe. `N` branch homes cannot ride one
+/// collapsed slot, so `execute` drops them (`self.out.put(..)`, home `None`). The
+/// terminal `Checkout<Vec<..>>` therefore has `home == None`: a fan-out whose
+/// branches are IN-PLACE ops over caller-owned buffers (e.g. `fan_out(bufs, |b|
+/// fill(b, v))`) does **not** return those buffers to their cells on drop, so the
+/// same `FanOut` graph is **not re-runnable** (run 2 reports the cells busy).
+///
+/// This is a conscious, documented boundary, not a silent trap — it is pinned by
+/// `bundle2_caller_buffers_rearm_x2_stable_handles` (bundle re-arms) contrasted
+/// with `fan_out_caller_buffers_do_not_rearm` (fan-out does not) in
+/// `tests/tier2/tests/home_invariant.rs`. Fixing it requires a type-shape change
+/// (e.g. `Checkouts = Vec<Checkout<U::Output>>`, or a side `Vec<Option<BoxedHome>>`
+/// the output owns) — deferred. Fan-out over **minted** buffers (`upload`/`alloc`)
+/// or read-only inputs is unaffected: those have no home to return.
 pub struct FanOut<U: DeviceOp> {
     ops: Vec<U>,
     pipes: Vec<Pipe<U::Output>>,
@@ -7125,6 +7252,23 @@ where
         ))?;
         deps.extend(dst_deps);
         Ok(((out_src, out_dst), deps))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn collect_home(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(Self::Output, Deps, Option<BoxedHome<Self::Output>>)>
+    where
+        Self: Sized,
+        Self::Output: Send + 'static,
+    {
+        // Multi-output (`(src, dst)`): each side's home rides its own `Checkout`
+        // via `gather_checkouts`, not one collapsed tuple home. Nested as a bundle
+        // branch it collapses to `home == None`. Delegate to `collect`.
+        let (value, deps) = self.collect(ec, mode)?;
+        Ok((value, deps, None))
     }
 
     fn gather_checkouts(
