@@ -1324,6 +1324,33 @@ impl<T> Input<T> {
         }
     }
 
+    /// Resolve a copy operand → `(value, deps, output-typed return home)`, the
+    /// home-preserving form of [`resolve`](Self::resolve) for the copy path.
+    /// Unlike [`copy_input_home`](Self::copy_input_home) (built BEFORE resolving,
+    /// so its `Pipe` arm is blind to the payload), this reads the home while
+    /// draining the input, so a **lent pipe** operand (a cross-graph `Checkout`
+    /// fed to the copy — see [`Input::lent`]) forwards the ORIGIN graph's home via
+    /// [`CopyHome::pipe_home`], giving copy operands the same LEND-and-return
+    /// semantics as the kernel-arg path. Concrete / slot arms take their
+    /// retype-aware home from `copy_input_home` (identity or `Uninit → Init`
+    /// downgrade); a homeless (minted-upstream) pipe stays `None`.
+    fn resolve_copy<Out>(
+        &self,
+        ec: &ExecutionContext<'_>,
+    ) -> Result<(T, Deps, Option<BoxedHome<Out>>)>
+    where
+        T: CopyHome<Out> + Send + 'static,
+    {
+        let (v, deps, in_home) = self.resolve_home(ec)?;
+        let out_home = match self {
+            // The pipe payload's home is the origin's; forward it output-typed.
+            Input::Pipe(_) => in_home.and_then(<T as CopyHome<Out>>::pipe_home),
+            // Concrete / slot: rebuild the retype-aware home from the cell.
+            Input::Concrete(_) | Input::Slot { .. } => self.copy_input_home(),
+        };
+        Ok((v, deps, out_home))
+    }
+
     /// Borrow the concrete value via a clone of its cell, or `None` if this is a
     /// pipe or a slot. Used by the concrete-head no-launcher terminals
     /// (`wait`/`submit`) to recover the owning context from the buffer before
@@ -6457,6 +6484,19 @@ pub trait CopyHome<Out>: Sized {
         let _ = cell;
         None
     }
+
+    /// Forward a home threaded on a **lent pipe** input (a cross-graph `Checkout`
+    /// fed as a copy operand — see `Input::lent`) as the copy output's return
+    /// home. A lent-pipe operand carries the ORIGIN graph's home on its payload;
+    /// the copy must pass it through so the borrowed buffer RETURNS to the origin
+    /// on the copy `Checkout`'s drop (LEND semantics, matching the kernel-arg
+    /// path). Only reachable for the identity impls (`Self == Out`) — a lent
+    /// `Checkout` is always an `Init` buffer, so the copy never retypes it — hence
+    /// the default `None` (the `Uninit → Init` downgrade impls never see one).
+    fn pipe_home(home: BoxedHome<Self>) -> Option<BoxedHome<Out>> {
+        let _ = home;
+        None
+    }
 }
 
 /// Rehome that DOWNGRADES an `Init` buffer back into a `Cell<Uninit-wrapper>`.
@@ -6486,6 +6526,9 @@ impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<DeviceSlice<T, M>>
     fn copy_slot_home(cell: SlotCell<Self>) -> Option<BoxedHome<DeviceSlice<T, M>>> {
         Some(Box::new(SlotHome { cell }))
     }
+    fn pipe_home(home: BoxedHome<Self>) -> Option<BoxedHome<DeviceSlice<T, M>>> {
+        Some(home)
+    }
 }
 impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<MappedSlice<T, M>>
     for MappedSlice<T, M>
@@ -6496,6 +6539,9 @@ impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<MappedSlice<T, M>>
     fn copy_slot_home(cell: SlotCell<Self>) -> Option<BoxedHome<MappedSlice<T, M>>> {
         Some(Box::new(SlotHome { cell }))
     }
+    fn pipe_home(home: BoxedHome<Self>) -> Option<BoxedHome<MappedSlice<T, M>>> {
+        Some(home)
+    }
 }
 impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<USMSlice<T, M>> for USMSlice<T, M> {
     fn copy_home(cell: Cell<Self>) -> Option<BoxedHome<USMSlice<T, M>>> {
@@ -6503,6 +6549,9 @@ impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<USMSlice<T, M>> fo
     }
     fn copy_slot_home(cell: SlotCell<Self>) -> Option<BoxedHome<USMSlice<T, M>>> {
         Some(Box::new(SlotHome { cell }))
+    }
+    fn pipe_home(home: BoxedHome<Self>) -> Option<BoxedHome<USMSlice<T, M>>> {
+        Some(home)
     }
 }
 
@@ -6613,10 +6662,14 @@ macro_rules! impl_copy_operand_concrete {
             M: $crate::MemMode,
             E: Send,
         {
-            // Severs the return and feeds the inner buffer as a concrete input
-            // (same as the `ToInput`/`From` Checkout paths).
+            // LEND: relocate the value + its home onto a pre-loaded pipe so the
+            // home rides into the copy's graph and returns to A on drop — A stays
+            // BUSY while the borrow is held, then re-arms for a plain `sync()` (no
+            // `mutate_bind`). Identical semantics to the `ToInput`/`From` Checkout
+            // arg paths; `.into_inner()` remains the explicit sever verb.
             fn into_copy_input(self) -> Input<$crate::$buf<E, M>> {
-                Input::from(self.into_inner())
+                let (value, home) = self.into_value_and_home();
+                Input::lent(value, home)
             }
         }
     };
@@ -6702,20 +6755,19 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // Build each input's output-typed return home BEFORE resolving, so we can
-        // thread it onto the output element pipe (re-arming `g` on Checkout /
-        // PipePayload drop). `copy_input_home` unifies all three arms under the home
+        // Resolve each input → (buffer, upstream Deps, output-typed return home),
+        // threading the home onto the output element pipe (re-arming `g` on Checkout
+        // / PipePayload drop). `resolve_copy` unifies all three arms under the home
         // invariant: a CONCRETE cell routes through `CopyHome::copy_home` (identity,
         // or the `Uninit → Init` downgrade re-wrap); a SLOT routes through
         // `CopyHome::copy_slot_home` (a four-state `SlotHome` — re-arms `Lent →
         // Bound`, severs on `into_inner`), closing the former copy-slot gap; a
-        // pipe-fed input has `None` (its upstream producer owns the provenance).
-        let src_home = self.src.copy_input_home();
-        let dst_home = self.dst.copy_input_home();
-        // Resolve both inputs → (buffer, upstream Deps). Either may be a pipe
-        // (upstream output) or concrete. Combine their wait-lists.
-        let (src, src_deps) = self.src.resolve(ec)?;
-        let (dst, dst_deps) = self.dst.resolve(ec)?;
+        // LENT pipe (a cross-graph `Checkout` fed as a copy operand) forwards the
+        // ORIGIN's home via `CopyHome::pipe_home` so the borrow RETURNS to it on
+        // drop (LEND, matching the kernel-arg path); a minted-upstream pipe is
+        // `None`. Either input may be a pipe or concrete — combine their wait-lists.
+        let (src, src_deps, src_home) = self.src.resolve_copy(ec)?;
+        let (dst, dst_deps, dst_home) = self.dst.resolve_copy(ec)?;
         let mut deps = src_deps;
         deps.extend(dst_deps);
         // Reuse the closure-layer copy op: it owns the right per-family

@@ -460,6 +460,78 @@ fn cross_graph_as_kernel_arg_lends_and_returns() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// 8a. cross-graph as a COPY OPERAND — LENDS and returns (NOT sever).
+//     Same story as 8, but the Checkout is fed as the SRC of an
+//     `eager_copy_to(co, dst)` rather than as a kernel arg. A copy operand
+//     Checkout must LEND (identical semantics to the kernel-arg path): while B's
+//     copy result is alive, A is BUSY (its slot is still `Lent`); dropping B's
+//     result RETURNS the buffer to A's slot, re-arming it for a plain `sync()`
+//     (NO mutate_bind), over the SAME handle. Before this fix the copy-operand
+//     path called `into_inner()` (severed A) — the OPPOSITE of the kernel-arg
+//     path under the same `eager_copy_to(co, …)` / `kernel(co, …)` surface
+//     syntax. The copy also computes correctly over A's lent buffer.
+//     (`into_inner_still_severs` below covers the contrast — the explicit sever.)
+// ───────────────────────────────────────────────────────────────────────────
+#[test]
+fn copy_operand_checkout_lends_and_returns() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // Graph A: scale a slot buffer by 2 in place → yields a Checkout `co`.
+    let ga = ks.scale_u32([N], slot!(Buf), 2u32);
+    let b = seeded(&ctx, 3); // 3*2 = 6
+    let h0 = handle_of(&b);
+    let co = ga.bind(Buf(b)).expect("bind A").sync(&ctx).expect("A run");
+
+    // Graph B: feed `co` as the SRC of a copy into a fresh dst. This LENDS A's
+    // buffer into B; A stays `Lent`/busy while B's copy result is alive.
+    let dst = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("dst alloc");
+    let (co_src, co_dst) = eager_copy_to(co, dst).sync(&ctx).expect("B copy run");
+
+    // (c) the copy ran over A's LENT buffer (same handle on the src side), not a
+    // fresh one, and produced correct data (dst == A's buffer contents = 6).
+    assert_eq!(
+        handle_of(&*co_src),
+        h0,
+        "copy ran over A's LENT buffer (same handle), not a copy of a fresh one"
+    );
+    let mut out = vec![0u32; N];
+    co_dst.read(&mut out).wait().expect("read dst");
+    assert!(
+        out.iter().all(|&x| x == 6),
+        "copy produced A's data: 3*2 = 6"
+    );
+
+    // (a) A is busy (lent into B) while B's src result is alive → a second
+    // A.sync() must ERROR — A was LENT, not severed.
+    assert!(
+        ga.sync(&ctx).is_err(),
+        "A is lent as a copy operand while B's result is alive → busy, NOT a silent re-run"
+    );
+
+    // (b) Plain DROP of B's result (NOT into_inner) RETURNS the lent buffer to
+    // A's slot, re-arming it — A re-runs via a PLAIN sync() (NO mutate_bind),
+    // over the SAME handle.
+    drop(co_src);
+    let co3 = ga
+        .sync(&ctx)
+        .expect("A re-armable via plain sync after the lent copy operand returned");
+    assert_eq!(
+        handle_of(&*co3),
+        h0,
+        "lent copy-operand buffer returned to A's slot with a STABLE handle (not severed)"
+    );
+    let mut r3 = vec![0u32; N];
+    co3.read(&mut r3).wait().expect("read A rerun");
+    // A's buffer returned holding 6 (the copy is non-mutating on its src); A's
+    // re-run scales ×2 → 12.
+    assert!(
+        r3.iter().all(|&x| x == 12),
+        "A re-run over returned buffer: (3*2)*2 = 12"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // 8b. into_inner STILL severs (the explicit take-it-out verb is unchanged).
 //     Contrast with 7/8: only the IMPLICIT feed-as-input path lends; calling
 //     `into_inner()` explicitly and feeding the RAW buffer still severs the slot
