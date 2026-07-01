@@ -201,6 +201,29 @@ fn scalar_slot_idempotent_and_conflict() {
     g.bind(Factor(2u32))
         .expect("second bind of the SAME scalar value is an idempotent no-op");
 
+    // The duplicate `bind(Factor(2))` must leave the bound VALUE unchanged (still
+    // 2), not silently replaced by an equal-looking one. Prove it by RUNNING a
+    // fresh graph shape whose Factor is bound-then-idempotently-rebound to 2: the
+    // result must reflect factor 2 (5 * 2 = 10). A silent-overwrite-with-equal bug
+    // would still land on 2 here, but a change to any OTHER value would not — this
+    // pins the value the idempotent path actually kept.
+    let idem = ks
+        .scale_u32([N], slot!(Buf), slot!(Factor))
+        .and_then(download);
+    idem.bind(Factor(2u32)).expect("idem first bind");
+    idem.bind(Factor(2u32))
+        .expect("idem second bind of the SAME value is a no-op");
+    let idem_out = idem
+        .bind(Buf(seeded(&ctx, 5)))
+        .expect("bind buf")
+        .sync(&ctx)
+        .expect("sync idempotent-value check");
+    assert!(
+        idem_out.iter().all(|&v| v == 10),
+        "idempotent scalar rebind kept Factor=2 (unchanged): 5 * 2 = 10, got {:?}",
+        &idem_out[..8]
+    );
+
     // A different value via `bind` → SlotConflict (set-once contract, by value).
     let err = bind_err(
         g.bind(Factor(9u32)),

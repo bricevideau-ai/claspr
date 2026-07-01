@@ -20,6 +20,7 @@
 
 use claspr::Context;
 use claspr::DeviceSlice;
+use claspr::Error;
 use claspr::eager::{DeviceOpExt, download, upload};
 use claspr_test_kernels::kernels;
 
@@ -219,11 +220,17 @@ fn second_sync_while_checked_out_is_busy_error() {
     let g = ks.scale_u32([N], buf, 2u32);
 
     let live = g.sync(&ctx).expect("first sync");
-    // Second sync while `live` is alive: the lent buffer's cell is empty.
-    let busy = g.sync(&ctx);
+    // Second sync while `live` is alive: the lent buffer's concrete cell is empty,
+    // so the busy path is `Error::NotSupported` whose message names the lent
+    // concrete input ("already lent" / "the graph is busy") — a specific variant,
+    // not just any error.
+    let busy = g
+        .sync(&ctx)
+        .expect_err("second sync while a Checkout is alive must error (graph busy)");
     assert!(
-        busy.is_err(),
-        "second sync while a Checkout is alive must error (graph busy)"
+        matches!(&busy, Error::NotSupported(m)
+            if m.contains("already lent") && m.contains("busy")),
+        "expected NotSupported busy (concrete input already lent), got {busy:?}"
     );
 
     // After the first Checkout drops, the buffer returns to its cell and the

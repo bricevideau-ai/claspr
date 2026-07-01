@@ -27,7 +27,7 @@
 //! (re-exported from the crate root) — `BufHandle.mem` is a `MemRef::Buffer(cl_mem)`
 //! whose raw pointer is the stable identity key.
 
-use claspr::eager::{DeviceOpExt, download, eager_copy_to, upload, upload_as};
+use claspr::eager::{DeviceOpExt, download, eager_copy_to, fill, upload, upload_as};
 use claspr::image::format::R32Uint;
 use claspr::{Context, DeviceSlice, Error, Image2D, MemRef, ReadOnly, RecordableBuffer, WriteOnly};
 use claspr::{slot, slots};
@@ -134,25 +134,37 @@ fn user_alloc_scale_download_x3_rehomed_stable() {
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     let buf = seeded(&ctx, 5);
-    let _h0 = handle_of(&buf); // the handle the rehomed buffer MUST keep each run.
+    let h0 = handle_of(&buf); // the handle the rehomed buffer MUST keep each run.
 
-    // scale(buf, 1) in place -> download. factor 1 makes the result idempotent
-    // even though scale itself compounds — so a stable result across 3 runs proves
-    // the SAME buffer (same handle) is returned by download and reused (NOT
-    // re-allocated, NOT compounding). The download terminal yields a Vec, so the
-    // kernel buffer's handle can't be read directly here — its stability is what
-    // makes runs 2/3 succeed at all (a released buffer → empty cell → busy error).
-    let g = ks.scale_u32([N], buf, 1u32).and_then(download);
+    // scale(buf, 1) in place, NO download — the terminal IS the buffer, so its
+    // Checkout exposes the (rehomed) handle each run. factor 1 makes the result
+    // idempotent even though scale itself compounds, so a stable result across 3
+    // runs proves the SAME buffer is returned and reused (NOT re-allocated). We
+    // ALSO capture the handle before the graph consumes it and assert, each run,
+    // that the run lent EXACTLY that cl_mem back (rehome, not re-mint) — reading
+    // the contents through the still-lent Checkout (a borrowing read), then
+    // dropping it to rehome for the next run.
+    let g = ks.scale_u32([N], buf, 1u32);
 
     for run in 0..3 {
-        let out = g
+        let co = g
             .sync(&ctx)
             .unwrap_or_else(|e| panic!("run {run}: graph must re-arm via rehome: {e}"));
-        assert!(
-            out.iter().all(|&v| v == 5),
-            "run {run}: idempotent scale(×1) over the rehomed buffer → 5, got {:?}",
-            &out[..8]
+        assert_eq!(
+            handle_of(&*co),
+            h0,
+            "run {run}: rehomed buffer must keep a STABLE cl_mem across runs (not re-mint)"
         );
+        // Borrowing read (map, not the consuming `read`) so `co` survives to be
+        // dropped → rehomed for the next run.
+        let guard = co.map().wait().expect("map read back");
+        assert!(
+            guard.iter().all(|&v| v == 5),
+            "run {run}: idempotent scale(×1) over the rehomed buffer → 5, got {:?}",
+            &guard[..8]
+        );
+        drop(guard);
+        drop(co); // rehome the buffer to its concrete cell for the next run.
     }
 }
 
@@ -176,10 +188,16 @@ fn upload_readwrite_scale_download_x3_reseed_stable() {
     let h0 = handle_of(&*c1);
 
     // A second sync while c1 is alive must be graph-busy (the home is lent), NOT a
-    // fresh re-mint with a distinct handle.
+    // fresh re-mint with a distinct handle. The upload cell is a concrete-style
+    // cell, so the busy path is `Error::NotSupported` whose message names the lent
+    // upload buffer ("already lent" / "the graph is busy") — NOT a slot error.
+    let err = probe
+        .sync(&ctx)
+        .expect_err("upload(ReadWrite) home is lent while c1 is alive → second sync must be busy");
     assert!(
-        probe.sync(&ctx).is_err(),
-        "upload(ReadWrite) home is lent while c1 is alive → second sync must be busy"
+        matches!(&err, Error::NotSupported(m)
+            if m.contains("already lent") && m.contains("busy")),
+        "expected NotSupported busy (upload buffer already lent), got {err:?}"
     );
 
     // Drop c1 → the buffer rehomes to the persistent upload cell. A re-run must
@@ -275,29 +293,47 @@ fn upload_writeonly_kernel_download_x3_stable() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 5. user-alloc → download directly, ×2.
+// 5. user-alloc → buffer-terminal op, ×2.
 //    Invariant: after run 1 the buffer is rehomed (same handle), run 2 works
-//    without a fresh alloc.
+//    without a fresh alloc — proven by capturing the buffer's handle before the
+//    graph consumes it and asserting the SAME cl_mem is lent back on BOTH runs.
+//
+//    A pure `download` terminal yields a host `Vec`, so the device handle is not
+//    observable through it. To PROVE the stable-handle claim (not just
+//    re-runnability + contents) this uses `fill(buf, 9)` — a kernel-free op over
+//    a bare user buffer whose terminal IS the buffer (a Checkout), so its handle
+//    is readable each run. `fill(9)` on an already-9 buffer is idempotent, and we
+//    read contents via a borrowing `map` so the Checkout survives to rehome.
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
 fn user_alloc_download_directly_x2_rehomed() {
     let Some(ctx) = ctx() else { return };
 
     let buf = seeded(&ctx, 9);
+    let h0 = handle_of(&buf); // the handle the rehomed buffer MUST keep each run.
 
-    // Pure download of a user buffer. The buffer must be RETURNED to its cell on
-    // the run's Checkout drop so a second sync reads the SAME buffer again.
-    let g = download::<u32, _>(buf);
+    // Idempotent fill over a user buffer. The buffer must be RETURNED to its cell
+    // on the run's Checkout drop so a second sync lends the SAME buffer again.
+    let g = fill(buf, 9u32);
 
-    let out1 = g.sync(&ctx).expect("download run 1");
-    assert!(out1.iter().all(|&v| v == 9), "run 1 reads 9");
-    drop(out1); // re-arm via rehome (NOT release).
+    let co1 = g.sync(&ctx).expect("run 1");
+    assert_eq!(handle_of(&*co1), h0, "run 1 lends the original buffer");
+    let guard1 = co1.map().wait().expect("map run 1");
+    assert!(guard1.iter().all(|&v| v == 9), "run 1 reads 9");
+    drop(guard1);
+    drop(co1); // re-arm via rehome (NOT release).
 
-    let out2 = g
+    let co2 = g
         .sync(&ctx)
-        .expect("download run 2 must reuse the rehomed buffer (no fresh alloc)");
+        .expect("run 2 must reuse the rehomed buffer (no fresh alloc)");
+    assert_eq!(
+        handle_of(&*co2),
+        h0,
+        "run 2 lends the SAME rehomed cl_mem (stable handle, not re-minted)"
+    );
+    let guard2 = co2.map().wait().expect("map run 2");
     assert!(
-        out2.iter().all(|&v| v == 9),
+        guard2.iter().all(|&v| v == 9),
         "run 2 reads the SAME buffer: 9"
     );
 }
@@ -430,9 +466,14 @@ fn cross_graph_as_kernel_arg_lends_and_returns() {
     );
 
     // g1 is busy (lent into g2) while out2 is alive → a second sync must error.
+    // g1's home is a SLOT (Buf), currently `Lent`, so the busy path surfaces as
+    // `Error::SlotUnbound` naming the tag (its message covers the Lent/busy case).
+    let err = g1
+        .sync(&ctx)
+        .expect_err("g1 is lent into g2 while g2's result is alive → busy, NOT a silent re-run");
     assert!(
-        g1.sync(&ctx).is_err(),
-        "g1 is lent into g2 while g2's result is alive → busy, NOT a silent re-run"
+        matches!(&err, Error::SlotUnbound(n) if n.contains("Buf")),
+        "expected SlotUnbound(Buf) for the lent slot, got {err:?}"
     );
 
     // Plain DROP of g2's result (NOT into_inner/read) → the lent buffer RETURNS to
@@ -503,10 +544,14 @@ fn copy_operand_checkout_lends_and_returns() {
     );
 
     // (a) A is busy (lent into B) while B's src result is alive → a second
-    // A.sync() must ERROR — A was LENT, not severed.
+    // A.sync() must ERROR — A was LENT, not severed. A's home is a SLOT (Buf),
+    // currently `Lent`, so the busy path is `Error::SlotUnbound` naming the tag.
+    let err = ga
+        .sync(&ctx)
+        .expect_err("A is lent as a copy operand while B's result is alive → busy");
     assert!(
-        ga.sync(&ctx).is_err(),
-        "A is lent as a copy operand while B's result is alive → busy, NOT a silent re-run"
+        matches!(&err, Error::SlotUnbound(n) if n.contains("Buf")),
+        "expected SlotUnbound(Buf) for the lent slot, got {err:?}"
     );
 
     // (b) Plain DROP of B's result (NOT into_inner) RETURNS the lent buffer to
@@ -597,10 +642,14 @@ fn checkout_lend_transitive() {
     let co_b = ks.scale_u32([N], co_a, 2u32).sync(&ctx).expect("B run");
     let co_c = ks.scale_u32([N], co_b, 5u32).sync(&ctx).expect("C run");
 
-    // A is still busy: its home rode A → B → C and hasn't returned yet.
+    // A is still busy: its home rode A → B → C and hasn't returned yet. A's home is
+    // a SLOT (Buf), currently `Lent`, so the busy path is `Error::SlotUnbound`.
+    let err = g_a
+        .sync(&ctx)
+        .expect_err("A is lent through the whole chain while C's result is alive → busy");
     assert!(
-        g_a.sync(&ctx).is_err(),
-        "A is lent through the whole chain while C's result is alive → busy"
+        matches!(&err, Error::SlotUnbound(n) if n.contains("Buf")),
+        "expected SlotUnbound(Buf) for the lent slot, got {err:?}"
     );
 
     // Feed co_c forward ONE more hop into a download (D): the home rides A→B→C→D

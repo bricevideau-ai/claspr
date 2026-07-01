@@ -105,12 +105,27 @@ fn usm_copy_uninit_dst_is_reusable() {
     let g = eager_copy_to(src, dst);
 
     {
-        let _ = g.sync(&ctx).expect("first sync");
+        // Run 1 ALSO verifies the copy actually copied the right bytes: USMSlice
+        // (fine-grain-system SVM) `Deref`s to `[T]` directly, so read the dst back
+        // through the Checkout and assert it equals src. (`_co_src` unused.)
+        let (_co_src, co_dst) = g.sync(&ctx).expect("first sync");
+        assert_eq!(
+            &co_dst[..],
+            &data[..],
+            "run 1 USM uninit dst must hold the copied src bytes"
+        );
     } // <- USM downgrade rehome returns the Init dst into the Cell<USMSliceUninit>.
 
     {
-        let _ = g
+        // Run 2 proves reusability (downgrade-rehome, not busy) AND re-copies the
+        // right bytes into the re-armed dst.
+        let (_co_src, co_dst) = g
             .sync(&ctx)
             .expect("second sync (USM uninit dst must downgrade-rehome, not busy)");
+        assert_eq!(
+            &co_dst[..],
+            &data[..],
+            "run 2 USM uninit dst == src after downgrade-rehome"
+        );
     }
 }

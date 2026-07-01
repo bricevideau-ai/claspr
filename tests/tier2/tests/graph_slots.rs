@@ -234,29 +234,50 @@ fn bind_same_buffer_is_idempotent() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
+    use claspr::{MemRef, RecordableBuffer};
     use std::sync::Arc;
+
+    /// Raw `cl_mem`/SVM pointer as a `usize`, for `==` identity across the run.
+    fn handle_of<B: RecordableBuffer>(b: &B) -> usize {
+        match b.record_handle().mem {
+            MemRef::Buffer(m) => m as usize,
+            MemRef::Svm(p) => p as usize,
+        }
+    }
+
     // out = sharedA + b. `a` is a read-only arg (accepts `Arc<DeviceSlice>`).
     let g = ks.add_u32([N], slot!(SharedA), slot!(B), slot!(Out));
 
     let shared = Arc::new(seeded(&ctx, 2));
+    let h_shared = handle_of(&*shared); // the FIRST-bound buffer's identity.
     // First bind, then bind the SAME buffer again (a second `Arc::clone`): equal
     // handle → `bind` is idempotent, NOT a conflict.
     g.bind(SharedA(Arc::clone(&shared))).expect("first bind");
     g.bind(SharedA(Arc::clone(&shared)))
         .expect("second bind of the SAME buffer is an idempotent no-op");
 
-    let (_a, _b, out_co) = g
+    let (a_co, _b, out_co) = g
         .bind(B(seeded(&ctx, 5)))
         .expect("bind B")
         .bind(Out(seeded(&ctx, 0)))
         .expect("bind Out")
         .sync(&ctx)
         .expect("sync after idempotent rebind");
+
+    // The duplicate `bind` must leave the binding UNCHANGED — the run's `a` operand
+    // is the EXACT buffer the FIRST bind provided (same cl_mem), not a silently
+    // re-installed equal one. (`a_co` derefs to `Arc<DeviceSlice>` → `DeviceSlice`.)
+    assert_eq!(
+        handle_of(&**a_co),
+        h_shared,
+        "idempotent rebind must keep the FIRST-bound buffer (unchanged), not replace it"
+    );
+
     let mut r = vec![0u32; N];
     out_co.read(&mut r).wait().expect("read");
     assert!(
         r.iter().all(|&v| v == 7),
-        "idempotent rebind still computes 2 + 5 = 7, got {:?}",
+        "idempotent rebind still computes 2 + 5 = 7 over the SAME shared buffer, got {:?}",
         &r[..8]
     );
 }
