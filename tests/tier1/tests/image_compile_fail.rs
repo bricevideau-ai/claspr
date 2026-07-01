@@ -67,8 +67,21 @@ fn main() -> Result<()> {
     let fail_config = make_config("compile_fail/image", Mode::Fail, &args, &externs);
     let pass_config = make_config("compile_pass/image", Mode::Pass, &args, &externs);
 
+    // Macro-level diagnostics (no kernel crate needed — a `claspr::kernels!`
+    // invocation exercises `expand_kernel` at host compile time, so only the
+    // `claspr` extern is required). `compile_fail/macro` covers the >8
+    // runtime-arg friendly error; `compile_pass/macro` pins the 8-arg
+    // boundary as still-valid.
+    let macro_fail_config = make_config("compile_fail/macro", Mode::Fail, &args, &externs);
+    let macro_pass_config = make_config("compile_pass/macro", Mode::Pass, &args, &externs);
+
     run_tests_generic(
-        vec![fail_config, pass_config],
+        vec![
+            fail_config,
+            pass_config,
+            macro_fail_config,
+            macro_pass_config,
+        ],
         ui_test::default_file_filter,
         |_, _| {},
         Box::<dyn StatusEmitter>::from(args.format),

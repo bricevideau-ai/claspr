@@ -1,0 +1,8 @@
+error: claspr kernels support at most 8 runtime arguments (buffers, images, and scalars — the grid is separate); `too_many_args` has 9. Reduce the argument count or bake fixed values into the device module as consts.
+  --> compile_fail/macro/too_many_args.rs:17:12
+   |
+17 |         fn too_many_args(
+   |            ^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+
