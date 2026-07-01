@@ -3494,11 +3494,14 @@ impl_bind_all_tuple!(A, B, C, D, E, F, G, H);
 /// slot(s) to an upstream pipe.
 ///
 /// The two spellings share one surface: `Buf(x)` is a value-bind when `x` is a value
-/// (or [`Checkout`]) and a pipe-feed when `x` is a `Pipe<Buf::Value>`. The value-bind
-/// arm is the blanket `impl<Tg: Tag> CallArg for Tg`; the pipe-feed arm is the per-tag
-/// `impl CallArg for Tag<Pipe<..>>` the [`slots!`](crate::slots) macro emits (gated to
-/// buffer-valued tags via [`RecordableBuffer`](crate::record::RecordableBuffer), so a
-/// scalar `F(pipe)` does not compile).
+/// (or [`Checkout`]) and a pipe-feed when `x` is a `Pipe<Buf::Value>`. All three arms
+/// are emitted PER-TAG by the [`slots!`](crate::slots) macro on the CONCRETE source
+/// (`$name<$val>` and `$name<Checkout<$val>>` value-bind, `$name<Pipe<V>>` pipe-feed)
+/// — deliberately NOT an open `impl<Tg: Tag> CallArg for Tg` blanket, which would
+/// break cross-crate coherence against the pipe impl (see the module comment below).
+/// The pipe-feed arm is gated to buffer-valued tags via
+/// [`RecordableBuffer`](crate::record::RecordableBuffer), so a scalar `F(pipe)` does
+/// not compile.
 ///
 /// Applied **infallibly**: [`apply`](CallArg::apply) drops any bind error (an absent
 /// tag, a conflict, a checked-out slot) — the error surfaces later at
