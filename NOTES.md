@@ -9,6 +9,520 @@ items resolve.
 
 ## Active
 
+### 🔎 INVESTIGATION 2026-07-01 — should all `*bind`/`*call` verbs be move (consuming)? → NO (keep the split; one gap worth adding)
+
+Question (Brice): should `bind`/`mutate_bind`/`call`/`mutate_call` become consuming
+(`self -> …`) like `call_move`/`bind_move`, instead of fluent `&self -> Result<&Self>`?
+
+**Verdict: NO — the two families are load-bearing for two different, both-needed
+call shapes. Do not collapse them.** Recommend a small ADDITION instead (see below).
+
+**The decisive fact (not ergonomics — the type system):** the op-tree IS the
+reusable graph, and its terminals are `&self`: `sync`/`wait_on` take `&self`
+(eager.rs; the graph re-arms via `Checkout` drop and runs again). A *consuming*
+bind returning owned `Self` is fine right up until you need to `sync()` and then
+bind *again* — the replay loop. Concretely the two shapes:
+
+- **Fluent `&self` (reuse-in-place):** `for … { g.mutate_call((…))?; g.sync(ctx)?; }`.
+  The graph is a `let g` (or a closure capture, as in gray-scott `run_swap`
+  `step`), mutated in place each iteration and synced repeatedly. Sites that
+  REQUIRE this: gray-scott `run_swap` (`g.mutate_call` inside the shared `step`
+  closure, ~1000s of iters + a `mutate_bind` F/K reconfigure between the two phase
+  loops); `double_buffering.rs` (both the two-`mutate_bind` and the one-line
+  `mutate_call` crossed-swap loops); `graph_slots.rs` rebind-in-for-loop.
+- **Consuming `self` (compose-in-`and_then`):** `call_move`/`bind_move` return bare
+  owned `Self` so the graph is usable as the `U: DeviceOp` an `and_then` closure
+  must return (a `Result<Self>` would NOT fit — `and_then` wants bare `U`). Sites
+  that REQUIRE this: gray-scott `run_immutable`, `feed_and_call_move.rs` (12
+  call_move + 2 bind_move). These are DAG-build one-shots, never in a rebind loop.
+
+**Could a consuming verb serve the loop via `g = g.mutate_call(…)?` reassignment?**
+Technically yes for a plain `let mut g`, but it breaks the moment `g` is a closure
+capture (gray-scott `step` closure borrows `g` — a move-and-reassign inside a
+`FnMut` doesn't type-check) and it fights the `&self` terminals (you'd `g =
+g.sync_and_rebind(…)`-shape everything). Net: consuming-only would make the
+dominant reuse pattern strictly harder and uglier, to save nothing.
+
+**Fallible-vs-infallible is a SEPARATE axis from receiver, and it's the real
+reason both exist.** Fluent = `&self` + EAGER errors (`SlotConflict`/`SlotNoSuchTag`
+at the call site, phase-0 probe = all-or-nothing). Move = `self` + INFALLIBLE
+(errors deferred to `sync`'s `check_ready`, sound via #178 atomicity). You cannot
+have "consuming + eager `Result`" feed an `and_then` closure — so `call_move` HAS
+to be infallible, which means it HAS to be a distinct verb from `call`. The split
+is forced, not stylistic.
+
+**Traits are already receiver-agnostic:** `BindAll`/`CallArg`/`CallArgs` all take
+`self` (the tuple) + `&Op` (the graph, borrowed). No trait rework needed either
+way — so "unify the verbs" would buy nothing at the trait layer either.
+
+**The one real gap (worth a follow-up, NOT part of this decision):** `bind`'s own
+doc carries `TODO(step b→c)` — `bind` returns `&Self`, but the fully-composable
+single-output form (a bound graph usable as a kernel arg / `bundle2(b, g.bind())`)
+needs a node that re-exposes the bound graph's output pipe. That's a MISSING
+capability (compose a *reusable* sub-graph into a larger graph by value), not an
+argument for making the existing verbs consuming. `call_move` already covers the
+consume-and-compose case for the whole graph; the gap is specifically "nest a
+bound graph as one operand." Defer; revisit alongside CB `.call()` composition
+(the segment-plan step needs the same output-pipe-reexpose node).
+
+#### Q3 (2026-07-02) — implications of making `and_then` fallible?
+
+First, disambiguate. `and_then<U,F>(self,f) -> AndThen<Self,U> where F: FnOnce(Handle)
+->U` runs `f` EAGERLY at construction (`let next=f(self.handle())`) and DISCARDS it,
+storing only the built `U`. "Fallible `and_then`" therefore means the BUILDER
+closure returns `Result<U>` and `and_then` returns `Result<AndThen<Self,U>>`. (NOT
+execute-fallibility — `execute` already returns `Result`; and NOT the host-seam kind
+— `and_then_host` takes a fallible `FnOnce(View)->Result<()>` but it runs at EXECUTE
+and its error rides execute's Result; the BUILDER `and_then_host` stays infallible.)
+
+**What it would BUY (the only real win):** eager, BUILD-TIME bind errors in the
+compose path. Today `call_move`/`bind_move` are infallible precisely so they fit
+`and_then`'s bare-`U` closure; their bind errors defer to `sync`'s `check_ready`. If
+`and_then` accepted `Result<U>`, a fallible `call_into`/`bind_into -> Result<Self>`
+could live inside the closure, so a bad bind fails a few lines earlier (at build) and
+the error names the CALL rather than the unbound SLOT.
+
+**What it would COST:**
+- **Viral `Result` through every builder closure.** `Result<AndThen>` is not a
+  `DeviceOp`, so `.and_then(f).and_then(g)` stops chaining — it becomes
+  `.and_then(f)?.and_then(g)?`, and every NESTED builder closure (e.g. gray-scott
+  `get_meta_kernel`'s three-deep `and_then`) must itself return `Result<U>` with `?`
+  inside. Fallibility is all-or-nothing viral: one fallible `and_then` forces the
+  whole tree of builder closures into `Result`. The ~99% of builders that CANNOT
+  fail (a plain kernel-launch builder never fails) pay the tax anyway.
+- **Combinator surface multiplies.** For uniformity `bundle!`/`fan_out`/etc. would
+  want fallible builder variants too.
+- **Reimplements what #178 already gives.** Deferred `call_move` errors are ALREADY
+  sound: `check_ready` validates every cell before ANY enqueue, so a bad bind fails
+  closed at `sync` with nothing enqueued and a clear `SlotUnbound`/`SlotNoSuchTag`.
+  The error is caught either way — build-time vs sync-time is a diagnostic-locality
+  nicety, not a correctness gain.
+
+**What it does NOT cost (important):** the closure-free inspectability is PRESERVED —
+the builder still runs eagerly and is discarded whether it returns `U` or
+`Result<U>`; only `U` is stored. So `describe()`/CB-recording are unaffected. This is
+NOT a casualty.
+
+**Assessment:** net-negative as a change to the PRIMARY `and_then`. The infallible
+builder was a deliberate design choice — `call_move` was made infallible+deferred SO
+it composes with plain `and_then`, and #178 makes the deferral sound. Making
+`and_then` fallible trades pervasive `Result` ergonomics for a marginal
+error-locality improvement.
+
+**If eager compose-time errors are ever genuinely wanted**, the right shape is a
+SEPARATE opt-in combinator `and_then_try<U,F: FnOnce(Handle)->Result<U>> ->
+Result<AndThen>` (the standard Rust "map vs try_fold" split), used only where the
+builder can actually fail, alongside a fallible `call_into`/`bind_into`. Keeps the
+common path clean; serves the rare case. Recommend deferring even that until a
+concrete use case demands build-time bind errors — none exists today.
+
+**Q3 follow-up (2026-07-02) — can `and_then` absorb+forward the error so the
+programmer doesn't `?` each step? YES — the CARRIER pattern. (Corrects my
+"viral `?`" claim above: that only applies to the NAIVE `Result<AndThen>` used
+directly on a bare op; the carrier avoids it.)**
+
+The trick is to make the PIPELINE TYPE be `Result<Op, Error>` (or a `TryGraph(Result<
+Op>)` newtype) and implement the builder verbs ON THAT carrier:
+  - `Ok(op).and_then(f)` → run `f(op.handle())`, build, re-wrap `Ok` (flatten if `f`
+    itself returns `Result`).
+  - `Err(e).and_then(_)` → return `Err(e)`, closure NEVER called (short-circuit).
+So `head.and_then(a).and_then(b).and_then(c)` chains with NO per-step `?` — each
+`.and_then` is called on a `Result` and returns a `Result`; the error threads
+through and surfaces ONCE, at the terminal (`sync` on `Result<Op>` = `self?.sync()`).
+This is EXACTLY how Rust keeps fallible iterators ergonomic:
+  - `iter.map(fallible).collect::<Result<Vec<_>,E>>()` — `FromIterator for Result`
+    short-circuits on the first `Err`; the "unwrap" is ONCE at `collect`, not per item.
+  - `try_fold`/`try_for_each` — short-circuiting drivers returning `Result`/any `Try`.
+  - `Itertools::process_results(iter, |ok_iter| …)` — hands you unwrapped items,
+    stops at first error.
+  The deep principle: `Result` IS the carrier (a monad); the combinators are written
+  to KNOW about it, so fallibility is threaded as a value and collapsed at the
+  boundary. Our carrier `and_then` = the `collect::<Result>` of graph-building.
+
+Closures returning EITHER `U` or `Result<U>` can be unified with a small
+`IntoFallibleOp` trait (`impl for U -> Ok(u)`, `impl for Result<U> -> identity`), so
+one `and_then` signature serves both fallible and infallible builders.
+
+**So the real tradeoff is NOT per-step `?`** (the carrier removes it) — it is:
+1. **A parallel carrier surface.** `and_then`/`bundle`/`fan_out`/terminals need impls
+   on `Result<Op>` (a `TryDeviceOpExt`, coherent: local trait on `Result<O>` is
+   allowed by the orphan rule since the trait is ours). Bounded one-time library work.
+2. **The pipeline becomes `Result`-typed even when infallible.** A fully-infallible
+   chain in carrier-land still yields `Result<Op>` → one `?`/`unwrap` at the terminal
+   that can never fire (or an infallible-terminal variant). This is the residual tax
+   — ONE `?` at the end, not per step. Much milder than "viral".
+3. **Two worlds to bridge.** Bare `Op` chains (infallible, `AndThen` values) vs
+   carrier `Result<Op>` chains. Interop = `Ok`-lift at the head; a fallible verb
+   (`bind_into`) is the natural head that MINTS the first `Result`. Mixed chains work
+   because infallible steps just always yield `Ok`, but you pay the carrier wrapping
+   ergonomically throughout that chain.
+4. **Generic/inference/error-message degradation** on deep `Result<AndThen<AndThen<…
+   >>>` nests (worse than the already-hairy bare nests).
+5. Closure-free inspectability is STILL preserved (build eagerly, store only the
+   unwrapped `U`; an errored build yields `Err` and no graph — correct).
+
+**Revised recommendation:** the carrier is a LEGITIMATE, ergonomic design (Brice is
+right that `?`-per-step is avoidable) — but it's still only worth it if build-time
+bind errors are actually wanted, and today `check_ready` (#178) already catches them
+soundly at `sync`. So: keep the infallible `call_move` + fluent-`call` split as the
+default; if/when a real need appears, add the carrier as an OPT-IN parallel surface
+(`TryGraph`/`bind_into` + `TryDeviceOpExt`) rather than making the primary `and_then`
+fallible. The `and_then_try` single-combinator idea above is the smaller first step;
+the full carrier is the ergonomic end-state if the fallible path becomes common.
+
+#### Q3 follow-up-2 (2026-07-02) — "call_move is a workaround; won't we need mutate_call_move next, API grows forever?" The combinatorial worry.
+
+Brice's concern: `call_move` exists only to escape an `and_then` closure (base verbs
+are `&self`, can't return owned); soon we'll want `mutate_call_move`, then
+`feed_move`, and the matrix (fluent/move × bind/call × set/mutate × value/pipe) keeps
+growing. If a disruptive change can DELETE the `*_move` family, deferring may be wrong
+— disruption only grows with call-site count.
+
+**KEY VERIFIED FACT that bounds the growth: every `call_move`/`bind_move` site builds
+a FRESH graph inside the closure (virgin `Unbound` slots).** Confirmed by grepping all
+14 sites (gray-scott run_immutable, feed_and_call_move). Compose = build-fresh-then-
+bind. A fresh graph's slots are virgin → SET-ONCE (`bind`/`call`) is the correct verb;
+MUTATE (overwrite an already-bound slot) is meaningless on a fresh graph. Rebinding an
+already-bound graph is the REUSE pattern (loops), which uses the fluent `&self`
+`mutate_call` and never needs to escape a closure.
+
+**Therefore `mutate_call_move` is very likely NEVER needed** — the move family is
+COMPLETE at two verbs (`call_move` set-once tuple; `bind_move` = its currying alias).
+The only way a consuming-mutate could arise is composing a PRE-BOUND reusable graph as
+an operand inside `and_then` and overwriting its slots — which requires the
+"bind-as-operand" node (the `bind` `TODO(step b→c)`, not built) AND wanting to rebind
+it mid-compose. Neither exists. So the feared combinatorial growth is bounded; the
+matrix is not actually open-ended. This substantially defuses the "decide fast or
+disruption grows" pressure — the move family isn't a growing wart, it's a 2-verb
+escape hatch whose cell for `mutate` is provably empty for today's usage.
+
+**IF we still want to collapse the fluent/move duplication into ONE family**, the real
+options (all touch the whole slot surface — this is the disruptive decision):
+- **(C) All-consuming infallible base.** Make `bind`/`mutate_bind`/`call`/`mutate_call`
+  `self -> Self`, infallible (defer errors to `sync`, sound via #178). Delete
+  `call_move`/`bind_move` (`call` IS consuming now). WINS: half the verbs, one mental
+  model, straight-line binds LOSE their per-step `?` (`g.bind(A).bind(B).sync()?` — only
+  the terminal is fallible), compose unchanged. COSTS: (1) reuse-in-a-closure BREAKS —
+  gray-scott's shared `step` closure does `g.mutate_call(...)` on a captured `g`; under
+  C that's `g = g.mutate_call(...)`, a move-out-of-`&mut`-capture that does NOT compile
+  (needs `mem::replace` or inlining the loop — a real regression for the flagship
+  pattern). (2) plain loops thread `g` (`g = g.mutate_call(...)`; fine for `let mut g`).
+  (3) eager `SlotConflict`/`SlotNoSuchTag` at the bind site LOST (deferred to sync as
+  `SlotUnbound` — sound, worse locality). Migration: ~150 fluent sites + both gray-scott
+  variants + all slot tests.
+- **(B) Carrier (`Result<Op>` fallible chain).** IMPORTANT correction: the carrier
+  only removes the FALLIBILITY reason for the twins — with `and_then` accepting
+  `Result<U>`, a fallible-consuming `call_into -> Result<Self>` can be the closure
+  body, so no INFALLIBLE variant is needed. It does NOT remove the OWNERSHIP reason:
+  one verb serving BOTH fluent-then-sync AND compose must still be CONSUMING, which
+  reintroduces Option C's reuse-in-closure breakage. So B = C's ownership change PLUS
+  carrier machinery (Result-types every chain + a parallel `TryDeviceOpExt`, see
+  Q3-follow-up-1) to keep eager errors. It is C-plus (heaviest), NOT a lighter
+  twin-delete. Twins cannot be deleted without EITHER a consuming surviving verb
+  (C-like reuse cost) OR keeping two verbs — the carrier alone doesn't change that.
+- **(D) One generic escape verb.** Keep base verbs `&self` (reuse stays clean, incl.
+  closures — the coherent property C sacrifices); replace `call_move`/`bind_move` with a
+  SINGLE `configure(self, |g| { g.call(..)?; g.feed(..)?; Ok(()) }) -> Self` that runs
+  any fluent binds by-ref then returns the owned graph (errors deferred, like
+  call_move). ONE verb covers every present+future fluent verb combo → NO twin ever
+  grows, including a hypothetical mutate-in-compose (`g.mutate_call(..)` inside the
+  closure). COST: loses the terse tuple sugar `call_move((UIn(x), VIn(y)))` for a
+  closure block — a per-site ergonomic step down, but the matrix is permanently closed.
+  Lowest disruption (base verbs + reuse loops untouched; only the 14 `*_move` sites
+  migrate).
+
+- **(E) ⭐ THE ASYMMETRIC CUT (Brice 2026-07-02) — make set-once consuming, keep
+  mutate `&self`.** The insight that fixes C: C failed ONLY because it made `mutate_*`
+  consuming too, breaking reuse-in-closure (gray-scott run_swap). But `&self` on the
+  set-once verbs buys almost NOTHING — a set-once verb can only be LEGITIMATELY
+  re-called with the SAME value (a different value is `SlotConflict`; verified: every
+  multi-call set-once site is either an idempotent same-value rebind or a
+  conflict-contract test — never a loop rebinding to NEW values). Repeated-call-with-
+  different-values is the EXCLUSIVE province of `mutate_*` (the loop pattern). So:
+    - `bind` / `call` → CONSUMING + infallible (`self -> Self`). This IS exactly
+      today's `call_move`/`bind_move` semantics → **DELETE `call_move`/`bind_move`**;
+      `call` now serves compose directly (returns owned Self, fits `and_then`'s bare-U).
+      bind_move-currying folds in too: `get_meta_kernel(..).call((F,K,Grid))` then
+      later `.call((UIn,..))` — two consuming calls chain.
+    - `mutate_bind` / `mutate_call` → STAY `&self`. Reuse loops (incl. the captured-`g`
+      closure in run_swap) untouched — this is the axis C sacrificed and E preserves.
+  RESULT: 4 verbs, no `_move` twins, matrix CLOSED (no `mutate_call_move` possible —
+  mutate is `&self`, compose builds fresh ⇒ needs set-once, never mutate). This is
+  STRICTLY BETTER than the "keep 6 verbs" status quo AND than C/B/D: fewer verbs than
+  today, and reuse stays clean unlike C.
+  ⭐ REFINEMENT (2026-07-02, Brice's "what's actually deferred?" question): NO VALUE
+  check is ever deferred — to construct `Buf(b)` the caller must hold a valid `b`
+  (type system guarantees existence+type); bind MOVES it in. Every deferred check is
+  purely SLOT-STATE: SlotConflict (Bound-to-different), FedByPipe-conflict,
+  SlotCheckedOut (Lent), SlotSevered, and SlotNoSuchTag (tag-not-in-graph — a typo,
+  the only non-"already-filled" one). CRUCIAL: today's call_move defers by `let _ =
+  g.bind(..)` which DROPS the error, and check_ready only re-catches slot-left-UNBOUND
+  cases → a SlotConflict (slot stays Bound-to-OLD) or a typo'd tag (when real slots
+  are otherwise satisfied) is SILENTLY SWALLOWED and the graph runs (with the old
+  value / ignoring the typo). That's a real fidelity loss. FIX baked into E: don't
+  drop — RECORD the deferred `binder.outcome` Err into an interior-mutable cell on the
+  graph; check_ready drains+reports it FIRST (before the Bound-ness scan). Then E loses
+  ONLY error TIMING (bind-line → sync), not error EXISTENCE — full SlotConflict/
+  SlotNoSuchTag/etc fidelity preserved, nothing enqueued on error (atomic via #178).
+  This should ALSO be retrofitted to today's call_move regardless of E (it's a latent
+  silent-swallow bug in the shipped call_move).
+  COSTS (bounded, one-time): (1) set-once errors report at `sync` not at the bind line
+  (TIMING only, given the record-don't-drop fix above; sound via #178). (2) migrate
+  set-once call sites that are SEPARATE statements to chained/reassigned form
+  (`g.bind(A); g.bind(B);` → `let g = g.bind(A).bind(B);` — mechanical; the ~14
+  call_move sites are ALREADY this shape and just lose the `_move` suffix). (3) rewrite
+  the set-once EAGER-error-contract tests (graph_slots conflict/severed cases) to
+  expect the deferred sync error — test-only, exercising a contract we're
+  intentionally relaxing. (4) `bind`/`call` being infallible means a pure one-shot
+  can't learn of an absent tag until `sync` — accept (sound). Migration scope: the
+  ~14 `*_move` sites (trivial rename) + set-once separate-statement binds + set-once
+  error-contract tests. gray-scott run_swap: UNTOUCHED (uses `mutate_*`).
+
+#### Q3 follow-up-3 (2026-07-02, Brice) — now that set-once bind/call MOVE self, is it worth typestate (graph carries unbound slots in its type; bind transitions to one-fewer-slot; double-bind + completeness = COMPILE errors)? "call can be a macro chaining binds."
+
+**The enabling observation is CORRECT and genuinely new.** With `&self` bind, a
+type transition was impossible (a `&self` method can't consume-and-return a different
+type). With Option E's `self -> Self` set-once bind, `bind<Tg>(self) -> Graph<Remaining
+∖ Tg>` becomes expressible. So move-semantics UNLOCK typestate. And "call = macro
+chaining binds" removes the CallArgs/BindAll tuple-trait — good, one less axis.
+
+**But three hard problems, in increasing severity:**
+
+1. **The graph type does NOT carry slots today.** The eager type is `AndThen<S,U>` /
+   `LaunchOp<…>` — slots are RUNTIME `Arc<Mutex<SlotState>>` cells discovered by
+   `bind_slots` walking `Input` fields. Typestate needs a type-level `Remaining:
+   TagSet` param threaded through EVERY op + combinator. Every `and_then`/`bundle`/
+   `fan_out` must UNION its children's slot-sets at the type level, and the kernel
+   proc-macro must COMPUTE each launcher's slot-set by filtering `SlotHandle<Tg>` args
+   from concrete args. Big architectural addition to the whole surface.
+
+2. **Order-free + shared-fan-out ⇒ type-level SET with dedup = the ABANDONED pain.**
+   Binding is order-free (bind A then B ≡ B then A) ⇒ `Remaining` is a SET, not a
+   sequence. A shared slot (gray-scott `Grid` fans to 3 dispatch sites across nested
+   `and_then`s) must count ONCE ⇒ the cross-combinator union must DEDUP by tag. That
+   is exactly the "HList / type-level set-algebra / turbofish / dedup pain" the notes
+   record as WHY compile-time-set was abandoned (see REUSABLE GRAPH MODEL §3 below).
+   Move-semantics don't make the set-algebra any cheaper — they only remove the
+   `&self` blocker. The dedup-union-across-combinators is the real wall, and fan-out
+   makes it mandatory (set, not multiset). Doable (frunk-style) but heavy compile
+   times + gnarly E0277s — reintroduces precisely what the turbofish-free redesign
+   (18/18, the win) deleted.
+
+3. **⭐ DECISIVE: typestate for COMPLETENESS is INCOMPLETE — the just-built reuse
+   machinery makes occupancy RUNTIME-dynamic.** Slot occupancy is not static after
+   the initial bind: `into_inner()` SEVERS a slot (Bound→Severed = empties it) AFTER
+   the type said "bound"; `FedByPipe` drains its pipe each replay; the Checkout/
+   re-arm cycle moves Bound→Lent→Bound. A standalone `into_inner` (keep-the-buffer,
+   typically terminal) leaves a hole the FROZEN type still calls "bound" → a
+   type-level "syncable" that is runtime-empty. Sync would STILL runtime-error
+   (check_ready catches Severed), so it's not unsound — but it means **you cannot
+   DELETE check_ready even with full typestate**. The type-level completeness
+   machinery is therefore PURE ADDED COST on the completeness axis (runtime check
+   stays as the backstop for sever/drain). Its only IRREDUCIBLE win is compile-time
+   DOUBLE-BIND prevention — which the record-don't-drop `SlotConflict` (Q3-follow-up-2
+   refinement) already surfaces soundly at sync.
+   (Note the mutate/set-once split stays coherent under typestate: initial fill is
+   ALWAYS set-once `bind` [type-transitioning]; `mutate_*` stay `&self` and operate
+   only on ALREADY-bound slots [no transition] — matches run_swap: 7 set-once binds
+   to reach bound, then mutate-only. Only graph_slots' "mutate_bind fills a virgin
+   slot" test would need to become a `bind`. So the split isn't the blocker; #2 and
+   #3 are.)
+
+**Assessment:** the win (compile-time double-bind + completeness) is elegant, but (a)
+completeness-typestate can't retire the runtime check (sever/drain/re-arm are
+dynamic) so it's cost-without-savings there, and (b) the remaining win (double-bind)
+is already handled soundly by record-don't-drop, at the price of reintroducing the
+deliberately-abandoned type-level set-algebra + a graph-wide type-param rework. Net:
+**not worth full typestate.** The move-semantics genuinely enable it — but enabling ≠
+justifying, and the dynamic reuse machinery is the decisive reason it doesn't pay.
+
+**Middle grounds if a compile-time guarantee is still wanted (ranked):**
+- **(i) Two-state readiness receipt (LIGHT, no set-algebra):** keep runtime slot
+  cells; add a type-level `Graph<Unbound>` vs `Graph<Ready>` where `.ready(self) ->
+  Result<Graph<Ready>>` does the runtime completeness check ONCE and hands a typed
+  receipt; only `Graph<Ready>` exposes a `sync` that can't fail on completeness. Gives
+  compile-time "did you bind everything before sync" WITHOUT per-tag set machinery.
+  Does NOT prevent double-bind. ~small. Interacts OK with reuse (re-derive receipt
+  after a sever). Probably the only typestate worth considering, and only if
+  sync-time completeness errors prove annoying in practice (they haven't yet).
+- **(ii) const-generic `REMAINING: usize` count:** UNSOUND without identity (bind-A-
+  twice decrements 2 for 1 fill) unless the type ALSO prevents rebinding a tag = set
+  membership = back to #2. Reject.
+- **(iii) full per-tag HList typestate:** the expensive one above. Reject unless
+  compile-time double-bind becomes a demonstrated real need.
+
+**Recommendation:** ship Option E (consuming set-once + record-don't-drop) WITHOUT
+typestate. Revisit only (i) the readiness receipt, and only if deferred completeness
+errors become a practical pain. Do NOT reintroduce type-level slot-set algebra — the
+reuse machinery's dynamic occupancy undercuts its main benefit and it re-imports the
+abandoned pain.
+
+**The deep coherence to notice:** the CURRENT design optimizes REUSE (loops / shared
+closures / shared fns are clean because base verbs are `&self`), and pays for it with a
+bounded `*_move` escape hatch for COMPOSE. Option C optimizes COMPOSE and pays with
+awkward reuse. They optimize opposite axes; neither is strictly better. gray-scott —
+the flagship — exercises BOTH (run_swap = reuse-in-closure; run_immutable = compose),
+and run_swap is precisely the pattern C breaks.
+
+**REVISED Recommendation (2026-07-02, supersedes the "keep the split" call below):
+adopt Option E — the asymmetric cut.** Set-once `bind`/`call` become consuming +
+infallible (absorbing `call_move`/`bind_move`, which are DELETED); `mutate_bind`/
+`mutate_call` stay `&self`. This is the design Brice's reversal exposes: the `&self`
+on set-once verbs was never load-bearing (set-once can only be re-called with the
+SAME value, so there's nothing to reuse), while `mutate_*`'s `&self` IS load-bearing
+(the loop). Net: 6 verbs → 4, `_move` twins gone, matrix provably closed
+(`mutate_call_move` impossible — mutate is `&self`; compose builds fresh ⇒ set-once).
+gray-scott run_swap (the reuse-in-closure flagship) is untouched because it uses
+`mutate_*`. Cost is bounded + one-time (deferred set-once errors via #178; mechanical
+call-site migration; relax the set-once eager-error-contract tests). This is the rare
+change that shrinks the surface AND removes the "will the API keep growing?" worry
+permanently — worth doing NOW while only ~14 `_move` sites + a handful of set-once
+binds exist, before disruption grows. Verify E has no hidden reuse-of-set-once case
+first (audit done: none found — all multi-call set-once sites are idempotent-same-
+value or conflict-contract tests). If E is greenlit, it's an engine change on a
+dedicated branch, sequenced (not fanned out), full 3-ICD gate before promote.
+
+(Superseded options for the record: A=all-consuming-incl-mutate broke reuse; B=carrier
+was C-plus; C=all-consuming broke reuse-in-closure; D=one `configure` verb kept twins-
+as-one-verb but lost tuple sugar. E dominates all four: it's C restricted to the axis
+where consuming is actually free.)
+
+~~Earlier recommendation (now superseded by E): keep all four fluent `&self` verbs AND
+the two `*_move` verbs exactly as they are.~~ Document the 2×2 (fluent/move × bind/call) + the
+fallible/infallible rationale in the `DeviceOpExt` module docs so the split reads
+as intentional. No verb should change receiver. (If anything is added later, it's
+the output-pipe-reexpose node for the `bind`-as-operand TODO — a new capability,
+not a receiver change.)
+
+### 🧭 STRATEGY + PLAN 2026-07-01 — (im)mutable command-buffer support (reconciled with what's now on main)
+
+Consolidates the CB design (`Command-buffer-backed graphs` + `Replayable-eager-graph
+PROPOSAL` + `REUSABLE GRAPH MODEL` sections below) against the CURRENT tree. **Most
+of the anticipated hard part already shipped.** This is a written plan; no code yet.
+Ends in a phase list to approve.
+
+#### Where we actually are (verified in tree 2026-07-01, NOT the stale "no code yet")
+- `claspr/src/record.rs` (882 LOC, LIVE on main): the FFI loader
+  (`clGetExtensionFunctionAddressForPlatform` → transmute to opencl-sys PFNs;
+  opencl3 safe wrapper unusable), `RecordableOp: DeviceOp` sub-trait, dual backend
+  (real `cl_khr_command_buffer` CB + `SoftCommand` software list), `RecordedGraph`
+  with `.replay()` (one `clEnqueueCommandBufferKHR` on CB, fresh-events software
+  otherwise) + `.using_command_buffer()`. Recordable leaves done: fill / copy /
+  ndrange-kernel / SVM. Green: `tests/tier2/tests/record_replay.rs` 9/9 (incl.
+  `cl_mem_graph_uses_command_buffer` proving the native CB path).
+- The eager closure-free struct-graph LANDED (was THE blocker per old notes:
+  `and_then` FnOnce made description==execution). `AndThen{source,next}` stores
+  built ops → the graph already IS the IR. `check_ready` (#178) gives atomic
+  pre-validation. Typed slots + the **home invariant** (lent buffers rehome to
+  their cell, cl_mem STABLE across replays — built explicitly as the CB-cache
+  prerequisite) + `FedByPipe` all landed.
+- Crate split changed: `claspr-async` FOLDED into `claspr` (old plan said
+  "claspr-async: RecordableOp…" — it's all one crate now).
+
+#### The gap (what's actually left) — 4 things, not the old 4 layers
+1. **No capability detection.** context.rs has `svm_capability()` but NO
+   `has_cl_khr_command_buffer{,_mutable_dispatch}`. Everything downstream needs it.
+2. **`record()`/`replay()` is a SEPARATE public surface, not under `sync()`.** The
+   agreed model (REUSABLE GRAPH MODEL below): `g` IS the reusable graph, `sync()` is
+   the verb, and CB should be an INVISIBLE cache under `sync()`. Today a user must
+   explicitly `record()`. Two options (decision needed — see Q1):
+   (A) keep `record()`/`replay()` as the explicit low-level surface AND add a cached
+   fast-path inside `sync()`/replay-loops; (B) demote record.rs fully under `sync()`.
+   Leaning (A): record_replay.rs is a passing tested surface; don't break it — add
+   the cache path alongside.
+3. **record.rs is SLOT-UNAWARE.** grep confirms zero `Slot`/`Checkout`/`FedByPipe`
+   references in record.rs. So it can record an OWN-THE-BUFFERS graph but not yet a
+   SLOT-BOUND reusable one, and it doesn't cache-and-reuse across the `Checkout`
+   drop/re-arm cycle. Wiring CB caching into the slot/home machinery is the core new
+   work (the home invariant makes it SOUND — cl_mem stable across re-arm).
+4. **No mutable dispatch.** No `clUpdateMutableCommandsKHR`; `MUTABLE_KHR` /
+   `SIMULTANEOUS_USE_KHR` CB-creation flags unused. This is the rebind-different-
+   buffers path (`mutate_call` → update-args-and-replay instead of re-record).
+
+#### Proposed phases (each shippable + green on its own; sequenced, NOT fanned out
+— engine-touching parallel agents tangled last time, see the record/replay note below)
+
+**Phase 0 — capability detection (~30 LOC, zero risk).** `Context::has_cl_khr_
+command_buffer()` + `has_cl_khr_command_buffer_mutable_dispatch()`, mirroring
+`svm_capability()` (query device/platform extension string). Unit-guarded, skips
+cleanly. Unblocks every later phase's tier selection. Land first.
+
+**Phase 1 — CB cache UNDER the reusable graph (the core value).** When a
+slot-bound / own-the-buffers graph is `sync()`'d repeatedly with STABLE cl_mem
+(guaranteed by the home invariant), record a CB ONCE on first sync and replay it on
+subsequent syncs (single `clEnqueueCommandBufferKHR`) instead of re-walking
+`execute`. Mechanism sketch:
+  - A per-graph cache slot (interior-mutable, e.g. `OnceCell`/`Mutex<Option<
+    RecordedCb>>` hung off the terminal or a wrapper) keyed on the resolved cl_mem
+    set. First `sync`: walk+record (reusing record.rs's `RecordableOp`); cache the
+    RecordedCb. Next `sync`: if the graph is recordable AND cl_mems match AND no
+    slot rebind changed a handle → replay the cached CB; else fall back to eager
+    walk (and re-record).
+  - Recordability is the existing compile-time `RecordableOp` bound; a chain with a
+    non-recordable leaf (upload/download/host-seam) just never caches → always
+    eager walk (correct, no error). Invisible: user still just calls `sync()`.
+  - The `check_ready` pre-pass stays the front gate (atomic; nothing enqueued on an
+    unbound slot) — runs BEFORE any cached replay.
+  - Convex-segment note: a mixed chain (CB-able ops + software ops like
+    download/host-writes) partitions into convex segments (guaranteed free by
+    eager single-owner dataflow — no back-edges); CB segments replay cached,
+    software segments re-enqueue with fresh events, events bridge. record.rs's dual
+    backend already models this; Phase 1 may start CB-only (whole-chain recordable)
+    and add mixed-segment caching as Phase 1b if needed.
+  - Tests: extend record_replay-style — a slot-bound graph `sync`'d N times uses
+    the CB on runs ≥2 (assert via a `using_command_buffer()`-equivalent probe),
+    bit-identical to the eager path; a non-recordable chain stays eager; gray-scott
+    `run_immutable` (the pure-replay loop, zero rebind) is the natural integration
+    target — it should transparently light up the CB path.
+
+**Phase 2 — immutable `.call()` composition surface (optional sugar over Phase 1).**
+The agreed design's `.call()` as COMPOSITION syntax (returns a `DeviceOp` composable
+via and_then/fan_out), materializing contextually (cached CB enqueue / inline into
+outer CB / eager walk). If Phase 1 already makes `sync()` transparently cached, this
+is largely ergonomic; may be deferrable. Decision Q2.
+
+**Phase 3 — mutable dispatch (`mutate_call` → update-and-replay).** Gate on
+`mutable_dispatch`. Create the CB with `MUTABLE_KHR`; on `mutate_call` with the SAME
+graph shape but DIFFERENT buffers, `clUpdateMutableCommandsKHR` the changed kernel
+args instead of re-recording, then replay. This is where the double-buffer crossed
+swap (gray-scott `run_swap`) gets its payoff — currently it re-walks every step;
+with mutable dispatch it becomes update-args + one CB enqueue per step. Also
+`SIMULTANEOUS_USE_KHR` for concurrent replay (cached fan_out / batch-inference).
+Both are construction-time opt-ins that STILL run correctly on Tier-0 / no-CB
+(fall back to eager) — users never call `has_extension`. This is the largest +
+riskiest phase; do last.
+
+#### Tier model (unchanged from agreed design, restated)
+- **Tier 0** (`cl_khr_command_buffer`): cached immutable CB, one in-flight/graph.
+- **Tier 1** (`+ mutable_dispatch`): `mutate_call` update-and-replay + concurrent
+  (`SIMULTANEOUS_USE_KHR`). Opt-ins portable (degrade to eager walk).
+
+#### Risks / open questions
+- **Q1 (record surface):** keep `record()`/`replay()` public alongside the sync
+  cache (A, leaning), or demote it fully (B)? A preserves the 9 passing tests.
+- **Q2:** is `.call()` composition (Phase 2) wanted, or is transparent-sync-cache
+  (Phase 1) + `mutate_call` (Phase 3) enough? Leaning: skip Phase 2 unless a
+  cross-crate pipeline-export use case demands the nameable composition node.
+- **Cache invalidation soundness:** the cache is keyed on the cl_mem set; a slot
+  rebind that changes a handle MUST invalidate (or use Phase-3 mutable update). The
+  home invariant guarantees re-arm keeps the SAME cl_mem, so pure replay (no
+  rebind) is always cache-valid; rebind-to-new-buffer is the case that needs
+  invalidate-or-update. Get this wrong = replay stale buffers → get it explicitly
+  tested (rebind-invalidates test).
+- **CI/test reach:** native Tier-1 only on pocl 7.2-pre (`~/local/pocl`); distro
+  pocl 6.0 = Tier 0; the bashbaug cmdbufemu `OPENCL_LAYERS` shim gives CB over
+  rusticl/NEO for CI (POC quality). Per `claspr CI deferred` memo, CB CI waits on
+  pocl 7.2 release anyway — so Phases land tested locally on pocl 7.2-pre first.
+- **Profiling:** CB extension exposes only whole-CB timestamps, not per-command —
+  `.profiled()` inside a cached segment loses per-op granularity. Document.
+- **Process:** engine-touching work here MUST be sequenced (one agent at a time
+  against a fixed base) — parallel runs against a moving base caused a stale-base
+  merge tangle + shared-file collision in the slot work. Commit per-phase.
+
+**Recommended first action:** Phase 0 (capability detection) — trivial, unblocks
+everything, zero risk. Then Phase 1 on a dedicated branch. Present as an
+ExitPlanMode plan when Brice greenlights building.
+
 ### ✅ `sync`/`wait_on` ATOMIC via `check_ready` pre-pass — 2026-06-30 (branch `typed-slots`, UNCOMMITTED, staged)
 
 Bug: `execute` LENDS each leaf's input (`Bound→Lent`) AND enqueues in the same
