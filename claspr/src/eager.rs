@@ -186,6 +186,44 @@ pub enum SlotState<T> {
 /// The four-state cell shared by a [`SlotHandle`] and its [`Input::Slot`].
 pub type SlotCell<T> = Arc<Mutex<SlotState<T>>>;
 
+// ── DeferredErrors: the graph-reachable sink for the INFALLIBLE apply path ──
+
+/// A **graph-reachable deferred-error sink** — the record-don't-drop channel for
+/// the infallible [`call_move`](DeviceOpExt::call_move) / [`bind_move`](DeviceOpExt::bind_move)
+/// path (via [`CallArg::apply`]).
+///
+/// ## Why it exists (the silent-swallow hole it closes)
+///
+/// `call_move`/`bind_move` are INFALLIBLE (they return the owned graph so they fit
+/// inside an [`and_then`](DeviceOpExt::and_then) closure). Their per-element
+/// [`apply`](CallArg::apply) used to `let _ = g.bind(..)` — DROPPING every bind
+/// error and trusting [`check_ready`](DeviceOp::check_ready) to re-catch it at
+/// `sync`. But `check_ready` only re-catches slots left *unbound*: a
+/// [`SlotConflict`](Error::SlotConflict) leaves the cell `Bound` to the OLD value,
+/// a [`SlotNoSuchTag`](Error::SlotNoSuchTag) has no cell at all, and
+/// [`SlotCheckedOut`](Error::SlotCheckedOut) / [`SlotSevered`](Error::SlotSevered)
+/// leave states `check_ready` may accept — so those errors VANISHED and the graph
+/// RAN with wrong / stale data.
+///
+/// ## The mechanism
+///
+/// Every [`slot!`](crate::slot) hole carries its own (empty) sink. The infallible
+/// apply path RECORDS a bind error into a sink reachable from the graph (the sink
+/// of the first slot cell the `bind_slots` walk visits — captured by the
+/// [`SlotBinder`] as it walks, which works even for an ABSENT tag, whose walk
+/// matches no cell but still visits the graph's real slots). At `sync`,
+/// [`check_ready`](DeviceOp::check_ready) DRAINS every slot's sink FIRST — before
+/// any enqueue — and returns the first recorded error, preserving the atomicity
+/// guarantee (nothing ran). A graph on which no deferred bind ever erred keeps
+/// EMPTY sinks, so `check_ready` drains nothing and the reuse / re-sync path is
+/// byte-for-byte unchanged. An errored graph reports at `sync` instead of running;
+/// it need not stay reusable (the error is terminal for that graph value).
+///
+/// Only the infallible apply path writes here; the fluent [`bind`](DeviceOpExt::bind)
+/// / [`feed`](DeviceOpExt::feed) / [`call`](DeviceOpExt::call) verbs still surface
+/// their errors EAGERLY and never touch a sink.
+pub type DeferredErrors = Arc<Mutex<Vec<Error>>>;
+
 // ── ScalarSlotState: the TWO-state cell for non-resource (scalar/launch) slots ─
 
 /// The simple, **two-state** cell for a NON-resource slot — a scalar kernel arg
@@ -675,6 +713,22 @@ pub struct SlotBinder {
     /// presence is mutually exclusive with a `value` (a feed binder carries no
     /// value; its `eq`/`clone` are inert dummies).
     feed_pipe: Option<Box<dyn Any + Send>>,
+    /// **Infallible-apply marker.** `true` ONLY for a binder built by the consuming,
+    /// infallible [`call_move`](DeviceOpExt::call_move) path (via the deferred
+    /// `bind`/`feed` helpers behind [`CallArg::apply`]). When set, the
+    /// [`try_bind_slot`](Input::try_bind_slot) walk CAPTURES a
+    /// [`captured_sink`](Self::captured_sink) so a bind error can be RECORDED into a
+    /// graph-reachable [`DeferredErrors`] sink instead of dropped — see the sink type
+    /// docs. `false` for every fluent-verb / probe binder (they surface errors
+    /// eagerly and never touch a sink).
+    deferred: bool,
+    /// The [`DeferredErrors`] sink captured from the FIRST slot cell the walk visits
+    /// (only when [`deferred`](Self::deferred) is set). After the walk, the infallible
+    /// apply path pushes any recorded error here (`SlotConflict`/`SlotSevered`/
+    /// `SlotCheckedOut` from [`outcome`](Self::outcome), or `SlotNoSuchTag` when
+    /// [`matched`](Self::matched)`== 0`). `None` for a graph with no slots (nothing to
+    /// bind — no error is possible) and for every non-deferred binder.
+    captured_sink: Option<DeferredErrors>,
 }
 
 impl SlotBinder {
@@ -717,6 +771,8 @@ impl SlotBinder {
             probe: false,
             severable_cells: Vec::new(),
             feed_pipe: None,
+            deferred: false,
+            captured_sink: None,
         }
     }
 
@@ -742,6 +798,8 @@ impl SlotBinder {
             probe: false,
             severable_cells: Vec::new(),
             feed_pipe: Some(Box::new(pipe)),
+            deferred: false,
+            captured_sink: None,
         }
     }
 
@@ -769,6 +827,8 @@ impl SlotBinder {
             probe: true,
             severable_cells,
             feed_pipe: None,
+            deferred: false,
+            captured_sink: None,
         }
     }
 
@@ -863,6 +923,35 @@ impl SlotBinder {
     /// rule (a fan-out tag legitimately matches every site it appears at).
     pub fn matched(&self) -> usize {
         self.matched
+    }
+
+    /// Mark this binder as belonging to the INFALLIBLE
+    /// [`call_move`](DeviceOpExt::call_move) apply path, so the
+    /// [`bind_slots`](DeviceOp::bind_slots) walk captures a
+    /// [`captured_sink`](Self::captured_sink) (see [`DeferredErrors`]). Only the
+    /// deferred `bind`/`feed` helpers behind [`CallArg::apply`] call this.
+    fn mark_deferred(&mut self) {
+        self.deferred = true;
+    }
+
+    /// After a deferred-apply walk, RECORD any bind error into the graph-reachable
+    /// [`captured_sink`](Self::captured_sink) (record-don't-drop) rather than dropping
+    /// it. Pushes the [`outcome`](Self::outcome) error (`SlotConflict`/`SlotSevered`/
+    /// `SlotCheckedOut`), OR — when the tag matched NO cell — a
+    /// [`SlotNoSuchTag`](Error::SlotNoSuchTag). A clean bind (matched ≥ 1, `Ok`
+    /// outcome) records nothing, so the sink stays empty and the reuse path is
+    /// unchanged. `name` is the tag's display name for the `SlotNoSuchTag` case (which
+    /// has no matching cell to read a name from). No-op if no sink was captured (a
+    /// graph with no slots — nothing could have been bound).
+    fn record_deferred(&self, name: &'static str) {
+        let err = match self.outcome() {
+            Err(e) => Some(e),
+            Ok(()) if self.matched == 0 => Some(Error::SlotNoSuchTag(name)),
+            Ok(()) => None,
+        };
+        if let (Some(err), Some(sink)) = (err, &self.captured_sink) {
+            sink.lock().unwrap().push(err);
+        }
     }
 }
 
@@ -1247,6 +1336,13 @@ pub enum Input<T> {
         /// deposits the value ([`Bound`](SlotState::Bound)); [`Lent`](SlotState::Lent)
         /// while a run holds it.
         cell: SlotCell<T>,
+        /// The [`DeferredErrors`] sink for the INFALLIBLE
+        /// [`call_move`](DeviceOpExt::call_move) apply path: a bind error that the
+        /// consuming, infallible path cannot return is RECORDED here (record-don't-drop)
+        /// and DRAINED by [`check_ready`](Input::check_ready) at `sync`, FIRST, before
+        /// any enqueue. Starts empty; stays empty for a graph the deferred path never
+        /// errs on (so the reuse path is unchanged). See [`DeferredErrors`].
+        sink: DeferredErrors,
     },
 }
 
@@ -1468,16 +1564,36 @@ impl<T> Input<T> {
                     ))
                 }
             }
+            // A typed slot: check its CELL STATE first, then DRAIN the deferred-error
+            // sink. State-first gives a genuine missing bind (`SlotUnbound`) priority
+            // over a recorded deferred error — so a graph left partly-unbound reports
+            // the honest completeness failure, exactly as before this fix. Only once a
+            // slot's own state is satisfiable do we surface a RECORDED bind error the
+            // infallible `call_move` apply path could not return (record-don't-drop;
+            // see `DeferredErrors`): a `SlotConflict` (cell left `Bound` to the OLD
+            // value), a `SlotNoSuchTag` (no cell of its own — recorded onto the first
+            // real slot), or a `SlotCheckedOut`/`SlotSevered`. This fires BEFORE any
+            // enqueue, so an errored deferred bind fails closed at sync instead of
+            // silently running; the sink is empty for any graph the deferred path never
+            // erred on, so the happy / reuse path is byte-for-byte untouched.
+            //
             // `Bound` lends; `FedByPipe` is satisfied-by-upstream (deferred, like
-            // `Input::Pipe` — never a pre-run failure); `Unbound`/`Severed`/`Lent`
-            // are all `SlotUnbound` (its message covers all three) — mirrors
-            // `lend_slot` exactly.
-            Input::Slot { name, cell, .. } => match &*cell.lock().unwrap() {
-                SlotState::Bound(_) | SlotState::FedByPipe(_) => Ok(()),
-                SlotState::Unbound | SlotState::Severed | SlotState::Lent => {
-                    Err(Error::SlotUnbound(name))
+            // `Input::Pipe` — never a pre-run failure); `Unbound`/`Severed`/`Lent` are
+            // all `SlotUnbound` (its message covers all three) — mirrors `lend_slot`.
+            Input::Slot {
+                name, cell, sink, ..
+            } => {
+                match &*cell.lock().unwrap() {
+                    SlotState::Bound(_) | SlotState::FedByPipe(_) => {}
+                    SlotState::Unbound | SlotState::Severed | SlotState::Lent => {
+                        return Err(Error::SlotUnbound(name));
+                    }
                 }
-            },
+                match sink.lock().unwrap().pop() {
+                    Some(err) => Err(err),
+                    None => Ok(()),
+                }
+            }
             // Deferred — see the doc above: never a pre-run failure.
             Input::Pipe(_) => Ok(()),
         }
@@ -1655,9 +1771,24 @@ impl<T> Input<T> {
     where
         T: Send + 'static,
     {
-        let Input::Slot { id, name, cell } = self else {
+        let Input::Slot {
+            id,
+            name,
+            cell,
+            sink,
+        } = self
+        else {
             return;
         };
+        // Capture a sink handle from the FIRST slot cell this walk visits — BEFORE
+        // the tag-id gate below. This is what lets the infallible apply path land an
+        // ABSENT-tag error (which matches no cell) into a graph-reachable sink that
+        // `check_ready` also drains: even an unrelated `slot!(Tag)` is a visited
+        // real slot of the same graph. Only the deferred apply path sets
+        // `binder.deferred` (the fluent verbs leave it `None` → no capture, no cost).
+        if binder.deferred && binder.captured_sink.is_none() {
+            binder.captured_sink = Some(Arc::clone(sink));
+        }
         if *id != binder.id {
             return;
         }
@@ -1911,6 +2042,10 @@ pub enum ScalarInput<V> {
         /// Two-state cell: [`Unbound`](ScalarSlotState::Unbound) until a matching
         /// bind deposits the value ([`Bound`](ScalarSlotState::Bound)).
         cell: ScalarSlotCell<V>,
+        /// The [`DeferredErrors`] sink for the infallible `call_move` apply path —
+        /// same role as [`Input::Slot`]'s `sink`. A scalar slot fed a conflicting
+        /// value-bind records here; `check_ready` drains it. Starts empty.
+        sink: DeferredErrors,
     },
 }
 
@@ -1939,10 +2074,20 @@ impl<V: Clone> ScalarInput<V> {
     pub fn check_ready(&self) -> Result<()> {
         match self {
             ScalarInput::Concrete(_) => Ok(()),
-            ScalarInput::Slot { name, cell, .. } => match &*cell.lock().unwrap() {
-                ScalarSlotState::Bound(_) => Ok(()),
-                ScalarSlotState::Unbound => Err(Error::SlotUnbound(name)),
-            },
+            ScalarInput::Slot {
+                name, cell, sink, ..
+            } => {
+                // State-first, then drain the deferred-error sink (see
+                // `Input::check_ready` for the ordering rationale).
+                match &*cell.lock().unwrap() {
+                    ScalarSlotState::Bound(_) => {}
+                    ScalarSlotState::Unbound => return Err(Error::SlotUnbound(name)),
+                }
+                match sink.lock().unwrap().pop() {
+                    Some(err) => Err(err),
+                    None => Ok(()),
+                }
+            }
         }
     }
 }
@@ -1968,9 +2113,22 @@ impl<V: Send + 'static> ScalarInput<V> {
     /// ([`SlotValue::fill_clone`]`= Some`), so the binder clones into this cell and
     /// stays armed — one `bind(Grid(g))` fills EVERY `slot!(Grid)` site.
     pub fn try_bind_slot(&self, binder: &mut SlotBinder) {
-        let ScalarInput::Slot { id, name, cell } = self else {
+        let ScalarInput::Slot {
+            id,
+            name,
+            cell,
+            sink,
+        } = self
+        else {
             return;
         };
+        // Capture a sink handle from the first slot this walk visits (before the
+        // tag-id gate) so an ABSENT-tag deferred error has a graph-reachable home —
+        // the scalar mirror of `Input::try_bind_slot`. Only the deferred apply path
+        // sets `binder.deferred`.
+        if binder.deferred && binder.captured_sink.is_none() {
+            binder.captured_sink = Some(Arc::clone(sink));
+        }
         if *id != binder.id {
             return;
         }
@@ -2090,6 +2248,9 @@ impl<Tg: Tag> SlotHandle<Tg> {
             id: self.id,
             name: self.name,
             cell: self.cell,
+            // Fresh empty deferred-error sink (see [`DeferredErrors`]): written only
+            // by the infallible `call_move` apply path, drained by `check_ready`.
+            sink: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -2105,6 +2266,8 @@ impl<Tg: Tag> SlotHandle<Tg> {
             id: self.id,
             name: self.name,
             cell: Arc::new(Mutex::new(ScalarSlotState::Unbound)),
+            // Fresh empty deferred-error sink (see [`DeferredErrors`]).
+            sink: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -3042,6 +3205,40 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             return Err(Error::SlotNoSuchTag(Tg::NAME));
         }
         Ok(self)
+    }
+
+    /// **Deferred (record-don't-drop) value-bind** — the INFALLIBLE
+    /// [`call_move`](Self::call_move) sibling of [`bind`](Self::bind), used ONLY by
+    /// [`CallArg::apply`]. It folds the tag exactly like `bind` (set-once, same
+    /// verb-2×2), but instead of RETURNING the error it RECORDS it into the graph's
+    /// [`DeferredErrors`] sink so [`check_ready`](DeviceOp::check_ready) surfaces it at
+    /// `sync` (FIRST, nothing enqueued). This closes the silent-swallow hole the old
+    /// `let _ = g.bind(..)` left: a `SlotConflict` (cell left `Bound` to the OLD
+    /// value), a `SlotNoSuchTag` (no cell at all), or a `SlotCheckedOut`/`SlotSevered`
+    /// no longer vanishes — `check_ready` sees the recorded error and fails closed. A
+    /// clean bind records nothing (sink stays empty; reuse path unchanged).
+    fn bind_deferred<Tg: Tag>(&self, tag: Tg)
+    where
+        Tg::Value: SlotEq + SlotValue,
+    {
+        let mut binder = SlotBinder::new::<Tg>(tag.into_value(), BindMode::Set);
+        binder.mark_deferred();
+        self.bind_slots(&mut binder);
+        binder.record_deferred(Tg::NAME);
+    }
+
+    /// **Deferred (record-don't-drop) pipe-feed** — the INFALLIBLE
+    /// [`call_move`](Self::call_move) sibling of [`feed`](Self::feed), used ONLY by
+    /// [`CallArg::apply`] for a `Tag(pipe)` element. Installs `FedByPipe` at every
+    /// matching site exactly like `feed`, but an absent tag (`matched == 0`) is
+    /// RECORDED as [`SlotNoSuchTag`](Error::SlotNoSuchTag) into the graph's
+    /// [`DeferredErrors`] sink (drained by `check_ready`) rather than dropped. (A feed
+    /// install never conflicts, so `SlotNoSuchTag` is its only failure.)
+    fn feed_deferred<Tg: Tag>(&self, pipe: Pipe<Tg::Value>) {
+        let mut binder = SlotBinder::feed::<Tg>(pipe);
+        binder.mark_deferred();
+        self.bind_slots(&mut binder);
+        binder.record_deferred(Tg::NAME);
     }
 
     /// **Consuming, INFALLIBLE, mixed value-or-feed bind** — the compose-in-`and_then`

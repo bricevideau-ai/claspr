@@ -84,25 +84,34 @@ fn call_move_binds_and_syncs() {
 }
 
 /// (2) `call_move` an ABSENT tag → NO eager error (it is infallible); the error is
-/// DEFERRED to `sync` (`SlotUnbound` for the still-unbound real slots), with
-/// NOTHING enqueued. Contrast the fluent `call`, which errors eagerly.
+/// DEFERRED to `sync`, with NOTHING enqueued. Contrast the fluent `call`, which
+/// errors eagerly.
+///
+/// NOTE: this graph is ALSO left with B/Out unbound, so `sync` has two deferred
+/// reasons to fail — the RECORDED `SlotNoSuchTag(Absent)` (record-don't-drop, the
+/// silent-swallow fix) and the completeness `SlotUnbound` for B/Out. Either is a
+/// correct "fails closed at sync, nothing ran" catch; the recorded absent-tag error
+/// (the more precise diagnosis of the typo) is what surfaces. Before the fix the
+/// absent tag was silently dropped.
 #[test]
 fn call_move_defers_absent_tag_to_sync() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     // Bind only `Absent` (a tag NOT in the graph) plus real A — leave B/Out unbound.
-    // call_move drops both the SlotNoSuchTag(Absent) and cannot bind B/Out; it is
-    // infallible, so NOTHING errors here.
+    // call_move RECORDS the SlotNoSuchTag(Absent) into the deferred sink and cannot
+    // bind B/Out; it is infallible, so NOTHING errors HERE (deferred to sync).
     let g = ks
         .add_u32([N], slot!(A), slot!(B), slot!(Out))
         .call_move((A(seeded(&ctx, 2)), Absent(seeded(&ctx, 9))));
 
-    // The deferred catch: sync errors on the first still-unbound real slot.
+    // The deferred catch: sync fails closed (nothing enqueued). The recorded
+    // absent-tag error surfaces (a completeness SlotUnbound would also be acceptable).
     match g.sync(&ctx) {
-        Ok(_) => panic!("sync must fail: B/Out were never bound (deferred error)"),
-        Err(Error::SlotUnbound(_)) => { /* expected: deferred completeness catch */ }
-        Err(e) => panic!("expected SlotUnbound at sync, got {e:?}"),
+        Ok(_) => panic!("sync must fail: Absent recorded + B/Out never bound (deferred)"),
+        Err(Error::SlotNoSuchTag(_)) => { /* expected: recorded absent-tag catch */ }
+        Err(Error::SlotUnbound(_)) => { /* also acceptable: completeness catch */ }
+        Err(e) => panic!("expected SlotNoSuchTag/SlotUnbound at sync, got {e:?}"),
     }
 
     // And the fluent `call` errors EAGERLY on the same absent tag (the contrast).
@@ -231,6 +240,103 @@ fn crossed_feed_swap() {
     assert!(
         r2.iter().all(|&v| v == 26),
         "crossed feed re-arm: replay must MATCH (26), got {:?}",
+        &r2[..8]
+    );
+}
+
+/// (7) SILENT-SWALLOW REGRESSION — a CONFLICTING set-once `call_move` onto an
+/// already-`Bound` slot must be RECORDED and surfaced at `sync` (record-don't-drop),
+/// NOT dropped so the graph runs with the OLD value.
+///
+/// `call_move` is set-once (folds through `bind`). Binding `Buf` once leaves it
+/// `Bound`; a SECOND `call_move` of a DIFFERENT buffer onto the same slot is a
+/// `SlotConflict`. Before the fix that error was `let _ =`-dropped and, because the
+/// cell stayed `Bound` to the first value, `check_ready` passed and the graph RAN
+/// with the OLD value — the conflicting bind vanished silently. Now the deferred sink
+/// carries the `SlotConflict` and `sync` fails closed with NOTHING enqueued.
+#[test]
+fn call_move_conflict_surfaces_at_sync_not_silent() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // scale_u32(slot!(Buf), 4): Buf is a single in-place slot. Bind it to a buffer of
+    // 1s (valid), then CONFLICT-bind it to a buffer of 9s via a second set-once
+    // call_move. The graph is otherwise complete (a satisfiable slot), so the OLD
+    // silent-swallow path would have run 1*4 = 4.
+    let g = ks
+        .scale_u32([N], slot!(Buf), 4u32)
+        .call_move((Buf(seeded(&ctx, 1)),)) // Buf := Bound(1s)
+        .call_move((Buf(seeded(&ctx, 9)),)) // CONFLICT: set-once onto Bound → recorded
+        .and_then(download);
+
+    match g.sync(&ctx) {
+        Ok(out) => panic!(
+            "sync must FAIL on the conflicting set-once bind (silent-swallow bug); \
+             instead it ran and produced {:?}",
+            &out[..8]
+        ),
+        // The deferred-recorded conflict (or a deferred variant) surfaces here.
+        Err(Error::SlotConflict(_)) => { /* expected: recorded, surfaced at sync */ }
+        Err(e) => panic!("expected SlotConflict at sync, got {e:?}"),
+    }
+}
+
+/// (8) SILENT-SWALLOW REGRESSION — an ABSENT/typo'd tag in `call_move` while the
+/// REAL slots ARE satisfiable must be RECORDED and surfaced at `sync` as
+/// `SlotNoSuchTag`, NOT dropped so the graph silently runs.
+///
+/// Before the fix, an absent tag was dropped and — if every real slot happened to be
+/// bound — `check_ready` passed and the graph RAN, hiding the typo. The absent tag
+/// has NO cell of its own, so it is recorded onto the first real slot's sink and
+/// drained by `check_ready`.
+#[test]
+fn call_move_absent_tag_surfaces_when_real_slots_satisfied() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // add_u32(A, B, Out): bind ALL THREE real slots (fully satisfiable) PLUS a typo'd
+    // Absent tag in the SAME call_move. The old path would drop Absent and run 2+5=7.
+    let g = ks
+        .add_u32([N], slot!(A), slot!(B), slot!(Out))
+        .call_move((
+            A(seeded(&ctx, 2)),
+            B(seeded(&ctx, 5)),
+            Out(seeded(&ctx, 0)),
+            Absent(seeded(&ctx, 9)), // absent: recorded as SlotNoSuchTag
+        ))
+        .and_then(|(_a, _b, out)| download(out));
+
+    match g.sync(&ctx) {
+        Ok(out) => panic!(
+            "sync must FAIL on the absent tag even though the real slots are bound \
+             (silent-swallow bug); instead it ran and produced {:?}",
+            &out[..8]
+        ),
+        Err(Error::SlotNoSuchTag(_)) => { /* expected: recorded, surfaced at sync */ }
+        Err(e) => panic!("expected SlotNoSuchTag at sync, got {e:?}"),
+    }
+}
+
+/// (9) REGRESSION — a fully VALID `call_move` still syncs correctly after the
+/// record-don't-drop change (the sink stays empty, so `check_ready` is unaffected).
+#[test]
+fn call_move_valid_still_syncs_after_fix() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    let g = ks
+        .add_u32([N], slot!(A), slot!(B), slot!(Out))
+        .call_move((A(seeded(&ctx, 3)), B(seeded(&ctx, 4)), Out(seeded(&ctx, 0))))
+        .and_then(|(_a, _b, out)| download(out));
+
+    // Run twice: proves the empty-sink reuse path is intact (re-sync unchanged).
+    let r1 = g.sync(&ctx).expect("valid call_move sync 1");
+    assert!(r1.iter().all(|&v| v == 7), "3 + 4 = 7, got {:?}", &r1[..8]);
+    drop(r1);
+    let r2 = g.sync(&ctx).expect("valid call_move sync 2 (re-arm)");
+    assert!(
+        r2.iter().all(|&v| v == 7),
+        "re-sync must match: 7, got {:?}",
         &r2[..8]
     );
 }

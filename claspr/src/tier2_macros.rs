@@ -358,8 +358,10 @@ macro_rules! slots {
                 $val: $crate::SlotEq + $crate::SlotValue,
             {
                 fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
-                    // Infallible: drop any bind error (deferred to sync's check_ready).
-                    let _ = $crate::DeviceOpExt::bind(g, self);
+                    // Infallible but RECORD-don't-drop: a bind error is recorded into
+                    // the graph's deferred-error sink and surfaced FIRST at sync's
+                    // check_ready (nothing enqueued), not silently swallowed.
+                    $crate::DeviceOpExt::bind_deferred(g, self);
                 }
             }
 
@@ -370,8 +372,9 @@ macro_rules! slots {
                 $val: $crate::SlotEq + $crate::SlotValue + ::core::marker::Send,
             {
                 fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
-                    // Infallible: drop any bind error (deferred to sync's check_ready).
-                    let _ = $crate::DeviceOpExt::bind(g, self);
+                    // Infallible but RECORD-don't-drop (see the raw-value arm): the
+                    // sever-and-adopt error is recorded into the sink, surfaced at sync.
+                    $crate::DeviceOpExt::bind_deferred(g, self);
                 }
             }
 
@@ -392,9 +395,10 @@ macro_rules! slots {
                 $name<V>: $crate::Tag<Value = V>,
             {
                 fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
-                    // Infallible: drop any feed error (an absent tag surfaces at sync,
-                    // exactly as the value-bind `CallArg` folds through `bind`).
-                    let _ = $crate::DeviceOpExt::feed::<$name<V>>(g, self.0);
+                    // Infallible but RECORD-don't-drop: an absent-tag feed error is
+                    // recorded into the graph's deferred-error sink and surfaced at
+                    // sync's check_ready, not silently swallowed.
+                    $crate::DeviceOpExt::feed_deferred::<$name<V>>(g, self.0);
                 }
             }
         )+
