@@ -112,12 +112,13 @@ fn double_buffer_ping_pong_computes_and_handles_stable() {
     assert_ne!(ha, hb, "A and B must be distinct buffers to begin with");
 
     // out = In + Ones. Three slots; `add_u32` is 3-output.
-    let g = ks.add_u32([N], slot!(In), slot!(Ones), slot!(Out));
-
-    // Step 0: read A, write B. `bind` (set-once) on the virgin slots.
-    g.bind(In(a)).expect("bind In=A");
-    g.bind(Ones(ones)).expect("bind Ones");
-    g.bind(Out(b)).expect("bind Out=B");
+    // Step 0: read A, write B. `bind` (set-once, consuming) on the virgin slots,
+    // folded into `g`; the loop below re-runs / `mutate_call`s `g` by `&`.
+    let g = ks
+        .add_u32([N], slot!(In), slot!(Ones), slot!(Out))
+        .bind(In(a))
+        .bind(Ones(ones))
+        .bind(Out(b));
 
     let (mut in_co, mut ones_co, mut out_co) = g.sync(&ctx).expect("step 0 sync");
 
@@ -205,10 +206,11 @@ fn double_buffer_one_line_swap_computes_and_handles_stable() {
     let hb = handle_of(&b);
     assert_ne!(ha, hb, "A and B must be distinct buffers to begin with");
 
-    let g = ks.add_u32([N], slot!(In), slot!(Ones), slot!(Out));
-
-    // Step 0: set-once on the virgin slots.
-    g.call((In(a), Ones(ones), Out(b))).expect("call step 0");
+    // Step 0: set-once (consuming) on the virgin slots, folded into `g`; the loop
+    // below re-runs / `mutate_call`s `g` by `&`.
+    let g = ks
+        .add_u32([N], slot!(In), slot!(Ones), slot!(Out))
+        .call((In(a), Ones(ones), Out(b)));
 
     let (mut in_co, mut ones_co, mut out_co) = g.sync(&ctx).expect("step 0 sync");
     let mut steps_done = 1usize;
@@ -262,9 +264,11 @@ fn double_buffer_one_line_swap_computes_and_handles_stable() {
 }
 
 /// Locks WHY `mutate_bind` is required: after one step + `into_inner` of both
-/// In/Out, a PLAIN `bind` (set-once) on either slot returns `Err(SlotSevered)`.
-/// This proves the ping-pong swap genuinely needs `mutate_bind` — `bind` cannot
-/// re-arm a severed slot, so it cannot express the crossed re-bind.
+/// In/Out, a PLAIN `bind` (set-once) on either slot is a `SlotSevered` error. Since
+/// `bind` is now consuming + infallible, that error is RECORDED (record-don't-drop)
+/// and surfaces DEFERRED at `sync`'s `check_ready` — nothing enqueued. This proves
+/// the ping-pong swap genuinely needs `mutate_bind`: `bind` cannot re-arm a severed
+/// slot, so it cannot express the crossed re-bind.
 #[test]
 fn double_buffer_plain_bind_after_sever_rejected() {
     let Some(ctx) = ctx() else { return };
@@ -274,10 +278,11 @@ fn double_buffer_plain_bind_after_sever_rejected() {
     let b = seeded(&ctx, 0);
     let ones = seeded(&ctx, 1);
 
-    let g = ks.add_u32([N], slot!(In), slot!(Ones), slot!(Out));
-    g.bind(In(a)).expect("bind In=A");
-    g.bind(Ones(ones)).expect("bind Ones");
-    g.bind(Out(b)).expect("bind Out=B");
+    let g = ks
+        .add_u32([N], slot!(In), slot!(Ones), slot!(Out))
+        .bind(In(a))
+        .bind(Ones(ones))
+        .bind(Out(b));
 
     let (in_co, ones_co, out_co) = g.sync(&ctx).expect("step 0 sync");
 
@@ -286,25 +291,22 @@ fn double_buffer_plain_bind_after_sever_rejected() {
     let kept_out = out_co.into_inner();
     drop(ones_co);
 
-    // A plain set-once `bind` of the crossed buffers must REJECT: the slots are
-    // `Severed`, not virgin. Re-providing a buffer is a CHANGE, not a first
-    // declaration. The Ok arm is `&Op` (not `Debug`), so match by hand.
-    match g.bind(In(kept_out)) {
-        Ok(_) => panic!("plain bind on a severed In slot must error (needs mutate_bind)"),
-        Err(Error::SlotSevered(name)) => assert!(
-            name.contains("In"),
-            "SlotSevered should name the tag `In`, got {name:?}"
-        ),
-        Err(other) => panic!("expected Error::SlotSevered, got {other:?}"),
-    }
-
-    // And the same for Out — both legs of the swap need `mutate_bind`.
-    match g.bind(Out(kept_in)) {
-        Ok(_) => panic!("plain bind on a severed Out slot must error (needs mutate_bind)"),
-        Err(Error::SlotSevered(name)) => assert!(
-            name.contains("Out"),
-            "SlotSevered should name the tag `Out`, got {name:?}"
-        ),
-        Err(other) => panic!("expected Error::SlotSevered, got {other:?}"),
-    }
+    // A plain set-once `bind` of the crossed buffers targets `Severed` slots (not
+    // virgin) — re-providing a buffer is a CHANGE, not a first declaration. `bind` is
+    // infallible now: the `SlotSevered` is RECORDED, but a set-once bind onto a
+    // Severed cell leaves the cell Severed, so `check_ready` (state-first) reports the
+    // completeness `SlotUnbound` for that still-empty slot BEFORE draining the sink.
+    // Either way the errored bind fails closed at `sync` with NOTHING run — which is
+    // the property this test locks (a plain `bind` cannot express the crossed swap;
+    // `mutate_bind` is required).
+    let err = g
+        .bind(In(kept_out))
+        .bind(Out(kept_in))
+        .sync(&ctx)
+        .expect_err("plain bind on severed slots must error at sync (needs mutate_bind)");
+    assert!(
+        matches!(&err, Error::SlotUnbound(name) | Error::SlotSevered(name)
+            if name.contains("In") || name.contains("Out")),
+        "expected deferred SlotSevered / state-first SlotUnbound naming In or Out, got {err:?}"
+    );
 }

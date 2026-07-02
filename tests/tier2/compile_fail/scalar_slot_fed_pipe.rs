@@ -2,7 +2,7 @@
 //! be rejected at compile time. The unified `Tag(value)`/`Tag(pipe)` constructor
 //! only grows a pipe-feed `CallArg` arm for BUFFER-valued tags (gated on
 //! `RecordableBuffer`, which scalars like `f32` never impl), so `F<Pipe<f32>>`
-//! has no `CallArg` — `call_move((F(pipe),))` can't be applied.
+//! has no `CallArg` — `call((F(pipe),))` can't be applied.
 //!
 //! This is the negative guard for the buffer/scalar asymmetry: pipe-acceptance is
 //! type-driven and never leaks onto scalar/launch slots.
@@ -23,10 +23,8 @@ fn main() {
 
     // `F` is a scalar slot: it must NOT accept a pipe source. `F(scalar_pipe)`
     // constructs `F<Pipe<f32>>`, which has no `CallArg` (the pipe arm is gated to
-    // buffer values), so `call_move` cannot apply it.
+    // buffer values), so `call` cannot apply it.
     let scalar_pipe: Pipe<f32> = Pipe::new();
 
-    let _ = ks
-        .scale_u32([4], slot!(Buf), 2u32)
-        .call_move((F(scalar_pipe),));
+    let _ = ks.scale_u32([4], slot!(Buf), 2u32).call((F(scalar_pipe),));
 }

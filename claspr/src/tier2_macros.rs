@@ -338,7 +338,7 @@ macro_rules! slots {
             // ── Unified `$name(x)` CallArg surface (value OR pipe, one ctor) ──
             //
             // These per-tag `CallArg` impls are what let a tag be used as an element
-            // of a [`call_move`](crate::DeviceOpExt::call_move) tuple. `$name(value)`
+            // of a `bind` / `call` tuple. `$name(value)`
             // and `$name(checkout)` BIND by value; `$name(pipe)` WIRES the slot to an
             // upstream pipe (`SlotState::FedByPipe`) — the pipe-feed and value-bind
             // spellings unified into ONE tag constructor (no separate `feed` verb).
@@ -412,7 +412,7 @@ macro_rules! slots {
 /// ```ignore
 /// slots! { Buf: DeviceSlice<u32> }
 /// let g = ks.scale([N], slot!(Buf), 2u32).and_then(download);
-/// let out = g.bind(Buf(b))?.sync(&ctx)?;  // bind, then run; re-runnable
+/// let out = g.bind(Buf(b)).sync(&ctx)?;  // bind (consuming), then run; re-runnable
 /// ```
 ///
 /// Expands to [`SlotHandle::<Tag>::new()`](crate::SlotHandle::new) — a fresh empty

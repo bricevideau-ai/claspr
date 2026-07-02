@@ -108,8 +108,9 @@ pub type Cell<T> = Arc<Mutex<Option<T>>>;
 ///
 /// The first four states form the eager value-bind machine (`Unbound` / `Bound` /
 /// `Lent` / `Severed`); the fifth, [`FedByPipe`](SlotState::FedByPipe), wires the
-/// slot to an upstream pipe instead of a value (the [`feed`](DeviceOpExt::feed)
-/// verb) and behaves like [`Input::Pipe`] at run time.
+/// slot to an upstream pipe instead of a value (installed by a `Tag(pipe)` source
+/// through [`bind`](DeviceOpExt::bind) / [`call`](DeviceOpExt::call)) and behaves
+/// like [`Input::Pipe`] at run time.
 ///
 /// A concrete head's [`Cell<T>`] only ever needs `Some`/`None` (full / lent),
 /// because "the cell is empty" unambiguously means "a run lent it and a still-live
@@ -158,8 +159,9 @@ pub enum SlotState<T> {
     /// **Fed by an upstream pipe** — the slot's value is produced by an UPSTREAM op
     /// each run and delivered through this [`Pipe`], NOT bound eagerly to a buffer.
     ///
-    /// This is the fifth slot state and the engine half of the
-    /// [`feed`](DeviceOpExt::feed) verb: it lets a `slot!(Tag)` declared in one
+    /// This is the fifth slot state and the engine half of the pipe-feed source
+    /// (`Tag(pipe)` through [`bind`](DeviceOpExt::bind) / [`call`](DeviceOpExt::call)):
+    /// it lets a `slot!(Tag)` declared in one
     /// subgraph be wired to an upstream [`Handle`](DeviceOp::Handle) (a build-time
     /// [`Pipe`]) at compose time, so a downstream stage READS whatever an upstream
     /// stage produced without a concrete buffer ever being named. It is how the
@@ -189,13 +191,13 @@ pub type SlotCell<T> = Arc<Mutex<SlotState<T>>>;
 // ── DeferredErrors: the graph-reachable sink for the INFALLIBLE apply path ──
 
 /// A **graph-reachable deferred-error sink** — the record-don't-drop channel for
-/// the infallible [`call_move`](DeviceOpExt::call_move) / [`bind_move`](DeviceOpExt::bind_move)
+/// the infallible, consuming [`bind`](DeviceOpExt::bind) / [`call`](DeviceOpExt::call)
 /// path (via [`CallArg::apply`]).
 ///
 /// ## Why it exists (the silent-swallow hole it closes)
 ///
-/// `call_move`/`bind_move` are INFALLIBLE (they return the owned graph so they fit
-/// inside an [`and_then`](DeviceOpExt::and_then) closure). Their per-element
+/// The consuming `bind`/`call` verbs are INFALLIBLE (they return the owned graph so
+/// they fit inside an [`and_then`](DeviceOpExt::and_then) closure). Their per-element
 /// [`apply`](CallArg::apply) used to `let _ = g.bind(..)` — DROPPING every bind
 /// error and trusting [`check_ready`](DeviceOp::check_ready) to re-catch it at
 /// `sync`. But `check_ready` only re-catches slots left *unbound*: a
@@ -219,9 +221,9 @@ pub type SlotCell<T> = Arc<Mutex<SlotState<T>>>;
 /// byte-for-byte unchanged. An errored graph reports at `sync` instead of running;
 /// it need not stay reusable (the error is terminal for that graph value).
 ///
-/// Only the infallible apply path writes here; the fluent [`bind`](DeviceOpExt::bind)
-/// / [`feed`](DeviceOpExt::feed) / [`call`](DeviceOpExt::call) verbs still surface
-/// their errors EAGERLY and never touch a sink.
+/// Only the infallible apply path writes here; the fluent
+/// [`mutate_bind`](DeviceOpExt::mutate_bind) / [`mutate_call`](DeviceOpExt::mutate_call)
+/// verbs still surface their errors EAGERLY and never touch a sink.
 pub type DeferredErrors = Arc<Mutex<Vec<Error>>>;
 
 // ── ScalarSlotState: the TWO-state cell for non-resource (scalar/launch) slots ─
@@ -714,8 +716,8 @@ pub struct SlotBinder {
     /// value; its `eq`/`clone` are inert dummies).
     feed_pipe: Option<Box<dyn Any + Send>>,
     /// **Infallible-apply marker.** `true` ONLY for a binder built by the consuming,
-    /// infallible [`call_move`](DeviceOpExt::call_move) path (via the deferred
-    /// `bind`/`feed` helpers behind [`CallArg::apply`]). When set, the
+    /// infallible [`bind`](DeviceOpExt::bind) / [`call`](DeviceOpExt::call) path (via
+    /// the deferred `bind`/`feed` helpers behind [`CallArg::apply`]). When set, the
     /// [`try_bind_slot`](Input::try_bind_slot) walk CAPTURES a
     /// [`captured_sink`](Self::captured_sink) so a bind error can be RECORDED into a
     /// graph-reachable [`DeferredErrors`] sink instead of dropped — see the sink type
@@ -925,8 +927,8 @@ impl SlotBinder {
         self.matched
     }
 
-    /// Mark this binder as belonging to the INFALLIBLE
-    /// [`call_move`](DeviceOpExt::call_move) apply path, so the
+    /// Mark this binder as belonging to the INFALLIBLE, consuming
+    /// [`bind`](DeviceOpExt::bind) / [`call`](DeviceOpExt::call) apply path, so the
     /// [`bind_slots`](DeviceOp::bind_slots) walk captures a
     /// [`captured_sink`](Self::captured_sink) (see [`DeferredErrors`]). Only the
     /// deferred `bind`/`feed` helpers behind [`CallArg::apply`] call this.
@@ -1336,9 +1338,9 @@ pub enum Input<T> {
         /// deposits the value ([`Bound`](SlotState::Bound)); [`Lent`](SlotState::Lent)
         /// while a run holds it.
         cell: SlotCell<T>,
-        /// The [`DeferredErrors`] sink for the INFALLIBLE
-        /// [`call_move`](DeviceOpExt::call_move) apply path: a bind error that the
-        /// consuming, infallible path cannot return is RECORDED here (record-don't-drop)
+        /// The [`DeferredErrors`] sink for the INFALLIBLE, consuming
+        /// [`bind`](DeviceOpExt::bind) / [`call`](DeviceOpExt::call) apply path: a bind
+        /// error the consuming, infallible path cannot return is RECORDED here (record-don't-drop)
         /// and DRAINED by [`check_ready`](Input::check_ready) at `sync`, FIRST, before
         /// any enqueue. Starts empty; stays empty for a graph the deferred path never
         /// errs on (so the reuse path is unchanged). See [`DeferredErrors`].
@@ -1569,7 +1571,7 @@ impl<T> Input<T> {
             // over a recorded deferred error — so a graph left partly-unbound reports
             // the honest completeness failure, exactly as before this fix. Only once a
             // slot's own state is satisfiable do we surface a RECORDED bind error the
-            // infallible `call_move` apply path could not return (record-don't-drop;
+            // infallible `bind`/`call` apply path could not return (record-don't-drop;
             // see `DeferredErrors`): a `SlotConflict` (cell left `Bound` to the OLD
             // value), a `SlotNoSuchTag` (no cell of its own — recorded onto the first
             // real slot), or a `SlotCheckedOut`/`SlotSevered`. This fires BEFORE any
@@ -2042,7 +2044,7 @@ pub enum ScalarInput<V> {
         /// Two-state cell: [`Unbound`](ScalarSlotState::Unbound) until a matching
         /// bind deposits the value ([`Bound`](ScalarSlotState::Bound)).
         cell: ScalarSlotCell<V>,
-        /// The [`DeferredErrors`] sink for the infallible `call_move` apply path —
+        /// The [`DeferredErrors`] sink for the infallible `bind`/`call` apply path —
         /// same role as [`Input::Slot`]'s `sink`. A scalar slot fed a conflicting
         /// value-bind records here; `check_ready` drains it. Starts empty.
         sink: DeferredErrors,
@@ -2249,7 +2251,7 @@ impl<Tg: Tag> SlotHandle<Tg> {
             name: self.name,
             cell: self.cell,
             // Fresh empty deferred-error sink (see [`DeferredErrors`]): written only
-            // by the infallible `call_move` apply path, drained by `check_ready`.
+            // by the infallible `bind`/`call` apply path, drained by `check_ready`.
             sink: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -2968,14 +2970,22 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         }
     }
 
-    /// **Set-once** bind of one typed slot: deposit `tag`'s value into the graph's
-    /// matching [`slot!`](crate::slot) cell. Returns `Result<&Self>` so binds
-    /// **chain** through `?` and the graph is then `sync`'d:
-    /// `g.bind(Buf(b))?.bind(W(w))?.sync(&ctx)?`.
+    /// **Set-once** bind of ONE typed slot — **consuming + infallible**. Deposit
+    /// `arg`'s binding into the graph's matching [`slot!`](crate::slot) cell(s) and
+    /// return the OWNED graph, so binds **chain by move** and the graph is then
+    /// `sync`'d: `g.bind(Buf(b)).bind(W(w)).sync(&ctx)?` (the `?` is only at the
+    /// terminal — `bind` itself never returns a `Result`).
     ///
-    /// **The set-once contract.** `bind` is idempotent on an *equal* binding and a
-    /// hard error on a *conflicting* one (the verb 2×2 — see
-    /// [`try_bind_slot`](Input::try_bind_slot)):
+    /// **One verb, two sources.** `arg` is any [`CallArg`], so `bind(Tag(value))`
+    /// binds by value (set-once) and `bind(Tag(pipe))` installs
+    /// [`FedByPipe`](SlotState::FedByPipe) — wiring the slot to an upstream pipe.
+    /// This is the single-element form of [`call`](Self::call): `bind(arg)` ==
+    /// `call((arg,))`, so it inherits `call`'s consuming, infallible, deferred-error
+    /// contract exactly (below).
+    ///
+    /// **The set-once contract (verb 2×2 — see [`try_bind_slot`](Input::try_bind_slot)):**
+    /// a value bind is idempotent on an *equal* binding and an error on a
+    /// *conflicting* one.
     ///
     /// - slot [`Unbound`](SlotState::Unbound) (virgin) → fill it.
     /// - slot [`Bound`](SlotState::Bound) to the SAME buffer object
@@ -2991,31 +3001,44 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     ///   re-providing a buffer is a *change*, not a first declaration, so the
     ///   set-once verb rejects it. Use [`mutate_bind`](Self::mutate_bind) to re-arm.
     ///
+    /// ## DEFERRED bind errors (record-don't-drop)
+    ///
+    /// `bind` is INFALLIBLE: it returns owned `Self` (so it fits inside an
+    /// [`and_then`](Self::and_then) closure as the bare `U: DeviceOp` and chains by
+    /// move) and therefore cannot return the set-once errors above. Instead each is
+    /// RECORDED into the graph's [`DeferredErrors`] sink (via [`CallArg::apply`]) and
+    /// surfaces at [`sync`](Self::sync) — [`check_ready`](DeviceOp::check_ready)
+    /// drains the sink FIRST, before any enqueue, returning the recorded error with
+    /// NOTHING run (the atomicity guarantee holds; sound via the state-first drain).
+    /// A missing or typo'd bind cannot silently run wrong data — it fails closed at
+    /// sync. For the fluent, EAGER-error, `&Self` set/change path use
+    /// [`mutate_bind`](Self::mutate_bind) / [`mutate_call`](Self::mutate_call)
+    /// (the reuse-loop verbs).
+    ///
+    /// **Known residual wart (not fixed).** The sink is drained by `pop()` —
+    /// REPORT-ONCE. An errored graph fails its FIRST `sync` closed (correct); a
+    /// caller that IGNORES that `Err` and re-`sync`s WITHOUT rebinding finds an empty
+    /// sink and could then run. That is an abuse path (ignoring a returned error and
+    /// re-running) and is benign, but is documented here rather than papered over.
+    ///
     /// **Order-free + curryable + partial.** Each `bind` carries exactly one tag,
-    /// folded independently, so `g.bind(Buf(b))?.bind(W(w))?` and the reverse are
+    /// folded independently, so `g.bind(Buf(b)).bind(W(w))` and the reverse are
     /// equivalent, and a subset is allowed — *completeness* (every slot bound) is
     /// enforced only at [`sync`](Self::sync)/[`wait_on`](Self::wait_on) (runtime),
     /// where an unbound slot is [`Error::SlotUnbound`]. After a run, the run's
     /// [`Checkout`] returns the buffer to the slot cell on drop (same machinery as a
     /// concrete head), so a bound graph is re-runnable.
     ///
-    /// `Tg::Value: SlotEq` so the idempotency check can compare by buffer handle.
     /// The binding is dispatched via [`bind_slots`](DeviceOp::bind_slots), which
     /// walks the op-tree's [`Input`] fields. Ops that route buffer args through
     /// [`Input`] (kernels, `download`/`fill`/`write`/copy, the bundles) propagate
     /// it; a slot placed in an op that does not yet override `bind_slots` simply
     /// stays unbound (caught at `sync`).
-    ///
-    /// TODO(step b→c): `bind` returns `&Self`, which serves the `g.bind(...)?.sync()`
-    /// path and chained binds. The fully-composable form — a single-output
-    /// `g.bind()` usable as a kernel arg / `bundle2(b, g.bind())` nesting (NOTES
-    /// "Closure-free graph model", §3) — is deferred to the segment-plan step; it
-    /// needs a node that re-exposes the bound graph's output pipe.
-    fn bind<Tg: Tag>(&self, tag: Tg) -> Result<&Self>
+    fn bind<A: CallArg>(self, arg: A) -> Self
     where
-        Tg::Value: SlotEq + SlotValue,
+        Self: Sized,
     {
-        self.fold_bind::<Tg>(tag.into_value(), BindMode::Set)
+        self.call((arg,))
     }
 
     /// **Set/change** bind of one typed slot — the mutating sibling of
@@ -3110,42 +3133,59 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         Ok(())
     }
 
-    /// **Fill several slots at once**, turbofish-free, each value self-tagging via
-    /// its tuple struct: `g.call((A(a), B(b), Out(o)))?.sync(&ctx)?`.
+    /// **Fill several slots at once**, turbofish-free — **consuming + infallible**.
+    /// Each element self-tags via its tuple struct, is applied left-to-right, and the
+    /// OWNED graph is returned: `let g = g.call((A(a), B(b), Out(o))); g.sync(&ctx)?`
+    /// (the `?` is only at the terminal — `call` itself never returns a `Result`).
     ///
-    /// Each element folds through the SAME single-slot [`bind`](Self::bind) path, so
-    /// `call` inherits the set-once contract exactly — idempotent on an equal
-    /// binding, [`SlotConflict`](Error::SlotConflict) on a conflicting one,
-    /// [`SlotCheckedOut`](Error::SlotCheckedOut) on a lent one.
+    /// **Mixed value-or-feed.** Each element is INDEPENDENTLY a **value tag**
+    /// (`Buf(b)`, `Factor(2)` — set-once value bind) or a **pipe feed** (`Buf(pipe)`
+    /// — the same tag constructor fed a [`Pipe`], installing
+    /// [`FedByPipe`](SlotState::FedByPipe)), so one tuple freely MIXES concrete binds
+    /// and upstream-pipe wiring (the crossed rotation visible in the arg list). This
+    /// is dispatched through [`CallArgs`] / [`CallArg`] (arity 1..=8), NOT the fluent
+    /// [`BindAll`] path (which now serves only [`mutate_bind`](Self::mutate_bind) /
+    /// [`mutate_call`](Self::mutate_call)).
     ///
-    /// ## All-or-nothing (probe before sever)
+    /// ## Why consuming + infallible
     ///
-    /// A phase-0 [`probe_bind`](Self::probe_bind) dry run vets EVERY element BEFORE
-    /// any [`into_value`](Tag::into_value) severs a `Checkout` source, so the common
-    /// failures leave the graph AND every source untouched (nothing severed, nothing
-    /// mutated):
-    /// - **absent tag** → [`SlotNoSuchTag`](Error::SlotNoSuchTag),
-    /// - **lent by an external checkout** → [`SlotCheckedOut`](Error::SlotCheckedOut),
-    /// - **`Set` onto a severed / to-be-severed slot** → [`SlotSevered`](Error::SlotSevered).
+    /// It returns owned `Self`, so it (a) chains further (`.call(..).and_then(..)`)
+    /// AND (b) is usable INSIDE an [`and_then`](Self::and_then) closure as the bare
+    /// `U: DeviceOp` that `FnOnce(Handle) -> U` requires. A *fallible* `-> Result<Self>`
+    /// would force the closure to return `Result<U>`, which `and_then` does NOT accept.
     ///
-    /// This replaces the former "each element severs up front, then `?`-chained
-    /// folds" behaviour, which could sever every source AND then error (e.g. an
-    /// absent tag severed all Checkouts and *then* returned `SlotNoSuchTag`).
+    /// ## DEFERRED bind errors — the trade
     ///
-    /// **One documented residual.** The probe cannot decide the value-dependent
-    /// [`SlotConflict`](Error::SlotConflict) of a `Set` onto an already-`Bound`
-    /// (DIFFERENT) slot — the conflicting value is inside an unsevered `Checkout` the
-    /// probe never severs to read. That conflict still fires in phase 2, AFTER phase 1
-    /// may have severed OTHER elements' sources. It is a misuse case (`bind` is
-    /// set-once; re-binding a bound slot to a different buffer is the error) and does
-    /// not touch the motivating paths — the crossed swap uses `mutate` (no
-    /// `SlotConflict` leg), and absent-tag / checked-out are fully all-or-nothing.
+    /// Because it is infallible, an absent tag ([`SlotNoSuchTag`](Error::SlotNoSuchTag)),
+    /// a [`SlotConflict`](Error::SlotConflict), a [`SlotCheckedOut`](Error::SlotCheckedOut),
+    /// or a [`SlotSevered`](Error::SlotSevered) is not returned at the call site — it is
+    /// RECORDED (via [`CallArg::apply`] → [`bind_deferred`](Self::bind_deferred) /
+    /// [`feed_deferred`](Self::feed_deferred)) into the graph's [`DeferredErrors`] sink
+    /// and surfaces at [`sync`](Self::sync): [`check_ready`](DeviceOp::check_ready)
+    /// drains the sink FIRST, before any enqueue, returning the recorded error with
+    /// NOTHING run (the atomicity guarantee holds). A typo'd or missing bind cannot
+    /// silently run wrong data — it fails closed at sync.
     ///
-    /// Tuple ORDER does not matter for success (each binds its own tag). Implemented
-    /// for tuples of [`Tag`]s, arity 1..=8, via [`BindAll`].
-    fn call<Tags: BindAll>(&self, tags: Tags) -> Result<&Self> {
-        tags.bind_all(self)?;
-        Ok(self)
+    /// **Known residual wart (not fixed).** The sink is drained by `pop()` —
+    /// REPORT-ONCE. An errored graph fails its FIRST `sync` closed (correct); a caller
+    /// that IGNORES that `Err` and re-`sync`s WITHOUT rebinding finds an empty sink and
+    /// could then run. Abuse path (ignoring a returned error and re-running), benign —
+    /// documented here rather than papered over.
+    ///
+    /// ## Partial binds (currying)
+    ///
+    /// `call` binds ONLY the tags in `args` and leaves the rest of the graph's slots
+    /// as they are (`Unbound` / `FedByPipe`-able for a later `call`). So it is
+    /// naturally a PARTIAL bind — bind a subset now (e.g. the invariants), the rest
+    /// later. Any slot still unbound at `sync` errors there (deferred, as above).
+    ///
+    /// Tuple ORDER does not matter for success (each binds its own tag).
+    fn call<T: CallArgs>(self, args: T) -> Self
+    where
+        Self: Sized,
+    {
+        args.apply_all(&self);
+        self
     }
 
     /// **Mutate several slots at once** — the mutating sibling of [`call`](Self::call).
@@ -3178,38 +3218,9 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         Ok(self)
     }
 
-    /// **Wire tag `Tg`'s slot(s) to an upstream pipe** — the bind-slot-to-pipe verb.
-    ///
-    /// Instead of binding a concrete value, install [`SlotState::FedByPipe`] at every
-    /// site tag `Tg` appears, so the slot READS whatever an UPSTREAM op produced into
-    /// `pipe` (a build-time [`Handle`](DeviceOp::Handle) / [`Pipe<Tg::Value>`]) each
-    /// run. At run time the slot DRAINS that pipe (the producer filled it earlier the
-    /// same run) and RE-ARMS every replay — see [`SlotState::FedByPipe`]. This is how
-    /// a `slot!(Tag)` in one subgraph is late-bound to an upstream stage's output at
-    /// compose time — the crossed double-buffer rotation expressed as data.
-    ///
-    /// No `SlotEq`/`SlotValue` bound is needed (the install is unconditional). Fans
-    /// out like a shared-slot value bind: one `feed` fills ALL of the tag's sites.
-    /// Errors [`SlotNoSuchTag`](Error::SlotNoSuchTag) if the tag is absent from the
-    /// graph (the AT-LEAST-ONE rule, exactly as [`fold_bind`](Self::fold_bind)).
-    ///
-    /// Returns `&Self` (fluent, fallible) — the sibling of [`bind`](Self::bind) for
-    /// the pipe source. A feed inside a consuming `and_then`-composable tuple uses
-    /// the unified `Tag(pipe)` constructor in [`call_move`](Self::call_move)
-    /// instead (infallible, errors deferred to sync).
-    fn feed<Tg: Tag>(&self, pipe: Pipe<Tg::Value>) -> Result<&Self> {
-        let mut binder = SlotBinder::feed::<Tg>(pipe);
-        self.bind_slots(&mut binder);
-        binder.outcome()?;
-        if binder.matched() == 0 {
-            return Err(Error::SlotNoSuchTag(Tg::NAME));
-        }
-        Ok(self)
-    }
-
     /// **Deferred (record-don't-drop) value-bind** — the INFALLIBLE
-    /// [`call_move`](Self::call_move) sibling of [`bind`](Self::bind), used ONLY by
-    /// [`CallArg::apply`]. It folds the tag exactly like `bind` (set-once, same
+    /// [`call`](Self::call) sibling of a fluent value bind, used ONLY by
+    /// [`CallArg::apply`]. It folds the tag exactly like a set-once bind (same
     /// verb-2×2), but instead of RETURNING the error it RECORDS it into the graph's
     /// [`DeferredErrors`] sink so [`check_ready`](DeviceOp::check_ready) surfaces it at
     /// `sync` (FIRST, nothing enqueued). This closes the silent-swallow hole the old
@@ -3228,9 +3239,9 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     }
 
     /// **Deferred (record-don't-drop) pipe-feed** — the INFALLIBLE
-    /// [`call_move`](Self::call_move) sibling of [`feed`](Self::feed), used ONLY by
-    /// [`CallArg::apply`] for a `Tag(pipe)` element. Installs `FedByPipe` at every
-    /// matching site exactly like `feed`, but an absent tag (`matched == 0`) is
+    /// [`call`](Self::call) sibling of a value bind for the `Tag(pipe)` source, used
+    /// ONLY by [`CallArg::apply`] for a `Tag(pipe)` element. Installs `FedByPipe` at
+    /// every matching site, but an absent tag (`matched == 0`) is
     /// RECORDED as [`SlotNoSuchTag`](Error::SlotNoSuchTag) into the graph's
     /// [`DeferredErrors`] sink (drained by `check_ready`) rather than dropped. (A feed
     /// install never conflicts, so `SlotNoSuchTag` is its only failure.)
@@ -3239,63 +3250,6 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         binder.mark_deferred();
         self.bind_slots(&mut binder);
         binder.record_deferred(Tg::NAME);
-    }
-
-    /// **Consuming, INFALLIBLE, mixed value-or-feed bind** — the compose-in-`and_then`
-    /// sibling of the fluent [`call`](Self::call).
-    ///
-    /// Applies each element of `args` (a [`CallArgs`] tuple, arity 1..=8) to this
-    /// graph, then returns the OWNED graph. Each element is INDEPENDENTLY either a
-    /// **value tag** (`Buf(b)`, `Factor(2)` — folded through [`bind`](Self::bind)) or
-    /// a **pipe feed** (`Buf(pipe)` — the same tag constructor fed a `Pipe`, folded
-    /// through [`feed`](Self::feed)), so a single tuple freely MIXES concrete binds and
-    /// upstream-pipe wiring (the crossed rotation visible in the arg list).
-    ///
-    /// ## Why consuming + infallible
-    ///
-    /// It returns owned `Self`, so it (a) chains further (`.call_move(..).and_then(..)`)
-    /// AND (b) is usable INSIDE an [`and_then`](Self::and_then) closure as the bare
-    /// `U: DeviceOp` that `FnOnce(Handle) -> U` requires. A *fallible*
-    /// `-> Result<Self>` would force the closure to return `Result<U>`, which
-    /// `and_then` does NOT accept — it would need a whole fallible-`and_then`
-    /// variant. `call_move` returns bare `Self` and fits `and_then` directly.
-    ///
-    /// ## DEFERRED bind errors — the trade
-    ///
-    /// **`call_move` gives up the EAGER errors the fluent [`call`](Self::call) gives.**
-    /// Because it is infallible, an absent tag, a
-    /// [`SlotConflict`](Error::SlotConflict), or a [`SlotCheckedOut`](Error::SlotCheckedOut)
-    /// is DROPPED at the call site (see [`CallArg::apply`]) and surfaces only LATER,
-    /// at [`sync`](Self::sync) — as [`SlotUnbound`](Error::SlotUnbound) /
-    /// [`SlotNoSuchTag`](Error::SlotNoSuchTag) from the [`check_ready`](DeviceOp::check_ready)
-    /// completeness pass, with NOTHING enqueued (the atomicity guarantee holds:
-    /// `check_ready` runs before any device work). This is SOUND — a typo'd or
-    /// missing bind cannot silently run wrong data; it fails closed at sync. But it
-    /// is a real trade: use the fluent [`call`](Self::call) / [`mutate_call`](Self::mutate_call)
-    /// (fallible, `&Self`, EAGER `SlotConflict`/`SlotNoSuchTag`, phase-0 probe) for
-    /// the fluent-then-sync path; use `call_move` for the compose-in-`and_then` path.
-    ///
-    /// ## Partial binds (currying)
-    ///
-    /// `call_move` binds ONLY the tags in `args` and leaves the rest of the graph's
-    /// slots as they are (`Unbound` / `FedByPipe`-able for a later `call_move`). So it
-    /// is naturally a PARTIAL bind — [`bind_move`](Self::bind_move) is exactly this
-    /// method under a currying-flavoured name (bind a subset now, the rest later).
-    /// Any slot still unbound at `sync` errors there (deferred, as above).
-    fn call_move<T: CallArgs>(self, args: T) -> Self {
-        args.apply_all(&self);
-        self
-    }
-
-    /// **Partial [`call_move`](Self::call_move) — currying.** Bind a SUBSET of the
-    /// graph's slots now (via a [`CallArgs`] tuple), leaving the rest open for a
-    /// later `call_move` / `bind_move` / `feed`. This IS [`call_move`](Self::call_move)
-    /// (same consuming, infallible, deferred-error, mixed value-or-feed body) — a
-    /// distinct name only to read as "bind part now" at a currying call site. Slots
-    /// left unbound after the final bind error at `sync` (deferred), same as
-    /// `call_move`.
-    fn bind_move<T: CallArgs>(self, args: T) -> Self {
-        self.call_move(args)
     }
 
     /// Run `self` to completion on `launcher`'s queue and hand back a
@@ -3683,12 +3637,12 @@ impl_bind_all_tuple!(A, B, C, D, E, F);
 impl_bind_all_tuple!(A, B, C, D, E, F, G);
 impl_bind_all_tuple!(A, B, C, D, E, F, G, H);
 
-// ── CallArg / CallArgs: the mixed value-or-feed tuple for `call_move` ────────
+// ── CallArg / CallArgs: the mixed value-or-feed tuple for `bind` / `call` ────
 
-/// One element of a [`call_move`](DeviceOpExt::call_move) tuple — EITHER a **value
-/// tag** (`Buf(b)`, `Factor(2)`) that binds by value, OR a **pipe feed** (`Buf(pipe)`
-/// — the SAME tag constructor fed a [`Pipe`] instead of a value) that wires the tag's
-/// slot(s) to an upstream pipe.
+/// One element of a [`call`](DeviceOpExt::call) (or single-element
+/// [`bind`](DeviceOpExt::bind)) tuple — EITHER a **value tag** (`Buf(b)`, `Factor(2)`)
+/// that binds by value, OR a **pipe feed** (`Buf(pipe)` — the SAME tag constructor fed
+/// a [`Pipe`] instead of a value) that wires the tag's slot(s) to an upstream pipe.
 ///
 /// The two spellings share one surface: `Buf(x)` is a value-bind when `x` is a value
 /// (or [`Checkout`]) and a pipe-feed when `x` is a `Pipe<Buf::Value>`. All three arms
@@ -3700,16 +3654,18 @@ impl_bind_all_tuple!(A, B, C, D, E, F, G, H);
 /// [`RecordableBuffer`](crate::record::RecordableBuffer), so a scalar `F(pipe)` does
 /// not compile.
 ///
-/// Applied **infallibly**: [`apply`](CallArg::apply) drops any bind error (an absent
-/// tag, a conflict, a checked-out slot) — the error surfaces later at
-/// [`sync`](DeviceOpExt::sync) via [`check_ready`](DeviceOp::check_ready) instead.
-/// This is the trade [`call_move`](DeviceOpExt::call_move) makes to be infallible +
+/// Applied **infallibly**: [`apply`](CallArg::apply) RECORDS any bind error (an absent
+/// tag, a conflict, a checked-out slot) into the graph's [`DeferredErrors`] sink — the
+/// error surfaces later at [`sync`](DeviceOpExt::sync) via
+/// [`check_ready`](DeviceOp::check_ready) instead. This is the trade
+/// [`bind`](DeviceOpExt::bind) / [`call`](DeviceOpExt::call) make to be infallible +
 /// consuming (usable as the bare `U` an [`and_then`](DeviceOpExt::and_then) closure
-/// requires); see that method's doc for the full rationale.
+/// requires); see those methods' docs for the full rationale.
 pub trait CallArg {
     /// Apply this element's binding to graph `g`, INFALLIBLY (errors deferred to
-    /// `sync`). A value tag folds through [`bind`](DeviceOpExt::bind) (set-once); a
-    /// pipe-source tag folds through [`feed`](DeviceOpExt::feed).
+    /// `sync`). A value tag folds through [`bind_deferred`](DeviceOpExt::bind_deferred)
+    /// (set-once); a pipe-source tag folds through
+    /// [`feed_deferred`](DeviceOpExt::feed_deferred).
     fn apply<Op: DeviceOp>(self, g: &Op);
 }
 
@@ -3728,10 +3684,10 @@ pub trait CallArg {
 // concrete value-bind arms exactly cover the two existing `IntoBound` sources (identity
 // `V` and `Checkout<V>`); there are no others.
 
-/// A tuple of [`CallArg`]s — the argument to [`call_move`](DeviceOpExt::call_move).
-/// Each element is INDEPENDENTLY a value tag (`Buf(v)`) or a pipe feed (`Buf(pipe)`),
-/// applied left-to-right, infallibly. Implemented for arities 1..=8 (mirroring
-/// [`BindAll`]).
+/// A tuple of [`CallArg`]s — the argument to [`call`](DeviceOpExt::call) (and, as a
+/// 1-tuple, [`bind`](DeviceOpExt::bind)). Each element is INDEPENDENTLY a value tag
+/// (`Buf(v)`) or a pipe feed (`Buf(pipe)`), applied left-to-right, infallibly.
+/// Implemented for arities 1..=8 (mirroring [`BindAll`]).
 pub trait CallArgs {
     /// Apply every element to `g` (infallibly, in tuple order).
     fn apply_all<Op: DeviceOp>(self, g: &Op);

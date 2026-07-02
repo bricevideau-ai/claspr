@@ -356,11 +356,11 @@ fn copy_slot_src_and_slot_dst_x2_both_rehome() {
     let hs = handle_of(&_src);
     let hd = handle_of(&_dst);
 
-    // Both copy operands are SLOTS, bound before the run. `bind` returns `&Self`,
-    // so the copy op must live in a `let` (it can't be a temporary).
-    let g = eager_copy_to(slot!(Src), slot!(Dst));
-    g.bind(Src(_src)).expect("bind Src");
-    g.bind(Dst(_dst)).expect("bind Dst");
+    // Both copy operands are SLOTS, set-once bound (consuming) before the run and
+    // folded into `g`; `g` is then re-`sync`'d by `&` below.
+    let g = eager_copy_to(slot!(Src), slot!(Dst))
+        .bind(Src(_src))
+        .bind(Dst(_dst));
 
     {
         let (co_s, co_d) = g.sync(&ctx).expect("copy run 1");
@@ -395,11 +395,11 @@ fn cross_graph_handoff_lends_and_returns() {
 
     // g: scale a slot buffer by 1 (idempotent), in place. Idempotent so a re-run
     // over the SAME returned buffer is stable (proves rehome, not compounding).
-    let g = ks.scale_u32([N], slot!(Buf), 1u32);
-
     let b = seeded(&ctx, 8);
     let h0 = handle_of(&b);
-    let co = g.bind(Buf(b)).expect("bind").sync(&ctx).expect("g run");
+    // Set-once bind (consuming) folded into `g`; re-`sync`'d by `&` below.
+    let g = ks.scale_u32([N], slot!(Buf), 1u32).bind(Buf(b));
+    let co = g.sync(&ctx).expect("g run");
 
     // Hand `co` to a second graph that downloads it (consumes the value into a Vec,
     // but the device buffer's home — g's `Lent` slot — rides the lend and is
@@ -446,15 +446,12 @@ fn cross_graph_as_kernel_arg_lends_and_returns() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    // g1: scale a slot buffer by 1 (idempotent) in place.
-    let g1 = ks.scale_u32([N], slot!(Buf), 1u32);
+    // g1: scale a slot buffer by 1 (idempotent) in place. Set-once bind (consuming)
+    // folded into `g1`; `g1` is re-`sync`'d by `&` below.
     let b = seeded(&ctx, 6);
     let h0 = handle_of(&b);
-    let co = g1
-        .bind(Buf(b))
-        .expect("bind g1")
-        .sync(&ctx)
-        .expect("g1 run");
+    let g1 = ks.scale_u32([N], slot!(Buf), 1u32).bind(Buf(b));
+    let co = g1.sync(&ctx).expect("g1 run");
 
     // g2: feed `co` as a kernel arg — scale by 2 (the terminal is the BUFFER, a
     // Checkout). This LENDS g1's slot buffer into g2; g1 stays `Lent`/busy while
@@ -520,11 +517,12 @@ fn copy_operand_checkout_lends_and_returns() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    // Graph A: scale a slot buffer by 2 in place → yields a Checkout `co`.
-    let ga = ks.scale_u32([N], slot!(Buf), 2u32);
+    // Graph A: scale a slot buffer by 2 in place → yields a Checkout `co`. Set-once
+    // bind (consuming) folded into `ga`; re-`sync`'d by `&` below.
     let b = seeded(&ctx, 3); // 3*2 = 6
     let h0 = handle_of(&b);
-    let co = ga.bind(Buf(b)).expect("bind A").sync(&ctx).expect("A run");
+    let ga = ks.scale_u32([N], slot!(Buf), 2u32).bind(Buf(b));
+    let co = ga.sync(&ctx).expect("A run");
 
     // Graph B: feed `co` as the SRC of a copy into a fresh dst. This LENDS A's
     // buffer into B; A stays `Lent`/busy while B's copy result is alive.
@@ -590,9 +588,11 @@ fn into_inner_still_severs() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    let g = ks.scale_u32([N], slot!(Buf), 2u32);
     let b = seeded(&ctx, 4); // 4*2 = 8
-    let co = g.bind(Buf(b)).expect("bind").sync(&ctx).expect("g run");
+    // Set-once bind (consuming) folded into `g`; `g` is re-armed via `mutate_bind`
+    // (`&self`) and re-`sync`'d below.
+    let g = ks.scale_u32([N], slot!(Buf), 2u32).bind(Buf(b));
+    let co = g.sync(&ctx).expect("g run");
 
     // Explicitly TAKE the buffer out — this severs g's slot (Lent → Severed).
     let raw = co.into_inner();
@@ -600,17 +600,30 @@ fn into_inner_still_severs() {
     raw.read(&mut rb).wait().expect("read raw");
     assert!(rb.iter().all(|&x| x == 8), "kept buffer holds 4*2 = 8");
 
-    // g's slot is SEVERED → a plain `bind` rejects; only `mutate_bind` re-arms.
-    match g.bind(Buf(seeded(&ctx, 1))) {
-        Ok(_) => panic!("plain bind on a severed slot must error"),
-        Err(Error::SlotSevered(n)) => {
-            assert!(
-                n.contains("Buf"),
-                "expected SlotSevered naming Buf, got {n:?}"
-            )
-        }
-        Err(other) => panic!("expected SlotSevered, got {other:?}"),
+    // g's slot is SEVERED → a plain (consuming, infallible) `bind` records
+    // `SlotSevered` and it surfaces DEFERRED at `sync` (nothing enqueued). Prove
+    // that on a CLONE-shaped separate probe graph seeded the same way, since testing
+    // it on `g` itself would consume `g` (and we still want to prove `mutate_bind`
+    // re-arms the very same slot below).
+    {
+        let probe_b = seeded(&ctx, 4);
+        let probe = ks.scale_u32([N], slot!(Buf), 2u32).bind(Buf(probe_b));
+        let probe_co = probe.sync(&ctx).expect("probe run");
+        let _kept = probe_co.into_inner(); // sever the probe's slot
+        let err = probe
+            .bind(Buf(seeded(&ctx, 1)))
+            .sync(&ctx)
+            .expect_err("plain bind on a severed slot must error at sync");
+        // A set-once bind onto a Severed cell records `SlotSevered` but leaves the cell
+        // Severed, so `check_ready` (state-first) reports the completeness `SlotUnbound`
+        // for that still-empty slot before draining the sink. Both are fail-closed.
+        assert!(
+            matches!(&err, Error::SlotUnbound(n) | Error::SlotSevered(n) if n.contains("Buf")),
+            "expected deferred SlotSevered / state-first SlotUnbound naming Buf, got {err:?}"
+        );
     }
+
+    // Only `mutate_bind` re-arms the severed slot — proven on `g` itself.
     let other = seeded(&ctx, 5); // 5*2 = 10
     let co2 = g
         .mutate_bind(Buf(other))
@@ -634,11 +647,12 @@ fn checkout_lend_transitive() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    // A: scale a slot buffer by 1 (idempotent) in place.
-    let g_a = ks.scale_u32([N], slot!(Buf), 1u32);
+    // A: scale a slot buffer by 1 (idempotent) in place. Set-once bind (consuming)
+    // folded into `g_a`; re-`sync`'d by `&` below.
     let b = seeded(&ctx, 3);
     let h0 = handle_of(&b);
-    let co_a = g_a.bind(Buf(b)).expect("bind A").sync(&ctx).expect("A run");
+    let g_a = ks.scale_u32([N], slot!(Buf), 1u32).bind(Buf(b));
+    let co_a = g_a.sync(&ctx).expect("A run");
 
     // B: scale A's buffer by 2 → 6. C: scale B's result by 5 → 30.
     let co_b = ks.scale_u32([N], co_a, 2u32).sync(&ctx).expect("B run");
@@ -690,12 +704,12 @@ fn slot_rehome_vs_sever_handle_identity() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    let g = ks.scale_u32([N], slot!(Buf), 2u32);
-
     // (a) rehome: drop the Checkout → slot re-arms Lent→Bound, SAME handle.
+    // Set-once bind (consuming) folded into `g`; re-`sync`'d / `mutate_bind`'d by `&`.
     let b = seeded(&ctx, 3);
     let h0 = handle_of(&b);
-    let co1 = g.bind(Buf(b)).expect("bind").sync(&ctx).expect("run a1");
+    let g = ks.scale_u32([N], slot!(Buf), 2u32).bind(Buf(b));
+    let co1 = g.sync(&ctx).expect("run a1");
     assert_eq!(handle_of(&*co1), h0, "lent buffer keeps its handle in-run");
     drop(co1); // rehome.
     let co2 = g.sync(&ctx).expect("run a2 over re-armed slot");
@@ -806,8 +820,8 @@ fn multi_output_copy_independence() {
     let hd = handle_of(&dst);
 
     // Concrete src + SLOT dst: the dst is governed by the 4-state slot machine.
-    let g = eager_copy_to(src, slot!(Dst));
-    g.bind(Dst(dst)).expect("bind dst slot");
+    // Set-once bind (consuming) folded into `g`; re-`sync`'d / `mutate_bind`'d by `&`.
+    let g = eager_copy_to(src, slot!(Dst)).bind(Dst(dst));
 
     let (co_src, co_dst) = g.sync(&ctx).expect("copy run 1");
     assert_eq!(handle_of(&*co_src), hs, "src handle stable run 1");
@@ -821,14 +835,28 @@ fn multi_output_copy_independence() {
     kept_dst.read(&mut out).wait().expect("read kept dst");
     assert_eq!(out, data, "kept dst holds the copied data");
 
-    // The dst slot is SEVERED → a plain `bind` rejects; only `mutate_bind` re-arms.
-    match g.bind(Dst(DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("d2"))) {
-        Ok(_) => panic!("plain bind on a severed copy-dst slot must error"),
-        Err(Error::SlotSevered(n)) => assert!(
-            n.contains("Dst"),
-            "expected SlotSevered naming Dst, got {n:?}"
-        ),
-        Err(other) => panic!("expected SlotSevered on severed dst bind, got {other:?}"),
+    // The dst slot is SEVERED → a plain (consuming, infallible) `bind` records
+    // `SlotSevered`, surfacing DEFERRED at `sync` (nothing enqueued). Prove it on a
+    // separate probe graph shaped the same way (testing it on `g` would consume `g`,
+    // and we still want to prove `mutate_bind` re-arms `g`'s very slot below).
+    {
+        let psrc = DeviceSlice::<u32>::from_slice(&ctx, &data).expect("psrc");
+        let pdst = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("pdst");
+        let probe = eager_copy_to(psrc, slot!(Dst)).bind(Dst(pdst));
+        let (ps, pd) = probe.sync(&ctx).expect("probe copy run");
+        let _kept = pd.into_inner(); // sever the probe's dst slot
+        drop(ps); // re-arm the concrete src (so ONLY the severed Dst is exercised)
+        let err = probe
+            .bind(Dst(DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("d2")))
+            .sync(&ctx)
+            .expect_err("plain bind on a severed copy-dst slot must error at sync");
+        // Set-once bind onto a Severed cell records `SlotSevered` but leaves the cell
+        // Severed, so `check_ready` (state-first) reports the completeness `SlotUnbound`
+        // before draining the sink. Both are fail-closed.
+        assert!(
+            matches!(&err, Error::SlotUnbound(n) | Error::SlotSevered(n) if n.contains("Dst")),
+            "expected deferred SlotSevered / state-first SlotUnbound naming Dst, got {err:?}"
+        );
     }
 
     // Re-arm the severed dst with a NEW buffer via mutate_bind, then re-sync. src

@@ -70,15 +70,6 @@ fn handle_of<B: claspr::RecordableBuffer>(b: &B) -> usize {
     }
 }
 
-/// Extract the [`Error`] from a `bind`/`mutate_bind` result, asserting it failed.
-/// (The Ok arm is `&Op`, which is not `Debug`.)
-fn bind_err<G>(r: claspr::Result<&G>, msg: &str) -> Error {
-    match r {
-        Ok(_) => panic!("{msg}"),
-        Err(e) => e,
-    }
-}
-
 /// Allocate + fill a `DeviceSlice<u32>` of `N` elements with `v`.
 fn seeded(ctx: &Context, v: u32) -> DeviceSlice<u32> {
     DeviceSlice::<u32>::alloc_zero(ctx, N)
@@ -105,9 +96,7 @@ fn scalar_slot_bind_then_sync() {
         .and_then(download);
     let out = dl
         .bind(Buf(seeded(&ctx, 3)))
-        .expect("bind buf")
         .bind(Factor(2u32))
-        .expect("bind factor")
         .sync(&ctx)
         .expect("sync");
     assert!(
@@ -119,14 +108,12 @@ fn scalar_slot_bind_then_sync() {
     // Now an in-place graph re-run: drop the first Checkout UNREAD to re-arm the
     // buffer slot; the factor slot is READ again (still 2), so 3 -> 6 -> 12. The
     // final 12 is only correct if the scalar factor persisted across the replay.
-    let g = ks.scale_u32([N], slot!(Buf), slot!(Factor));
-    let co1 = g
+    // Set-once binds (consuming) folded into `g`; re-`sync`'d by `&` below.
+    let g = ks
+        .scale_u32([N], slot!(Buf), slot!(Factor))
         .bind(Buf(seeded(&ctx, 3)))
-        .expect("bind buf")
-        .bind(Factor(2u32))
-        .expect("bind factor")
-        .sync(&ctx)
-        .expect("run 1");
+        .bind(Factor(2u32));
+    let co1 = g.sync(&ctx).expect("run 1");
     drop(co1); // re-arm (Lent -> Bound), no read/sever
 
     let co2 = g.sync(&ctx).expect("re-run over re-armed graph");
@@ -185,37 +172,24 @@ fn scalar_slot_mutate_across_replays() {
 }
 
 /// (3) **Scalar bind idempotency + conflict.** `bind(Factor(2))` twice is a clean
-/// no-op (value equality); `bind(Factor(9))` over a Bound `Factor(2)` is
-/// `SlotConflict`; `mutate_bind(Factor(9))` then changes it.
+/// no-op (value equality); a set-once `bind(Factor(9))` over a Bound `Factor(2)` is
+/// `SlotConflict`, now RECORDED and surfaced DEFERRED at `sync`; `mutate_bind(Factor(9))`
+/// (fluent, EAGER) then changes it.
 #[test]
 fn scalar_slot_idempotent_and_conflict() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    let g = ks
+    // The duplicate `bind(Factor(2))` must leave the bound VALUE unchanged (still 2),
+    // not silently replaced by an equal-looking one. Prove it by RUNNING a graph whose
+    // Factor is bound-then-idempotently-rebound to 2 (folded into one consuming
+    // chain): the result must reflect factor 2 (5 * 2 = 10).
+    let idem_out = ks
         .scale_u32([N], slot!(Buf), slot!(Factor))
-        .and_then(download);
-
-    // Bind the same value twice — idempotent, not a conflict.
-    g.bind(Factor(2u32)).expect("first scalar bind");
-    g.bind(Factor(2u32))
-        .expect("second bind of the SAME scalar value is an idempotent no-op");
-
-    // The duplicate `bind(Factor(2))` must leave the bound VALUE unchanged (still
-    // 2), not silently replaced by an equal-looking one. Prove it by RUNNING a
-    // fresh graph shape whose Factor is bound-then-idempotently-rebound to 2: the
-    // result must reflect factor 2 (5 * 2 = 10). A silent-overwrite-with-equal bug
-    // would still land on 2 here, but a change to any OTHER value would not — this
-    // pins the value the idempotent path actually kept.
-    let idem = ks
-        .scale_u32([N], slot!(Buf), slot!(Factor))
-        .and_then(download);
-    idem.bind(Factor(2u32)).expect("idem first bind");
-    idem.bind(Factor(2u32))
-        .expect("idem second bind of the SAME value is a no-op");
-    let idem_out = idem
+        .and_then(download)
+        .bind(Factor(2u32))
+        .bind(Factor(2u32)) // idempotent no-op (same value)
         .bind(Buf(seeded(&ctx, 5)))
-        .expect("bind buf")
         .sync(&ctx)
         .expect("sync idempotent-value check");
     assert!(
@@ -224,20 +198,33 @@ fn scalar_slot_idempotent_and_conflict() {
         &idem_out[..8]
     );
 
-    // A different value via `bind` → SlotConflict (set-once contract, by value).
-    let err = bind_err(
-        g.bind(Factor(9u32)),
-        "different-value scalar bind must conflict",
-    );
-    assert!(
-        matches!(err, Error::SlotConflict(n) if n.contains("Factor")),
-        "expected SlotConflict naming Factor, got {err:?}"
-    );
-
-    // `mutate_bind` overwrites to 9; the new factor drives the result.
-    let out = g
+    // A different value via a set-once `bind` → `SlotConflict`. It is recorded and
+    // surfaces DEFERRED at `sync`: the conflicting bind leaves the cell `Bound` to the
+    // OLD value, so `check_ready` (state-first) sees it satisfiable and drains the
+    // recorded conflict. Buf is bound too so the graph is otherwise complete.
+    let conflict = ks
+        .scale_u32([N], slot!(Buf), slot!(Factor))
+        .and_then(download)
+        .bind(Factor(2u32)) // Factor := Bound(2)
         .bind(Buf(seeded(&ctx, 2)))
-        .expect("bind buf")
+        .bind(Factor(9u32)); // CONFLICT: set-once onto Bound(2) → recorded
+    match conflict.sync(&ctx) {
+        Ok(_) => panic!("different-value scalar set-once bind must fail at sync (deferred)"),
+        Err(Error::SlotConflict(n)) => assert!(
+            n.contains("Factor"),
+            "expected SlotConflict naming Factor, got {n:?}"
+        ),
+        Err(other) => panic!("expected deferred SlotConflict, got {other:?}"),
+    }
+
+    // `mutate_bind` (fluent, EAGER) overwrites a bound scalar to 9; the new factor
+    // drives the result.
+    let g = ks
+        .scale_u32([N], slot!(Buf), slot!(Factor))
+        .and_then(download)
+        .bind(Buf(seeded(&ctx, 2)))
+        .bind(Factor(2u32)); // Factor := Bound(2)
+    let out = g
         .mutate_bind(Factor(9u32))
         .expect("mutate_bind changes a bound scalar")
         .sync(&ctx)
@@ -256,11 +243,12 @@ fn scalar_slot_unbound_sync_errors() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    // Buffer bound, factor NOT — the scalar slot is the only hole.
+    // Buffer bound, factor NOT — the scalar slot is the only hole. Set-once bind
+    // (consuming) folded into `g`; `g` is re-`sync`'d / bound by `&`+move below.
     let g = ks
         .scale_u32([N], slot!(Buf), slot!(Factor))
-        .and_then(download);
-    g.bind(Buf(seeded(&ctx, 3))).expect("bind buf");
+        .and_then(download)
+        .bind(Buf(seeded(&ctx, 3)));
 
     let err = g
         .sync(&ctx)
@@ -271,11 +259,7 @@ fn scalar_slot_unbound_sync_errors() {
     );
 
     // Bind it → the same graph runs.
-    let out = g
-        .bind(Factor(2u32))
-        .expect("bind factor")
-        .sync(&ctx)
-        .expect("now complete");
+    let out = g.bind(Factor(2u32)).sync(&ctx).expect("now complete");
     assert!(
         out.iter().all(|&v| v == 6),
         "3 * 2 = 6, got {:?}",
@@ -360,9 +344,7 @@ fn shared_scalar_slot_fans_out() {
     // ONE bind of K fills the scalar slot at BOTH dispatch sites.
     let out = g
         .bind(Buf(seeded(&ctx, 2)))
-        .expect("bind buf")
-        .bind(K(3u32))
-        .expect("one bind fills both K sites")
+        .bind(K(3u32)) // one bind fills both K sites
         .sync(&ctx)
         .expect("sync");
     // 2 * 3 * 3 = 18 — only correct if BOTH sites saw K=3.
@@ -409,12 +391,9 @@ fn shared_launch_slot_fans_out() {
 
     // ONE bind of Grid fills BOTH sites at [N/2]; the bundle delivers both outputs.
     let (a_co, b_co) = g
-        .bind(Grid(LaunchSpec::from([half])))
-        .expect("one bind fills both Grid sites")
+        .bind(Grid(LaunchSpec::from([half]))) // one bind fills both Grid sites
         .bind(BufA(seeded(&ctx, SENTINEL)))
-        .expect("bind A")
         .bind(BufB(seeded(&ctx, SENTINEL)))
-        .expect("bind B")
         .sync(&ctx)
         .expect("sync shared grid");
 
@@ -492,14 +471,10 @@ fn shared_arc_buffer_fans_out() {
     // ONE bind of each Arc operand fills BOTH add sites (Arc::clone fan-out); the
     // bundle delivers both outs as a `(Checkout, Checkout)` tuple.
     let (out_a, out_b) = g
-        .bind(Shared(Arc::clone(&shared)))
-        .expect("one bind fills both Shared sites")
-        .bind(SharedB(Arc::clone(&shared_b)))
-        .expect("one bind fills both SharedB sites")
+        .bind(Shared(Arc::clone(&shared))) // one bind fills both Shared sites
+        .bind(SharedB(Arc::clone(&shared_b))) // one bind fills both SharedB sites
         .bind(OutA(seeded(&ctx, 0)))
-        .expect("bind outA")
         .bind(OutB(seeded(&ctx, 0)))
-        .expect("bind outB")
         .sync(&ctx)
         .expect("sync two-site");
 
@@ -535,14 +510,12 @@ fn move_only_single_site_buffer_slot_unchanged() {
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     // A bare DeviceSlice slot (move-only) at a single in-place site, plain scalar
-    // factor (NOT a slot) — the exact pre-generalisation shape.
-    let g = ks.scale_u32([N], slot!(MoveOnly), 2u32);
-
-    let co1 = g
-        .bind(MoveOnly(seeded(&ctx, 4)))
-        .expect("move-only single-site bind still works")
-        .sync(&ctx)
-        .expect("run 1");
+    // factor (NOT a slot) — the exact pre-generalisation shape. Set-once bind
+    // (consuming) folded into `g`; re-`sync`'d by `&` below.
+    let g = ks
+        .scale_u32([N], slot!(MoveOnly), 2u32)
+        .bind(MoveOnly(seeded(&ctx, 4)));
+    let co1 = g.sync(&ctx).expect("run 1");
     drop(co1); // re-arm (Lent -> Bound), no read/sever
 
     // Re-runs over the re-armed move-only slot compound (4 -> 8 -> 16), proving the
@@ -583,10 +556,8 @@ fn slot_in_bundle_branch_is_bound() {
 
     // One bind of each tag must reach INTO branch A through the bundle.
     let (a_co, _b_co) = g
-        .bind(Buf(seeded(&ctx, 3)))
-        .expect("bind Buf reaches into the bundle branch")
-        .bind(Factor(4u32))
-        .expect("bind Factor reaches into the bundle branch")
+        .bind(Buf(seeded(&ctx, 3))) // reaches into the bundle branch
+        .bind(Factor(4u32)) // reaches into the bundle branch
         .sync(&ctx)
         .expect("bundle-branch slots all bound → sync runs (would SlotUnbound before the fix)");
 
@@ -600,41 +571,46 @@ fn slot_in_bundle_branch_is_bound() {
 }
 
 /// (11) **Regression: a `bind` of a tag matching ZERO cells is a hard error.**
-/// The graph uses only `slot!(Present)`; `bind(Absent(..))` matches no cell, so —
-/// per the AT-LEAST-ONE rule — it returns `Error::SlotNoSuchTag` naming `Absent`
-/// (rather than silently succeeding and only surfacing as `SlotUnbound` at sync).
-/// `bind(Present(..))` still succeeds (it matches its one cell).
+/// The graph uses only `slot!(Present)`; a set-once `bind(Absent(..))` matches no
+/// cell, so — per the AT-LEAST-ONE rule — it RECORDS `Error::SlotNoSuchTag` naming
+/// `Absent` (consuming, infallible) which surfaces DEFERRED at `sync` (rather than
+/// silently succeeding). We bind the real `Present` tag too so the graph is otherwise
+/// satisfiable and `check_ready` drains the recorded absent-tag error (an absent tag
+/// has no cell of its own, so it is recorded onto the first real slot's sink).
+/// `bind(Present(..))` alone still runs cleanly.
 #[test]
 fn bind_absent_tag_errors() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    // A graph whose ONLY scalar slot is `Present` (the buffer is concrete).
-    let g = ks.scale_u32([N], seeded(&ctx, 1), slot!(Present));
-
-    // Binding a tag the graph never uses → SlotNoSuchTag naming Absent.
-    let err = bind_err(
-        g.bind(Absent(7u32)),
-        "binding a tag absent from the graph must hard-error",
-    );
-    match &err {
-        Error::SlotNoSuchTag(n) => {
+    // Bind the real `Present` scalar (satisfiable) PLUS a tag the graph never uses.
+    // The absent-tag `SlotNoSuchTag(Absent)` is recorded and surfaces at `sync`.
+    let g = ks
+        .scale_u32([N], seeded(&ctx, 1), slot!(Present))
+        .bind(Present(2u32))
+        .bind(Absent(7u32));
+    match g.sync(&ctx) {
+        Ok(_) => panic!("binding a tag absent from the graph must fail at sync (deferred)"),
+        Err(Error::SlotNoSuchTag(n)) => {
             // The diagnostic is the CLEAN tag ident — exactly `Absent`, with no
             // internal `<KeyMarker>` source suffix leaking into user-facing text
             // (review issue S3).
-            assert_eq!(*n, "Absent", "SlotNoSuchTag should name exactly `Absent`");
+            assert_eq!(n, "Absent", "SlotNoSuchTag should name exactly `Absent`");
             assert!(
                 !n.contains("KeyMarker"),
                 "no `KeyMarker` in slot error: {n:?}"
             );
             assert!(!n.contains('<'), "no generic suffix in slot error: {n:?}");
         }
-        other => panic!("expected SlotNoSuchTag naming Absent, got {other:?}"),
+        Err(other) => panic!("expected deferred SlotNoSuchTag naming Absent, got {other:?}"),
     }
 
-    // The tag that IS present still binds cleanly.
-    g.bind(Present(2u32))
-        .expect("binding the present tag still succeeds");
+    // The tag that IS present binds and runs cleanly on its own.
+    let _present_co = ks
+        .scale_u32([N], seeded(&ctx, 1), slot!(Present))
+        .bind(Present(2u32))
+        .sync(&ctx)
+        .expect("binding the present tag still runs");
 }
 
 /// (12) **Fan-out across two bundle branches, one bind.** The SAME `slot!(K)`
@@ -658,8 +634,7 @@ fn fan_out_across_bundle_branches() {
 
     // ONE bind of K must fan out into BOTH branches (no early stop at branch 1).
     let (a_co, b_co) = g
-        .bind(K(3u32))
-        .expect("one bind of a fan-out scalar fills K in BOTH bundle branches")
+        .bind(K(3u32)) // one fan-out bind fills K in BOTH bundle branches
         .sync(&ctx)
         .expect("both branches' K bound → sync runs");
 
@@ -697,13 +672,12 @@ fn bind_checkout_into_slot_severs_source_adopts_target() {
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     // SOURCE graph: scale `slot!(Src)` by 2. One run yields a Checkout<DeviceSlice>
-    // whose home is the Src slot (Lent while the Checkout is alive).
-    let src_graph = ks.scale_u32([N], slot!(Src), 2u32);
-    let co = src_graph
-        .bind(Src(seeded(&ctx, 5))) // 5 * 2 = 10
-        .expect("bind Src")
-        .sync(&ctx)
-        .expect("source run");
+    // whose home is the Src slot (Lent while the Checkout is alive). Set-once bind
+    // (consuming) folded in; `src_graph` is re-`bind`'d (deferred error) below.
+    let src_graph = ks
+        .scale_u32([N], slot!(Src), 2u32)
+        .bind(Src(seeded(&ctx, 5))); // 5*2=10
+    let co = src_graph.sync(&ctx).expect("source run");
     let src_handle = handle_of(&*co); // identity of the buffer the Checkout holds
 
     // TARGET graph: scale `slot!(Dst)` by 3. Bind the Checkout DIRECTLY into Dst —
@@ -711,19 +685,21 @@ fn bind_checkout_into_slot_severs_source_adopts_target() {
     let dst_graph = ks.scale_u32([N], slot!(Dst), 3u32);
     let dst_co = dst_graph
         .bind(Dst(co)) // <-- Checkout bound into a slot: sever + adopt
-        .expect("bind Checkout into Dst (sever-and-adopt)")
         .sync(&ctx)
         .expect("target run");
 
-    // (a) The SOURCE slot is now Severed: a plain set-once `bind` on it must error
-    //     `SlotSevered` (the Checkout's home was severed by the bind above).
-    let err = bind_err(
-        src_graph.bind(Src(seeded(&ctx, 1))),
-        "Src must be Severed after its Checkout was bound away",
-    );
+    // (a) The SOURCE slot is now Severed: a plain set-once `bind` on it fails closed
+    //     at `sync`. `bind` is infallible now, so the `SlotSevered` is RECORDED, but a
+    //     bind onto a Severed cell leaves it Severed, so `check_ready` (state-first)
+    //     reports the completeness `SlotUnbound` before draining the sink. Both are
+    //     fail-closed catches — the point is Src was severed by the Checkout bind.
+    let err = src_graph
+        .bind(Src(seeded(&ctx, 1)))
+        .sync(&ctx)
+        .expect_err("Src must be Severed after its Checkout was bound away");
     assert!(
-        matches!(err, Error::SlotSevered(n) if n.contains("Src")),
-        "expected SlotSevered naming Src, got {err:?}"
+        matches!(&err, Error::SlotUnbound(n) | Error::SlotSevered(n) if n.contains("Src")),
+        "expected state-first SlotUnbound / recorded SlotSevered naming Src, got {err:?}"
     );
 
     // (b) The TARGET ran with the adopted buffer: 10 * 3 = 30, and it is the SAME

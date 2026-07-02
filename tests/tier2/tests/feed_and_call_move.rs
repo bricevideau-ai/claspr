@@ -1,22 +1,24 @@
-//! Engine-level proof for the unified `Tag(value)`/`Tag(pipe)` constructor,
-//! `call_move` / `bind_move`, and the [`SlotState::FedByPipe`] slot state (promoted
-//! from spike #194).
+//! Engine-level proof for the unified `Tag(value)`/`Tag(pipe)` constructor, the
+//! consuming set-once `bind` / `call` verbs, and the [`SlotState::FedByPipe`] slot
+//! state (promoted from spike #194).
 //!
 //! Three interlocking pieces are exercised here:
 //!
-//! - **`call_move`** — a CONSUMING, INFALLIBLE, mixed value-or-feed bind. It returns
-//!   the OWNED graph (so it chains and composes inside `and_then`) and DEFERS every
-//!   bind error to `sync` (an absent / unbound tag surfaces there as
-//!   `SlotUnbound`/`SlotNoSuchTag`, with nothing enqueued — the atomicity guarantee).
-//!   Contrast the fluent `call`, which errors EAGERLY.
+//! - **`bind` / `call`** — CONSUMING, INFALLIBLE, mixed value-or-feed set-once binds.
+//!   They return the OWNED graph (so they chain and compose inside `and_then`) and
+//!   DEFER every bind error to `sync` (an absent / unbound tag surfaces there as
+//!   `SlotUnbound`/`SlotNoSuchTag`, a conflicting set-once as `SlotConflict`, with
+//!   nothing enqueued — the atomicity guarantee). The fluent, EAGER-error verbs are
+//!   now `mutate_bind` / `mutate_call` (the reuse-loop set/change verbs); the
+//!   set-once verbs no longer have an eager form.
 //! - **the unified tag constructor** — `Tag(value)` binds a slot by value; the SAME
 //!   `Tag(pipe)` (fed a `Pipe` instead of a value) WIRES a `slot!(Tag)` to an UPSTREAM
 //!   pipe (a build-time `Handle`), installing `SlotState::FedByPipe` so the slot reads
 //!   whatever the upstream produced each run. The fed slot resolves DEFERRED (drains
 //!   the pipe at run time) and RE-ARMS every replay (the upstream refills the pipe).
 //!   There is no separate `feed(Tag, pipe)` verb — the pipe source IS the tag ctor.
-//! - **`bind_move`** — `call_move` used for currying (bind a subset now, the rest
-//!   later); it IS `call_move` under a currying-flavoured name.
+//! - **currying** — `call` binds ONLY the tags in its tuple, leaving the rest open
+//!   for a later `bind` / `call` (bind a subset now, the rest later).
 //!
 //! Uses the portable `add_u32` (3-output) / `scale_u32` (in-place, single-output)
 //! test kernels — NOT gray-scott.
@@ -53,39 +55,38 @@ slots! {
     B: DeviceSlice<u32>,
     Out: DeviceSlice<u32>,
     Buf: DeviceSlice<u32>,
-    // A tag the graph never declares — used to prove `call_move` DEFERS an absent
+    // A tag the graph never declares — used to prove `call` DEFERS an absent
     // tag to sync instead of erroring eagerly.
     Absent: DeviceSlice<u32>,
     // Downstream slot fed from an upstream pipe.
     Dst: DeviceSlice<u32>,
 }
 
-/// (1) `call_move` binds a graph's value slots, `sync` produces the correct data,
+/// (1) `call` binds a graph's value slots, `sync` produces the correct data,
 /// and the owned return chains further.
 #[test]
-fn call_move_binds_and_syncs() {
+fn call_binds_and_syncs() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    // out = a + b, all three as value slots, bound in ONE consuming call_move.
+    // out = a + b, all three as value slots, bound in ONE consuming call.
     // The owned graph is then `.and_then(download)`-chained (proving owned-return).
     let g = ks
         .add_u32([N], slot!(A), slot!(B), slot!(Out))
-        .call_move((A(seeded(&ctx, 2)), B(seeded(&ctx, 5)), Out(seeded(&ctx, 0))))
+        .call((A(seeded(&ctx, 2)), B(seeded(&ctx, 5)), Out(seeded(&ctx, 0))))
         // `add_u32`'s Handle is a 3-tuple of pipes; download the `out` pipe.
         .and_then(|(_a, _b, out)| download(out));
 
-    let out = g.sync(&ctx).expect("call_move sync");
+    let out = g.sync(&ctx).expect("call sync");
     assert!(
         out.iter().all(|&v| v == 7),
-        "call_move((A=2,B=5,Out=0)) then add: 2 + 5 = 7, got {:?}",
+        "call((A=2,B=5,Out=0)) then add: 2 + 5 = 7, got {:?}",
         &out[..8]
     );
 }
 
-/// (2) `call_move` an ABSENT tag → NO eager error (it is infallible); the error is
-/// DEFERRED to `sync`, with NOTHING enqueued. Contrast the fluent `call`, which
-/// errors eagerly.
+/// (2) `call` an ABSENT tag → NO eager error (it is consuming + infallible); the
+/// error is DEFERRED to `sync`, with NOTHING enqueued.
 ///
 /// NOTE: this graph is ALSO left with B/Out unbound, so `sync` has two deferred
 /// reasons to fail — the RECORDED `SlotNoSuchTag(Absent)` (record-don't-drop, the
@@ -94,16 +95,16 @@ fn call_move_binds_and_syncs() {
 /// (the more precise diagnosis of the typo) is what surfaces. Before the fix the
 /// absent tag was silently dropped.
 #[test]
-fn call_move_defers_absent_tag_to_sync() {
+fn call_defers_absent_tag_to_sync() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     // Bind only `Absent` (a tag NOT in the graph) plus real A — leave B/Out unbound.
-    // call_move RECORDS the SlotNoSuchTag(Absent) into the deferred sink and cannot
+    // `call` RECORDS the SlotNoSuchTag(Absent) into the deferred sink and cannot
     // bind B/Out; it is infallible, so NOTHING errors HERE (deferred to sync).
     let g = ks
         .add_u32([N], slot!(A), slot!(B), slot!(Out))
-        .call_move((A(seeded(&ctx, 2)), Absent(seeded(&ctx, 9))));
+        .call((A(seeded(&ctx, 2)), Absent(seeded(&ctx, 9))));
 
     // The deferred catch: sync fails closed (nothing enqueued). The recorded
     // absent-tag error surfaces (a completeness SlotUnbound would also be acceptable).
@@ -114,12 +115,17 @@ fn call_move_defers_absent_tag_to_sync() {
         Err(e) => panic!("expected SlotNoSuchTag/SlotUnbound at sync, got {e:?}"),
     }
 
-    // And the fluent `call` errors EAGERLY on the same absent tag (the contrast).
-    let g2 = ks.add_u32([N], slot!(A), slot!(B), slot!(Out));
-    match g2.call((A(seeded(&ctx, 2)), Absent(seeded(&ctx, 9)))) {
-        Ok(_) => panic!("fluent call must error eagerly on an absent tag"),
-        Err(Error::SlotNoSuchTag(_)) => { /* expected: eager error */ }
-        Err(e) => panic!("expected eager SlotNoSuchTag from call, got {e:?}"),
+    // The single-tag `bind` form of the SAME absent tag likewise DEFERS (infallible):
+    // build it, then assert `sync` surfaces the recorded SlotNoSuchTag.
+    let g2 = ks
+        .add_u32([N], slot!(A), slot!(B), slot!(Out))
+        .bind(A(seeded(&ctx, 2)))
+        .bind(Absent(seeded(&ctx, 9)));
+    match g2.sync(&ctx) {
+        Ok(_) => panic!("sync must fail: Absent recorded via bind + B/Out unbound (deferred)"),
+        Err(Error::SlotNoSuchTag(_)) => { /* expected: recorded absent-tag catch */ }
+        Err(Error::SlotUnbound(_)) => { /* also acceptable: completeness catch */ }
+        Err(e) => panic!("expected SlotNoSuchTag/SlotUnbound at sync, got {e:?}"),
     }
 }
 
@@ -145,7 +151,7 @@ fn feed_slot_from_pipe_resolves_deferred_and_rearms() {
         .and_then(|up_pipe: Pipe<DeviceSlice<u32>>| {
             // Downstream reads the upstream buffer via the fed slot, scales ×3.
             ks.scale_u32([N], slot!(Dst), 3u32)
-                .call_move((Dst(up_pipe),)) // Dst := FedByPipe(up_pipe)
+                .call((Dst(up_pipe),)) // Dst := FedByPipe(up_pipe)
                 .and_then(download)
         });
 
@@ -181,10 +187,10 @@ fn feed_slot_check_ready_ok() {
     // check_ready on the FedByPipe slot lets sync proceed.
     let g = ks
         .scale_u32([N], slot!(Buf), 4u32)
-        .call_move((Buf(seeded(&ctx, 1)),)) // 1 -> 4
+        .call((Buf(seeded(&ctx, 1)),)) // 1 -> 4
         .and_then(|up_pipe: Pipe<DeviceSlice<u32>>| {
             ks.scale_u32([N], slot!(Dst), 1u32) // ×1: pass-through, isolates readiness
-                .call_move((Dst(up_pipe),))
+                .call((Dst(up_pipe),))
                 .and_then(download)
         });
 
@@ -221,7 +227,7 @@ fn crossed_feed_swap() {
                     // `add_u32`'s Handle is a 3-tuple of pipes; destructure to the
                     // `out` pipe and download it.
                     ks.add_u32([N], slot!(A), slot!(B), slot!(Out))
-                        .call_move((A(pipe_x), B(pipe_y), Out(seed_out)))
+                        .call((A(pipe_x), B(pipe_y), Out(seed_out)))
                         .and_then(|(_a, _b, out)| download(out))
                 })
         });
@@ -244,29 +250,29 @@ fn crossed_feed_swap() {
     );
 }
 
-/// (7) SILENT-SWALLOW REGRESSION — a CONFLICTING set-once `call_move` onto an
+/// (7) SILENT-SWALLOW REGRESSION — a CONFLICTING set-once `call` onto an
 /// already-`Bound` slot must be RECORDED and surfaced at `sync` (record-don't-drop),
 /// NOT dropped so the graph runs with the OLD value.
 ///
-/// `call_move` is set-once (folds through `bind`). Binding `Buf` once leaves it
-/// `Bound`; a SECOND `call_move` of a DIFFERENT buffer onto the same slot is a
+/// `call` is set-once (folds through `bind`). Binding `Buf` once leaves it
+/// `Bound`; a SECOND `call` of a DIFFERENT buffer onto the same slot is a
 /// `SlotConflict`. Before the fix that error was `let _ =`-dropped and, because the
 /// cell stayed `Bound` to the first value, `check_ready` passed and the graph RAN
 /// with the OLD value — the conflicting bind vanished silently. Now the deferred sink
 /// carries the `SlotConflict` and `sync` fails closed with NOTHING enqueued.
 #[test]
-fn call_move_conflict_surfaces_at_sync_not_silent() {
+fn call_conflict_surfaces_at_sync_not_silent() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     // scale_u32(slot!(Buf), 4): Buf is a single in-place slot. Bind it to a buffer of
     // 1s (valid), then CONFLICT-bind it to a buffer of 9s via a second set-once
-    // call_move. The graph is otherwise complete (a satisfiable slot), so the OLD
+    // call. The graph is otherwise complete (a satisfiable slot), so the OLD
     // silent-swallow path would have run 1*4 = 4.
     let g = ks
         .scale_u32([N], slot!(Buf), 4u32)
-        .call_move((Buf(seeded(&ctx, 1)),)) // Buf := Bound(1s)
-        .call_move((Buf(seeded(&ctx, 9)),)) // CONFLICT: set-once onto Bound → recorded
+        .bind(Buf(seeded(&ctx, 1))) // Buf := Bound(1s)
+        .bind(Buf(seeded(&ctx, 9))) // CONFLICT: set-once onto Bound → recorded
         .and_then(download);
 
     match g.sync(&ctx) {
@@ -281,7 +287,7 @@ fn call_move_conflict_surfaces_at_sync_not_silent() {
     }
 }
 
-/// (8) SILENT-SWALLOW REGRESSION — an ABSENT/typo'd tag in `call_move` while the
+/// (8) SILENT-SWALLOW REGRESSION — an ABSENT/typo'd tag in `call` while the
 /// REAL slots ARE satisfiable must be RECORDED and surfaced at `sync` as
 /// `SlotNoSuchTag`, NOT dropped so the graph silently runs.
 ///
@@ -290,15 +296,15 @@ fn call_move_conflict_surfaces_at_sync_not_silent() {
 /// has NO cell of its own, so it is recorded onto the first real slot's sink and
 /// drained by `check_ready`.
 #[test]
-fn call_move_absent_tag_surfaces_when_real_slots_satisfied() {
+fn call_absent_tag_surfaces_when_real_slots_satisfied() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     // add_u32(A, B, Out): bind ALL THREE real slots (fully satisfiable) PLUS a typo'd
-    // Absent tag in the SAME call_move. The old path would drop Absent and run 2+5=7.
+    // Absent tag in the SAME call. The old path would drop Absent and run 2+5=7.
     let g = ks
         .add_u32([N], slot!(A), slot!(B), slot!(Out))
-        .call_move((
+        .call((
             A(seeded(&ctx, 2)),
             B(seeded(&ctx, 5)),
             Out(seeded(&ctx, 0)),
@@ -317,23 +323,23 @@ fn call_move_absent_tag_surfaces_when_real_slots_satisfied() {
     }
 }
 
-/// (9) REGRESSION — a fully VALID `call_move` still syncs correctly after the
+/// (9) REGRESSION — a fully VALID `call` still syncs correctly after the
 /// record-don't-drop change (the sink stays empty, so `check_ready` is unaffected).
 #[test]
-fn call_move_valid_still_syncs_after_fix() {
+fn call_valid_still_syncs_after_fix() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     let g = ks
         .add_u32([N], slot!(A), slot!(B), slot!(Out))
-        .call_move((A(seeded(&ctx, 3)), B(seeded(&ctx, 4)), Out(seeded(&ctx, 0))))
+        .call((A(seeded(&ctx, 3)), B(seeded(&ctx, 4)), Out(seeded(&ctx, 0))))
         .and_then(|(_a, _b, out)| download(out));
 
     // Run twice: proves the empty-sink reuse path is intact (re-sync unchanged).
-    let r1 = g.sync(&ctx).expect("valid call_move sync 1");
+    let r1 = g.sync(&ctx).expect("valid call sync 1");
     assert!(r1.iter().all(|&v| v == 7), "3 + 4 = 7, got {:?}", &r1[..8]);
     drop(r1);
-    let r2 = g.sync(&ctx).expect("valid call_move sync 2 (re-arm)");
+    let r2 = g.sync(&ctx).expect("valid call sync 2 (re-arm)");
     assert!(
         r2.iter().all(|&v| v == 7),
         "re-sync must match: 7, got {:?}",
@@ -341,27 +347,27 @@ fn call_move_valid_still_syncs_after_fix() {
     );
 }
 
-/// (6) `bind_move` currying: bind a SUBSET of the graph's slots via `bind_move`, then
-/// bind the REST via a second `call_move`, then `sync` — correct data. Proves
-/// call_move-is-partial (unbound slots left open for a later bind).
+/// (6) `bind` currying: bind a SUBSET of the graph's slots via `bind`, then
+/// bind the REST via a second `call`, then `sync` — correct data. Proves
+/// call-is-partial (unbound slots left open for a later bind).
 #[test]
-fn bind_move_currying() {
+fn bind_currying() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    // Bind A now (bind_move), then B + Out later (call_move). All three needed by
-    // sync; the partial first bind leaves B/Out open, filled by the second.
+    // Bind A now (single-tag `bind`), then B + Out later (`call`). All three needed
+    // by sync; the partial first bind leaves B/Out open, filled by the second.
     let g = ks
         .add_u32([N], slot!(A), slot!(B), slot!(Out))
-        .bind_move((A(seeded(&ctx, 10)),)) // partial: only A
-        .call_move((B(seeded(&ctx, 20)), Out(seeded(&ctx, 0)))) // the rest
+        .bind(A(seeded(&ctx, 10))) // partial: only A
+        .call((B(seeded(&ctx, 20)), Out(seeded(&ctx, 0)))) // the rest
         // `add_u32`'s Handle is a 3-tuple of pipes; download the `out` pipe.
         .and_then(|(_a, _b, out)| download(out));
 
     let out = g.sync(&ctx).expect("curried sync");
     assert!(
         out.iter().all(|&v| v == 30),
-        "bind_move(A=10) then call_move(B=20,Out): 10 + 20 = 30, got {:?}",
+        "bind(A=10) then call(B=20,Out): 10 + 20 = 30, got {:?}",
         &out[..8]
     );
 }

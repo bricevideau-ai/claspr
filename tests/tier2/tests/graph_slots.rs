@@ -1,4 +1,4 @@
-//! Typed-slots + verb-2×2 proof test (step (b): `slots!` / `slot!` /
+//! Typed-slots + verb-2×2 proof test (`slots!` / `slot!` /
 //! `g.bind` / `g.mutate_bind` / `g.call`).
 //!
 //! A reusable graph can carry **unbound typed holes** — `slot!(Tag)` — that plug
@@ -6,28 +6,35 @@
 //! Binding a slot folds a `TypeId → resource` binding into the graph's tri-state
 //! slot cells. The set-binding verb 2×2 governs what happens at bind time:
 //!
-//! |               | `bind` (set-once)        | `mutate_bind` (set/change) |
-//! |---------------|--------------------------|----------------------------|
-//! | Unbound       | fill                     | fill                       |
-//! | Bound, `==`   | no-op (idempotent)       | overwrite                  |
-//! | Bound, `≠`    | `Err(SlotConflict)`      | overwrite                  |
-//! | Lent          | `Err(SlotCheckedOut)`    | `Err(SlotCheckedOut)`      |
-//! | Severed       | `Err(SlotSevered)`       | fill (re-arm)              |
+//! |               | `bind`/`call` (set-once) | `mutate_bind`/`mutate_call` (set/change) |
+//! |---------------|--------------------------|------------------------------------------|
+//! | Unbound       | fill                     | fill                                     |
+//! | Bound, `==`   | no-op (idempotent)       | overwrite                                |
+//! | Bound, `≠`    | `SlotConflict`           | overwrite                                |
+//! | Lent          | `SlotCheckedOut`         | `Err(SlotCheckedOut)`                    |
+//! | Severed       | `SlotSevered`            | fill (re-arm)                            |
+//!
+//! The set-once verbs (`bind`/`call`) are **consuming + infallible**: they take
+//! `self`, return the owned graph, and RECORD their errors (`SlotConflict` /
+//! `SlotCheckedOut` / `SlotSevered` / `SlotNoSuchTag`) into the graph's deferred
+//! sink, surfacing them at `sync` (before any enqueue — nothing runs). The
+//! set/change verbs (`mutate_bind`/`mutate_call`) stay **fluent + EAGER** (`&self`,
+//! `Result<&Self>`) — the reuse-loop verbs whose errors fire at the call site.
 //!
 //! Equality is **buffer-handle identity** (`SlotEq`), not byte-equal contents.
 //! Completeness (every slot bound) is enforced only at `sync` (runtime): an
 //! unbound (or severed) slot is `Error::SlotUnbound`. After a run the Checkout
 //! returns the buffer to its slot cell (re-arm `Lent → Bound`), so a bound graph
 //! re-runs; `into_inner` severs it (`Lent → Severed`) — a state a set-once `bind`
-//! rejects (`SlotSevered`) and only `mutate_bind` re-arms. These tests lock the
-//! matrix plus the kept step-(b) properties:
+//! rejects (`SlotSevered`, deferred) and only `mutate_bind` re-arms. These tests
+//! lock the matrix plus the kept properties:
 //!
-//! (a) `slot!` + `g.bind(Tag(v))?.sync()` produces correct data.
+//! (a) `slot!` + `g.bind(Tag(v)).sync()` produces correct data.
 //! (b) order-free — chained `bind`s AND the tuple `call((A,B,Out))`.
 //! (c) re-run a bound graph twice (the slot re-arms like a concrete cell).
 //! (d) an unbound slot makes `sync` return the "slot unbound" `Err`.
 //! (e) the verb 2×2: idempotent bind, conflict, mutate, checked-out, sever
-//!     (`bind` after sever rejects with `SlotSevered`; `mutate_bind` re-arms).
+//!     (`bind` after sever surfaces `SlotSevered` at sync; `mutate_bind` re-arms).
 
 use claspr::eager::{DeviceOpExt, download};
 use claspr::{Context, DeviceSlice, Error};
@@ -59,9 +66,11 @@ slots! {
     SharedA: std::sync::Arc<DeviceSlice<u32>>,
 }
 
-/// Extract the [`Error`] from a `bind`/`mutate_bind`/`call` result, asserting it
-/// failed. The Ok arm is `&Op` (the graph), which is NOT `Debug`, so the usual
-/// `expect_err` doesn't apply — drop the Ok value and pull the error out.
+/// Extract the [`Error`] from a `mutate_bind`/`mutate_call` result, asserting it
+/// failed. Those fluent verbs return `Result<&Op>`; the Ok arm is `&Op` (the graph),
+/// which is NOT `Debug`, so the usual `expect_err` doesn't apply — drop the Ok value
+/// and pull the error out. (The set-once `bind`/`call` are infallible now; their
+/// errors are asserted at `sync` instead.)
 fn bind_err<G>(r: claspr::Result<&G>, msg: &str) -> Error {
     match r {
         Ok(_) => panic!("{msg}"),
@@ -89,11 +98,7 @@ fn slot_bind_then_sync_produces_data() {
     let g = ks.scale_u32([N], slot!(Buf), 2u32).and_then(download);
 
     let b = seeded(&ctx, 3); // 3 * 2 = 6
-    let out = g
-        .bind(Buf(b))
-        .expect("bind")
-        .sync(&ctx)
-        .expect("bound sync");
+    let out = g.bind(Buf(b)).sync(&ctx).expect("bound sync");
     assert!(
         out.iter().all(|&v| v == 6),
         "scale(slot=3, 2) should be 6, got {:?}",
@@ -113,11 +118,8 @@ fn slot_bind_is_order_free() {
     let forward = ks.add_u32([N], slot!(A), slot!(B), slot!(Out));
     let (_a, _b, out_co) = forward
         .bind(A(seeded(&ctx, 2)))
-        .expect("bind A")
         .bind(B(seeded(&ctx, 5)))
-        .expect("bind B")
         .bind(Out(seeded(&ctx, 0)))
-        .expect("bind Out")
         .sync(&ctx)
         .expect("forward-order sync");
     let mut r1 = vec![0u32; N];
@@ -128,11 +130,8 @@ fn slot_bind_is_order_free() {
     let reverse = ks.add_u32([N], slot!(A), slot!(B), slot!(Out));
     let (_a, _b, out_co) = reverse
         .bind(Out(seeded(&ctx, 0)))
-        .expect("bind Out")
         .bind(B(seeded(&ctx, 5)))
-        .expect("bind B")
         .bind(A(seeded(&ctx, 2)))
-        .expect("bind A")
         .sync(&ctx)
         .expect("reverse-order sync");
     let mut r2 = vec![0u32; N];
@@ -147,7 +146,6 @@ fn slot_bind_is_order_free() {
     let tupled = ks.add_u32([N], slot!(A), slot!(B), slot!(Out));
     let (_a, _b, out_co) = tupled
         .call((A(seeded(&ctx, 2)), B(seeded(&ctx, 5)), Out(seeded(&ctx, 0))))
-        .expect("call")
         .sync(&ctx)
         .expect("call sync");
     let mut r3 = vec![0u32; N];
@@ -169,11 +167,12 @@ fn bound_slot_graph_reruns() {
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     // No download: the output IS the buffer, so its Checkout re-arms the slot.
-    let g = ks.scale_u32([N], slot!(Buf), 2u32);
-
+    // Set-once bind (consuming) folded into `g`; re-`sync`'d by `&` below.
     let b = seeded(&ctx, 3);
+    let g = ks.scale_u32([N], slot!(Buf), 2u32).bind(Buf(b));
+
     // Run 1: 3 -> 6. Drop the Checkout to re-arm the slot.
-    let co1 = g.bind(Buf(b)).expect("bind").sync(&ctx).expect("run 1");
+    let co1 = g.sync(&ctx).expect("run 1");
     drop(co1);
 
     // Run 2 (already bound, slot re-armed): 6 -> 12, in place.
@@ -213,11 +212,7 @@ fn unbound_slot_sync_errors() {
     }
 
     // The same graph runs once bound — proves the slot, not the graph, was at fault.
-    let out = g
-        .bind(Buf(seeded(&ctx, 4)))
-        .expect("bind")
-        .sync(&ctx)
-        .expect("now bound");
+    let out = g.bind(Buf(seeded(&ctx, 4))).sync(&ctx).expect("now bound");
     assert!(
         out.iter().all(|&v| v == 8),
         "4 * 2 = 8, got {:?}",
@@ -246,21 +241,17 @@ fn bind_same_buffer_is_idempotent() {
     }
 
     // out = sharedA + b. `a` is a read-only arg (accepts `Arc<DeviceSlice>`).
-    let g = ks.add_u32([N], slot!(SharedA), slot!(B), slot!(Out));
-
     let shared = Arc::new(seeded(&ctx, 2));
     let h_shared = handle_of(&*shared); // the FIRST-bound buffer's identity.
     // First bind, then bind the SAME buffer again (a second `Arc::clone`): equal
-    // handle → `bind` is idempotent, NOT a conflict.
-    g.bind(SharedA(Arc::clone(&shared))).expect("first bind");
-    g.bind(SharedA(Arc::clone(&shared)))
-        .expect("second bind of the SAME buffer is an idempotent no-op");
-
-    let (a_co, _b, out_co) = g
+    // handle → set-once `bind` is idempotent (records nothing), NOT a conflict. The
+    // duplicate + the remaining binds fold into ONE consuming chain.
+    let (a_co, _b, out_co) = ks
+        .add_u32([N], slot!(SharedA), slot!(B), slot!(Out))
+        .bind(SharedA(Arc::clone(&shared)))
+        .bind(SharedA(Arc::clone(&shared))) // idempotent no-op (same buffer)
         .bind(B(seeded(&ctx, 5)))
-        .expect("bind B")
         .bind(Out(seeded(&ctx, 0)))
-        .expect("bind Out")
         .sync(&ctx)
         .expect("sync after idempotent rebind");
 
@@ -282,34 +273,37 @@ fn bind_same_buffer_is_idempotent() {
     );
 }
 
-/// (e2) `bind` on a Bound slot with a **different** buffer is `Err(SlotConflict)`;
-/// `mutate_bind` changes it; the new buffer drives the result.
+/// (e2) A set-once `bind` on a Bound slot with a **different** buffer is a
+/// `SlotConflict` — now RECORDED (consuming, infallible) and surfaced DEFERRED at
+/// `sync` (nothing enqueued). `mutate_bind` (fluent, EAGER) changes it; the new
+/// buffer drives the result.
 #[test]
 fn bind_conflict_then_mutate() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    let g = ks.scale_u32([N], slot!(Buf), 2u32).and_then(download);
-
-    // Bind to buffer a (seeded 3). Slot is now Bound(a) (download consumes the
-    // value, but the slot's cell is re-armed only on Checkout drop — so bind the
-    // slot WITHOUT running to keep it Bound for the conflict check).
-    g.bind(Buf(seeded(&ctx, 3))).expect("first bind");
-
-    // A different buffer via `bind` → conflict (set-once contract).
-    let err = bind_err(
-        g.bind(Buf(seeded(&ctx, 10))),
-        "different-value bind must conflict",
-    );
-    match err {
-        Error::SlotConflict(name) => assert!(
+    // The DEFERRED conflict path, on its own graph: set-once bind buffer a (seeded 3),
+    // then a set-once bind of a DIFFERENT buffer (seeded 10) onto the now-Bound slot.
+    // The `SlotConflict` is recorded and must surface at `sync` — nothing runs.
+    let conflict = ks
+        .scale_u32([N], slot!(Buf), 2u32)
+        .and_then(download)
+        .bind(Buf(seeded(&ctx, 3))) // Buf := Bound(3s)
+        .bind(Buf(seeded(&ctx, 10))); // CONFLICT: set-once onto Bound → recorded
+    match conflict.sync(&ctx) {
+        Ok(_) => panic!("conflicting set-once bind must fail at sync (deferred)"),
+        Err(Error::SlotConflict(name)) => assert!(
             name.contains("Buf"),
             "conflict should name the tag, got {name:?}"
         ),
-        other => panic!("expected SlotConflict, got {other:?}"),
+        Err(other) => panic!("expected deferred SlotConflict, got {other:?}"),
     }
 
-    // `mutate_bind` overwrites the slot to the new buffer (seeded 10) — allowed.
+    // The EAGER recovery path, on a fresh graph: `mutate_bind` overwrites a Bound
+    // slot (seeded 3 → seeded 10), and the new buffer drives the result.
+    let g = ks.scale_u32([N], slot!(Buf), 2u32).and_then(download);
+    g.mutate_bind(Buf(seeded(&ctx, 3)))
+        .expect("first mutate_bind");
     let out = g
         .mutate_bind(Buf(seeded(&ctx, 10)))
         .expect("mutate_bind changes a bound slot")
@@ -355,29 +349,23 @@ fn mutate_bind_fills_unbound_in_loop() {
 
 /// (e4) **Binding while checked out is a hard error.** Use an in-place op with no
 /// download so the slot buffer IS the checked-out output. While the Checkout is
-/// live, both `bind` and `mutate_bind` to a different buffer are
-/// `Err(SlotCheckedOut)`; after `drop(co)` the slot re-arms and a rebind works.
+/// live, both verbs reject a re-bind to a different buffer with `SlotCheckedOut` —
+/// `mutate_bind` EAGERLY (fluent), a set-once `bind` DEFERRED (recorded, surfaced at
+/// `sync`). After `drop(co)` the slot re-arms and a rebind works.
 #[test]
 fn bind_while_checked_out_errors() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     // In-place scale, NO download: the Checkout holds the slot's buffer (Lent).
-    let g = ks.scale_u32([N], slot!(Buf), 2u32);
-
+    // Set-once bind (consuming) folded into `g`; re-armed via `mutate_bind` below.
     let a = seeded(&ctx, 3);
-    let co = g.bind(Buf(a)).expect("bind a").sync(&ctx).expect("run");
+    let g = ks.scale_u32([N], slot!(Buf), 2u32).bind(Buf(a));
+    let co = g.sync(&ctx).expect("run");
     // `co` is live → the slot is `Lent`.
 
-    // Both verbs reject a re-bind while the buffer is in the caller's hands.
-    let e_bind = bind_err(
-        g.bind(Buf(seeded(&ctx, 9))),
-        "bind while checked out must error",
-    );
-    assert!(
-        matches!(e_bind, Error::SlotCheckedOut(n) if n.contains("Buf")),
-        "expected SlotCheckedOut from bind, got {e_bind:?}"
-    );
+    // `mutate_bind` (fluent, EAGER) rejects a re-bind while the buffer is in the
+    // caller's hands.
     let e_mut = bind_err(
         g.mutate_bind(Buf(seeded(&ctx, 9))),
         "mutate_bind while checked out must error",
@@ -386,6 +374,28 @@ fn bind_while_checked_out_errors() {
         matches!(e_mut, Error::SlotCheckedOut(n) if n.contains("Buf")),
         "expected SlotCheckedOut from mutate_bind, got {e_mut:?}"
     );
+
+    // A set-once `bind` while checked out is DEFERRED — prove it fails closed at
+    // `sync` on a separate probe graph held Lent the same way (a consuming set-once
+    // bind would move `g`, which we still need for the mutate re-arm below). The
+    // recorded `SlotCheckedOut` and the state-first busy-`Lent` `SlotUnbound` are BOTH
+    // correct "fails closed, nothing ran" catches (state is drained before the sink),
+    // so accept either — the point is the errored bind never silently runs.
+    {
+        let probe = ks
+            .scale_u32([N], slot!(Buf), 2u32)
+            .bind(Buf(seeded(&ctx, 3)));
+        let probe_co = probe.sync(&ctx).expect("probe run"); // slot now Lent
+        let err = probe
+            .bind(Buf(seeded(&ctx, 9)))
+            .sync(&ctx)
+            .expect_err("set-once bind while checked out must error at sync");
+        assert!(
+            matches!(&err, Error::SlotCheckedOut(n) | Error::SlotUnbound(n) if n.contains("Buf")),
+            "expected deferred SlotCheckedOut or busy SlotUnbound from bind, got {err:?}"
+        );
+        drop(probe_co);
+    }
 
     // Drop the Checkout → slot re-arms (`Lent → Bound`). Now `mutate_bind` to a
     // fresh buffer is allowed and drives the result.
@@ -406,40 +416,44 @@ fn bind_while_checked_out_errors() {
 
 /// (e5) **`into_inner` severs the slot to `Severed`.** After a run, taking the
 /// value out (rather than re-arming) leaves the slot SEVERED — empty, but NOT
-/// virgin: it was once bound and the caller deliberately kept its value. So the
-/// set-once `bind` of a DIFFERENT buffer is now `Err(SlotSevered)` (re-providing a
-/// buffer is a CHANGE, not a first declaration); only `mutate_bind` may re-arm it,
-/// and the NEW buffer then drives the result.
-///
-/// (This replaces the old `into_inner_severs_slot_to_unbound`, which asserted a
-/// plain `bind` after sever SUCCEEDS — the bug the 4th `Severed` state fixes.)
+/// virgin: it was once bound and the caller deliberately kept its value. So a
+/// set-once `bind` of a DIFFERENT buffer is a `SlotSevered` (re-providing a buffer is
+/// a CHANGE, not a first declaration) — now RECORDED (consuming, infallible) and
+/// fails closed at `sync` (the still-`Severed` cell reports the completeness
+/// `SlotUnbound` state-first, or the recorded `SlotSevered` if state were satisfied);
+/// only `mutate_bind` may re-arm it, and the NEW buffer then drives the result.
 #[test]
 fn into_inner_severs_slot_then_bind_rejected_mutate_rearms() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    let g = ks.scale_u32([N], slot!(Buf), 2u32);
+    // (a) The DEFERRED reject path, on a probe graph: set-once bind, run, sever, then
+    // a set-once bind of a DIFFERENT buffer onto the now-`Severed` slot must fail
+    // closed at `sync` (nothing runs). A consuming set-once bind moves the graph, so
+    // this uses its own probe; the `mutate_bind` re-arm is proven on `g` below.
+    {
+        let probe = ks
+            .scale_u32([N], slot!(Buf), 2u32)
+            .bind(Buf(seeded(&ctx, 3)));
+        let kept = probe.sync(&ctx).expect("probe run").into_inner(); // sever
+        drop(kept);
+        let err = probe
+            .bind(Buf(seeded(&ctx, 99)))
+            .sync(&ctx)
+            .expect_err("bind after sever must fail closed at sync (slot is Severed)");
+        assert!(
+            matches!(&err, Error::SlotUnbound(n) | Error::SlotSevered(n) if n.contains("Buf")),
+            "expected state-first SlotUnbound / recorded SlotSevered, got {err:?}"
+        );
+    }
 
+    // (b) `mutate_bind` of a DIFFERENT buffer re-arms a severed slot, and the NEW
+    // buffer drives the result — proven on `g`.
     let a = seeded(&ctx, 3);
-    let co = g.bind(Buf(a)).expect("bind a").sync(&ctx).expect("run");
-    // Sever: keep the value, leave the slot `Severed` (NOT `Lent`, NOT re-armed,
-    // NOT virgin-`Unbound`).
-    let kept = co.into_inner();
+    let g = ks.scale_u32([N], slot!(Buf), 2u32).bind(Buf(a));
+    let co = g.sync(&ctx).expect("run");
+    let kept = co.into_inner(); // sever g's slot
     drop(kept);
-
-    // (a) A set-once `bind` of a DIFFERENT buffer must now REJECT — the slot is
-    // Severed, so re-providing a buffer is a change, not a first declaration.
-    let err = bind_err(
-        g.bind(Buf(seeded(&ctx, 99))),
-        "bind after sever must error (slot is Severed, not virgin)",
-    );
-    assert!(
-        matches!(err, Error::SlotSevered(n) if n.contains("Buf")),
-        "expected SlotSevered from bind after sever, got {err:?}"
-    );
-
-    // (b) `mutate_bind` of a DIFFERENT buffer re-arms the severed slot, and the
-    // NEW buffer drives the result.
     let out = g
         .mutate_bind(Buf(seeded(&ctx, 7)))
         .expect("mutate_bind re-arms a severed slot")
@@ -466,14 +480,12 @@ fn virgin_bind_ok_and_severed_resync_without_rebind_errors() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    let g = ks.scale_u32([N], slot!(Buf), 2u32);
-
-    // Virgin path: a plain `bind` on a never-bound slot fills it and runs.
-    let co = g
-        .bind(Buf(seeded(&ctx, 4)))
-        .expect("virgin slot accepts a plain bind")
-        .sync(&ctx)
-        .expect("run over virgin-bound slot");
+    // Virgin path: a plain `bind` on a never-bound slot fills it and runs. Set-once
+    // bind (consuming) folded into `g`; `g` is re-`sync`'d by `&` below.
+    let g = ks
+        .scale_u32([N], slot!(Buf), 2u32)
+        .bind(Buf(seeded(&ctx, 4)));
+    let co = g.sync(&ctx).expect("run over virgin-bound slot");
     // Sever it (keep the value), leaving the slot `Severed`.
     let kept = co.into_inner();
     drop(kept);
@@ -491,27 +503,30 @@ fn virgin_bind_ok_and_severed_resync_without_rebind_errors() {
 }
 
 /// (e6) A **conflicting element inside a `call`** errors (the multi-fill inherits
-/// the set-once contract per element).
+/// the set-once contract per element). `call` is consuming + infallible, so the
+/// `SlotConflict` is RECORDED and surfaces DEFERRED at `sync`: the conflicting A
+/// leaves its cell `Bound` to the OLD value while B/Out bind fine, so every cell is
+/// satisfiable and `check_ready` drains the recorded conflict (nothing runs).
 #[test]
 fn call_with_conflicting_element_errors() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    let g = ks.add_u32([N], slot!(A), slot!(B), slot!(Out));
+    // Pre-bind A to one buffer, then a `call` whose A element conflicts with it;
+    // B/Out elements bind fine. Folded into one consuming chain.
+    let g = ks
+        .add_u32([N], slot!(A), slot!(B), slot!(Out))
+        .bind(A(seeded(&ctx, 1))) // A := Bound(1s)
+        .call((A(seeded(&ctx, 2)), B(seeded(&ctx, 5)), Out(seeded(&ctx, 0))));
 
-    // Pre-bind A to one buffer (no run, so A stays Bound).
-    g.bind(A(seeded(&ctx, 1))).expect("pre-bind A");
-
-    // A `call` whose A element conflicts with the existing A binding errors;
-    // B/Out elements bind fine, but the conflicting A stops the fold.
-    let err = bind_err(
-        g.call((A(seeded(&ctx, 2)), B(seeded(&ctx, 5)), Out(seeded(&ctx, 0)))),
-        "call with a conflicting element must error",
-    );
-    assert!(
-        matches!(err, Error::SlotConflict(n) if n.contains("A")),
-        "expected SlotConflict on A, got {err:?}"
-    );
+    match g.sync(&ctx) {
+        Ok(_) => panic!("call with a conflicting element must fail at sync (deferred)"),
+        Err(Error::SlotConflict(n)) => assert!(
+            n.contains("A"),
+            "expected SlotConflict on A, got name {n:?}"
+        ),
+        Err(other) => panic!("expected deferred SlotConflict, got {other:?}"),
+    }
 }
 
 // ── B2: all-or-nothing (probe before sever) ─────────────────────────────────
@@ -553,18 +568,11 @@ fn call_absent_tag_does_not_sever_other_sources() {
 
     // Two independent source graphs producing co_a (home = ga's A slot) and
     // co_b (home = gb's B slot); both slots are `Lent` while the Checkouts live.
-    let ga = scale_src!(ks, A);
-    let gb = scale_src!(ks, B);
-    let co_a = ga
-        .call((A(seeded(&ctx, 7)),))
-        .expect("bind A")
-        .sync(&ctx)
-        .expect("ga sync");
-    let co_b = gb
-        .call((B(seeded(&ctx, 9)),))
-        .expect("bind B")
-        .sync(&ctx)
-        .expect("gb sync");
+    // Set-once bind (consuming) folded in; each source is re-`sync`'d by `&` below.
+    let ga = scale_src!(ks, A).bind(A(seeded(&ctx, 7)));
+    let gb = scale_src!(ks, B).bind(B(seeded(&ctx, 9)));
+    let co_a = ga.sync(&ctx).expect("ga sync");
+    let co_b = gb.sync(&ctx).expect("gb sync");
 
     // Target graph carries `Buf` — NEITHER A NOR B. `mutate_call((A(co_a),
     // B(co_b)))` must reject on the FIRST (absent) element, A.
@@ -603,22 +611,19 @@ fn call_checked_out_element_does_not_sever_others() {
 
     // Target graph with two slots A and B; sync once with both bound. Keep the
     // A Checkout ALIVE (external) so A stays `Lent`; re-arm B (drop its Checkout).
-    let g = ks.add_u32([N], slot!(A), slot!(B), slot!(Out));
-    let (a_live, b_co, out_co) = g
-        .call((A(seeded(&ctx, 1)), B(seeded(&ctx, 2)), Out(seeded(&ctx, 0))))
-        .expect("initial bind")
-        .sync(&ctx)
-        .expect("initial sync");
+    // Set-once bind (consuming) folded into `g`; `g` is `mutate_call`'d by `&` below.
+    let g = ks.add_u32([N], slot!(A), slot!(B), slot!(Out)).call((
+        A(seeded(&ctx, 1)),
+        B(seeded(&ctx, 2)),
+        Out(seeded(&ctx, 0)),
+    ));
+    let (a_live, b_co, out_co) = g.sync(&ctx).expect("initial sync");
     drop(b_co); // B re-arms (Lent → Bound); `a_live` stays alive → A stays Lent.
     drop(out_co); // Out re-arms too.
 
     // An independent source graph producing co_b (home = gb's B slot), Lent.
-    let gb = scale_src!(ks, B);
-    let co_b = gb
-        .call((B(seeded(&ctx, 5)),))
-        .expect("bind gb B")
-        .sync(&ctx)
-        .expect("gb sync");
+    let gb = scale_src!(ks, B).bind(B(seeded(&ctx, 5)));
+    let co_b = gb.sync(&ctx).expect("gb sync");
 
     // `mutate_call((A(seeded), B(co_b)))` on g: A is Lent by the EXTERNAL
     // `a_live` (its cell id is NOT among the tuple's severable cells), so the
@@ -652,16 +657,14 @@ fn mutate_call_crossed_swap_over_lent_by_tuple_checkout_succeeds() {
 
     // add_u32(In, Ones, Out): out = in + ones. Two data slots (In, Out) plus a
     // shared operand (B reused as "ones").
-    let g = ks.add_u32([N], slot!(A), slot!(B), slot!(Out));
-    let (in_co, ones_co, out_co) = g
-        .call((
-            A(seeded(&ctx, 10)),
-            B(seeded(&ctx, 1)),
-            Out(seeded(&ctx, 0)),
-        ))
-        .expect("bind step0")
-        .sync(&ctx)
-        .expect("sync step0");
+    // Set-once bind (consuming) folded into `g`; `g` is `mutate_call`'d / re-`sync`'d
+    // by `&` below.
+    let g = ks.add_u32([N], slot!(A), slot!(B), slot!(Out)).call((
+        A(seeded(&ctx, 10)),
+        B(seeded(&ctx, 1)),
+        Out(seeded(&ctx, 0)),
+    ));
+    let (in_co, ones_co, out_co) = g.sync(&ctx).expect("sync step0");
     // Now A and Out slots are Lent (held by in_co / out_co — both in the swap
     // tuple below). Re-arm the shared operand.
     drop(ones_co);

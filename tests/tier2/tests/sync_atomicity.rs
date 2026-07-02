@@ -122,7 +122,6 @@ fn unbound_slot_in_later_node_leaves_earlier_cells_untouched() {
     // `sync` would spuriously fail "graph busy". It must succeed.
     let (early_co, late_co) = g
         .bind(Missing(seeded(&ctx, 5)))
-        .expect("bind Missing")
         .sync(&ctx)
         .expect("recovered sync — early buffer must NOT have been left Lent");
 
@@ -164,18 +163,15 @@ fn checked_out_cell_in_later_node_is_atomic() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    // In-place slot scale ×1, NO download: the Checkout holds the slot's buffer.
-    let g = ks.scale_u32([N], slot!(Late), 1u32);
-
     let bound = seeded(&ctx, 4);
     let bound_handle = handle_of(&bound);
 
-    // Run 1: bind, sync → a live Checkout (its slot buffer is now `Lent`).
-    let co1 = g
-        .bind(Late(bound))
-        .expect("bind Late")
-        .sync(&ctx)
-        .expect("run 1");
+    // In-place slot scale ×1, NO download: the Checkout holds the slot's buffer.
+    // Set-once-bind (consuming) into `g`, then re-`sync` it below by `&`.
+    let g = ks.scale_u32([N], slot!(Late), 1u32).bind(Late(bound));
+
+    // Run 1: sync → a live Checkout (its slot buffer is now `Lent`).
+    let co1 = g.sync(&ctx).expect("run 1");
 
     // Run 2 (slot still checked out → `Lent`). `check_ready` must error
     // `SlotUnbound` atomically — nothing is lent or enqueued.
