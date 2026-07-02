@@ -224,7 +224,42 @@ pub type SlotCell<T> = Arc<Mutex<SlotState<T>>>;
 /// Only the infallible apply path writes here; the fluent
 /// [`mutate_bind`](DeviceOpExt::mutate_bind) / [`mutate_call`](DeviceOpExt::mutate_call)
 /// verbs still surface their errors EAGERLY and never touch a sink.
+///
+/// ## Sticky / poison recovery contract
+///
+/// A recorded deferred error **poisons the graph**: [`check_ready`](DeviceOp::check_ready)
+/// **peeks** the sink (see `peek_deferred`) rather than draining it, so EVERY
+/// subsequent `sync` re-reports the same error. There is no in-place clearing — the
+/// legitimate recovery is to **rebuild the graph** (the factory idiom; graphs are
+/// cheap, and reuse was always factory-shaped). This is deliberate: an errored graph
+/// stays errored, so a caller cannot accidentally ignore the error and re-`sync` into
+/// a run. Contrast the fluent [`mutate_bind`](DeviceOpExt::mutate_bind) /
+/// [`mutate_call`](DeviceOpExt::mutate_call): they fail EAGERLY at the call site and
+/// never touch the sink, so a failed mutate leaves the graph unpoisoned and usable.
 pub type DeferredErrors = Arc<Mutex<Vec<Error>>>;
+
+/// **Peek** the first recorded error in a [`DeferredErrors`] sink WITHOUT removing it
+/// (sticky/poison — see the type doc), reconstructing an owned [`Error`] from the
+/// borrowed one. Returns `None` for an empty sink (the common, never-erred case).
+///
+/// [`Error`] is not `Clone` (it wraps a foreign `ClError`), but every error the
+/// deferred apply path records is one of the slot variants carrying a `Copy`
+/// `&'static str` tag name — so a peek reconstructs the exact variant. Any other
+/// variant (never produced here) is reported as an internal-inconsistency
+/// [`Error::NotSupported`] rather than silently dropped.
+fn peek_deferred(sink: &Mutex<Vec<Error>>) -> Option<Error> {
+    sink.lock().unwrap().first().map(|e| match e {
+        Error::SlotConflict(n) => Error::SlotConflict(n),
+        Error::SlotNoSuchTag(n) => Error::SlotNoSuchTag(n),
+        Error::SlotCheckedOut(n) => Error::SlotCheckedOut(n),
+        Error::SlotSevered(n) => Error::SlotSevered(n),
+        Error::SlotUnbound(n) => Error::SlotUnbound(n),
+        _ => Error::NotSupported(
+            "eager graph: a non-slot error was recorded in a deferred-error sink \
+             (internal inconsistency)",
+        ),
+    })
+}
 
 // ── ScalarSlotState: the TWO-state cell for non-resource (scalar/launch) slots ─
 
@@ -1591,7 +1626,10 @@ impl<T> Input<T> {
                         return Err(Error::SlotUnbound(name));
                     }
                 }
-                match sink.lock().unwrap().pop() {
+                // PEEK (not pop): a recorded deferred error is STICKY — it poisons
+                // the graph so every subsequent `sync` re-reports it (recovery =
+                // rebuild). See `DeferredErrors`.
+                match peek_deferred(sink) {
                     Some(err) => Err(err),
                     None => Ok(()),
                 }
@@ -2085,7 +2123,9 @@ impl<V: Clone> ScalarInput<V> {
                     ScalarSlotState::Bound(_) => {}
                     ScalarSlotState::Unbound => return Err(Error::SlotUnbound(name)),
                 }
-                match sink.lock().unwrap().pop() {
+                // PEEK (not pop): sticky/poison — see `Input::check_ready` and
+                // `DeferredErrors`.
+                match peek_deferred(sink) {
                     Some(err) => Err(err),
                     None => Ok(()),
                 }
@@ -3162,15 +3202,17 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// RECORDED (via [`CallArg::apply`] → [`bind_deferred`](Self::bind_deferred) /
     /// [`feed_deferred`](Self::feed_deferred)) into the graph's [`DeferredErrors`] sink
     /// and surfaces at [`sync`](Self::sync): [`check_ready`](DeviceOp::check_ready)
-    /// drains the sink FIRST, before any enqueue, returning the recorded error with
+    /// reads the sink FIRST, before any enqueue, returning the recorded error with
     /// NOTHING run (the atomicity guarantee holds). A typo'd or missing bind cannot
     /// silently run wrong data — it fails closed at sync.
     ///
-    /// **Known residual wart (not fixed).** The sink is drained by `pop()` —
-    /// REPORT-ONCE. An errored graph fails its FIRST `sync` closed (correct); a caller
-    /// that IGNORES that `Err` and re-`sync`s WITHOUT rebinding finds an empty sink and
-    /// could then run. Abuse path (ignoring a returned error and re-running), benign —
-    /// documented here rather than papered over.
+    /// **Sticky / poison + recovery.** A recorded deferred error POISONS the graph:
+    /// `check_ready` PEEKS the sink (does not drain it), so EVERY subsequent `sync`
+    /// re-reports the same error — a caller cannot ignore it and re-`sync` into a run.
+    /// The recovery is to REBUILD the graph (the factory idiom; graphs are cheap). See
+    /// [`DeferredErrors`]. Contrast the fluent [`mutate_bind`](Self::mutate_bind) /
+    /// [`mutate_call`](Self::mutate_call): they fail EAGERLY at the call site and never
+    /// touch the sink, so a failed mutate leaves the graph unpoisoned and reusable.
     ///
     /// ## Partial binds (currying)
     ///

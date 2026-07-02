@@ -287,6 +287,83 @@ fn call_conflict_surfaces_at_sync_not_silent() {
     }
 }
 
+/// (7b) STICKY / POISON — a recorded deferred error POISONS the graph: a SECOND
+/// `sync` WITHOUT rebinding re-reports the SAME error (check_ready PEEKS, does not
+/// drain), and a freshly-rebuilt graph works (rebuild is the recovery). This is the
+/// contract that closes the former report-once wart.
+#[test]
+fn deferred_error_is_sticky_rebuild_recovers() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // Build an errored graph (conflicting set-once bind), as in (7).
+    let g = ks
+        .scale_u32([N], slot!(Buf), 4u32)
+        .bind(Buf(seeded(&ctx, 1)))
+        .bind(Buf(seeded(&ctx, 9))) // CONFLICT → recorded, poisons g
+        .and_then(download);
+
+    // First sync fails closed.
+    match g.sync(&ctx) {
+        Err(Error::SlotConflict(_)) => {}
+        other => panic!("sync 1 must fail with SlotConflict, got {other:?}"),
+    }
+    // STICKY: a second sync WITHOUT rebinding re-reports the SAME error (peek, not
+    // pop). The old report-once (pop) path would have found an empty sink and run.
+    match g.sync(&ctx) {
+        Err(Error::SlotConflict(_)) => { /* expected: poison is sticky */ }
+        Ok(out) => panic!(
+            "sync 2 must STILL fail (sticky poison); instead it ran and produced {:?}",
+            &out[..8]
+        ),
+        Err(e) => panic!("sync 2 must re-report SlotConflict, got {e:?}"),
+    }
+
+    // RECOVERY = rebuild a fresh graph (empty sinks). This one is valid and runs.
+    let fresh = ks
+        .scale_u32([N], slot!(Buf), 4u32)
+        .bind(Buf(seeded(&ctx, 3)))
+        .and_then(download);
+    let out = fresh.sync(&ctx).expect("rebuilt graph recovers");
+    assert!(
+        out.iter().all(|&v| v == 12),
+        "rebuild recovers: 3 * 4 = 12, got {:?}",
+        &out[..8]
+    );
+}
+
+/// (7c) A FAILED `mutate_*` does NOT poison the graph — the fluent mutate verbs fail
+/// EAGERLY at the call site and never touch the deferred-error sink, so the graph
+/// stays reusable. Contrast (7b): only the infallible `bind`/`call` path records.
+#[test]
+fn failed_mutate_does_not_poison() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    let g = ks
+        .scale_u32([N], slot!(Buf), 4u32)
+        .bind(Buf(seeded(&ctx, 2)));
+
+    // A mutate of an ABSENT tag errors EAGERLY (fluent, &self) and returns the error
+    // at the call site — nothing is recorded into any sink. (`mutate_bind` returns
+    // `Result<&Op>` whose `Op` isn't `Debug`, so map to the error before matching.)
+    match g.mutate_bind(Absent(seeded(&ctx, 9))).map(|_| ()) {
+        Err(Error::SlotNoSuchTag(_)) => { /* eager, at the call site */ }
+        other => panic!("mutate_bind of an absent tag must error eagerly, got {other:?}"),
+    }
+
+    // The graph is UNPOISONED: it still syncs correctly (Buf is validly bound to 2s).
+    let out = g
+        .and_then(download)
+        .sync(&ctx)
+        .expect("graph unpoisoned after failed mutate");
+    assert!(
+        out.iter().all(|&v| v == 8),
+        "unpoisoned graph runs: 2 * 4 = 8, got {:?}",
+        &out[..8]
+    );
+}
+
 /// (8) SILENT-SWALLOW REGRESSION — an ABSENT/typo'd tag in `call` while the
 /// REAL slots ARE satisfiable must be RECORDED and surfaced at `sync` as
 /// `SlotNoSuchTag`, NOT dropped so the graph silently runs.
