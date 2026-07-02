@@ -168,15 +168,39 @@ use claspr::eager::{DeviceOpExt, download};
 
 slots! { Buf: DeviceSlice<u32>, Factor: u32 }
 
-let g = kernels.scale([N], slot!(Buf), slot!(Factor)).and_then(download);
+// Set-once compose: `call` is consuming + infallible, so the fully-bound graph
+// IS the value of `g` (no `?`, no per-slot statement).
+let g = kernels
+    .scale([N], slot!(Buf), slot!(Factor))
+    .and_then(download)
+    .call((Factor(2),));           // curry the invariant once
 
-for x in inputs {                      // one graph, many runs
-    let out = g.mutate_call((Buf(upload_x), Factor(2)))  // (re)bind by name
+for x in inputs {                  // one graph, many runs
+    let out = g.mutate_call((Buf(upload_x),))  // reuse-loop: re-bind by name
                .sync(&ctx)?;
 }
 ```
 
-The bind surface is a small verb set: `bind` / `mutate_bind` (set-once / change, one slot) and `call` / `mutate_call` (a tuple, all-or-nothing). Their **consuming, infallible** siblings `call_move` / `bind_move` return the owned graph, so a whole reusable graph is usable *inside* an `.and_then` closure — the basis for composing one graph out of others. A slot's source can be a value (`Buf(x)`), a finished run's output (`Buf(checkout)` — sever-and-adopt, the double-buffer swap), or an upstream pipe (`Buf(pipe)` — the same constructor fed a `Pipe`, wiring the slot to another graph's output). This "bind-by-name meta-kernel" style lets you assemble a multi-dispatch graph, curry its invariants once with `bind_move`, and vary only the rotating buffers per step. `examples/gray-scott` is the flagship: a reaction-diffusion solver written two ways — a mutable-swap replay and a curried immutable compose — proven bit-identical.
+The bind surface is a **closed 4-verb set**. Two are **consuming + infallible**
+set-once verbs — `bind` (one slot) / `call` (a tuple) — that return the owned
+graph, so a fully-bound graph is usable both as the composed `U` *inside* an
+`.and_then` closure and as a one-shot at the terminal. The `Tag(value)`
+constructor value-binds; `Tag(pipe)` installs a `FedByPipe` slot wired to an
+upstream pipe. Their **bind errors are deferred** — recorded at the call site
+and surfaced at `sync` (readiness check, nothing enqueued) — and **sticky /
+poison**: an errored graph re-reports on every `sync`; recover by rebuilding.
+The other two are the reuse-loop verbs — `mutate_bind` (one slot) / `mutate_call`
+(a tuple) — fluent `&self -> Result`, EAGER errors at the call site, never poison
+the graph. The matrix is closed: mutate is `&self` and compose already builds a
+fresh graph, so there is no `mutate_call_move` — set-once is the only composing
+mode. A slot's source can be a value (`Buf(x)`), a finished run's output
+(`Buf(checkout)` — sever-and-adopt, the double-buffer swap), or an upstream pipe
+(`Buf(pipe)`, wiring the slot to another graph's output). This "bind-by-name
+meta-kernel" style lets you assemble a multi-dispatch graph, curry its invariants
+once with set-once `call`, and vary only the rotating buffers per step.
+`examples/gray-scott` is the flagship: a reaction-diffusion solver written two
+ways — a mutable-swap replay and a curried immutable compose — proven
+bit-identical.
 
 ## Workspace layout
 
@@ -192,7 +216,7 @@ The bind surface is a small verb set: `bind` / `mutate_bind` (set-once / change,
 | `examples/async-pipeline/` | Device-graph demo: upload → linear → relu → linear → download as one lazy chain. Inline `#[test]` validates device output against an identical host implementation. |
 | `examples/batch-inference/` | Device-graph fan-out: N independent batches in parallel via `fan_out`, sharing model weights through one `Arc<DeviceSlice>` (uploaded once, read-only in every branch). |
 | `examples/two-device/` | Multi-device API: `Context::for_devices()`, `Queue::on_device()`, cross-queue buffer `copy_to`, plus a sub-device partition fallback so it does something useful even on single-physical-device boxes. No kernel code. |
-| `examples/gray-scott/` | Reusable-graph flagship: a Gray-Scott reaction-diffusion solver built two ways over typed slots — `run_swap` (mutable-swap replay) and `run_immutable` (a curried bind-by-name meta-kernel composed with `call_move` / `bind_move`). An inline `#[test]` proves the two are bit-identical. Writes a `.ppm` of the final V field. |
+| `examples/gray-scott/` | Reusable-graph flagship: a Gray-Scott reaction-diffusion solver built two ways over typed slots — `run_swap` (mutable-swap replay via `mutate_call`) and `run_immutable` (a curried bind-by-name meta-kernel composed with set-once `call`). An inline `#[test]` proves the two are bit-identical. Writes a `.ppm` of the final V field. |
 
 ## Running the examples
 

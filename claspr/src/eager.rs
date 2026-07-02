@@ -819,7 +819,7 @@ impl SlotBinder {
     /// [`Pipe::clone`]d per cell). No `SlotEq`/`SlotValue` bound is needed — the
     /// install is unconditional and needs neither a value comparator nor a fan-out
     /// clone hook (the `eq`/`clone` fields are inert dummies, exactly as for a
-    /// [`probe`](Self::probe)). Used by [`DeviceOpExt::feed`].
+    /// [`probe`](Self::probe)). Used by [`DeviceOpExt::feed_deferred`].
     fn feed<Tg: Tag>(pipe: Pipe<Tg::Value>) -> Self {
         SlotBinder {
             id: TypeId::of::<Tg::Key>(),

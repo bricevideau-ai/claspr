@@ -388,7 +388,7 @@ macro_rules! slots {
             // uninhabited: `F(pipe)` finds no `CallArg` and FAILS TO COMPILE, keeping
             // scalar/launch slots value-only. The `$name<V>: Tag<Value = V>` bound
             // pins `V` to the tag's value type (via the identity `IntoBound<V> for V`)
-            // and hands us the concrete tag to feed via [`DeviceOpExt::feed`].
+            // and hands us the concrete tag to feed via `DeviceOpExt::feed_deferred`.
             impl<V> $crate::eager::CallArg for $name<$crate::Pipe<V>>
             where
                 V: $crate::record::RecordableBuffer + ::core::marker::Send + 'static,

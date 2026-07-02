@@ -411,6 +411,18 @@ fn run_swap(
     // (`lap_out`) flow into `combine`. So `slot!(UIn)`/`slot!(VIn)` live at ONE
     // site each (their lap dispatch), and the Laplacian scratch buffers need no
     // slot tags at all — both are carried by `and_then`'s pipe threading.
+    // Build the DAG, then fold ALL SEVEN set-once binds into ONE consuming chain.
+    // `bind` is consuming + infallible now (`bind(self, arg) -> Self`), so there
+    // is no `?` and no separate statement per slot — the whole graph, with every
+    // set-once slot filled, is the value of `g`. Any bind error is DEFERRED and
+    // surfaced at `sync` (sticky/poison: rebuild to recover).
+    //
+    // Scalar slots (F/K) are read — not consumed — on every replay, so they
+    // persist across all steps for free. F/K are the phase-1 regime we reconfigure
+    // mid-run. `Grid` is the shared launch slot: ONE bind fills its cell at ALL
+    // THREE dispatch sites (genuinely 2D — `[W, H]`). UIn/VIn/UOut/VOut are the
+    // step-0 buffer roles; UIn/VIn each fan out to their lap dispatch AND combine
+    // from this one bind. (Du/Dv are compile-time consts in the device module.)
     let g = ks
         .laplacian(slot!(Grid), slot!(UIn), lap_u_buf)
         .and_then(move |(u_in, lap_u)| {
@@ -431,24 +443,14 @@ fn run_swap(
                         slot!(K),
                     )
                 })
-        });
-
-    // Scalar slots bound ONCE — read (not consumed) on every replay, so they
-    // persist across all steps for free. F/K are the phase-1 regime we will
-    // reconfigure mid-run. (Du/Dv are compile-time consts in the device module.)
-    g.bind(F(F1))?;
-    g.bind(K(K1))?;
-
-    // The shared launch slot: ONE bind fills the Grid cell at ALL THREE dispatch
-    // sites. The dispatch is genuinely 2D — `[W, H]`.
-    g.bind(Grid(LaunchSpec::from([grid_w, grid_h])))?;
-
-    // Step 0: bind the initial buffer roles (set-once `bind` on virgin slots).
-    // UIn/VIn each fan out to their lap dispatch AND combine from this one bind.
-    g.bind(UIn(u_a))?;
-    g.bind(VIn(v_a))?;
-    g.bind(UOut(u_b))?;
-    g.bind(VOut(v_b))?;
+        })
+        .bind(F(F1))
+        .bind(K(K1))
+        .bind(Grid(LaunchSpec::from([grid_w, grid_h])))
+        .bind(UIn(u_a))
+        .bind(VIn(v_a))
+        .bind(UOut(u_b))
+        .bind(VOut(v_b));
 
     let total = steps_phase1 + steps_phase2;
 
@@ -580,7 +582,7 @@ fn run_swap(
 /// ## The composition model: a curried, bind-by-name meta-kernel
 ///
 /// The per-step subgraph is captured ONCE as a pair of curried closures over the
-/// `claspr::eager` verbs (`call_move` / `bind_move`) and the unified `Tag(value)`/
+/// consuming set-once `claspr::eager` verb (`call`) and the unified `Tag(value)`/
 /// `Tag(pipe)` slot constructor:
 ///
 /// - **`get_meta_kernel(ks, lap_u, lap_v)`** builds the raw three-dispatch DAG
@@ -593,24 +595,25 @@ fn run_swap(
 ///   `_lap` placeholders.
 /// - **`curried_kernel(ks, lap_u, lap_v)`** partially binds the invariants that
 ///   never rotate — the launch `Grid` and the reaction scalars `F`/`K` — via
-///   `bind_move`, leaving ONLY the four field slots open for the step-specific
-///   `call_move` at the call site.
+///   set-once `call`, leaving ONLY the four field slots open for the step-specific
+///   `call` at the call site.
 ///
 /// `step` is then two `curried_kernel` calls composed:
 ///
 /// - STEP 1 binds the four field slots to CONCRETE buffers by value:
-///   `call_move((UIn(u_a), VIn(v_a), UOut(u_b), VOut(v_b)))` — read A, write B.
+///   `call((UIn(u_a), VIn(v_a), UOut(u_b), VOut(v_b)))` — read A, write B.
 /// - STEP 2, inside the `and_then`, wires the SAME four slots to step 1's output
 ///   PIPES with the rotation VISIBLE in the arg list:
-///   `call_move((UIn(u_b), VIn(v_b), UOut(u_a), VOut(v_a)))` — read B, write back
+///   `call((UIn(u_b), VIn(v_b), UOut(u_a), VOut(v_a)))` — read B, write back
 ///   into A. The SAME tag constructor fed a pipe (`Tag(pipe)`) installs
 ///   `SlotState::FedByPipe`, so each slot DRAINS its upstream pipe every run and
 ///   re-arms on the next replay — no separate `feed` verb.
 ///
-/// `call_move` is CONSUMING + INFALLIBLE: it returns the owned graph (so it is
+/// Set-once `call` is CONSUMING + INFALLIBLE: it returns the owned graph (so it is
 /// usable as the bare `U` inside an `and_then` closure) and DEFERS any bind
-/// error to `sync`'s readiness check. There is no per-step rebinding: the pair
-/// is bound once at build and replayed `steps/2` times via plain `sync()`.
+/// error to `sync`'s readiness check (sticky/poison — rebuild to recover). There
+/// is no per-step rebinding: the pair is bound once at build and replayed
+/// `steps/2` times via plain `sync()`.
 ///
 /// ## Lap scratch: two independent sets
 ///
@@ -697,10 +700,10 @@ fn run_immutable(
     };
 
     // `curried_kernel` partially binds the INVARIANTS that never rotate — `Grid`,
-    // `F`, `K` — via `bind_move`, leaving ONLY the four field slots open for the
-    // step-specific `call_move` at the call site.
+    // `F`, `K` — via set-once `call`, leaving ONLY the four field slots open for
+    // the step-specific `call` at the call site.
     let curried_kernel = |ks: &gpu::Kernels, lap_u, lap_v| {
-        get_meta_kernel(ks, lap_u, lap_v).bind_move((
+        get_meta_kernel(ks, lap_u, lap_v).call((
             F(feed_rate),
             K(kill_rate),
             Grid(LaunchSpec::from([grid_w, grid_h])),
@@ -714,9 +717,9 @@ fn run_immutable(
     // Over the pair the buffer roles are identity (A→B→A), so the graph is bound
     // ONCE at build and replays with NO per-step rebinding.
     let g = curried_kernel(&ks, lap_u1, lap_v1)
-        .call_move((UIn(u_a), VIn(v_a), UOut(u_b), VOut(v_b)))
+        .call((UIn(u_a), VIn(v_a), UOut(u_b), VOut(v_b)))
         .and_then(move |(u_a, v_a, u_b, v_b)| {
-            curried_kernel(&ks, lap_u2, lap_v2).call_move((
+            curried_kernel(&ks, lap_u2, lap_v2).call((
                 UIn(u_b),  // read B
                 VIn(v_b),  // read B
                 UOut(u_a), // write back into A
