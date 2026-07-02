@@ -9,6 +9,110 @@ items resolve.
 
 ## Active
 
+### 🧠 CORRECTION 2026-07-02 (Brice) — typestate re-examined: `Graph<Unbound>→Graph<Bound>` is viable; my earlier "completeness typestate is impossible/pure-cost" was WRONG
+
+Supersedes the pessimistic parts of Q3-follow-up-3's point 3 below. Two corrections
+Brice forced, both right:
+
+**(1) BOUND is static; READY is dynamic — different properties, don't conflate.**
+- **`Bound`** = every slot has been ASSIGNED a source. A CONSTRUCTION property.
+  Monotonic under set-once (each consuming `bind` moves one slot Unbound→Bound), so
+  it IS expressible as a type transition `Graph<Unbound> --bind--> … --> Graph<Bound>`.
+  Decided at COMPILE time.
+- **`Ready`** = every bound slot's cell is CURRENTLY FULL. A RUNTIME-MOMENT property:
+  depends on all prior-sync Checkouts having dropped (re-armed), no live `into_inner`
+  sever, pipes filled. The SAME `Graph<Bound>` value is ready-or-not by wall-clock
+  lending state → CANNOT be a type. (My earlier `Graph<Ready>` was a category error;
+  Brice's `Graph<Bound>` is the correct static frontier — it draws the line exactly
+  where static knowledge ends.)
+
+**(2) Therefore completeness typestate is ACHIEVABLE and RETIRES HALF the runtime
+check.** My point-3 claim ("completeness typestate can't retire check_ready, so it's
+pure cost") was too strong. With `Graph<Bound>`:
+- `sync` requires `Graph<Bound>` ⇒ "forgot to bind a slot" is a TYPE error, not a
+  sync-time `SlotUnbound`. Completeness is proven statically.
+- set-once `bind<Tg>` consumes its tag from the type-level unbound-set ⇒ DOUBLE-BIND
+  won't compile.
+- `check_ready` at sync then can ONLY fail on READINESS (lent / severed via
+  `into_inner` / pipe-unfilled) — never on completeness. That's a real NARROWING of
+  which runtime errors are even possible, not pure cost.
+- The residual dynamic cases are type-consistent, not holes: `into_inner` severs but
+  `co` (the Checkout) doesn't hold the graph and `sync` is `&self`, so `g` stays
+  `Graph<Bound>` (correct — the slot WAS assigned) and only READINESS lapses → runtime
+  catch, no contradiction. Mutate path stays `&self` on `Graph<Bound>` (rebinds an
+  already-bound slot; boundness unchanged) — fully runtime as today. So you keep the
+  readiness half of check_ready (always irreducibly dynamic), retire the completeness
+  half. My cited "FedByPipe / re-arm cycle make it dynamic" were WRONG as objections:
+  check_ready already treats FedByPipe as statically-satisfied, and the re-arm cycle
+  keeps the type ACCURATE at each sync point (drop returns the buffer).
+
+**The cost is now ISOLATED to exactly ONE thing (point 2 below, unchanged):**
+`Graph<Unbound>`'s parameter is the SET of still-unbound tags; order-free binding +
+shared fan-out ⇒ `bind<Tg>` needs type-level set-DIFFERENCE and `and_then`/`bundle`
+need type-level set-UNION-with-DEDUP across children (Grid counted once across 3
+sites). That is the frunk/HList set-algebra the turbofish-free redesign deliberately
+deleted. This is the whole remaining tax; everything else about the design is clean.
+
+**TWO TIERS (the real decision):**
+- **Cheap 80% — a runtime-checked `Graph<Bound>` token, ZERO set-algebra.** A
+  `.finish(self) -> Result<Graph<Bound>>` (or `.ready()`) runs the completeness check
+  ONCE at build and mints a `Graph<Bound>` newtype; only `Graph<Bound>` exposes a
+  `sync` that can't fail on completeness. Gives the "sync won't complain you forgot a
+  bind" ergonomic + a clear place to handle the completeness error, WITHOUT any
+  type-level tag-set. Does NOT give compile-time double-bind or compile-error-at-the-
+  forgotten-bind. Small. Interacts fine with reuse (re-mint after a structural change;
+  normal re-arm doesn't change boundness).
+- **Full 100% — real `Graph<Unbound{set}>` typestate.** Compile error AT the forgotten
+  bind / double bind. Requires the set-algebra (heavy compile times, gnarly E0277s —
+  the abandoned pain). Only worth it if compile-time bind-completeness becomes a
+  demonstrated real need.
+
+**(3) ⭐ Brice 2026-07-02 — the real prize is DELETING the deferred-error apparatus,
+not error locality.** With FULL typestate, set-once construction errors are
+STRUCTURALLY IMPOSSIBLE, not deferred:
+- typo'd tag → `bind<Tg>` requires `Tg ∈ Unbound` set → COMPILE error (no SlotNoSuchTag).
+- double-bind / conflict → `Tg` consumed from the set → won't compile (no SlotConflict).
+- completeness → `sync` requires `Graph<Bound>` → COMPILE error (no SlotUnbound).
+- SlotCheckedOut / SlotSevered → can't occur on the set-once path at all (nothing is
+  lent or severed at CONSTRUCTION, before any sync).
+So set-once bind/call become infallible BECAUSE ERRORS CAN'T HAPPEN — not "infallible
+by deferring to sync." That distinction DELETES the machinery Option E is building:
+  | aspect                         | Option E (as-built) | Full typestate |
+  | bind/call infallible           | by DEFERRAL         | by IMPOSSIBILITY |
+  | E1 record-don't-drop sink      | NEEDED              | GONE |
+  | E1b sticky-poison              | NEEDED              | GONE |
+  | recover-error-on-graph contract| NEEDED (rebuild)    | no error ever on the graph |
+  | check_ready COMPLETENESS half  | NEEDED              | GONE (only READINESS remains) |
+The earlier recovery question ("legitimate way to recover once an error is on the
+graph?") simply DOESN'T ARISE under typestate — the only runtime Result left is
+READINESS (busy/lent/severed), which is dynamic, self-clearing (re-evaluated each
+sync), never sticky.
+
+CRUCIAL: this elevates FULL typestate SPECIFICALLY. The cheap `.finish() ->
+Graph<Bound>` tier does NOT get this win — it checks only COMPLETENESS at runtime;
+bind/call stay `self -> Self` infallible-by-defer, so double-bind/typo still need
+somewhere to go → it STILL needs E1 + E1b. Only FULL (set-algebra) typestate makes the
+errors impossible and thus deletes the sink/poison/recovery.
+
+So the HONEST trade is now EVEN: **type-level set-algebra complexity** ⟷ **runtime
+deferred-error bookkeeping (E1 sink) + sticky-poison (E1b) + rebuild-to-recover
+contract**. You pay complexity either way; typestate moves it from runtime bookkeeping
+(being built now) to compile-time set-algebra (abandoned once for compile-times/E0277s/
+the turbofish-free win). IMPLICATION: E1 + E1b are, in the typestate world, THROWAWAY —
+they exist only to make infallible-by-DEFER sound. Not a reason to stop shipping E
+(typestate is a big lift, shouldn't block), but E1/E1b are honestly the price of the
+NON-typestate infallible design; adopting full typestate later DELETES them.
+
+**Recommendation (revised again):** still ship Option E (consuming + E1 + E1b) NOW —
+typestate's set-algebra is a large lift and shouldn't block the verb collapse. BUT the
+decision "is full typestate worth it?" is no longer "set-algebra for marginal compile-
+time guards" — it's "set-algebra INSTEAD OF (sink + poison + recovery contract +
+runtime completeness check)." If we ever find ourselves adding MORE deferred-error
+machinery, that's the signal to switch to full typestate and delete E1/E1b wholesale.
+The cheap `.finish()` tier is NOT a stepping stone to this (it keeps E1/E1b) — it's a
+separate, lesser ergonomic. Key vocabulary to keep: **Bound = static (type-
+expressible), Ready = dynamic (stays runtime)** — never make Ready a type.
+
 ### 🔎 INVESTIGATION 2026-07-01 — should all `*bind`/`*call` verbs be move (consuming)? → NO (keep the split; one gap worth adding)
 
 Question (Brice): should `bind`/`mutate_bind`/`call`/`mutate_call` become consuming
