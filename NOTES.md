@@ -2042,6 +2042,164 @@ stacks over rusticl + NEO legacy (both OpenCL 2.1+, needed for
 
 ## Deferred
 
+### Write-only kernel args → graph-internal uninit scratch (`&mut [MaybeUninit<T>]`)
+
+MOTIVATION (gray-scott lap buffers): a kernel scratch output (`laplacian`'s
+`lap_out`) is SEMANTICALLY write-only (overwrites every cell, reads none) but the
+macro types every `&mut [T]` as `KernelSliceReadWriteArg` (ReadWrite) — there is NO
+write-only slice arg (`classify_param` in claspr-macros/src/lib.rs maps by mutability
+only: `&[T]`→Read, `&mut [T]`→ReadWrite). Consequence: the scratch can't be a
+graph-internal auto-allocated buffer, because the honest allocation is UNINIT
+(`DeviceSliceUninit` exists) and an uninit buffer feeding a ReadWrite arg is correctly
+a type error. So the sample allocates scratch concretely up front + threads it by arg
++ needs TWO explicit sets (to dodge the intra-submission WAR aliasing in the unrolled
+run_immutable — two steps in one dataflow submission sharing one scratch = a
+write-after-read the pipe graph doesn't serialize). If scratch could be graph-internal
++ write-only, the home-invariant drop rules would return it to its cell each run
+(allocate-ONCE, no reseed, stable cl_mem) AND each dispatch auto-allocating its own
+write-only scratch dissolves the two-sets aliasing by construction.
+
+DESIGN: `&mut [MaybeUninit<T>]` in a kernel arg = the WRITE-ONLY marker. Macro
+classifies the host side as write-only / accepts `DeviceSliceUninit` (new
+`KernelSliceWriteArg`); leave `MaybeUninit<T>` in the body (do NOT strip — see the
+marker-choice decision below). Body uses `.write()` / `MaybeUninit::new()` — regular
+Rust; `out[i] = x` does NOT compile (`out[i]` is `MaybeUninit<f32>`, RHS is `f32`).
+
+⭐ MARKER CHOICE DECIDED 2026-07-03 (Brice): use the STDLIB `MaybeUninit<T>` in the
+signature, NOT a bespoke `#[claspr::write_only] &mut [T]` attribute. The attribute
+would be a LIE to the type system: `&mut [f32]` means "initialized memory required" in
+regular Rust, so an attribute claiming "uninit ok" over it contradicts the underlying
+type. That fiction is invisible today only because kernel BODIES aren't host-compiled —
+but claspr compiles the same source for host + device (helpers ARE host-compiled +
+host-callable for validation; a future SOFTWARE kernel-execution pass would host-run
+kernel bodies too). `MaybeUninit` is HONEST across all three worlds (device SPIR-V,
+host helper compile, software pass): `.write()` to init, `assume_init` (unsafe) to
+read, defined identically everywhere. So a software pass gets the write-before-read
+guarantee for free from Rust's own uninit rules — no device-only checker needed on that
+path. The `.write()`-vs-`out[i]=x` verbosity is the PRICE of the code meaning the same
+thing in all three worlds — which is the whole point of single-source. Kernel authors
+touch NO `unsafe` for the write path (`.write()` is safe); the single `assume_init`
+`unsafe` lives once in claspr's `DeviceSliceUninit → DeviceSlice` read-back transition.
+
+⭐ PROBE DONE 2026-07-03 (/tmp/probe-mu, standalone crate on the pinned nightly, through
+claspr_build→SpirvBuilder). Kernel: `out: &mut [core::mem::MaybeUninit<f32>]` with
+`out[i].write(src[i]*2.0)`. RESULT:
+- The macro lifted the type VERBATIM into the kernel sub-crate (no strip needed).
+- rust-gpu COMPILED it clean — exit 0, valid SPIR-V (3264B, magic 0x07230203).
+- `MaybeUninit<f32>` was TRANSPARENTLY erased to plain `f32`: disasm shows
+  `%_ptr_CrossWorkgroup_float = OpTypePointer CrossWorkgroup %float` (NOT a union/
+  struct) + `OpStore` for `.write()` + `OpEntryPoint Kernel "fill_wo"`. So the earlier
+  "SPIR-V has no unions → might ICE" worry is FALSE: `MaybeUninit<T>` is
+  `#[repr(transparent)]`, rust-gpu never materializes a union, nothing to lower.
+CONCLUSION: the representation blocker is GONE — `&mut [MaybeUninit<T>]` kernels
+compile TODAY with zero rust-gpu changes. Remaining work is (a) macro: recognize the
+marker + emit `KernelSliceWriteArg` accepting `DeviceSliceUninit`; (b) runtime: the
+write-only arg path + graph-internal auto-scratch riding the home invariant; (c)
+OPTIONAL soundness: a NEVER-READ verification pass (decidable — "does this ptr ever
+appear in a load?"; write-BEFORE-read per-index is undecidable and NOT needed). Without
+(c) it's the same author-trust contract every write-only/uninit API rests on;
+laplacian provably honors it (writes every in-bounds cell, reads out never). LAYER
+FACTS for the note: rust-gpu compiler = fine (nothing to lower); device runtime reading
+physically-uninit memory = garbage not crash (OpenCL buffers are valid/addressable,
+contents indeterminate — unlike host-Rust uninit UB); risk = SILENT garbage from a
+mis-declared write-only arg, caught only by (c) or a full-grid-write discipline
+(watch partial-grid `if x>=W {return}` kernels leaving tail cells unwritten that a
+later full-range read would hit).
+
+⭐ SOUNDNESS REFINEMENT 2026-07-03 (Brice) — TWO distinct properties, don't conflate:
+- **never-read**: the kernel writing `out` never LOADS from `out`. DECIDABLE (syntactic
+  "does this ptr appear in a load?"). Guards the kernel against reading its own garbage.
+  This is item (c) above.
+- **total coverage**: EVERY cell of `out` is written before anything downstream reads
+  it. This is what the uninit→init TRANSITION actually needs, and it is UNDECIDABLE in
+  general (depends on runtime index arithmetic + conditionals). never-read does NOT give
+  it. Coverage is a property of (kernel + LAUNCH GEOMETRY + buffer size) TOGETHER, not
+  the kernel alone: `laplacian` covers every cell only because dispatch == [W,H], guard
+  is `if x>=W||y>=H {return}`, buffer is W*H. Launch it [W/2,H] → top half uninit, same
+  kernel. So the framework can't certify coverage even from a perfect kernel view — the
+  grid is half the equation and is runtime.
+- **reseed-is-the-same-coin**: zero-init the scratch → always fully initialized, sound
+  transition with NO contract — but that IS the reseed we're eliding. uninit → no fill →
+  coverage is an unverifiable author assertion. Skipping the fill IS giving up the
+  guarantee; not separable. The transition to init is fundamentally a BUFFER-LEVEL
+  `assume_init` (same trust as stdlib, at cl_mem granularity) → its API must be EXPLICIT
+  + contract-documented, not a silent `DeviceSliceUninit→DeviceSlice`.
+- **CHECKABLE SUBSET (the happy path)**: auto-allocated GRID-SIZED scratch + a TOTAL-MAP
+  kernel (`out[gid]=…`, bounds-guarded) → coverage reduces to "writes out[gid] for every
+  gid", which IS lintable, and the transition is SOUND (not trust). gray-scott's lap is
+  exactly this. General write-only output stays honest-but-manual (size check
+  `dispatch_len>=buffer_len` is necessary-not-sufficient mitigation).
+
+⭐ SCRATCH-IS-A-PRODUCER-OUTPUT reframing 2026-07-03 (Brice): gray-scott's lap buffers
+are NOT "meta-kernel scratch" — in single-owner dataflow every buffer has exactly one
+producer, and lap_u/lap_v are `laplacian`'s OUTPUT (consumed by `combine`), kind-2
+intermediates. They only FEEL like meta-kernel scratch because the sample materializes +
+threads them by hand. So you declare auto-scratch at the PRODUCING KERNEL, not the
+meta-kernel — an `#[auto]` write-only output that DROPS from the launcher signature but
+still rides the output pipe: `ks.laplacian(slot!(Grid), slot!(UIn))` (no lap arg) →
+handle `(u_in, lap)`. This dissolves all three earlier snags at once: two-sets aliasing
+(each of the 4 laplacian calls auto-allocs its OWN output → no shared buffer → no WAR),
+size (elementwise ⇒ grid-shaped default), coverage (grid-sized total-map ⇒ provable).
+TRUE kernel-INTERNAL scratch (kind-4, private temp, no downstream consumer, LWORK-class)
+is also per-kernel but must NOT appear in the output pipe — different plumbing, and the
+case where size is `f(m,n)` + coverage is unverifiable. gray-scott has none of these.
+CB-REPLAY interaction to flag: an in-graph `#[auto]` intermediate needs a HOME cell to
+keep stable cl_mem across replays (else re-alloc each sync → CB-cache invalidation) —
+this is the "in-graph-allocated buffer persistence" open question from the CB notes; the
+auto-intermediate is a concrete instance, solvable with the home-invariant machinery.
+
+⭐ SIZE-DERIVATION thread 2026-07-03 (Brice) — scratch size depends on PROBLEM size,
+which we bind via the call Grid; even as a slot (defer alloc to enqueue), a NON-grid-
+shaped size must be DERIVED from problem dims. Tiers:
+- **grid-shaped (free)**: framework already has the LaunchSpec at enqueue; elementwise/
+  stencil scratch = one element per work-item → derive len from Grid, ZERO user input.
+  Default for `#[auto]`. Covers gray-scott lap + maps/stencils/images. Same subset as
+  provable-coverage — size-derivation and coverage-soundness line up EXACTLY.
+- **grid ≠ problem size** (the crack): padded launches (grid rounded to wg multiple +
+  `if gid>=N {return}` → grid_product > data_len; size to data extent N, not grid) and
+  LAPACK `LWORK=f(m,n,block)` (unrelated to grid). So size is `f(problem)`, grid only
+  SOMETIMES a faithful proxy.
+- **author-declared size (better than LAPACK)**: in single-source the kernel author
+  knows the size relation + declares it ONCE at the kernel, so NO caller derives it
+  (unlike LAPACK's caller-side LWORK=-1 probe). Two spellings:
+  - CLOSURE (no IR — the recommended start): the alloc holds (a) a SLOT INPUT for the
+    tag(s) the size depends on + (b) a closure over their resolved values, run at
+    enqueue. User writes:
+      `ks.laplacian(slot!(Grid), slot!(UIn), alloc(slot!(Grid), |g: LaunchSpec| g.x()*g.y()))`
+      `alloc((slot!(M), slot!(N)), |(m,n): (u32,u32)| lwork(m,n))`   // multi-dep
+      `alloc(slot!(N), |n: u32| n as usize)`                          // padded: data extent
+    ROUTING (the key q Brice asked): NO new channel — the alloc CARRIES a `slot!(Grid)`
+    site (a ScalarInput::Slot cell), so `bind(Grid([X,Y]))` fans by TypeId to the
+    alloc's Grid cell AND the 3 dispatch Grid cells in ONE bind (existing bind_slots
+    fan-out). check_ready requires the alloc's cell Bound (deferred SlotUnbound else);
+    execute locks the cell, reads the resolved value, runs the closure → len → allocs →
+    deposits into the output pipe. This GUARANTEES consistency (size + launch driven by
+    the SAME bound value — can't desync). It's a closure-at-EXECUTE LEAF (same category
+    as and_then_host — the ACCEPTED kind of retained closure, NOT the graph-builder
+    FnOnce the eager cutover deleted). Nit: `alloc(slot!(Grid), |g| …)` names Grid TWICE
+    (launch arg + size dep); an implicit `alloc(|g| …)`-over-own-grid sugar covers the
+    common grid case but breaks for LWORK (depends on M/N not grid), so the explicit-dep
+    form is the general one.
+  - EXPRESSION IR (`alloc(len: Product(slot!(Grid)))`): reified `enum SizeExpr {
+    Product(Tag), Sum(Box,Box), Const, RoundUpTo, … }` interpreted at enqueue.
+    INSPECTABLE + serializable + printable — but a new interpreted layer that WILL grow
+    (this is the MLIR/XLA/TVM shape-algebra pull; Brice: "I start to get why people rely
+    on IRs for this"). TENSION: the whole eager design moved AWAY from an interpreted IR
+    (graph IS structs, describe-able, no re-interpreter); a SizeExpr smuggles a little
+    interpreted IR back through the size hole.
+- **DECISION LEAN**: start with the CLOSURE (a ~one-field extension of the existing
+  derived-cell/slot machinery; covers Product(Grid) AND LWORK f(m,n) alike; zero new
+  IR). Reify into SizeExpr ONLY when INSPECTION/serialization is actually required — CB
+  cache KEY needing "scratch = Grid.x*Grid.y", or library pipeline export with symbolic
+  scratch, or printing the size relation. Let the INSPECTION requirement force the IR,
+  NOT the arithmetic requirement — keeps us on the eager-struct side of the line until
+  there's a concrete reason to cross. (Closure = compute-only, opaque `Box<dyn Fn>`;
+  can't answer a cache-key or be serialized — that's precisely when SizeExpr earns it.)
+STATUS: whole write-only + auto-scratch + size thread is DESIGN-ONLY, Brice thinking on
+it; no code. Happy path = `#[auto]` grid-shaped write-only producer output (free size,
+provable coverage, no caller unsafe); everything else is honest-but-manual as HPC
+scratch is.
+
 ### Inherit generated kernel deps from host workspace
 
 `claspr-build`'s generated kernel `Cargo.toml`
