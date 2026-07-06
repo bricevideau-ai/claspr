@@ -9,6 +9,64 @@ items resolve.
 
 ## Active
 
+### ⚑ RECONSIDER 2026-07-06 (Brice) — Checkout-into-slot should MOVE (home transfers into the slot cell), not SEVER. Sever was a narrowly-justified decision that may be wrong.
+
+TRIGGER: the new `examples/cg` (matrix-free Conjugate Gradient, committed 5156d74) is
+the first genuinely mixed CB-able/host graph. Rewriting its inner loop to "pass
+Checkouts to graphs, they return on drop" (the intended lend design) worked for the
+INTRA-pass handoff (region A's per-element Checkouts lent into region B's kernels, no
+into_inner between them) — but the LOOP-CARRIED cycle (`p`: region C's output is region
+A's input next iteration) still forces `into_inner()` at the bundle + C boundaries.
+Root cause: lend returns a buffer to the graph that OWNED it, but CG's per-iteration
+graphs are throwaway; a buffer that must OUTLIVE its producing graph has nowhere stable
+to live → sever it out + re-own. Two structural walls found: (1) `SlotHandle` is NOT
+`Clone` → persistent A/B/C graphs can't SHARE a buffer cell (p's cell would be C's
+output slot AND A's input slot), so the clean "persistent graphs, buffers lent between"
+shape isn't expressible; (2) `bind(Slot(checkout))` SEVERS rather than moving the home.
+
+BRICE'S HYPOTHESIS: "Checkout should be movable inside slots, and severing when putting
+checkouts inside a slot was a badly informed decision." I.e. binding a Checkout into a
+slot should TRANSFER its home into the slot's cell (so it returns THERE on drop), not
+sever the home and adopt an anonymous buffer.
+
+ARCHAEOLOGY (subagent, transcript L26076–L26938) — why sever was chosen:
+- Approved at L26625 ("definitely worth it and severing here is the right design"),
+  answering "is the implicit sever acceptable inside Tag(checkout)?".
+- SOLE justification = the CROSSED double-buffer swap (gray-scott): `mutate_call((
+  UIn(u_out_co), UOut(u_in_co), …))` crosses buffers between cells. Assistant L26634:
+  "in the ping-pong the buffer genuinely changes role, so its old home must release it
+  or the next drop would try to return it to the wrong cell." Sever severs the old
+  attachment; the destination slot adopts as new home.
+- CRUX: Brice's ORIGINAL instinct was MOVE, not sever (L26625.3): "This was not what I
+  had in mind, I thought we would put it back in a pipe with its home so it would keep
+  the first graph busy and would be put back once it is dropped." That MOVE/return
+  instinct was ADOPTED for the DIFFERENT case (Checkout fed as INPUT to a 2nd graph =
+  LEND, task #176) and REJECTED only for the slot-bind case (#174). So the two paths
+  were made ASYMMETRIC by destination: input-to-graph = lend+return; bind-into-slot =
+  sever+adopt.
+- cl_mem/CB tie-in (separate, for re-arming a Severed slot, task #170): cl_mem handles
+  RECYCLE after drop → can't soundly detect "same buffer" → `bind` on Severed rejected,
+  `mutate` required; and mutate = handle-changed = invalidate-immutable-CB or
+  clUpdateMutableCommandsKHR. Parked relaxation: `Arc<DeviceSlice>` + `Weak`/`ptr_eq`
+  COULD soundly recover "same buffer."
+- FALLOUT evidence the sever path is fragile: review item B2 (L26938) found the
+  two-phase sever-all-before-fold trashed unrelated graph state on an error path →
+  needed a probe-before-sever phase to fix. The lend/move path had no such bug.
+
+ASSESSMENT: sever-and-adopt is correct ONLY for a genuinely CROSSED swap (two DIFFERENT
+buffers exchange cells — keeping old homes would misroute drops). It was NEVER weighed
+against a pure MOVE for the NON-crossed case, and MOVE is what Brice originally wanted
+everywhere. The open question to resolve: can the crossed swap be expressed as an
+ATOMIC MOVE of BOTH homes (UIn↔UOut swap their cells' homes together) so no drop is
+misrouted — making MOVE-into-slot the single primitive and unifying the sever/lend
+asymmetry? If yes, sever-into-slot can likely be replaced by move-into-slot (home
+follows the buffer into the slot cell, returns there on drop), which is what CG's
+loop-carried cycle actually wants (no into_inner at the C→A boundary). NEXT: design
+whether the crossed double-buffer swap survives MOVE semantics (atomic two-home swap)
+before touching the engine; this is the reconsideration Brice asked for. Also revisit
+whether `SlotHandle` should be shareable (Arc-cell) so persistent graphs can co-own a
+cell — the other wall CG hit. DESIGN-ONLY; no code yet.
+
 ### 🧠 CORRECTION 2026-07-02 (Brice) — typestate re-examined: `Graph<Unbound>→Graph<Bound>` is viable; my earlier "completeness typestate is impossible/pure-cost" was WRONG
 
 Supersedes the pessimistic parts of Q3-follow-up-3's point 3 below. Two corrections
