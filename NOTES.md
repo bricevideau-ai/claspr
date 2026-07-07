@@ -9,6 +9,75 @@ items resolve.
 
 ## Active
 
+### ⚑ CG SHOULD BE ONE GRAPH — device-resident scalars + loop peel dissolve the friction 2026-07-06 (Brice)
+
+The `into_inner`/sever/persistent-graph friction in `examples/cg` is SELF-INFLICTED: it
+comes from chopping each CG iteration into 3 sync'd pieces ONLY to get α/β out to the
+host and back. Fix = keep α/β ON DEVICE and express the whole iteration as ONE graph.
+
+KEY ENABLERS (both already in claspr):
+- A kernel SLICE arg is scalar-by-reference: `#[spirv(cross_workgroup)] alpha: &[f32]`
+  (len-1 DeviceSlice, kernel reads `alpha[0]`). α/β/rsold/rsnew become 1-element device
+  buffers, threaded through the graph like any buffer — internal edges, never
+  severed/rebound. (BETTER SPELLING wanted: bare `&f32`/`&mut f32` — see the probe item
+  below; may need claspr-macro + rust-gpu work.)
+- `and_then_host`'s View for `DeviceSlice<T>` is `&mut [T]` (WRITABLE — mappable.rs:169).
+  So a host seam can map device scalars, compute, and WRITE BACK in-graph:
+  `alpha[0] = rsold[0]/pap[0]`. BUT if α/β are computed by a tiny SCALAR KERNEL instead
+  of a host seam, the graph has ZERO host seams → it is ONE fully CB-able region.
+
+⭐ THE LOOP PEEL (Brice) — for the "break out of the loop" problem, PEEL the start so the
+convergence quantity lands at the loop boundary, then `loop { g.sync(); if check break }`:
+```
+PEEL once:  p=r=b; rsold=b·b;  Ap=Ap; pAp=p·Ap; α=rsold/pAp; x+=αp; r-=αAp; rsnew=r·r
+g (body, ONE all-device graph):
+   β=rsnew/rsold; rsold=rsnew            (scalar kernel)
+   p = r + β p                           (xpby)
+   Ap=A p; pAp=p·Ap; α=rsold/pAp         (spmv, dot, scalar kernel)
+   x+=αp;  r-=αAp;  rsnew=r·r            (axpy ‖ {axpy→norm2})  ← ends on rsnew
+loop { g.sync(); if read(rsnew) < tol² break }
+```
+Every buffer (incl. α/β/rsold/rsnew as device scalars) is an internal `and_then` edge
+within `g`; the graph closes on itself (xpby's p → next spmv's p). NO into_inner, NO
+sever, NO cross-graph lending, NO loop-carried-cycle wall — all the friction was the
+chopping. Host does ONLY: read rsnew[0] at the boundary + branch. If α/β are scalar
+KERNELS, `g` is a single CB-able region replayed each iter with one scalar readback
+between replays — the IDEAL partitioner workload (deep recordable region, rare host
+readback), strictly better than the current host-cut-every-iteration CG.
+
+CONSEQUENCE for the sever/move reconsideration (the ⚑ RECONSIDER note below): this does
+NOT refute move-vs-sever, but it REMOVES THE PRESSURE — single-graph CG needs neither
+persistent-graph-lending nor move-into-slot, so that decision becomes a standalone
+ergonomic call, not a blocker.
+
+PLAN: rewrite examples/cg to peeled single-graph + device scalars (α/β via scalar
+kernels so `g` is host-seam-free). Prefer bare `&f32` args if the probe says feasible;
+else `&[f32]`+`[0]`. Verify still converges (~5 iters) bit-identical on 3 ICDs. Then the
+sample also validates the device-scalar / scalar-by-ref pattern end-to-end.
+PROBE RESULT (2026-07-06, verified both layers; a first quick inference that "the macro
+accepts it" was WRONG — a stale incremental build; the clean rebuild errors):
+- LAYER 2 rust-gpu: ✅ COMPILES `&f32` AND `&mut f32` cross_workgroup to a POINTER-TO-
+  SCALAR. spirv-dis: `%factor = OpFunctionParameter %_ptr_CrossWorkgroup_float` with NO
+  accompanying `%ulong` length param (the slice arg gets pointer + `%ulong` length;
+  scalar-ref gets pointer only). No OpTypeRuntimeArray/OpTypeStruct. rust-gpu needs ZERO
+  changes.
+- LAYER 1 claspr macro: ❌ REJECTS it today. `classify_param` (lib.rs:1680) routes EVERY
+  `#[spirv(cross_workgroup)]` param through `slice_element_ty` (lib.rs:1735), which
+  requires `Type::Reference` wrapping `Type::Slice`; a bare `&f32` is Reference-over-
+  Path → hard error "expected a slice type `[T]` after the reference; other shapes are
+  not yet supported by claspr::kernel" (confirmed by building a claspr example — errors
+  at the host/macro step, no binary).
+- WORK NEEDED (claspr-macro-only): add `ParamRole::ScalarRef { name, elem, mutable }`,
+  detect `Type::Reference`-over-`Type::Path` in classify_param, and emit a host binding
+  that sets a SINGLE pointer `clSetKernelArg` (NO length — the slice path in launch.rs
+  sets pointer+length; scalar-ref must set pointer only), backed by a scalar-ref host
+  arg trait (length-less sibling of KernelSliceReadArg), taking a len-1 device buffer.
+  Bounded, well-scoped.
+- DECISION: `&f32`/`&mut f32` scalar-by-ref is FEASIBLE, claspr-macro-only. Filed as its
+  own task. For the CG rewrite NOW, use `&[f32]` + `[0]` (works today, zero macro
+  changes, identical device-scalar semantics — a len-1 buffer; SPIR-V differs only by
+  the extra length arg). CG migrates `&[f32]`→`&f32` once ScalarRef lands.
+
 ### ⚑ RECONSIDER 2026-07-06 (Brice) — Checkout-into-slot should MOVE (home transfers into the slot cell), not SEVER. Sever was a narrowly-justified decision that may be wrong.
 
 TRIGGER: the new `examples/cg` (matrix-free Conjugate Gradient, committed 5156d74) is
