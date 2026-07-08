@@ -112,7 +112,7 @@ mod kernel_slice_arg_sealed {
 /// every impl. Users wanting a custom buffer-shaped argument should
 /// open an issue rather than try to add an impl out-of-tree.
 pub trait KernelSliceReadArg<T>:
-    KernelArg + Send + 'static + kernel_slice_arg_sealed::Sealed
+    KernelArg + KernelPointerArg + Send + 'static + kernel_slice_arg_sealed::Sealed
 {
     /// Number of elements in the underlying buffer. Reused by some
     /// chain combinators that need to size a downstream allocation
@@ -128,6 +128,43 @@ pub trait KernelSliceReadArg<T>:
         Err(crate::Error::NotSupported(
             "record: this kernel arg type has no recordable memory handle",
         ))
+    }
+}
+
+/// A buffer that can set **only** its device pointer as a kernel arg
+/// (advancing the arg index by exactly one, with no trailing length).
+///
+/// This is the eager/record counterpart of the slice's [`KernelArg::set`]
+/// (which sets *two* args: pointer + `usize` length). It backs a
+/// scalar-by-reference kernel parameter (`#[spirv(cross_workgroup)] &T` /
+/// `&mut T`): rust-gpu lowers a scalar-ref to a bare pointer-to-scalar
+/// `OpFunctionParameter` with **no** length operand, so the host must set
+/// one arg slot, not two. A length-1
+/// [`DeviceSlice`]/`MappedSlice`/`USMSlice` supplies the pointer.
+///
+/// [`KernelSliceReadArg`] requires this (every buffer that can be a slice
+/// arg can also be a scalar-ref arg), so the proc-macro's `ScalarRef` arm
+/// gets it for free on the same buffer generic. `KernelArg` is a
+/// supertrait so [`ScalarRefArg`] can delegate `register_completion` to
+/// the underlying buffer (e.g. `MappedSlice`'s SVM-free bookkeeping).
+pub trait KernelPointerArg: KernelArg {
+    /// Set this buffer's device pointer on `exec` as a single kernel arg.
+    fn set_pointer_only(&self, exec: &mut ExecuteKernel<'_>);
+}
+
+/// Wrapper turning a borrowed [`KernelPointerArg`] buffer into a
+/// pointer-only [`KernelArg`] — used by the proc-macro's `ScalarRef`
+/// launch tuple so a scalar-ref param sets exactly one arg slot.
+pub struct ScalarRefArg<'a, D: KernelPointerArg + ?Sized>(pub &'a D);
+
+impl<D: KernelPointerArg + ?Sized> KernelArg for ScalarRefArg<'_, D> {
+    fn set(&self, exec: &mut ExecuteKernel<'_>) {
+        self.0.set_pointer_only(exec);
+    }
+    fn register_completion(&self, event: &::opencl3::event::Event) {
+        // Delegate to the buffer's own post-enqueue bookkeeping (e.g.
+        // MappedSlice retains the event for its Drop's SVM-free wait-list).
+        KernelArg::register_completion(self.0, event);
     }
 }
 
@@ -171,6 +208,16 @@ impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadabl
         })
     }
 }
+impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadable> KernelPointerArg
+    for DeviceSlice<T, M>
+{
+    fn set_pointer_only(&self, exec: &mut ExecuteKernel<'_>) {
+        // Pointer only — no trailing length (scalar-ref shape).
+        unsafe {
+            exec.set_arg(&*self.buffer);
+        }
+    }
+}
 impl<
     T: Send + 'static,
     M: crate::access::MemMode + crate::access::KernelReadable + crate::access::KernelWritable,
@@ -197,6 +244,16 @@ impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadabl
         })
     }
 }
+impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadable> KernelPointerArg
+    for crate::MappedSlice<T, M>
+{
+    fn set_pointer_only(&self, exec: &mut ExecuteKernel<'_>) {
+        // SVM pointer only — no trailing length (scalar-ref shape).
+        unsafe {
+            exec.set_arg_svm(self.ptr());
+        }
+    }
+}
 impl<
     T: Send + 'static,
     M: crate::access::MemMode + crate::access::KernelReadable + crate::access::KernelWritable,
@@ -221,6 +278,16 @@ impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadabl
             mem: crate::record::MemRef::Svm(self.ptr() as *mut std::ffi::c_void),
             byte_len: crate::Buffer::len(self) * std::mem::size_of::<T>(),
         })
+    }
+}
+impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadable> KernelPointerArg
+    for crate::USMSlice<T, M>
+{
+    fn set_pointer_only(&self, exec: &mut ExecuteKernel<'_>) {
+        // SVM pointer only — no trailing length (scalar-ref shape).
+        unsafe {
+            exec.set_arg_svm(self.ptr());
+        }
     }
 }
 impl<
@@ -275,6 +342,13 @@ impl<T: Send + Sync + 'static, M: crate::access::MemMode + crate::access::Kernel
     }
     fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
         (**self).record_handle()
+    }
+}
+impl<T: Send + Sync + 'static, M: crate::access::MemMode + crate::access::KernelReadable>
+    KernelPointerArg for Arc<DeviceSlice<T, M>>
+{
+    fn set_pointer_only(&self, exec: &mut ExecuteKernel<'_>) {
+        (**self).set_pointer_only(exec);
     }
 }
 // Deliberately no `KernelSliceReadWriteArg` impl — see comment above.

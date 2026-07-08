@@ -122,8 +122,8 @@ pub use image::{
     KernelImageBufferReadWriteArg, KernelImageBufferWriteArg, ToInputImage, format,
 };
 pub use launch::{
-    IntoLaunchSpec, KernelArg, KernelArgs, KernelSliceArg, KernelSliceReadArg,
-    KernelSliceReadWriteArg, LaunchSpec, LocalBuffer, ScalarArg, profiling_duration,
+    IntoLaunchSpec, KernelArg, KernelArgs, KernelPointerArg, KernelSliceArg, KernelSliceReadArg,
+    KernelSliceReadWriteArg, LaunchSpec, LocalBuffer, ScalarArg, ScalarRefArg, profiling_duration,
 };
 pub use op::{
     LaunchOp, ProfileCb, ProfilingInfo, assert_same_context, complete_user_event,

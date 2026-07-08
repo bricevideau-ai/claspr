@@ -656,6 +656,97 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     }
                 });
             }
+            ParamRole::ScalarRef {
+                name: pname,
+                elem,
+                mutable,
+            } => {
+                // A scalar-by-reference (`&T` / `&mut T`) is a reusable BUFFER
+                // arg identical to a slice in EVERY respect (host binding,
+                // Output threading, bind_slots, check_ready, resolve_home) —
+                // a length-1 `DeviceSlice<T>` / `Pipe` / `slot!` satisfies the
+                // SAME `KernelSliceRead[Write]Arg<T>` bounds — EXCEPT the eager
+                // + record arg-set sets ONE arg slot (the pointer), not the
+                // slice's `(pointer, len)` pair. rust-gpu emits a bare
+                // pointer-to-scalar param with no `%ulong` length operand.
+                let gid = quote::format_ident!("__claspr_D{}", arg_gen_idx);
+                let sid = quote::format_ident!("__claspr_S{}", arg_gen_idx);
+                let deps_ident = quote::format_ident!("__claspr_deps{}", arg_gen_idx);
+                let home_ident = quote::format_ident!("__claspr_home{}", arg_gen_idx);
+                arg_gen_idx += 1;
+                let gid_tt: TokenStream2 = quote! { #gid };
+                let iid_tt: TokenStream2 = quote! { #sid };
+                // SAME buffer bound as a slice arg (Read vs ReadWrite by
+                // mutability). `KernelSliceReadArg: KernelPointerArg`, so the
+                // pointer-only setter is available on `__D` for free.
+                let dbound: TokenStream2 = if mutable {
+                    quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> }
+                } else {
+                    quote! { #gid: ::claspr::KernelSliceReadArg<#elem> }
+                };
+                let ibound: TokenStream2 = quote! { #sid: ::claspr::ToInput<#elem, Buf = #gid> };
+                generics.push((gid_tt.clone(), dbound));
+                method_only_generics.push((iid_tt.clone(), ibound));
+
+                host_names.push(pname.clone());
+                method_params.push(quote! { #pname: #iid_tt });
+                arg_types.push(quote! { ::claspr::Input<#gid_tt> });
+                op_field_init.push(quote! { ::claspr::ToInput::to_input(#pname) });
+                // Output threading / lend / rehome: IDENTICAL to Slice.
+                input_resolve_eager.push(quote! {
+                    let (#pname, #deps_ident, #home_ident) =
+                        ::claspr::Input::resolve_home(#pname, ec)?;
+                });
+                input_deps_idents.push(quote! { #deps_ident });
+                input_bind_slots.push(quote! {
+                    if ::claspr::SlotBinder::is_fanout(binder)
+                        || !::claspr::SlotBinder::is_consumed(binder)
+                    {
+                        ::claspr::Input::try_bind_slot(#pname, binder);
+                    }
+                });
+                input_check_ready.push(quote! {
+                    ::claspr::Input::check_ready(#pname)?;
+                });
+                bind_slot_pat_names.push(quote! { #pname });
+                // The ONLY difference from Slice in the EAGER path: wrap the
+                // resolved buffer in `ScalarRefArg` so the launch tuple sets a
+                // SINGLE pointer arg (no trailing length).
+                op_arg_pass.push(quote! { ::claspr::ScalarRefArg(&#pname) });
+                output_names.push(pname.clone());
+                output_types.push(gid_tt);
+                output_homes.push(quote! { #home_ident });
+
+                // Record path: resolve this scalar-ref's buffer exactly like a
+                // slice, but set ONLY the pointer arg (advance arg index by 1,
+                // not 2). Getting this wrong misaligns every following arg.
+                record_arg_stmts.push(quote! {
+                    {
+                        let __claspr_concrete = match ::claspr::Input::with_concrete(
+                            #pname,
+                            |__d| ::claspr::KernelSliceReadArg::record_handle(__d),
+                        ) {
+                            ::core::option::Option::Some(__r) =>
+                                ::core::option::Option::Some(__r?),
+                            ::core::option::Option::None => ::core::option::Option::None,
+                        };
+                        let __claspr_cell = ::claspr::Input::pipe_cell_id(#pname);
+                        let (__claspr_h, __claspr_w) =
+                            __claspr_ctx.resolve_input(__claspr_concrete, __claspr_cell)?;
+                        // SAFETY: kernel is valid; this is the scalar-ref's
+                        // single pointer slot (no length operand).
+                        unsafe {
+                            __claspr_ctx.set_mem_arg(
+                                __claspr_kernel,
+                                &mut __claspr_argi,
+                                __claspr_h.mem,
+                            )?;
+                        }
+                        __claspr_in_handles.push(__claspr_h);
+                        __claspr_waits.extend(__claspr_w);
+                    }
+                });
+            }
             ParamRole::Image {
                 name: pname,
                 dim,
@@ -1675,6 +1766,24 @@ enum ParamRole {
         name: TokenStream2,
         ty: TokenStream2,
     },
+    /// Scalar-by-reference param (`#[spirv(cross_workgroup)] &T` or
+    /// `&mut T`, where `T` is NOT a slice). rust-gpu lowers this to a
+    /// bare pointer-to-scalar `OpFunctionParameter` with NO length
+    /// operand — so it rides the SAME reusable-buffer path as
+    /// [`ParamRole::Slice`] (a length-1 `DeviceSlice<T>` / `Pipe` /
+    /// `slot!` binds it, flows through `Output`, re-arms on `Checkout`),
+    /// EXCEPT the eager + record arg-set sets ONE arg slot (the pointer)
+    /// instead of the slice's `(pointer, len)` pair. The `&mut T` form
+    /// threads to `Output` like `&mut [T]`; `&T` is a read input.
+    ScalarRef {
+        name: TokenStream2,
+        /// The `T` from `&T` / `&mut T` — constrains the buffer generic
+        /// (reuses the slice `KernelSliceRead[Write]Arg<T>` bounds).
+        elem: TokenStream2,
+        /// `true` for `&mut T` (`KernelSliceReadWriteArg<T>`); `false`
+        /// for `&T` (`KernelSliceReadArg<T>`).
+        mutable: bool,
+    },
 }
 
 fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
@@ -1706,12 +1815,22 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
     };
 
     if matches!(kind, Some(SpirvKind::CrossWorkgroup)) {
-        let (elem, mutable) = slice_element_ty(&pt.ty)?;
-        return Ok(ParamRole::Slice {
-            name: pname,
-            elem,
-            mutable,
-        });
+        // A `#[spirv(cross_workgroup)]` param is a reference: `&[T]` /
+        // `&mut [T]` (a slice → pointer + length) or `&T` / `&mut T`
+        // (a scalar-ref → pointer only). Peek what the reference wraps
+        // to pick the role; anything else hits the shared error below.
+        return match cross_workgroup_element_ty(&pt.ty)? {
+            CrossWorkgroupTy::Slice { elem, mutable } => Ok(ParamRole::Slice {
+                name: pname,
+                elem,
+                mutable,
+            }),
+            CrossWorkgroupTy::ScalarRef { elem, mutable } => Ok(ParamRole::ScalarRef {
+                name: pname,
+                elem,
+                mutable,
+            }),
+        };
     }
     if let Some(info) = classify_image_param(pt)? {
         return Ok(ParamRole::Image {
@@ -1728,29 +1847,47 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
     })
 }
 
-/// Pull `(element type, is-mutable)` out of `&[T]` / `&mut [T]`.
-/// The mutability bit drives the choice between
-/// `KernelSliceReadArg<T>` (`&[T]`) and `KernelSliceReadWriteArg<T>`
-/// (`&mut [T]`) bounds on the emitted host method.
-fn slice_element_ty(ty: &Type) -> syn::Result<(TokenStream2, bool)> {
+/// What a `#[spirv(cross_workgroup)]` reference wraps: a slice `[T]`
+/// (pointer + length) or a bare scalar `T` (pointer only). Both carry
+/// the element type and the reference's mutability, which drives the
+/// `KernelSliceReadArg<T>` (`&`) vs `KernelSliceReadWriteArg<T>` (`&mut`)
+/// bound the emitted host method picks.
+enum CrossWorkgroupTy {
+    Slice { elem: TokenStream2, mutable: bool },
+    ScalarRef { elem: TokenStream2, mutable: bool },
+}
+
+/// Classify a `#[spirv(cross_workgroup)]` parameter's type. The param
+/// must be a reference; `&[T]`/`&mut [T]` → `Slice`, `&T`/`&mut T` (a
+/// reference over any non-slice type) → `ScalarRef`. rust-gpu lowers the
+/// former to a `(pointer, ulong length)` pair and the latter to a bare
+/// pointer-to-scalar with no length — the two host arg-setting shapes.
+fn cross_workgroup_element_ty(ty: &Type) -> syn::Result<CrossWorkgroupTy> {
     let Type::Reference(TypeReference {
         elem, mutability, ..
     }) = ty
     else {
         return Err(syn::Error::new(
             ty.span(),
-            "expected a reference type (`&[T]` or `&mut [T]`) for a #[spirv(cross_workgroup)] \
-             parameter; other shapes are not yet supported by claspr::kernel",
+            "expected a reference type (`&[T]` / `&mut [T]` for a slice, or `&T` / `&mut T` for a \
+             scalar-by-reference) for a #[spirv(cross_workgroup)] parameter; other shapes are not \
+             yet supported by claspr::kernel",
         ));
     };
-    let Type::Slice(TypeSlice { elem: inner, .. }) = &**elem else {
-        return Err(syn::Error::new(
-            elem.span(),
-            "expected a slice type `[T]` after the reference; other shapes are not yet supported \
-             by claspr::kernel",
-        ));
-    };
-    Ok((quote! { #inner }, mutability.is_some()))
+    let mutable = mutability.is_some();
+    match &**elem {
+        Type::Slice(TypeSlice { elem: inner, .. }) => Ok(CrossWorkgroupTy::Slice {
+            elem: quote! { #inner },
+            mutable,
+        }),
+        // Anything else the reference wraps (a `Type::Path` like `f32`,
+        // or another concrete non-slice type) is a scalar-by-reference:
+        // one pointer arg, no length.
+        inner => Ok(CrossWorkgroupTy::ScalarRef {
+            elem: quote! { #inner },
+            mutable,
+        }),
+    }
 }
 
 fn find_spirv_attr(attrs: &[Attribute]) -> Option<Attribute> {

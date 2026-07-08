@@ -100,6 +100,31 @@ pub mod kernels {
     ) {
         data[gid.x] = gid.x as u32;
     }
+
+    /// Multiply every element by a scalar passed **by reference** —
+    /// exercises `#[spirv(cross_workgroup)] &u32` (a read scalar-ref,
+    /// lowered to a bare pointer-to-scalar with no length operand).
+    #[claspr::kernel]
+    pub fn scale_by_ref_u32(
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
+        #[spirv(cross_workgroup)] data: &mut [u32],
+        #[spirv(cross_workgroup)] factor: &u32,
+    ) {
+        let i = id.x;
+        data[i] = data[i].wrapping_mul(*factor);
+    }
+
+    /// Write a by-value scalar through a `&mut u32` output scalar-ref —
+    /// exercises `#[spirv(cross_workgroup)] &mut u32` threading to
+    /// `Output` (host-readable after the launch). Single-element grid.
+    #[claspr::kernel]
+    pub fn write_scalar_u32(
+        #[spirv(global_invocation_id)] _id: spirv_std::glam::USizeVec3,
+        #[spirv(cross_workgroup)] out: &mut u32,
+        val: u32,
+    ) {
+        *out = val;
+    }
 }
 
 #[claspr::device]

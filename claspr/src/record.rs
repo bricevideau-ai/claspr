@@ -520,6 +520,42 @@ impl RecordContext {
         Ok(())
     }
 
+    /// Set one buffer **pointer** argument on `kernel` at `arg_index` — the
+    /// scalar-by-reference shape (`#[spirv(cross_workgroup)] &T` / `&mut T`),
+    /// which rust-gpu lowers to a bare pointer-to-scalar with **no** length
+    /// operand. Dispatches `clSetKernelArg` for a `cl_mem` or
+    /// `clSetKernelArgSVMPointer` for an SVM buffer, then advances
+    /// `arg_index` by exactly 1 (unlike [`set_buffer_arg`](Self::set_buffer_arg), which sets a
+    /// `(pointer, len)` pair and advances by 2).
+    ///
+    /// # Safety
+    /// `kernel` must be valid and `mem` a live buffer; `arg_index` must be the
+    /// single pointer slot of a scalar-ref parameter.
+    pub unsafe fn set_mem_arg(
+        &self,
+        kernel: cl_kernel,
+        arg_index: &mut cl_uint,
+        mem: MemRef,
+    ) -> Result<()> {
+        use std::ffi::c_void;
+        match mem {
+            MemRef::Buffer(m) => unsafe {
+                cl3::kernel::set_kernel_arg(
+                    kernel,
+                    *arg_index,
+                    std::mem::size_of::<cl_mem>(),
+                    (&m as *const cl_mem) as *const c_void,
+                )
+            },
+            MemRef::Svm(p) => unsafe {
+                cl3::kernel::set_kernel_arg_svm_pointer(kernel, *arg_index, p as *const c_void)
+            },
+        }
+        .map_err(|s| Error::OpenCl(opencl3::error_codes::ClError(s)))?;
+        *arg_index += 1;
+        Ok(())
+    }
+
     /// Set one scalar (by-value) argument on `kernel` at `arg_index` from its
     /// raw bytes, then advance `arg_index` by 1.
     ///
