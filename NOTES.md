@@ -9,6 +9,38 @@ items resolve.
 
 ## Active
 
+### ⚑ TODO 2026-07-08 — write a "authoring reusable-graph host code" usage guide (docs gap)
+
+Diagnosed from the #206 CG-rewrite agent's transcript: it spent ~half its tool calls
+(18 Bash + 12 engine-file Reads) REVERSE-ENGINEERING the Tier-2 graph USAGE semantics
+from source + cribbing patterns from tests — because there is no usage-level guide.
+CLAUDE.md documents the macro/build pipeline thoroughly and has a Tier-2 slot-VERB
+section, but nothing on WRITING a reusable-graph host program. The load-bearing
+concepts live only as doc-comments buried in eager.rs (fine for rustdoc, invisible to a
+sample author). Specific things the agent had to dig for (= the guide's contents):
+1. **reclaim_undelivered / rehome** — MOST-searched (grepped 3×). "Does an unconsumed
+   mid-graph buffer return to its cell on drop, or must I thread it to the terminal?"
+   THE question for a self-closing graph. Answer: it rehomes; thread only what dataflow
+   needs.
+2. **Checkout deref → .map() to read** — you can map a Checkout (borrows via Deref to
+   Output, does NOT consume) to read a result without into_inner.
+3. **self-closing / re-arm / stable-handle reuse** — build g ONCE, sync in a loop;
+   lent buffers rehome on Checkout drop → next sync reuses same cl_mem, zero rebinding.
+   Agent learned this only from graph_reuse.rs + gray-scott run_immutable.
+4. **what sync returns** — per-element Checkouts for multi-output kernels; per-branch
+   structure-preserving for bundles (#207); Checkout<O> for single.
+5. **into_inner vs drop** — into_inner SEVERS (keep the buffer, cell won't re-arm);
+   plain drop REHOMES (cell re-arms). When to use which.
+6. **Kernels clone-ability** — can `ks` be shared across graph closures (yes; the
+   launchers clone the context internally, don't borrow ks).
+7. **scalar-ref binding** — bind a len-1 DeviceSlice to a &f32/&mut f32 arg (#205).
+PLAN (after #206 lands, so cg is the canonical self-closing example to point at):
+a module-level `//!` guide in eager.rs (travels with the API, shows in rustdoc):
+"Writing reusable-graph host code" — the Checkout lend/rehome/reclaim lifecycle,
+deref-map to read, into_inner-vs-drop, the build-once-sync-in-a-loop replay idiom, and
+the sync-return shapes — with gray-scott run_immutable + cg as worked examples. Plus a
+short pointer from CLAUDE.md. NOT more doc-comments (those exist) — a usage narrative.
+
 ### ⚑ DESIGN 2026-07-08 (Brice) — `DeviceScalar<T>`: dedicated device-scalar type + `and_then_host` scalar mapping
 
 #205 gave scalar-by-ref KERNEL ARGS (`&f32`/`&mut f32` → pointer-to-scalar) but only
