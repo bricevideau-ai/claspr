@@ -9,6 +9,34 @@ items resolve.
 
 ## Active
 
+### ⚑ DECIDED 2026-07-08 (Brice) — DeviceScalar forks settled + CG reduction-strategy parametrization
+
+Plan: do #208 (DeviceScalar) FIRST, then parametrize CG (#210) to pick its
+reduction/α-β strategy via meta-kernels (all-on-device vs and_then_host).
+
+#208 FORKS SETTLED:
+- (a) DISTINCT `DeviceScalar<T>` type (NOT a DeviceSlice marker) — only a distinct
+  type makes the len-mismatch a COMPILE error (len-5 slice ⊄ &f32 arg; DeviceScalar ⊄
+  &[f32] arg) and carries a scalar `&mut T` View. Low cost: wraps a len-1 DeviceSlice,
+  delegates the whole Input/Checkout/rehome path; new = View + kernel-arg impls +
+  constructors.
+- (b) PER-TYPE `Mappable::View`: DeviceScalar → `&mut T`; DeviceSlice KEEPS `&mut [T]`
+  (View is already a per-mappable assoc type; no slice-ergonomics change).
+- CRITICAL new requirement baked into #208: a DeviceScalar must work as a MID-GRAPH
+  edge WRITTEN by an and_then_host seam then READ by a later kernel in the SAME graph,
+  threading + rehoming like a buffer (so a self-closing loop replays). This is the half
+  CG-all-device does NOT exercise — the &mut T write-View — and #210 strategy-2 needs it.
+
+#210 (blocked on #208): CG's compute_alpha/compute_beta become meta-kernels with two
+interchangeable strategies — ALL-ON-DEVICE (current finish-kernel path → one CB-able
+region) vs AND_THEN_HOST (download partials → host closure writes DeviceScalar α/β via
+&mut T → interpreted cuts inside the graph). Holds the algorithm fixed, swaps seam
+placement → the two CB shapes the partitioner is validated against (trivial whole-region
+vs discover-segments), and exercises BOTH halves of #208. All-device stays the default
+(also the guide's worked example — keep the flat explicit form for teaching). The
+meta-kernel factoring flattens today's 6-level nested and_then. Mirrors gray-scott's
+run_swap/run_immutable two-variant precedent.
+
 ### ⚑ TODO 2026-07-08 — write a "authoring reusable-graph host code" usage guide (docs gap)
 
 Diagnosed from the #206 CG-rewrite agent's transcript: it spent ~half its tool calls
