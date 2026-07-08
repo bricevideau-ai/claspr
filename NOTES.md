@@ -9,6 +9,35 @@ items resolve.
 
 ## Active
 
+### ⚑ PRINCIPLE 2026-07-08 (Brice) — stop shipping half-baked core primitives ("documented limitation" is not a completion state)
+
+Recurring failure mode called out by Brice: a core primitive hits a hard case, we
+handle the easy case + write an HONEST comment about what doesn't work + ship — and the
+gap resurfaces later as rework ("this always ends up biting"). Confirmed instances this
+project: B2 sever-all-before-fold bug (sever path shipped fragile), bundle multi-output
+branch "doesn't re-arm, home==None" (documented at eager.rs ~4849, now being fixed in
+#207), E1 call_move silent-error-swallow (shipped, later fixed E1), report-once deferred
+errors (E1b). Each comment was accurate; a documented gap is still a gap.
+
+RULE going forward:
+- A "documented limitation" is NOT an acceptable completion state for a case that lies
+  in a primitive's OWN conceptual domain (a bundle branch being multi-output IS bundle's
+  job; a slot holding a moved checkout IS the slot's job). Such a case is a BUG to fix
+  now, or a DESIGN DECISION to escalate to Brice — never a comment to ship.
+- Honesty test for "is this a legitimate limitation vs a trap": is the excluded case
+  ruled out by TYPE (won't compile — honest, self-enforcing) or only by RUNTIME
+  (silently-wrong / doesn't-re-arm / deferred-swallow — a TRAP)? Type-excluded is fine;
+  runtime-excluded on a core primitive is the smell.
+- COMPLETENESS is driven by HARDER SAMPLES, not more unit tests. gray-scott only bundled
+  single-output pipes → the multi-output-bundle gap stayed invisible until CG forced it.
+  The seams between green-in-isolation pieces are where half-baking hides. (Brice earlier:
+  "single function tests are just not good enough.")
+- When a fix yields a "bonus" that fixes a pre-existing limitation, that is EVIDENCE the
+  original was incomplete — treat it as paying down debt that shouldn't have existed, and
+  ADVERSARIALLY verify the fix is complete + probe the NEXT seam (e.g. #207: verify
+  multi-output bundle re-arm AND nested-multi-output-bundle transitivity), rather than
+  celebrating the accident and shipping the next gap.
+
 ### ⚑ CG SHOULD BE ONE GRAPH — device-resident scalars + loop peel dissolve the friction 2026-07-06 (Brice)
 
 The `into_inner`/sever/persistent-graph friction in `examples/cg` is SELF-INFLICTED: it
