@@ -1268,8 +1268,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 )> {
                     // Multi-output kernel: each output's home rides its own
                     // `Checkout` (via `gather_checkouts`), not one collapsed tuple
-                    // home. Nested as a bundle branch it collapses to `home == None`.
-                    // Delegate to `collect`.
+                    // home. This BY-VALUE path (`collect` / async `run`) returns
+                    // `home == None` — it builds no `Checkout`s, so has no homes to
+                    // thread. As a bundle branch the kernel still re-arms: the
+                    // bundle's terminal `gather_checkouts` DELEGATES to this op's
+                    // `gather_checkouts` (below), which threads every output's home.
+                    // Delegate the value to `collect`.
                     let (__claspr_v, __claspr_deps) = self.collect(ec, mode)?;
                     ::core::result::Result::Ok((__claspr_v, __claspr_deps, ::core::option::Option::None))
                 }

@@ -261,14 +261,22 @@ fn solve(ctx: &Context, b_host: &[f32]) -> claspr::Result<(Vec<f32>, usize, f32)
             }),
         )
         .sync(ctx)?;
-        // A bundle branch's `sync` yields ONE Checkout over its WHOLE output tuple
-        // (can't extract one element), and the CG buffers form a CYCLE across
-        // iterations (p: C→A) that outlives these throwaway graphs — so HERE we must
-        // recover owned buffers with `into_inner`. That severs region A's lent cells
-        // (p/ap/partials) and hands back region B's owned outputs (x/r) in one go.
-        let (r_inner, ap_inner, part_inner) = rap_co.into_inner();
+        // A bundle now yields STRUCTURE-PRESERVING per-branch Checkouts: branch 1
+        // `(Checkout<x>, Checkout<p>)`, branch 2 `(Checkout<r>, Checkout<ap>,
+        // Checkout<partials>)` — each buffer individually recoverable. The CG
+        // buffers form a CYCLE across iterations (p: C→A) that outlives these
+        // throwaway graphs, so HERE we recover owned buffers per element with
+        // `into_inner` (severing region A's lent cells p/ap/partials, handing back
+        // region B's owned outputs x/r).
+        let (x_co, p_co2) = xp_co;
+        let (r_co, ap_co2, part_co2) = rap_co;
+        let (r_inner, ap_inner, part_inner) = (
+            r_co.into_inner(),
+            ap_co2.into_inner(),
+            part_co2.into_inner(),
+        );
         let rsnew = sum_dev(&part_inner)?;
-        let (x_inner, p_inner) = xp_co.into_inner();
+        let (x_inner, p_inner) = (x_co.into_inner(), p_co2.into_inner());
         x = x_inner;
         p = p_inner;
         r = r_inner;
