@@ -285,3 +285,55 @@ fn two_scalars_in_bundle() {
     assert_eq!(a_co.read_value().expect("a read"), 7u32);
     assert!((b_co.read_value().expect("b read") - 1.5).abs() < 1e-6);
 }
+
+/// TIER COVERAGE: a `MappedScalar<u32>` (coarse-grain SVM backing) binds to the
+/// SAME `&u32` scalar-ref arg as a `DeviceScalar` — the scalar-ref traits are
+/// generic over the backing tier (`Scalar<B> where B: KernelSliceReadArg`), so
+/// all three memory tiers get scalar-ref for free. Skips on a no-SVM device.
+/// (Guards the regression the strict-DeviceScalar-only binding could have caused:
+/// before #208 a len-1 MappedSlice bound to `&u32`; now MappedScalar does.)
+#[test]
+fn mapped_scalar_reads_via_scalar_ref() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let factor = match claspr::MappedScalar::<u32>::new_mapped(&ctx, 3) {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln!("SKIP: no coarse-grain SVM for MappedScalar");
+            return;
+        }
+    };
+
+    let result = upload(vec![7u32; N])
+        .and_then(|data| kernels.scale_by_ref_u32([N], data, factor))
+        .and_then(|(data, _factor)| download(data))
+        .sync(&ctx)
+        .expect("mapped-scalar scale-by-ref chain");
+    assert!(result.iter().all(|&v| v == 21), "got {result:?}");
+}
+
+/// TIER COVERAGE: a `USMScalar<u32>` (fine-grain system SVM backing) binds to the
+/// same `&u32` scalar-ref arg — the third memory tier. Skips on a no-fine-grain-SVM
+/// device. Together with the DeviceScalar + MappedScalar tests this proves the
+/// scalar-ref surface is symmetric with the three slice tiers (no tier dropped).
+#[test]
+fn usm_scalar_reads_via_scalar_ref() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let factor = match claspr::USMScalar::<u32>::new_usm(&ctx, 3) {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln!("SKIP: no fine-grain system SVM for USMScalar");
+            return;
+        }
+    };
+
+    let result = upload(vec![7u32; N])
+        .and_then(|data| kernels.scale_by_ref_u32([N], data, factor))
+        .and_then(|(data, _factor)| download(data))
+        .sync(&ctx)
+        .expect("usm-scalar scale-by-ref chain");
+    assert!(result.iter().all(|&v| v == 21), "got {result:?}");
+}
