@@ -154,6 +154,73 @@ impl<T: Default + Copy + Send + 'static, M: MemMode> USMSlice<T, M> {
     }
 }
 
+// ── USMScalar — the fine-grain-system-SVM device scalar ─────────────
+
+/// A [`Scalar`](crate::Scalar) backed by a length-1 [`USMSlice<T, M>`]
+/// (fine-grain system SVM over a host `Vec<T>`). The USM tier's
+/// device-resident scalar, symmetric with
+/// [`DeviceScalar`](crate::DeviceScalar) — binds ONLY to scalar-ref
+/// kernel params and delegates the host `Vec` + in-flight-wait
+/// bookkeeping to the backing `USMSlice`.
+pub type USMScalar<T, M = ReadWrite> = crate::Scalar<USMSlice<T, M>>;
+
+/// The uninit type-state for a [`USMScalar<T, M>`].
+pub type USMScalarUninit<T, M = ReadWrite> = crate::ScalarUninit<USMSliceUninit<T, M>>;
+
+impl<T: Copy + Send + 'static, M: MemMode> crate::Scalar<USMSlice<T, M>> {
+    /// Create a USM device scalar seeded with `value` (a length-1 host
+    /// `Vec<T>` wrapped as USM). Errors with [`Error::NotSupported`] on
+    /// a device without fine-grain system SVM.
+    pub fn new_usm(ctx: &Context, value: T) -> Result<Self> {
+        Ok(crate::Scalar {
+            inner: USMSlice::new(ctx, vec![value])?,
+        })
+    }
+}
+
+impl<T, M: MemMode> crate::Scalar<USMSlice<T, M>> {
+    /// Allocate an uninitialised USM device scalar, returning the
+    /// type-state-gated [`USMScalarUninit`]. Mirrors
+    /// [`USMSlice::alloc_uninit`].
+    pub fn uninit_usm(ctx: &Context) -> Result<USMScalarUninit<T, M>> {
+        Ok(crate::ScalarUninit {
+            inner: USMSlice::alloc_uninit(ctx, 1)?,
+        })
+    }
+
+    /// Borrow the backing length-1 [`USMSlice<T, M>`].
+    pub fn as_usm_slice(&self) -> &USMSlice<T, M> {
+        &self.inner
+    }
+}
+
+impl<T, M: MemMode> crate::ScalarUninit<USMSliceUninit<T, M>> {
+    /// Assert the scalar has been (or will be) written before any read.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`USMSliceUninit::assume_init`].
+    pub unsafe fn assume_init_usm(self) -> USMScalar<T, M> {
+        // SAFETY: forwarded to the caller (see this fn's Safety section).
+        crate::Scalar {
+            inner: unsafe { self.inner.assume_init() },
+        }
+    }
+}
+
+/// Free-fn ctor for a seeded [`USMScalar<T>`] (default marker).
+pub fn usm_scalar<T: Copy + Send + 'static>(
+    ctx: &Context,
+    value: T,
+) -> Result<USMScalar<T, ReadWrite>> {
+    USMScalar::new_usm(ctx, value)
+}
+
+/// Free-fn ctor for an uninitialised [`USMScalar<T>`] (default marker).
+pub fn usm_scalar_uninit<T>(ctx: &Context) -> Result<USMScalarUninit<T, ReadWrite>> {
+    USMScalar::<T, ReadWrite>::uninit_usm(ctx)
+}
+
 impl<T, M: MemMode> USMSlice<T, M> {
     /// Allocate a USMSlice of `len` elements with uninitialised
     /// contents. Returns a [`USMSliceUninit<T, M>`] wrapper — host

@@ -317,6 +317,69 @@ impl<T: Copy, M: MemMode> MappedSlice<T, M> {
     }
 }
 
+// ── MappedScalar — the SVM-backed device scalar ─────────────────────
+
+/// A [`Scalar`](crate::Scalar) backed by a length-1 [`MappedSlice<T, M>`]
+/// (coarse-grain SVM). The SVM tier's device-resident scalar, symmetric
+/// with [`DeviceScalar`](crate::DeviceScalar) — binds ONLY to scalar-ref
+/// kernel params and delegates the SVM allocation + in-flight-free
+/// bookkeeping to the backing `MappedSlice`.
+pub type MappedScalar<T, M = ReadWrite> = crate::Scalar<MappedSlice<T, M>>;
+
+/// The uninit type-state for a [`MappedScalar<T, M>`].
+pub type MappedScalarUninit<T, M = ReadWrite> = crate::ScalarUninit<MappedSliceUninit<T, M>>;
+
+impl<T: Copy, M: MemMode> crate::Scalar<MappedSlice<T, M>> {
+    /// Create an SVM device scalar seeded with `value` (length-1
+    /// [`MappedSlice::from_slice`]). Errors with
+    /// [`Error::SvmNotAvailable`] on a no-SVM device.
+    pub fn new_mapped(ctx: &Context, value: T) -> Result<Self> {
+        Ok(crate::Scalar {
+            inner: MappedSlice::from_slice(ctx, std::slice::from_ref(&value))?,
+        })
+    }
+}
+
+impl<T, M: MemMode> crate::Scalar<MappedSlice<T, M>> {
+    /// Allocate an uninitialised SVM device scalar, returning the
+    /// type-state-gated [`MappedScalarUninit`]. Mirrors
+    /// [`MappedSlice::alloc_uninit`].
+    pub fn uninit_mapped(ctx: &Context) -> Result<MappedScalarUninit<T, M>> {
+        Ok(crate::ScalarUninit {
+            inner: MappedSlice::alloc_uninit(ctx, 1)?,
+        })
+    }
+
+    /// Borrow the backing length-1 [`MappedSlice<T, M>`].
+    pub fn as_mapped_slice(&self) -> &MappedSlice<T, M> {
+        &self.inner
+    }
+}
+
+impl<T, M: MemMode> crate::ScalarUninit<MappedSliceUninit<T, M>> {
+    /// Assert the scalar has been (or will be) written before any read.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`MappedSliceUninit::assume_init`].
+    pub unsafe fn assume_init_mapped(self) -> MappedScalar<T, M> {
+        // SAFETY: forwarded to the caller (see this fn's Safety section).
+        crate::Scalar {
+            inner: unsafe { self.inner.assume_init() },
+        }
+    }
+}
+
+/// Free-fn ctor for a seeded [`MappedScalar<T>`] (default marker).
+pub fn mapped_scalar<T: Copy>(ctx: &Context, value: T) -> Result<MappedScalar<T, ReadWrite>> {
+    MappedScalar::new_mapped(ctx, value)
+}
+
+/// Free-fn ctor for an uninitialised [`MappedScalar<T>`] (default marker).
+pub fn mapped_scalar_uninit<T>(ctx: &Context) -> Result<MappedScalarUninit<T, ReadWrite>> {
+    MappedScalar::<T, ReadWrite>::uninit_mapped(ctx)
+}
+
 impl<T, M: MemMode> MappedSlice<T, M> {
     /// Append `event` to this buffer's in-flight-use list. Drop passes
     /// every accumulated event to `clEnqueueSVMFree`'s wait-list, so

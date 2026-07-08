@@ -127,6 +127,7 @@
 //!   the context internally rather than borrowing the `Kernels`, so the built op
 //!   owns what it needs — pass `&ks` freely into nested `and_then` closures.
 
+use crate::buffer::{DeviceScalar, Scalar};
 use crate::copy::CopyTo;
 use crate::exec_ctx::ExecutionContext;
 use crate::host_view::{
@@ -443,6 +444,15 @@ impl_slot_eq!(DeviceSlice);
 impl_slot_eq!(MappedSlice);
 impl_slot_eq!(USMSlice);
 
+// A device SCALAR ([`Scalar<B>`], any memory tier) is a length-1 buffer — its
+// `SlotEq` is the backing buffer's handle identity, so it can be a `slot!(Tag)`
+// value bound/rebound by buffer identity across all three tiers.
+impl<B: SlotEq> SlotEq for Scalar<B> {
+    fn slot_eq(&self, other: &Self) -> bool {
+        self.inner.slot_eq(other.as_buffer())
+    }
+}
+
 // A shared (read-only fan-out) `Arc<DeviceSlice>` slot compares its inner buffer.
 impl<E, M> SlotEq for std::sync::Arc<DeviceSlice<E, M>>
 where
@@ -595,6 +605,14 @@ macro_rules! impl_slot_value_move {
 impl_slot_value_move!(DeviceSlice);
 impl_slot_value_move!(MappedSlice);
 impl_slot_value_move!(USMSlice);
+
+// A device SCALAR ([`Scalar<B>`], any tier) is a move-only buffer (single
+// owner), exactly like a slice.
+impl<B: Send + 'static> SlotValue for Scalar<B> {
+    fn fill_clone(&self) -> Option<Box<dyn Any + Send>> {
+        None
+    }
+}
 
 // ── Typed slots: per-tag value type compile-time, presence runtime ─────────
 
@@ -2485,6 +2503,19 @@ impl_to_input_concrete!(DeviceSlice);
 impl_to_input_concrete!(MappedSlice);
 impl_to_input_concrete!(USMSlice);
 
+// A device SCALAR ([`Scalar<B>`], any memory tier) plugs into a (scalar-ref)
+// kernel-arg position exactly like a slice does into a slice position — the
+// macro's `__D: KernelScalarRefArg<E>` bound (not the slice trait) is what pins
+// it to `&T` args only. `E` is unconstrained here (the macro's `Buf = __D` bound
+// ties it); `Scalar<B>` is a distinct nominal type from the bare slice families
+// / `Pipe<D>` / `Checkout<_>`, so it stays disjoint under coherence.
+impl<E, B> ToInput<E> for Scalar<B> {
+    type Buf = Scalar<B>;
+    fn to_input(self) -> Input<Scalar<B>> {
+        Input::from(self)
+    }
+}
+
 // A `slot!(Tag)` plugs straight into a kernel arg position: it resolves to
 // `Input<Tag::Value>`, with `Buf = Tag::Value` (the macro's `__D`) — so
 // `kernels.scale([N], slot!(Buf), 2u32)` infers `__D = Tag::Value` and applies
@@ -2644,6 +2675,29 @@ macro_rules! impl_to_input_checkout {
 impl_to_input_checkout!(DeviceSlice);
 impl_to_input_checkout!(MappedSlice);
 impl_to_input_checkout!(USMSlice);
+
+// A `Checkout<Scalar<B>>` (any memory tier) LENDS forward exactly like a slice
+// checkout. Distinct nominal type from the bare families / `Pipe` / slice
+// checkouts, so it stays disjoint under coherence.
+impl<E, B> ToInput<E> for Checkout<Scalar<B>>
+where
+    B: Send,
+{
+    type Buf = Scalar<B>;
+    fn to_input(self) -> Input<Scalar<B>> {
+        let (value, home) = self.into_value_and_home();
+        Input::lent(value, home)
+    }
+}
+impl<B> From<Checkout<Scalar<B>>> for Input<Scalar<B>>
+where
+    B: Send,
+{
+    fn from(co: Checkout<Scalar<B>>) -> Self {
+        let (value, home) = co.into_value_and_home();
+        Input::lent(value, home)
+    }
+}
 
 // `Checkout<Arc<DeviceSlice<E, M>>>` — the shared-buffer arg, LENT via its home
 // (see the macro above): A stays busy until B drops the Arc, then it rehomes.
@@ -5680,6 +5734,159 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("upload".into());
+    }
+}
+
+// ── Leaf: seeded device-scalar alloc (host value → DeviceScalar) ────────
+
+/// Allocate a [`DeviceScalar<T, M>`] ONCE, seed it from `value`, and hand it a
+/// **persistent home** so the SAME `cl_mem` is reused across `g.sync()` replays
+/// — the scalar twin of [`Upload`]. A chain-entry leaf (no upstream input).
+///
+/// Same stable-handle + reseed-on-replay contract as [`Upload`]: on the first
+/// run the scalar is allocated + seeded via [`DeviceScalar::new`]
+/// (`CL_MEM_COPY_HOST_PTR`); on replay it is re-lent from this op's home cell,
+/// and re-seeded IFF the marker is kernel-writable
+/// ([`UploadReseed::RESEED_ON_REPLAY`](crate::UploadReseed)).
+pub struct ScalarUpload<T: Copy, M: MemMode = ReadWrite> {
+    value: T,
+    buf: Cell<DeviceScalar<T, M>>,
+    seeded: Arc<Mutex<bool>>,
+    out: Pipe<DeviceScalar<T, M>>,
+}
+
+/// Build a seeded device-scalar alloc leaf with the **default [`ReadWrite`]
+/// marker** — the scalar twin of [`upload`]: `scalar_value(0.0f32)`.
+pub fn scalar_value<T>(value: T) -> ScalarUpload<T, ReadWrite>
+where
+    T: Copy + Send + Sync + 'static,
+{
+    scalar_value_as(value, ReadWrite)
+}
+
+/// Build a seeded device-scalar alloc leaf with an **explicit access marker**,
+/// inferred from the `marker` witness — the scalar twin of [`upload_as`].
+pub fn scalar_value_as<T, M>(value: T, marker: M) -> ScalarUpload<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: crate::UploadReseed + Send + 'static,
+{
+    let _ = marker;
+    ScalarUpload {
+        value,
+        buf: Arc::new(Mutex::new(None)),
+        seeded: Arc::new(Mutex::new(false)),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M> DeviceOp for ScalarUpload<T, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: crate::UploadReseed + Send + 'static,
+{
+    type Output = DeviceScalar<T, M>;
+
+    fn output_pipe(&self) -> Pipe<DeviceScalar<T, M>> {
+        self.out.clone()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.out.clone()
+    }
+
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // Same three-case stable-handle logic as `Upload`, over a length-1 scalar.
+        let mut seeded = self.seeded.lock().unwrap();
+        let lent = self.buf.lock().unwrap().take();
+        let buf = match (lent, *seeded) {
+            (None, false) => {
+                let buf = DeviceScalar::<T, M>::new(ec.context(), self.value)?;
+                *seeded = true;
+                buf
+            }
+            (Some(mut buf), _) => {
+                if M::RESEED_ON_REPLAY {
+                    crate::buffer::write_buffer_enqueue(
+                        &mut buf.inner,
+                        ec,
+                        std::slice::from_ref(&self.value),
+                        true,
+                        &[],
+                    )?;
+                }
+                buf
+            }
+            (None, true) => {
+                return Err(Error::NotSupported(
+                    "eager graph: a device-scalar upload buffer was already lent and \
+                     not returned — a graph is `sync`'d while a previous `Checkout` is \
+                     still alive (the graph is busy)",
+                ));
+            }
+        };
+        let home: Option<BoxedHome<DeviceScalar<T, M>>> = Some(Box::new(Arc::clone(&self.buf)));
+        self.out.put_home(buf, Deps::new(), home);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("scalar_value".into());
+    }
+}
+
+// ── Leaf: zero-init device-scalar alloc ────────────────────────────────
+
+/// Allocate a [`DeviceScalar<T, M>`] zero-initialised (via a length-1
+/// [`DeviceScalar::new`]`(T::default())`), with a persistent home — the scalar
+/// twin of [`alloc_zero`]. A chain-entry leaf.
+pub struct ScalarZero<T: Copy, M: MemMode = ReadWrite> {
+    inner: ScalarUpload<T, M>,
+}
+
+/// Build a zero-init device-scalar alloc leaf with the **default [`ReadWrite`]
+/// marker** — `scalar_zero::<f32>()`.
+pub fn scalar_zero<T>() -> ScalarZero<T, ReadWrite>
+where
+    T: Copy + Default + Send + Sync + 'static,
+{
+    ScalarZero {
+        inner: scalar_value_as(T::default(), ReadWrite),
+    }
+}
+
+/// Build a zero-init device-scalar alloc leaf with an **explicit access marker**.
+pub fn scalar_zero_as<T, M>(marker: M) -> ScalarZero<T, M>
+where
+    T: Copy + Default + Send + Sync + 'static,
+    M: crate::UploadReseed + Send + 'static,
+{
+    ScalarZero {
+        inner: scalar_value_as(T::default(), marker),
+    }
+}
+
+impl<T, M> DeviceOp for ScalarZero<T, M>
+where
+    T: Copy + Default + Send + Sync + 'static,
+    M: crate::UploadReseed + Send + 'static,
+{
+    type Output = DeviceScalar<T, M>;
+
+    fn output_pipe(&self) -> Pipe<DeviceScalar<T, M>> {
+        self.inner.output_pipe()
+    }
+
+    fn handle(&self) -> Self::Handle {
+        self.inner.handle()
+    }
+
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        self.inner.execute(ec, mode)
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("scalar_zero".into());
     }
 }
 

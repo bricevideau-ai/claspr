@@ -661,14 +661,22 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 elem,
                 mutable,
             } => {
-                // A scalar-by-reference (`&T` / `&mut T`) is a reusable BUFFER
-                // arg identical to a slice in EVERY respect (host binding,
-                // Output threading, bind_slots, check_ready, resolve_home) —
-                // a length-1 `DeviceSlice<T>` / `Pipe` / `slot!` satisfies the
-                // SAME `KernelSliceRead[Write]Arg<T>` bounds — EXCEPT the eager
-                // + record arg-set sets ONE arg slot (the pointer), not the
-                // slice's `(pointer, len)` pair. rust-gpu emits a bare
-                // pointer-to-scalar param with no `%ulong` length operand.
+                // A scalar-by-reference (`&T` / `&mut T`) is a reusable
+                // device-SCALAR arg. It threads through the graph identically
+                // to a slice in EVERY respect (host binding, Output threading,
+                // bind_slots, check_ready, resolve_home) — a `DeviceScalar<T>`
+                // / `Pipe` / `slot!` / `Checkout` of one satisfies the DEDICATED
+                // `KernelScalarRef[Mut]Arg<T>` bounds — EXCEPT the eager + record
+                // arg-set sets ONE arg slot (the pointer), not the slice's
+                // `(pointer, len)` pair. rust-gpu emits a bare pointer-to-scalar
+                // param with no `%ulong` length operand.
+                //
+                // STRICT binding (#208): the bound is the SCALAR-ref trait, NOT
+                // the slice trait. Only `DeviceScalar<T>` impls it — a length-1
+                // `DeviceSlice` does NOT, so binding a slice here is a compile
+                // error; and `DeviceScalar` does NOT impl the slice traits, so
+                // binding it to a `&[T]` slice arg is a compile error too
+                // (exclusion enforced in both directions).
                 let gid = quote::format_ident!("__claspr_D{}", arg_gen_idx);
                 let sid = quote::format_ident!("__claspr_S{}", arg_gen_idx);
                 let deps_ident = quote::format_ident!("__claspr_deps{}", arg_gen_idx);
@@ -676,13 +684,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 arg_gen_idx += 1;
                 let gid_tt: TokenStream2 = quote! { #gid };
                 let iid_tt: TokenStream2 = quote! { #sid };
-                // SAME buffer bound as a slice arg (Read vs ReadWrite by
-                // mutability). `KernelSliceReadArg: KernelPointerArg`, so the
+                // The dedicated scalar-ref bound (Read vs ReadWrite by
+                // mutability). `KernelScalarRefArg: KernelPointerArg`, so the
                 // pointer-only setter is available on `__D` for free.
                 let dbound: TokenStream2 = if mutable {
-                    quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> }
+                    quote! { #gid: ::claspr::KernelScalarRefMutArg<#elem> }
                 } else {
-                    quote! { #gid: ::claspr::KernelSliceReadArg<#elem> }
+                    quote! { #gid: ::claspr::KernelScalarRefArg<#elem> }
                 };
                 let ibound: TokenStream2 = quote! { #sid: ::claspr::ToInput<#elem, Buf = #gid> };
                 generics.push((gid_tt.clone(), dbound));
@@ -724,7 +732,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     {
                         let __claspr_concrete = match ::claspr::Input::with_concrete(
                             #pname,
-                            |__d| ::claspr::KernelSliceReadArg::record_handle(__d),
+                            |__d| ::claspr::KernelScalarRefArg::record_handle(__d),
                         ) {
                             ::core::option::Option::Some(__r) =>
                                 ::core::option::Option::Some(__r?),

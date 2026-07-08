@@ -14,6 +14,26 @@ items resolve.
 Plan: do #208 (DeviceScalar) FIRST, then parametrize CG (#210) to pick its
 reduction/α-β strategy via meta-kernels (all-on-device vs and_then_host).
 
+**#208 LANDED 2026-07-08.** Shipped as a GENERIC `Scalar<B>` newtype (backing
+buffer `B`) with tier aliases `DeviceScalar`/`MappedScalar`/`USMScalar` — chosen
+over three duplicated types to cover ALL THREE memory tiers symmetric with the
+slice tiers (a scope escalation from the coordinator caught that #205's scalar-ref
+reused `KernelSliceReadArg`, so len-1 `MappedSlice`/`USMSlice` bound to `&T` args;
+a DeviceScalar-only strict binding would have SILENTLY DROPPED Mapped/USM
+scalar-arg support — a regression). New dedicated `KernelScalarRef[Mut]Arg<T>`
+traits (impl'd for `Scalar<B>` only, gated on B's slice traits — strict exclusion
+both ways, compile-fail-proven). `Mappable::View = &mut T` for `DeviceScalar` only
+(mirrors `Mappable` being `DeviceSlice`-only among slices). Ctors:
+`device_scalar`/`_uninit`, `mapped_scalar`/`_uninit`, `usm_scalar`/`_uninit`, lazy
+`scalar_value`/`scalar_zero` leaves + `device_scalar_alloc!`/`device_scalar_zero!`
+macros. Whole Input/ToInput/Checkout/SlotEq/SlotValue/CopyHome path delegated
+generically over `Scalar<B>`. CG's 5 scalars migrated to `DeviceScalar` (5-iter
+self-closing, zero loop-body `into_inner`, 3-ICD). Host-seam-write-`&mut T`-then-
+kernel-read + replay proven (the #210-critical path). Macro `ScalarRef` arm
+re-pointed to the scalar traits. 11 generality tests (u32+f32, slot, pipe,
+checkout, host-seam, bundle) + 2 compile-fail (both directions) green on
+pocl/rusticl/intel.
+
 #208 FORKS SETTLED:
 - (a) DISTINCT `DeviceScalar<T>` type (NOT a DeviceSlice marker) — only a distinct
   type makes the len-mismatch a COMPILE error (len-5 slice ⊄ &f32 arg; DeviceScalar ⊄

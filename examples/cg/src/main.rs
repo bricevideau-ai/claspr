@@ -84,7 +84,7 @@
 //! workgroup memory / barriers, robust on every ICD.
 
 use claspr::eager::{DeviceOpExt, bundle2, forward};
-use claspr::{Context, DeviceSlice};
+use claspr::{Context, DeviceScalar, DeviceSlice};
 
 #[claspr::device]
 pub mod gpu {
@@ -303,15 +303,17 @@ fn solve(ctx: &Context, b_host: &[f32]) -> claspr::Result<(Vec<f32>, usize, f32)
     let p: DeviceSlice<f32> = DeviceSlice::from_slice(ctx, b_host)?;
     let ap: DeviceSlice<f32> = DeviceSlice::alloc_zero(ctx, N)?;
     let partials: DeviceSlice<f32> = DeviceSlice::alloc_zero(ctx, G)?;
-    // Device scalars (len-1). `beta = 0` makes iteration 1's `xpby(p, r, 0)` a
-    // no-op (`p` already = b), so no peeled first iteration is needed. `rsold =
-    // b·b` seeds the α of the first step (we already hold b on the host).
+    // Device scalars — first-class `DeviceScalar<f32>` (each a single `&f32` /
+    // `&mut f32` scalar-by-reference kernel arg). `beta = 0` makes iteration 1's
+    // `xpby(p, r, 0)` a no-op (`p` already = b), so no peeled first iteration is
+    // needed. `rsold = b·b` seeds the α of the first step (we already hold b on
+    // the host).
     let rsold_val: f32 = b_host.iter().map(|v| v * v).sum();
-    let rsold: DeviceSlice<f32> = DeviceSlice::from_slice(ctx, &[rsold_val])?;
-    let alpha: DeviceSlice<f32> = DeviceSlice::alloc_zero(ctx, 1)?;
-    let nalpha: DeviceSlice<f32> = DeviceSlice::alloc_zero(ctx, 1)?;
-    let beta: DeviceSlice<f32> = DeviceSlice::alloc_zero(ctx, 1)?;
-    let rsnew: DeviceSlice<f32> = DeviceSlice::alloc_zero(ctx, 1)?;
+    let rsold: DeviceScalar<f32> = DeviceScalar::new(ctx, rsold_val)?;
+    let alpha: DeviceScalar<f32> = DeviceScalar::new(ctx, 0.0)?;
+    let nalpha: DeviceScalar<f32> = DeviceScalar::new(ctx, 0.0)?;
+    let beta: DeviceScalar<f32> = DeviceScalar::new(ctx, 0.0)?;
+    let rsnew: DeviceScalar<f32> = DeviceScalar::new(ctx, 0.0)?;
 
     // ── Build the whole CG iteration ONCE as a single self-closing graph. ────
     // Each kernel op takes its buffers as concrete cells (first use) or threaded
@@ -377,7 +379,10 @@ fn solve(ctx: &Context, b_host: &[f32]) -> claspr::Result<(Vec<f32>, usize, f32)
         // mid-graph buffer), so the next `sync` reuses identical handles with no
         // rebinding.
         let (x_co, rsnew_co) = g.sync(ctx)?;
-        let rsnew_scalar = rsnew_co.map().wait()?[0];
+        // The sole host action: read back the len-1 `rsnew` (= r·r) scalar. A
+        // borrowing `DeviceScalar::read_value` (Deref through the Checkout) — no
+        // `into_inner`, so the Checkout still rehomes on drop below.
+        let rsnew_scalar = rsnew_co.read_value()?;
         iters += 1;
         if rsnew_scalar < TOL * TOL || iters >= MAXITER {
             // Converged (or capped): read the solution off the same Checkout — a

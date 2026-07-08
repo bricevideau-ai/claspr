@@ -298,6 +298,218 @@ impl<T, M: MemMode> crate::record::RecordableBuffer for DeviceSliceUninit<T, M> 
     }
 }
 
+// ── Scalar<B> — the device-resident scalar (all three memory tiers) ──
+
+/// A first-class **device-resident scalar** — a single `T` living in
+/// device memory, the type-fidelity counterpart of a slice buffer for
+/// `#[spirv(cross_workgroup)] &T` / `&mut T` kernel parameters.
+///
+/// rust-gpu lowers a scalar-by-reference kernel param to a bare
+/// pointer-to-scalar (no length operand), so on the host it needs a
+/// buffer that sets exactly **one** kernel-arg slot (the pointer), not
+/// the `(pointer, len)` pair a slice sets. `Scalar<B>` wraps a length-1
+/// backing buffer `B` (a [`DeviceSlice`], [`MappedSlice`](crate::MappedSlice),
+/// or [`USMSlice`](crate::USMSlice)) and re-shapes only the host-facing
+/// surface: it binds ONLY to scalar-ref kernel params
+/// ([`KernelScalarRefArg`](crate::KernelScalarRefArg) /
+/// [`KernelScalarRefMutArg`](crate::KernelScalarRefMutArg)) — setting one
+/// arg slot — while all device-memory behaviour (allocation, `cl_mem` /
+/// SVM lifetime, the SVM-free in-flight bookkeeping, recording) is
+/// delegated to `B`.
+///
+/// ## Strict binding (both directions)
+///
+/// A length-1 slice no longer satisfies a `&T` arg, and a `Scalar` does
+/// not satisfy a `&[T]` arg. `Scalar<B>` impls the scalar-ref traits and
+/// NOT the slice traits; the slice tiers impl the slice traits and NOT
+/// the scalar-ref traits — the mismatch is a compile error in both
+/// directions.
+///
+/// ## Three tiers (no regression vs #205)
+///
+/// The kernel-arg binding is generic over the backing buffer, so ALL
+/// three memory tiers get scalar-ref support symmetric with their slice
+/// counterparts. Use the tier aliases:
+///
+/// - [`DeviceScalar<T, M>`] = `Scalar<DeviceSlice<T, M>>` (cl_mem).
+/// - [`MappedScalar<T, M>`](crate::MappedScalar) = `Scalar<MappedSlice<T, M>>` (coarse SVM).
+/// - [`USMScalar<T, M>`](crate::USMScalar) = `Scalar<USMSlice<T, M>>` (fine-grain system SVM).
+///
+/// ## Graph + host view
+///
+/// A `Scalar` flows through the reusable-graph engine (Tier 2) in every
+/// position a buffer input does: a kernel arg, a
+/// [`slot!`](crate::slot)`(Tag)` value, a [`Pipe`](crate::Pipe), a
+/// [`Checkout`](crate::Checkout), and a `bind`/`call` source (all generic
+/// over `B`). Its [`Mappable`](crate::Mappable) view is `&mut T` (a
+/// single element, not a slice) — impl'd for [`DeviceScalar`] only, exactly
+/// as `Mappable` among the slice tiers is `DeviceSlice`-only — so an
+/// [`and_then_host`](crate::DeviceOpExt::and_then_host) seam over a
+/// `DeviceScalar` writes it with `*view = …`.
+///
+/// Construct via the per-tier ctors ([`DeviceScalar::new`] /
+/// [`DeviceScalar::uninit`] and the `MappedScalar` / `USMScalar`
+/// analogues), the free-fn aliases [`device_scalar`] /
+/// [`device_scalar_uninit`] (+ mapped/usm), or the lazy graph leaves
+/// [`device_scalar_alloc!`](crate::device_scalar_alloc) family.
+pub struct Scalar<B> {
+    /// The length-1 backing buffer. `Scalar` only re-shapes the
+    /// host-facing surface (one element, scalar-ref kernel arg, and —
+    /// for the DeviceSlice backing — a `&mut T` map view); everything
+    /// else delegates here.
+    pub(crate) inner: B,
+}
+
+/// A [`Scalar`] backed by a length-1 [`DeviceSlice<T, M>`] (`cl_mem`).
+pub type DeviceScalar<T, M = ReadWrite> = Scalar<DeviceSlice<T, M>>;
+
+impl<B> Scalar<B> {
+    /// Borrow the backing length-1 buffer.
+    pub fn as_buffer(&self) -> &B {
+        &self.inner
+    }
+
+    /// Consume this scalar, yielding the backing length-1 buffer (e.g.
+    /// to hand it to slice-shaped APIs).
+    pub fn into_buffer(self) -> B {
+        self.inner
+    }
+}
+
+impl<T: Copy, M: MemMode> Scalar<DeviceSlice<T, M>> {
+    /// Create a device scalar seeded with `value`, copied to the device
+    /// at construction via `CL_MEM_COPY_HOST_PTR` (the length-1
+    /// [`DeviceSlice::from_slice`] path). Works for any marker `M`.
+    pub fn new(ctx: &Context, value: T) -> Result<Self> {
+        Ok(Scalar {
+            inner: DeviceSlice::from_slice(ctx, std::slice::from_ref(&value))?,
+        })
+    }
+}
+
+impl<T, M: MemMode> Scalar<DeviceSlice<T, M>> {
+    /// Allocate a device scalar leaving the byte uninitialised. Returns
+    /// a [`DeviceScalarUninit<T, M>`] type-state wrapper (host reads
+    /// blocked until initialised), mirroring
+    /// [`DeviceSlice::alloc_uninit`]. Transition via `assume_init` (the
+    /// kernel-write-only pattern) or by writing it through a Tier 2
+    /// graph.
+    pub fn uninit(ctx: &Context) -> Result<DeviceScalarUninit<T, M>> {
+        Ok(ScalarUninit {
+            inner: DeviceSlice::alloc_uninit(ctx, 1)?,
+        })
+    }
+
+    /// Borrow the underlying length-1 [`ClBuffer`](opencl3::memory::Buffer).
+    pub fn buffer(&self) -> &ClBuffer<T> {
+        self.inner.buffer()
+    }
+
+    /// Borrow the backing length-1 [`DeviceSlice<T, M>`].
+    pub fn as_slice(&self) -> &DeviceSlice<T, M> {
+        &self.inner
+    }
+}
+
+impl<T: Copy, M: MemMode + HostReadable> Scalar<DeviceSlice<T, M>> {
+    /// Blocking read-back of the scalar's current device value via a
+    /// `clEnqueueMapBuffer(CL_MAP_READ)` on the owning context's default
+    /// queue. Convenience over `self.as_slice().map().wait()?[0]`.
+    pub fn read_value(&self) -> Result<T> {
+        let guard = self.inner.map().wait()?;
+        Ok(guard[0])
+    }
+}
+
+impl<T, B: Buffer<T>> Buffer<T> for Scalar<B> {
+    fn len(&self) -> usize {
+        1
+    }
+
+    fn ctx(&self) -> &Context {
+        self.inner.ctx()
+    }
+}
+
+impl<B: crate::record::RecordableBuffer> crate::record::RecordableBuffer for Scalar<B> {
+    fn record_handle(&self) -> crate::record::BufHandle {
+        self.inner.record_handle()
+    }
+}
+
+/// Metadata-only `Debug` — never reads device memory and doesn't
+/// require `T: Debug` (the element type doesn't flow through).
+impl<B> fmt::Debug for Scalar<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Scalar")
+            .field("backing", &std::any::type_name::<B>())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Type-state wrapper returned by the `Scalar::uninit` ctors — the byte
+/// is uninitialised and host reads are statically blocked. Transition
+/// to an initialised [`Scalar<B>`] via
+/// [`unsafe fn assume_init`](Self::assume_init) (kernel-write-only) or a
+/// Tier 2 graph that writes it. `U` is the backing uninit buffer
+/// (`DeviceSliceUninit` / `MappedSliceUninit` / `USMSliceUninit`).
+/// Mirrors [`DeviceSliceUninit`].
+pub struct ScalarUninit<U> {
+    pub(crate) inner: U,
+}
+
+/// The uninit type-state for a [`DeviceScalar<T, M>`].
+pub type DeviceScalarUninit<T, M = ReadWrite> = ScalarUninit<DeviceSliceUninit<T, M>>;
+
+impl<T, M: MemMode> ScalarUninit<DeviceSliceUninit<T, M>> {
+    /// Assert the scalar has been (or will be) written by some path
+    /// before any read. Escape hatch for the rust-gpu MaybeUninit gap.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`DeviceSliceUninit::assume_init`]: the caller
+    /// asserts the byte is written by SOME path before any read.
+    pub unsafe fn assume_init(self) -> DeviceScalar<T, M> {
+        // SAFETY: forwarded to the caller (see this fn's Safety section).
+        Scalar {
+            inner: unsafe { self.inner.assume_init() },
+        }
+    }
+}
+
+impl<B: crate::record::RecordableBuffer> crate::record::RecordableBuffer for ScalarUninit<B> {
+    fn record_handle(&self) -> crate::record::BufHandle {
+        self.inner.record_handle()
+    }
+}
+
+impl<U> fmt::Debug for ScalarUninit<U> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScalarUninit")
+            .field("backing", &std::any::type_name::<U>())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Eager free-function constructor for a seeded [`DeviceScalar<T>`] with
+/// the default [`ReadWrite`] marker — the scalar twin of the eager
+/// [`DeviceSlice::from_slice`] path. Mirrors the `DeviceSlice` naming.
+///
+/// ```ignore
+/// let alpha = claspr::device_scalar(&ctx, 0.0f32)?;
+/// ```
+pub fn device_scalar<T: Copy>(ctx: &Context, value: T) -> Result<DeviceScalar<T, ReadWrite>> {
+    DeviceScalar::new(ctx, value)
+}
+
+/// Eager free-function constructor for an uninitialised
+/// [`DeviceScalar<T>`] (default [`ReadWrite`] marker), returning the
+/// type-state-gated [`DeviceScalarUninit`]. Mirrors
+/// [`DeviceSlice::alloc_uninit`].
+pub fn device_scalar_uninit<T>(ctx: &Context) -> Result<DeviceScalarUninit<T, ReadWrite>> {
+    DeviceScalar::<T, ReadWrite>::uninit(ctx)
+}
+
 impl<T, M: MemMode> fmt::Debug for DeviceSliceUninit<T, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeviceSliceUninit")

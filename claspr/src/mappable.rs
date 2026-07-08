@@ -37,7 +37,7 @@
 
 use crate::map_primitive;
 use crate::util::{RetainedQueue, mapped_slice_mut};
-use crate::{Buffer, Context, DeviceSlice, Event, Result};
+use crate::{Buffer, Context, DeviceScalar, DeviceSlice, Event, Result};
 use opencl3::command_queue::CommandQueue;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, ClMem};
 use opencl3::types::{cl_event, cl_mem};
@@ -234,6 +234,56 @@ where
 
     fn mark_unmap_not_done(handle: &mut Self::MapHandle) {
         handle.unmap_enqueued = false;
+    }
+}
+
+// ── DeviceScalar<T> impl ────────────────────────────────────────────
+
+/// `Mappable` for a device-resident [`DeviceScalar<T>`]
+/// (`Scalar<DeviceSlice<T>>`): maps its length-1 backing buffer and
+/// hands the closure a `&mut T` view (the single element, NOT a
+/// `&mut [T]` slice — the per-type `View` distinction of #208). The
+/// map/unmap/Drop machinery is delegated to the backing slice's
+/// [`DeviceSliceMapHandle`] entirely; only the `view` reshaping
+/// (`&mut [T]` → `&mut T`) is scalar-specific.
+///
+/// `Mappable` is impl'd for the `DeviceScalar` tier ONLY — exactly as
+/// `Mappable` among the slice tiers is `DeviceSlice`-only (the
+/// `MappedScalar`/`USMScalar` SVM tiers use their own map paths, not
+/// the `and_then_host` seam, mirroring their slice counterparts).
+impl<T> Mappable for DeviceScalar<T>
+where
+    T: Copy + Send + 'static,
+{
+    type View<'a> = &'a mut T;
+    type MapHandle = DeviceSliceMapHandle<T>;
+
+    fn map(
+        &self,
+        queue: &CommandQueue,
+        deps: &[cl_event],
+    ) -> Result<(Self::MapHandle, Vec<Event>)> {
+        // Delegate to the backing length-1 slice's map — same cl_mem,
+        // same CL_MAP_READ | CL_MAP_WRITE, same defensive Drop.
+        <DeviceSlice<T> as Mappable>::map(self.as_slice(), queue, deps)
+    }
+
+    fn enqueue_unmap(
+        handle: &mut Self::MapHandle,
+        queue: &CommandQueue,
+        wait_for: &[cl_event],
+    ) -> Result<Vec<Event>> {
+        <DeviceSlice<T> as Mappable>::enqueue_unmap(handle, queue, wait_for)
+    }
+
+    fn view<'a>(handle: &'a mut Self::MapHandle) -> Self::View<'a> {
+        // Reshape the slice view (`&mut [T]` of length 1) to `&mut T`
+        // of element 0. The map guaranteed `len == 1`.
+        &mut <DeviceSlice<T> as Mappable>::view(handle)[0]
+    }
+
+    fn mark_unmap_not_done(handle: &mut Self::MapHandle) {
+        <DeviceSlice<T> as Mappable>::mark_unmap_not_done(handle);
     }
 }
 

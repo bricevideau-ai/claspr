@@ -35,7 +35,7 @@
 //! Rust types). The stage-2 build-time codegen and stage-3 proc-macro
 //! will tighten this to compile-time checks.
 
-use crate::buffer::DeviceSlice;
+use crate::buffer::{DeviceSlice, Scalar};
 use opencl3::event::Event;
 use opencl3::kernel::ExecuteKernel;
 use std::sync::Arc;
@@ -187,6 +187,105 @@ pub trait KernelSliceReadWriteArg<T>: KernelSliceReadArg<T> {}
 /// macro to pick Read vs ReadWrite based on slice mutability.
 pub trait KernelSliceArg<T>: KernelSliceReadWriteArg<T> {}
 impl<T, X: KernelSliceReadWriteArg<T>> KernelSliceArg<T> for X {}
+
+// ── KernelScalarRefArg — the scalar-by-reference kernel-arg bound ────
+//
+// rust-gpu lowers a `#[spirv(cross_workgroup)] &T` / `&mut T` kernel
+// param to a bare pointer-to-scalar `OpFunctionParameter` (NO length
+// operand), so the host must set exactly ONE arg slot (the pointer).
+// This is the DEDICATED scalar-ref trait family — the type-fidelity
+// half of #208. It is impl'd ONLY for `Scalar<B>` (the device-scalar
+// wrapper — every memory tier via its backing `B`; plus its
+// `Pipe`/`slot!`/`Checkout` via the scalar `ToInput`), NOT for the bare
+// slice tiers. Conversely `Scalar<B>` does NOT impl the slice traits
+// ([`KernelSliceReadArg`] etc.). The two exclusions together make the
+// &T-arg / &[T]-arg mismatch a compile error in BOTH directions.
+//
+// Generic over the backing buffer `B`, which supplies the pointer via
+// its own [`KernelPointerArg`] (`set_pointer_only`) — so ALL three
+// memory tiers (`DeviceScalar`/`MappedScalar`/`USMScalar`, backed by
+// `DeviceSlice`/`MappedSlice`/`USMSlice`) get scalar-ref support
+// symmetric with their slice counterparts, no regression vs #205.
+
+/// Sealing module — keeps the scalar-ref trait impls in-crate.
+mod kernel_scalar_ref_sealed {
+    pub trait Sealed {}
+}
+
+/// Marker + capability trait identifying a value usable as the
+/// host-side counterpart of a `#[spirv(cross_workgroup)] &T` kernel
+/// parameter (a **read** scalar-by-reference).
+///
+/// Implemented ONLY for [`Scalar<B>`] whose backing buffer `B` can set
+/// a device pointer ([`KernelPointerArg`]) — i.e. the device-scalar
+/// wrapper across every memory tier. A length-1 bare slice deliberately
+/// does NOT satisfy it (that is the strict-binding half of #208). It
+/// extends [`KernelPointerArg`] (so the pointer-only arg-set is reused)
+/// and is sealed.
+///
+/// Stronger sibling [`KernelScalarRefMutArg<T>`] is the bound used for
+/// `&mut T` kernel params — backings whose marker also impls
+/// [`crate::KernelWritable`] satisfy it.
+pub trait KernelScalarRefArg<T>:
+    KernelArg + KernelPointerArg + Send + 'static + kernel_scalar_ref_sealed::Sealed
+{
+    /// The recording handle for this scalar's backing memory, used by
+    /// the record/replay path (mirrors
+    /// [`KernelSliceReadArg::record_handle`]).
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
+        Err(crate::Error::NotSupported(
+            "record: this scalar-ref arg type has no recordable memory handle",
+        ))
+    }
+}
+
+/// The kernel may both read and write through this scalar-ref arg — the
+/// bound for `&mut T` kernel parameters. Implemented for [`Scalar<B>`]
+/// whose backing impls [`KernelSliceReadWriteArg<T>`] (write-capable
+/// marker). Extends [`KernelScalarRefArg<T>`].
+pub trait KernelScalarRefMutArg<T>: KernelScalarRefArg<T> {}
+
+// ── Scalar<B> impls (scalar-ref only, generic over the backing) ─────
+//
+// The read bound keys on `B: KernelSliceReadArg<T>` — every buffer that
+// can be a read slice arg backs a read scalar-ref (its `record_handle`
+// and pointer-only setter are reused). The mut bound keys on
+// `B: KernelSliceReadWriteArg<T>`. This gives all three memory tiers
+// (DeviceScalar/MappedScalar/USMScalar) scalar-ref support for free.
+
+impl<B> kernel_scalar_ref_sealed::Sealed for Scalar<B> {}
+
+impl<T, B> KernelScalarRefArg<T> for Scalar<B>
+where
+    B: KernelSliceReadArg<T>,
+{
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
+        KernelSliceReadArg::record_handle(&self.inner)
+    }
+}
+
+impl<T, B> KernelScalarRefMutArg<T> for Scalar<B> where B: KernelSliceReadWriteArg<T> {}
+
+// `Scalar<B>` sets exactly the backing's device pointer (one arg slot,
+// no trailing length) — both via `KernelArg::set` (so `ScalarRefArg`'s
+// `KernelPointerArg` supertrait and the Tier-1 launch tuple work) and
+// via `set_pointer_only`. `register_completion` delegates to the
+// backing so an SVM scalar (`MappedScalar`/`USMScalar`) records the
+// completion event for its Drop's `clEnqueueSVMFree` wait-list.
+impl<B: KernelPointerArg> KernelArg for Scalar<B> {
+    fn set(&self, exec: &mut ExecuteKernel<'_>) {
+        self.inner.set_pointer_only(exec);
+    }
+    fn register_completion(&self, event: &::opencl3::event::Event) {
+        KernelArg::register_completion(&self.inner, event);
+    }
+}
+
+impl<B: KernelPointerArg> KernelPointerArg for Scalar<B> {
+    fn set_pointer_only(&self, exec: &mut ExecuteKernel<'_>) {
+        self.inner.set_pointer_only(exec);
+    }
+}
 
 // ── DeviceSlice<T, M> impls ────────────────────────────────────────
 

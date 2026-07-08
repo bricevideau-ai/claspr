@@ -125,6 +125,44 @@ pub mod kernels {
     ) {
         *out = val;
     }
+
+    /// `f32` twin of [`scale_by_ref_u32`] — a `&f32` READ scalar-ref
+    /// scales every element. Proves the scalar-ref path is generic over
+    /// the element type (not f32-special-cased, not u32-special-cased).
+    #[claspr::kernel]
+    pub fn scale_by_ref_f32(
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
+        #[spirv(cross_workgroup)] data: &mut [f32],
+        #[spirv(cross_workgroup)] factor: &f32,
+    ) {
+        let i = id.x;
+        data[i] = data[i] * *factor;
+    }
+
+    /// `f32` twin of [`write_scalar_u32`] — a `&mut f32` OUTPUT
+    /// scalar-ref written by value.
+    #[claspr::kernel]
+    pub fn write_scalar_f32(
+        #[spirv(global_invocation_id)] _id: spirv_std::glam::USizeVec3,
+        #[spirv(cross_workgroup)] out: &mut f32,
+        val: f32,
+    ) {
+        *out = val;
+    }
+
+    /// Add a device-resident `&u32` scalar to every element in place —
+    /// used by the host-write-then-kernel-read seam test: a host seam
+    /// WRITES `addend` (a `&mut u32` DeviceScalar) mid-graph, then this
+    /// kernel READS it as `&u32` in the SAME graph.
+    #[claspr::kernel]
+    pub fn add_ref_u32(
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
+        #[spirv(cross_workgroup)] data: &mut [u32],
+        #[spirv(cross_workgroup)] addend: &u32,
+    ) {
+        let i = id.x;
+        data[i] = data[i].wrapping_add(*addend);
+    }
 }
 
 #[claspr::device]

@@ -105,7 +105,8 @@ pub use access::{
 };
 pub use buffer::{
     Buffer, DeviceMapMutOp, DeviceMapOp, DeviceMapReadPending, DeviceMapWritePending,
-    DeviceMappedReadGuard, DeviceMappedWriteGuard, DeviceSlice, DeviceSliceUninit,
+    DeviceMappedReadGuard, DeviceMappedWriteGuard, DeviceScalar, DeviceScalarUninit, DeviceSlice,
+    DeviceSliceUninit, Scalar, ScalarUninit, device_scalar, device_scalar_uninit,
 };
 pub use context::{Context, SvmLevel};
 pub use device::{Device, DeviceType, Platform};
@@ -122,8 +123,9 @@ pub use image::{
     KernelImageBufferReadWriteArg, KernelImageBufferWriteArg, ToInputImage, format,
 };
 pub use launch::{
-    IntoLaunchSpec, KernelArg, KernelArgs, KernelPointerArg, KernelSliceArg, KernelSliceReadArg,
-    KernelSliceReadWriteArg, LaunchSpec, LocalBuffer, ScalarArg, ScalarRefArg, profiling_duration,
+    IntoLaunchSpec, KernelArg, KernelArgs, KernelPointerArg, KernelScalarRefArg,
+    KernelScalarRefMutArg, KernelSliceArg, KernelSliceReadArg, KernelSliceReadWriteArg, LaunchSpec,
+    LocalBuffer, ScalarArg, ScalarRefArg, profiling_duration,
 };
 pub use op::{
     LaunchOp, ProfileCb, ProfilingInfo, assert_same_context, complete_user_event,
@@ -135,10 +137,13 @@ pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 #[cfg(feature = "async-events")]
 pub use future::{EventFuture, EventFutureExt, LaunchFuture};
 pub use mapped::{
-    MapMutOp, MapOp, MappedReadGuard, MappedReadPending, MappedSlice, MappedSliceUninit,
-    MappedWriteGuard, MappedWritePending,
+    MapMutOp, MapOp, MappedReadGuard, MappedReadPending, MappedScalar, MappedScalarUninit,
+    MappedSlice, MappedSliceUninit, MappedWriteGuard, MappedWritePending, mapped_scalar,
+    mapped_scalar_uninit,
 };
-pub use usm::{USMSlice, USMSliceUninit};
+pub use usm::{
+    USMScalar, USMScalarUninit, USMSlice, USMSliceUninit, usm_scalar, usm_scalar_uninit,
+};
 
 // ── Tier 2 device-graph re-exports ──
 //
@@ -167,12 +172,13 @@ pub use eager::{
     Deps, DeviceDynOp, DeviceEnqueue, DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt,
     Download, ExecMode, FanOut, Fill, FillMapped, FromCheckout, ImageDownloadEager,
     ImageUploadEager, Input, IntoBound, KeyMarker, OnDevice, Pipe, ReadInto, ScalarInput,
-    ScalarSlotCell, ScalarSlotState, SlotBinder, SlotCell, SlotEq, SlotHandle, SlotState,
-    SlotValue, Tag, ToInput, TransferToDevice, Upload, WriteDevice, WriteMapped, arc_split, arced,
-    bundle2, bundle3, bundle4, bundle5, bundle6, bundle7, bundle8, bundle9, bundle10, bundle11,
-    bundle12, bundle13, bundle14, bundle15, bundle16, deps_as_events, deps_into_single_event,
-    eager_copy_to, fan_out, fill_mapped, forward, image_download, image_upload, lift, read_into,
-    rehome_consumed, transfer_to_device, transfer_to_device_at, value, wrap_event, write,
+    ScalarSlotCell, ScalarSlotState, ScalarUpload, ScalarZero, SlotBinder, SlotCell, SlotEq,
+    SlotHandle, SlotState, SlotValue, Tag, ToInput, TransferToDevice, Upload, WriteDevice,
+    WriteMapped, arc_split, arced, bundle2, bundle3, bundle4, bundle5, bundle6, bundle7, bundle8,
+    bundle9, bundle10, bundle11, bundle12, bundle13, bundle14, bundle15, bundle16, deps_as_events,
+    deps_into_single_event, eager_copy_to, fan_out, fill_mapped, forward, image_download,
+    image_upload, lift, read_into, rehome_consumed, scalar_value, scalar_value_as, scalar_zero,
+    scalar_zero_as, transfer_to_device, transfer_to_device_at, value, wrap_event, write,
     write_mapped,
 };
 

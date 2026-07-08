@@ -258,6 +258,46 @@ macro_rules! usm_slice {
     };
 }
 
+// ── Device-scalar chain-entry leaves ───────────────────────────────────────
+
+/// Lazy seeded [`DeviceScalar<T, M>`](crate::DeviceScalar) alloc leaf — the
+/// scalar twin of [`device_slice_alloc_zero!`]. Backed by the
+/// [`scalar_value`](crate::scalar_value) leaf (alloc-once + persistent home +
+/// reseed-on-replay), so it plugs straight into an `and_then` chain / `bundle!`.
+///
+/// - `device_scalar_alloc!(value)` — seed with `value`, default `ReadWrite`.
+/// - `device_scalar_alloc!(value; M)` — explicit marker witness (e.g. `Frozen`).
+///
+/// ```ignore
+/// let g = scalar_value(0.0f32).and_then(|a| ks.finish(a));  // free-fn form
+/// let g = device_scalar_alloc!(0.0f32).and_then(|a| ks.finish(a)); // macro form
+/// ```
+#[macro_export]
+macro_rules! device_scalar_alloc {
+    ($v:expr) => {
+        $crate::scalar_value($v)
+    };
+    ($v:expr; $m:expr) => {
+        $crate::scalar_value_as($v, $m)
+    };
+}
+
+/// Lazy zero-init [`DeviceScalar<T, M>`](crate::DeviceScalar) alloc leaf — the
+/// scalar twin of [`device_slice_alloc_zero!`]. Backed by
+/// [`scalar_zero`](crate::scalar_zero).
+///
+/// - `device_scalar_zero!(T)` — default `ReadWrite`.
+/// - `device_scalar_zero!(T; M)` — explicit marker witness.
+#[macro_export]
+macro_rules! device_scalar_zero {
+    ($t:ty) => {
+        $crate::scalar_zero::<$t>()
+    };
+    ($t:ty; $m:expr) => {
+        $crate::scalar_zero_as::<$t, _>($m)
+    };
+}
+
 // ── Typed slots (reusable-graph holes) ─────────────────────────────────────
 
 /// Declare one or more typed [`Tag`](crate::Tag)s for reusable-graph slots.

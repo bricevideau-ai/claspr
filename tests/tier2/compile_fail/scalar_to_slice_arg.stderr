@@ -1,8 +1,8 @@
-error[E0277]: the trait bound `std::sync::Arc<DeviceSlice<u32>>: KernelSliceReadWriteArg<u32>` is not satisfied
-  --> compile_fail/arc_to_writable_arg.rs:24:21
+error[E0277]: the trait bound `Scalar<DeviceSlice<u32>>: KernelSliceReadWriteArg<u32>` is not satisfied
+  --> compile_fail/scalar_to_slice_arg.rs:18:21
    |
-24 |     let _ = kernels.scale_u32([4usize], shared, 2u32);
-   |                     ^^^^^^^^^ the trait `KernelSliceReadWriteArg<u32>` is not implemented for `std::sync::Arc<DeviceSlice<u32>>`
+18 |     let _ = kernels.scale_u32([1usize], scalar, 2u32);
+   |                     ^^^^^^^^^ the trait `KernelSliceReadWriteArg<u32>` is not implemented for `Scalar<DeviceSlice<u32>>`
    |
 help: the following other types implement trait `KernelSliceReadWriteArg<T>`
   --> claspr/src/launch.rs:320:0
