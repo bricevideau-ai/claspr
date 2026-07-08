@@ -27,6 +27,105 @@
 //! `DeviceOperation` layer it replaced has been removed; the only residue is the
 //! tiny [`DeviceEnqueue`] contract a few primitive leaves (host-view map/unmap,
 //! the polymorphic `copy_to` family) delegate their raw enqueue body to.
+//!
+//! # Writing reusable-graph host code
+//!
+//! The sections above describe the engine internals; this one is the *usage*
+//! guide — how to write host code against a graph. Worked examples:
+//! `examples/gray-scott` (`run_immutable`, a curried meta-kernel replayed by
+//! period) and `examples/cg` (a self-closing Conjugate-Gradient loop).
+//!
+//! ## Build once, run many — the [`Checkout`] lend/rehome cycle
+//!
+//! A graph `g` is a **reusable** value: [`sync`](DeviceOpExt::sync) takes `&self`,
+//! so you build `g` **once** and call `g.sync(ctx)?` in a loop. Each run **lends**
+//! the graph's buffers (a concrete cell hands its buffer out for the duration of
+//! the run) and returns a [`Checkout`] over the output. When that `Checkout` is
+//! **dropped**, the buffer is **rehomed** — returned to its origin cell — so the
+//! *next* `sync` re-lends the SAME `cl_mem` with zero rebinding (a stable handle
+//! across replays). This is the whole basis of graph reuse:
+//!
+//! ```ignore
+//! let g = ks.scale([N], slot!(Buf), 2.0).bind(Buf(b));  // build + bind ONCE
+//! loop {
+//!     let co = g.sync(ctx)?;   // lends Buf's buffer, runs, returns a Checkout
+//!     // ... read co if needed ...
+//!     drop(co);                // rehomes the buffer → g is armed for the next sync
+//! }
+//! ```
+//!
+//! ## Reading a result: deref + `map` (borrow, don't consume)
+//!
+//! A [`Checkout<O>`] **derefs to `O`**, and buffer reads (`.map()`, `.read()`)
+//! take `&self` — so you can read a result **without consuming** the Checkout,
+//! leaving it free to rehome on drop:
+//!
+//! ```ignore
+//! let co = g.sync(ctx)?;
+//! let v = (*co).map().wait()?;   // borrows — co still drops/rehomes afterward
+//! ```
+//!
+//! ## [`into_inner`](Checkout::into_inner) vs `drop` — sever vs rehome
+//!
+//! - **`drop(co)`** → the buffer REHOMES to its cell; `g` re-arms and re-runs.
+//! - **`co.into_inner()`** → SEVERS: you take ownership of the buffer, and its
+//!   origin cell is left empty (a plain `bind`/`sync` won't re-arm it; that needs
+//!   `mutate_bind`). Use `into_inner` only when you genuinely want to *extract* a
+//!   buffer out of the graph, not to read it. For read-and-reuse, prefer
+//!   deref+`map` then `drop`.
+//!
+//! ## `reclaim_undelivered` — you needn't thread every buffer to the terminal
+//!
+//! Only the outputs your terminal *names* come back as Checkouts. A mid-graph
+//! buffer that is produced but **not consumed downstream and not returned** is
+//! **reclaimed** on the run's drop — rehomed to its cell like any lent buffer (see
+//! [`reclaim_undelivered`](DeviceOp::reclaim_undelivered)). So a self-closing loop
+//! body only has to thread to the terminal the handful of values the host actually
+//! reads; every other buffer just needs to be *used* (lent from its cell) and its
+//! unconsumed tail reclaims. (`examples/cg` threads only the solution `x` and the
+//! residual scalar `rsnew`; its other 8 buffers reclaim.)
+//!
+//! ## What [`sync`](DeviceOpExt::sync) hands back
+//!
+//! The [`Checkouts`](DeviceOp::Checkouts) shape mirrors the graph's output shape:
+//! - a single-output op → one `Checkout<Output>`;
+//! - a **multi-output kernel** → per-buffer Checkouts, `(Checkout<a>, Checkout<b>,
+//!   …)` — each droppable/readable independently;
+//! - a **[`bundle`](bundle2)** → per-branch, structure-preserving:
+//!   `(A::Checkouts, B::Checkouts)` (a single-output branch contributes one
+//!   `Checkout`, a multi-output branch its own tuple, a nested bundle its nested
+//!   shape). Grouped by branch, per-buffer within each branch.
+//!
+//! ## Self-closing loops (in-graph iteration)
+//!
+//! A graph whose outputs feed back to its own inputs across `sync`s is a
+//! *self-closing* loop: build the whole iteration as one `and_then` chain that
+//! ends producing the values the next iteration reads (each an internal
+//! [`Pipe`] edge, threaded through the builder closures — carry a value forward by
+//! capturing its handle in the `move` closures, not by naming the concrete cell
+//! twice, which would double-lend). `sync` in a loop; drop the Checkout to re-arm.
+//! Keeping loop control on the host (a convergence test) while all compute is one
+//! device graph is the ideal shape for the future command-buffer backend (one
+//! recordable region, replayed, with a small host readback between replays).
+//! `examples/cg` is this pattern end-to-end.
+//!
+//! ## Slots, scalars, and other authoring notes
+//!
+//! - **Slots** ([`slot!`](crate::slot) / [`slots!`](crate::slots)) make a graph
+//!   rebindable: a `slot!(Tag)` hole is filled by the consuming set-once
+//!   [`bind`](DeviceOpExt::bind) / [`call`](DeviceOpExt::call) (or re-set by the
+//!   fluent [`mutate_bind`](DeviceOpExt::mutate_bind) /
+//!   [`mutate_call`](DeviceOpExt::mutate_call) for replay loops). Errors on the
+//!   consuming verbs are deferred to `sync` and are STICKY (rebuild to recover);
+//!   the fluent `mutate_*` verbs error eagerly and never poison the graph.
+//! - **Device scalars**: a kernel arg `#[spirv(cross_workgroup)] s: &f32` /
+//!   `&mut f32` takes a len-1 [`DeviceSlice<f32>`](crate::DeviceSlice) by
+//!   reference (read/written as `*s`), so a scalar can live on-device and pipe
+//!   through the graph like any buffer — the way `examples/cg` keeps α/β/residual
+//!   device-resident and avoids host round-trips inside the loop.
+//! - **`Kernels` is cheap to share** across builder closures: a launcher clones
+//!   the context internally rather than borrowing the `Kernels`, so the built op
+//!   owns what it needs — pass `&ks` freely into nested `and_then` closures.
 
 use crate::copy::CopyTo;
 use crate::exec_ctx::ExecutionContext;
