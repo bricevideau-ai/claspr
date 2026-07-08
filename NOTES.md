@@ -9,6 +9,44 @@ items resolve.
 
 ## Active
 
+### ⚑ DESIGN 2026-07-08 (Brice) — `DeviceScalar<T>`: dedicated device-scalar type + `and_then_host` scalar mapping
+
+#205 gave scalar-by-ref KERNEL ARGS (`&f32`/`&mut f32` → pointer-to-scalar) but only
+half the scalar story. Two open questions Brice raised:
+- Q1 (host map): how does `and_then_host` map a device scalar — single `&mut T` vs the
+  current size-1-array `&mut [T]`? Today `Mappable::View for DeviceSlice<T>` = `&mut [T]`
+  (mappable.rs:169), so a host seam over a len-1 buffer writes `view[0]`. A dedicated
+  scalar type could have `View = &mut T` (`*view = …`, no `[0]`).
+- Q2 (allocation): dedicated primitives (`DeviceScalar<T>`, `device_scalar(ctx,v)` /
+  `_uninit` / lazy `device_scalar_alloc!`) vs piggybacking on `DeviceSlice::alloc_zero(
+  ctx, 1)` read as a buffer.
+
+TAXONOMY: claspr now has three scalar-ish things, only two named — `f32` by value
+(`ParamRole::Scalar`, host-provided, not device-resident); `&f32`/`&mut f32`
+(`ParamRole::ScalarRef`, #205, device-resident, kernel-writable, pipes through graph);
+and the UNNAMED backing store (today a len-1 `DeviceSlice`).
+
+RECOMMENDATION: add a `DeviceScalar<T>` type. Not just tidiness — it closes a
+RUNTIME-EXCLUDED → TYPE-EXCLUDED gap (the principle below): today a len-1 DeviceSlice
+binds to `&f32` AND a len-5 one ALSO binds (only `[0]` read) — a runtime footgun.
+`DeviceScalar<T>` satisfies the scalar-ref bound but NOT the slice bound (and
+vice-versa), making the mismatch a compile error. Plus `View = &mut T` (Q1). It's the
+TRIVIAL corner of the scratch/size story: a scalar's size is always 1, STATICALLY — so
+unlike the `#[auto]`/MaybeUninit scratch (size=f(grid), needs SizeExpr/closure), it
+needs NONE of that machinery. Implementation is mostly DELEGATION: wrap a len-1
+DeviceSlice; Input/Checkout/rehome/resolve_home/home-threading reuse the slice path;
+only NEW bits are `Mappable::View = &mut T`, the kernel-arg trait impls (scalar-ref yes
+/ slice no), and constructors. Bounded.
+
+SEQUENCING: does NOT block CG (in-flight CG uses len-1 DeviceSlice scalars; its α/β are
+on-device KERNELS so and_then_host isn't in its loop — only maps rsnew[0] at the
+boundary). `DeviceScalar` is a FOLLOW-UP that CG migrates to (like #205 → CG migrates
+&[f32]→&f32). FORKS for Brice: (a) distinct `DeviceScalar<T>` type [lean — enables
+type-fidelity + &mut T View] vs keep DeviceSlice + a scalar view/marker [less surface,
+can't type-exclude the len mismatch]; (b) does and_then_host need a scalar-aware View
+regardless, or is `&mut [T]`+`[0]` fine for buffers and `&mut T` only for DeviceScalar?
+DESIGN-ONLY; no code yet; decide build-vs-defer.
+
 ### ⚑ PRINCIPLE 2026-07-08 (Brice) — stop shipping half-baked core primitives ("documented limitation" is not a completion state)
 
 Recurring failure mode called out by Brice: a core primitive hits a hard case, we
