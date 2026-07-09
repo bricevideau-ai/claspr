@@ -4218,6 +4218,132 @@ where
     }
 }
 
+/// The **bidirectional companion** to [`FromCheckout`]: SPLIT a
+/// [`Checkouts`](DeviceOp::Checkouts) value into its assembled output value plus
+/// its per-branch return homes, and REASSEMBLE it from a (possibly
+/// seam-mutated) value + those same homes.
+///
+/// [`FromCheckout`] only goes one way — assemble a `Checkouts` from a single
+/// `Checkout`. The **host seam** ([`AndThenHost`]) needs the reverse too. To run
+/// its closure over the whole `S::Output` (which for a bundle/multi-output source
+/// is a TUPLE) it must:
+/// - (a) pull the assembled tuple VALUE out of the source's per-branch
+///   `Checkout`s WITHOUT dropping their homes (so the buffers can be mapped +
+///   written in place), and
+/// - (b) after the seam has run, rebuild the `Checkouts` re-threading each
+///   branch's ORIGINAL home, so every branch re-arms its own origin cell on drop
+///   — the multi-home replay the single collapsed [`collect_home`](DeviceOp::collect_home)
+///   slot cannot carry.
+///
+/// Implemented for `Checkout<O>` (identity: one value + one home) and,
+/// recursively, for tuples of `CheckoutSplit`s — so the seam is arity- and
+/// nesting-general (a nested bundle's `Checkouts` is a tuple-of-tuples, split by
+/// this same family one level down). No `[C; N]` impl: an array `Checkouts`
+/// (only `arc_split`) has `Output = [O; N]`, which is not `Mappable`, so it can
+/// never feed a seam — the impl would be dead code.
+pub trait CheckoutSplit {
+    /// The assembled output value these checkouts wrap — equals the producing
+    /// op's [`Output`](DeviceOp::Output).
+    type Value;
+    /// The per-branch return homes, in a shape that reassembles 1:1 with
+    /// [`Value`](Self::Value).
+    type Homes;
+    /// Move out the assembled value + the homes intact. The homes are
+    /// **relocated, not fired** (the value+home pair is moved out of each leaf
+    /// `Checkout` intact, NOT severed) so [`reassemble`](Self::reassemble) can
+    /// re-thread them.
+    fn split(self) -> (Self::Value, Self::Homes);
+    /// Rebuild the checkouts from a (possibly seam-mutated) value + the ORIGINAL
+    /// homes, so each element re-arms its origin cell on drop.
+    fn reassemble(value: Self::Value, homes: Self::Homes) -> Self;
+}
+
+impl<O: Send> CheckoutSplit for Checkout<O> {
+    type Value = O;
+    type Homes = Option<BoxedHome<O>>;
+    fn split(self) -> (O, Option<BoxedHome<O>>) {
+        // Relocate value+home out intact (does NOT sever / fire the home).
+        self.into_value_and_home()
+    }
+    fn reassemble(value: O, home: Option<BoxedHome<O>>) -> Self {
+        Checkout::new(value, home)
+    }
+}
+
+// Recursive tuple family: a bundle / multi-output branch's `Checkouts` is a
+// tuple, and each element is itself a `CheckoutSplit` (a `Checkout` for a
+// single-output branch, or another tuple for a nested bundle / multi-output
+// branch). Split/reassemble descend structurally, so re-threading works at any
+// nesting depth. Arity 2..=16 mirrors the `FromCheckout` tuple family.
+macro_rules! impl_checkout_split_tuple {
+    ( $( $ck:ident : $vn:ident : $hn:ident : $idx:tt ),+ ) => {
+        impl<$($ck: CheckoutSplit,)+> CheckoutSplit for ( $($ck,)+ ) {
+            type Value = ( $(<$ck as CheckoutSplit>::Value,)+ );
+            type Homes = ( $(<$ck as CheckoutSplit>::Homes,)+ );
+            fn split(self) -> (Self::Value, Self::Homes) {
+                $( let ($vn, $hn) = self.$idx.split(); )+
+                ( ($($vn,)+), ($($hn,)+) )
+            }
+            fn reassemble(value: Self::Value, homes: Self::Homes) -> Self {
+                ( $( <$ck as CheckoutSplit>::reassemble(value.$idx, homes.$idx), )+ )
+            }
+        }
+    };
+}
+impl_checkout_split_tuple!(CA: va: ha: 0, CB: vb: hb: 1);
+impl_checkout_split_tuple!(CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2);
+impl_checkout_split_tuple!(CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3);
+impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4
+);
+impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5
+);
+impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6
+);
+impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7
+);
+impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8
+);
+impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9
+);
+impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10
+);
+impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10, CL: vl: hl: 11
+);
+impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10, CL: vl: hl: 11,
+    CM: vm: hm: 12
+);
+impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10, CL: vl: hl: 11,
+    CM: vm: hm: 12, CN: vn: hn: 13
+);
+impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10, CL: vl: hl: 11,
+    CM: vm: hm: 12, CN: vn: hn: 13, CO: vo: ho: 14
+);
+impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10, CL: vl: hl: 11,
+    CM: vm: hm: 12, CN: vn: hn: 13, CO: vo: ho: 14, CP: vp: hp: 15
+);
+
 impl<O> std::ops::Deref for Checkout<O> {
     type Target = O;
     fn deref(&self) -> &O {
@@ -8779,12 +8905,29 @@ impl<S, F> DeviceOp for AndThenHost<S, F>
 where
     S: DeviceOp,
     S::Output: crate::mappable::Mappable,
+    // The source's terminal `Checkouts` must SPLIT into the assembled tuple value
+    // (`S::Output`, what the seam maps) plus its per-branch homes, and REASSEMBLE
+    // from a (seam-mutated) value + those homes. For a single-output source this
+    // is `Checkout<S::Output>` (identity split — the #211 path stays byte-for-byte
+    // the same); for a bundle / multi-output source it is that source's per-branch
+    // `Checkouts` tuple, split/reassembled recursively (any arity, any nesting).
+    S::Checkouts: CheckoutSplit<Value = S::Output>,
+    // The source's own `gather_checkouts` needs this bound too — a bundle/multi-
+    // output source's `Checkouts` satisfies it via the recursive `FromCheckout`
+    // family, a single-output source via the identity impl.
+    S::Checkouts: FromCheckout<S::Output>,
     F: for<'a> Fn(<S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
         + Send
         + Sync
         + 'static,
 {
     type Output = S::Output;
+    // The seam's terminal result IS the source's — one `Checkout` for a
+    // single-output source, a per-branch tuple for a bundle/multi-output source.
+    // The seam re-threads EACH branch's home (via `CheckoutSplit`) so every branch
+    // re-arms its origin cell across `sync`s — the multi-home replay a single
+    // collapsed `collect_home` slot cannot carry.
+    type Checkouts = S::Checkouts;
 
     fn output_pipe(&self) -> Pipe<S::Output> {
         self.out.clone()
@@ -8795,12 +8938,15 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // Gather the source via `collect_home` (any arity) so the source's return
-        // home rides THROUGH the seam: the value passes downstream unchanged, and
-        // on `Checkout` drop it re-arms the source's origin cell — the prerequisite
-        // for replaying a slot/buffer-backed graph across `sync`s (#211). (The seam
-        // used to be one-shot, so it discarded the home via `collect`; a reusable
-        // seam must preserve it.)
+        // BY-VALUE / MID-GRAPH path (async `run`, or the seam nested as an
+        // `and_then` source): gather the source via `collect_home` and thread the
+        // SINGLE collapsed home through the seam's output pipe. For a single-output
+        // source this preserves the source's return home (#211 replay). For a
+        // bundle/multi-output source `collect_home` returns `home == None` (a tuple
+        // has N per-buffer homes that can't ride one collapsed slot — the same
+        // boundary bundle's `collect_home` documents); the multi-home re-arm rides
+        // the CHECKOUT path (`gather_checkouts` below), which every waiting terminal
+        // uses. See the `gather_checkouts` override.
         let (value, deps, home) = self.source.collect_home(ec, ExecMode::Pipelined)?;
         // Reusable: `Arc::clone` the closure so the per-run worker thread gets
         // its OWN owned handle to move in (it runs off the submitting thread).
@@ -8811,6 +8957,32 @@ where
             run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(view))?;
         self.out.put_home(out_value, out_deps, home);
         Ok(())
+    }
+
+    fn gather_checkouts(
+        &self,
+        ec: &ExecutionContext<'_>,
+        _mode: ExecMode,
+    ) -> Result<(Self::Checkouts, Deps)> {
+        // TERMINAL / CHECKOUT gather — the multi-home fix. Mirror #207's per-branch
+        // delegation, but AT THE SEAM: gather the source via its OWN
+        // `gather_checkouts` (a single-output source builds one `Checkout`; a
+        // bundle/multi-output source delegates to each branch, so EVERY branch
+        // threads its own per-buffer return home). Then SPLIT those checkouts into
+        // the assembled tuple VALUE (to map + hand the closure) plus the per-branch
+        // homes (relocated intact, NOT severed), run the seam over the value, and
+        // REASSEMBLE the checkouts re-threading each ORIGINAL home. So a bundle-fed
+        // seam re-arms every branch on drop and replays across `sync`s — the gap
+        // this closes. The source pipelines (it is upstream of the seam); the
+        // returned `out_deps` (unmaps + the `proceed` gate) are what the terminal
+        // waits on.
+        let (src_cos, deps) = self.source.gather_checkouts(ec, ExecMode::Pipelined)?;
+        let (value, homes) = src_cos.split();
+        let f = Arc::clone(&self.f);
+        let (out_value, out_deps) =
+            run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(view))?;
+        let checkouts = <S::Checkouts as CheckoutSplit>::reassemble(out_value, homes);
+        Ok((checkouts, out_deps))
     }
 
     fn check_ready(&self) -> Result<()> {
@@ -8837,12 +9009,23 @@ impl<S, F> DeviceOp for AndThenHostWithContext<S, F>
 where
     S: DeviceOp,
     S::Output: crate::mappable::Mappable,
+    // Same `CheckoutSplit` bound as `AndThenHost` — see its impl for the rationale
+    // (split the source's per-branch checkouts to map the tuple value, reassemble
+    // re-threading each home). Single-output source keeps the #211 path identical.
+    S::Checkouts: CheckoutSplit<Value = S::Output>,
+    // The source's own `gather_checkouts` needs this bound too — a bundle/multi-
+    // output source's `Checkouts` satisfies it via the recursive `FromCheckout`
+    // family, a single-output source via the identity impl.
+    S::Checkouts: FromCheckout<S::Output>,
     F: for<'a> Fn(&Context, <S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
         + Send
         + Sync
         + 'static,
 {
     type Output = S::Output;
+    // See `AndThenHost::Checkouts`: the seam's terminal result is the source's,
+    // with every branch re-armed via `CheckoutSplit`.
+    type Checkouts = S::Checkouts;
 
     fn output_pipe(&self) -> Pipe<S::Output> {
         self.out.clone()
@@ -8853,9 +9036,9 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // Gather the source via `collect_home` (any arity) so the source's return
-        // home rides THROUGH the seam and the graph replays across `sync`s (#211).
-        // See the `AndThenHost::execute` note for the full rationale.
+        // BY-VALUE / MID-GRAPH path — single collapsed home threaded through the
+        // output pipe (bundle source → `home == None`; multi-home re-arm rides the
+        // checkout path). See `AndThenHost::execute` for the full rationale.
         let (value, deps, home) = self.source.collect_home(ec, ExecMode::Pipelined)?;
         // Reusable: `Arc::clone` the closure and clone a fresh `Context` per run,
         // then move both into a fresh one-shot callable for the worker thread.
@@ -8867,6 +9050,26 @@ where
             run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(&context, view))?;
         self.out.put_home(out_value, out_deps, home);
         Ok(())
+    }
+
+    fn gather_checkouts(
+        &self,
+        ec: &ExecutionContext<'_>,
+        _mode: ExecMode,
+    ) -> Result<(Self::Checkouts, Deps)> {
+        // TERMINAL / CHECKOUT gather — the multi-home fix (twin of
+        // `AndThenHost::gather_checkouts`; see it for the full rationale). Gather
+        // the source per-branch, split the checkouts into value + homes, run the
+        // seam over the value (closure also gets `&Context`), reassemble
+        // re-threading each original home so every branch re-arms across `sync`s.
+        let (src_cos, deps) = self.source.gather_checkouts(ec, ExecMode::Pipelined)?;
+        let (value, homes) = src_cos.split();
+        let f = Arc::clone(&self.f);
+        let context = ec.context().clone();
+        let (out_value, out_deps) =
+            run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(&context, view))?;
+        let checkouts = <S::Checkouts as CheckoutSplit>::reassemble(out_value, homes);
+        Ok((checkouts, out_deps))
     }
 
     fn check_ready(&self) -> Result<()> {

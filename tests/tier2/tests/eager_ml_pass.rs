@@ -71,6 +71,9 @@ fn forward_pass_carries_scalar_state_via_bundle() {
 
     let sum_cell = Arc::new(Mutex::new(0u32));
     let cell = Arc::clone(&sum_cell);
+    // The seam is fed by a `bundle2`, so its terminal `Checkouts` is now the
+    // source's per-branch tuple `(Checkout<DeviceSlice>, Checkout<u32>)` (#212 —
+    // each branch threads its own home), not a collapsed `Checkout<(…, …)>`.
     let (_final_buf, step) = upload(vec![10u32; N])
         .and_then(|buf| {
             // Pack: kernel output (a bare `Pipe<DeviceSlice>`) + the scalar 1.
@@ -86,10 +89,10 @@ fn forward_pass_carries_scalar_state_via_bundle() {
             Ok(())
         })
         .sync(&ctx)
-        .expect("stateful forward pass")
-        .into_inner();
+        .expect("stateful forward pass");
     let final_sum = *sum_cell.lock().unwrap();
     assert_eq!(final_sum, 60 * N as u32); // 10 * 2 * 3 = 60
+    // `step` is a `Checkout<u32>`; `Checkout<u32>: PartialEq<u32>` compares direct.
     assert_eq!(step, 2);
 }
 
