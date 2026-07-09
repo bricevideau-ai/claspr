@@ -35,6 +35,26 @@
 //! `examples/gray-scott` (`run_immutable`, a curried meta-kernel replayed by
 //! period) and `examples/cg` (a self-closing Conjugate-Gradient loop).
 //!
+//! ## Combinator cheat-sheet (concept → the function to reach for)
+//!
+//! Start here — most "how do I express X" questions map to one existing name:
+//!
+//! | You want to… | Use | Notes |
+//! |---|---|---|
+//! | sequence: run B on A's output | [`and_then`](DeviceOpExt::and_then) | builder runs at construction over A's [`Handle`](DeviceOp::Handle) |
+//! | **carry a value PAST an intervening step** (keep it to hand to a later op / the terminal) | **[`forward`]** | `forward(x)` re-exposes an already-produced value as a one-node op; capture its handle in the `move` closures. This is the "thread a buffer forward" primitive. |
+//! | run device ops in PARALLEL | [`bundle2`] / [`bundle!`](crate::bundle) | independent branches; per-branch structure-preserving `Checkouts` |
+//! | N-way homogeneous parallel | [`fan_out`] | one op per item |
+//! | hold a host VALUE as a graph input | [`value`] (by-value, `Clone`) or [`lift`] (move-once) | |
+//! | get data ONTO / OFF the device | [`upload`] / [`download`] | non-recordable (host transfer) |
+//! | a rebindable typed hole | [`slot!`](crate::slot) + [`bind`](DeviceOpExt::bind)/[`call`](DeviceOpExt::call) | see "Slots" below |
+//! | a device-resident scalar | [`crate::DeviceScalar`] via [`crate::device_scalar`] | binds a `&T`/`&mut T` kernel arg; see "Device scalars" below |
+//! | run host code mid-graph | [`and_then_host`](DeviceOpExt::and_then_host) | writable [`&mut View`](crate::mappable::Mappable::View); currently one-shot (not replayable) |
+//!
+//! There is intentionally NO `present`/`hold`/`carry`/`thread`/`identity` — the
+//! "keep a value around" verb is [`forward`]; the "inject a host value" verbs are
+//! [`value`]/[`lift`].
+//!
 //! ## Build once, run many — the [`Checkout`] lend/rehome cycle
 //!
 //! A graph `g` is a **reusable** value: [`sync`](DeviceOpExt::sync) takes `&self`,
@@ -119,10 +139,14 @@
 //!   consuming verbs are deferred to `sync` and are STICKY (rebuild to recover);
 //!   the fluent `mutate_*` verbs error eagerly and never poison the graph.
 //! - **Device scalars**: a kernel arg `#[spirv(cross_workgroup)] s: &f32` /
-//!   `&mut f32` takes a len-1 [`DeviceSlice<f32>`](crate::DeviceSlice) by
-//!   reference (read/written as `*s`), so a scalar can live on-device and pipe
-//!   through the graph like any buffer — the way `examples/cg` keeps α/β/residual
-//!   device-resident and avoids host round-trips inside the loop.
+//!   `&mut f32` binds a [`DeviceScalar<f32>`](crate::DeviceScalar) (built with
+//!   [`device_scalar`](crate::device_scalar); also [`MappedScalar`](crate::MappedScalar)
+//!   / [`USMScalar`](crate::USMScalar) for the SVM tiers), read/written in-kernel as
+//!   `*s`. A scalar lives on-device and pipes through the graph like any buffer — the
+//!   way `examples/cg` keeps α/β/residual device-resident and avoids host round-trips
+//!   inside the loop. A plain len-1 `DeviceSlice` does NOT bind to a `&T` arg (and a
+//!   `DeviceScalar` does not bind to a `&[T]` arg) — the mismatch is a compile error.
+//!   `and_then_host` over a `DeviceScalar` maps it as a scalar [`&mut T`](crate::mappable::Mappable::View).
 //! - **`Kernels` is cheap to share** across builder closures: a launcher clones
 //!   the context internally rather than borrowing the `Kernels`, so the built op
 //!   owns what it needs — pass `&ks` freely into nested `and_then` closures.
