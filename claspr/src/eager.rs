@@ -45,15 +45,18 @@
 //! | **carry a value PAST an intervening step** (keep it to hand to a later op / the terminal) | **[`forward`]** | `forward(x)` re-exposes an already-produced value as a one-node op; capture its handle in the `move` closures. This is the "thread a buffer forward" primitive. |
 //! | run device ops in PARALLEL | [`bundle2`] / [`bundle!`](crate::bundle) | independent branches; per-branch structure-preserving `Checkouts` |
 //! | N-way homogeneous parallel | [`fan_out`] | one op per item |
-//! | hold a host VALUE as a graph input | [`value`] (by-value, `Clone`) or [`lift`] (move-once) | |
+//! | hold a host VALUE as a graph input | [`value`] (by-value, `Clone`) or [`lift`] (owned / non-`Clone`, self-rehoming — replays) | |
+//! | present an OWNED buffer/scalar as a re-homing branch (no device work) | [`lift`] | lends-and-returns from its own [`Cell`]; a `lift`ed value re-arms across `sync`s like a concrete input, so `bundle!(lift(a), lift(b), …).and_then_host(…)` is a replayable multi-home seam |
 //! | get data ONTO / OFF the device | [`upload`] / [`download`] | non-recordable (host transfer) |
 //! | a rebindable typed hole | [`slot!`](crate::slot) + [`bind`](DeviceOpExt::bind)/[`call`](DeviceOpExt::call) | see "Slots" below |
 //! | a device-resident scalar | [`crate::DeviceScalar`] via [`crate::device_scalar`] | binds a `&T`/`&mut T` kernel arg; see "Device scalars" below |
 //! | run host code mid-graph | [`and_then_host`](DeviceOpExt::and_then_host) | writable [`&mut View`](crate::mappable::Mappable::View); reusable — the `Fn` closure re-runs on every replay (borrow / `Arc` / clone captures, don't move-consume) |
 //!
 //! There is intentionally NO `present`/`hold`/`carry`/`thread`/`identity` — the
-//! "keep a value around" verb is [`forward`]; the "inject a host value" verbs are
-//! [`value`]/[`lift`].
+//! "keep a value around" verb is [`forward`] (for an already-produced [`Pipe`]);
+//! the "inject / present an owned host value or buffer" verbs are [`value`] (by
+//! value, `Clone`) and [`lift`] (owned / non-`Clone`, self-rehoming so it presents
+//! a concrete buffer/scalar as a re-arming branch that replays).
 //!
 //! ## Build once, run many — the [`Checkout`] lend/rehome cycle
 //!
@@ -4649,7 +4652,7 @@ impl<T: Send + Clone + 'static> DeviceOp for Value<T> {
     }
 }
 
-// ── Lift: an owned (non-Clone) resource as a leaf, default Pipe handle ──
+// ── Lift: an owned (non-Clone) resource as a SELF-REHOMING leaf ──────────
 
 /// An owned resource lifted into the graph as a leaf — like [`Value`] but with
 /// the **default `Pipe` handle** instead of by-value, so it works for non-`Clone`
@@ -4664,21 +4667,37 @@ impl<T: Send + Clone + 'static> DeviceOp for Value<T> {
 /// A buffer can't be computed on at build time anyway, so its downstream handle
 /// is a `Pipe` (the value flows; you don't read it until execute). For a `Clone`
 /// host value you want to compute on downstream, use [`value`] (by-value handle).
+///
+/// ## Self-rehoming: reusable across replays
+///
+/// `Lift` holds its value in a [`Cell`] (`Arc<Mutex<Option<T>>>`) — the SAME cell
+/// an [`Input::Concrete`] uses — and **lends-and-returns** it: on each run the
+/// value is taken out, threaded downstream with a home pointing back at this very
+/// cell, and rehomed on the run's [`Checkout`] drop (the home invariant). So a
+/// graph containing a `lift` **replays** across `sync`s over the SAME `cl_mem`
+/// handle — a `lift`ed scalar / buffer is a re-arming bundle branch, exactly like
+/// a concrete cell fed to an in-place verb. This is the "just present this owned
+/// resource as a re-homing branch" primitive (no device work, unlike fill/scale).
+///
+/// A second `sync` while a previous [`Checkout`] is still alive (the value not yet
+/// rehomed) errors "already lent — the graph is busy", like any concrete input.
+/// [`Checkout::into_inner`] severs (takes the value for good); the cell then stays
+/// empty and a subsequent `sync` reports busy — the concrete-cell sever semantics.
 pub struct Lift<T: Send> {
-    // One-shot: a non-`Clone` owned resource can't be re-emitted, so a `Lift`
-    // chain head runs once; a second `sync` errors clearly. (For a reusable
-    // chain head over a caller-owned buffer, pass it as a `Concrete` input to a
-    // buffer verb — that lends-and-returns. `Lift` is the move-in-once form.)
-    v: Mutex<Option<T>>,
+    // The lifted value lives in a `Cell` (`Arc<Mutex<Option<T>>>`): lent on each
+    // run and returned on `Checkout` drop, so the lift node is its OWN home and
+    // the graph replays. Wrapping it as an `Input::Concrete` reuses the exact
+    // lend/rehome/check_ready machinery a concrete kernel input uses.
+    input: Input<T>,
     out: Pipe<T>,
 }
 
 /// Lift an owned resource into the graph (default `Pipe` handle — see [`Lift`]).
 /// With [`value`], together ≈ cuda-oxide's `value` (the by-pipe half, for
-/// non-`Clone` owned resources).
+/// non-`Clone` owned resources). Self-rehoming: the graph replays across `sync`s.
 pub fn lift<T: Send + 'static>(v: T) -> Lift<T> {
     Lift {
-        v: Mutex::new(Some(v)),
+        input: Input::from(v),
         out: Pipe::new(),
     }
 }
@@ -4695,14 +4714,20 @@ impl<T: Send + 'static> DeviceOp for Lift<T> {
         self.out.clone()
     }
 
-    fn execute(&self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let v = self.v.lock().unwrap().take().ok_or(Error::NotSupported(
-            "eager graph: a `lift`ed resource was already consumed — `lift` is a \
-             move-in-once chain head and can't drive a reused graph; pass a \
-             caller-owned buffer as a concrete input instead",
-        ))?;
-        self.out.put(v, Deps::new());
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // Lend the value out of the concrete cell WITH its home (this very cell),
+        // threading the host-seam start gate — exactly the concrete-input lend
+        // path. The home flows downstream via `put_home`, so the value returns to
+        // this cell on `Checkout` drop and the graph re-arms for the next run.
+        let (v, deps, home) = self.input.resolve_home(ec)?;
+        self.out.put_home(v, deps, home);
         Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        // Pre-run atomicity: the cell is empty iff a previous run's Checkout still
+        // holds the value (busy) or it was severed — the concrete-input check.
+        self.input.check_ready()
     }
 
     fn describe(&self, out: &mut Vec<String>) {

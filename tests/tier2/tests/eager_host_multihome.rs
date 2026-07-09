@@ -285,11 +285,16 @@ fn bundle_with_nested_multi_output_branch_fed_seam_rearms_transitively() {
 // seam maps the mixed `(&mut u32, &mut [u32], &mut [u32])` tuple, splitting three
 // heterogeneous per-branch homes and reassembling each. The DeviceScalar +
 // DeviceSlice branches re-arm their caller cells (asserted stable); the
-// MappedSlice is a lifted resource (move-in-once head) so it does not re-arm a
-// caller cell — its write-through is verified by re-mapping the released buffer.
-// (The ×2 replay of the re-arming kinds is pinned by
-// `bundle_of_scalar_and_slice_fed_seam_rearms_x2`; a lifted MappedSlice is out of
-// scope for a ×2 replay by construction.)
+// MappedSlice's write-through is verified by re-mapping the released buffer.
+// (The ×2 replay of the DeviceScalar + DeviceSlice kinds is pinned by
+// `bundle_of_scalar_and_slice_fed_seam_rearms_x2`.) NOTE: `lift` itself now
+// self-rehomes (a lifted value re-arms across `sync`s — see
+// `eager_lift_rehome.rs`), so a DIRECT `lift(buf)` branch replays; here the
+// MappedSlice goes through an `acquire_mapped_view → … → release_mapped_view`
+// TRANSFORM round-trip, and those acquire/release leaves `resolve` (drop the
+// home) rather than thread it through, so buffer identity is not preserved across
+// the transform — the transform round-trip, not `lift`, is what bounds this
+// branch to a single run.
 //
 // SVM-gated: skips on devices without coarse-grain SVM (MappedSlice needs it).
 #[test]
