@@ -1,7 +1,7 @@
 //@no-rustfix
 //! The `and_then_host` closure must not be able to stash a borrow of the
 //! mapped view into outer state — the view's lifetime is confined to the
-//! closure body by the `for<'a> FnOnce(View<'a>) -> Result<()>` HRTB
+//! closure body by the `for<'a> Fn(View<'a>) -> Result<()>` HRTB
 //! (`DeviceOpExt::and_then_host`, claspr/src/eager.rs).
 //!
 //! This fixture tries to push the `&mut [u32]` view into an outer

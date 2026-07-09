@@ -49,7 +49,7 @@
 //! | get data ONTO / OFF the device | [`upload`] / [`download`] | non-recordable (host transfer) |
 //! | a rebindable typed hole | [`slot!`](crate::slot) + [`bind`](DeviceOpExt::bind)/[`call`](DeviceOpExt::call) | see "Slots" below |
 //! | a device-resident scalar | [`crate::DeviceScalar`] via [`crate::device_scalar`] | binds a `&T`/`&mut T` kernel arg; see "Device scalars" below |
-//! | run host code mid-graph | [`and_then_host`](DeviceOpExt::and_then_host) | writable [`&mut View`](crate::mappable::Mappable::View); currently one-shot (not replayable) |
+//! | run host code mid-graph | [`and_then_host`](DeviceOpExt::and_then_host) | writable [`&mut View`](crate::mappable::Mappable::View); reusable — the `Fn` closure re-runs on every replay (borrow / `Arc` / clone captures, don't move-consume) |
 //!
 //! There is intentionally NO `present`/`hold`/`carry`/`thread`/`identity` — the
 //! "keep a value around" verb is [`forward`]; the "inject a host value" verbs are
@@ -3158,16 +3158,24 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// host-valid), maps the value, runs the closure (mutations persist via the
     /// unmap), then forwards the same value downstream. Errors from the closure
     /// propagate directly. See [`AndThenHost`].
+    ///
+    /// **Reusable / replayable.** The closure is `Fn` (not `FnOnce`), so a graph
+    /// containing a host seam can be `sync`'d repeatedly — the seam re-runs the
+    /// closure on every replay. The trade: a replayed closure borrows / `Arc`s /
+    /// clones its captures rather than move-consuming them (the right constraint
+    /// for something that runs more than once). The engine keeps the closure in an
+    /// `Arc` and hands the per-run worker thread its own owned handle.
     fn and_then_host<F>(self, f: F) -> AndThenHost<Self, F>
     where
         Self::Output: crate::mappable::Mappable,
-        F: for<'a> FnOnce(<Self::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
+        F: for<'a> Fn(<Self::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
             + Send
+            + Sync
             + 'static,
     {
         AndThenHost {
             source: self,
-            f: Mutex::new(Some(f)),
+            f: Arc::new(f),
             out: Pipe::new(),
         }
     }
@@ -3175,19 +3183,24 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// Like [`and_then_host`](Self::and_then_host) but the closure also receives
     /// the running [`Context`] (e.g. to read device props). See
     /// [`AndThenHostWithContext`].
+    ///
+    /// **Reusable / replayable** — same as [`and_then_host`](Self::and_then_host):
+    /// the closure is `Fn`, the graph replays, and the closure re-runs each
+    /// `sync` (borrow / `Arc` / clone captures, don't move-consume them).
     fn and_then_host_with_context<F>(self, f: F) -> AndThenHostWithContext<Self, F>
     where
         Self::Output: crate::mappable::Mappable,
-        F: for<'a> FnOnce(
+        F: for<'a> Fn(
                 &Context,
                 <Self::Output as crate::mappable::Mappable>::View<'a>,
             ) -> Result<()>
             + Send
+            + Sync
             + 'static,
     {
         AndThenHostWithContext {
             source: self,
-            f: Mutex::new(Some(f)),
+            f: Arc::new(f),
             out: Pipe::new(),
         }
     }
@@ -8522,7 +8535,7 @@ where
     S::Output: crate::mappable::Mappable,
 {
     source: S,
-    f: Mutex<Option<F>>,
+    f: Arc<F>,
     out: Pipe<S::Output>,
 }
 
@@ -8533,7 +8546,7 @@ where
     S::Output: crate::mappable::Mappable,
 {
     source: S,
-    f: Mutex<Option<F>>,
+    f: Arc<F>,
     out: Pipe<S::Output>,
 }
 
@@ -8766,8 +8779,9 @@ impl<S, F> DeviceOp for AndThenHost<S, F>
 where
     S: DeviceOp,
     S::Output: crate::mappable::Mappable,
-    F: for<'a> FnOnce(<S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
+    F: for<'a> Fn(<S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
         + Send
+        + Sync
         + 'static,
 {
     type Output = S::Output;
@@ -8781,21 +8795,32 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // Gather the source via `collect` (any arity — a bundle source fills
-        // element pipes, not output_pipe).
-        let (value, deps) = self.source.collect(ec, ExecMode::Pipelined)?;
-        let f = self.f.lock().unwrap().take().ok_or(Error::NotSupported(
-            "eager graph: an `and_then_host` closure was already consumed — a host \
-             seam is a one-shot `FnOnce`, so a graph containing one can't be reused \
-             (step-(a) limitation; reuse covers pure-device graphs)",
-        ))?;
-        let (out_value, out_deps) = run_host_seam::<S::Output, F>(value, deps, ec, f)?;
-        self.out.put(out_value, out_deps);
+        // Gather the source via `collect_home` (any arity) so the source's return
+        // home rides THROUGH the seam: the value passes downstream unchanged, and
+        // on `Checkout` drop it re-arms the source's origin cell — the prerequisite
+        // for replaying a slot/buffer-backed graph across `sync`s (#211). (The seam
+        // used to be one-shot, so it discarded the home via `collect`; a reusable
+        // seam must preserve it.)
+        let (value, deps, home) = self.source.collect_home(ec, ExecMode::Pipelined)?;
+        // Reusable: `Arc::clone` the closure so the per-run worker thread gets
+        // its OWN owned handle to move in (it runs off the submitting thread).
+        // `run_host_seam` keeps its `FnOnce` param — the clone is a fresh
+        // one-shot callable per replay; the closure itself (`Fn`) re-runs.
+        let f = Arc::clone(&self.f);
+        let (out_value, out_deps) =
+            run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(view))?;
+        self.out.put_home(out_value, out_deps, home);
         Ok(())
     }
 
     fn check_ready(&self) -> Result<()> {
         self.source.check_ready()
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // A host seam is a structural pass-through: recurse into the source so
+        // `bind`/`call` reach any `slot!` cells the source op carries.
+        self.source.bind_slots(binder);
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -8812,8 +8837,9 @@ impl<S, F> DeviceOp for AndThenHostWithContext<S, F>
 where
     S: DeviceOp,
     S::Output: crate::mappable::Mappable,
-    F: for<'a> FnOnce(&Context, <S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
+    F: for<'a> Fn(&Context, <S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
         + Send
+        + Sync
         + 'static,
 {
     type Output = S::Output;
@@ -8827,25 +8853,29 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // Gather the source via `collect` (any arity).
-        let (value, deps) = self.source.collect(ec, ExecMode::Pipelined)?;
-        let f = self.f.lock().unwrap().take().ok_or(Error::NotSupported(
-            "eager graph: an `and_then_host_with_context` closure was already \
-             consumed — a host seam is a one-shot `FnOnce`, so a graph containing \
-             one can't be reused (step-(a) limitation)",
-        ))?;
-        // Move a `Context` clone (cheap, Arc-backed, 'static) into the worker
-        // closure so it can call `f(&context, view)`; the view borrow is supplied
-        // by the seam. The closure is Send + 'static (context + f both are).
+        // Gather the source via `collect_home` (any arity) so the source's return
+        // home rides THROUGH the seam and the graph replays across `sync`s (#211).
+        // See the `AndThenHost::execute` note for the full rationale.
+        let (value, deps, home) = self.source.collect_home(ec, ExecMode::Pipelined)?;
+        // Reusable: `Arc::clone` the closure and clone a fresh `Context` per run,
+        // then move both into a fresh one-shot callable for the worker thread.
+        // The closure (`Fn`) re-runs on every replay; captures are borrowed via
+        // the Arc rather than move-consumed.
+        let f = Arc::clone(&self.f);
         let context = ec.context().clone();
         let (out_value, out_deps) =
-            run_host_seam::<S::Output, _>(value, deps, ec, move |view| f(&context, view))?;
-        self.out.put(out_value, out_deps);
+            run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(&context, view))?;
+        self.out.put_home(out_value, out_deps, home);
         Ok(())
     }
 
     fn check_ready(&self) -> Result<()> {
         self.source.check_ready()
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // Pass-through: recurse into the source so `bind`/`call` reach its slots.
+        self.source.bind_slots(binder);
     }
 
     fn describe(&self, out: &mut Vec<String>) {

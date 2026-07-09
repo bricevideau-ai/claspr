@@ -8,7 +8,8 @@
 //!   `.and_then_host(|view|…)`           → same method on `DeviceOpExt`
 
 use claspr::eager::{DeviceOpExt, upload, value};
-use claspr::{Context, Device};
+use claspr::{Context, Device, DeviceSlice};
+use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
 use std::sync::{Arc, Mutex};
 
@@ -63,6 +64,100 @@ fn and_then_host_error_propagates() {
         .sync(&ctx)
         .expect_err("expected error");
     assert!(matches!(err, claspr::Error::SvmNotAvailable), "got {err:?}",);
+}
+
+// ── REUSABLE host seam: replay across syncs (#211) ───────────────────
+//
+// The host seam used to be a one-shot `FnOnce` (stored `Mutex<Option<F>>`,
+// `.take()`n on first execute) — a graph containing one could only be `sync`'d
+// once. It is now `Fn` (kept in an `Arc`, cloned per run for the worker thread),
+// so a host-seam graph REPLAYS and the closure re-runs every `sync`. These two
+// tests prove replay + that the closure genuinely re-executes each run.
+
+slots! { Buf: DeviceSlice<u32> }
+
+/// A host-seam graph `sync`'d TWICE over the SAME buffer handle. The seam DOUBLES
+/// the mapped view each run, so the buffer QUADRUPLES across two syncs — which can
+/// only happen if the `Fn` closure re-ran on the replay (a one-shot `FnOnce` would
+/// error on the 2nd `sync`). `scale_u32(slot, 1)` is an identity kernel head that
+/// makes the slot-bound buffer flow into the seam.
+#[test]
+fn and_then_host_replays_and_reruns_each_sync() {
+    let Some(ctx) = ctx(false) else {
+        eprintln!("SKIP: no OpenCL device");
+        return;
+    };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    // Reusable graph: identity kernel head over a slot-bound buffer, then a host
+    // seam that doubles every element in place. The slot is behind the seam; `bind`
+    // reaches it (the seam forwards `bind_slots`) and the buffer rehomes to its
+    // cell across replays (the seam threads the source's home). Closure captures
+    // NOTHING and only borrows the view — the right shape for something replayed.
+    let buf = DeviceSlice::<u32>::from_slice(&ctx, &[3u32; N]).expect("seed buffer");
+    let g = kernels
+        .scale_u32([N], slot!(Buf), 1u32)
+        .and_then_host(|view: &mut [u32]| {
+            for slot in view.iter_mut() {
+                *slot = slot.wrapping_mul(2);
+            }
+            Ok(())
+        })
+        .bind(Buf(buf));
+
+    // Run 1: 3 × 1 (kernel) × 2 (host seam) = 6. Borrowing `map` so the Buf slot
+    // rehomes on the Checkout's drop and the graph re-arms for replay.
+    let co = g.sync(&ctx).expect("host-seam run 1");
+    {
+        let view = co.map().wait().expect("map 1");
+        assert!(view.iter().all(|&v| v == 6), "run1 got {:?}", &view[..4]);
+    }
+    drop(co); // rehome Buf for replay
+
+    // Run 2 (replay over the SAME handle, now holding 6): 6 × 1 × 2 = 12. Proves
+    // the seam re-ran — a one-shot FnOnce would have errored here instead.
+    let co = g.sync(&ctx).expect("host-seam run 2 (replay)");
+    {
+        let view = co.map().wait().expect("map 2");
+        assert!(view.iter().all(|&v| v == 12), "run2 got {:?}", &view[..4]);
+    }
+    drop(co);
+}
+
+/// Replay stress: the SAME host-seam graph `sync`'d N times in a loop, with an
+/// external `Arc<Mutex<u32>>` counter incremented by the closure each run. After
+/// the loop the counter equals the run count — direct proof the `Fn` closure fired
+/// on every replay (and that captures are shared by borrow, not move-consumed).
+#[test]
+fn and_then_host_loop_reruns_closure_every_iteration() {
+    let Some(ctx) = ctx(false) else {
+        eprintln!("SKIP: no OpenCL device");
+        return;
+    };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let calls = Arc::new(Mutex::new(0u32));
+    let calls_c = Arc::clone(&calls);
+
+    let buf = DeviceSlice::<u32>::from_slice(&ctx, &[0u32; N]).expect("seed buffer");
+    let g = kernels
+        .scale_u32([N], slot!(Buf), 1u32)
+        .and_then_host(move |_view: &mut [u32]| {
+            *calls_c.lock().unwrap() += 1;
+            Ok(())
+        })
+        .bind(Buf(buf));
+
+    const RUNS: u32 = 5;
+    for _ in 0..RUNS {
+        let co = g.sync(&ctx).expect("loop replay sync");
+        drop(co); // rehome for the next iteration
+    }
+    assert_eq!(
+        *calls.lock().unwrap(),
+        RUNS,
+        "the host seam closure must re-run once per sync"
+    );
 }
 
 // ── profile ──────────────────────────────────────────────────────────

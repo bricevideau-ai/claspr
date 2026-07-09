@@ -1,3 +1,20 @@
+error[E0596]: cannot borrow `escaped` as mutable, as it is a captured variable in a `Fn` closure
+  --> compile_fail/and_then_host_escapes_buffer.rs:30:13
+   |
+26 |       let mut escaped: Vec<&mut [u32]> = Vec::new();
+   |           ----------- `escaped` declared here, outside the closure
+27 |       let _ = upload(vec![1u32, 2, 3, 4])
+28 |           .and_then_host(|view| {
+   |            -             ------ in this closure
+   |  __________|
+   | |
+29 | |             // Try to leak the borrow past the closure body — must be rejected.
+30 | |             escaped.push(view);
+   | |             ^^^^^^^ cannot borrow as mutable
+31 | |             Ok(())
+32 | |         })
+   | |__________- expects `Fn` instead of `FnMut`
+
 error[E0521]: borrowed data escapes outside of closure
   --> compile_fail/and_then_host_escapes_buffer.rs:30:13
    |
@@ -39,7 +56,7 @@ help: to force the closure to take ownership of `escaped` (and any other referen
 28 |         .and_then_host(move |view| {
    |                        ++++
 
-error: aborting due to 2 previous errors
+error: aborting due to 3 previous errors
 
-Some errors have detailed explanations: E0373, E0521.
+Some errors have detailed explanations: E0373, E0521, E0596.
 For more information about an error, try `rustc --explain E0373`.

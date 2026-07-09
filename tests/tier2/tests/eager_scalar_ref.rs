@@ -227,10 +227,10 @@ fn host_seam_writes_scalar_then_kernel_reads_replayed() {
 }
 
 /// Same host-write-then-read shape but the scalar is a REUSED graph
-/// cell replayed across multiple syncs (rehome across runs). The host
-/// seam is a one-shot `FnOnce`, so this variant uses concrete cells +
-/// a plain re-bind of the scalar value between runs to prove the
-/// rehome path (the #210 replay guarantee) works for a DeviceScalar.
+/// cell replayed across multiple syncs (rehome across runs). This
+/// variant uses concrete cells + a plain re-bind of the scalar value
+/// between runs to prove the rehome path (the #210 replay guarantee)
+/// works for a DeviceScalar.
 #[test]
 fn device_scalar_rehomes_across_replays() {
     let Some(ctx) = ctx() else { return };

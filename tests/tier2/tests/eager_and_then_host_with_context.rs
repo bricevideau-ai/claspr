@@ -12,7 +12,8 @@
 //! three test fns port 1:1 — same N, values, and assertions.
 
 use claspr::eager::{DeviceOpExt, download, upload};
-use claspr::{Context, Error};
+use claspr::{Context, DeviceSlice, Error};
+use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
 use std::sync::{Arc, Mutex};
 
@@ -100,4 +101,57 @@ fn closure_err_surfaces_rich_variant_via_host_error_slot() {
         matches!(&err, Error::Build { log } if log == "ec-aware host abort"),
         "got {err:?}",
     );
+}
+
+// ── REUSABLE with-context host seam: replay across syncs (#211) ───────
+
+slots! { Buf: DeviceSlice<u32> }
+
+/// The `_with_context` host seam is now `Fn` (Arc-held, cloned per run; the
+/// `&Context` is cloned fresh per run too), so a graph containing one REPLAYS.
+/// This graph adds `context.devices().len()` to every element each run, so a
+/// buffer seeded at 0 holds `k` after run 1 and `2k` after run 2 — proving the
+/// closure re-ran on the replay (a one-shot `FnOnce` would have errored on the
+/// 2nd `sync`).
+#[test]
+fn and_then_host_with_context_replays_and_reruns() {
+    let Some(ctx) = ctx() else { return };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+
+    let k = ctx.devices().len() as u32;
+
+    // Slot lives behind the seam; `bind` reaches it and the buffer rehomes across
+    // replays (the seam forwards `bind_slots` and threads the source's home). The
+    // seam adds `k` to every element each run.
+    let buf = DeviceSlice::<u32>::from_slice(&ctx, &[0u32; N]).expect("seed buffer");
+    let g = kernels
+        .scale_u32([N], slot!(Buf), 1u32)
+        .and_then_host_with_context(|context: &Context, view: &mut [u32]| {
+            let add = context.devices().len() as u32;
+            for slot in view.iter_mut() {
+                *slot = slot.wrapping_add(add);
+            }
+            Ok(())
+        })
+        .bind(Buf(buf));
+
+    // Run 1: 0 + k.
+    let co = g.sync(&ctx).expect("with-context run 1");
+    {
+        let view = co.map().wait().expect("map 1");
+        assert!(view.iter().all(|&v| v == k), "run1 got {:?}", &view[..4]);
+    }
+    drop(co); // rehome for replay
+
+    // Run 2 (replay): k + k = 2k. Proves the seam re-ran with a fresh context.
+    let co = g.sync(&ctx).expect("with-context run 2 (replay)");
+    {
+        let view = co.map().wait().expect("map 2");
+        assert!(
+            view.iter().all(|&v| v == 2 * k),
+            "run2 got {:?}",
+            &view[..4]
+        );
+    }
+    drop(co);
 }
