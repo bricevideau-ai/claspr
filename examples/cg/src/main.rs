@@ -109,7 +109,7 @@
 //! and the finish kernels sum the `G` partials on-device (a len-1 dispatch) — no
 //! workgroup memory / barriers, robust on every ICD.
 
-use claspr::eager::{DeviceOp, DeviceOpExt, bundle2, bundle4, forward, lift};
+use claspr::eager::{DeviceOp, DeviceOpExt, bundle2, bundle4, lift};
 use claspr::{Context, DeviceScalar, DeviceSlice, Pipe};
 
 #[claspr::device]
@@ -441,14 +441,7 @@ impl ReduceStrategy for AllDevice {
         // nalpha); re-expose (alpha, nalpha, rsold, partials) as the fixed 4-tuple
         // handle. alpha = rsold / Σpartials; partials threads to step 5's norm2.
         ks.finish_alpha([1], partials, rsold, alpha, nalpha)
-            .and_then(|(partials, rsold, alpha, nalpha)| {
-                bundle4(
-                    forward(alpha),
-                    forward(nalpha),
-                    forward(rsold),
-                    forward(partials),
-                )
-            })
+            .and_then(|(partials, rsold, alpha, nalpha)| bundle4(alpha, nalpha, rsold, partials))
     }
 
     fn compute_beta(
@@ -465,8 +458,10 @@ impl ReduceStrategy for AllDevice {
     > {
         // finish_beta(partials, rsold, beta, rsnew): rsnew = Σpartials; beta =
         // rsnew/rsold; rsold = rsnew. Thread only rsnew onward (beta/rsold reclaim).
+        // The `and_then` SELECTS rsnew out of the 4-tuple handle; a bare `Pipe` is
+        // itself a `DeviceOp`, so no `forward` wrap is needed.
         ks.finish_beta([1], partials, rsold, beta, rsnew)
-            .and_then(|(_partials, _rsold, _beta, rsnew)| forward(rsnew))
+            .and_then(|(_partials, _rsold, _beta, rsnew)| rsnew)
     }
 }
 
@@ -529,14 +524,7 @@ impl ReduceStrategy for HostSeam {
             )
             // Re-expose (alpha, nalpha, rsold, partials) as the fixed 4-tuple handle
             // the solver expects — partials threads to step 5's norm2 (same buffer).
-            .and_then(|(part, alpha, nalpha, rsold)| {
-                bundle4(
-                    forward(alpha),
-                    forward(nalpha),
-                    forward(rsold),
-                    forward(part),
-                )
-            })
+            .and_then(|(part, alpha, nalpha, rsold)| bundle4(alpha, nalpha, rsold, part))
     }
 
     fn compute_beta(
@@ -554,10 +542,10 @@ impl ReduceStrategy for HostSeam {
         // Same bundle-into-seam shape for β: sum partials (= r·r) → rsnew, form
         // beta = rsnew/rsold (OLD rsold), then advance rsold = rsnew. Writes rsnew,
         // beta, rsold through their `&mut f32` views; reads partials. `rsold`/`beta`
-        // arrive as threaded pipes — `forward` them into the bundle so their homes
-        // ride through and re-arm. Thread only rsnew onward (beta/rsold reclaim +
-        // re-home for the next iteration).
-        bundle4(partials, lift(rsnew), forward(beta), forward(rsold))
+        // arrive as threaded pipes — a bare `Pipe` is itself a `DeviceOp`, so it
+        // drops straight into the bundle (its home rides through and re-arms). Thread
+        // only rsnew onward (beta/rsold reclaim + re-home for the next iteration).
+        bundle4(partials, lift(rsnew), beta, rsold)
             .and_then_host(
                 |(part, rsnew, beta, rsold): (&mut [f32], &mut f32, &mut f32, &mut f32)| {
                     let sum: f32 = part.iter().sum();
@@ -567,7 +555,7 @@ impl ReduceStrategy for HostSeam {
                     Ok(())
                 },
             )
-            .and_then(|(_part, rsnew, _beta, _rsold)| forward(rsnew))
+            .and_then(|(_part, rsnew, _beta, _rsold)| rsnew)
     }
 }
 
@@ -656,7 +644,7 @@ fn solve_with<S: ReduceStrategy>(
                                         //    (solution) and `rsnew` (residual) to the
                                         //    terminal; other outputs reclaim.
                                         bundle2(
-                                            forward(x),
+                                            x,
                                             strategy.compute_beta(ks, partials, rsold, beta, rsnew),
                                         )
                                     },
