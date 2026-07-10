@@ -3171,6 +3171,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     fn and_then_host<F>(self, f: F) -> AndThenHost<Self, F>
     where
         Self::Output: crate::mappable::Mappable,
+        Self::Checkouts: SeamScatter<Value = Self::Output>,
         F: for<'a> Fn(<Self::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
             + Send
             + Sync
@@ -3179,7 +3180,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         AndThenHost {
             source: self,
             f: Arc::new(f),
-            out: Pipe::new(),
+            handle: <Self::Checkouts as SeamScatter>::empty_handle(),
         }
     }
 
@@ -3193,6 +3194,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     fn and_then_host_with_context<F>(self, f: F) -> AndThenHostWithContext<Self, F>
     where
         Self::Output: crate::mappable::Mappable,
+        Self::Checkouts: SeamScatter<Value = Self::Output>,
         F: for<'a> Fn(
                 &Context,
                 <Self::Output as crate::mappable::Mappable>::View<'a>,
@@ -3204,7 +3206,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         AndThenHostWithContext {
             source: self,
             f: Arc::new(f),
-            out: Pipe::new(),
+            handle: <Self::Checkouts as SeamScatter>::empty_handle(),
         }
     }
 
@@ -4342,6 +4344,191 @@ impl_checkout_split_tuple!(
     CM: vm: hm: 12, CN: vn: hn: 13, CO: vo: ho: 14
 );
 impl_checkout_split_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10, CL: vl: hl: 11,
+    CM: vm: hm: 12, CN: vn: hn: 13, CO: vo: ho: 14, CP: vp: hp: 15
+);
+
+/// The **MID-GRAPH companion** to [`CheckoutSplit`]: give a host seam
+/// ([`AndThenHost`]) its own per-branch **element pipes** — shaped like the
+/// source's [`Checkouts`](DeviceOp::Checkouts) — and SCATTER a seam-mutated value
+/// plus per-branch homes into them, so a bundle / multi-output source's branches
+/// stay individually consumable **downstream** (a `Pipe` per branch, not one
+/// `Pipe<tuple>`) AND re-home across replays.
+///
+/// [`CheckoutSplit`] completed #212 only at the **terminal** (`gather_checkouts`
+/// reassembles a `Checkouts` tuple). A seam nested MID-graph (the source of a
+/// downstream [`and_then`](DeviceOpExt::and_then)) runs via `execute`, whose old
+/// path collapsed a bundle source to `home == None` (no re-home) and exposed a
+/// single `Pipe<S::Output>` (`= Pipe<tuple>`, so the written α/−α couldn't be
+/// routed to separate downstream kernels). `SeamScatter` closes that: it is
+/// implemented on the SAME `Checkout<O>` + tuple structure `CheckoutSplit` uses
+/// (so it is arity- and nesting-general), and mirrors what a `bundle!`'s `execute`
+/// does for kernel branches — scatter each branch into its own element pipe with
+/// its own home. A single-output source keeps `Handle = Pipe<O>` (byte-identical
+/// to the pre-#212 default), so only the multi-output mid-graph case changes.
+pub trait SeamScatter: CheckoutSplit {
+    /// The pipe-shaped downstream handle: `Pipe<O>` for a single-output source, a
+    /// tuple of these for a bundle / multi-output source (mirrors
+    /// [`Handle`](DeviceOp::Handle)). Owned by the seam; `execute` fills it,
+    /// downstream reads it. `Send` because the seam struct owns one and
+    /// [`DeviceOp`] is `Send`.
+    type Handle: Clone + Send;
+    /// A fresh, empty handle (each element an empty [`Pipe`]) — built once at
+    /// construction, refilled every `execute`.
+    fn empty_handle() -> Self::Handle;
+    /// The seam's [`output_pipe`](DeviceOp::output_pipe) view — a single
+    /// `Pipe<Value>`. For a **single-output** source this IS the storage pipe (so
+    /// [`AndThen`]'s orphaned-source-deps threading behaves EXACTLY as it did
+    /// pre-#212 when a downstream closure discards the seam's output — byte-identity
+    /// of the single-output mid-graph path). For a **multi-output** source, storage
+    /// is the per-branch element pipes, so this returns a fresh never-filled pipe
+    /// (the same convention a `bundle!` / [`CopyTo2`] `output_pipe` use).
+    fn output_pipe_view(handle: &Self::Handle) -> Pipe<Self::Value>;
+    /// Scatter the seam-mutated `value` + per-branch `homes` into `handle`'s
+    /// element pipes, cloning `deps` (the seam's unmap + `proceed` gate) onto each
+    /// so whichever branch flows downstream carries the wait-list.
+    fn scatter(handle: &Self::Handle, value: Self::Value, homes: Self::Homes, deps: &Deps);
+    /// Drain any element pipes a downstream closure discarded, rehoming each
+    /// undelivered branch to its origin cell (the mid-graph half of the home
+    /// invariant — see [`reclaim_undelivered`](DeviceOp::reclaim_undelivered)).
+    fn reclaim(handle: &Self::Handle);
+    /// Reconstruct the assembled value + joined deps by draining every element
+    /// pipe — the by-value (`collect` / async `run`) path for a multi-output seam.
+    fn reconstruct(handle: &Self::Handle) -> Result<(Self::Value, Deps)>;
+    /// Like [`reconstruct`](Self::reconstruct) but also yield the collapsed
+    /// return home — the `collect_home` path. A single-output source preserves its
+    /// one home (the #211 nested-in-`and_then` re-arm); a multi-output source
+    /// returns `None` (N per-branch homes can't ride one slot — the same boundary
+    /// [`collect_home`](DeviceOp::collect_home) documents; the multi-home re-arm
+    /// rides the Checkout path instead).
+    #[allow(clippy::type_complexity)]
+    fn reconstruct_home(
+        handle: &Self::Handle,
+    ) -> Result<(Self::Value, Deps, Option<BoxedHome<Self::Value>>)>;
+}
+
+impl<O: Send + 'static> SeamScatter for Checkout<O> {
+    type Handle = Pipe<O>;
+    fn empty_handle() -> Pipe<O> {
+        Pipe::new()
+    }
+    fn output_pipe_view(handle: &Pipe<O>) -> Pipe<O> {
+        // Single-output: the handle IS the storage pipe.
+        handle.clone()
+    }
+    fn scatter(handle: &Pipe<O>, value: O, homes: Option<BoxedHome<O>>, deps: &Deps) {
+        handle.put_home(value, deps.clone(), homes);
+    }
+    fn reclaim(handle: &Pipe<O>) {
+        if let Some((value, _deps, home)) = handle.take_home() {
+            rehome_consumed(value, home);
+        }
+    }
+    fn reconstruct(handle: &Pipe<O>) -> Result<(O, Deps)> {
+        handle
+            .take()
+            .ok_or(Error::NotSupported("eager graph: seam produced no output"))
+    }
+    fn reconstruct_home(handle: &Pipe<O>) -> Result<(O, Deps, Option<BoxedHome<O>>)> {
+        handle
+            .take_home()
+            .ok_or(Error::NotSupported("eager graph: seam produced no output"))
+    }
+}
+
+// Recursive tuple family — a bundle / multi-output branch's `Checkouts` is a
+// tuple, split/scattered structurally at any nesting depth. Arity 2..=16 mirrors
+// the `CheckoutSplit` / `FromCheckout` families.
+macro_rules! impl_seam_scatter_tuple {
+    ( $( $ck:ident : $vn:ident : $hn:ident : $idx:tt ),+ ) => {
+        impl<$($ck: SeamScatter,)+> SeamScatter for ( $($ck,)+ ) {
+            type Handle = ( $(<$ck as SeamScatter>::Handle,)+ );
+            fn empty_handle() -> Self::Handle {
+                ( $(<$ck as SeamScatter>::empty_handle(),)+ )
+            }
+            fn output_pipe_view(_handle: &Self::Handle) -> Pipe<Self::Value> {
+                // Multi-output: storage is the element pipes; this single pipe is
+                // never filled or drained. A fresh empty pipe, well-typed, never
+                // read (same convention as bundle/CopyTo2 `output_pipe`).
+                Pipe::new()
+            }
+            fn scatter(handle: &Self::Handle, value: Self::Value, homes: Self::Homes, deps: &Deps) {
+                $( <$ck as SeamScatter>::scatter(&handle.$idx, value.$idx, homes.$idx, deps); )+
+            }
+            fn reclaim(handle: &Self::Handle) {
+                $( <$ck as SeamScatter>::reclaim(&handle.$idx); )+
+            }
+            fn reconstruct(handle: &Self::Handle) -> Result<(Self::Value, Deps)> {
+                let mut deps = Deps::new();
+                let value = ( $({
+                    let (v, d) = <$ck as SeamScatter>::reconstruct(&handle.$idx)?;
+                    deps.extend(d);
+                    v
+                },)+ );
+                Ok((value, deps))
+            }
+            fn reconstruct_home(
+                handle: &Self::Handle,
+            ) -> Result<(Self::Value, Deps, Option<BoxedHome<Self::Value>>)> {
+                // A tuple value has N per-branch homes that can't ride one
+                // collapsed slot — return `None` (the multi-home re-arm rides the
+                // Checkout path). Reconstruct value + deps via `reconstruct`.
+                let (value, deps) = Self::reconstruct(handle)?;
+                Ok((value, deps, None))
+            }
+        }
+    };
+}
+impl_seam_scatter_tuple!(CA: va: ha: 0, CB: vb: hb: 1);
+impl_seam_scatter_tuple!(CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2);
+impl_seam_scatter_tuple!(CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3);
+impl_seam_scatter_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4
+);
+impl_seam_scatter_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5
+);
+impl_seam_scatter_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6
+);
+impl_seam_scatter_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7
+);
+impl_seam_scatter_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8
+);
+impl_seam_scatter_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9
+);
+impl_seam_scatter_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10
+);
+impl_seam_scatter_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10, CL: vl: hl: 11
+);
+impl_seam_scatter_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10, CL: vl: hl: 11,
+    CM: vm: hm: 12
+);
+impl_seam_scatter_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10, CL: vl: hl: 11,
+    CM: vm: hm: 12, CN: vn: hn: 13
+);
+impl_seam_scatter_tuple!(
+    CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
+    CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10, CL: vl: hl: 11,
+    CM: vm: hm: 12, CN: vn: hn: 13, CO: vo: ho: 14
+);
+impl_seam_scatter_tuple!(
     CA: va: ha: 0, CB: vb: hb: 1, CC: vc: hc: 2, CD: vd: hd: 3, CE: ve: he: 4, CF: vf: hf: 5,
     CG: vg: hg: 6, CH: vh: hh: 7, CI: vi: hi: 8, CJ: vj: hj: 9, CK: vk: hk: 10, CL: vl: hl: 11,
     CM: vm: hm: 12, CN: vn: hn: 13, CO: vo: ho: 14, CP: vp: hp: 15
@@ -8684,10 +8871,17 @@ where
 pub struct AndThenHost<S: DeviceOp, F>
 where
     S::Output: crate::mappable::Mappable,
+    S::Checkouts: SeamScatter<Value = S::Output>,
 {
     source: S,
     f: Arc<F>,
-    out: Pipe<S::Output>,
+    // The per-branch, pipe-shaped downstream handle — `Pipe<O>` for a
+    // single-output source (the pre-#212 default), a tuple of pipes for a bundle /
+    // multi-output source. `execute` scatters the seam-mutated value+homes into
+    // these, so downstream can route each written branch to its own kernel AND
+    // every branch re-homes across replays. Owned (not `Pipe::new()` per run) so
+    // `handle()` hands out stable pipe identities.
+    handle: <S::Checkouts as SeamScatter>::Handle,
 }
 
 /// Like [`AndThenHost`] but the closure also receives `&Context` — built by
@@ -8695,10 +8889,12 @@ where
 pub struct AndThenHostWithContext<S: DeviceOp, F>
 where
     S::Output: crate::mappable::Mappable,
+    S::Checkouts: SeamScatter<Value = S::Output>,
 {
     source: S,
     f: Arc<F>,
-    out: Pipe<S::Output>,
+    // See `AndThenHost::handle`.
+    handle: <S::Checkouts as SeamScatter>::Handle,
 }
 
 /// Shared body for the host seam: enqueue maps for the source value (wait-list =
@@ -8937,6 +9133,12 @@ where
     // the same); for a bundle / multi-output source it is that source's per-branch
     // `Checkouts` tuple, split/reassembled recursively (any arity, any nesting).
     S::Checkouts: CheckoutSplit<Value = S::Output>,
+    // MID-GRAPH re-scatter (#212 completion): the same per-branch structure, but
+    // exposed as element PIPES downstream + re-homed via `execute`. Single-output
+    // → `Handle = Pipe<O>` (pre-#212 default, byte-identical); multi-output → a
+    // tuple of pipes, so written branches route to separate downstream kernels AND
+    // re-home across replays.
+    S::Checkouts: SeamScatter<Value = S::Output>,
     // The source's own `gather_checkouts` needs this bound too — a bundle/multi-
     // output source's `Checkouts` satisfies it via the recursive `FromCheckout`
     // family, a single-output source via the identity impl.
@@ -8947,6 +9149,11 @@ where
         + 'static,
 {
     type Output = S::Output;
+    // The downstream-facing handle is the source's per-branch PIPE shape (via
+    // `SeamScatter::Handle`): `Pipe<O>` for a single-output source (unchanged), a
+    // tuple of pipes for a bundle/multi-output source — so `and_then(|(a, b)| …)`
+    // can route each written branch to its own kernel.
+    type Handle = <S::Checkouts as SeamScatter>::Handle;
     // The seam's terminal result IS the source's — one `Checkout` for a
     // single-output source, a per-branch tuple for a bundle/multi-output source.
     // The seam re-threads EACH branch's home (via `CheckoutSplit`) so every branch
@@ -8955,24 +9162,29 @@ where
     type Checkouts = S::Checkouts;
 
     fn output_pipe(&self) -> Pipe<S::Output> {
-        self.out.clone()
+        // Single-output: the storage pipe; multi-output: a fresh never-read pipe
+        // (storage is the element pipes). See `SeamScatter::output_pipe_view`.
+        <S::Checkouts as SeamScatter>::output_pipe_view(&self.handle)
     }
 
     fn handle(&self) -> Self::Handle {
-        self.out.clone()
+        self.handle.clone()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // BY-VALUE / MID-GRAPH path (async `run`, or the seam nested as an
-        // `and_then` source): gather the source via `collect_home` and thread the
-        // SINGLE collapsed home through the seam's output pipe. For a single-output
-        // source this preserves the source's return home (#211 replay). For a
-        // bundle/multi-output source `collect_home` returns `home == None` (a tuple
-        // has N per-buffer homes that can't ride one collapsed slot — the same
-        // boundary bundle's `collect_home` documents); the multi-home re-arm rides
-        // the CHECKOUT path (`gather_checkouts` below), which every waiting terminal
-        // uses. See the `gather_checkouts` override.
-        let (value, deps, home) = self.source.collect_home(ec, ExecMode::Pipelined)?;
+        // MID-GRAPH path (the seam nested as an `and_then` source, or async `run`).
+        // Gather the source PER-BRANCH via its own `gather_checkouts` (a
+        // single-output source builds one `Checkout`; a bundle/multi-output source
+        // delegates to each branch, threading every branch's per-buffer return
+        // home) — the SAME per-branch gather the terminal uses. Then SPLIT into the
+        // assembled value (mapped + handed to the closure) + per-branch homes,
+        // run the seam, and RE-SCATTER each written-back branch (value+home) into
+        // its OWN element pipe. So downstream reads each branch as its own pipe AND
+        // every branch re-homes on drop — the mid-graph multi-home replay (#212
+        // completion). A single-output source scatters into one pipe with its home
+        // preserved (byte-identical to the pre-#212 `collect_home` + `put_home`).
+        let (src_cos, deps) = self.source.gather_checkouts(ec, ExecMode::Pipelined)?;
+        let (value, homes) = src_cos.split();
         // Reusable: `Arc::clone` the closure so the per-run worker thread gets
         // its OWN owned handle to move in (it runs off the submitting thread).
         // `run_host_seam` keeps its `FnOnce` param — the clone is a fresh
@@ -8980,8 +9192,37 @@ where
         let f = Arc::clone(&self.f);
         let (out_value, out_deps) =
             run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(view))?;
-        self.out.put_home(out_value, out_deps, home);
+        <S::Checkouts as SeamScatter>::scatter(&self.handle, out_value, homes, &out_deps);
         Ok(())
+    }
+
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(S::Output, Deps)>
+    where
+        Self: Sized,
+    {
+        // BY-VALUE gather (async `run` / `into_output`): scatter via `execute`,
+        // then reconstruct the assembled value by draining the element pipe(s).
+        // Single-output drains one pipe (unchanged); multi-output reconstructs the
+        // tuple, joining deps.
+        self.execute(ec, mode)?;
+        <S::Checkouts as SeamScatter>::reconstruct(&self.handle)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn collect_home(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(S::Output, Deps, Option<BoxedHome<S::Output>>)>
+    where
+        Self: Sized,
+        S::Output: Send + 'static,
+    {
+        // Home-preserving by-value gather: single-output preserves its one home
+        // (the #211 nested-in-`and_then` re-arm); multi-output returns `home ==
+        // None` (per-branch homes ride the Checkout / element-pipe path).
+        self.execute(ec, mode)?;
+        <S::Checkouts as SeamScatter>::reconstruct_home(&self.handle)
     }
 
     fn gather_checkouts(
@@ -8989,18 +9230,12 @@ where
         ec: &ExecutionContext<'_>,
         _mode: ExecMode,
     ) -> Result<(Self::Checkouts, Deps)> {
-        // TERMINAL / CHECKOUT gather — the multi-home fix. Mirror #207's per-branch
-        // delegation, but AT THE SEAM: gather the source via its OWN
-        // `gather_checkouts` (a single-output source builds one `Checkout`; a
-        // bundle/multi-output source delegates to each branch, so EVERY branch
-        // threads its own per-buffer return home). Then SPLIT those checkouts into
-        // the assembled tuple VALUE (to map + hand the closure) plus the per-branch
-        // homes (relocated intact, NOT severed), run the seam over the value, and
-        // REASSEMBLE the checkouts re-threading each ORIGINAL home. So a bundle-fed
-        // seam re-arms every branch on drop and replays across `sync`s — the gap
-        // this closes. The source pipelines (it is upstream of the seam); the
-        // returned `out_deps` (unmaps + the `proceed` gate) are what the terminal
-        // waits on.
+        // TERMINAL / CHECKOUT gather — the #212 pass-1 path, UNCHANGED (byte-for-
+        // byte). Gather the source per-branch, split into value + homes, run the
+        // seam, REASSEMBLE the checkouts re-threading each ORIGINAL home so every
+        // branch re-arms on drop. (Distinct from `execute`, which re-scatters into
+        // the seam's own element pipes for a DOWNSTREAM consumer; here the terminal
+        // takes the checkouts directly.)
         let (src_cos, deps) = self.source.gather_checkouts(ec, ExecMode::Pipelined)?;
         let (value, homes) = src_cos.split();
         let f = Arc::clone(&self.f);
@@ -9008,6 +9243,18 @@ where
             run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(view))?;
         let checkouts = <S::Checkouts as CheckoutSplit>::reassemble(out_value, homes);
         Ok((checkouts, out_deps))
+    }
+
+    fn reclaim_undelivered(&self) {
+        // Mid-graph mop-up: a downstream `and_then` closure may discard some of the
+        // seam's element pipes (e.g. keep only the written α, drop −α). Each was
+        // filled by `execute`; drain + rehome any the consumer left, so those
+        // branches re-arm their origin cells for the next run. Already-drained pipes
+        // are no-ops. The source's own reclaim runs too (its outputs were consumed
+        // into the seam's checkouts at `execute`, so this is a no-op there, but keep
+        // the traversal complete).
+        <S::Checkouts as SeamScatter>::reclaim(&self.handle);
+        self.source.reclaim_undelivered();
     }
 
     fn check_ready(&self) -> Result<()> {
@@ -9034,10 +9281,11 @@ impl<S, F> DeviceOp for AndThenHostWithContext<S, F>
 where
     S: DeviceOp,
     S::Output: crate::mappable::Mappable,
-    // Same `CheckoutSplit` bound as `AndThenHost` — see its impl for the rationale
-    // (split the source's per-branch checkouts to map the tuple value, reassemble
-    // re-threading each home). Single-output source keeps the #211 path identical.
+    // Same `CheckoutSplit` + `SeamScatter` bounds as `AndThenHost` — see its impl
+    // for the rationale (terminal split/reassemble + mid-graph re-scatter).
+    // Single-output source keeps the #211 / pre-#212 paths identical.
     S::Checkouts: CheckoutSplit<Value = S::Output>,
+    S::Checkouts: SeamScatter<Value = S::Output>,
     // The source's own `gather_checkouts` needs this bound too — a bundle/multi-
     // output source's `Checkouts` satisfies it via the recursive `FromCheckout`
     // family, a single-output source via the identity impl.
@@ -9048,23 +9296,24 @@ where
         + 'static,
 {
     type Output = S::Output;
-    // See `AndThenHost::Checkouts`: the seam's terminal result is the source's,
-    // with every branch re-armed via `CheckoutSplit`.
+    // See `AndThenHost` — per-branch pipe handle downstream, per-branch checkouts
+    // at the terminal.
+    type Handle = <S::Checkouts as SeamScatter>::Handle;
     type Checkouts = S::Checkouts;
 
     fn output_pipe(&self) -> Pipe<S::Output> {
-        self.out.clone()
+        <S::Checkouts as SeamScatter>::output_pipe_view(&self.handle)
     }
 
     fn handle(&self) -> Self::Handle {
-        self.out.clone()
+        self.handle.clone()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // BY-VALUE / MID-GRAPH path — single collapsed home threaded through the
-        // output pipe (bundle source → `home == None`; multi-home re-arm rides the
-        // checkout path). See `AndThenHost::execute` for the full rationale.
-        let (value, deps, home) = self.source.collect_home(ec, ExecMode::Pipelined)?;
+        // MID-GRAPH re-scatter — twin of `AndThenHost::execute` (see it for the full
+        // rationale); the closure additionally gets `&Context`.
+        let (src_cos, deps) = self.source.gather_checkouts(ec, ExecMode::Pipelined)?;
+        let (value, homes) = src_cos.split();
         // Reusable: `Arc::clone` the closure and clone a fresh `Context` per run,
         // then move both into a fresh one-shot callable for the worker thread.
         // The closure (`Fn`) re-runs on every replay; captures are borrowed via
@@ -9073,8 +9322,30 @@ where
         let context = ec.context().clone();
         let (out_value, out_deps) =
             run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(&context, view))?;
-        self.out.put_home(out_value, out_deps, home);
+        <S::Checkouts as SeamScatter>::scatter(&self.handle, out_value, homes, &out_deps);
         Ok(())
+    }
+
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(S::Output, Deps)>
+    where
+        Self: Sized,
+    {
+        self.execute(ec, mode)?;
+        <S::Checkouts as SeamScatter>::reconstruct(&self.handle)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn collect_home(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(S::Output, Deps, Option<BoxedHome<S::Output>>)>
+    where
+        Self: Sized,
+        S::Output: Send + 'static,
+    {
+        self.execute(ec, mode)?;
+        <S::Checkouts as SeamScatter>::reconstruct_home(&self.handle)
     }
 
     fn gather_checkouts(
@@ -9082,11 +9353,8 @@ where
         ec: &ExecutionContext<'_>,
         _mode: ExecMode,
     ) -> Result<(Self::Checkouts, Deps)> {
-        // TERMINAL / CHECKOUT gather — the multi-home fix (twin of
-        // `AndThenHost::gather_checkouts`; see it for the full rationale). Gather
-        // the source per-branch, split the checkouts into value + homes, run the
-        // seam over the value (closure also gets `&Context`), reassemble
-        // re-threading each original home so every branch re-arms across `sync`s.
+        // TERMINAL / CHECKOUT gather — the #212 pass-1 path, UNCHANGED (twin of
+        // `AndThenHost::gather_checkouts`; closure also gets `&Context`).
         let (src_cos, deps) = self.source.gather_checkouts(ec, ExecMode::Pipelined)?;
         let (value, homes) = src_cos.split();
         let f = Arc::clone(&self.f);
@@ -9095,6 +9363,12 @@ where
             run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(&context, view))?;
         let checkouts = <S::Checkouts as CheckoutSplit>::reassemble(out_value, homes);
         Ok((checkouts, out_deps))
+    }
+
+    fn reclaim_undelivered(&self) {
+        // Mid-graph mop-up — twin of `AndThenHost::reclaim_undelivered`.
+        <S::Checkouts as SeamScatter>::reclaim(&self.handle);
+        self.source.reclaim_undelivered();
     }
 
     fn check_ready(&self) -> Result<()> {
