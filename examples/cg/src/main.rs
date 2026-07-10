@@ -1,8 +1,9 @@
 //! claspr Tier 2: **matrix-free Conjugate Gradient** — ONE self-closing graph
-//! replayed as the CG loop body, with the α/β reduction **parametrized behind a
-//! [`ReduceStrategy`]** so CG becomes a comparison sample: the SAME math, the SAME
-//! self-closing loop, computing α/β two interchangeable ways that a
-//! command-buffer partitioner sees as two DIFFERENT shapes.
+//! replayed as the CG loop body, with the α/β reduction **parametrized by two
+//! finish CLOSURES** (`solve_all_device` vs `solve_host_seam`) so CG becomes a
+//! comparison sample: the SAME math, the SAME self-closing loop, computing α/β two
+//! interchangeable ways that a command-buffer partitioner sees as two DIFFERENT
+//! shapes.
 //!
 //! Gray-Scott is a *pure device* solver with a FIXED step count, so the whole
 //! simulation trivially records into one command buffer. CG is more interesting:
@@ -19,8 +20,8 @@
 //! differ ONLY in WHERE α/β are *finished* from those partials — which is exactly
 //! what changes the command-buffer shape:
 //!
-//! - **[`AllDevice`]** (the default / primary, the guide's readable worked
-//!   example): two tiny single-work-item **finish KERNELS** (`finish_alpha` /
+//! - **all-device** (`solve_all_device`, the default / primary, the guide's
+//!   readable worked example): two tiny single-work-item **finish KERNELS** (`finish_alpha` /
 //!   `finish_beta`) consume the `partials` + residual scalars and write α, −α, β,
 //!   and the running `rsold`/`rsnew` straight into len-1 device buffers (the
 //!   `&f32` / `&mut f32` scalar-by-reference kernel-arg path). The step scalars
@@ -28,7 +29,7 @@
 //!   command-buffer-able region — a single maximal recordable graph whose only
 //!   host seam is the len-1 residual read at the loop boundary.
 //!
-//! - **[`AndThenHost`](HostSeam)**: the device reduction still runs, but α/β are
+//! - **host-seam** (`solve_host_seam`): the device reduction still runs, but α/β are
 //!   finished in an [`and_then_host`](claspr::eager::DeviceOpExt::and_then_host)
 //!   closure that READS the mapped `partials` and WRITES the α/−α/rsold/rsnew
 //!   [`DeviceScalar`]s through their `&mut f32` host views. This puts *interpreted
@@ -319,259 +320,171 @@ struct Scalars {
     rsnew: DeviceScalar<f32>,
 }
 
-/// How α and β are **finished** from the `G`-lane reduction `partials` — the ONE
-/// axis on which the two CG variants differ. Everything else (the device
-/// reduction, the axpys, the self-closing loop) is shared. A strategy supplies two
-/// subgraph builders; the solver ([`solve_with`]) is generic over it.
-///
-/// Each builder is handed the buffers/scalars it needs (as concrete cells or
-/// threaded pipes) and returns a subgraph whose [`DeviceOp::Output`] /
-/// [`DeviceOp::Handle`] shape is FIXED across strategies, so the solver body that
-/// composes them is identical. See [`AllDevice`] (finish kernels — one recordable
-/// region) and [`HostSeam`] (an `and_then_host` cut — the mixed shape).
-///
-/// The two shapes a command-buffer partitioner sees:
-/// - [`AllDevice`]: no host seam anywhere in `g` ⇒ ONE maximal recordable region.
-/// - [`HostSeam`]: two interpreted host cuts inside `g` ⇒ device spans to record
-///   between the cuts, host closures to interpret at the cuts.
-trait ReduceStrategy {
-    /// Whether this strategy introduces an `and_then_host` cut into the iteration
-    /// graph. `false` for [`AllDevice`] (one recordable region — the property the
-    /// self-closing all-device path must NOT regress); `true` for [`HostSeam`]. The
-    /// solver `debug_assert`s the built graph's
-    /// [`contains_host_seam`](claspr::eager::DeviceOp::contains_host_seam) matches
-    /// this — so an accidental seam in the all-device path (or a lost seam in the
-    /// host path) is caught on every run.
-    const HAS_HOST_SEAM: bool;
-
-    /// Build the **α finish**: read `partials` (= p·Ap) and `rsold`, produce α and
-    /// −α as `Pipe<DeviceScalar<f32>>`s the step-5 axpys read. All three scalars
-    /// arrive CONCRETE (first use). `rsold` is threaded onward (β needs the *old*
-    /// value), and `partials` is threaded onward too (step 5's `norm2` reuses the
-    /// SAME buffer for r·r), so the handle is
-    /// `(Pipe<alpha>, Pipe<nalpha>, Pipe<rsold>, Pipe<partials>)`.
-    #[allow(clippy::type_complexity)]
-    fn compute_alpha(
-        &self,
-        ks: &gpu::Kernels,
-        partials: Pipe<DeviceSlice<f32>>,
-        rsold: DeviceScalar<f32>,
-        alpha: DeviceScalar<f32>,
-        nalpha: DeviceScalar<f32>,
-    ) -> impl DeviceOp<
-        Output = (
-            DeviceScalar<f32>,
-            DeviceScalar<f32>,
-            DeviceScalar<f32>,
-            DeviceSlice<f32>,
-        ),
-        Handle = (
-            Pipe<DeviceScalar<f32>>,
-            Pipe<DeviceScalar<f32>>,
-            Pipe<DeviceScalar<f32>>,
-            Pipe<DeviceSlice<f32>>,
-        ),
-        Checkouts = (
-            claspr::Checkout<DeviceScalar<f32>>,
-            claspr::Checkout<DeviceScalar<f32>>,
-            claspr::Checkout<DeviceScalar<f32>>,
-            claspr::Checkout<DeviceSlice<f32>>,
-        ),
-    >;
-
-    /// Build the **β finish**: consume `partials` (now = r·r) and `rsold`, publish
-    /// `rsnew = Σpartials`, form `beta = rsnew / rsold`, advance `rsold = rsnew`.
-    /// `rsold` and `beta` arrive as THREADED pipes (`rsold` from the α finish,
-    /// `beta` from step 1's `xpby`) — the physical cells whose homes the finish must
-    /// re-home; `rsnew` arrives CONCRETE (first use). Only `rsnew` is threaded to
-    /// the terminal (the loop-boundary read); `beta`/`rsold` cycle and re-home via
-    /// reclaim, so the handle is just `Pipe<rsnew>`.
-    fn compute_beta(
-        &self,
-        ks: &gpu::Kernels,
-        partials: Pipe<DeviceSlice<f32>>,
-        rsold: Pipe<DeviceScalar<f32>>,
-        beta: Pipe<DeviceScalar<f32>>,
-        rsnew: DeviceScalar<f32>,
-    ) -> impl DeviceOp<
-        Output = DeviceScalar<f32>,
-        Handle = Pipe<DeviceScalar<f32>>,
-        Checkouts = claspr::Checkout<DeviceScalar<f32>>,
-    >;
-}
+// The α/β FINISH — the ONE axis on which the two CG variants differ — is factored
+// as two CLOSURES the generic solver (`solve_with`) composes. Everything else (the
+// device reduction, the axpys, the self-closing loop) is shared. Each closure is
+// handed the buffers/scalars it needs (concrete cells or threaded pipes) and
+// returns a subgraph; the solver's `where`-clause fixes the `Output` (+ the α
+// closure's `Handle`) shape ONCE, and each closure's full type is otherwise
+// INFERRED — so the two variants are two small closure pairs, not two trait impls
+// spelling the 3-associated-type signature over and over. The two shapes a
+// command-buffer partitioner sees: all-device = no host seam ⇒ ONE recordable
+// region; host-seam = two interpreted `and_then_host` cuts inside `g`.
 
 /// **Strategy 1 — all on-device (default / primary).** α and β are finished by two
 /// single-work-item KERNELS (`finish_alpha` / `finish_beta`) that sum the `G`
 /// partials and write the step scalars straight into their len-1 device buffers.
 /// No host seam anywhere ⇒ the whole iteration graph is ONE recordable region.
-/// This is the readable worked example; keep it simple.
-struct AllDevice;
-
-impl ReduceStrategy for AllDevice {
-    const HAS_HOST_SEAM: bool = false;
-
-    fn compute_alpha(
-        &self,
-        ks: &gpu::Kernels,
-        partials: Pipe<DeviceSlice<f32>>,
-        rsold: DeviceScalar<f32>,
-        alpha: DeviceScalar<f32>,
-        nalpha: DeviceScalar<f32>,
-    ) -> impl DeviceOp<
-        Output = (
-            DeviceScalar<f32>,
-            DeviceScalar<f32>,
-            DeviceScalar<f32>,
-            DeviceSlice<f32>,
-        ),
-        Handle = (
-            Pipe<DeviceScalar<f32>>,
-            Pipe<DeviceScalar<f32>>,
-            Pipe<DeviceScalar<f32>>,
-            Pipe<DeviceSlice<f32>>,
-        ),
-        Checkouts = (
-            claspr::Checkout<DeviceScalar<f32>>,
-            claspr::Checkout<DeviceScalar<f32>>,
-            claspr::Checkout<DeviceScalar<f32>>,
-            claspr::Checkout<DeviceSlice<f32>>,
-        ),
-    > {
-        // finish_alpha(partials, rsold, alpha, nalpha) → (partials, rsold, alpha,
-        // nalpha); re-expose (alpha, nalpha, rsold, partials) as the fixed 4-tuple
-        // handle. alpha = rsold / Σpartials; partials threads to step 5's norm2.
-        ks.finish_alpha([1], partials, rsold, alpha, nalpha)
-            .and_then(|(partials, rsold, alpha, nalpha)| bundle4(alpha, nalpha, rsold, partials))
-    }
-
-    fn compute_beta(
-        &self,
-        ks: &gpu::Kernels,
-        partials: Pipe<DeviceSlice<f32>>,
-        rsold: Pipe<DeviceScalar<f32>>,
-        beta: Pipe<DeviceScalar<f32>>,
-        rsnew: DeviceScalar<f32>,
-    ) -> impl DeviceOp<
-        Output = DeviceScalar<f32>,
-        Handle = Pipe<DeviceScalar<f32>>,
-        Checkouts = claspr::Checkout<DeviceScalar<f32>>,
-    > {
-        // finish_beta(partials, rsold, beta, rsnew): rsnew = Σpartials; beta =
-        // rsnew/rsold; rsold = rsnew. Thread only rsnew onward (beta/rsold reclaim).
-        // The `and_then` SELECTS rsnew out of the 4-tuple handle; a bare `Pipe` is
-        // itself a `DeviceOp`, so no `forward` wrap is needed.
-        ks.finish_beta([1], partials, rsold, beta, rsnew)
-            .and_then(|(_partials, _rsold, _beta, rsnew)| rsnew)
-    }
+fn solve_all_device(ctx: &Context, b_host: &[f32]) -> claspr::Result<(Vec<f32>, usize, f32)> {
+    solve_with(
+        ctx,
+        b_host,
+        false, // no host seam — one maximal recordable region
+        // α finish: finish_alpha(partials, rsold, alpha, nalpha) → re-expose
+        // (alpha, nalpha, rsold, partials). alpha = rsold / Σpartials; partials
+        // threads to step 5's norm2.
+        |ks: &gpu::Kernels, partials, rsold, alpha, nalpha| {
+            ks.finish_alpha([1], partials, rsold, alpha, nalpha)
+                .and_then(|(partials, rsold, alpha, nalpha)| {
+                    bundle4(alpha, nalpha, rsold, partials)
+                })
+        },
+        // β finish: finish_beta → rsnew = Σpartials; beta = rsnew/rsold; rsold =
+        // rsnew. The `and_then` SELECTS rsnew out of the 4-tuple handle (a bare
+        // `Pipe` is itself a `DeviceOp`); beta/rsold reclaim.
+        |ks: &gpu::Kernels, partials, rsold, beta, rsnew| {
+            ks.finish_beta([1], partials, rsold, beta, rsnew)
+                .and_then(|(_partials, _rsold, _beta, rsnew)| rsnew)
+        },
+    )
 }
 
 /// **Strategy 2 — host-seam finish.** The device reduction still fills `partials`,
 /// but α/β are finished in an [`and_then_host`](claspr::eager::DeviceOpExt::and_then_host)
 /// closure that reads the mapped `partials` and writes the step scalars through
-/// their `&mut f32` views. This is the MIXED shape: interpreted host cuts inside
-/// the self-closing iteration graph. The seam **bundles** the `partials` read-view
+/// their `&mut f32` views. The MIXED shape: interpreted host cuts inside the
+/// self-closing iteration graph. Each finish **bundles** the `partials` read-view
 /// with the scalar write-views into ONE mid-graph multi-home seam — every branch
 /// re-homes across replays, so the scalars written on-host feed the next device
-/// kernels over stable handles (NO per-scalar seams, NO `into_inner`).
-struct HostSeam;
-
-impl ReduceStrategy for HostSeam {
-    const HAS_HOST_SEAM: bool = true;
-
-    fn compute_alpha(
-        &self,
-        _ks: &gpu::Kernels,
-        partials: Pipe<DeviceSlice<f32>>,
-        rsold: DeviceScalar<f32>,
-        alpha: DeviceScalar<f32>,
-        nalpha: DeviceScalar<f32>,
-    ) -> impl DeviceOp<
-        Output = (
-            DeviceScalar<f32>,
-            DeviceScalar<f32>,
-            DeviceScalar<f32>,
-            DeviceSlice<f32>,
-        ),
-        Handle = (
-            Pipe<DeviceScalar<f32>>,
-            Pipe<DeviceScalar<f32>>,
-            Pipe<DeviceScalar<f32>>,
-            Pipe<DeviceSlice<f32>>,
-        ),
-        Checkouts = (
-            claspr::Checkout<DeviceScalar<f32>>,
-            claspr::Checkout<DeviceScalar<f32>>,
-            claspr::Checkout<DeviceScalar<f32>>,
-            claspr::Checkout<DeviceSlice<f32>>,
-        ),
-    > {
-        // Bundle the partials read-view (a threaded pipe) + the three scalars
-        // (lifted concrete cells — `lift` re-homes across replays) into ONE seam.
-        // The closure sums partials and writes alpha = rsold/Σ, nalpha = −alpha,
-        // reading rsold and writing alpha/nalpha through their `&mut f32` views;
-        // rsold is threaded onward unchanged (β needs the OLD value). Every branch
-        // re-homes (the mid-graph multi-home seam), so alpha/nalpha feed step-5's
-        // axpys over stable handles and the whole graph replays.
-        bundle4(partials, lift(alpha), lift(nalpha), lift(rsold))
-            .and_then_host(
-                |(part, alpha, nalpha, rsold): (&mut [f32], &mut f32, &mut f32, &mut f32)| {
-                    let sum: f32 = part.iter().sum();
-                    let a = *rsold / sum;
-                    *alpha = a;
-                    *nalpha = -a;
-                    Ok(())
-                },
-            )
-            // Re-expose (alpha, nalpha, rsold, partials) as the fixed 4-tuple handle
-            // the solver expects — partials threads to step 5's norm2 (same buffer).
-            .and_then(|(part, alpha, nalpha, rsold)| bundle4(alpha, nalpha, rsold, part))
-    }
-
-    fn compute_beta(
-        &self,
-        _ks: &gpu::Kernels,
-        partials: Pipe<DeviceSlice<f32>>,
-        rsold: Pipe<DeviceScalar<f32>>,
-        beta: Pipe<DeviceScalar<f32>>,
-        rsnew: DeviceScalar<f32>,
-    ) -> impl DeviceOp<
-        Output = DeviceScalar<f32>,
-        Handle = Pipe<DeviceScalar<f32>>,
-        Checkouts = claspr::Checkout<DeviceScalar<f32>>,
-    > {
-        // Same bundle-into-seam shape for β: sum partials (= r·r) → rsnew, form
-        // beta = rsnew/rsold (OLD rsold), then advance rsold = rsnew. Writes rsnew,
-        // beta, rsold through their `&mut f32` views; reads partials. `rsold`/`beta`
-        // arrive as threaded pipes — a bare `Pipe` is itself a `DeviceOp`, so it
-        // drops straight into the bundle (its home rides through and re-arms). Thread
-        // only rsnew onward (beta/rsold reclaim + re-home for the next iteration).
-        bundle4(partials, lift(rsnew), beta, rsold)
-            .and_then_host(
-                |(part, rsnew, beta, rsold): (&mut [f32], &mut f32, &mut f32, &mut f32)| {
-                    let sum: f32 = part.iter().sum();
-                    *rsnew = sum;
-                    *beta = sum / *rsold;
-                    *rsold = sum;
-                    Ok(())
-                },
-            )
-            .and_then(|(_part, rsnew, _beta, _rsold)| rsnew)
-    }
+/// kernels over stable handles (NO per-scalar seams, NO `into_inner`; `lift`
+/// presents each concrete scalar as a re-arming branch).
+fn solve_host_seam(ctx: &Context, b_host: &[f32]) -> claspr::Result<(Vec<f32>, usize, f32)> {
+    solve_with(
+        ctx,
+        b_host,
+        true, // and_then_host cuts — the mixed shape
+        // α finish: seam sums partials, writes alpha = rsold/Σ and nalpha = −alpha
+        // through their `&mut f32` views; rsold threaded unchanged (β needs the OLD
+        // value), partials threaded to step 5's norm2.
+        |_ks: &gpu::Kernels, partials, rsold, alpha, nalpha| {
+            bundle4(partials, lift(alpha), lift(nalpha), lift(rsold))
+                .and_then_host(
+                    |(part, alpha, nalpha, rsold): (&mut [f32], &mut f32, &mut f32, &mut f32)| {
+                        let sum: f32 = part.iter().sum();
+                        let a = *rsold / sum;
+                        *alpha = a;
+                        *nalpha = -a;
+                        Ok(())
+                    },
+                )
+                .and_then(|(part, alpha, nalpha, rsold)| bundle4(alpha, nalpha, rsold, part))
+        },
+        // β finish: seam sums partials (= r·r) → rsnew, forms beta = rsnew/rsold
+        // (OLD rsold), advances rsold = rsnew; threads only rsnew onward.
+        |_ks: &gpu::Kernels, partials, rsold, beta, rsnew| {
+            bundle4(partials, lift(rsnew), beta, rsold)
+                .and_then_host(
+                    |(part, rsnew, beta, rsold): (&mut [f32], &mut f32, &mut f32, &mut f32)| {
+                        let sum: f32 = part.iter().sum();
+                        *rsnew = sum;
+                        *beta = sum / *rsold;
+                        *rsold = sum;
+                        Ok(())
+                    },
+                )
+                .and_then(|(_part, rsnew, _beta, _rsold)| rsnew)
+        },
+    )
 }
 
-/// Solve `A x = b` by Conjugate Gradient with the given reduction `strategy`.
+/// Solve `A x = b` by Conjugate Gradient, generic over the α/β finish closures.
 /// Returns `(x, iterations, final ‖r‖)`.
 ///
 /// The entire iteration is ONE device graph `g`, built once and `sync`'d in a
 /// loop. Every CG buffer + device scalar is a concrete (or `lift`ed) cell of `g`,
 /// lent per `sync` and rehomed on the run's `Checkout` drop — so the loop reuses
 /// identical handles with **zero** `into_inner` and no rebinding, for BOTH
-/// strategies. Only the α/β finish subgraphs (built by `strategy`) differ.
-fn solve_with<S: ReduceStrategy>(
+/// strategies. Only the α/β finish subgraphs (built by the two closures) differ;
+/// `has_host_seam` states whether they introduce an `and_then_host` cut, asserted
+/// against the built graph's
+/// [`contains_host_seam`](claspr::eager::DeviceOp::contains_host_seam).
+///
+/// `compute_alpha` reads `partials` (= p·Ap) + `rsold` (all three scalars CONCRETE)
+/// and produces `(alpha, nalpha, rsold, partials)` — `rsold` threaded on (β needs
+/// the old value), `partials` threaded on (step 5's `norm2` reuses the buffer).
+/// `compute_beta` reads `partials` (= r·r) + threaded `rsold`/`beta` pipes and
+/// produces `rsnew` (the loop-boundary read); `beta`/`rsold` cycle via reclaim.
+#[allow(clippy::type_complexity)]
+fn solve_with<CA, CB, A, B>(
     ctx: &Context,
     b_host: &[f32],
-    strategy: &S,
-) -> claspr::Result<(Vec<f32>, usize, f32)> {
+    has_host_seam: bool,
+    compute_alpha: CA,
+    compute_beta: CB,
+) -> claspr::Result<(Vec<f32>, usize, f32)>
+where
+    CA: Fn(
+        &gpu::Kernels,
+        Pipe<DeviceSlice<f32>>,
+        DeviceScalar<f32>,
+        DeviceScalar<f32>,
+        DeviceScalar<f32>,
+    ) -> A,
+    CB: Fn(
+        &gpu::Kernels,
+        Pipe<DeviceSlice<f32>>,
+        Pipe<DeviceScalar<f32>>,
+        Pipe<DeviceScalar<f32>>,
+        DeviceScalar<f32>,
+    ) -> B,
+    A: DeviceOp<
+            Output = (
+                DeviceScalar<f32>,
+                DeviceScalar<f32>,
+                DeviceScalar<f32>,
+                DeviceSlice<f32>,
+            ),
+            // `Handle` IS needed here (not just `Output`): the graph builder does
+            // `compute_alpha(..).and_then(move |(alpha, nalpha, rsold, partials)| ..)`,
+            // and `and_then`'s closure receives `A::Handle` — so it must be the 4-tuple
+            // of pipes for the destructure to typecheck. `Checkouts` is NOT needed:
+            // this subgraph is composed onward (never a terminal), so nothing names its
+            // per-branch Checkouts. Still ONE place, vs the trait's SIX signature blocks.
+            Handle = (
+                Pipe<DeviceScalar<f32>>,
+                Pipe<DeviceScalar<f32>>,
+                Pipe<DeviceScalar<f32>>,
+                Pipe<DeviceSlice<f32>>,
+            ),
+        >,
+    // `B`'s `Checkouts` IS named at the terminal: `g.sync()` returns
+    // `(Checkout<x>, B::Checkouts)` and the loop calls `rsnew_co.read_value()`, so
+    // pin `B::Checkouts = Checkout<DeviceScalar<f32>>` (the single-output shape —
+    // `compute_beta` produces one scalar). This subsumes the composition's
+    // `FromCheckout<Output>` bound (`Checkout<O>` satisfies it via the identity
+    // impl). `Handle` still infers (never destructured — fed whole to `bundle2`).
+    B: DeviceOp<Output = DeviceScalar<f32>, Checkouts = claspr::Checkout<DeviceScalar<f32>>>,
+    // `A::Checkouts` is never named (A is composed onward, never a terminal), but a
+    // generic op nested in a `bundle`/`and_then` must prove
+    // `Checkouts: FromCheckout<Output>` — every concrete op satisfies it, but the
+    // compiler can't assume it for a bare `A`. State it (one place).
+    A::Checkouts: claspr::FromCheckout<(
+            DeviceScalar<f32>,
+            DeviceScalar<f32>,
+            DeviceScalar<f32>,
+            DeviceSlice<f32>,
+        )>,
+{
     let kernels = gpu::kernels(ctx)?;
     let ks = &kernels;
 
@@ -625,9 +538,8 @@ fn solve_with<S: ReduceStrategy>(
                     .and_then(move |(p, ap, partials)| {
                         // 4. STRATEGY: alpha = rsold / Σpartials ; nalpha = -alpha.
                         //    Threads (alpha, nalpha, rsold, partials) onward.
-                        strategy
-                            .compute_alpha(ks, partials, rsold, alpha, nalpha)
-                            .and_then(move |(alpha, nalpha, rsold, partials)| {
+                        compute_alpha(ks, partials, rsold, alpha, nalpha).and_then(
+                            move |(alpha, nalpha, rsold, partials)| {
                                 // 5. BUNDLE two independent branches:
                                 //   A: x += alpha*p
                                 //   B: r -= alpha*Ap  ->  partials = r·r
@@ -643,13 +555,11 @@ fn solve_with<S: ReduceStrategy>(
                                         //    rsnew/rsold ; rsold = rsnew. Thread `x`
                                         //    (solution) and `rsnew` (residual) to the
                                         //    terminal; other outputs reclaim.
-                                        bundle2(
-                                            x,
-                                            strategy.compute_beta(ks, partials, rsold, beta, rsnew),
-                                        )
+                                        bundle2(x, compute_beta(ks, partials, rsold, beta, rsnew))
                                     },
                                 )
-                            })
+                            },
+                        )
                     })
             })
         });
@@ -662,8 +572,8 @@ fn solve_with<S: ReduceStrategy>(
     // every solve (a hard assert, so it fires in release too).
     assert_eq!(
         g.contains_host_seam(),
-        S::HAS_HOST_SEAM,
-        "strategy host-seam shape regressed: contains_host_seam() != HAS_HOST_SEAM"
+        has_host_seam,
+        "strategy host-seam shape regressed: contains_host_seam() != has_host_seam"
     );
 
     let mut iters = 0usize;
@@ -704,15 +614,16 @@ fn test_problem() -> (Vec<f32>, Vec<f32>) {
     (x_true, b)
 }
 
-/// Solve with one strategy, print + assert convergence, and return
-/// `(iters, ‖r‖, max|x − x_true|)` so callers can compare strategies.
-fn run_strategy<S: ReduceStrategy>(
-    ctx: &Context,
-    label: &str,
-    strategy: &S,
-) -> claspr::Result<(usize, f32, f32)> {
+/// A strategy solver: `solve_all_device` / `solve_host_seam`. Takes the context +
+/// RHS, returns `(x, iterations, final ‖r‖)`.
+type SolveFn = fn(&Context, &[f32]) -> claspr::Result<(Vec<f32>, usize, f32)>;
+
+/// Solve with one strategy solver (`solve_all_device` / `solve_host_seam`), print +
+/// assert convergence, and return `(iters, ‖r‖, max|x − x_true|)` so callers can
+/// compare strategies.
+fn run_strategy(ctx: &Context, label: &str, solve: SolveFn) -> claspr::Result<(usize, f32, f32)> {
     let (x_true, b) = test_problem();
-    let (x, iters, rnorm) = solve_with(ctx, &b, strategy)?;
+    let (x, iters, rnorm) = solve(ctx, &b)?;
     let err = x
         .iter()
         .zip(&x_true)
@@ -733,8 +644,8 @@ fn run_strategy<S: ReduceStrategy>(
 fn run(ctx: Context) -> claspr::Result<()> {
     // Run BOTH strategies — the comparison sample. Same math, two command-buffer
     // shapes: `AllDevice` (one recordable region) and `HostSeam` (interpreted cuts).
-    run_strategy(&ctx, "all-device", &AllDevice)?;
-    run_strategy(&ctx, "host-seam", &HostSeam)?;
+    run_strategy(&ctx, "all-device", solve_all_device)?;
+    run_strategy(&ctx, "host-seam", solve_host_seam)?;
     Ok(())
 }
 
@@ -760,7 +671,7 @@ mod tests {
             eprintln!("SKIP: no OpenCL device");
             return;
         };
-        run_strategy(&ctx, "all-device", &AllDevice).expect("CG all-device solve");
+        run_strategy(&ctx, "all-device", solve_all_device).expect("CG all-device solve");
     }
 
     /// The host-seam strategy converges to the known solution too.
@@ -770,7 +681,7 @@ mod tests {
             eprintln!("SKIP: no OpenCL device");
             return;
         };
-        run_strategy(&ctx, "host-seam", &HostSeam).expect("CG host-seam solve");
+        run_strategy(&ctx, "host-seam", solve_host_seam).expect("CG host-seam solve");
     }
 
     /// **The proof they are the same algorithm.** Both strategies compute the SAME
@@ -784,9 +695,9 @@ mod tests {
             return;
         };
         let (i_dev, r_dev, e_dev) =
-            run_strategy(&ctx, "all-device", &AllDevice).expect("all-device");
+            run_strategy(&ctx, "all-device", solve_all_device).expect("all-device");
         let (i_host, r_host, e_host) =
-            run_strategy(&ctx, "host-seam", &HostSeam).expect("host-seam");
+            run_strategy(&ctx, "host-seam", solve_host_seam).expect("host-seam");
         // Identical iteration count — same recurrence, same convergence test.
         assert_eq!(
             i_dev, i_host,
@@ -808,26 +719,19 @@ mod tests {
     /// **The all-device path stays self-closing / fully recordable.** Its built
     /// graph must contain NO `and_then_host` cut — one maximal command-buffer-able
     /// region. The host-seam path, by contrast, MUST contain the interpreted cuts.
-    /// `solve_with` `assert_eq!`s `contains_host_seam() == HAS_HOST_SEAM` on the
-    /// whole built graph every solve; this test makes that structural contract
-    /// explicit and also inspects the node `description()` so a regression (an
-    /// accidental host seam sneaking into the all-device graph, or the host strategy
-    /// losing its seam) is caught with a readable diff. Runs the solve too (via the
-    /// internal assert) — SKIP without a device.
+    /// `solve_with` `assert_eq!`s `contains_host_seam() == has_host_seam` (the bool
+    /// each strategy solver passes — `false` for `solve_all_device`, `true` for
+    /// `solve_host_seam`) on the whole built graph every solve; a solve that returns
+    /// Ok means the structural contract held. So running BOTH solvers here exercises
+    /// that guard: if the all-device graph grew a host seam (or the host path lost
+    /// its seam), the in-`solve_with` assert would panic.
     #[test]
     fn all_device_is_self_closing_host_seam_is_mixed() {
-        // The strategy const is the source of truth the solver asserts against.
-        const { assert!(!AllDevice::HAS_HOST_SEAM, "all-device must be seam-free") };
-        const { assert!(HostSeam::HAS_HOST_SEAM, "host-seam must declare its seam") };
-
         let Ok(ctx) = Context::any() else {
             eprintln!("SKIP: no OpenCL device");
             return;
         };
-        // A solve runs the in-`solve_with` structural assert (contains_host_seam ==
-        // HAS_HOST_SEAM) over the fully-built graph for each strategy — the actual
-        // guard. If the all-device graph grew a host seam, this solve would panic.
-        run_strategy(&ctx, "all-device", &AllDevice).expect("all-device solve");
-        run_strategy(&ctx, "host-seam", &HostSeam).expect("host-seam solve");
+        run_strategy(&ctx, "all-device", solve_all_device).expect("all-device solve");
+        run_strategy(&ctx, "host-seam", solve_host_seam).expect("host-seam solve");
     }
 }
