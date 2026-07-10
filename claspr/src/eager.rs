@@ -9404,9 +9404,20 @@ where
 /// the [`Context`] with [`.profiling(true)`](crate::context::ContextBuilder::profiling));
 /// otherwise `execute` returns [`Error::ProfilingDisabled`] up front (the
 /// source op still ran — profiling is a host side-effect, not data flow).
+///
+/// **Reusable / replayable.** The callback is `Fn` (not `FnOnce`) behind an
+/// `Arc`, so a `.profiled()` graph can be `sync`'d repeatedly — each replay
+/// `Arc::clone`s the callback and re-registers a fresh one-shot shim on that run's
+/// marker, so the callback fires once per run with that run's timestamps. Profiling
+/// is a pure host side-effect (no rehoming value), so unlike the host seam there is
+/// no home/checkout threading — this is strictly a subset of the `and_then_host`
+/// reusability change.
 pub struct Profiled<S: DeviceOp, F> {
     source: S,
-    cb: Mutex<Option<F>>,
+    // Reusable: the callback is kept in an `Arc` and re-invoked on every replay
+    // (each run boxes a fresh `FnOnce` shim that calls the `Fn`). Was a
+    // `Mutex<Option<F>>` drained once — a one-shot that broke a second `sync`.
+    cb: Arc<F>,
     out: Pipe<S::Output>,
 }
 
@@ -9417,13 +9428,17 @@ pub trait DeviceProfileExt: DeviceOp + Sized {
     /// Register `cb` to receive the wall-clock [`ProfilingInfo`](crate::ProfilingInfo) for everything
     /// `self` enqueued onto the chain's queue. The closure fires on an OpenCL
     /// callback thread when the marker event completes. See [`Profiled`].
+    ///
+    /// **Reusable / replayable.** `cb` is `Fn` (not `FnOnce`), so a `.profiled()`
+    /// graph can be `sync`'d repeatedly — the callback re-fires each run with that
+    /// run's timestamps (borrow / `Arc` / clone captures, don't move-consume them).
     fn profiled<F>(self, cb: F) -> Profiled<Self, F>
     where
-        F: FnOnce(Result<crate::ProfilingInfo>) + Send + 'static,
+        F: Fn(Result<crate::ProfilingInfo>) + Send + Sync + 'static,
     {
         Profiled {
             source: self,
-            cb: Mutex::new(Some(cb)),
+            cb: Arc::new(cb),
             out: Pipe::new(),
         }
     }
@@ -9433,7 +9448,11 @@ impl<T: DeviceOp> DeviceProfileExt for T {}
 impl<S, F> DeviceOp for Profiled<S, F>
 where
     S: DeviceOp,
-    F: FnOnce(Result<crate::ProfilingInfo>) + Send + 'static,
+    // `collect_home` (used in `execute` to thread the source's return home so a
+    // profiled graph replays) requires the output be `Send + 'static` — every real
+    // buffer/scalar output is.
+    S::Output: Send + 'static,
+    F: Fn(Result<crate::ProfilingInfo>) + Send + Sync + 'static,
 {
     // Profiling is a host side-effect; the chain's data flow is unchanged.
     type Output = S::Output;
@@ -9448,8 +9467,13 @@ where
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         use crate::Launcher;
-        // Gather the source via `collect` (any arity).
-        let (value, source_deps) = self.source.collect(ec, ExecMode::Pipelined)?;
+        // Gather the source WITH its return home (any arity) — profiling is a
+        // transparent passthrough, so the source's home must ride through to the
+        // terminal `Checkout` for the graph to REPLAY (else a caller-owned / minted
+        // source buffer never rehomes and the 2nd `sync` reports "already lent").
+        // A multi-output source collapses to `home == None` (the documented
+        // by-value boundary) — profiling wraps a single logical output in practice.
+        let (value, source_deps, home) = self.source.collect_home(ec, ExecMode::Pipelined)?;
         // Same up-front check as the old layer / Tier 1: the queue needs
         // profiling enabled before we waste a marker + callback registration.
         if (ec.cl_queue().properties()? & crate::CL_QUEUE_PROFILING_ENABLE) == 0 {
@@ -9467,14 +9491,16 @@ where
         // `source_deps` keeps the underlying cl_events alive across the
         // enqueue; safe to drop after.
         drop(source_deps);
-        let cb = self.cb.lock().unwrap().take().ok_or(Error::NotSupported(
-            "eager graph: a `.profiled()` callback was already consumed — the \
-             profiling callback is a one-shot `FnOnce` and can't drive a reused graph",
-        ))?;
-        crate::register_profiling_callback(&marker, Box::new(cb))?;
+        // Reusable: `Arc::clone` the callback and wrap it in a fresh one-shot
+        // `FnOnce` shim per run. `register_profiling_callback` takes a boxed
+        // `FnOnce` (fired exactly once when THIS run's marker completes); the
+        // clone lets the underlying `Fn` re-fire on the next replay's marker.
+        let cb = Arc::clone(&self.cb);
+        crate::register_profiling_callback(&marker, Box::new(move |info| (*cb)(info)))?;
         // The marker becomes this op's completion event for downstream
-        // chaining (it subsumes the source's events).
-        self.out.put(value, vec![wrap_event(marker)]);
+        // chaining (it subsumes the source's events); thread the source's home so
+        // the terminal `Checkout` rehomes it and the graph re-arms.
+        self.out.put_home(value, vec![wrap_event(marker)], home);
         Ok(())
     }
 
