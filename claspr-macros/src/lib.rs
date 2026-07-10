@@ -1216,7 +1216,16 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     #(
                         raw_deps.extend(#input_deps_idents.iter().map(|d| d.as_ref().get()));
                     )*
-                    let profile_cb = self.profile_cb.lock().unwrap().take();
+                    // Reusable profiling: `Arc::clone` the callback and box a
+                    // fresh one-shot shim per run (`with_state` takes a
+                    // `Box<dyn FnOnce>`; the `Arc<Fn>` re-supplies it each replay).
+                    let profile_cb: ::core::option::Option<::claspr::ProfileCb> =
+                        self.profile_cb.as_ref().map(|cb| {
+                            let cb = ::std::sync::Arc::clone(cb);
+                            let shim: ::claspr::ProfileCb =
+                                ::std::boxed::Box::new(move |info| (cb)(info));
+                            shim
+                        });
                     let event = ::claspr::LaunchOp::new(
                         ec,
                         &self.kernel,
@@ -1405,9 +1414,16 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     #(
                         raw_deps.extend(#input_deps_idents.iter().map(|d| d.as_ref().get()));
                     )*
-                    // `spec` is `Copy`; `kernel` borrowed; profiling cb taken
-                    // one-shot (a reused run launches without re-profiling).
-                    let profile_cb = self.profile_cb.lock().unwrap().take();
+                    // `spec` is `Copy`; `kernel` borrowed. Reusable profiling:
+                    // `Arc::clone` the callback + box a fresh one-shot shim per run
+                    // (the `Arc<Fn>` re-fires on every replay).
+                    let profile_cb: ::core::option::Option<::claspr::ProfileCb> =
+                        self.profile_cb.as_ref().map(|cb| {
+                            let cb = ::std::sync::Arc::clone(cb);
+                            let shim: ::claspr::ProfileCb =
+                                ::std::boxed::Box::new(move |info| (cb)(info));
+                            shim
+                        });
                     let event = ::claspr::LaunchOp::new(
                         ec,
                         &self.kernel,
@@ -1612,7 +1628,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     spec: ::core::convert::Into::into(grid),
                     args: #op_args_tuple_init,
                     deps: ::std::vec::Vec::new(),
-                    profile_cb: ::std::sync::Mutex::new(::core::option::Option::None),
+                    profile_cb: ::core::option::Option::None,
                     ctx: ::core::clone::Clone::clone(&self.__claspr_ctx)
                     #op_out_field_init
                 }
@@ -1640,13 +1656,22 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 /// handles aren't, and a borrowed `&Event` can't outlive
                 /// its source binding once the Op is moved.
                 pub deps: ::std::vec::Vec<::claspr::Event>,
-                /// One-shot profiling callback behind a `Mutex` so
-                /// `execute(&self)` can take it without consuming the
-                /// (reusable) Op. A `FnOnce`, so a reused graph runs
-                /// without re-profiling — fetch a fresh callback per build
-                /// if you need timing on every run.
-                pub profile_cb: ::std::sync::Mutex<
-                    ::core::option::Option<::claspr::ProfileCb>,
+                /// Reusable profiling callback: an `Arc<Fn>` (not a
+                /// one-shot `FnOnce`), so a REPLAYED op re-fires the
+                /// callback on every run with that run's timestamps —
+                /// consistent with the Tier 2 `.profiled()` combinator
+                /// (#213/#216). `execute(&self)` `Arc::clone`s it and boxes
+                /// a fresh one-shot shim per run for `with_state`
+                /// (`register_profiling_callback` fires once per marker; the
+                /// `Arc<Fn>` re-supplies it each replay). `None` when no
+                /// callback was set.
+                pub profile_cb: ::core::option::Option<
+                    ::std::sync::Arc<
+                        dyn ::core::ops::Fn(::claspr::Result<::claspr::ProfilingInfo>)
+                            + ::core::marker::Send
+                            + ::core::marker::Sync
+                            + 'static,
+                    >,
                 >,
                 /// Carried `Context` so the no-arg `.wait()` /
                 /// `.submit()` terminals can submit on its default
@@ -1681,15 +1706,21 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
 
                 /// Register a completion callback for profiling info.
                 /// Chainable.
+                ///
+                /// **Reusable / replayable.** `cb` is `Fn` (not `FnOnce`), so a
+                /// `.profiled()` op can be `.wait()`'d / replayed repeatedly and
+                /// the callback re-fires each run with that run's timestamps
+                /// (borrow / `Arc` / clone captures, don't move-consume them) —
+                /// matching the Tier 2 `.profiled()` combinator.
                 pub fn profiled<F>(mut self, cb: F) -> Self
                 where
-                    F: ::core::ops::FnOnce(::claspr::Result<::claspr::ProfilingInfo>)
+                    F: ::core::ops::Fn(::claspr::Result<::claspr::ProfilingInfo>)
                         + ::core::marker::Send
+                        + ::core::marker::Sync
                         + 'static,
                 {
-                    self.profile_cb = ::std::sync::Mutex::new(
-                        ::core::option::Option::Some(::std::boxed::Box::new(cb)),
-                    );
+                    self.profile_cb =
+                        ::core::option::Option::Some(::std::sync::Arc::new(cb));
                     self
                 }
 
