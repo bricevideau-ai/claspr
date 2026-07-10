@@ -138,6 +138,38 @@ impl<T, M: MemMode> USMSlice<T, M> {
     }
 }
 
+impl<T: Copy, M: MemMode> USMSlice<T, M> {
+    /// Re-seed the wrapped host `Vec` in place from `src`, over the SAME
+    /// allocation (the SVM pointer is unchanged). USM IS host memory
+    /// (fine-grain system SVM over a Rust `Vec`), so a re-seed is a plain
+    /// host `copy_from_slice` — no `clEnqueueSVMMemcpy`, no map — after
+    /// draining any in-flight kernel-use events so we don't overwrite bytes
+    /// a previous run's kernel is still reading.
+    ///
+    /// The reusable-graph twin of `Upload`'s `write_buffer_enqueue`
+    /// reseed-on-replay path, used by the [`usm_slice`](crate::eager::usm_slice)
+    /// leaf to keep a replayed USM chain head idempotent. `src.len()` must
+    /// equal `self.len()` (the buffer is allocated once at the source's
+    /// length and never resized).
+    pub(crate) fn reseed_sync(&mut self, src: &[T]) -> Result<()> {
+        debug_assert_eq!(
+            src.len(),
+            self.data.len(),
+            "USMSlice::reseed_sync length mismatch"
+        );
+        // Drain in-flight kernel-use events before touching the bytes — a
+        // prior run's kernel may still be reading this SVM region. This is
+        // the same host-side wait `Drop` performs, but here we KEEP the
+        // buffer alive and re-arm it. Errors bump the sticky context flag.
+        let events = std::mem::take(&mut *self.in_flight.lock().expect("in_flight mutex poisoned"));
+        for ev in &events {
+            ev.wait().map_err(Error::OpenCl)?;
+        }
+        self.data.copy_from_slice(src);
+        Ok(())
+    }
+}
+
 impl<T: Default + Copy + Send + 'static, M: MemMode> USMSlice<T, M> {
     /// Allocate a USMSlice of `len` elements initialised to
     /// `T::default()`. Convenience wrapper over

@@ -7313,22 +7313,41 @@ where
 
 // ── Leaf: wrap a host Vec<T> as a USMSlice (eager UsmSliceOp) ───────────────
 
-/// Wrap a host `Vec<T>` as a [`USMSlice<T, M>`]. Source leaf (no upstream
-/// input); construction is pure host code (`USMSlice::new`) — no enqueue, no
-/// event (mode N/A). Mirrors [`Upload`]'s synchronous-create shape.
-pub struct UsmSlice<T, M: MemMode = ReadWrite> {
-    // One-shot: the host `Vec` is moved into the `USMSlice` (USM IS host memory),
-    // so a `usm_slice(data)` chain head runs once; a second `sync` errors.
-    data: Mutex<Option<Vec<T>>>,
+/// Wrap a host `Vec<T>` as a [`USMSlice<T, M>`], allocating ONCE and re-lending
+/// the SAME USM allocation across `g.sync()` replays — the USM twin of
+/// [`Upload`], whose reusable structure it mirrors exactly (source leaf, no
+/// upstream input; construction is pure host code — `USMSlice::new` — with no
+/// enqueue / event).
+///
+/// Same stable-handle + reseed-on-replay contract as [`Upload`]: on the first run
+/// the `Vec` is moved into a `USMSlice` (USM IS that host allocation); on replay
+/// the SAME slice is re-lent from this op's home cell, and re-seeded IFF the marker
+/// is kernel-writable ([`UploadReseed::RESEED_ON_REPLAY`](crate::UploadReseed)) —
+/// a plain host `copy_from_slice` into the same allocation (USM is host memory),
+/// keeping a replayed USM chain head idempotent. A kernel read-only marker
+/// (`ReadOnly`/`Frozen`) seeds once and skips the replay write.
+pub struct UsmSlice<T: Copy, M: MemMode = ReadWrite> {
+    // The host source, RETAINED for the seed-once move and any reseed-on-replay
+    // (the reseed copies from here into the persistent USM allocation).
+    src: UploadSource<T>,
+    // The persistent USM slice's home cell: allocated once (first run), then
+    // re-lent + re-armed across replays so the SVM pointer stays stable. Empty
+    // while lent (busy if already seeded); `None`-on-take is the lend.
+    buf: Cell<USMSlice<T, M>>,
+    // Whether the slice has ever been allocated/seeded. Distinguishes "first run
+    // → alloc" (cell empty, not seeded) from "lent out → busy" (cell empty, seeded).
+    seeded: Arc<Mutex<bool>>,
     out: Pipe<USMSlice<T, M>>,
 }
 
-/// Build an eager USM-wrap leaf from a host `Vec<T>` with the **default
-/// [`ReadWrite`] marker** — no turbofish: `usm_slice(data)`. For a non-default
-/// marker use [`usm_slice_as`] with a marker witness.
-pub fn usm_slice<T>(data: Vec<T>) -> UsmSlice<T, ReadWrite>
+/// Build an eager USM-wrap leaf from any `Vec<T>` / `Box<[T]>` / `Arc<[T]>` with
+/// the **default [`ReadWrite`] marker** — no turbofish: `usm_slice(data)`. For a
+/// non-default marker use [`usm_slice_as`] with a marker witness. Reusable across
+/// `sync`s (stable SVM pointer, reseed-on-replay) — the USM twin of [`upload`].
+pub fn usm_slice<T, S>(data: S) -> UsmSlice<T, ReadWrite>
 where
-    T: Send + 'static,
+    T: Copy + Send + Sync + 'static,
+    S: Into<UploadSource<T>>,
 {
     usm_slice_as(data, ReadWrite)
 }
@@ -7336,22 +7355,25 @@ where
 /// Build an eager USM-wrap leaf with an **explicit access marker**, inferred
 /// from the `marker` witness — no turbofish: `usm_slice_as(data, HostReadOnly)`.
 /// The default-marker shorthand is [`usm_slice`].
-pub fn usm_slice_as<T, M>(data: Vec<T>, marker: M) -> UsmSlice<T, M>
+pub fn usm_slice_as<T, M, S>(data: S, marker: M) -> UsmSlice<T, M>
 where
-    T: Send + 'static,
-    M: MemMode + Send + 'static,
+    T: Copy + Send + Sync + 'static,
+    M: crate::UploadReseed + Send + 'static,
+    S: Into<UploadSource<T>>,
 {
-    let _ = marker;
+    let _ = marker; // witness only — fixes M, zero-sized, no runtime use.
     UsmSlice {
-        data: Mutex::new(Some(data)),
+        src: data.into(),
+        buf: Arc::new(Mutex::new(None)),
+        seeded: Arc::new(Mutex::new(false)),
         out: Pipe::new(),
     }
 }
 
 impl<T, M> DeviceOp for UsmSlice<T, M>
 where
-    T: Send + 'static,
-    M: MemMode + Send + 'static,
+    T: Copy + Send + Sync + 'static,
+    M: crate::UploadReseed + Send + 'static,
 {
     type Output = USMSlice<T, M>;
 
@@ -7364,13 +7386,51 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // USMSlice::new is pure host code — no in-flight event, mode N/A.
-        let data = self.data.lock().unwrap().take().ok_or(Error::NotSupported(
-            "eager graph: a `usm_slice` host Vec was already consumed — \
-             `usm_slice` is a move-in-once chain head and can't drive a reused graph",
-        ))?;
-        let slice = USMSlice::new(ec.context(), data)?;
-        self.out.put(slice, Deps::new());
+        // The USM slice is allocated ONCE and lives in `self.buf` across runs; its
+        // home is that very cell, so a run's Checkout / PipePayload drop returns the
+        // SAME SVM allocation here. Three cases, decided by the cell + `seeded` flag
+        // — the exact shape `Upload::execute` uses (USMSlice::new is the synchronous
+        // host-create analog of DeviceSlice::from_slice; reseed is a host copy).
+        let mut seeded = self.seeded.lock().unwrap();
+        let lent = self.buf.lock().unwrap().take();
+        let buf = match (lent, *seeded) {
+            // First run: never seeded → move the host source into a fresh USMSlice
+            // (pure host code — USM IS the host allocation, no enqueue/event).
+            (None, false) => {
+                let buf = USMSlice::<T, M>::new(ec.context(), self.src.as_slice().to_vec())?;
+                *seeded = true;
+                buf
+            }
+            // Replay: the slice is back in the cell. Re-lend it; re-seed the host
+            // source IF the marker is kernel-writable (it may have been mutated in
+            // place last run) — keeping `usm_slice(RW) → … → download` idempotent
+            // over a stable SVM pointer. A kernel read-only marker (ReadOnly/Frozen)
+            // skips the write: its bytes never changed device-side, seed-once suffices.
+            (Some(mut buf), _) => {
+                if M::RESEED_ON_REPLAY {
+                    // Plain host copy back into the SAME allocation (stable pointer),
+                    // after draining in-flight kernel-use events. No SVM map/memcpy —
+                    // USM is host memory.
+                    buf.reseed_sync(self.src.as_slice())?;
+                }
+                buf
+            }
+            // Cell empty but already seeded: the slice is lent out (a prior run's
+            // Checkout is still alive) → graph-busy, the concrete-cell contract.
+            (None, true) => {
+                return Err(Error::NotSupported(
+                    "eager graph: a `usm_slice` buffer was already lent and not \
+                     returned — a graph is `sync`'d while a previous `Checkout` is \
+                     still alive (the graph is busy)",
+                ));
+            }
+        };
+        // The home is this op's persistent cell (identity rehome): the slice is
+        // returned here on Checkout / PipePayload drop, re-arming the leaf with a
+        // STABLE SVM pointer. So a downstream consume rehomes it here, not the
+        // releasing drop.
+        let home: Option<BoxedHome<USMSlice<T, M>>> = Some(Box::new(Arc::clone(&self.buf)));
+        self.out.put_home(buf, Deps::new(), home);
         Ok(())
     }
 
