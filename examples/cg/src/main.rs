@@ -110,7 +110,7 @@
 //! and the finish kernels sum the `G` partials on-device (a len-1 dispatch) — no
 //! workgroup memory / barriers, robust on every ICD.
 
-use claspr::eager::{DeviceOp, DeviceOpExt, bundle2, bundle4, lift};
+use claspr::eager::{DeviceOp, DeviceOpExt, bundle2, bundle4, bundle6, lift};
 use claspr::{Context, DeviceScalar, DeviceSlice, Pipe};
 
 #[claspr::device]
@@ -307,29 +307,17 @@ fn read_vec(buf: &DeviceSlice<f32>) -> claspr::Result<Vec<f32>> {
     Ok(guard.to_vec())
 }
 
-/// The CG **state scalars**, each a device-resident [`DeviceScalar<f32>`] carrying
-/// the recurrence. Bundled so the two strategies receive the SAME handles and the
-/// solver reads them back uniformly. `alpha`/`nalpha` feed the step-5 axpys;
-/// `rsold` carries into the β finish; `beta` feeds the next step-1 `xpby`; `rsnew`
-/// (= r·r) is the value mapped at the loop boundary for the convergence test.
-struct Scalars {
-    rsold: DeviceScalar<f32>,
-    alpha: DeviceScalar<f32>,
-    nalpha: DeviceScalar<f32>,
-    beta: DeviceScalar<f32>,
-    rsnew: DeviceScalar<f32>,
-}
-
-// The α/β FINISH — the ONE axis on which the two CG variants differ — is factored
-// as two CLOSURES the generic solver (`solve_with`) composes. Everything else (the
-// device reduction, the axpys, the self-closing loop) is shared. Each closure is
-// handed the buffers/scalars it needs (concrete cells or threaded pipes) and
-// returns a subgraph; the solver's `where`-clause fixes the `Output` (+ the α
+// The α/β REDUCTION + FINISH — the ONE axis on which the two CG variants differ —
+// is factored as two CLOSURES the generic solver (`solve_with`) composes. Each
+// closure owns its full sub-step: `compute_alpha` runs `dot_partial` (p·Ap →
+// partials) then finishes α; `compute_beta` runs `norm2_partial` (r·r → partials)
+// then finishes β. This boundary is natural: `dot_partial`/`norm2_partial` are the
+// operations that will eventually be replaced by hierarchical single-kernel
+// reductions (with atomics), so keeping them inside the strategy closures localises
+// that future change. The solver's `where`-clause fixes the `Output` (+ the α
 // closure's `Handle`) shape ONCE, and each closure's full type is otherwise
-// INFERRED — so the two variants are two small closure pairs, not two trait impls
-// spelling the 3-associated-type signature over and over. The two shapes a
-// command-buffer partitioner sees: all-device = no host seam ⇒ ONE recordable
-// region; host-seam = two interpreted `and_then_host` cuts inside `g`.
+// INFERRED. The two shapes a command-buffer partitioner sees: all-device = no host
+// seam ⇒ ONE recordable region; host-seam = two `and_then_host` cuts inside `g`.
 
 /// **Strategy 1 — all on-device (default / primary).** α and β are finished by two
 /// single-work-item KERNELS (`finish_alpha` / `finish_beta`) that sum the `G`
@@ -340,21 +328,26 @@ fn solve_all_device(ctx: &Context, b_host: &[f32]) -> claspr::Result<(Vec<f32>, 
         ctx,
         b_host,
         false, // no host seam — one maximal recordable region
-        // α finish: finish_alpha(partials, rsold, alpha, nalpha) → re-expose
-        // (alpha, nalpha, rsold, partials). alpha = rsold / Σpartials; partials
-        // threads to step 5's norm2.
-        |ks: &gpu::Kernels, partials, rsold, alpha, nalpha| {
-            ks.finish_alpha([1], partials, rsold, alpha, nalpha)
-                .and_then(|(partials, rsold, alpha, nalpha)| {
-                    bundle4(alpha, nalpha, rsold, partials)
+        // α step: dot_partial(p, ap) → partials = p·Ap; finish_alpha sums and writes
+        // alpha = rsold/Σpartials, nalpha = −alpha. Threads (p, ap, partials, alpha,
+        // nalpha, rsold) onward; partials is reused by compute_beta's norm2.
+        |ks: &gpu::Kernels, p, ap, partials, rsold, alpha, nalpha| {
+            ks.dot_partial([G], p, ap, partials)
+                .and_then(move |(p, ap, partials)| {
+                    ks.finish_alpha([1], partials, rsold, alpha, nalpha)
+                        .and_then(move |(partials, rsold, alpha, nalpha)| {
+                            bundle6(p, ap, partials, alpha, nalpha, rsold)
+                        })
                 })
         },
-        // β finish: finish_beta → rsnew = Σpartials; beta = rsnew/rsold; rsold =
-        // rsnew. The `and_then` SELECTS rsnew out of the 4-tuple handle (a bare
-        // `Pipe` is itself a `DeviceOp`); beta/rsold reclaim.
-        |ks: &gpu::Kernels, partials, rsold, beta, rsnew| {
-            ks.finish_beta([1], partials, rsold, beta, rsnew)
-                .and_then(|(_partials, _rsold, _beta, rsnew)| rsnew)
+        // β step: norm2_partial(r) → partials = r·r; finish_beta sums and writes
+        // rsnew = Σpartials, beta = rsnew/rsold, rsold = rsnew. Selects rsnew.
+        |ks: &gpu::Kernels, r, partials, rsold, beta, rsnew| {
+            ks.norm2_partial([G], r, partials)
+                .and_then(move |(_r, partials)| {
+                    ks.finish_beta([1], partials, rsold, beta, rsnew)
+                        .and_then(|(_partials, _rsold, _beta, rsnew)| rsnew)
+                })
         },
     )
 }
@@ -373,36 +366,40 @@ fn solve_host_seam(ctx: &Context, b_host: &[f32]) -> claspr::Result<(Vec<f32>, u
         ctx,
         b_host,
         true, // and_then_host cuts — the mixed shape
-        // α finish: seam sums partials, writes alpha = rsold/Σ and nalpha = −alpha
-        // through their `&mut f32` views; rsold threaded unchanged (β needs the OLD
-        // value), partials threaded to step 5's norm2.
-        |_ks: &gpu::Kernels, partials, rsold, alpha, nalpha| {
-            bundle4(partials, lift(alpha), lift(nalpha), lift(rsold))
-                .and_then_host(
-                    |(part, alpha, nalpha, rsold): (&mut [f32], &mut f32, &mut f32, &mut f32)| {
-                        let sum: f32 = part.iter().sum();
-                        let a = *rsold / sum;
-                        *alpha = a;
-                        *nalpha = -a;
-                        Ok(())
-                    },
-                )
-                .and_then(|(part, alpha, nalpha, rsold)| bundle4(alpha, nalpha, rsold, part))
+        // α step: dot_partial(p, ap) on device → seam sums partials on host, writes
+        // alpha = rsold/Σ and nalpha = −alpha through &mut f32 views. Threads
+        // (p, ap, partials, alpha, nalpha, rsold) onward; partials reused for norm2.
+        |ks: &gpu::Kernels, p, ap, partials, rsold, alpha, nalpha| {
+            ks.dot_partial([G], p, ap, partials)
+                .and_then(move |(p, ap, partials)| {
+                    bundle4(partials, lift(alpha), lift(nalpha), lift(rsold))
+                        .and_then_host(|(part, alpha, nalpha, rsold)| {
+                            let sum: f32 = part.iter().sum();
+                            let a = *rsold / sum;
+                            *alpha = a;
+                            *nalpha = -a;
+                            Ok(())
+                        })
+                        .and_then(move |(part, alpha, nalpha, rsold)| {
+                            bundle6(p, ap, part, alpha, nalpha, rsold)
+                        })
+                })
         },
-        // β finish: seam sums partials (= r·r) → rsnew, forms beta = rsnew/rsold
-        // (OLD rsold), advances rsold = rsnew; threads only rsnew onward.
-        |_ks: &gpu::Kernels, partials, rsold, beta, rsnew| {
-            bundle4(partials, lift(rsnew), beta, rsold)
-                .and_then_host(
-                    |(part, rsnew, beta, rsold): (&mut [f32], &mut f32, &mut f32, &mut f32)| {
-                        let sum: f32 = part.iter().sum();
-                        *rsnew = sum;
-                        *beta = sum / *rsold;
-                        *rsold = sum;
-                        Ok(())
-                    },
-                )
-                .and_then(|(_part, rsnew, _beta, _rsold)| rsnew)
+        // β step: norm2_partial(r) on device → seam sums partials on host, writes
+        // rsnew = Σ, beta = rsnew/rsold (OLD rsold), rsold = rsnew. Selects rsnew.
+        |ks: &gpu::Kernels, r, partials, rsold, beta, rsnew| {
+            ks.norm2_partial([G], r, partials)
+                .and_then(move |(_r, partials)| {
+                    bundle4(partials, lift(rsnew), beta, rsold)
+                        .and_then_host(|(part, rsnew, beta, rsold)| {
+                            let sum: f32 = part.iter().sum();
+                            *rsnew = sum;
+                            *beta = sum / *rsold;
+                            *rsold = sum;
+                            Ok(())
+                        })
+                        .and_then(|(_part, rsnew, _beta, _rsold)| rsnew)
+                })
         },
     )
 }
@@ -419,11 +416,12 @@ fn solve_host_seam(ctx: &Context, b_host: &[f32]) -> claspr::Result<(Vec<f32>, u
 /// against the built graph's
 /// [`contains_host_seam`](claspr::eager::DeviceOp::contains_host_seam).
 ///
-/// `compute_alpha` reads `partials` (= p·Ap) + `rsold` (all three scalars CONCRETE)
-/// and produces `(alpha, nalpha, rsold, partials)` — `rsold` threaded on (β needs
-/// the old value), `partials` threaded on (step 5's `norm2` reuses the buffer).
-/// `compute_beta` reads `partials` (= r·r) + threaded `rsold`/`beta` pipes and
-/// produces `rsnew` (the loop-boundary read); `beta`/`rsold` cycle via reclaim.
+/// `compute_alpha` takes piped `(p, ap)` (from `spmv.and_then`) + concrete `(partials, rsold, alpha, nalpha)`,
+/// runs `dot_partial` internally, and produces `(p, ap, partials, alpha, nalpha, rsold)` —
+/// `p`/`ap` threaded on (step 5's axpys), `partials` threaded on (step 5b's norm2
+/// reuses the same buffer), `rsold` threaded on (β needs the OLD value).
+/// `compute_beta` takes the threaded `(r, partials, rsold, beta)` pipes + concrete `rsnew`,
+/// runs `norm2_partial` internally, and produces `rsnew` (the loop-boundary read).
 #[allow(clippy::type_complexity)]
 fn solve_with<CA, CB, A, B>(
     ctx: &Context,
@@ -436,6 +434,8 @@ where
     CA: Fn(
         &gpu::Kernels,
         Pipe<DeviceSlice<f32>>,
+        Pipe<DeviceSlice<f32>>,
+        DeviceSlice<f32>,
         DeviceScalar<f32>,
         DeviceScalar<f32>,
         DeviceScalar<f32>,
@@ -443,46 +443,58 @@ where
     CB: Fn(
         &gpu::Kernels,
         Pipe<DeviceSlice<f32>>,
+        Pipe<DeviceSlice<f32>>,
         Pipe<DeviceScalar<f32>>,
         Pipe<DeviceScalar<f32>>,
         DeviceScalar<f32>,
     ) -> B,
     A: DeviceOp<
             Output = (
-                DeviceScalar<f32>,
-                DeviceScalar<f32>,
-                DeviceScalar<f32>,
                 DeviceSlice<f32>,
+                DeviceSlice<f32>,
+                DeviceSlice<f32>,
+                DeviceScalar<f32>,
+                DeviceScalar<f32>,
+                DeviceScalar<f32>,
             ),
             // `Handle` IS needed here (not just `Output`): the graph builder does
-            // `compute_alpha(..).and_then(move |(alpha, nalpha, rsold, partials)| ..)`,
-            // and `and_then`'s closure receives `A::Handle` — so it must be the 4-tuple
+            // `compute_alpha(..).and_then(move |(p, ap, partials, alpha, nalpha, rsold)| ..)`,
+            // and `and_then`'s closure receives `A::Handle` — so it must be the 6-tuple
             // of pipes for the destructure to typecheck. `Checkouts` is NOT needed:
             // this subgraph is composed onward (never a terminal), so nothing names its
             // per-branch Checkouts. Still ONE place, vs the trait's SIX signature blocks.
             Handle = (
-                Pipe<DeviceScalar<f32>>,
-                Pipe<DeviceScalar<f32>>,
-                Pipe<DeviceScalar<f32>>,
                 Pipe<DeviceSlice<f32>>,
+                Pipe<DeviceSlice<f32>>,
+                Pipe<DeviceSlice<f32>>,
+                Pipe<DeviceScalar<f32>>,
+                Pipe<DeviceScalar<f32>>,
+                Pipe<DeviceScalar<f32>>,
             ),
         >,
-    // `B`'s `Checkouts` IS named at the terminal: `g.sync()` returns
-    // `(Checkout<x>, B::Checkouts)` and the loop calls `rsnew_co.read_value()`, so
-    // pin `B::Checkouts = Checkout<DeviceScalar<f32>>` (the single-output shape —
-    // `compute_beta` produces one scalar). This subsumes the composition's
-    // `FromCheckout<Output>` bound (`Checkout<O>` satisfies it via the identity
-    // impl). `Handle` still infers (never destructured — fed whole to `bundle2`).
-    B: DeviceOp<Output = DeviceScalar<f32>, Checkouts = claspr::Checkout<DeviceScalar<f32>>>,
+    // `B`'s `Checkouts` and `Handle` are both pinned: `g.sync()` destructures as
+    // `(Checkout<x>, Checkout<DeviceScalar<f32>>)`, so `Checkouts` must be
+    // `Checkout<DeviceScalar<f32>>`. `Handle` must be `Pipe<DeviceScalar<f32>>`
+    // because the inner `bundle2(x, rsnew)` feeds B's handle into a bundle — Rust
+    // needs a concrete DeviceOp type there. Both concrete `compute_beta`
+    // implementations select their final `rsnew: Pipe<DeviceScalar<f32>>` via
+    // `and_then(|..., rsnew| rsnew)`, so this is always satisfied.
+    B: DeviceOp<
+            Output = DeviceScalar<f32>,
+            Handle = Pipe<DeviceScalar<f32>>,
+            Checkouts = claspr::Checkout<DeviceScalar<f32>>,
+        >,
     // `A::Checkouts` is never named (A is composed onward, never a terminal), but a
     // generic op nested in a `bundle`/`and_then` must prove
     // `Checkouts: FromCheckout<Output>` — every concrete op satisfies it, but the
     // compiler can't assume it for a bare `A`. State it (one place).
     A::Checkouts: claspr::FromCheckout<(
-            DeviceScalar<f32>,
-            DeviceScalar<f32>,
-            DeviceScalar<f32>,
             DeviceSlice<f32>,
+            DeviceSlice<f32>,
+            DeviceSlice<f32>,
+            DeviceScalar<f32>,
+            DeviceScalar<f32>,
+            DeviceScalar<f32>,
         )>,
 {
     let kernels = gpu::kernels(ctx)?;
@@ -504,27 +516,18 @@ where
     // 1's `xpby(p, r, 0)` a no-op (`p` already = b), so no peeled first iteration
     // is needed. `rsold = b·b` seeds the α of the first step.
     let rsold_val: f32 = b_host.iter().map(|v| v * v).sum();
-    let s = Scalars {
-        rsold: DeviceScalar::new(ctx, rsold_val)?,
-        alpha: DeviceScalar::new(ctx, 0.0)?,
-        nalpha: DeviceScalar::new(ctx, 0.0)?,
-        beta: DeviceScalar::new(ctx, 0.0)?,
-        rsnew: DeviceScalar::new(ctx, 0.0)?,
-    };
-    let Scalars {
-        rsold,
-        alpha,
-        nalpha,
-        beta,
-        rsnew,
-    } = s;
+    let rsold = DeviceScalar::new(ctx, rsold_val)?;
+    let alpha = DeviceScalar::new(ctx, 0.0)?;
+    let nalpha = DeviceScalar::new(ctx, 0.0)?;
+    let beta = DeviceScalar::new(ctx, 0.0)?;
+    let rsnew = DeviceScalar::new(ctx, 0.0)?;
 
     // ── Build the whole CG iteration ONCE as a single self-closing graph. ────
-    // Steps 1-3 + step 5 are shared device kernels; steps 4 and 6 (the α/β finish)
-    // are the `strategy`'s subgraphs — a finish KERNEL (all-device) or an
-    // `and_then_host` cut (host-seam), both with the SAME output/handle shape, so
-    // this composition is identical either way. `ks` is captured by every closure;
-    // the ops it builds own a fresh `cl_kernel` + a cloned context, so `g` does NOT
+    // Steps 1-2 + step 5's axpys are shared kernels. Steps 3-4 (dot + α finish)
+    // are `compute_alpha`'s subgraph; steps 5b-6 (norm2 + β finish) are
+    // `compute_beta`'s subgraph. Both strategies compose identically here; only
+    // the subgraph implementations differ. `ks` is captured by every closure; the
+    // ops it builds own a fresh `cl_kernel` + a cloned context, so `g` does NOT
     // borrow `ks`. Only `x` (solution) and `rsnew` (residual) reach the terminal;
     // every other buffer re-homes via `reclaim_undelivered`.
     let g = ks
@@ -533,34 +536,26 @@ where
         .and_then(move |(p, r, beta)| {
             // 2. ap = A*p
             ks.spmv([N], p, ap).and_then(move |(p, ap)| {
-                // 3. partials = p·Ap
-                ks.dot_partial([G], p, ap, partials)
-                    .and_then(move |(p, ap, partials)| {
-                        // 4. STRATEGY: alpha = rsold / Σpartials ; nalpha = -alpha.
-                        //    Threads (alpha, nalpha, rsold, partials) onward.
-                        compute_alpha(ks, partials, rsold, alpha, nalpha).and_then(
-                            move |(alpha, nalpha, rsold, partials)| {
-                                // 5. BUNDLE two independent branches:
-                                //   A: x += alpha*p
-                                //   B: r -= alpha*Ap  ->  partials = r·r
-                                bundle2(
-                                    ks.axpy_dev([N], x, p, alpha),
-                                    ks.axpy_dev([N], r, ap, nalpha).and_then(
-                                        move |(r, _ap, _nalpha)| ks.norm2_partial([G], r, partials),
-                                    ),
-                                )
-                                .and_then(
-                                    move |((x, _p, _alpha), (_r, partials))| {
-                                        // 6. STRATEGY: rsnew = Σpartials ; beta =
-                                        //    rsnew/rsold ; rsold = rsnew. Thread `x`
-                                        //    (solution) and `rsnew` (residual) to the
-                                        //    terminal; other outputs reclaim.
-                                        bundle2(x, compute_beta(ks, partials, rsold, beta, rsnew))
-                                    },
-                                )
-                            },
+                // 3+4. STRATEGY: partials = p·Ap ; alpha = rsold/Σpartials.
+                //      Threads (p, ap, partials, alpha, nalpha, rsold) onward.
+                compute_alpha(ks, p, ap, partials, rsold, alpha, nalpha).and_then(
+                    move |(p, ap, partials, alpha, nalpha, rsold)| {
+                        // 5. BUNDLE two independent branches:
+                        //   A: x += alpha*p
+                        //   B: r -= alpha*Ap  ->  STRATEGY: partials = r·r
+                        bundle2(
+                            ks.axpy_dev([N], x, p, alpha),
+                            ks.axpy_dev([N], r, ap, nalpha)
+                                .and_then(move |(r, _ap, _nalpha)| {
+                                    compute_beta(ks, r, partials, rsold, beta, rsnew)
+                                }),
                         )
-                    })
+                        .and_then(move |((x, _p, _alpha), rsnew)| {
+                            // Thread `x` (solution) and `rsnew` (residual) to terminal.
+                            bundle2(x, rsnew)
+                        })
+                    },
+                )
             })
         });
 
