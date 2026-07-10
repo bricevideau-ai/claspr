@@ -955,51 +955,70 @@ fn bundle2_caller_buffers_rearm_x2_stable_handles() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// 15. fan_out over caller-owned buffers does NOT re-arm (S5 documented limit).
-//     CONTRAST with #14 (bundle re-arms): `FanOut` collapses its N branch
-//     outputs into ONE `Vec<..>` with a SINGLE home slot, so the N branch homes
-//     are dropped (`self.out.put(..)`, home None). This PINS that conscious
-//     boundary: run 1 succeeds and produces correct data, but the terminal
-//     `Checkout<Vec<..>>` carries no home, so dropping it does NOT return the
-//     caller buffers to their cells — a SECOND `sync` of the same fan-out reports
-//     the graph busy. If fan-out branch re-arm is ever implemented (a type-shape
-//     change, see `FanOut` docs), FLIP this test to assert run 2 succeeds.
+// 15. fan_out over caller-owned buffers RE-ARMS per-branch, x2, stable handles
+//     (#214 — the dynamic-`Vec` analog of #14's bundle re-arm). `FanOut`'s
+//     terminal `Checkouts` is a `Vec<U::Checkouts>` — one `Checkout` per branch,
+//     each threading its OWN return home — so dropping the Vec returns every
+//     caller buffer to its cell and the SAME fan-out replays with stable `cl_mem`
+//     handles, exactly like `bundle!` at fixed arity. (Was pinned as a documented
+//     limitation `fan_out_caller_buffers_do_not_rearm`; FLIPPED here now that the
+//     per-branch gather is implemented.)
 // ───────────────────────────────────────────────────────────────────────────
 #[test]
-fn fan_out_caller_buffers_do_not_rearm() {
+fn fan_out_caller_buffers_rearm_x2_stable_handles() {
     let Some(ctx) = ctx() else { return };
 
     let buf_a = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("buf_a");
     let buf_b = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("buf_b");
+    let ha = handle_of(&buf_a);
+    let hb = handle_of(&buf_b);
 
     // Two in-place fill branches over caller-owned buffers, homogeneous → fan_out.
+    // Idempotent fill, so contents are stable across runs; the re-arm/handle
+    // invariant is what's under test.
     let g = fan_out(vec![buf_a, buf_b], |b| fill(b, 5u32));
 
-    // Run 1 succeeds and fills correctly (the fan-out WORKS — only re-arm is the
-    // limitation being pinned).
+    // Run 1: two branches → two Checkouts, each keeping its own handle.
     let cos = g.sync(&ctx).expect("fan_out run 1");
     assert_eq!(cos.len(), 2, "two branches → two Checkouts");
+    assert_eq!(handle_of(&*cos[0]), ha, "run 1: branch 0 keeps its handle");
+    assert_eq!(handle_of(&*cos[1]), hb, "run 1: branch 1 keeps its handle");
     {
         let g0 = cos[0].map().wait().expect("map branch 0 run 1");
         let g1 = cos[1].map().wait().expect("map branch 1 run 1");
         assert!(g0.iter().all(|&v| v == 5), "run 1: branch 0 filled with 5");
         assert!(g1.iter().all(|&v| v == 5), "run 1: branch 1 filled with 5");
     }
-    // Drop the Checkouts — home is None (Vec-collapse), so the caller buffers are
-    // NOT returned to their cells.
+    // Drop the Checkouts → BOTH branch buffers re-arm their cells (each Checkout
+    // carries its own home now).
     drop(cos);
 
-    // Run 2 MUST fail busy: the branch buffers never re-armed. This is the pinned
-    // current reality — a documented `FanOut` limitation, contrasted with #14.
-    match g.sync(&ctx) {
-        Err(Error::NotSupported(msg)) => assert!(
-            msg.contains("busy") || msg.contains("already lent"),
-            "expected a graph-busy error (fan-out branch buffers do not re-arm), got: {msg}"
-        ),
-        Ok(_) => panic!(
-            "fan_out over caller buffers UNEXPECTEDLY re-armed on run 2 — if fan-out \
-             branch re-arm was implemented, flip this test to assert success (see FanOut docs)"
-        ),
-        Err(other) => panic!("expected NotSupported(busy), got {other:?}"),
+    // Run 2 — the crux: the SAME fan-out re-runs only if both branch homes fired,
+    // over the SAME cl_mem handles.
+    let cos2 = g
+        .sync(&ctx)
+        .expect("fan_out run 2: both caller buffers must re-arm via their homes");
+    assert_eq!(cos2.len(), 2);
+    assert_eq!(
+        handle_of(&*cos2[0]),
+        ha,
+        "run 2: branch 0 re-armed with the SAME cl_mem"
+    );
+    assert_eq!(
+        handle_of(&*cos2[1]),
+        hb,
+        "run 2: branch 1 re-armed with the SAME cl_mem"
+    );
+    {
+        let g0 = cos2[0].map().wait().expect("map branch 0 run 2");
+        let g1 = cos2[1].map().wait().expect("map branch 1 run 2");
+        assert!(
+            g0.iter().all(|&v| v == 5),
+            "run 2: idempotent fill(5) over the re-armed buffer 0"
+        );
+        assert!(
+            g1.iter().all(|&v| v == 5),
+            "run 2: idempotent fill(5) over the re-armed buffer 1"
+        );
     }
 }

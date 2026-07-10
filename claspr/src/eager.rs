@@ -4223,6 +4223,26 @@ where
     }
 }
 
+// The DYNAMIC-length homogeneous `Vec<C>` shape produced by [`FanOut`] — the
+// dynamic-arity analog of the `[C; N]` impl above. `C` need only be
+// `FromCheckout<O>` (a fan-out branch may itself be multi-output, so `C =
+// U::Checkouts`, a tuple, satisfying `FromCheckout` via the recursive tuple
+// family; a single-output branch's `C = Checkout<O>` via the identity impl).
+// Never reaches `from_single`: `FanOut` overrides `gather_checkouts` to build the
+// `Vec` per-branch. No overlap with the array/tuple/identity impls (`Vec` is a
+// distinct nominal type).
+impl<C, O> FromCheckout<Vec<O>> for Vec<C>
+where
+    C: FromCheckout<O>,
+{
+    fn from_single(_co: Checkout<Vec<O>>) -> Self {
+        unreachable!(
+            "fan_out builds its Vec<Checkouts> in gather_checkouts; \
+             from_single is never called"
+        )
+    }
+}
+
 /// The **bidirectional companion** to [`FromCheckout`]: SPLIT a
 /// [`Checkouts`](DeviceOp::Checkouts) value into its assembled output value plus
 /// its per-branch return homes, and REASSEMBLE it from a (possibly
@@ -5644,28 +5664,33 @@ macro_rules! bundle {
 /// — eager — over the known input list), run them independently, join via a
 /// marker. Output is `Vec<U::Output>`.
 ///
-/// ## Limitation: branches over caller-owned buffers do NOT re-arm
+/// ## Per-branch re-arm (the dynamic-`Vec` analog of `bundle!`)
 ///
-/// Unlike [`bundle!`](crate::bundle) (whose per-branch [`Checkout`] tuple carries
-/// each branch's return [`home`](BoxedHome), so a bundle over caller-owned
-/// buffers re-runs — see [`collect_home`](DeviceOp::collect_home)), `FanOut`
-/// collapses its `N` branch outputs into ONE `Vec<U::Output>` value with a
-/// **single** home slot on its output pipe. `N` branch homes cannot ride one
-/// collapsed slot, so `execute` drops them (`self.out.put(..)`, home `None`). The
-/// terminal `Checkout<Vec<..>>` therefore has `home == None`: a fan-out whose
-/// branches are IN-PLACE ops over caller-owned buffers (e.g. `fan_out(bufs, |b|
-/// fill(b, v))`) does **not** return those buffers to their cells on drop, so the
-/// same `FanOut` graph is **not re-runnable** (run 2 reports the cells busy).
+/// Like [`bundle!`](crate::bundle) (whose per-branch [`Checkout`] tuple carries
+/// each branch's return [`home`](BoxedHome) so a bundle over caller-owned buffers
+/// replays), `FanOut`'s terminal [`Checkouts`](DeviceOp::Checkouts) is a
+/// `Vec<U::Checkouts>` — ONE `Checkout` (or nested `Checkouts` tuple, for a
+/// multi-output branch) per branch, each threading its OWN return home. So a
+/// fan-out whose branches are IN-PLACE ops over caller-owned buffers (e.g.
+/// `fan_out(bufs, |b| fill(b, v))`) returns every buffer to its cell on drop, and
+/// the SAME `FanOut` graph **replays** with stable `cl_mem` handles — exactly like
+/// `bundle!`, just at dynamic arity. This is the bundle-arity `gather_checkouts`
+/// per-branch delegation ([#207] / [#212]) generalised from a fixed tuple to a
+/// runtime `Vec`. Fan-out over **minted** buffers (`upload`/`alloc`) or read-only
+/// inputs also replays: those branches carry `home == None` (nothing to return),
+/// which is fine.
 ///
-/// This is a conscious, documented boundary, not a silent trap — it is pinned by
-/// `bundle2_caller_buffers_rearm_x2_stable_handles` (bundle re-arms) contrasted
-/// with `fan_out_caller_buffers_do_not_rearm` (fan-out does not) in
-/// `tests/tier2/tests/home_invariant.rs`. Fixing it requires a type-shape change
-/// (e.g. `Checkouts = Vec<Checkout<U::Output>>`, or a side `Vec<Option<BoxedHome>>`
-/// the output owns) — deferred. Fan-out over **minted** buffers (`upload`/`alloc`)
-/// or read-only inputs is unaffected: those have no home to return.
+/// The by-value paths ([`collect`](DeviceOp::collect) / async `run`) collapse to a
+/// `Vec<U::Output>` with no per-element home (a `Vec` value has one slot, `N` homes
+/// can't ride it) — the same by-value boundary `bundle!` documents; the re-arm
+/// rides the [`Checkout`] terminal ([`gather_checkouts`](DeviceOp::gather_checkouts)),
+/// which every waiting terminal uses.
 pub struct FanOut<U: DeviceOp> {
     ops: Vec<U>,
+    // Per-branch single output pipes — captured for the DESCRIBE arity and the
+    // single-output gather fast path; a multi-output branch fills its own element
+    // pipes instead (its `collect`/`gather_checkouts` read those), so these are
+    // only used where a branch is single-output. Kept in step with `ops`.
     pipes: Vec<Pipe<U::Output>>,
     out: Pipe<Vec<U::Output>>,
 }
@@ -5707,8 +5732,24 @@ impl<I> DeviceFanOutExt<I> for Vec<I> {
     }
 }
 
-impl<U: DeviceOp> DeviceOp for FanOut<U> {
+impl<U: DeviceOp> DeviceOp for FanOut<U>
+where
+    // Each branch's output must be `Send + 'static` so its return home (a
+    // `BoxedHome`) can ride the branch's own `Checkout` — the seam that re-arms a
+    // fan-out over caller-owned buffers. Buffer outputs are always `'static`.
+    U::Output: Send + 'static,
+    // Each branch's terminal `Checkouts` must reconstruct from its own `Output` —
+    // the branch's OWN `gather_checkouts` bound (single-output via the identity
+    // impl, multi-output via the recursive tuple family).
+    U::Checkouts: FromCheckout<U::Output>,
+{
     type Output = Vec<U::Output>;
+    // STRUCTURE-PRESERVING per-branch Checkouts: a `Vec` of each branch's OWN
+    // `Checkouts` (a `Checkout<O>` for a single-output branch; its tuple for a
+    // multi-output branch), each threading its own per-buffer return home — so
+    // every branch re-arms its origin cell on drop and the fan-out replays. The
+    // dynamic-`Vec` analog of `bundle!`'s per-branch tuple `Checkouts`.
+    type Checkouts = Vec<U::Checkouts>;
 
     fn output_pipe(&self) -> Pipe<Vec<U::Output>> {
         self.out.clone()
@@ -5719,11 +5760,10 @@ impl<U: DeviceOp> DeviceOp for FanOut<U> {
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // `collect` each branch op (not `execute`) so a multi-output branch runs
-        // its own gather and yields one reconstructed value + deps — `self.pipes`
-        // (captured single output pipes) are empty for such branches. The pipes
-        // field is now unused for gathering; we read values straight from
-        // `collect`.
+        // MID-GRAPH / by-value scatter: `collect` each branch (not `execute`) so a
+        // multi-output branch runs its own gather → one reconstructed value + deps.
+        // Deposits the collapsed `Vec<Output>` into the single output pipe (home
+        // `None` — the by-value boundary; per-branch re-arm rides `gather_checkouts`).
         let n = self.ops.len();
         let mut branch_deps: Vec<Deps> = Vec::with_capacity(n);
         let mut outputs: Vec<U::Output> = Vec::with_capacity(n);
@@ -5735,6 +5775,51 @@ impl<U: DeviceOp> DeviceOp for FanOut<U> {
         let joined = join_marker(ec, &branch_deps)?;
         self.out.put(outputs, joined);
         Ok(())
+    }
+
+    fn collect_home(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(Self::Output, Deps, Option<BoxedHome<Self::Output>>)> {
+        // A `Vec<Output>` value has ONE home slot but `N` per-branch homes that
+        // can't ride it — return `home == None` (the same by-value boundary
+        // `bundle!`/`arc_split` document). The Checkout terminal re-arms per branch.
+        let (value, deps) = self.collect(ec, mode)?;
+        Ok((value, deps, None))
+    }
+
+    fn gather_checkouts(
+        &self,
+        ec: &ExecutionContext<'_>,
+        _mode: ExecMode,
+    ) -> Result<(Self::Checkouts, Deps)> {
+        // TERMINAL gather — the per-branch re-arm. Each branch runs its OWN
+        // `gather_checkouts` (a single-output branch builds one `Checkout` with its
+        // return home; a multi-output branch its tuple, every buffer homed), so
+        // EVERY branch buffer re-arms its origin cell on drop and the fan-out
+        // replays. Branches pipeline; join their wait-lists into one marker. The
+        // dynamic-`Vec` analog of `bundle!`'s per-branch `gather_checkouts` delegation.
+        let n = self.ops.len();
+        let mut branch_deps: Vec<Deps> = Vec::with_capacity(n);
+        let mut cos: Vec<U::Checkouts> = Vec::with_capacity(n);
+        for op in &self.ops {
+            let (co, d) = op.gather_checkouts(ec, ExecMode::Pipelined)?;
+            cos.push(co);
+            branch_deps.push(d);
+        }
+        let joined = join_marker(ec, &branch_deps)?;
+        Ok((cos, joined))
+    }
+
+    fn reclaim_undelivered(&self) {
+        // Mid-graph mop-up: a downstream consumer of the collapsed `Vec` handle may
+        // discard branch outputs. Delegate to each branch's `reclaim_undelivered`
+        // so any undelivered homed buffer returns to its cell for the next run
+        // (already-drained pipes are no-ops).
+        for op in &self.ops {
+            op.reclaim_undelivered();
+        }
     }
 
     fn check_ready(&self) -> Result<()> {
