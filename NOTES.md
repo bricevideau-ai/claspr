@@ -9,7 +9,60 @@ items resolve.
 
 ## Active
 
-### ⚑ DESIGN 2026-07-11 (Brice) — automatic, invisible, SEGMENTED command buffers
+### ⚑ DESIGN v2 2026-07-11 (Brice) — CB-as-EXECUTION-MODE (supersedes the record-then-replay/segment-list design below)
+
+THE KEY INSIGHT (Brice): don't separate recording from execution. CB-building is a
+MODE of the same recursive execution walk (execute/collect/gather_checkouts), NOT a
+separate record pass. This dissolves the AndThenHost double-execution blocker (a
+node "adds itself to the CB" INSTEAD of enqueuing — one traversal, buffers
+materialized once). Segmentation falls out of a per-node fork, not a partitioner.
+
+PLUMBING (decided): extend the existing execute/collect/collect_home/
+gather_checkouts/into_output signatures with `cb: Option<&mut CbBuilder>` threaded
+DOWN, and return TWO kinds of dependency UP: cl_events (external, for
+clEnqueueCommandBufferKHR wait-lists + non-CB nodes) AND sync_points (CB-internal
+markers). This dual return is not a convenience — it's the extension's boundary:
+CB-internal commands wait on cl_sync_point_khr; external cl_event deps apply ONLY
+at clEnqueueCommandBufferKHR. So a node inside a CB hands its parent MARKERS; a
+node feeding/consuming a CB from outside hands/takes EVENTS. Scope: FULL walk —
+all-device AND host-seam in one go (the design is unified; the hard case is the
+point).
+
+THE PER-NODE ALGORITHM (Brice's spec, verbatim intent):
+- Node that CAN be part of a CB:
+  - does NOT reference/home a CB:
+    - CB given → forward CB to children (recurse), add self to that CB with
+      children's MARKERS, clone the CB Arc into your storage cell.
+    - no CB given → create a new CB, home it in yourself, forward to children, add
+      self with children's markers, ENQUEUE the CB with dependencies = collected
+      EVENTS.
+  - DOES reference/home a CB:
+    - CB given:
+      - matches → forward to children, do nothing (the replay fast-path).
+      - differs → drop your ref, forward the NEW CB to children, add self with
+        children's markers, clone the new CB Arc into your cell.
+    - no CB given → check your homed CB's validity:
+      - valid → recurse giving your homed CB, then enqueue it with gathered events.
+      - invalid → create new CB, home it, forward, add self with markers, enqueue
+        with collected events.
+- Node that CANNOT be part of a CB (host seam, host↔device transfer): recurse into
+  children WITHOUT forwarding the CB, then enqueue yourself. (Its device children
+  each open their own CB; it consumes their EVENTS; host→device transfers become
+  dependencies the consuming CB waits on, device→host depend on the producing CB.)
+- MUTATION: invalidate all CBs this Slot touches, INCLUDING transitively through
+  pipes.
+
+CONSEQUENCES: cache is graph-owned (each CB-homing node stores the Arc in its own
+cell; children clone it) → drops with the graph, no global/ABA. Invisible: first
+sync builds+homes+enqueues; later syncs hit "CB given, matches → do nothing" =
+replay. Invalidation is PRECISE (only CBs a mutated slot touches, not the whole
+graph). CG all-device = root homes one CB, everyone forwards it. CG host-seam =
+seam doesn't forward → device sub-CBs + host steps wired by the event/sync-point
+boundary. THE HARD PART TO GUARD WITH TESTS: the event↔sync-point conversion at CB
+boundaries (missing dep = race; wrong kind = CL error), and the "differs → drop +
+re-parent" bookkeeping (a finalized CB is immutable; don't strand/reuse a stale one).
+
+### (superseded) ⚑ DESIGN 2026-07-11 (Brice) — automatic, invisible, SEGMENTED command buffers
 
 Branch `cb-support-20260711`. Goal: command buffers are an IMPLEMENTATION DETAIL
 users never see. No `record()`/`replay()` surface. A graph is built once and
