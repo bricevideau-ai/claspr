@@ -680,10 +680,10 @@ impl RecordedGraph<'_> {
 
     /// True if every command is `cl_mem`-backed. SVM commands currently force
     /// software replay — NOT because the extension lacks SVM variants (it has
-    /// `clCommandSVMMemcpyKHR` / `clCommandSVMMemFillKHR`, OpenCL 2.0+, ext
-    /// >= 0.9.4), but because those entry points aren't wired into
-    /// [`CommandBufferExt`] yet. TODO: resolve the SVM command PFNs and emit
-    /// them for `MemRef::Svm`, then allow SVM recordings into the CB.
+    /// `clCommandSVMMemcpyKHR` / `clCommandSVMMemFillKHR`, on OpenCL 2.0+ with
+    /// extension version 0.9.4 or newer), but because those entry points aren't
+    /// wired into [`CommandBufferExt`] yet. TODO: resolve the SVM command PFNs
+    /// and emit them for `MemRef::Svm`, then allow SVM recordings into the CB.
     fn cb_eligible(&self) -> bool {
         self.commands.iter().all(|c| match c {
             SoftCommand::Fill { buffer, .. } => matches!(buffer, MemRef::Buffer(_)),

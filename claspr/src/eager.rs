@@ -4942,6 +4942,21 @@ impl<T: Send + 'static> DeviceOp for Lift<T> {
     }
 }
 
+impl<T> crate::record::RecordableOp for Lift<T>
+where
+    T: crate::record::RecordableBuffer + Send + 'static,
+{
+    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
+        // Like `Forward`: a lifted concrete buffer is a chain head with no
+        // command. Resolve its handle from the lift's own `Concrete` cell and
+        // register it under the output pipe so downstream consumers find it.
+        let concrete = self.input.with_concrete(|b| b.record_handle());
+        let (handle, waits) = ctx.resolve_input(concrete, self.input.pipe_cell_id())?;
+        ctx.register_output(self.out.cell_id(), handle, waits);
+        Ok(())
+    }
+}
+
 // ── Forward: select/identity — make one upstream Pipe a single-output op ──
 
 /// Forward a single upstream value (a `Pipe<T>`) onward as a single-output
@@ -4999,6 +5014,24 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("forward".into());
+    }
+}
+
+impl<T> crate::record::RecordableOp for Forward<T>
+where
+    T: crate::record::RecordableBuffer + Send + 'static,
+{
+    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
+        // Identity: no command. Resolve the input's handle (this op's concrete
+        // buffer as a chain head, or the upstream producer's output when pipe-
+        // fed) and re-register it under our OWN output pipe's cell, so a
+        // downstream consumer resolving from the forwarded pipe finds the same
+        // buffer with the same pending sync points. Purely a pipe-alias in the
+        // edge map — mirrors `execute`'s resolve+re-deposit with no device work.
+        let concrete = self.input.with_concrete(|b| b.record_handle());
+        let (handle, waits) = ctx.resolve_input(concrete, self.input.pipe_cell_id())?;
+        ctx.register_output(self.out.cell_id(), handle, waits);
+        Ok(())
     }
 }
 
@@ -5194,6 +5227,24 @@ where
 
     fn contains_host_seam(&self) -> bool {
         self.source.contains_host_seam()
+    }
+}
+
+impl<S> crate::record::RecordableOp for Arced<S>
+where
+    S: crate::record::RecordableOp,
+    S::Output: crate::record::RecordableBuffer + Sync,
+{
+    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
+        // `Arc` is a host-side wrap — no command. Record the source (registers
+        // its output buffer under the source pipe's cell), then alias that same
+        // handle under our own output pipe so a downstream reader of the
+        // `Arc<buffer>` resolves to the underlying buffer + its sync points.
+        self.source.record(ctx)?;
+        let src_cell = self.source.output_pipe().cell_id();
+        let (handle, waits) = ctx.resolve_input(None, Some(src_cell))?;
+        ctx.register_output(self.out.cell_id(), handle, waits);
+        Ok(())
     }
 }
 

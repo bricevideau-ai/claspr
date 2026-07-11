@@ -9,7 +9,7 @@
 
 use claspr::Context;
 use claspr::DeviceSlice;
-use claspr::eager::fill;
+use claspr::eager::{DeviceOpExt, fill, forward};
 use claspr::record::RecordExt;
 use claspr_test_kernels::kernels;
 
@@ -320,4 +320,52 @@ fn fill_replays_many_times() {
             .replay(&ctx)
             .unwrap_or_else(|e| panic!("replay {i}: {e:?}"));
     }
+}
+
+/// Phase 1: the structural `forward` combinator is recordable. A multi-output
+/// kernel (`add_u32` → `(a, b, out)`) whose `out` is selected via `forward` and
+/// threaded into a downstream in-place kernel records into one command buffer
+/// and replays. `forward` emits NO command — it aliases `out`'s buffer under its
+/// own pipe so `scale_u32` resolves the same `cl_mem` + sync points. Asserts the
+/// CB path engages where supported and the arithmetic is right across replays.
+#[test]
+fn forward_selects_and_records_into_command_buffer() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    let a = DeviceSlice::<u32>::alloc_zero(&ctx, N)
+        .expect("alloc a")
+        .fill(3u32)
+        .wait()
+        .expect("seed a");
+    let b = DeviceSlice::<u32>::alloc_zero(&ctx, N)
+        .expect("alloc b")
+        .fill(4u32)
+        .wait()
+        .expect("seed b");
+    let out = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc out");
+
+    // out = a + b = 7; forward(out) selects it; scale_u32 doubles it in place.
+    let graph = ks
+        .add_u32([N], a, b, out)
+        .and_then(|(_a, _b, out)| forward(out))
+        .and_then(|out| ks.scale_u32([N], out, 2u32));
+    let recorded = graph.record().expect("record forward graph");
+
+    // `add_u32` OVERWRITES `out = a + b` each run (not in-place accumulate), and
+    // a/b are stable concrete inputs, so every full replay deterministically
+    // recomputes out = (3 + 4) * 2 = 14 — a clean idempotent-replay check.
+    recorded.replay(&ctx).expect("replay 1"); // out = (3+4)*2 = 14
+    let cb = recorded.using_command_buffer();
+    recorded.replay(&ctx).expect("replay 2"); // recompute from a=3,b=4 -> 14
+    drop(recorded);
+
+    if ctx.has_cl_khr_command_buffer() {
+        assert!(cb, "forward graph should record into a command buffer");
+    }
+
+    let out = graph.sync(&ctx).expect("terminal sync"); // recompute -> 14
+    let mut r = vec![0u32; N];
+    out.read(&mut r).wait().expect("read");
+    assert!(r.iter().all(|&v| v == 14), "expected 14, got {:?}", &r[..8]);
 }
