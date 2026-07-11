@@ -1097,7 +1097,7 @@ dependencies = [
  "once_cell",
  "petgraph",
  "rustc-hash",
- "spirv 0.4.0+sdk-1.4.341.0",
+ "spirv",
  "thiserror 2.0.18",
 ]
 
@@ -1313,12 +1313,12 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rspirv"
-version = "0.12.0+sdk-1.3.268.0"
+version = "0.13.0+sdk-1.4.341.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69cf3a93856b6e5946537278df0d3075596371b1950ccff012f02b0f7eafec8d"
+checksum = "091dca2e1d6fd3098417b5ec88e77e80d1ba5945750943419dc976858082c296"
 dependencies = [
  "rustc-hash",
- "spirv 0.3.0+sdk-1.3.268.0",
+ "spirv",
 ]
 
 [[package]]
@@ -1336,7 +1336,7 @@ checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 [[package]]
 name = "rustc_codegen_spirv"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#590299a63493046f71f2c3a12ee147286cced0b6"
+source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#8fb93ebbfc348ec0cb5b148e550d67f63f0ea7ec"
 dependencies = [
  "ahash",
  "ar",
@@ -1369,13 +1369,13 @@ dependencies = [
 [[package]]
 name = "rustc_codegen_spirv-types"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#590299a63493046f71f2c3a12ee147286cced0b6"
+source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#8fb93ebbfc348ec0cb5b148e550d67f63f0ea7ec"
 dependencies = [
  "rspirv",
  "semver",
  "serde",
  "serde_json",
- "spirv 0.3.0+sdk-1.3.268.0",
+ "spirv",
  "thiserror 2.0.18",
 ]
 
@@ -1599,27 +1599,18 @@ dependencies = [
 
 [[package]]
 name = "spirv"
-version = "0.3.0+sdk-1.3.268.0"
+version = "0.4.0+sdk-1.4.341.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eda41003dc44290527a59b13432d4a0379379fa074b70174882adfbdfd917844"
+checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
 dependencies = [
  "bitflags 2.13.0",
  "serde",
 ]
 
 [[package]]
-name = "spirv"
-version = "0.4.0+sdk-1.4.341.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
-dependencies = [
- "bitflags 2.13.0",
-]
-
-[[package]]
 name = "spirv-builder"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#590299a63493046f71f2c3a12ee147286cced0b6"
+source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#8fb93ebbfc348ec0cb5b148e550d67f63f0ea7ec"
 dependencies = [
  "cargo_metadata 0.21.0",
  "log",
@@ -1636,7 +1627,7 @@ dependencies = [
 [[package]]
 name = "spirv-std"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#590299a63493046f71f2c3a12ee147286cced0b6"
+source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#8fb93ebbfc348ec0cb5b148e550d67f63f0ea7ec"
 dependencies = [
  "bitflags 1.3.2",
  "glam",
@@ -1649,7 +1640,7 @@ dependencies = [
 [[package]]
 name = "spirv-std-macros"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#590299a63493046f71f2c3a12ee147286cced0b6"
+source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#8fb93ebbfc348ec0cb5b148e550d67f63f0ea7ec"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1660,7 +1651,7 @@ dependencies = [
 [[package]]
 name = "spirv-std-types"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#590299a63493046f71f2c3a12ee147286cced0b6"
+source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#8fb93ebbfc348ec0cb5b148e550d67f63f0ea7ec"
 
 [[package]]
 name = "spirv-tools"
