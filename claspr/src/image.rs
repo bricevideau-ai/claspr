@@ -697,8 +697,8 @@ pub struct ImageWrite<'a, I: ImageEnqueue, E> {
 impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
     type Output = I;
 
-    fn output_pipe(&self) -> Pipe<I> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<I>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -771,8 +771,8 @@ pub struct ImageRead<'a, I: ImageEnqueue, E> {
 impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
     type Output = I;
 
-    fn output_pipe(&self) -> Pipe<I> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<I>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -845,11 +845,11 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
     type Handle = (Pipe<Src>, Pipe<Dst>);
     type Checkouts = (crate::eager::Checkout<Src>, crate::eager::Checkout<Dst>);
 
-    fn output_pipe(&self) -> Pipe<(Src, Dst)> {
+    fn output_pipe(&self) -> Option<Pipe<(Src, Dst)>> {
         // Multi-output: the value is reconstructed in `collect` from the two
         // element pipes, never this single pipe (which stays empty). Mirrors the
         // buffer `CopyTo2` shape.
-        Pipe::new()
+        None
     }
 
     fn handle(&self) -> Self::Handle {
@@ -959,8 +959,8 @@ pub struct ImageFill<I: ImageEnqueue, T: Copy> {
 impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
     type Output = I;
 
-    fn output_pipe(&self) -> Pipe<I> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<I>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {

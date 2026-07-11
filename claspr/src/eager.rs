@@ -1444,10 +1444,10 @@ impl<T> Pipe<T> {
 impl<T: Send + 'static> DeviceOp for Pipe<T> {
     type Output = T;
 
-    fn output_pipe(&self) -> Pipe<T> {
+    fn output_pipe(&self) -> Option<Pipe<T>> {
         // The pipe is its OWN output storage — no separate `out`. The producer
         // already (or will) deposit here; we alias it.
-        self.clone()
+        Some(self.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -2820,10 +2820,18 @@ pub trait DeviceOp: Send {
     /// per-element build-time pipes.
     type Checkouts = Checkout<Self::Output>;
 
-    /// The output value pipe — where `execute` deposits the result; what the
-    /// terminal (`sync`) drains. Always a single `Pipe<Output>` regardless of
-    /// [`Handle`](Self::Handle).
-    fn output_pipe(&self) -> Pipe<Self::Output>;
+    /// The **runtime value-storage** pipe — where `execute` deposits the result;
+    /// what the single-output terminal (`sync`) drains. `Some` for a single-output
+    /// op (its one storage pipe, independent of the build-time [`Handle`](Self::Handle)),
+    /// `None` for a **multi-output** op (Bundle2..16, [`FanOut`], [`CopyTo2`],
+    /// `arc_split`, the `and_then_host` seam over a multi-output source, …), whose
+    /// storage is per-branch/element pipes with no single collapsed pipe. The
+    /// generic default gather methods ([`collect`](Self::collect) /
+    /// [`collect_home`](Self::collect_home) / [`gather_checkouts`](Self::gather_checkouts)
+    /// / [`reclaim_undelivered`](Self::reclaim_undelivered)) unwrap the `Some` — they
+    /// are single-output-only (every multi-output op overrides all of them), so the
+    /// `None` case is never reached through them.
+    fn output_pipe(&self) -> Option<Pipe<Self::Output>>;
 
     /// The downstream-facing [`Handle`](Self::Handle). Default: the output pipe
     /// (so a downstream closure gets `Pipe<Output>`). Combinators override.
@@ -2868,7 +2876,9 @@ pub trait DeviceOp: Send {
     where
         Self: Sized,
     {
-        let out = self.output_pipe();
+        let out = self
+            .output_pipe()
+            .expect("single-output op must have an output pipe (multi-output overrides collect)");
         self.execute(ec, mode)?;
         out.take()
             .ok_or(Error::NotSupported("eager graph: op produced no output"))
@@ -2910,7 +2920,9 @@ pub trait DeviceOp: Send {
         Self: Sized,
         Self::Output: Send + 'static,
     {
-        let out = self.output_pipe();
+        let out = self.output_pipe().expect(
+            "single-output op must have an output pipe (multi-output overrides collect_home)",
+        );
         self.execute(ec, mode)?;
         out.take_home()
             .ok_or(Error::NotSupported("eager graph: op produced no output"))
@@ -2964,7 +2976,9 @@ pub trait DeviceOp: Send {
         Self::Output: Send + 'static,
         Self::Checkouts: FromCheckout<Self::Output>,
     {
-        let out = self.output_pipe();
+        let out = self.output_pipe().expect(
+            "single-output op must have an output pipe (multi-output overrides gather_checkouts)",
+        );
         self.execute(ec, mode)?;
         let (value, deps, home) = out
             .take_home()
@@ -3075,7 +3089,10 @@ pub trait DeviceOp: Send {
         // rehomes), so we must call `rehome_consumed` ourselves. `None` (already
         // drained downstream, or never produced) is a no-op; `home == None` (a
         // minted/transformed output) just releases the value.
-        if let Some((value, _deps, home)) = self.output_pipe().take_home() {
+        // Single-output only (multi-output ops override this to drain each element
+        // pipe); `output_pipe()` is therefore always `Some` here. Use `and_then`
+        // so a defensive `None` is simply a no-op rather than a panic.
+        if let Some((value, _deps, home)) = self.output_pipe().and_then(|p| p.take_home()) {
             rehome_consumed(value, home);
         }
     }
@@ -4419,14 +4436,15 @@ pub trait SeamScatter: CheckoutSplit {
     /// A fresh, empty handle (each element an empty [`Pipe`]) — built once at
     /// construction, refilled every `execute`.
     fn empty_handle() -> Self::Handle;
-    /// The seam's [`output_pipe`](DeviceOp::output_pipe) view — a single
-    /// `Pipe<Value>`. For a **single-output** source this IS the storage pipe (so
-    /// [`AndThen`]'s orphaned-source-deps threading behaves EXACTLY as it did
-    /// pre-#212 when a downstream closure discards the seam's output — byte-identity
-    /// of the single-output mid-graph path). For a **multi-output** source, storage
-    /// is the per-branch element pipes, so this returns a fresh never-filled pipe
-    /// (the same convention a `bundle!` / [`CopyTo2`] `output_pipe` use).
-    fn output_pipe_view(handle: &Self::Handle) -> Pipe<Self::Value>;
+    /// The seam's [`output_pipe`](DeviceOp::output_pipe) view — an optional single
+    /// `Pipe<Value>`. For a **single-output** source this is `Some` of the storage
+    /// pipe (so [`AndThen`]'s orphaned-source-deps threading behaves EXACTLY as it
+    /// did pre-#212 when a downstream closure discards the seam's output —
+    /// byte-identity of the single-output mid-graph path). For a **multi-output**
+    /// source, storage is the per-branch element pipes and there is no single
+    /// storage pipe, so this returns `None` (the same convention a `bundle!` /
+    /// [`CopyTo2`] `output_pipe` use).
+    fn output_pipe_view(handle: &Self::Handle) -> Option<Pipe<Self::Value>>;
     /// Scatter the seam-mutated `value` + per-branch `homes` into `handle`'s
     /// element pipes, cloning `deps` (the seam's unmap + `proceed` gate) onto each
     /// so whichever branch flows downstream carries the wait-list.
@@ -4455,9 +4473,9 @@ impl<O: Send + 'static> SeamScatter for Checkout<O> {
     fn empty_handle() -> Pipe<O> {
         Pipe::new()
     }
-    fn output_pipe_view(handle: &Pipe<O>) -> Pipe<O> {
+    fn output_pipe_view(handle: &Pipe<O>) -> Option<Pipe<O>> {
         // Single-output: the handle IS the storage pipe.
-        handle.clone()
+        Some(handle.clone())
     }
     fn scatter(handle: &Pipe<O>, value: O, homes: Option<BoxedHome<O>>, deps: &Deps) {
         handle.put_home(value, deps.clone(), homes);
@@ -4489,11 +4507,10 @@ macro_rules! impl_seam_scatter_tuple {
             fn empty_handle() -> Self::Handle {
                 ( $(<$ck as SeamScatter>::empty_handle(),)+ )
             }
-            fn output_pipe_view(_handle: &Self::Handle) -> Pipe<Self::Value> {
-                // Multi-output: storage is the element pipes; this single pipe is
-                // never filled or drained. A fresh empty pipe, well-typed, never
-                // read (same convention as bundle/CopyTo2 `output_pipe`).
-                Pipe::new()
+            fn output_pipe_view(_handle: &Self::Handle) -> Option<Pipe<Self::Value>> {
+                // Multi-output: storage is the element pipes; there is no single
+                // storage pipe (same convention as bundle/CopyTo2 `output_pipe`).
+                None
             }
             fn scatter(handle: &Self::Handle, value: Self::Value, homes: Self::Homes, deps: &Deps) {
                 $( <$ck as SeamScatter>::scatter(&handle.$idx, value.$idx, homes.$idx, deps); )+
@@ -4622,16 +4639,28 @@ impl<O: PartialEq> PartialEq<O> for Checkout<O> {
 /// whole chain's events still gate the terminal. See `AndThen::collect`. No-op
 /// when the source pipe was consumed by `next` (the normal case). The discarded
 /// source value drops.
-fn thread_orphaned_source_deps<A, B>(src_pipe: &Pipe<A>, out_pipe: &Pipe<B>) {
-    // Source pipe consumed by `next` (the normal case) → nothing to thread.
-    let Some((_discarded, src_deps)) = src_pipe.take() else {
+///
+/// Both pipes are `Option` (the [`output_pipe`](DeviceOp::output_pipe) shape): a
+/// **multi-output** source or `next` has NO single storage pipe (`None`), so its
+/// storage is per-branch element pipes and there is nothing to thread through
+/// here — the multi-output source's completion events ride its own per-branch
+/// gather (`collect`/`gather_checkouts`), and a multi-output `next`'s deps are
+/// threaded by its own override. A `None` on either side is therefore a no-op —
+/// byte-identical to the pre-Option behaviour, where a multi-output op returned a
+/// fresh never-filled `Pipe::new()` that `take()` always drained as empty.
+fn thread_orphaned_source_deps<A, B>(src_pipe: &Option<Pipe<A>>, out_pipe: &Option<Pipe<B>>) {
+    // Multi-output source (`None`) → no single pipe to thread; or the source pipe
+    // was consumed by `next` (the normal case) → nothing to thread.
+    let Some((_discarded, src_deps)) = src_pipe.as_ref().and_then(|p| p.take()) else {
         return;
     };
     // Merge the stranded source events into the out pipe's deps. If `out_pipe` is
-    // empty (a multi-output `next` whose storage is its element pipes, not
+    // absent/empty (a multi-output `next` whose storage is its element pipes, not
     // `output_pipe`), `execute` isn't the gather path — `collect` handles
     // orphaned deps for that case directly, so this is a no-op here.
-    if let Some((v, mut deps)) = out_pipe.take() {
+    if let Some(out_pipe) = out_pipe.as_ref()
+        && let Some((v, mut deps)) = out_pipe.take()
+    {
         deps.extend(src_deps);
         out_pipe.put(v, deps);
     }
@@ -4656,7 +4685,7 @@ where
     // (bundle*, arc_split, CopyTo pair) yields its tuple/array of `Checkout`s.
     type Checkouts = U::Checkouts;
 
-    fn output_pipe(&self) -> Pipe<U::Output> {
+    fn output_pipe(&self) -> Option<Pipe<U::Output>> {
         self.next.output_pipe()
     }
 
@@ -4698,7 +4727,7 @@ where
         // closure layer got this for free by passing `prior_evts` into
         // `next.execute`.) The discarded value drops here — the closure didn't
         // want it; its `cl_mem` is retained by any in-flight unmap until done.
-        if let Some((_discarded, src_deps)) = src_pipe.take() {
+        if let Some((_discarded, src_deps)) = src_pipe.and_then(|p| p.take()) {
             deps.extend(src_deps);
         }
         Ok((value, deps))
@@ -4722,7 +4751,7 @@ where
         let src_pipe = self.source.output_pipe();
         self.source.execute(ec, ExecMode::Pipelined)?;
         let (value, mut deps, home) = self.next.collect_home(ec, mode)?;
-        if let Some((_discarded, src_deps)) = src_pipe.take() {
+        if let Some((_discarded, src_deps)) = src_pipe.and_then(|p| p.take()) {
             deps.extend(src_deps);
         }
         Ok((value, deps, home))
@@ -4746,7 +4775,7 @@ where
         let src_pipe = self.source.output_pipe();
         self.source.execute(ec, ExecMode::Pipelined)?;
         let (checkouts, mut deps) = self.next.gather_checkouts(ec, mode)?;
-        if let Some((_discarded, src_deps)) = src_pipe.take() {
+        if let Some((_discarded, src_deps)) = src_pipe.and_then(|p| p.take()) {
             deps.extend(src_deps);
         }
         Ok((checkouts, deps))
@@ -4857,8 +4886,8 @@ impl<T: Send + Clone + 'static> DeviceOp for Value<T> {
     // By-value handle: downstream gets `T`, enabling build-time host compute.
     type Handle = T;
 
-    fn output_pipe(&self) -> Pipe<T> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<T>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -4938,8 +4967,8 @@ impl<T: crate::record::RecordableBuffer + Send + 'static> DeviceOp for Lift<T> {
     type Output = T;
     // Default `Handle = Pipe<T>` — a resource flows, it isn't read at build.
 
-    fn output_pipe(&self) -> Pipe<T> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<T>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -5011,8 +5040,8 @@ pub fn forward<T: Send + 'static>(pipe: Pipe<T>) -> Forward<T> {
 impl<T: Send + 'static> DeviceOp for Forward<T> {
     type Output = T;
 
-    fn output_pipe(&self) -> Pipe<T> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<T>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -5154,8 +5183,8 @@ impl<'op, T: Send + 'static> DeviceDynOp<'op, T> {
 impl<T: Send + 'static> DeviceOp for DeviceDynOp<'_, T> {
     type Output = T;
 
-    fn output_pipe(&self) -> Pipe<T> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<T>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -5216,8 +5245,8 @@ where
 {
     type Output = Arc<S::Output>;
 
-    fn output_pipe(&self) -> Pipe<Arc<S::Output>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<Arc<S::Output>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -5253,7 +5282,16 @@ where
         // source's own `record` errors (via the default) if it is not recordable;
         // resolving `None`/`Some(src_cell)` needs no `RecordableBuffer` bound.
         self.source.record(ctx)?;
-        let src_cell = self.source.output_pipe().cell_id();
+        // `arced` wraps a SINGLE-output source (its `Output` is one buffer it
+        // `Arc`s), so the source always has a single storage pipe to key its edge
+        // by; a multi-output source has no such single cell to alias here.
+        let src_cell = self
+            .source
+            .output_pipe()
+            .ok_or(Error::NotSupported(
+                "record: arced source has no single output pipe (multi-output arced is unsupported)",
+            ))?
+            .cell_id();
         let (handle, waits) = ctx.resolve_input(None, Some(src_cell))?;
         ctx.register_output(self.out.cell_id(), handle, waits);
         Ok(())
@@ -5315,12 +5353,11 @@ where
     // Per-branch Checkouts (homes are all `None` — these are read-only Arc clones).
     type Checkouts = [Checkout<S::Output>; N];
 
-    fn output_pipe(&self) -> Pipe<Self::Output> {
-        // Multi-output storage is the per-element pipes; this single pipe is
-        // never filled or drained (the default `into_output` is overridden, and
-        // `and_then` uses `handle()`). Return a fresh empty pipe — well-typed,
-        // never read.
-        Pipe::new()
+    fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
+        // Multi-output storage is the per-element pipes; there is no single
+        // storage pipe (the default `into_output` is overridden, and `and_then`
+        // uses `handle()`), so return `None`.
+        None
     }
 
     fn handle(&self) -> Self::Handle {
@@ -5501,12 +5538,12 @@ macro_rules! impl_eager_bundle {
             // fixed).
             type Checkouts = ( $(<$ty as DeviceOp>::Checkouts,)+ );
 
-            fn output_pipe(&self) -> Pipe<Self::Output> {
+            fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
                 // Multi-output storage is the per-branch pipes (owned by each
-                // branch); this single pipe is never filled or drained (the default
-                // `into_output` is overridden, and `and_then` uses `handle()`).
-                // Return a fresh empty pipe — well-typed, never read.
-                Pipe::new()
+                // branch); there is no single storage pipe (the default
+                // `into_output` is overridden, and `and_then` uses `handle()`), so
+                // return `None`.
+                None
             }
 
             fn handle(&self) -> Self::Handle {
@@ -5750,11 +5787,6 @@ macro_rules! bundle {
 /// which every waiting terminal uses.
 pub struct FanOut<U: DeviceOp> {
     ops: Vec<U>,
-    // Per-branch single output pipes — captured for the DESCRIBE arity and the
-    // single-output gather fast path; a multi-output branch fills its own element
-    // pipes instead (its `collect`/`gather_checkouts` read those), so these are
-    // only used where a branch is single-output. Kept in step with `ops`.
-    pipes: Vec<Pipe<U::Output>>,
     out: Pipe<Vec<U::Output>>,
 }
 
@@ -5765,10 +5797,8 @@ where
     U: DeviceOp,
 {
     let ops: Vec<U> = inputs.into_iter().map(&mut f).collect();
-    let pipes: Vec<Pipe<U::Output>> = ops.iter().map(|o| o.output_pipe()).collect();
     FanOut {
         ops,
-        pipes,
         out: Pipe::new(),
     }
 }
@@ -5814,8 +5844,8 @@ where
     // dynamic-`Vec` analog of `bundle!`'s per-branch tuple `Checkouts`.
     type Checkouts = Vec<U::Checkouts>;
 
-    fn output_pipe(&self) -> Pipe<Vec<U::Output>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<Vec<U::Output>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -5894,7 +5924,7 @@ where
     }
 
     fn describe(&self, out: &mut Vec<String>) {
-        out.push(format!("fan_out[{}]", self.pipes.len()));
+        out.push(format!("fan_out[{}]", self.ops.len()));
     }
 
     fn contains_host_seam(&self) -> bool {
@@ -5944,8 +5974,8 @@ where
 {
     type Output = DeviceSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -6026,8 +6056,8 @@ where
 {
     type Output = DeviceSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -6189,8 +6219,8 @@ where
 {
     type Output = DeviceSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -6304,8 +6334,8 @@ where
 {
     type Output = DeviceScalar<T, M>;
 
-    fn output_pipe(&self) -> Pipe<DeviceScalar<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<DeviceScalar<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -6390,7 +6420,7 @@ where
 {
     type Output = DeviceScalar<T, M>;
 
-    fn output_pipe(&self) -> Pipe<DeviceScalar<T, M>> {
+    fn output_pipe(&self) -> Option<Pipe<DeviceScalar<T, M>>> {
         self.inner.output_pipe()
     }
 
@@ -6435,8 +6465,8 @@ where
 {
     type Output = Vec<T>;
 
-    fn output_pipe(&self) -> Pipe<Vec<T>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<Vec<T>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -6554,8 +6584,8 @@ where
 {
     type Output = DeviceSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -6693,8 +6723,8 @@ where
 {
     type Output = DeviceSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -6772,8 +6802,8 @@ where
 {
     type Output = DeviceSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -6842,8 +6872,8 @@ where
 {
     type Output = MappedSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<MappedSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -6912,8 +6942,8 @@ where
 {
     type Output = USMSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<USMSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<USMSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -6975,8 +7005,8 @@ where
 {
     type Output = DeviceSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -7064,8 +7094,8 @@ where
 {
     type Output = DeviceSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -7164,8 +7194,8 @@ where
 {
     type Output = MappedSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<MappedSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -7236,8 +7266,8 @@ where
 {
     type Output = MappedSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<MappedSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -7331,8 +7361,8 @@ where
 {
     type Output = MappedSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<MappedSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -7424,8 +7454,8 @@ where
 {
     type Output = USMSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<USMSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<USMSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -7519,8 +7549,8 @@ where
 {
     type Output = USMSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<USMSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<USMSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -7625,8 +7655,8 @@ where
 {
     type Output = USMSliceUninit<T, M>;
 
-    fn output_pipe(&self) -> Pipe<USMSliceUninit<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<USMSliceUninit<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -7691,8 +7721,8 @@ where
 {
     type Output = DeviceSliceUninit<T, M>;
 
-    fn output_pipe(&self) -> Pipe<DeviceSliceUninit<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<DeviceSliceUninit<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -7757,8 +7787,8 @@ where
 {
     type Output = MappedSliceUninit<T, M>;
 
-    fn output_pipe(&self) -> Pipe<MappedSliceUninit<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<MappedSliceUninit<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -7821,8 +7851,8 @@ where
 {
     type Output = I;
 
-    fn output_pipe(&self) -> Pipe<I> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<I>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -7884,8 +7914,8 @@ where
 {
     type Output = Vec<I::Pixel>;
 
-    fn output_pipe(&self) -> Pipe<Vec<I::Pixel>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<Vec<I::Pixel>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -7965,8 +7995,8 @@ where
 {
     type Output = DeviceSliceHostView<T, M, MapReadWrite>;
 
-    fn output_pipe(&self) -> Pipe<Self::Output> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -8022,8 +8052,8 @@ where
 {
     type Output = DeviceSliceHostView<T, M, MapReadOnly>;
 
-    fn output_pipe(&self) -> Pipe<Self::Output> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -8079,8 +8109,8 @@ where
 {
     type Output = DeviceSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<DeviceSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -8133,8 +8163,8 @@ where
 {
     type Output = MappedSliceHostView<T, M, MapReadWrite>;
 
-    fn output_pipe(&self) -> Pipe<Self::Output> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -8188,8 +8218,8 @@ where
 {
     type Output = MappedSliceHostView<T, M, MapReadOnly>;
 
-    fn output_pipe(&self) -> Pipe<Self::Output> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -8245,8 +8275,8 @@ where
 {
     type Output = MappedSlice<T, M>;
 
-    fn output_pipe(&self) -> Pipe<MappedSlice<T, M>> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -8602,12 +8632,11 @@ where
         Checkout<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
     );
 
-    fn output_pipe(&self) -> Pipe<Self::Output> {
-        // Multi-output storage is the per-element pipes; this single pipe is
-        // never filled or drained (the default `into_output` is overridden, and
-        // `and_then` uses `handle()`). Return a fresh empty pipe — well-typed,
-        // never read.
-        Pipe::new()
+    fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
+        // Multi-output storage is the per-element pipes; there is no single
+        // storage pipe (the default `into_output` is overridden, and `and_then`
+        // uses `handle()`), so return `None`.
+        None
     }
 
     fn handle(&self) -> Self::Handle {
@@ -8983,8 +9012,8 @@ where
 {
     type Output = S::Output;
 
-    fn output_pipe(&self) -> Pipe<S::Output> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<S::Output>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {
@@ -9356,8 +9385,8 @@ where
     // collapsed `collect_home` slot cannot carry.
     type Checkouts = S::Checkouts;
 
-    fn output_pipe(&self) -> Pipe<S::Output> {
-        // Single-output: the storage pipe; multi-output: a fresh never-read pipe
+    fn output_pipe(&self) -> Option<Pipe<S::Output>> {
+        // Single-output: `Some` of the storage pipe; multi-output: `None`
         // (storage is the element pipes). See `SeamScatter::output_pipe_view`.
         <S::Checkouts as SeamScatter>::output_pipe_view(&self.handle)
     }
@@ -9496,7 +9525,7 @@ where
     type Handle = <S::Checkouts as SeamScatter>::Handle;
     type Checkouts = S::Checkouts;
 
-    fn output_pipe(&self) -> Pipe<S::Output> {
+    fn output_pipe(&self) -> Option<Pipe<S::Output>> {
         <S::Checkouts as SeamScatter>::output_pipe_view(&self.handle)
     }
 
@@ -9652,8 +9681,8 @@ where
     // Profiling is a host side-effect; the chain's data flow is unchanged.
     type Output = S::Output;
 
-    fn output_pipe(&self) -> Pipe<S::Output> {
-        self.out.clone()
+    fn output_pipe(&self) -> Option<Pipe<S::Output>> {
+        Some(self.out.clone())
     }
 
     fn handle(&self) -> Self::Handle {

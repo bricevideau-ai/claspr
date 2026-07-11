@@ -1228,8 +1228,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     let eager_impl = if multi_output {
         // `Handle = (Pipe<D0>, Pipe<D1>, …)`; per-element scatter; reconstruct
         // in `into_output`. `output_pipe()` is unused on this path (the default
-        // `into_output` is overridden), but the trait requires it — return a
-        // fresh empty pipe so it's well-typed and never read.
+        // `into_output` is overridden) and a multi-output op has no single storage
+        // pipe — return `None`.
         let handle_ty = quote! { ( #( ::claspr::Pipe<#output_types> ),* ) };
         let handle_expr = quote! {
             ( #( ::core::clone::Clone::clone(&self.#op_pipe_fields) ),* )
@@ -1244,11 +1244,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 type Handle = #handle_ty;
                 type Checkouts = #checkouts_ty;
 
-                fn output_pipe(&self) -> ::claspr::Pipe<#output_ty> {
-                    // Multi-output storage is the per-element pipes; this single
-                    // pipe is never filled or drained (the default `into_output`
-                    // is overridden, and `and_then` uses `handle()`).
-                    ::claspr::Pipe::new()
+                fn output_pipe(&self) -> ::core::option::Option<::claspr::Pipe<#output_ty>> {
+                    // Multi-output storage is the per-element pipes; there is no
+                    // single storage pipe (the default `into_output` is overridden,
+                    // and `and_then` uses `handle()`).
+                    ::core::option::Option::None
                 }
 
                 fn handle(&self) -> Self::Handle {
@@ -1443,8 +1443,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
             impl #gen_decl ::claspr::DeviceOp for Op #gen_use {
                 type Output = #output_ty;
 
-                fn output_pipe(&self) -> ::claspr::Pipe<#output_ty> {
-                    ::core::clone::Clone::clone(&self.__claspr_out)
+                fn output_pipe(&self) -> ::core::option::Option<::claspr::Pipe<#output_ty>> {
+                    ::core::option::Option::Some(::core::clone::Clone::clone(&self.__claspr_out))
                 }
 
                 // Default `Handle = Pipe<Output>`: a kernel's downstream handle
