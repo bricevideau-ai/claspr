@@ -25,6 +25,53 @@ DONE so far:
   2.0+, ext ≥0.9.4 — just not wired yet; software fallback for SVM meanwhile).
 - Phase 1 (aa4c296): `RecordableOp` for structural passthroughs Forward/Lift/
   Arced (alias a buffer handle in the record edge map, emit no command).
+- Fold (2bd5021): DELETED the `RecordableOp` sub-trait; `record` is now
+  `DeviceOp::record(&self, &mut RecordContext)` with a DEFAULT that errors
+  `NotSupported`. Device leaves + combinators override; host-touching leaves
+  inherit the error. `RecordExt::record()` renamed `record_graph()` (a
+  `DeviceOp::record`/`RecordExt::record` pair collides on `.record()` even at
+  different arity — E0034). `Lift`/`CopyTo2` DeviceOp impls gained a
+  `RecordableBuffer` bound (an override can't tighten `where` past its impl
+  header — E0276; all in-repo uses satisfy it). Green; 10 record_replay pass.
+
+⚑ TWO STOP-AND-REPORT BLOCKERS surfaced while building the segmenter (2026-07-11,
+still open — commits 2-4 NOT landed):
+
+1. CACHE HOME (trigger #2). `sync(&self)` is a blanket `DeviceOpExt` method over
+   arbitrary graph structs; there is NO field to hold a cached `ReplayPlan`, and
+   the multi-output terminal (`bundle2(x, rsnew)` in CG) has NO stable
+   `output_pipe()` (it returns a fresh `Pipe::new()` each call), so it can't be
+   the anchor. Options WITHOUT a user-visible wrapper (Brice forbade an explicit
+   CB surface): (a) global `Mutex<HashMap<anchor_cell_ptr, ReplayPlan>>` keyed by
+   a new `first_leaf_cell()` walk (every leaf's `__claspr_out`/`out` pipe cell is
+   stable; `AndThen::first_leaf = source.first_leaf`) — needs ABA guarding (graph
+   A drops, graph B reuses the freed anchor address) via a liveness `Weak` or a
+   cheap cell-set hash re-checked per sync; mutate_* removes the entry; (b) add a
+   minimal non-user-facing `Arc<Mutex<Option<ReplayPlan>>>` field to the ONE
+   struct every reusable graph is built through — but bare kernels / bundles are
+   valid terminals too, so there is no single such struct; (c) thread the cache
+   Arc through a new `DeviceOp::plan_cache(&self) -> Option<&PlanCache>` returning
+   `None` by default and overridden only by leaves that carry the field — a field
+   addition to every leaf, invasive but not user-visible. RECOMMEND (a) with a
+   liveness `Weak` sentinel (sound, zero struct changes) — needs Brice's ok on a
+   process-global table.
+
+2. HOST-SEAM EXECUTION THROUGH THE CB PLAN (trigger #3/#4 — "the genuinely hard
+   part"). A host step must run the seam's map→closure→unmap over the buffers the
+   PRECEDING device-span CB produced, WITHOUT re-running that device work. But
+   `AndThenHost` obtains its typed `S::Output` (which `Mappable::map(&self)` needs)
+   ONLY via `self.source.gather_checkouts(ec)`, which ENQUEUES the source's device
+   commands. There is no "lend the source's buffers without enqueuing" path, so a
+   segmented plan (source-subtree→CB, seam→HostStep) would DOUBLE-EXECUTE the
+   device source. Fixing this needs AndThenHost refactored to separate
+   "materialize source buffers from their concrete cells (+ attach the CB's
+   completion event as deps)" from "enqueue the source's device commands" — the
+   record edge-map already computes cell→cl_mem, so the seam COULD map raw cl_mems
+   if it exposed an erased "map these handles / run closure / unmap" step, but that
+   touches the delicate start-gate / worker / two-user-event machinery. Until this
+   lands, `solve_host_seam` cannot run THROUGH the CB plan; it still converges on
+   the existing per-op path. Per the trigger, NOT shipping partial/incorrect
+   segmentation. All-device single-CB path (blocker 1 permitting) is unaffected.
 
 THE MODEL (Brice: **CBs are SUB-TREES, not linear segments**). A CB = a MAXIMAL
 sub-tree whose `contains_host_seam() == false`. The plan is built by a recursive
