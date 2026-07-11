@@ -9,6 +9,73 @@ items resolve.
 
 ## Active
 
+### ⚑ DESIGN 2026-07-11 (Brice) — automatic, invisible, SEGMENTED command buffers
+
+Branch `cb-support-20260711`. Goal: command buffers are an IMPLEMENTATION DETAIL
+users never see. No `record()`/`replay()` surface. A graph is built once and
+`sync`'d in a loop exactly as today; the FIRST `sync` builds a cached replay plan,
+subsequent `sync`s replay it, and any graph mutation (`mutate_bind`/`mutate_call`)
+invalidates the cache so the next `sync` rebuilds. (Immutable CBs only for now —
+no mutable-dispatch rebind yet.)
+
+DONE so far:
+- Phase 0 (a01adc4): `Context::has_cl_khr_command_buffer{,_mutable_dispatch}()`;
+  hard-assert the HW CB path in record_replay; corrected the false "no SVM
+  variants" comment (SVM CB commands EXIST — clCommandSVMMem{cpy,Fill}KHR, OCL
+  2.0+, ext ≥0.9.4 — just not wired yet; software fallback for SVM meanwhile).
+- Phase 1 (aa4c296): `RecordableOp` for structural passthroughs Forward/Lift/
+  Arced (alias a buffer handle in the record edge map, emit no command).
+
+THE MODEL (Brice: **CBs are SUB-TREES, not linear segments**). A CB = a MAXIMAL
+sub-tree whose `contains_host_seam() == false`. The plan is built by a recursive
+tree walk, not a linear scan:
+- At a node, if `contains_host_seam()==false` → the WHOLE subtree is ONE
+  `cl_khr_command_buffer` (record it via the existing `RecordableOp` path — every
+  node in it is a device op — and STOP descending). Anchored at the subtree-root
+  `cell_id`.
+- If it DOES contain a seam → it's a boundary composite: RECURSE into its
+  children. Its device-able child subtrees each become their own CB; the seam
+  node itself (`AndThenHost`) is a `HostStep` run the normal per-op way.
+- `HostStep` also covers host↔device transfers (upload seed / download): host→
+  device enqueues as a DEPENDENCY the consuming CB waits on; device→host as a
+  DEPENDENT on the producing CB's completion (Brice's rule: transfers are NOT
+  CB-able, they bracket the CB).
+
+Consequence — MAXIMAL CBs fall out for free (descend only until a subtree is
+seam-free) and the blast radius is small: NO new walk method on all ~43 ops. The
+seam-free fast path records via existing `RecordableOp`; the recursive
+`plan_segmented` is needed ONLY on combinators that CAN contain a seam (`AndThen`,
+`Bundle*`, `FanOut`, passthroughs, and `AndThenHost` as the boundary). Leaves +
+seam-free subtrees never reach the recursion. Dependencies follow the TREE edges
+(cell deps), not a linear order.
+
+CELL ATTRIBUTION is the spine: `cell_id` = `Arc::as_ptr` of a pipe's cell (stable
+per node), already the record edge-map key. The plan carries a
+`cell_id → producing-step` map; a step consuming cell X waits on X's producer
+(CB completion event or host-op event). This IS the dependency graph between the
+non-CB-able nodes and the CBs, expressed purely in cell terms.
+
+THE WALK (`plan_segmented(&self, &mut PlanBuilder)`, a new `DeviceOp` method
+with a DEFAULT that handles the leaf/seam-free case): default impl = "I am a
+seam-free subtree → record me as one CB via `RecordableOp`." Only the
+seam-capable combinators override it to recurse: at `AndThen`/`Bundle`/`FanOut`,
+for each child, if the child subtree is seam-free emit it as a CB, else recurse;
+`AndThenHost` overrides to emit its device source-subtree(s) as CB(s) + itself as
+a HostStep. All-device graph (CG solve_all_device, root seam-free) → the default
+fires at the root → ONE CB, no recursion. Host-seam graph (CG solve_host_seam) →
+recursion yields [CB(device span), HostStep(seam), CB(device span), HostStep] as
+a TREE of steps wired by cell deps.
+
+STORAGE: cached in an interior-mutable cell reachable from the terminal (`sync`
+is `&self`). Each CbSegment stores its finalized CB keyed by segment-root cell.
+`mutate_*` clears the cache. SERIAL REPLAY unchanged — the existing Checkout
+lend/rehome already forbids re-`sync` while buffers are lent, so an immutable CB
+inherits the "graph idle before re-enqueue" constraint for free.
+
+DISPATCH: `sync(&self)` — if a valid cached plan exists, replay it; else build
+the plan (segment walk), cache, execute. A graph with no CB-eligible segment (all
+host/SVM, or no ext) degrades to the current per-op execute path unchanged.
+
 ### ⚑ DECIDED 2026-07-08 (Brice) — DeviceScalar forks settled + CG reduction-strategy parametrization
 
 Plan: do #208 (DeviceScalar) FIRST, then parametrize CG (#210) to pick its
