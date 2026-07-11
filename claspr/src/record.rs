@@ -7,8 +7,8 @@
 //!
 //! # Two backends, one IR
 //!
-//! [`record`](RecordExt::record) walks the graph by `&self` and builds a
-//! software command list (the portable IR). On the first [`replay`]:
+//! [`record_graph`](RecordExt::record_graph) walks the graph by `&self` and
+//! builds a software command list (the portable IR). On the first [`replay`]:
 //! - if the platform supports `cl_khr_command_buffer` and the recording is
 //!   all-`cl_mem` (the SVM command variants — `clCommandSVMMemcpyKHR` /
 //!   `clCommandSVMMemFillKHR`, extension >= 0.9.4 — are not yet wired here;
@@ -39,14 +39,18 @@
 //! recorded [`RecordedGraph`] borrows the source graph for `'g`, so the buffers
 //! its commands reference stay live across every replay.
 //!
-//! # Recordability is a compile-time property
+//! # Recordability is a run-time property
 //!
-//! [`RecordableOp`] is a sub-trait of `DeviceOp`. Device-side leaves (fill,
-//! copy, kernels) implement it; host-touching leaves (`Upload`, `Download`,
-//! `AndThenHost`, `OnDevice`, …) deliberately do **not**, and a combinator is
-//! `RecordableOp` only when its children are. So a chain containing a
-//! non-recordable leaf fails to compile at [`record`](RecordExt::record), naming
-//! the offending leaf through the generic wrappers.
+//! [`DeviceOp::record`] is the recording twin of `execute`, with a DEFAULT that
+//! errors `NotSupported`. Device-side leaves (fill, copy, kernels) and the
+//! structural combinators OVERRIDE it; host-touching leaves (`Upload`,
+//! `Download`, `AndThenHost`, `OnDevice`, …) inherit the erroring default. So a
+//! chain containing a non-recordable node does not fail to compile — it errors at
+//! run time when [`record_graph`](RecordExt::record_graph) reaches that node.
+//! (This is deliberate: the automatic segmenter records only the seam-free
+//! subtrees it has already proven recordable via
+//! [`contains_host_seam`](DeviceOp::contains_host_seam), and walks mixed graphs by
+//! `&dyn DeviceOp`, which a compile-time bound could not express.)
 //!
 //! # Current scope
 //!
@@ -54,8 +58,8 @@
 //!   against different buffers, via `cl_khr_command_buffer_mutable_dispatch`) is
 //!   a later layer (slots + mutable dispatch).
 //! - Recordable leaves: fill, copy (same-family), kernels (buffer + scalar
-//!   args, no image). Host-touching leaves are excluded by not implementing
-//!   [`RecordableOp`].
+//!   args, no image). Host-touching leaves inherit the erroring
+//!   [`DeviceOp::record`] default.
 
 use crate::eager::DeviceOp;
 use crate::error::{Error, Result};
@@ -388,7 +392,7 @@ impl SoftCommand {
 
 // ── RecordContext: the seam leaf `record` bodies emit into ──────────────────
 
-/// The seam a [`RecordableOp::record`] body emits commands into: a software
+/// The seam a [`DeviceOp::record`] body emits commands into: a software
 /// command list (the portable IR) + a map from graph-edge identity
 /// ([`cell_id`](crate::eager::Pipe)) to the producer's recorded output. The
 /// software list is what [`RecordedGraph`] replays, or compiles once into a real
@@ -610,27 +614,6 @@ impl RecordContext {
         });
         Ok(idx)
     }
-}
-
-// ── RecordableOp: the recordable sub-trait ──────────────────────────────────
-
-/// A [`DeviceOp`] whose work is device-side commands with no host seam, so it
-/// can be recorded into a [`RecordContext`] and replayed.
-///
-/// `record` is the **non-consuming** twin of [`execute`](DeviceOp::execute): it
-/// walks `&self`, resolves its inputs from `ctx` (concrete buffer or upstream
-/// pipe edge), emits its device commands, and registers its output handle(s)
-/// under its output pipe(s) — threading [`SyncPoints`] where `execute` threads
-/// `Deps`.
-///
-/// Recordability propagates structurally: a combinator implements `RecordableOp`
-/// only when its children do (`AndThen<S, U>` iff both `S` and `U` are). Leaves
-/// that touch the host don't implement it, so such chains are rejected at
-/// compile time.
-pub trait RecordableOp: DeviceOp {
-    /// Record this op's device commands into `ctx`, resolving its inputs from
-    /// `ctx`'s edge map and registering its outputs there.
-    fn record(&self, ctx: &mut RecordContext) -> Result<()>;
 }
 
 // ── RecordedGraph: the materialized, replayable form ────────────────────────
@@ -902,16 +885,25 @@ impl RecordedGraph<'_> {
     }
 }
 
-// ── RecordExt: the `.record()` terminal ─────────────────────────────────────
+// ── RecordExt: the `.record_graph()` entry ──────────────────────────────────
 
-/// `.record()` on any recordable [`DeviceOp`] chain.
-pub trait RecordExt: RecordableOp {
+/// `.record_graph()` on any [`DeviceOp`] chain — an internal helper that records
+/// the WHOLE chain into one [`RecordedGraph`] via [`DeviceOp::record`]. Blanket-
+/// implemented for every `DeviceOp`; a chain containing a non-recordable node (a
+/// host seam / transfer) surfaces the `DeviceOp::record` default error at RUN time
+/// rather than being rejected at compile time (the former `RecordableOp` bound).
+///
+/// This is no longer the user-facing path — the command-buffer layer is invisible
+/// (built + cached automatically by `sync`); `record_graph` records a single
+/// seam-free subtree and is used by the segmenter and the record/replay tests.
+pub trait RecordExt: DeviceOp {
     /// Record this graph into a reusable [`RecordedGraph`] without running it.
     /// The returned graph borrows `self`, so the buffers/kernels its leaves
-    /// reference stay live for every replay.
-    fn record(&self) -> Result<RecordedGraph<'_>> {
+    /// reference stay live for every replay. Errors if any node is not
+    /// device-recordable (the [`DeviceOp::record`] default).
+    fn record_graph(&self) -> Result<RecordedGraph<'_>> {
         let mut ctx = RecordContext::new();
-        RecordableOp::record(self, &mut ctx)?;
+        DeviceOp::record(self, &mut ctx)?;
         Ok(RecordedGraph {
             commands: ctx.commands,
             cb: Mutex::new(None),
@@ -920,7 +912,7 @@ pub trait RecordExt: RecordableOp {
     }
 }
 
-impl<O: RecordableOp> RecordExt for O {}
+impl<O: DeviceOp + ?Sized> RecordExt for O {}
 
 // Re-export the leaf/combinator record impls (kept in eager.rs / the macro,
 // next to the `execute` bodies they mirror).

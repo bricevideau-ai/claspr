@@ -160,9 +160,7 @@ pub use host_view::{
 };
 pub use mappable::{DeviceSliceMapHandle, Mappable};
 pub use opencl3::types::cl_uint;
-pub use record::{
-    BufHandle, MemRef, RecordContext, RecordExt, RecordableBuffer, RecordableOp, RecordedGraph,
-};
+pub use record::{BufHandle, MemRef, RecordContext, RecordExt, RecordableBuffer, RecordedGraph};
 pub use transfer::UploadSource;
 
 #[cfg(feature = "async-events")]

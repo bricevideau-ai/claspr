@@ -533,7 +533,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // Record-path codegen (one statement per arg, in signature order): resolve a
     // slice arg's buffer from the record edge-map and set it on the kernel, or
     // set a scalar's bytes. `has_image_param` gates whether the kernel gets a
-    // `RecordableOp` impl at all (images aren't recordable yet).
+    // `DeviceOp::record` override at all (images aren't recordable yet).
     let mut record_arg_stmts: Vec<TokenStream2> = Vec::new();
     let mut has_image_param = false;
     // `(generic_ident, bound_token_stream)` — populated once per
@@ -1145,6 +1145,79 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         )
     };
 
+    // ── `DeviceOp::record` override (record/replay, the CB path) ──────────
+    //
+    // Folded INTO the `DeviceOp` impl (the former standalone `RecordableOp` trait
+    // is gone — recordability is now the overridable `DeviceOp::record` method,
+    // defaulting to "not recordable"). Emitted ONLY for kernels with no image
+    // params (images aren't recordable yet); an image kernel keeps the erroring
+    // default. It mirrors `execute` but is NON-CONSUMING (`&self`): set each arg on
+    // the (retained) `cl_kernel` from the record edge-map, record one ND-range, and
+    // register each buffer output edge so a downstream op resolves it. A kernel
+    // writes in place to its buffer args, so each output pipe carries the
+    // corresponding input buffer's handle, gated on this launch's sync point.
+    let record_method = if has_image_param {
+        quote! {}
+    } else {
+        // Output pipes, in order: single → `__claspr_out`; multi → element pipes.
+        let out_pipe_idents: Vec<TokenStream2> = if multi_output {
+            op_pipe_fields.iter().map(|f| quote! { self.#f }).collect()
+        } else {
+            vec![quote! { self.__claspr_out }]
+        };
+        // Each buffer output edge gets its in-order input handle + the launch SP.
+        let register_outputs = out_pipe_idents.iter().enumerate().map(|(i, p)| {
+            let idx = syn::Index::from(i);
+            quote! {
+                __claspr_ctx.register_output(
+                    ::claspr::Pipe::cell_id(&#p),
+                    __claspr_in_handles[#idx],
+                    ::std::vec![__claspr_sp],
+                );
+            }
+        });
+        quote! {
+            fn record(
+                &self,
+                __claspr_ctx: &mut ::claspr::RecordContext,
+            ) -> ::claspr::Result<()> {
+                let __claspr_kernel = ::claspr::Kernel::get(&self.kernel);
+                let mut __claspr_argi: ::claspr::cl_uint = 0;
+                let mut __claspr_in_handles: ::std::vec::Vec<::claspr::BufHandle> =
+                    ::std::vec::Vec::new();
+                let mut __claspr_waits: ::claspr::record::SyncPoints =
+                    ::std::vec::Vec::new();
+                // Destructure the args tuple by reference (each `#pname` binds
+                // to `&arg`); set every arg in signature order (buffers from
+                // the edge-map, scalars from bytes), accumulating handles+waits.
+                let #op_args_tuple_pat = &self.args;
+                #(#record_arg_stmts)*
+                // Resolve the (possibly slot-bound) grid for this record.
+                let __claspr_spec: ::claspr::LaunchSpec =
+                    ::claspr::ScalarInput::read(&self.spec)?;
+                // Record the ND-range over the arg-set kernel.
+                let __claspr_global: ::std::vec::Vec<usize> =
+                    ::claspr::LaunchSpec::global(&__claspr_spec).to_vec();
+                let __claspr_local: ::std::vec::Vec<usize> =
+                    ::claspr::LaunchSpec::local(&__claspr_spec)
+                        .map(|l| l.to_vec())
+                        .unwrap_or_default();
+                // SAFETY: kernel valid + args set above; retained by the ctx.
+                let __claspr_sp = unsafe {
+                    __claspr_ctx.ndrange_kernel(
+                        __claspr_kernel,
+                        __claspr_global,
+                        __claspr_local,
+                        __claspr_waits,
+                    )?
+                };
+                // Register each buffer output edge (in-place write).
+                #(#register_outputs)*
+                ::core::result::Result::Ok(())
+            }
+        }
+    };
+
     // ── DeviceOp impl body — single vs multi output ──────────────────────
     //
     // EVERY kernel (buffer and/or image) is a reusable `DeviceOp`. Image args now
@@ -1361,6 +1434,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         }
                     )*
                 }
+
+                #record_method
             }
         }
     } else {
@@ -1470,78 +1545,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     #grid_check_ready
                     ::core::result::Result::Ok(())
                 }
-            }
-        }
-    };
 
-    // ── RecordableOp impl (record/replay) ───────────────────────────────
-    //
-    // Emitted ONLY for kernels with no image params (images aren't recordable
-    // yet). It mirrors `execute` but is NON-CONSUMING (`&self`): set each arg on
-    // the (retained) `cl_kernel` from the record edge-map, record one ND-range,
-    // and register each buffer output edge so a downstream op resolves it. A
-    // kernel writes in place to its buffer args, so each output pipe carries the
-    // corresponding input buffer's handle, gated on this launch's sync point.
-    let record_impl = if has_image_param {
-        quote! {}
-    } else {
-        // Output pipes, in order: single → `__claspr_out`; multi → element pipes.
-        let out_pipe_idents: Vec<TokenStream2> = if multi_output {
-            op_pipe_fields.iter().map(|f| quote! { self.#f }).collect()
-        } else {
-            vec![quote! { self.__claspr_out }]
-        };
-        // Each buffer output edge gets its in-order input handle + the launch SP.
-        let register_outputs = out_pipe_idents.iter().enumerate().map(|(i, p)| {
-            let idx = syn::Index::from(i);
-            quote! {
-                __claspr_ctx.register_output(
-                    ::claspr::Pipe::cell_id(&#p),
-                    __claspr_in_handles[#idx],
-                    ::std::vec![__claspr_sp],
-                );
-            }
-        });
-        quote! {
-            impl #gen_decl ::claspr::RecordableOp for Op #gen_use {
-                fn record(
-                    &self,
-                    __claspr_ctx: &mut ::claspr::RecordContext,
-                ) -> ::claspr::Result<()> {
-                    let __claspr_kernel = ::claspr::Kernel::get(&self.kernel);
-                    let mut __claspr_argi: ::claspr::cl_uint = 0;
-                    let mut __claspr_in_handles: ::std::vec::Vec<::claspr::BufHandle> =
-                        ::std::vec::Vec::new();
-                    let mut __claspr_waits: ::claspr::record::SyncPoints =
-                        ::std::vec::Vec::new();
-                    // Destructure the args tuple by reference (each `#pname` binds
-                    // to `&arg`); set every arg in signature order (buffers from
-                    // the edge-map, scalars from bytes), accumulating handles+waits.
-                    let #op_args_tuple_pat = &self.args;
-                    #(#record_arg_stmts)*
-                    // Resolve the (possibly slot-bound) grid for this record.
-                    let __claspr_spec: ::claspr::LaunchSpec =
-                        ::claspr::ScalarInput::read(&self.spec)?;
-                    // Record the ND-range over the arg-set kernel.
-                    let __claspr_global: ::std::vec::Vec<usize> =
-                        ::claspr::LaunchSpec::global(&__claspr_spec).to_vec();
-                    let __claspr_local: ::std::vec::Vec<usize> =
-                        ::claspr::LaunchSpec::local(&__claspr_spec)
-                            .map(|l| l.to_vec())
-                            .unwrap_or_default();
-                    // SAFETY: kernel valid + args set above; retained by the ctx.
-                    let __claspr_sp = unsafe {
-                        __claspr_ctx.ndrange_kernel(
-                            __claspr_kernel,
-                            __claspr_global,
-                            __claspr_local,
-                            __claspr_waits,
-                        )?
-                    };
-                    // Register each buffer output edge (in-place write).
-                    #(#register_outputs)*
-                    ::core::result::Result::Ok(())
-                }
+                #record_method
             }
         }
     };
@@ -1738,8 +1743,6 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
             // Multi-output: per-element pipes (`Handle = (Pipe<D0>, …)`),
             // scatter-in-`execute` + reconstruct-in-`into_output` (see above).
             #eager_impl
-
-            #record_impl
         }
     })
 }

@@ -3107,6 +3107,28 @@ pub trait DeviceOp: Send {
     fn contains_host_seam(&self) -> bool {
         false
     }
+
+    /// Record this op's device commands into `ctx` — the **non-consuming twin of
+    /// [`execute`](Self::execute)** used by the command-buffer path (see
+    /// [`crate::record`]). Walk `&self`, resolve inputs from `ctx`'s edge map (a
+    /// concrete buffer, or an upstream producer's output keyed by
+    /// [`cell_id`](Pipe::cell_id)), emit the op's device commands, and register its
+    /// output handle(s) under its output pipe(s) — threading
+    /// [`SyncPoints`](crate::record::SyncPoints) where `execute` threads
+    /// [`Deps`].
+    ///
+    /// **Default: not recordable.** Host-touching leaves (`Upload`/`Download`/the
+    /// host seams) and any op with no device-command lowering inherit this error,
+    /// so a graph that reaches one on the CB path falls back to the per-op execute
+    /// path. Device ops (kernels, `fill`, copy, and the structural combinators)
+    /// override it. This replaces the former `RecordableOp` sub-trait: recordability
+    /// is now a **run-time** property (the default errors) rather than a
+    /// compile-time bound, which is what lets the segmenter walk a mixed graph by
+    /// `&dyn DeviceOp` and record only its seam-free subtrees.
+    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
+        let _ = ctx;
+        Err(Error::NotSupported("op is not device-recordable"))
+    }
 }
 
 /// Builder verbs for composing [`DeviceOp`]s. Blanket-implemented.
@@ -4622,20 +4644,6 @@ pub struct AndThen<S, U> {
     next: U,
 }
 
-impl<S, U> crate::record::RecordableOp for AndThen<S, U>
-where
-    S: crate::record::RecordableOp,
-    U: crate::record::RecordableOp,
-{
-    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
-        // Record source first (registers its outputs), then next (which resolves
-        // its inputs from those edges) — the same source-before-next order as
-        // `execute`.
-        self.source.record(ctx)?;
-        self.next.record(ctx)
-    }
-}
-
 impl<S, U> DeviceOp for AndThen<S, U>
 where
     S: DeviceOp,
@@ -4786,6 +4794,17 @@ where
         // seam built in the closure IS visible here.
         self.source.contains_host_seam() || self.next.contains_host_seam()
     }
+
+    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
+        // Record source first (registers its outputs), then next (which resolves
+        // its inputs from those edges) — the same source-before-next order as
+        // `execute`. A non-recordable child (a host seam nested in this subtree)
+        // errors via the `DeviceOp::record` default; the segmenter only records a
+        // subtree once `contains_host_seam()` has proven it seam-free, so on the CB
+        // path this recursion never actually hits the error.
+        self.source.record(ctx)?;
+        self.next.record(ctx)
+    }
 }
 
 // ── Value: lift a host value into the graph ────────────────────────────
@@ -4902,14 +4921,20 @@ pub struct Lift<T: Send> {
 /// Lift an owned resource into the graph (default `Pipe` handle — see [`Lift`]).
 /// With [`value`], together ≈ cuda-oxide's `value` (the by-pipe half, for
 /// non-`Clone` owned resources). Self-rehoming: the graph replays across `sync`s.
-pub fn lift<T: Send + 'static>(v: T) -> Lift<T> {
+///
+/// `T: RecordableBuffer` — a `lift` presents an owned **device** resource (a
+/// buffer / scalar) as a re-homing graph edge, so it carries a recording handle
+/// like every other device leaf; this lets a `lift`ed cell live inside a
+/// command-buffer subtree. (A `Clone` host value you compute on downstream is
+/// [`value`], not `lift`.)
+pub fn lift<T: crate::record::RecordableBuffer + Send + 'static>(v: T) -> Lift<T> {
     Lift {
         input: Input::from(v),
         out: Pipe::new(),
     }
 }
 
-impl<T: Send + 'static> DeviceOp for Lift<T> {
+impl<T: crate::record::RecordableBuffer + Send + 'static> DeviceOp for Lift<T> {
     type Output = T;
     // Default `Handle = Pipe<T>` — a resource flows, it isn't read at build.
 
@@ -4940,14 +4965,9 @@ impl<T: Send + 'static> DeviceOp for Lift<T> {
     fn describe(&self, out: &mut Vec<String>) {
         out.push("lift".into());
     }
-}
 
-impl<T> crate::record::RecordableOp for Lift<T>
-where
-    T: crate::record::RecordableBuffer + Send + 'static,
-{
     fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
-        // Like `Forward`: a lifted concrete buffer is a chain head with no
+        // Like `Forward`: a lifted concrete device resource is a chain head with no
         // command. Resolve its handle from the lift's own `Concrete` cell and
         // register it under the output pipe so downstream consumers find it.
         let concrete = self.input.with_concrete(|b| b.record_handle());
@@ -5015,21 +5035,17 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
     fn describe(&self, out: &mut Vec<String>) {
         out.push("forward".into());
     }
-}
 
-impl<T> crate::record::RecordableOp for Forward<T>
-where
-    T: crate::record::RecordableBuffer + Send + 'static,
-{
     fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
-        // Identity: no command. Resolve the input's handle (this op's concrete
-        // buffer as a chain head, or the upstream producer's output when pipe-
-        // fed) and re-register it under our OWN output pipe's cell, so a
-        // downstream consumer resolving from the forwarded pipe finds the same
-        // buffer with the same pending sync points. Purely a pipe-alias in the
-        // edge map — mirrors `execute`'s resolve+re-deposit with no device work.
-        let concrete = self.input.with_concrete(|b| b.record_handle());
-        let (handle, waits) = ctx.resolve_input(concrete, self.input.pipe_cell_id())?;
+        // Identity: no command. `forward` is ALWAYS pipe-fed (its constructor
+        // wraps a `Pipe`), so there is no concrete buffer to read a handle from —
+        // resolve the upstream producer's output and re-register it under our OWN
+        // output pipe's cell, so a downstream consumer resolving from the forwarded
+        // pipe finds the same buffer with the same pending sync points. Purely a
+        // pipe-alias in the edge map — mirrors `execute`'s resolve+re-deposit with
+        // no device work. Passing `None` for the concrete side keeps this override
+        // free of the `RecordableBuffer` bound (which `execute` also doesn't need).
+        let (handle, waits) = ctx.resolve_input(None, self.input.pipe_cell_id())?;
         ctx.register_output(self.out.cell_id(), handle, waits);
         Ok(())
     }
@@ -5228,18 +5244,14 @@ where
     fn contains_host_seam(&self) -> bool {
         self.source.contains_host_seam()
     }
-}
 
-impl<S> crate::record::RecordableOp for Arced<S>
-where
-    S: crate::record::RecordableOp,
-    S::Output: crate::record::RecordableBuffer + Sync,
-{
     fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
         // `Arc` is a host-side wrap — no command. Record the source (registers
         // its output buffer under the source pipe's cell), then alias that same
         // handle under our own output pipe so a downstream reader of the
-        // `Arc<buffer>` resolves to the underlying buffer + its sync points.
+        // `Arc<buffer>` resolves to the underlying buffer + its sync points. The
+        // source's own `record` errors (via the default) if it is not recordable;
+        // resolving `None`/`Some(src_cell)` needs no `RecordableBuffer` bound.
         self.source.record(ctx)?;
         let src_cell = self.source.output_pipe().cell_id();
         let (handle, waits) = ctx.resolve_input(None, Some(src_cell))?;
@@ -5994,37 +6006,6 @@ pub struct Fill<T: Copy, M: MemMode> {
     out: Pipe<DeviceSlice<T, M>>,
 }
 
-impl<T, M> crate::record::RecordableOp for Fill<T, M>
-where
-    T: Copy + Send + Sync + 'static,
-    M: MemMode + Fillable + Send + 'static,
-{
-    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
-        use crate::record::{BufHandle, MemRef};
-        use opencl3::memory::ClMem;
-        // Resolve the buffer: this op's concrete input (chain head) or the
-        // upstream producer's output (mid-chain, in-place fill).
-        let concrete = self.buf.with_concrete(|b| BufHandle {
-            mem: MemRef::Buffer(b.buffer().get()),
-            byte_len: b.byte_len(),
-        });
-        let (handle, waits) = ctx.resolve_input(concrete, self.buf.pipe_cell_id())?;
-        // Byte pattern of the fill value.
-        // SAFETY: `T: Copy`; read its `size_of::<T>()` bytes.
-        let pattern = unsafe {
-            std::slice::from_raw_parts(
-                (&self.value as *const T) as *const u8,
-                std::mem::size_of::<T>(),
-            )
-        }
-        .to_vec();
-        let sp = ctx.fill_buffer(handle.mem, pattern, 0, handle.byte_len, waits);
-        // Fill is in-place: its output is the same buffer, gated on this command.
-        ctx.register_output(self.out.cell_id(), handle, vec![sp]);
-        Ok(())
-    }
-}
-
 /// Build a fill leaf over an upstream buffer.
 pub fn fill<T, M>(buf: impl Into<Input<DeviceSlice<T, M>>>, value: T) -> Fill<T, M>
 where
@@ -6079,6 +6060,31 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("fill".into());
+    }
+
+    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
+        use crate::record::{BufHandle, MemRef};
+        use opencl3::memory::ClMem;
+        // Resolve the buffer: this op's concrete input (chain head) or the
+        // upstream producer's output (mid-chain, in-place fill).
+        let concrete = self.buf.with_concrete(|b| BufHandle {
+            mem: MemRef::Buffer(b.buffer().get()),
+            byte_len: b.byte_len(),
+        });
+        let (handle, waits) = ctx.resolve_input(concrete, self.buf.pipe_cell_id())?;
+        // Byte pattern of the fill value.
+        // SAFETY: `T: Copy`; read its `size_of::<T>()` bytes.
+        let pattern = unsafe {
+            std::slice::from_raw_parts(
+                (&self.value as *const T) as *const u8,
+                std::mem::size_of::<T>(),
+            )
+        }
+        .to_vec();
+        let sp = ctx.fill_buffer(handle.mem, pattern, 0, handle.byte_len, waits);
+        // Fill is in-place: its output is the same buffer, gated on this command.
+        ctx.register_output(self.out.cell_id(), handle, vec![sp]);
+        Ok(())
     }
 }
 
@@ -8567,8 +8573,12 @@ where
 
 impl<Src, Dst> DeviceOp for CopyTo2<Src, Dst>
 where
-    Src: CopyTo<Dst> + Send + 'static,
-    Dst: Send + 'static,
+    // `RecordableBuffer` on both operands lets the folded `record` override resolve
+    // each concrete buffer's handle (a copy operand is always a device buffer that
+    // satisfies it — `DeviceSlice`/`MappedSlice`/`USMSlice` + their `Uninit` dst
+    // forms), so the CB path records a copy leaf; no observable narrowing.
+    Src: CopyTo<Dst> + Send + crate::record::RecordableBuffer + 'static,
+    Dst: Send + crate::record::RecordableBuffer + 'static,
     Src::Op: Send,
     <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
     // Each input cell knows how to rehome its (possibly retyped) output: src is
@@ -8739,18 +8749,7 @@ where
             rehome_consumed(v, home);
         }
     }
-}
 
-impl<Src, Dst> crate::record::RecordableOp for CopyTo2<Src, Dst>
-where
-    Src: CopyTo<Dst> + Send + crate::record::RecordableBuffer + 'static,
-    Dst: Send + crate::record::RecordableBuffer + 'static,
-    Src::Op: Send,
-    <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
-    // Mirror the `DeviceOp` impl's home bounds (RecordableOp: DeviceOp).
-    Src: CopyHome<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src>,
-    Dst: CopyHome<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
-{
     fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
         // `record_handle` comes from the `RecordableBuffer` bound on Src/Dst.
         // Resolve src + dst (own concrete buffer, or upstream producer edge).

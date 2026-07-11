@@ -35,7 +35,7 @@ fn fill_records_once_replays_twice() {
     let graph = fill(buf, 7u32);
 
     // Record WITHOUT consuming the graph (&self walk).
-    let recorded = graph.record().expect("record");
+    let recorded = graph.record_graph().expect("record");
 
     // Replay the recording on the device twice.
     recorded.replay(&ctx).expect("replay 1");
@@ -69,7 +69,7 @@ fn kernel_records_once_replays_twice() {
 
     // Record scale-by-3 over the concrete buffer (no execution).
     let graph = ks.scale_u32([N], buf, 3u32);
-    let recorded = graph.record().expect("record kernel");
+    let recorded = graph.record_graph().expect("record kernel");
 
     recorded.replay(&ctx).expect("replay 1"); // 1 -> 3
     recorded.replay(&ctx).expect("replay 2"); // 3 -> 9
@@ -96,7 +96,7 @@ fn fill_then_kernel_chain_records_and_replays() {
     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     // fill(buf, 2) -> scale_u32(_, 5): 2 -> 10 per run.
     let graph = fill(buf, 2u32).and_then(|b| ks.scale_u32([N], b, 5u32));
-    let recorded = graph.record().expect("record chain");
+    let recorded = graph.record_graph().expect("record chain");
 
     recorded.replay(&ctx).expect("replay 1");
     recorded.replay(&ctx).expect("replay 2");
@@ -136,7 +136,7 @@ fn multi_output_kernel_records_and_replays() {
     let out = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("out");
 
     let graph = ks.add_u32([N], a, b, out);
-    let recorded = graph.record().expect("record add");
+    let recorded = graph.record_graph().expect("record add");
     recorded.replay(&ctx).expect("replay 1");
     recorded.replay(&ctx).expect("replay 2");
     drop(recorded);
@@ -165,7 +165,7 @@ fn copy_records_and_replays() {
     let dst = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc dst");
 
     let graph = eager_copy_to(src, dst);
-    let recorded = graph.record().expect("record copy");
+    let recorded = graph.record_graph().expect("record copy");
     recorded.replay(&ctx).expect("replay 1");
     recorded.replay(&ctx).expect("replay 2");
     drop(recorded);
@@ -198,7 +198,7 @@ fn copy_to_uninit_dst_records_and_replays() {
     let dst = DeviceSlice::<u32>::alloc_uninit(&ctx, N).expect("uninit dst");
 
     let graph = eager_copy_to(src, dst);
-    let recorded = graph.record().expect("record copy-to-uninit");
+    let recorded = graph.record_graph().expect("record copy-to-uninit");
     recorded.replay(&ctx).expect("replay 1");
     recorded.replay(&ctx).expect("replay 2");
     drop(recorded);
@@ -230,7 +230,7 @@ fn svm_kernel_records_and_replays() {
     let buf = buf.fill(1u32).wait().expect("seed svm");
 
     let graph = ks.scale_u32([N], buf, 3u32);
-    let recorded = graph.record().expect("record svm kernel");
+    let recorded = graph.record_graph().expect("record svm kernel");
     recorded.replay(&ctx).expect("replay 1"); // 1 -> 3
     recorded.replay(&ctx).expect("replay 2"); // 3 -> 9
     drop(recorded);
@@ -259,7 +259,7 @@ fn cl_mem_graph_uses_command_buffer() {
         .wait()
         .expect("seed");
     let graph = ks.scale_u32([N], buf, 5u32);
-    let recorded = graph.record().expect("record");
+    let recorded = graph.record_graph().expect("record");
 
     assert!(
         !recorded.using_command_buffer(),
@@ -314,7 +314,7 @@ fn fill_replays_many_times() {
     let Some(ctx) = ctx() else { return };
     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let graph = fill(buf, 0xABCD_u32);
-    let recorded = graph.record().expect("record");
+    let recorded = graph.record_graph().expect("record");
     for i in 0..16 {
         recorded
             .replay(&ctx)
@@ -350,7 +350,7 @@ fn forward_selects_and_records_into_command_buffer() {
         .add_u32([N], a, b, out)
         .and_then(|(_a, _b, out)| forward(out))
         .and_then(|out| ks.scale_u32([N], out, 2u32));
-    let recorded = graph.record().expect("record forward graph");
+    let recorded = graph.record_graph().expect("record forward graph");
 
     // `add_u32` OVERWRITES `out = a + b` each run (not in-place accumulate), and
     // a/b are stable concrete inputs, so every full replay deterministically
