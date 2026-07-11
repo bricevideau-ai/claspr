@@ -281,9 +281,23 @@ fn cl_mem_graph_uses_command_buffer() {
     );
     // The CB fast path engages only where `cl_khr_command_buffer` is supported
     // (pocl 7.2-pre yes; legacy Intel NEO / older platforms no → software
-    // fallback, which gives the SAME result, asserted above). We have no
-    // capability query to gate on, so just report which path ran rather than
-    // hard-assert a platform-specific outcome. Both paths are correct.
+    // fallback, which gives the SAME result, asserted above). Now that we have a
+    // capability query, hard-assert the path matches the capability: a device
+    // that advertises the extension MUST have taken the CB path (else the record
+    // layer silently regressed to software); a device without it MUST have used
+    // software.
+    if ctx.has_cl_khr_command_buffer() {
+        assert!(
+            cb_built,
+            "device advertises cl_khr_command_buffer but the recording fell back \
+             to software replay"
+        );
+    } else {
+        assert!(
+            !cb_built,
+            "device lacks cl_khr_command_buffer but a command buffer was built"
+        );
+    }
     eprintln!(
         "record/replay backend: {}",
         if cb_built {

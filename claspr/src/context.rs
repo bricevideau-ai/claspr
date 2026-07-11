@@ -503,6 +503,38 @@ impl Context {
         SvmLevel::from_caps(caps)
     }
 
+    // ── Command-buffer capability ──────────────────────────────────
+
+    /// Whether the primary device advertises `cl_khr_command_buffer` — the
+    /// prerequisite for recording a graph into a real `cl_khr_command_buffer`
+    /// and replaying it with one `clEnqueueCommandBufferKHR` (see
+    /// [`crate::record`]). When absent, recorded graphs fall back to software
+    /// replay (re-enqueuing each command). Checks the device extension string;
+    /// a whitespace-delimited token match so it won't false-positive on
+    /// `cl_khr_command_buffer_mutable_dispatch` etc.
+    pub fn has_cl_khr_command_buffer(&self) -> bool {
+        self.device_has_extension("cl_khr_command_buffer")
+    }
+
+    /// Whether the primary device advertises
+    /// `cl_khr_command_buffer_mutable_dispatch` — record once, then rebind
+    /// buffers/args per replay via `clUpdateMutableCommandsKHR` (the reusable
+    /// command-buffer path; a later layer on top of the immutable recording).
+    pub fn has_cl_khr_command_buffer_mutable_dispatch(&self) -> bool {
+        self.device_has_extension("cl_khr_command_buffer_mutable_dispatch")
+    }
+
+    /// Exact-token check against the primary device's `CL_DEVICE_EXTENSIONS`
+    /// string (space-delimited), so a substring like `cl_khr_command_buffer`
+    /// does not match the longer `cl_khr_command_buffer_mutable_dispatch`.
+    fn device_has_extension(&self, ext: &str) -> bool {
+        self.inner.devices[0]
+            .cl3()
+            .extensions()
+            .map(|s| s.split_whitespace().any(|tok| tok == ext))
+            .unwrap_or(false)
+    }
+
     // ── Sticky-error counter ───────────────────────────────────────
 
     /// How many sticky errors have been recorded by Drop impls.

@@ -10,10 +10,12 @@
 //! [`record`](RecordExt::record) walks the graph by `&self` and builds a
 //! software command list (the portable IR). On the first [`replay`]:
 //! - if the platform supports `cl_khr_command_buffer` and the recording is
-//!   all-`cl_mem` (the extension has no SVM command variants), the list is
-//!   compiled **once** into a real command buffer and cached — subsequent
-//!   replays are a single `clEnqueueCommandBufferKHR`;
-//! - otherwise (no extension, or SVM commands) replay re-issues the software
+//!   all-`cl_mem` (the SVM command variants — `clCommandSVMMemcpyKHR` /
+//!   `clCommandSVMMemFillKHR`, extension >= 0.9.4 — are not yet wired here;
+//!   see the `cb_eligible` TODO), the list is compiled **once** into a real
+//!   command buffer and cached — subsequent replays are a single
+//!   `clEnqueueCommandBufferKHR`;
+//! - otherwise (no extension, or an SVM command) replay re-issues the software
 //!   list with fresh events each call.
 //!
 //! Either way the result is identical; [`RecordedGraph::using_command_buffer`]
@@ -639,8 +641,9 @@ pub trait RecordableOp: DeviceOp {
 ///
 /// The software command list is the portable IR. On the first replay, if the
 /// platform supports `cl_khr_command_buffer` AND the recording is all-`cl_mem`
-/// (no SVM — the extension has no SVM command variants), the list is compiled
-/// once into a real command buffer and cached; subsequent replays are a single
+/// (SVM CB commands exist — `clCommandSVMMem{cpy,Fill}KHR` — but are not yet
+/// wired, so SVM recordings currently take the software path), the list is
+/// compiled once into a real command buffer and cached; subsequent replays are a single
 /// `clEnqueueCommandBufferKHR`. Otherwise (no extension / SVM commands), replay
 /// re-issues the software list with fresh events each call. Either way the
 /// observable result is identical.
@@ -675,8 +678,12 @@ impl RecordedGraph<'_> {
         self.cb.lock().unwrap().is_some()
     }
 
-    /// True if every command is `cl_mem`-backed (the CB extension has no SVM
-    /// command variants, so an SVM recording must use software replay).
+    /// True if every command is `cl_mem`-backed. SVM commands currently force
+    /// software replay — NOT because the extension lacks SVM variants (it has
+    /// `clCommandSVMMemcpyKHR` / `clCommandSVMMemFillKHR`, OpenCL 2.0+, ext
+    /// >= 0.9.4), but because those entry points aren't wired into
+    /// [`CommandBufferExt`] yet. TODO: resolve the SVM command PFNs and emit
+    /// them for `MemRef::Svm`, then allow SVM recordings into the CB.
     fn cb_eligible(&self) -> bool {
         self.commands.iter().all(|c| match c {
             SoftCommand::Fill { buffer, .. } => matches!(buffer, MemRef::Buffer(_)),
@@ -851,8 +858,9 @@ impl RecordedGraph<'_> {
                         ptr::null_mut(),
                     )
                 },
-                // SVM commands can't be in a CB; cb_eligible() already excluded
-                // these, so this is unreachable.
+                // SVM commands aren't wired into the CB yet (see `cb_eligible`),
+                // so it already excluded these — unreachable until the SVM CB
+                // command PFNs are resolved.
                 _ => return None,
             };
             if st != opencl_sys::CL_SUCCESS {
