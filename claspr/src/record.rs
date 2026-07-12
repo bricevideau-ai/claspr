@@ -88,6 +88,7 @@ use opencl_sys::{
 /// The `cl_khr_command_buffer` entry points, resolved for one platform. Each
 /// field is the opencl-sys PFN typedef (`Option<unsafe extern "C" fn …>`);
 /// `None` means the loader returned a null address.
+#[derive(Clone, Copy)]
 struct CommandBufferExt {
     create: clCreateCommandBufferKHR_t,
     finalize: clFinalizeCommandBufferKHR_t,
@@ -177,6 +178,357 @@ unsafe impl Sync for RecordedCb {}
 impl Drop for RecordedCb {
     fn drop(&mut self) {
         unsafe { (self.release)(self.cb) };
+    }
+}
+
+// ── CbBuilder / FinalizedCb: the CB-as-EXECUTION-MODE toolkit (design v2) ────
+//
+// Unlike `RecordedGraph` (record-then-replay: a separate software IR pass that is
+// later compiled to a CB), `CbBuilder` is a LIVE command buffer that the SAME
+// execution walk adds commands to as it descends — "a node adds itself to the CB
+// INSTEAD of enqueuing". Commands are `clCommand*KHR` calls that return
+// `cl_sync_point_khr` MARKERS (the CB-internal ordering primitive). When the walk
+// finishes, the homing node `finalize()`s the builder into a `FinalizedCb` and
+// caches the `Arc<FinalizedCb>` in its OWN cb-cache field; subsequent syncs replay
+// via one `clEnqueueCommandBufferKHR`.
+//
+// A `CbBuilder` is INTERIOR-MUTABLE (the live `cl_command_buffer_khr` handle plus
+// a `Mutex` guarding eligibility state) so it can be threaded DOWN the walk as a
+// shared `&CbBuilder`: bundle siblings all add to the SAME builder, while a
+// seam-boundary child is simply handed `None` and opens its own. This is what
+// makes the per-node CB-visibility POSITIONAL without any save/restore.
+
+/// A live `cl_khr_command_buffer` being built by the execution walk. Each device
+/// leaf that is "in CB mode" calls [`fill_buffer`](Self::fill_buffer) /
+/// [`copy_buffer`](Self::copy_buffer) / [`ndrange_kernel`](Self::ndrange_kernel),
+/// which add a `clCommand*KHR` to the buffer and return the command's
+/// [`cl_sync_point_khr`] MARKER; a consumer inside the same CB waits on its
+/// producer's markers. When the walk completes, the homing node calls
+/// [`finalize`](Self::finalize) to seal it into a [`FinalizedCb`].
+pub struct CbBuilder {
+    cb: cl_command_buffer_khr,
+    queue: cl_command_queue,
+    ext: CommandBufferExt,
+    /// Kernels retained at build (`clRetainKernel`), released when the
+    /// [`FinalizedCb`] drops — the CB references them for its whole lifetime.
+    kernels: Mutex<Vec<cl_kernel>>,
+    /// Set false if any command could not be added (e.g. an SVM buffer, which the
+    /// CB command PFNs don't yet cover — see [`RecordedGraph::cb_eligible`]). A
+    /// non-eligible builder is discarded and the caller falls back to per-op
+    /// execute.
+    eligible: Mutex<bool>,
+}
+
+// SAFETY: the CB / queue / kernel handles are opaque handles into the
+// internally-synchronized runtime; the ext PFNs are plain fn pointers. The
+// interior state is `Mutex`-guarded.
+unsafe impl Send for CbBuilder {}
+unsafe impl Sync for CbBuilder {}
+
+impl CbBuilder {
+    /// Create a fresh live command buffer over `queue` (single-queue CB). Returns
+    /// `None` if the extension's lifecycle isn't reachable for `platform`.
+    pub fn new(platform: cl_platform_id, queue: cl_command_queue) -> Option<Self> {
+        let ext = CommandBufferExt::load(platform)?;
+        let create = ext.create?;
+        let mut q = queue;
+        let mut err: opencl_sys::cl_int = 0;
+        // SAFETY: `create` is the resolved clCreateCommandBufferKHR for `platform`;
+        // one queue, default properties.
+        let cb = unsafe { create(1, &mut q as *mut _, ptr::null(), &mut err) };
+        if err != opencl_sys::CL_SUCCESS || cb.is_null() {
+            return None;
+        }
+        Some(CbBuilder {
+            cb,
+            queue,
+            ext,
+            kernels: Mutex::new(Vec::new()),
+            eligible: Mutex::new(true),
+        })
+    }
+
+    /// Mark the build as ineligible (an SVM command or a failed add) so the homing
+    /// node discards it and falls back to per-op execute.
+    fn mark_ineligible(&self) {
+        *self.eligible.lock().unwrap() = false;
+    }
+
+    /// Add a buffer fill to the CB. `mem` must be a `cl_mem` (SVM marks the build
+    /// ineligible). Returns the command's sync point, or `None` on any shortfall.
+    pub fn fill_buffer(
+        &self,
+        mem: MemRef,
+        pattern: &[u8],
+        offset: usize,
+        size: usize,
+        waits: &[cl_sync_point_khr],
+    ) -> Option<cl_sync_point_khr> {
+        let m = match mem {
+            MemRef::Buffer(m) => m,
+            MemRef::Svm(_) => {
+                self.mark_ineligible();
+                return None;
+            }
+        };
+        let fill = self.ext.fill_buffer?;
+        let (wptr, n) = wait_ptr(waits);
+        let mut sp: cl_sync_point_khr = 0;
+        // SAFETY: live CB + queue; `m` a valid cl_mem kept alive by the graph;
+        // `pattern` outlives the call; `waits` are markers from this same CB.
+        let st = unsafe {
+            fill(
+                self.cb,
+                self.queue,
+                ptr::null(),
+                m as opencl_sys::cl_mem,
+                pattern.as_ptr() as *const c_void,
+                pattern.len(),
+                offset,
+                size,
+                n,
+                wptr,
+                &mut sp,
+                ptr::null_mut(),
+            )
+        };
+        if st != opencl_sys::CL_SUCCESS {
+            self.mark_ineligible();
+            return None;
+        }
+        Some(sp)
+    }
+
+    /// Add a device-to-device copy to the CB (both `cl_mem`). Returns its sync
+    /// point, or `None` on any shortfall (SVM marks the build ineligible).
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_buffer(
+        &self,
+        src: MemRef,
+        dst: MemRef,
+        src_offset: usize,
+        dst_offset: usize,
+        size: usize,
+        waits: &[cl_sync_point_khr],
+    ) -> Option<cl_sync_point_khr> {
+        let (s, d) = match (src, dst) {
+            (MemRef::Buffer(s), MemRef::Buffer(d)) => (s, d),
+            _ => {
+                self.mark_ineligible();
+                return None;
+            }
+        };
+        let copy = self.ext.copy_buffer?;
+        let (wptr, n) = wait_ptr(waits);
+        let mut sp: cl_sync_point_khr = 0;
+        // SAFETY: as `fill_buffer`.
+        let st = unsafe {
+            copy(
+                self.cb,
+                self.queue,
+                ptr::null(),
+                s as opencl_sys::cl_mem,
+                d as opencl_sys::cl_mem,
+                src_offset,
+                dst_offset,
+                size,
+                n,
+                wptr,
+                &mut sp,
+                ptr::null_mut(),
+            )
+        };
+        if st != opencl_sys::CL_SUCCESS {
+            self.mark_ineligible();
+            return None;
+        }
+        Some(sp)
+    }
+
+    /// Add an ND-range kernel launch to the CB. The kernel's args must already be
+    /// set (the caller sets them at build time, exactly like the software record
+    /// path). The kernel is retained for the CB's lifetime. Returns its sync point.
+    ///
+    /// # Safety
+    /// `kernel` must be a valid `cl_kernel` whose args are set to the buffers this
+    /// launch uses; `waits` must be sync points from this same CB.
+    pub unsafe fn ndrange_kernel(
+        &self,
+        kernel: cl_kernel,
+        global: &[usize],
+        local: &[usize],
+        waits: &[cl_sync_point_khr],
+    ) -> Option<cl_sync_point_khr> {
+        let ndr = self.ext.ndrange_kernel?;
+        // Own a refcount for the CB's lifetime.
+        if unsafe { cl3::kernel::retain_kernel(kernel) }.is_err() {
+            self.mark_ineligible();
+            return None;
+        }
+        self.kernels.lock().unwrap().push(kernel);
+        let (wptr, n) = wait_ptr(waits);
+        let mut sp: cl_sync_point_khr = 0;
+        // SAFETY: live CB + queue; kernel valid + args set + retained; `waits` are
+        // markers from this same CB.
+        let st = unsafe {
+            ndr(
+                self.cb,
+                self.queue,
+                ptr::null(),
+                kernel as opencl_sys::cl_kernel,
+                global.len() as cl_uint,
+                ptr::null(),
+                global.as_ptr(),
+                if local.is_empty() {
+                    ptr::null()
+                } else {
+                    local.as_ptr()
+                },
+                n,
+                wptr,
+                &mut sp,
+                ptr::null_mut(),
+            )
+        };
+        if st != opencl_sys::CL_SUCCESS {
+            self.mark_ineligible();
+            return None;
+        }
+        Some(sp)
+    }
+
+    /// Whether every command added so far is CB-eligible (all `cl_mem`, no failed
+    /// add). A `false` here means the homing node must discard the builder and fall
+    /// back to the per-op execute path.
+    pub fn is_eligible(&self) -> bool {
+        *self.eligible.lock().unwrap()
+    }
+
+    /// Finalize the live CB into a replayable [`FinalizedCb`]. Consumes the builder
+    /// (a CB is sealed exactly once). Returns `None` if finalize fails or the build
+    /// was marked ineligible — the caller then releases nothing extra (the
+    /// builder's `Drop` releases the CB + kernels).
+    pub fn finalize(self) -> Option<FinalizedCb> {
+        if !self.is_eligible() {
+            return None;
+        }
+        let finalize = self.ext.finalize?;
+        // SAFETY: sealing the live CB built above.
+        if unsafe { finalize(self.cb) } != opencl_sys::CL_SUCCESS {
+            return None;
+        }
+        // Move the CB + retained kernels into the FinalizedCb; neutralize `self`'s
+        // Drop so it does not release the handle we just handed over.
+        let cb = self.cb;
+        let queue = self.queue;
+        let enqueue = self.ext.enqueue?;
+        let release = self.ext.release?;
+        let kernels = std::mem::take(&mut *self.kernels.lock().unwrap());
+        // Prevent the builder's Drop from releasing what we moved out.
+        std::mem::forget(self);
+        Some(FinalizedCb {
+            cb,
+            queue,
+            enqueue,
+            release,
+            kernels,
+        })
+    }
+}
+
+impl Drop for CbBuilder {
+    fn drop(&mut self) {
+        // Only reached on the DISCARD path (finalize `forget`s a successful build).
+        // Release the retained kernels, then the CB.
+        for k in self.kernels.lock().unwrap().drain(..) {
+            let _ = unsafe { cl3::kernel::release_kernel(k) };
+        }
+        if let Some(release) = self.ext.release {
+            unsafe { release(self.cb) };
+        }
+    }
+}
+
+/// A finalized, replayable command buffer homed in a graph node's cb-cache field.
+/// Replay is one [`enqueue`](Self::enqueue) (`clEnqueueCommandBufferKHR`) returning
+/// a completion event. RAII-releases the CB + its retained kernels on drop, so the
+/// cache "drops with the graph" (no global table, no ABA).
+pub struct FinalizedCb {
+    cb: cl_command_buffer_khr,
+    queue: cl_command_queue,
+    enqueue: unsafe extern "C" fn(
+        cl_uint,
+        *mut cl_command_queue,
+        cl_command_buffer_khr,
+        cl_uint,
+        *const cl_event,
+        *mut cl_event,
+    ) -> opencl_sys::cl_int,
+    release: unsafe extern "C" fn(cl_command_buffer_khr) -> opencl_sys::cl_int,
+    kernels: Vec<cl_kernel>,
+}
+
+// SAFETY: as `RecordedCb` — opaque handles + plain fn pointers.
+unsafe impl Send for FinalizedCb {}
+unsafe impl Sync for FinalizedCb {}
+
+impl FinalizedCb {
+    /// The queue this CB was finalized for — the homing node checks a cached CB is
+    /// valid for the current sync's queue before replaying.
+    pub fn queue(&self) -> cl_command_queue {
+        self.queue
+    }
+
+    /// Enqueue the whole CB on its queue with `wait` as the EXTERNAL `cl_event`
+    /// wait-list (the event↔sync-point boundary: external deps apply ONLY here,
+    /// never on the CB-internal `clCommand*KHR` commands). Returns the completion
+    /// event wrapped for the pipe/Deps path.
+    pub fn enqueue(&self, wait: &[cl_event]) -> Result<crate::Event> {
+        let mut queue = self.queue;
+        let (wptr, n) = wait_ptr_ev(wait);
+        let mut event: cl_event = ptr::null_mut();
+        // SAFETY: finalized CB for `queue`; `wait` are live events.
+        let status = unsafe {
+            (self.enqueue)(
+                1,
+                &mut queue as *mut cl_command_queue,
+                self.cb,
+                n,
+                wptr,
+                &mut event,
+            )
+        };
+        if status != opencl_sys::CL_SUCCESS {
+            return Err(Error::OpenCl(opencl3::error_codes::ClError(status)));
+        }
+        Ok(crate::Event::new(event))
+    }
+}
+
+impl Drop for FinalizedCb {
+    fn drop(&mut self) {
+        for k in self.kernels.drain(..) {
+            let _ = unsafe { cl3::kernel::release_kernel(k) };
+        }
+        unsafe { (self.release)(self.cb) };
+    }
+}
+
+/// `(ptr, count)` for a sync-point wait-list (null when empty).
+fn wait_ptr(waits: &[cl_sync_point_khr]) -> (*const cl_sync_point_khr, cl_uint) {
+    if waits.is_empty() {
+        (ptr::null(), 0)
+    } else {
+        (waits.as_ptr(), waits.len() as cl_uint)
+    }
+}
+
+/// `(ptr, count)` for a `cl_event` wait-list (null when empty).
+fn wait_ptr_ev(waits: &[cl_event]) -> (*const cl_event, cl_uint) {
+    if waits.is_empty() {
+        (ptr::null(), 0)
+    } else {
+        (waits.as_ptr(), waits.len() as cl_uint)
     }
 }
 
