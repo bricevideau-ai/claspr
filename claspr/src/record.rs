@@ -65,7 +65,7 @@ use crate::eager::DeviceOp;
 use crate::error::{Error, Result};
 use crate::queue::Launcher;
 use opencl3::types::{cl_command_queue, cl_event, cl_kernel, cl_mem, cl_uint};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::{CStr, c_void};
 use std::marker::PhantomData;
 use std::ptr;
@@ -297,7 +297,7 @@ impl CbBuilder {
         pattern: &[u8],
         offset: usize,
         size: usize,
-        waits: &[cl_sync_point_khr],
+        waits: &BTreeSet<cl_sync_point_khr>,
     ) -> Option<cl_sync_point_khr> {
         let m = match mem {
             MemRef::Buffer(m) => m,
@@ -307,7 +307,8 @@ impl CbBuilder {
             }
         };
         let fill = self.ext.fill_buffer?;
-        let (wptr, n) = wait_ptr(waits);
+        let waits: Vec<cl_sync_point_khr> = waits.iter().copied().collect();
+        let (wptr, n) = wait_ptr(&waits);
         let mut sp: cl_sync_point_khr = 0;
         // SAFETY: live CB + queue; `m` a valid cl_mem kept alive by the graph;
         // `pattern` outlives the call; `waits` are markers from this same CB.
@@ -345,7 +346,7 @@ impl CbBuilder {
         src_offset: usize,
         dst_offset: usize,
         size: usize,
-        waits: &[cl_sync_point_khr],
+        waits: &BTreeSet<cl_sync_point_khr>,
     ) -> Option<cl_sync_point_khr> {
         let (s, d) = match (src, dst) {
             (MemRef::Buffer(s), MemRef::Buffer(d)) => (s, d),
@@ -355,7 +356,8 @@ impl CbBuilder {
             }
         };
         let copy = self.ext.copy_buffer?;
-        let (wptr, n) = wait_ptr(waits);
+        let waits: Vec<cl_sync_point_khr> = waits.iter().copied().collect();
+        let (wptr, n) = wait_ptr(&waits);
         let mut sp: cl_sync_point_khr = 0;
         // SAFETY: as `fill_buffer`.
         let st = unsafe {
@@ -492,7 +494,7 @@ impl CbBuilder {
         kernel: cl_kernel,
         global: &[usize],
         local: &[usize],
-        waits: &[cl_sync_point_khr],
+        waits: &BTreeSet<cl_sync_point_khr>,
     ) -> Option<cl_sync_point_khr> {
         let ndr = self.ext.ndrange_kernel?;
         // Own a refcount for the CB's lifetime.
@@ -501,7 +503,12 @@ impl CbBuilder {
             return None;
         }
         self.kernels.lock().unwrap().push(kernel);
-        let (wptr, n) = wait_ptr(waits);
+        // Materialize the set into the contiguous slice the C call needs. The
+        // wait-list is a SET (wait for all markers; order irrelevant) — carrying it
+        // as a `BTreeSet` up to here means a consumer reading two pipes of one
+        // producer can't submit that marker twice.
+        let waits: Vec<cl_sync_point_khr> = waits.iter().copied().collect();
+        let (wptr, n) = wait_ptr(&waits);
         let mut sp: cl_sync_point_khr = 0;
         // SAFETY: live CB + queue; kernel valid + args set + retained; `waits` are
         // markers from this same CB.

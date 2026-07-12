@@ -22,7 +22,7 @@
 
 use crate::{CommandQueue, Context, Device, Error, Launcher};
 use opencl_sys::cl_sync_point_khr;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -37,7 +37,7 @@ use std::thread::JoinHandle;
 /// unlike the CB-visibility, which must be per-subtree. `cl_event` deps still
 /// flow through the pipes; only these CB-internal markers ride here. Live for one
 /// `sync` (a fresh `ExecutionContext` is built per terminal call).
-pub type SyncPointEdges = Arc<Mutex<HashMap<usize, Vec<cl_sync_point_khr>>>>;
+pub type SyncPointEdges = Arc<Mutex<HashMap<usize, BTreeSet<cl_sync_point_khr>>>>;
 
 /// The command-buffer walk mode for a walk position (design v2, CB-as-execution-
 /// mode). Threaded IMMUTABLY in each [`ExecutionContext`] value; positional
@@ -279,7 +279,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// predecessor) or has not run yet. The CB-mode fork uses this as a leaf's
     /// `sync_point_wait_list`. `None` upstream cell (a concrete/slot input, no
     /// pipe) yields no markers.
-    pub fn sp_lookup(&self, cell_id: Option<usize>) -> Vec<cl_sync_point_khr> {
+    pub fn sp_lookup(&self, cell_id: Option<usize>) -> BTreeSet<cl_sync_point_khr> {
         match cell_id {
             Some(id) => self
                 .sp_edges
@@ -288,13 +288,13 @@ impl<'ctx> ExecutionContext<'ctx> {
                 .get(&id)
                 .cloned()
                 .unwrap_or_default(),
-            None => Vec::new(),
+            None => BTreeSet::new(),
         }
     }
 
     /// Register a producer's output command sync point(s) under its output pipe's
     /// `cell_id`, so a CB-internal consumer resolves them via [`sp_lookup`](Self::sp_lookup).
-    pub fn sp_register(&self, cell_id: usize, sps: Vec<cl_sync_point_khr>) {
+    pub fn sp_register(&self, cell_id: usize, sps: BTreeSet<cl_sync_point_khr>) {
         self.sp_edges.lock().unwrap().insert(cell_id, sps);
     }
 

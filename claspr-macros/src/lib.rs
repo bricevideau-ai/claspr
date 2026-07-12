@@ -1205,7 +1205,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
             quote! {
                 __claspr_cb_ec.sp_register(
                     ::claspr::Pipe::cell_id(&#p),
-                    ::std::vec![__claspr_cb_sp],
+                    ::std::collections::BTreeSet::from([__claspr_cb_sp]),
                 );
                 #p.put_home(#name, ::claspr::Deps::new(), #home);
             }
@@ -1233,8 +1233,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     #collect_ext
                     let __claspr_cb_kernel = ::claspr::Kernel::get(&self.kernel);
                     let mut __claspr_cb_argi: ::claspr::cl_uint = 0;
-                    let mut __claspr_cb_waits: ::std::vec::Vec<::claspr::cl_sync_point_khr> =
-                        ::std::vec::Vec::new();
+                    // A SET, not a Vec: a consumer reading two pipes of the same
+                    // multi-output producer (e.g. gray-scott `combine` reading both a
+                    // `laplacian`'s field + scratch outputs) would `extend` that
+                    // producer's sync point twice. A wait-list is semantically a set
+                    // (wait for ALL listed markers; order irrelevant), so accumulating
+                    // into a `BTreeSet` makes duplicates impossible at the source.
+                    let mut __claspr_cb_waits: ::std::collections::BTreeSet<::claspr::cl_sync_point_khr> =
+                        ::std::collections::BTreeSet::new();
                     let mut __claspr_cb_out_handles: ::std::vec::Vec<::claspr::BufHandle> =
                         ::std::vec::Vec::new();
                     let _ = &mut __claspr_cb_out_handles; // may be unused (no buffer args)

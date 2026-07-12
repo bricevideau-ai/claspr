@@ -7061,7 +7061,7 @@ where
                 };
                 let byte_len = buf.byte_len();
                 if let Some(sp) = builder.fill_buffer(mem, pattern, 0, byte_len, &waits) {
-                    ec.sp_register(self.out.cell_id(), vec![sp]);
+                    ec.sp_register(self.out.cell_id(), std::collections::BTreeSet::from([sp]));
                 }
                 // Deposit the (lent) buffer with EMPTY cl_event deps — ordering is
                 // the CB-internal sync points, not events.
@@ -9811,8 +9811,14 @@ where
         let (dst_h, dst_w) = ctx.resolve_input(dst_concrete, self.dst.pipe_cell_id())?;
         // The copy moves `min(src,dst)` bytes (both equal in practice).
         let size = src_h.byte_len.min(dst_h.byte_len);
-        let mut waits = src_w;
-        waits.extend(dst_w);
+        // Merge src + dst producer edges through a set: if both resolve to the same
+        // upstream producer, its sync point must appear ONCE (a wait-list is a set).
+        let waits: Vec<_> = src_w
+            .into_iter()
+            .chain(dst_w)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let sp = ctx.copy_buffer(src_h.mem, dst_h.mem, 0, 0, size, waits);
         // Output is `(src, dst)`; both element pipes carry their handle, gated on
         // the copy. (The dst is now initialised — its bytes were written.)
