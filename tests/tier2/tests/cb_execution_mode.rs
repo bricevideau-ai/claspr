@@ -9,7 +9,13 @@
 use claspr::Context;
 use claspr::DeviceSlice;
 use claspr::eager::{DeviceOp, DeviceOpExt, fill};
+use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
+
+// A scalar (by-value) scale factor slot — `mutate_bind(Factor(v))` changes it.
+slots! {
+    Factor: u32,
+}
 
 const N: usize = 64;
 
@@ -262,4 +268,59 @@ fn host_seam_segments_into_multiple_command_buffers() {
         !homed_cb(&g),
         "a host-seam graph's ROOT must not home a single whole-graph CB"
     );
+}
+
+/// MUTATION INVALIDATION (step 6): a homed command buffer captures the concrete
+/// buffers/args it was built with. `mutate_bind`/`mutate_call` re-binding a slot
+/// must INVALIDATE the CB (clear the cb_cache) so the NEXT sync rebuilds it and the
+/// new binding takes effect — a stale CB would silently keep computing the OLD
+/// value. Here a `slot!(Factor)` scale factor is mutated between syncs; the result
+/// must reflect the NEW factor, and the CB must be a DIFFERENT Arc after the mutate.
+#[test]
+fn mutate_invalidates_and_rebuilds_command_buffer() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
+
+    // fill(buf,1) -> scale_u32(buf, Factor). Factor is an unbound scalar slot.
+    let g = fill(buf, 1u32).and_then(|b| ks.scale_u32([N], b, slot!(Factor)));
+
+    // Bind Factor=3, sync: 1*3 = 3. Homes the CB.
+    g.mutate_bind(Factor(3u32)).expect("bind factor 3");
+    let co = g.sync(&ctx).expect("sync 1");
+    let g1 = co.map().wait().expect("read 1");
+    assert!(g1.iter().all(|&v| v == 3), "factor 3: {:?}", &g1[..8]);
+    drop(g1);
+    let id1 = homed_cb_id(&g);
+    drop(co);
+
+    // Mutate Factor=5: MUST invalidate the homed CB.
+    g.mutate_bind(Factor(5u32)).expect("mutate factor 5");
+    if ctx.has_cl_khr_command_buffer() {
+        assert_eq!(
+            homed_cb_id(&g),
+            0,
+            "mutate_bind must clear the homed CB (invalidation) — it is still cached"
+        );
+    }
+
+    // Next sync: 1*5 = 5 (new factor took effect), and a FRESH CB is built.
+    let co = g.sync(&ctx).expect("sync 2");
+    let g2 = co.map().wait().expect("read 2");
+    assert!(
+        g2.iter().all(|&v| v == 5),
+        "after mutate to factor 5, expected 5, got {:?} — stale CB kept the old factor",
+        &g2[..8]
+    );
+    drop(g2);
+    let id2 = homed_cb_id(&g);
+    drop(co);
+
+    if ctx.has_cl_khr_command_buffer() {
+        assert_ne!(id2, 0, "sync after mutate should rebuild a CB");
+        assert_ne!(
+            id1, id2,
+            "the rebuilt CB must be a DIFFERENT finalized CB than the pre-mutate one"
+        );
+    }
 }
