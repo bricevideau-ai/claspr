@@ -21,8 +21,71 @@
 //! [`Launcher`]: crate::Launcher
 
 use crate::{CommandQueue, Context, Device, Error, Launcher};
+use opencl_sys::cl_sync_point_khr;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+
+/// The CB-internal marker edge-map (design v2): a producer inside a command
+/// buffer registers its output command's [`cl_sync_point_khr`]s under its output
+/// pipe's [`cell_id`](crate::Pipe::cell_id); a consumer inside the SAME CB looks
+/// them up by its input's upstream cell id to build its `sync_point_wait_list`.
+///
+/// This is the "return markers UP" channel that the spec pairs with the
+/// forwarded-CB "down" channel. It is legitimately AMBIENT (shared behind
+/// `Arc<Mutex>`, keyed by globally-unique cell ids) rather than positional —
+/// unlike the CB-visibility, which must be per-subtree. `cl_event` deps still
+/// flow through the pipes; only these CB-internal markers ride here. Live for one
+/// `sync` (a fresh `ExecutionContext` is built per terminal call).
+pub type SyncPointEdges = Arc<Mutex<HashMap<usize, Vec<cl_sync_point_khr>>>>;
+
+/// The command-buffer walk mode for a walk position (design v2, CB-as-execution-
+/// mode). Threaded IMMUTABLY in each [`ExecutionContext`] value; positional
+/// visibility comes from each recursion arm building its own child value (see
+/// [`ExecutionContext::with_cb`]).
+///
+/// Three states because a REPLAY still has to re-walk the graph to LEND buffers
+/// and build the terminal `Checkout`s (the buffers flow every run for stable
+/// handles + rehoming) — it just must not re-ENQUEUE / re-ADD the device work the
+/// cached CB already carries:
+/// - [`Off`](CbWalk::Off) — no command buffer here; a device leaf ENQUEUES
+///   normally (the current per-op path). A CB-capable node that sees `Off` and is
+///   the outermost CB-eligible node of its subtree is the CB BOUNDARY: it
+///   builds-or-replays a CB (in the terminal / at a host seam), forwarding `Build`
+///   or `LendOnly` to its children.
+/// - [`Build`](CbWalk::Build) — inside a CB being BUILT: a device leaf resolves
+///   (lends) its buffer, ADDS its command to the builder (recording a
+///   [`cl_sync_point_khr`]), and fills its output pipe with EMPTY `cl_event` deps
+///   (ordering is the sync points, not events).
+/// - [`LendOnly`](CbWalk::LendOnly) — inside a CB being REPLAYED: a device leaf
+///   resolves (lends) its buffer and fills its output pipe with empty deps, but
+///   ADDS NOTHING and ENQUEUES NOTHING (the cached CB does the work). This is what
+///   lets a replay materialize buffers + build `Checkout`s without re-executing
+///   device work — the double-execution hazard the superseded design hit,
+///   dissolved by making replay a lend-only pass of the SAME walk.
+#[derive(Clone, Copy)]
+pub(crate) enum CbWalk<'a> {
+    Off,
+    Build {
+        /// The live command buffer this subtree adds its commands to.
+        builder: &'a crate::record::CbBuilder,
+        /// The EXTERNAL `cl_event` dep accumulator for THIS command buffer (the
+        /// event↔sync-point boundary). A leaf whose resolved input carries a
+        /// NON-EMPTY `cl_event` wait-list — a producer OUTSIDE this CB (a host
+        /// step, or the start gate) — pushes those events here; the homing node
+        /// waits on them at `clEnqueueCommandBufferKHR`. Producers INSIDE the CB
+        /// deposit EMPTY `cl_event` deps (their ordering is the CB-internal sync
+        /// points), so nothing internal lands here. Owned on the boundary node's
+        /// stack; fresh per CB, so nested CBs never mix external deps.
+        ext: &'a Mutex<Vec<crate::eager::Dep>>,
+    },
+    LendOnly {
+        /// See [`Build::ext`](CbWalk::Build) — the same external-dep accumulator on
+        /// the replay pass (the cached CB still needs its external wait-list each
+        /// replay, since a host step re-produces fresh events every run).
+        ext: &'a Mutex<Vec<crate::eager::Dep>>,
+    },
+}
 
 /// Execution-time environment for a [`DeviceOp`].
 ///
@@ -68,6 +131,25 @@ pub struct ExecutionContext<'ctx> {
     /// workers (via [`with_host_error_slot`](Self::with_host_error_slot)) are
     /// joined by the same terminal.
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The **forwarded command buffer** for this walk position (design v2,
+    /// CB-as-execution-mode). `Some` iff this op is currently INSIDE a command
+    /// buffer being built — set by a CB-creating node for its children's
+    /// sub-`ExecutionContext` (via [`with_cb`](Self::with_cb)), `None` otherwise.
+    ///
+    /// This is IMMUTABLE per `ExecutionContext` value — positional visibility comes
+    /// from each recursion arm getting its OWN child `ExecutionContext`
+    /// ([`Build`](CbWalk::Build)`(&builder)` for a creator building, unchanged `ec`
+    /// for a forwarder / bundle sibling, [`Off`](CbWalk::Off) for a seam-boundary
+    /// source). No ambient mutable "current CB" slot: two siblings with different CB
+    /// visibility are two distinct `ExecutionContext` values. The borrow lifetime
+    /// `'ctx` is the creating node's stack frame, which outlives its children's
+    /// `execute` calls.
+    cb: CbWalk<'ctx>,
+    /// The CB-internal [`SyncPointEdges`] marker map — the "markers UP" channel.
+    /// Shared across the whole walk (cloned into every child `ExecutionContext`),
+    /// keyed by unique cell ids, so it is ambient by design (see
+    /// [`SyncPointEdges`]).
+    sp_edges: SyncPointEdges,
 }
 
 impl<'ctx> ExecutionContext<'ctx> {
@@ -86,6 +168,8 @@ impl<'ctx> ExecutionContext<'ctx> {
             host_error: Arc::new(Mutex::new(None)),
             start: None,
             workers: Arc::new(Mutex::new(Vec::new())),
+            cb: CbWalk::Off,
+            sp_edges: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -99,6 +183,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// can provide for `context` and `cl_queue` — typically a
     /// stack-local `Arc<Queue>` whose `.raw()` is borrowed for the
     /// duration of the child op's `execute()`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_host_error_slot<'a>(
         context: &'a Context,
         device: Device,
@@ -106,6 +191,7 @@ impl<'ctx> ExecutionContext<'ctx> {
         host_error: Arc<Mutex<Option<Error>>>,
         start: Option<crate::cl_event>,
         workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+        sp_edges: SyncPointEdges,
     ) -> ExecutionContext<'a> {
         ExecutionContext {
             context,
@@ -114,7 +200,73 @@ impl<'ctx> ExecutionContext<'ctx> {
             host_error,
             start,
             workers,
+            // A routed sub-chain runs on a DIFFERENT queue, so it cannot share the
+            // parent's command buffer (a CB is single-queue). It opens its own CB
+            // if eligible; here it starts outside any CB.
+            cb: CbWalk::Off,
+            sp_edges,
         }
+    }
+
+    /// Build a child `ExecutionContext` identical to `self` but with the CB walk
+    /// mode set to `cb` (design v2). This is the POSITIONAL CB-visibility
+    /// mechanism: a CB-creating node calls `ec.with_cb(CbWalk::Build(&builder))`
+    /// (or `LendOnly` on replay) for its children; a seam-boundary node calls
+    /// `ec.with_cb(CbWalk::Off)` for its device source; a plain forwarder passes
+    /// `ec` unchanged. Each returned value has an IMMUTABLE `cb` fixed for its whole
+    /// subtree — no save/restore, so two siblings with different CB visibility are
+    /// simply two distinct values.
+    ///
+    /// Shares the host-error slot, start gate, worker list, and sync-point edge map
+    /// (all `Arc` clones / `Copy`), re-borrowing `context`/`cl_queue` for `'a`.
+    pub(crate) fn with_cb<'a>(&'a self, cb: CbWalk<'a>) -> ExecutionContext<'a> {
+        ExecutionContext {
+            context: self.context,
+            device: self.device.clone(),
+            cl_queue: self.cl_queue,
+            host_error: Arc::clone(&self.host_error),
+            start: self.start,
+            workers: Arc::clone(&self.workers),
+            cb,
+            sp_edges: Arc::clone(&self.sp_edges),
+        }
+    }
+
+    /// The CB walk mode at this walk position. The per-node fork reads this to
+    /// decide build / replay-lend / normal-enqueue. See [`with_cb`](Self::with_cb).
+    pub(crate) fn cb(&self) -> CbWalk<'_> {
+        self.cb
+    }
+
+    /// Look up the sync-point markers a producer registered under `cell_id` (its
+    /// output pipe's [`cell_id`](crate::Pipe::cell_id)). Empty if the producer is
+    /// outside this CB (an entry into the CB from outside — no CB-internal
+    /// predecessor) or has not run yet. The CB-mode fork uses this as a leaf's
+    /// `sync_point_wait_list`. `None` upstream cell (a concrete/slot input, no
+    /// pipe) yields no markers.
+    pub(crate) fn sp_lookup(&self, cell_id: Option<usize>) -> Vec<cl_sync_point_khr> {
+        match cell_id {
+            Some(id) => self
+                .sp_edges
+                .lock()
+                .unwrap()
+                .get(&id)
+                .cloned()
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Register a producer's output command sync point(s) under its output pipe's
+    /// `cell_id`, so a CB-internal consumer resolves them via [`sp_lookup`](Self::sp_lookup).
+    pub(crate) fn sp_register(&self, cell_id: usize, sps: Vec<cl_sync_point_khr>) {
+        self.sp_edges.lock().unwrap().insert(cell_id, sps);
+    }
+
+    /// `Arc` clone of the sync-point edge map, for the [`OnDevice`](crate::OnDevice)
+    /// sibling EC constructor.
+    pub(crate) fn sp_edges_handle(&self) -> SyncPointEdges {
+        Arc::clone(&self.sp_edges)
     }
 
     /// `Arc` clone of the worker-join list, for the [`OnDevice`](crate::OnDevice)

@@ -255,6 +255,142 @@ pub fn new_cb_cache() -> CbCache {
     Arc::new(Mutex::new(None))
 }
 
+// ── CB-mode fork helpers (design v2, CB-as-EXECUTION-MODE) ───────────────────
+//
+// These are the shared primitives the per-node fork uses so every CB-capable op's
+// `execute` (leaf) or terminal gather (boundary node) stays small. The fork lives
+// in each op (per the spec), but the mechanical parts — "collect an entry leaf's
+// external cl_events into this CB's ext accumulator", "run the boundary protocol
+// (build-or-replay a CB, home it, enqueue with external deps)" — are here.
+
+use crate::exec_ctx::CbWalk;
+
+/// A leaf in CB-mode collects its resolved input's `cl_event` deps into the CB's
+/// EXTERNAL accumulator (the event↔sync-point boundary): a NON-EMPTY wait-list on
+/// a resolved input means a producer OUTSIDE this CB (a host step, or the start
+/// gate) — those events gate `clEnqueueCommandBufferKHR`, not any CB-internal
+/// command. A producer INSIDE the CB deposited EMPTY deps (its ordering is the
+/// sync points), so this is a no-op for internal edges. Idempotent + cheap.
+pub(crate) fn cb_collect_external(ext: &Mutex<Vec<Dep>>, deps: &Deps) {
+    if !deps.is_empty() {
+        ext.lock().unwrap().extend(deps.iter().cloned());
+    }
+}
+
+/// Whether a graph is CB-eligible RIGHT NOW: the platform advertises
+/// `cl_khr_command_buffer` and the graph has no host seam. (The all-`cl_mem`
+/// requirement is enforced dynamically — an SVM command marks the live builder
+/// ineligible via [`CbBuilder`], and the boundary discards it — so SVM graphs
+/// transparently fall back to per-op execute without a static type gate here.)
+pub(crate) fn cb_graph_eligible<O: DeviceOp + ?Sized>(op: &O, ec: &ExecutionContext<'_>) -> bool {
+    ec.context().has_cl_khr_command_buffer() && !op.contains_host_seam()
+}
+
+/// The **CB BOUNDARY protocol** (design v2): gather a maximal CB-eligible subtree
+/// `op` as ONE command buffer, homing it in `op`'s [`cb_cache`](DeviceOp::cb_cache),
+/// and return its terminal [`Checkouts`](DeviceOp::Checkouts) + the ONE completion
+/// event (as [`Deps`]) the caller waits on. Used by the terminal for a whole
+/// all-device graph AND by a host seam for each device sub-subtree — both are "run
+/// this seam-free subtree as a CB".
+///
+/// - **replay** (a valid homed CB for this queue): re-walk in
+///   [`LendOnly`](CbWalk::LendOnly) (lend every buffer, build Checkouts, add/enqueue
+///   NOTHING), then enqueue the cached CB once with the run's EXTERNAL events.
+/// - **build** (no/stale CB): re-walk in [`Build`](CbWalk::Build) (lend + add each
+///   command → sync points), [`finalize`](crate::record::CbBuilder::finalize) into
+///   the cache, enqueue with external events.
+/// - **ineligible fallback** (an SVM command marked the live build ineligible):
+///   the Build pass ENQUEUED NOTHING real (leaves only added to the now-discarded
+///   CB), so drop the lent Checkouts (rehome), reclaim, and re-run `op` in the
+///   normal per-op [`Off`](CbWalk::Off) path — correct results, no double-execute.
+///
+/// The event↔sync-point boundary: CB-internal ordering is the sync points added in
+/// Build; the ONLY `cl_event`s are `ext` (producers OUTSIDE this CB) applied at
+/// `clEnqueueCommandBufferKHR`, and the returned completion event handed UP.
+fn cb_boundary_gather<O>(
+    op: &O,
+    ec: &ExecutionContext<'_>,
+    mode: ExecMode,
+) -> Result<(O::Checkouts, Deps)>
+where
+    O: DeviceOp,
+    O::Output: Send + 'static,
+    O::Checkouts: FromCheckout<O::Output>,
+{
+    use crate::Launcher;
+    let queue = ec.cl_queue().get();
+    let cache = op
+        .cb_cache()
+        .expect("cb_boundary_gather: boundary node must carry a cb_cache");
+
+    // The EXTERNAL cl_event accumulator for THIS command buffer, on this frame.
+    let ext: Mutex<Vec<Dep>> = Mutex::new(Vec::new());
+
+    // Is there a valid cached CB for this queue? (Replay fast-path.)
+    let cached: Option<Arc<crate::record::FinalizedCb>> = {
+        let guard = cache.lock().unwrap();
+        match guard.as_ref() {
+            Some(cb) if cb.queue() == queue => Some(Arc::clone(cb)),
+            _ => None,
+        }
+    };
+
+    if let Some(cb) = cached {
+        // REPLAY: re-walk lend-only (materialize buffers + build Checkouts), then
+        // one clEnqueueCommandBufferKHR with the run's external events.
+        let build_ec = ec.with_cb(CbWalk::LendOnly { ext: &ext });
+        let (checkouts, _internal) = op.gather_checkouts(&build_ec, mode)?;
+        let waits: Vec<crate::cl_event> = ext
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_ref().get())
+            .collect();
+        let event = cb.enqueue(&waits)?;
+        return Ok((checkouts, vec![wrap_event(event)]));
+    }
+
+    // BUILD: create a live CB, re-walk adding each command, finalize, home, enqueue.
+    let platform = ec.context().device().platform().raw_id();
+    let Some(builder) = crate::record::CbBuilder::new(platform, queue) else {
+        // Extension unreachable after all — fall back to the normal path.
+        return op.gather_checkouts(ec, mode);
+    };
+    let build_ec = ec.with_cb(CbWalk::Build {
+        builder: &builder,
+        ext: &ext,
+    });
+    let (checkouts, _internal) = op.gather_checkouts(&build_ec, mode)?;
+
+    if !builder.is_eligible() {
+        // An SVM (or otherwise un-addable) command: the build pass enqueued NOTHING
+        // real, so drop the lent Checkouts (rehome every buffer to its cell),
+        // reclaim mid-graph intermediates, and re-run the normal per-op path.
+        drop(checkouts);
+        op.reclaim_undelivered();
+        return op.gather_checkouts(ec, mode);
+    }
+
+    let Some(finalized) = builder.finalize() else {
+        // Finalize failed: same clean fallback as ineligible.
+        drop(checkouts);
+        op.reclaim_undelivered();
+        return op.gather_checkouts(ec, mode);
+    };
+    let finalized = Arc::new(finalized);
+    // HOME the CB in the boundary node's OWN cache (drops with the graph).
+    *cache.lock().unwrap() = Some(Arc::clone(&finalized));
+
+    let waits: Vec<crate::cl_event> = ext
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_ref().get())
+        .collect();
+    let event = finalized.enqueue(&waits)?;
+    Ok((checkouts, vec![wrap_event(event)]))
+}
+
 // ── SlotState<T>: the five-state slot cell ─────────────────────────────────
 
 /// The cell behind an [`Input::Slot`] — a **five-state** resource holder, the
@@ -3632,7 +3768,18 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         // completion events here. Single-output ops use the default
         // `gather_checkouts`; multi-output ops override it to build a tuple.
         if !self.contains_host_seam() {
-            let result = self.gather_checkouts(&ec, ExecMode::Blocking);
+            // CB-as-EXECUTION-MODE (design v2): if the platform supports command
+            // buffers, this whole seam-free graph is ONE maximal CB region — run
+            // the boundary protocol (build-or-replay + home in the root's cb_cache
+            // + enqueue), which returns the SAME (Checkouts, Deps) shape as the
+            // plain gather (the deps are the CB's single completion event). A graph
+            // whose root carries no cb_cache, or an SVM/ineligible one, transparently
+            // falls back inside `cb_boundary_gather` to the normal per-op path.
+            let result = if cb_graph_eligible(self, &ec) && self.cb_cache().is_some() {
+                cb_boundary_gather(self, &ec, ExecMode::Blocking)
+            } else {
+                self.gather_checkouts(&ec, ExecMode::Blocking)
+            };
             return match result {
                 // A failing `and_then_host` worker stashed its rich error and
                 // signalled its user event negative; the blocking wait may return
@@ -6094,6 +6241,9 @@ pub struct Fill<T: Copy, M: MemMode> {
     buf: Input<DeviceSlice<T, M>>,
     value: T,
     out: Pipe<DeviceSlice<T, M>>,
+    /// Design-v2 CB home — this leaf can be a CB boundary (a single-`fill` graph)
+    /// or add itself to a parent's CB. See [`CbCache`].
+    cb_cache: CbCache,
 }
 
 /// Build a fill leaf over an upstream buffer.
@@ -6106,6 +6256,7 @@ where
         buf: buf.into(),
         value,
         out: Pipe::new(),
+        cb_cache: new_cb_cache(),
     }
 }
 
@@ -6125,7 +6276,42 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        use crate::record::MemRef;
+        use opencl3::memory::ClMem;
         let (mut buf, deps, home) = self.buf.resolve_home(ec)?;
+
+        // ── CB-mode fork (design v2) ────────────────────────────────────────
+        match ec.cb() {
+            CbWalk::Off => {} // fall through to the normal enqueue below.
+            CbWalk::Build { builder, ext } => {
+                // Entry deps (a producer OUTSIDE this CB) gate the CB enqueue.
+                cb_collect_external(ext, &deps);
+                let waits = ec.sp_lookup(self.buf.pipe_cell_id());
+                let mem = MemRef::Buffer(buf.buffer().get());
+                // Byte pattern of the fill value (T: Copy).
+                let pattern = unsafe {
+                    std::slice::from_raw_parts(
+                        (&self.value as *const T) as *const u8,
+                        std::mem::size_of::<T>(),
+                    )
+                };
+                let byte_len = buf.byte_len();
+                if let Some(sp) = builder.fill_buffer(mem, pattern, 0, byte_len, &waits) {
+                    ec.sp_register(self.out.cell_id(), vec![sp]);
+                }
+                // Deposit the (lent) buffer with EMPTY cl_event deps — ordering is
+                // the CB-internal sync points, not events.
+                self.out.put_home(buf, Deps::new(), home);
+                return Ok(());
+            }
+            CbWalk::LendOnly { ext } => {
+                cb_collect_external(ext, &deps);
+                // Replay: lend + deposit, add/enqueue nothing (the cached CB runs).
+                self.out.put_home(buf, Deps::new(), home);
+                return Ok(());
+            }
+        }
+
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // Fill has no native CL_BLOCKING flag (it's always enqueue + optional
         // wait — exactly what the old `FillOp::wait_on` did internally), so both
@@ -6146,6 +6332,10 @@ where
 
     fn check_ready(&self) -> Result<()> {
         self.buf.check_ready()
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        Some(&self.cb_cache)
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -9100,6 +9290,7 @@ where
             parent.host_error_slot(),
             parent.start_dep(),
             parent.workers_handle(),
+            parent.sp_edges_handle(),
         );
         // Gather the source against the child EC via `collect` (any arity). The
         // routed sub-chain collapses to OnDevice's single output pipe, so any
