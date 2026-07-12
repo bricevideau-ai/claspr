@@ -514,6 +514,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // Destructure pattern for `bind_slots`: buffer/image positions bind their name,
     // every scalar position binds `_` (so non-slot args don't trip unused-var lints).
     let mut bind_slot_pat_names: Vec<TokenStream2> = Vec::new();
+    // `dump_graph` (read-only structural dump) support: one destructure-name per
+    // arg (RESOURCE args bind their name, plain scalars bind `_` — they carry no
+    // `Input`, so the dump ignores them and must not trip unused-var lints), plus
+    // one pipe-cell-id-collect statement per RESOURCE arg. A resource arg fed by an
+    // upstream pipe contributes that pipe's `cell_id` to the node's `in_cells` —
+    // the SHARED producer edge the struct nesting alone can't show.
+    let mut dump_pat_names: Vec<TokenStream2> = Vec::new();
+    let mut dump_in_cell_stmts: Vec<TokenStream2> = Vec::new();
     // Extra generics that live ONLY on the kernel METHOD signature, not on the
     // Op struct/impls: the per-arg `__claspr_S{n}: ToInput[Image]<…, Buf=__D{n}>`
     // input generics. The Op is generic over `__D{n}` only (it stores
@@ -638,6 +646,16 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
                 output_homes.push(quote! { #home_ident });
+                // Read-only dump: a slice arg is a RESOURCE `Input` — a shared
+                // producer edge lands here if it is pipe-fed.
+                dump_pat_names.push(quote! { #pname });
+                dump_in_cell_stmts.push(quote! {
+                    if let ::core::option::Option::Some(__c) =
+                        ::claspr::Input::pipe_cell_id(#pname)
+                    {
+                        __claspr_in_cells.push(__c);
+                    }
+                });
 
                 // CB-mode: set this slice's (cl_mem, len) arg pair from the LENT
                 // local's handle, gather its upstream producer's sync points, and
@@ -759,6 +777,16 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
                 output_homes.push(quote! { #home_ident });
+                // Read-only dump: a scalar-ref (device-scalar) arg is a RESOURCE
+                // `Input` too — its pipe-fed edge is a shared producer edge.
+                dump_pat_names.push(quote! { #pname });
+                dump_in_cell_stmts.push(quote! {
+                    if let ::core::option::Option::Some(__c) =
+                        ::claspr::Input::pipe_cell_id(#pname)
+                    {
+                        __claspr_in_cells.push(__c);
+                    }
+                });
 
                 // CB-mode: set ONLY the pointer arg (advance by 1), gather upstream
                 // sync points, remember the handle for output-pipe registration.
@@ -881,6 +909,16 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
                 output_homes.push(quote! { #home_ident });
+                // Read-only dump: an image arg is a RESOURCE `Input` — pipe-fed
+                // images contribute a shared producer edge, like slices.
+                dump_pat_names.push(quote! { #pname });
+                dump_in_cell_stmts.push(quote! {
+                    if let ::core::option::Option::Some(__c) =
+                        ::claspr::Input::pipe_cell_id(#pname)
+                    {
+                        __claspr_in_cells.push(__c);
+                    }
+                });
             }
             ParamRole::Scalar { name: pname, ty } => {
                 // A scalar arg is now a NON-RESOURCE slot position: the method
@@ -903,6 +941,9 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 host_names.push(pname.clone());
                 // A scalar slot is a real bind position (bound by name, not `_`).
                 bind_slot_pat_names.push(quote! { #pname });
+                // Read-only dump: a plain scalar carries NO `Input` (no pipe edge),
+                // so bind `_` in the dump destructure and emit no in-cell stmt.
+                dump_pat_names.push(quote! { _ });
                 method_params.push(quote! { #pname: #ssid });
                 arg_types.push(quote! { ::claspr::ScalarInput<#ty> });
                 op_field_init.push(quote! { ::core::convert::Into::into(#pname) });
@@ -1239,6 +1280,50 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // is doc-hidden.
     let op_mod_ident = quote::format_ident!("__claspr_{}_op", name);
     let kernel_name_lit = name.to_string();
+
+    // Read-only `dump_graph` support (shared by single/multi-output impls). The
+    // dump node's OUTPUT cell ids are this kernel's output pipe(s); its INPUT cell
+    // ids are the pipe-fed RESOURCE args (`Input::pipe_cell_id().is_some()`) — the
+    // SHARED producer edges the struct nesting alone doesn't show. `args` is a
+    // private heterogeneous tuple, so the in-cell walk MUST be macro-emitted here.
+    let dump_args_pat = single_or_tuple(&dump_pat_names);
+    // OUTPUT cell id expressions: the single `__claspr_out` pipe, or each
+    // multi-output element pipe.
+    let dump_out_cell_exprs: Vec<TokenStream2> = if multi_output {
+        op_pipe_fields
+            .iter()
+            .map(|f| quote! { ::claspr::Pipe::cell_id(&self.#f) })
+            .collect()
+    } else if output_names.is_empty() {
+        Vec::new()
+    } else {
+        vec![quote! { ::claspr::Pipe::cell_id(&self.__claspr_out) }]
+    };
+    // The shared `dump_graph` method body — identical for single & multi output.
+    let dump_graph_method: TokenStream2 = quote! {
+        fn dump_graph(
+            &self,
+            depth: usize,
+            // Hygienic name (`__claspr_dump_out`, not `out`) so a kernel arg named
+            // `out` (destructured from `self.args` below) can't shadow the sink.
+            __claspr_dump_out: &mut ::std::vec::Vec<::claspr::eager::GraphNode>,
+        ) {
+            // Collect pipe-fed input edges from the (private) args tuple.
+            let #dump_args_pat = &self.args;
+            let mut __claspr_in_cells: ::std::vec::Vec<usize> = ::std::vec::Vec::new();
+            #(#dump_in_cell_stmts)*
+            let __claspr_out_cells: ::std::vec::Vec<usize> =
+                ::std::vec![ #(#dump_out_cell_exprs),* ];
+            __claspr_dump_out.push(::claspr::eager::GraphNode {
+                depth,
+                name: ::std::string::ToString::to_string(#kernel_name_lit),
+                out_cells: __claspr_out_cells,
+                in_cells: __claspr_in_cells,
+                cb_addable: ::claspr::DeviceOp::cb_addable(self),
+                seam: ::claspr::DeviceOp::contains_host_seam(self),
+            });
+        }
+    };
 
     // Emit ONE method on `Kernels`, named after the kernel. It returns
     // a per-kernel `Op` struct that:
@@ -1622,6 +1707,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     out.push(::std::string::ToString::to_string(#kernel_name_lit));
                 }
 
+                #dump_graph_method
+
                 fn bind_slots(&self, binder: &mut ::claspr::SlotBinder) {
                     // Offer the `call(Tag(v))` binder to every bind position: each
                     // buffer/image arg (its `Input`), each scalar arg (its
@@ -1770,6 +1857,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 fn describe(&self, out: &mut ::std::vec::Vec<::std::string::String>) {
                     out.push(::std::string::ToString::to_string(#kernel_name_lit));
                 }
+
+                #dump_graph_method
 
                 fn bind_slots(&self, binder: &mut ::claspr::SlotBinder) {
                     // Offer the `call(Tag(v))` binder to every bind position: each

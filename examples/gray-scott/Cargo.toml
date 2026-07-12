@@ -11,6 +11,13 @@ description = "Gray-Scott reaction-diffusion — claspr Tier 2 graph-as-reusable
 name = "gray_scott_example"
 path = "src/main.rs"
 
+# Read-only debug tool: dumps the per-step graph STRUCTURE (indented tree + pipe
+# edge table) so the shared fan-out pipe edges are visible. Shares this crate's
+# OUT_DIR/gpu.rs (one build.rs per crate). Does not run on a device.
+[[bin]]
+name = "dump_graph"
+path = "src/bin/dump_graph.rs"
+
 [dependencies]
 claspr = { path = "../../claspr" }
 

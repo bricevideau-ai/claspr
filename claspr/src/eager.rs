@@ -3328,6 +3328,61 @@ pub enum ExecMode {
 
 // ── DeviceOp: the closure-free graph node ───────────────────────────────
 
+/// One flattened node in a **read-only structural dump** of an eager graph,
+/// produced by [`DeviceOp::dump_graph`]. This is a debug/introspection surface,
+/// SEPARATE from [`describe`](DeviceOp::describe) (whose output is snapshotted as
+/// a golden and must not change): `dump_graph` additionally surfaces the SHARED
+/// pipe edges that the struct nesting alone does not reveal — an upstream
+/// producer whose output pipe fans out to several consumers appears here as the
+/// SAME `cell_id` in multiple nodes' [`in_cells`](GraphNode::in_cells), which is
+/// exactly the DAG structure a fork-tree (`cg`) lacks and a pipe-DAG
+/// (`gray-scott`) has. See [`graph_edge_table`].
+#[derive(Debug, Clone)]
+pub struct GraphNode {
+    /// Nesting depth in the struct tree (0 = root). Purely presentational —
+    /// indentation for the human-readable tree; edges are keyed by cell id.
+    pub depth: usize,
+    /// Best-effort label for the node (kernel name, `and_then`, or a leaf label).
+    pub name: String,
+    /// The [`cell_id`](Pipe::cell_id)s of this node's OUTPUT pipe(s) — the
+    /// producer side of a pipe edge.
+    pub out_cells: Vec<usize>,
+    /// The [`cell_id`](Pipe::cell_id)s of this node's pipe-fed INPUTS (each
+    /// resource arg whose [`Input::pipe_cell_id`] is `Some`) — the consumer side.
+    /// A cell that also appears in some node's `out_cells` is a real graph edge.
+    pub in_cells: Vec<usize>,
+    /// Whether this (sub)graph is command-buffer-addable ([`DeviceOp::cb_addable`]).
+    pub cb_addable: bool,
+    /// Whether this (sub)graph contains a host seam ([`DeviceOp::contains_host_seam`]).
+    pub seam: bool,
+}
+
+/// Build the flat pipe-edge table from a [`dump_graph`](DeviceOp::dump_graph)
+/// node list: for every producer `cell_id` (any node's `out_cells`), the indices
+/// of the nodes that CONSUME it (their `in_cells` contain that id).
+///
+/// A producer with **out-degree > 1** is a SHARED fan-out edge — one pipe feeding
+/// several dispatch sites. That is the read-only signal distinguishing a genuine
+/// pipe-DAG (`gray-scott`: `combine` consumes four upstream pipes; each
+/// `laplacian`'s field-passthrough + scratch outputs both thread forward) from a
+/// fork-tree (`cg`), where every producer feeds exactly one consumer.
+pub fn graph_edge_table(nodes: &[GraphNode]) -> Vec<(usize, Vec<usize>)> {
+    let mut table: Vec<(usize, Vec<usize>)> = Vec::new();
+    for node in nodes {
+        for &out in &node.out_cells {
+            // Collect every node index whose in_cells contain this producer id.
+            let consumers: Vec<usize> = nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.in_cells.contains(&out))
+                .map(|(i, _)| i)
+                .collect();
+            table.push((out, consumers));
+        }
+    }
+    table
+}
+
 /// A node in the eager graph. `execute` runs it against the context, moving its
 /// output into its pipe; `describe` reports structure **without** executing.
 /// Builder verbs ([`and_then`](DeviceOpExt::and_then)) are on [`DeviceOpExt`].
@@ -3543,6 +3598,45 @@ pub trait DeviceOp: Send {
 
     /// Structural description — node names in execution order, NO execution.
     fn describe(&self, out: &mut Vec<String>);
+
+    /// Best-effort short label for this node in a [`dump_graph`](Self::dump_graph)
+    /// dump. Default: the FIRST line of a fresh [`describe`](Self::describe) vec
+    /// (so a leaf/kernel labels itself), or `"op"` if `describe` pushed nothing.
+    /// Combinators override with a fixed name (`"and_then"`, …). NOT snapshotted —
+    /// this is a debug-only surface, distinct from `describe`'s golden output.
+    fn node_label(&self) -> String {
+        let mut v = Vec::new();
+        self.describe(&mut v);
+        v.into_iter().next().unwrap_or_else(|| "op".to_string())
+    }
+
+    /// **Read-only structural dump** — flatten this (sub)graph into
+    /// [`GraphNode`]s (see there for why this is separate from `describe`), one
+    /// per op, recording each node's output pipe cell id(s), pipe-fed input cell
+    /// id(s), and CB/seam flags. `depth` is the current nesting level; children
+    /// recurse at `depth + 1`.
+    ///
+    /// Default (single-output leaves / kernels the macro doesn't override): push
+    /// ONE node whose `out_cells` is this op's [`output_pipe`](Self::output_pipe)
+    /// cell (if any), with NO `in_cells` — correct for concrete leaves
+    /// (`alloc_zero`, seeded fill) which have no upstream pipe edges. Combinators
+    /// (`AndThen`) and multi-output / multi-input kernel ops override this to
+    /// recurse and to emit their shared pipe edges — the whole point of the dump.
+    fn dump_graph(&self, depth: usize, out: &mut Vec<GraphNode>) {
+        let out_cells = self
+            .output_pipe()
+            .map(|p| p.cell_id())
+            .into_iter()
+            .collect();
+        out.push(GraphNode {
+            depth,
+            name: self.node_label(),
+            out_cells,
+            in_cells: Vec::new(),
+            cb_addable: self.cb_addable(),
+            seam: self.contains_host_seam(),
+        });
+    }
 
     /// Fold one [`SlotBinder`] into this op's [`slot!`](crate::slot) cells —
     /// the per-op half of [`bind`](DeviceOpExt::bind)`(Tag(value))`.
@@ -5516,6 +5610,33 @@ where
     fn describe(&self, out: &mut Vec<String>) {
         self.source.describe(out);
         self.next.describe(out);
+    }
+
+    fn node_label(&self) -> String {
+        "and_then(source→next)".to_string()
+    }
+
+    fn dump_graph(&self, depth: usize, out: &mut Vec<GraphNode>) {
+        // Push a node for the chain itself: its OUTPUT is the tail's output pipe
+        // (its `output_pipe` delegates to `next`), its flags are the whole
+        // subtree's. Then recurse SOURCE FIRST, then NEXT — the same execution
+        // order `execute`/`describe` use, so the flattened list reads top-down in
+        // dependency order and the depth column shows the source/next nesting.
+        let out_cells = self
+            .output_pipe()
+            .map(|p| p.cell_id())
+            .into_iter()
+            .collect();
+        out.push(GraphNode {
+            depth,
+            name: self.node_label(),
+            out_cells,
+            in_cells: Vec::new(),
+            cb_addable: self.cb_addable(),
+            seam: self.contains_host_seam(),
+        });
+        self.source.dump_graph(depth + 1, out);
+        self.next.dump_graph(depth + 1, out);
     }
 
     fn bind_slots(&self, binder: &mut SlotBinder) {
