@@ -78,6 +78,15 @@ spine but the general bundle case is per-branch. (2) precise per-slot→CB inval
 currently SVM marks the build ineligible → software. (4) `Arced`/`FanOut`/`CopyTo2`
 cb_addable (currently false → per-op).
 
+*** FIXED 2026-07-12 (commit pending): the race below is RESOLVED. `Input::pipe_cell_id()`
+now returns the upstream pipe's cell_id for a `FedByPipe` SLOT (was `None`), so the CB
+record path's `sp_lookup` finds the producer's sync point and lowers the cross-sub-graph
+edge into a sync_point — exactly the edge the per-op path already threads as a cl_event.
+cliloader on the immutable unroll-2 CB now shows step-2 laplacians wait=[3] (step-1
+combine's sp), was wait=NONE. gray-scott golden bit-exact 5/5 on pocl; llvmpipe + intel
+legacy unaffected; cb_execution_mode 6/6; CG 4/4; full tier2 green. Historical diagnosis
+retained below. ***
+
 CB-SESSION REGRESSION (corrected 2026-07-12 via git bisect — earlier "pre-existing" note
 was WRONG): gray-scott swap_and_immutable_agree_bit_for_bit RACES (max|Δ| varies
 1.4e-2..2.1e-2 run-to-run). Bisected: PASSES 6/0 at pre-CB baseline a049ad4 and through

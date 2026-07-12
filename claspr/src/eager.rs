@@ -2473,8 +2473,22 @@ impl<T> Input<T> {
     /// else `None` (a concrete entry-leaf buffer or a slot).
     pub fn pipe_cell_id(&self) -> Option<usize> {
         match self {
-            Input::Concrete(_) | Input::Slot { .. } => None,
+            Input::Concrete(_) => None,
             Input::Pipe(p) => Some(p.cell_id()),
+            // A slot FED BY an upstream pipe (`call((Tag(pipe),))` → `FedByPipe`)
+            // IS a producer→consumer edge, just carried through the slot machinery
+            // rather than a direct `Input::Pipe`. Its upstream pipe's `cell_id` is
+            // the key a CB-mode consumer's `sp_lookup` needs to find the producer's
+            // sync point — WITHOUT this the cross-sub-graph edge (e.g. gray-scott's
+            // unroll-2 step-2 laplacians reading step-1's output) is dropped and the
+            // recorded command gets an empty wait-list (a race). The per-op path
+            // already drains this same pipe in `resolve_home`; this exposes the same
+            // edge to the record path. A non-`FedByPipe` slot (Unbound/Bound/Lent/
+            // Severed) has no upstream pipe → `None`, like a concrete cell.
+            Input::Slot { cell, .. } => match &*cell.lock().unwrap() {
+                SlotState::FedByPipe(pipe) => Some(pipe.cell_id()),
+                _ => None,
+            },
         }
     }
 
