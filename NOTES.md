@@ -118,8 +118,16 @@ records 2 CBs (one per branch), not 1 — CG β's axpy pair happens to co-batch 
 spine but the general bundle case is per-branch. (2) precise per-slot→CB invalidation
 (currently coarse clear-all). (3) DONE 2026-07-12 — SVM CB commands
 (clCommandSVMMem{cpy,Fill}KHR) now recorded (see COMPLETE COMMAND SURFACE above); was
-"marks ineligible → software". (4) `Arced`/`FanOut` cb_addable still false → per-op
-(CopyTo2 is now DONE, adb42f3). (5) `.after()`/`.after_all()` deps on a
+"marks ineligible → software". (4) DONE 2026-07-12 — `Arced`/`ArcSplit`/`FanOut`/`CopyTo2`
+are now CB-able (delegate to source/branches: cb_addable/cbable_weight/cb_spine_head
+forward to children; execute forks alias the child sync points under their own cell —
+ArcSplit/FanOut to every branch, Arced to its one). cliloader-proven all-device
+arced+arc_split and fan_out both record ONE CB (tests/tier2/tests/cb_fanout.rs); note
+arc_split/arced are SINGLE-SYNC fans (read-only Arc-clone branches thread no home for a
+replay loop — pre-existing, orthogonal to CB, same as eager_diamond). NOTE: alloc_zero
+is intentionally NOT cb_addable — its execute is a synchronous host clCreateBuffer +
+zero-init, not a recordable device command; a span rooted at alloc_zero stays per-op
+(use a concrete pre-allocated buffer for an all-device CB span). (5) `.after()`/`.after_all()` deps on a
 CB-eligible kernel: currently disqualify the kernel from the CB (cb_addable=false when
 self.deps is non-empty) so it runs per-op (correct — deps validated + threaded — just not
 CB-accelerated). Proper fix: thread self.deps' events into the CB external wait-list

@@ -6222,6 +6222,9 @@ impl<T: Send + 'static> DeviceOp for DeviceDynOp<'_, T> {
 pub struct Arced<S: DeviceOp> {
     source: S,
     out: Pipe<Arc<S::Output>>,
+    /// Design-v2 CB home: `Arced` adds no command (an `Arc` wrap), but it DELEGATES
+    /// to its source — a CB-addable source subtree records through here.
+    cb_cache: CbCache,
 }
 
 /// Wrap `source`'s output in `Arc`. ≈ cuda-oxide's `.arc()` (also available here
@@ -6233,6 +6236,7 @@ where
     Arced {
         source,
         out: Pipe::new(),
+        cb_cache: new_cb_cache(),
     }
 }
 
@@ -6253,14 +6257,58 @@ where
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Gather the source via `collect` (reconstructs any arity — a bundle
-        // source fills element pipes, not output_pipe), then wrap in Arc.
+        // source fills element pipes, not output_pipe), then wrap in Arc. `collect`
+        // threads `ec`'s CbWalk, so a Build/LendOnly pass records the source's
+        // commands into the CB and deposits its output with EMPTY deps.
         let (v, deps) = self.source.collect(ec, ExecMode::Pipelined)?;
-        self.out.put(Arc::new(v), deps);
+        match ec.cb() {
+            CbWalk::Off => {
+                self.out.put(Arc::new(v), deps);
+            }
+            CbWalk::Build { .. } => {
+                // Alias the source's sync points under OUR output cell so a downstream
+                // CB consumer of the `Arc<buffer>` finds them (mirrors Forward). The
+                // source's single output pipe carries them (arced wraps single-output).
+                if let Some(src_cell) = self.source.output_pipe().map(|p| p.cell_id()) {
+                    let sps = ec.sp_lookup(Some(src_cell));
+                    ec.sp_register(self.out.cell_id(), sps);
+                }
+                self.out.put(Arc::new(v), Deps::new());
+            }
+            CbWalk::LendOnly { .. } => {
+                self.out.put(Arc::new(v), Deps::new());
+            }
+        }
         Ok(())
     }
 
     fn check_ready(&self) -> Result<()> {
         self.source.check_ready()
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        Some(&self.cb_cache)
+    }
+
+    fn cb_addable(&self) -> bool {
+        // No command of its own — CB-addable iff the source subtree is.
+        self.source.cb_addable()
+    }
+
+    fn cbable_weight(&self) -> usize {
+        // Arc-wrap records nothing; the weight is the source's.
+        self.source.cbable_weight()
+    }
+
+    fn cb_spine_head_addable(&self) -> bool {
+        self.source.cb_spine_head_addable()
+    }
+
+    fn cb_restamp(&self, evs: &[Dep]) {
+        // Stamp the CB completion event onto our output pipe for a cross-CB consumer.
+        if let Some((v, _d)) = self.out.take() {
+            self.out.put(v, Vec::from(evs));
+        }
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -6320,6 +6368,8 @@ where
     // One element pipe per branch (move-once storage); each gets an
     // `Arc::clone` of the source value in `execute`.
     outs: [Pipe<S::Output>; N],
+    /// Design-v2 CB home: adds no command (Arc-clone scatter), delegates to source.
+    cb_cache: CbCache,
 }
 
 /// Build an [`ArcSplit`]: fan `source`'s `Arc<T>` output to `N` read-only
@@ -6336,6 +6386,7 @@ where
     ArcSplit {
         source,
         outs: std::array::from_fn(|_| Pipe::new()),
+        cb_cache: new_cb_cache(),
     }
 }
 
@@ -6365,10 +6416,34 @@ where
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Gather the source via `collect` (any arity), then scatter a clone of
         // its value + events into every branch pipe (Arc::clone is a cheap
-        // refcount bump; Deps clone shares the same producer events).
+        // refcount bump; Deps clone shares the same producer events). `collect`
+        // threads `ec`'s CbWalk, so a Build/LendOnly pass records the source's
+        // commands into the CB.
         let (v, deps) = self.source.collect(ec, ExecMode::Pipelined)?;
-        for out in &self.outs {
-            out.put(v.clone(), deps.clone());
+        match ec.cb() {
+            CbWalk::Off => {
+                for out in &self.outs {
+                    out.put(v.clone(), deps.clone());
+                }
+            }
+            CbWalk::Build { .. } => {
+                // Alias the source's sync points under EVERY branch cell so each
+                // downstream CB consumer of a clone finds them; deposit empty deps.
+                let sps = self
+                    .source
+                    .output_pipe()
+                    .map(|p| ec.sp_lookup(Some(p.cell_id())))
+                    .unwrap_or_default();
+                for out in &self.outs {
+                    ec.sp_register(out.cell_id(), sps.clone());
+                    out.put(v.clone(), Deps::new());
+                }
+            }
+            CbWalk::LendOnly { .. } => {
+                for out in &self.outs {
+                    out.put(v.clone(), Deps::new());
+                }
+            }
         }
         Ok(())
     }
@@ -6438,6 +6513,32 @@ where
 
     fn check_ready(&self) -> Result<()> {
         self.source.check_ready()
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        Some(&self.cb_cache)
+    }
+
+    fn cb_addable(&self) -> bool {
+        // No command of its own (Arc-clone scatter) — addable iff the source is.
+        self.source.cb_addable()
+    }
+
+    fn cbable_weight(&self) -> usize {
+        self.source.cbable_weight()
+    }
+
+    fn cb_spine_head_addable(&self) -> bool {
+        self.source.cb_spine_head_addable()
+    }
+
+    fn cb_restamp(&self, evs: &[Dep]) {
+        // Multi-output: stamp the CB completion event onto every branch pipe.
+        for out in &self.outs {
+            if let Some((v, _d)) = out.take() {
+                out.put(v, Vec::from(evs));
+            }
+        }
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -6829,6 +6930,9 @@ macro_rules! bundle {
 pub struct FanOut<U: DeviceOp> {
     ops: Vec<U>,
     out: Pipe<Vec<U::Output>>,
+    /// Design-v2 CB home: no command of its own, but its N branches record through
+    /// here when they're all CB-addable.
+    cb_cache: CbCache,
 }
 
 /// Build a fan-out: `f` is called now for each input, producing the branch ops.
@@ -6841,6 +6945,7 @@ where
     FanOut {
         ops,
         out: Pipe::new(),
+        cb_cache: new_cb_cache(),
     }
 }
 
@@ -6906,6 +7011,30 @@ where
             outputs.push(v);
             branch_deps.push(d);
         }
+
+        // CB-mode: each branch's `collect(ec)` recorded into the CB (ordering =
+        // sync points). Union every branch's sync points under OUR output cell so a
+        // downstream CB consumer of the Vec waits on all branches; deposit empty deps
+        // (no marker — join_marker would ENQUEUE, which the CB build must not do).
+        match ec.cb() {
+            CbWalk::Build { .. } => {
+                let mut all_sps = std::collections::BTreeSet::new();
+                for op in &self.ops {
+                    if let Some(p) = op.output_pipe() {
+                        all_sps.extend(ec.sp_lookup(Some(p.cell_id())));
+                    }
+                }
+                ec.sp_register(self.out.cell_id(), all_sps);
+                self.out.put(outputs, Deps::new());
+                return Ok(());
+            }
+            CbWalk::LendOnly { .. } => {
+                self.out.put(outputs, Deps::new());
+                return Ok(());
+            }
+            CbWalk::Off => {}
+        }
+
         let joined = join_marker(ec, &branch_deps)?;
         self.out.put(outputs, joined);
         Ok(())
@@ -6962,6 +7091,28 @@ where
             op.check_ready()?;
         }
         Ok(())
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        Some(&self.cb_cache)
+    }
+
+    fn cb_addable(&self) -> bool {
+        // No command of its own — CB-addable iff EVERY branch is (mirrors bundle).
+        // Empty fan-out records nothing → not addable (cbable_weight 0 gates it too).
+        !self.ops.is_empty() && self.ops.iter().all(|op| op.cb_addable())
+    }
+
+    fn cbable_weight(&self) -> usize {
+        // Sum of the branches' weights.
+        self.ops.iter().map(|op| op.cbable_weight()).sum()
+    }
+
+    fn cb_restamp(&self, evs: &[Dep]) {
+        // Single output pipe (the Vec) — stamp the CB completion event onto it.
+        if let Some((v, _d)) = self.out.take() {
+            self.out.put(v, Vec::from(evs));
+        }
     }
 
     fn describe(&self, out: &mut Vec<String>) {
