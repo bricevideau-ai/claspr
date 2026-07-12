@@ -42,32 +42,46 @@ and replays it. Implementation notes so the design intent below reads as history
   mutate_bind/mutate_call. Precise per-slot→CB is a documented follow-up.
 
 VERIFIED (cliloader on pocl): CG all-device = ONE iteration CB, 8 kernels recorded
-create-once, replayed 5× (clEnqueueNDRangeKernel=0). CG host-seam = 7 distinct CBs +
-52 host-seam maps, clEnqueueNDRangeKernel=0. Both converge BIT-IDENTICAL (5 iters,
-|r|=4.722114e-6, max|x-x_true|=1.5152618e-6). 3 ICDs: pocl real CB; rusticl/intel
-no ext → software per-op fallback (converge identically). Guards in
+create-once, replayed 5× (clEnqueueNDRangeKernel=0). Both converge BIT-IDENTICAL
+(5 iters, |r|=4.722114e-6, max|x-x_true|=1.5152618e-6). 3 ICDs: pocl real CB;
+rusticl/intel no ext → software per-op fallback (converge identically). Guards in
 tests/tier2/tests/cb_execution_mode.rs.
 
-FOLLOW-UPS (deferred): (1) MAXIMAL-SPAN BATCHING for host-seam. Today the inter-seam
-device spans are recorded as SINGLETON CBs (1 kernel each) stitched by events, not as
-ONE CB per maximal seam-free sub-tree. A spine-batching attempt (cb_spine_head_addable
-= source.cb_addable; open-span-at-self; Build→Off close at the seam) DID batch
-[xpby,spmv,dot] into one CB but RACED: a mid-graph span-batching boundary enqueues its
-CB only AFTER `self.gather_checkouts` returns, yet that call descends through the
-batched spine AND into the downstream seam (switched to Off), so the seam's
-clEnqueueMapBuffer(partials) runs BEFORE the CB is enqueued → maps with no wait. Fix =
-FINALIZE-AT-CLOSE: finalize+enqueue the CB at the Build→Off transition (the seam),
-BEFORE running the seam, and restamp the span's output pipes with the CB event there.
-The hard part is the restamp target at close — the pipes the seam is about to read are
-not reachable generically at the close point; needs a per-span type-erased
-Restampable list collected during Build (the pipes each span node registered). Real
-refactor of CbBuilder (interior-mutable finalize) + the CbWalk::Build variant
-(carry cache + closed flag + restamp list). Empty-CB guard (LANDED) already removes
-the pure-passthrough empty CBs. (2) create-once for mid-graph span CBs (all-device
-whole-graph CB IS create-once; host-seam singletons rebuild per iter). (3) precise
-per-slot→CB invalidation. (4) SVM CB commands (clCommandSVMMem{cpy,Fill}KHR) —
-currently SVM marks the build ineligible → software. (5) `Arced`/`FanOut`/`CopyTo2`
+MAXIMAL-SPAN BATCHING — LANDED 2026-07-11 (finalize-at-close, commits 4857b4b →
+9f695a5 → 684ab89; sound-singletons rollback tag cb-sound-singletons-20260711 @
+68a7d03). Host-seam device spans now record ONE CB per maximal seam-free sub-tree, not
+singletons. cliloader CG host-seam: α=[xpby,spmv,dot_partial] | seam | β=[axpy,axpy,
+norm2_partial] | seam. creates==finalizes (0 EMPTY CBs), releases==creates (no leak),
+0 raw clEnqueueNDRangeKernel; each span finalized ONCE + enqueued 5× (create-once/
+replay). Both strategies bit-identical. Mechanism:
+- cb_spine_head_addable() (AndThen = self.source.cb_spine_head_addable(), recursive):
+  a chain HEADS/continues a span while its leading source is addable, even though the
+  whole chain is !cb_addable (seam down `next`). Closes at the AndThen whose `next`
+  can't continue.
+- Interior-mutable idempotent CbBuilder::finalize(&self) — the close seals the CB
+  through the shared &CbBuilder in CbWalk.
+- CbWalk::Build/LendOnly carry {cache, closed}: the close (deep in a source subtree —
+  CG's α closes inside compute_alpha, an ancestor's SOURCE) seals+enqueues+cb_restamps
+  `source`'s pipes (== what the seam reads) BEFORE the seam runs (in Off). The `closed`
+  AtomicBool latch (owned by the boundary frame) routes ALL ancestor work to Off after
+  a close → no re-add / re-enqueue (was the -59 CL_INVALID_OPERATION). Restamp target
+  is just `self.source` at the closing AndThen — no per-span type-erased list needed
+  (the earlier NOTES worry was wrong).
+- cb_records_command() gates boundary-open → never open a passthrough-only (empty) CB.
+- Interior-close detected at boundary-return via is_finalized()/closed latch — covers
+  host seams AND transfer tails (add_u32().and_then(download)).
+
+FOLLOW-UPS (deferred): (1) bundle-branch spans: a bundle2 of two device branches
+records 2 CBs (one per branch), not 1 — CG β's axpy pair happens to co-batch via the
+spine but the general bundle case is per-branch. (2) precise per-slot→CB invalidation
+(currently coarse clear-all). (3) SVM CB commands (clCommandSVMMem{cpy,Fill}KHR) —
+currently SVM marks the build ineligible → software. (4) `Arced`/`FanOut`/`CopyTo2`
 cb_addable (currently false → per-op).
+
+PRE-EXISTING (NOT from CB work): gray-scott swap_and_immutable_agree_bit_for_bit RACES
+(max|Δ| varies 7e-3..2.6e-2 run-to-run) — reproduces on de9fc76 (before any CB-session
+work) and on the sound-singletons tag. Independent of finalize-at-close. Needs its own
+investigation; do NOT attribute to the span-batching landing.
 
 --- ORIGINAL DESIGN INTENT (kept as the spec this implemented) ---
 
