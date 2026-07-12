@@ -391,6 +391,144 @@ where
     Ok((checkouts, vec![wrap_event(event)]))
 }
 
+/// Run a combinator's CHILD, opening a mid-graph command buffer for it when
+/// appropriate (design v2). The single decision point every combinator
+/// (`AndThen`, bundles, the host seam) routes a child `execute` through:
+///
+/// - in [`Off`](CbWalk::Off) mode, if the platform supports CBs and the child's
+///   WHOLE subtree is [`cb_addable`](DeviceOp::cb_addable), the child is a maximal
+///   seam-free span → run it as ONE command buffer via [`cb_boundary_execute`]
+///   (which fills the child's pipes + stamps the CB completion event);
+/// - otherwise (already inside a CB → `Build`/`LendOnly`; or the child contains a
+///   seam / transfer → not addable; or no extension) → a plain `execute`, which
+///   forwards the mode and lets any addable sub-span deeper down open its own CB.
+///
+/// This is what makes host-seam graphs segment into sub-tree CBs: the seam feeds
+/// its device source through here in `Off`, so the source span becomes its own CB.
+fn cb_exec_child<O: DeviceOp>(child: &O, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    if MIDGRAPH_CB
+        && matches!(ec.cb(), CbWalk::Off)
+        && child.cb_cache().is_some()
+        && cb_graph_eligible(child, ec)
+    {
+        cb_boundary_execute(child, ec, mode)
+    } else {
+        child.execute(ec, mode)
+    }
+}
+
+/// TEMPORARY diagnostic flag: gate mid-graph (host-seam) CB boundaries while the
+/// event↔sync-point cross-boundary threading is stabilised. `false` = only the
+/// whole-graph terminal boundary fires (all-device CB works; host-seam runs per-op).
+const MIDGRAPH_CB: bool = false;
+
+/// The gather-position analog of [`cb_exec_child`] — used when a combinator
+/// gathers its TAIL (`AndThen::next`, the terminal-shaped child). If the tail's
+/// whole subtree is a maximal seam-free span (and we're in `Off`), run it as ONE
+/// command buffer via [`cb_boundary_gather`] (build Checkouts + return the CB
+/// completion event as the deps); otherwise a plain `gather_checkouts` (which
+/// recurses, letting deeper addable spans open their own CBs).
+fn cb_gather_child<O>(
+    child: &O,
+    ec: &ExecutionContext<'_>,
+    mode: ExecMode,
+) -> Result<(O::Checkouts, Deps)>
+where
+    O: DeviceOp,
+    O::Output: Send + 'static,
+    O::Checkouts: FromCheckout<O::Output>,
+{
+    if MIDGRAPH_CB
+        && matches!(ec.cb(), CbWalk::Off)
+        && child.cb_cache().is_some()
+        && cb_graph_eligible(child, ec)
+    {
+        cb_boundary_gather(child, ec, mode)
+    } else {
+        child.gather_checkouts(ec, mode)
+    }
+}
+
+/// The **execute-position CB boundary** (design v2) — the mid-graph analog of
+/// [`cb_boundary_gather`]. When a combinator descending in [`Off`](CbWalk::Off)
+/// mode reaches a CB-eligible child subtree (e.g. a device span under a host seam,
+/// or the source of an `and_then` whose sibling is a seam), that child is a
+/// boundary: run it as ONE command buffer, home it in the child's `cb_cache`, then
+/// STAMP the CB's single completion event onto the child's output pipe(s) so a
+/// downstream (non-CB) consumer waits on the whole CB (the event↔sync-point
+/// boundary in reverse — markers INSIDE, one cl_event OUT).
+///
+/// Fills pipes only (returns `()`), like [`DeviceOp::execute`]; the caller
+/// (`AndThen`/bundle) then reads the stamped pipes normally. Falls back to a plain
+/// `execute` if the extension is unreachable or the build is ineligible (SVM).
+fn cb_boundary_execute<O>(op: &O, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()>
+where
+    O: DeviceOp,
+{
+    use crate::Launcher;
+    let queue = ec.cl_queue().get();
+    let cache = op
+        .cb_cache()
+        .expect("cb_boundary_execute: boundary node must carry a cb_cache");
+    let ext: Mutex<Vec<Dep>> = Mutex::new(Vec::new());
+
+    // Replay fast-path: a valid cached CB for this queue.
+    let cached: Option<Arc<crate::record::FinalizedCb>> = {
+        let guard = cache.lock().unwrap();
+        match guard.as_ref() {
+            Some(cb) if cb.queue() == queue => Some(Arc::clone(cb)),
+            _ => None,
+        }
+    };
+
+    if let Some(cb) = cached {
+        let build_ec = ec.with_cb(CbWalk::LendOnly { ext: &ext });
+        op.execute(&build_ec, mode)?;
+        let waits: Vec<crate::cl_event> = ext
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_ref().get())
+            .collect();
+        let event = cb.enqueue(&waits)?;
+        op.cb_restamp(&wrap_event(event));
+        return Ok(());
+    }
+
+    let platform = ec.context().device().platform().raw_id();
+    let Some(builder) = crate::record::CbBuilder::new(platform, queue) else {
+        return op.execute(ec, mode);
+    };
+    let build_ec = ec.with_cb(CbWalk::Build {
+        builder: &builder,
+        ext: &ext,
+    });
+    op.execute(&build_ec, mode)?;
+
+    if !builder.is_eligible() {
+        // The build enqueued nothing; the pipes hold the lent buffers with empty
+        // deps. Reclaim (rehome) them and re-run the normal per-op path so the
+        // buffers are re-lent + real device work runs.
+        op.reclaim_undelivered();
+        return op.execute(ec, mode);
+    }
+    let Some(finalized) = builder.finalize() else {
+        op.reclaim_undelivered();
+        return op.execute(ec, mode);
+    };
+    let finalized = Arc::new(finalized);
+    *cache.lock().unwrap() = Some(Arc::clone(&finalized));
+    let waits: Vec<crate::cl_event> = ext
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_ref().get())
+        .collect();
+    let event = finalized.enqueue(&waits)?;
+    op.cb_restamp(&wrap_event(event));
+    Ok(())
+}
+
 // ── SlotState<T>: the five-state slot cell ─────────────────────────────────
 
 /// The cell behind an [`Input::Slot`] — a **five-state** resource holder, the
@@ -1623,6 +1761,20 @@ impl<T: Send + 'static> DeviceOp for Pipe<T> {
         // directly. (Unlike `Forward`, there is no resolve-and-re-deposit step —
         // there is nowhere else to move it to.)
         Ok(())
+    }
+
+    fn cb_addable(&self) -> bool {
+        // A bare pipe-as-op is a pure structural passthrough — it aliases the
+        // upstream producer's storage cell (no device command, no re-deposit), so it
+        // is trivially CB-addable. CRUCIAL for real graphs: CG feeds raw `Pipe`
+        // handles as `bundle*` branches (`bundle6(p, ap, …)`, `bundle2(x, rsnew)`);
+        // without this override a `Pipe` branch reports the default `false`, which
+        // ANDs the whole bundle — and thus the whole iteration graph — down to the
+        // per-op fallback (no kernel ever recorded into a CB). Since a `Pipe` shares
+        // the producer's `cell_id`, the producer's registered sync points are already
+        // found by a downstream consumer's `sp_lookup` on the SAME cell — nothing to
+        // re-register here.
+        true
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -3361,6 +3513,29 @@ pub trait DeviceOp: Send {
             *cache.lock().unwrap() = None;
         }
     }
+
+    /// **Stamp the command-buffer completion event onto this node's output
+    /// pipe(s)** — the execute-position half of the CB boundary (design v2).
+    ///
+    /// When a device span is a MID-GRAPH boundary (a maximal seam-free subtree
+    /// under a host seam), it is run in [`Build`](CbWalk::Build)/[`LendOnly`](CbWalk::LendOnly)
+    /// mode, which deposits its outputs with EMPTY `cl_event` deps (CB-internal
+    /// ordering is the sync points). After the boundary enqueues the CB and gets ONE
+    /// completion event, a DOWNSTREAM consumer resolving those pipes needs that
+    /// event as its wait-list (the event↔sync-point boundary: OUTSIDE the CB,
+    /// ordering is `cl_event`s again). This re-deposits each output value with
+    /// `deps = [ev]`, so the seam / next span waits on the whole CB.
+    ///
+    /// Default: the single [`output_pipe`](Self::output_pipe). Multi-output ops
+    /// (kernels, bundles, `CopyTo2`, `FanOut`) override to stamp each element pipe —
+    /// mirroring [`reclaim_undelivered`](Self::reclaim_undelivered)'s traversal.
+    fn cb_restamp(&self, ev: &Dep) {
+        if let Some(pipe) = self.output_pipe()
+            && let Some((v, _deps, home)) = pipe.take_home()
+        {
+            pipe.put_home(v, vec![ev.clone()], home);
+        }
+    }
 }
 
 /// Builder verbs for composing [`DeviceOp`]s. Blanket-implemented.
@@ -4942,8 +5117,11 @@ where
         // events the `next` op discarded (see `collect`'s note on orphaned deps).
         let src_pipe = self.source.output_pipe();
         let out_pipe = self.next.output_pipe();
-        self.source.execute(ec, ExecMode::Pipelined)?;
-        self.next.execute(ec, mode)?;
+        // CB mid-graph boundaries (design v2): in `Off` mode a fully-addable child
+        // span opens its OWN command buffer here (via `cb_exec_child`); already
+        // inside a CB (`Build`/`LendOnly`) or a mixed child → plain forward.
+        cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
+        cb_exec_child(&self.next, ec, mode)?;
         thread_orphaned_source_deps(&src_pipe, &out_pipe);
         Ok(())
     }
@@ -4958,7 +5136,7 @@ where
         // default single-pipe drain — whose `output_pipe` it never fills. The
         // source pipelines; only the tail observes the terminal `mode`.
         let src_pipe = self.source.output_pipe();
-        self.source.execute(ec, ExecMode::Pipelined)?;
+        cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
         let (value, mut deps) = self.next.collect(ec, mode)?;
         // ORPHANED DEPS: if the `and_then` closure discarded the source's handle
         // (e.g. `.and_then(|_buf| value(0))`), the source's value + events are
@@ -4991,7 +5169,7 @@ where
         // home is the tail's — the source pipelines and its orphaned deps thread
         // in exactly as in `collect`.
         let src_pipe = self.source.output_pipe();
-        self.source.execute(ec, ExecMode::Pipelined)?;
+        cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
         let (value, mut deps, home) = self.next.collect_home(ec, mode)?;
         if let Some((_discarded, src_deps)) = src_pipe.and_then(|p| p.take()) {
             deps.extend(src_deps);
@@ -5015,8 +5193,11 @@ where
         // op never fills → "op produced no output"). Source pipelines; tail takes
         // the terminal `mode`. Same orphaned-source-deps threading as `collect`.
         let src_pipe = self.source.output_pipe();
-        self.source.execute(ec, ExecMode::Pipelined)?;
-        let (checkouts, mut deps) = self.next.gather_checkouts(ec, mode)?;
+        // Mid-graph CB boundaries: an addable source span opens its own CB (in
+        // `Off`); the tail gathers through `cb_gather_child` so a fully-addable tail
+        // span becomes its own CB too (and a mixed tail recurses).
+        cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
+        let (checkouts, mut deps) = cb_gather_child(&self.next, ec, mode)?;
         if let Some((_discarded, src_deps)) = src_pipe.and_then(|p| p.take()) {
             deps.extend(src_deps);
         }

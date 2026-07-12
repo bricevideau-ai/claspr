@@ -30,6 +30,20 @@ fn homed_cb<O: DeviceOp>(g: &O) -> bool {
         .unwrap_or(false)
 }
 
+/// Stable identity (the `Arc` pointer) of the root's homed `FinalizedCb`, or 0 if
+/// none. Two syncs returning the SAME non-zero id prove create-once + replay (the
+/// CB is built on sync #1 and REUSED on sync #2 — not rebuilt each run).
+fn homed_cb_id<O: DeviceOp>(g: &O) -> usize {
+    g.cb_cache()
+        .and_then(|c| {
+            c.lock()
+                .unwrap()
+                .as_ref()
+                .map(|arc| std::sync::Arc::as_ptr(arc) as usize)
+        })
+        .unwrap_or(0)
+}
+
 /// A single-`fill` graph is an all-device CB region: first `sync` builds + homes a
 /// CB (on a CB-capable platform), the second replays it. The fill lands both runs.
 #[test]
@@ -133,6 +147,65 @@ fn bundle_of_kernels_runs_as_command_buffer() {
         assert!(
             homed_cb(&g),
             "bundle-of-kernels should home a command buffer"
+        );
+    }
+}
+
+/// REGRESSION GUARD (the false-positive the micro-tests missed): a CG-shaped chain
+/// — kernels threaded through `and_then` whose closures feed RAW `Pipe` handles as
+/// `bundle*` branches — must record its kernels into ONE command buffer homed at
+/// the root AND replay the SAME finalized CB across syncs (create-once), NOT rebuild
+/// or silently fall back to per-op. The bare-`Pipe`-as-op branch previously reported
+/// `cb_addable() == false`, ANDing the whole bundle down to fallback, so this exact
+/// shape ran entirely on `clEnqueueNDRangeKernel` while still converging.
+///
+/// The guard: (a) the root homes a CB after sync #1, and (b) sync #2 reuses the
+/// SAME `FinalizedCb` Arc (create-once + replay), which per-op fallback (id==0) and
+/// rebuild-each-sync (id changes) both fail.
+#[test]
+fn cg_shaped_pipe_bundle_records_one_cb_and_replays() {
+    use claspr::eager::bundle2;
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let a = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("a");
+    let b = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("b");
+
+    // scale a (in place), thread `a` onward as a RAW pipe, then bundle2 of two
+    // pipe-fed branches — the CG `bundle6(p, ap, …)` / `bundle2(x, rsnew)` shape:
+    //   fill a=1 -> scale a*3 -> and_then(|a: Pipe| bundle2(scale b via a-derived, forward a))
+    // Kept simple: scale a, then bundle2(forward(a), scale_u32(b)) where forward(a)
+    // is a bare Pipe branch (the exact node that was non-addable).
+    let g = fill(a, 1u32)
+        .and_then(move |a| ks.scale_u32([N], a, 3u32)) // a = 3
+        .and_then(move |a_pipe| {
+            // a_pipe is a Pipe<DeviceSlice>; feed it RAW as a bundle branch.
+            bundle2(a_pipe, fill(b, 5u32))
+        });
+
+    let co = g.sync(&ctx).expect("sync 1");
+    let id1 = homed_cb_id(&g);
+    let (ca, cbk) = co;
+    let ga = ca.map().wait().expect("read a");
+    let gb = cbk.map().wait().expect("read b");
+    assert!(ga.iter().all(|&v| v == 3), "a: {:?}", &ga[..8]);
+    assert!(gb.iter().all(|&v| v == 5), "b: {:?}", &gb[..8]);
+    drop((ga, gb));
+    drop((ca, cbk));
+
+    let co = g.sync(&ctx).expect("sync 2");
+    let id2 = homed_cb_id(&g);
+    drop(co);
+
+    if ctx.has_cl_khr_command_buffer() {
+        assert_ne!(
+            id1, 0,
+            "CG-shaped pipe-bundle graph did NOT record a CB (fell back to per-op) \
+             — a bare-Pipe branch is reporting cb_addable()==false again"
+        );
+        assert_eq!(
+            id1, id2,
+            "iteration CB was NOT create-once: sync #2 built a different CB (or fell \
+             back). Same Arc across syncs = build-once + replay."
         );
     }
 }
