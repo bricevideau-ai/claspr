@@ -100,3 +100,39 @@ fn fill_then_kernel_chain_runs_as_command_buffer() {
         assert!(homed_cb(&g), "chain should home a command buffer");
     }
 }
+
+/// A bundle of two in-place kernels over concrete buffers, both fed onward — the
+/// multi-branch shape CG uses (bundle2 of axpys). The whole thing is ONE CB with
+/// two ND-ranges joined only by their (independent) buffers; it homes at the root
+/// AndThen and replays. Exercises the bundle CB fork + per-branch sync points.
+#[test]
+fn bundle_of_kernels_runs_as_command_buffer() {
+    use claspr::eager::bundle2;
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let a = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("a");
+    let b = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("b");
+
+    // fill a=2, b=3, then bundle(scale a*5, scale b*7): a->10, b->21 each run.
+    let g = fill(a, 2u32).and_then(move |a| {
+        fill(b, 3u32)
+            .and_then(move |b| bundle2(ks.scale_u32([N], a, 5u32), ks.scale_u32([N], b, 7u32)))
+    });
+
+    for i in 0..3 {
+        let (ca, cb) = g.sync(&ctx).unwrap_or_else(|e| panic!("sync {i}: {e:?}"));
+        let ga = ca.map().wait().expect("read a");
+        let gb = cb.map().wait().expect("read b");
+        assert!(ga.iter().all(|&v| v == 10), "a iter {i}: {:?}", &ga[..8]);
+        assert!(gb.iter().all(|&v| v == 21), "b iter {i}: {:?}", &gb[..8]);
+        drop(ga);
+        drop(gb);
+        drop((ca, cb));
+    }
+    if ctx.has_cl_khr_command_buffer() {
+        assert!(
+            homed_cb(&g),
+            "bundle-of-kernels should home a command buffer"
+        );
+    }
+}

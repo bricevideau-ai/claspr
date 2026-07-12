@@ -5241,7 +5241,19 @@ impl<T: crate::record::RecordableBuffer + Send + 'static> DeviceOp for Lift<T> {
         // path. The home flows downstream via `put_home`, so the value returns to
         // this cell on `Checkout` drop and the graph re-arms for the next run.
         let (v, deps, home) = self.input.resolve_home(ec)?;
-        self.out.put_home(v, deps, home);
+        match ec.cb() {
+            CbWalk::Off => {
+                self.out.put_home(v, deps, home);
+            }
+            CbWalk::Build { ext, .. } | CbWalk::LendOnly { ext } => {
+                // A lifted concrete resource is an ENTRY into the CB — no upstream
+                // producer, so no sync points to register (a consumer's sp_lookup on
+                // our cell yields empty; the CB's external deps carry any real
+                // wait). Its own deps (e.g. the start gate) become external deps.
+                cb_collect_external(ext, &deps);
+                self.out.put_home(v, Deps::new(), home);
+            }
+        }
         Ok(())
     }
 
@@ -5249,6 +5261,11 @@ impl<T: crate::record::RecordableBuffer + Send + 'static> DeviceOp for Lift<T> {
         // Pre-run atomicity: the cell is empty iff a previous run's Checkout still
         // holds the value (busy) or it was severed — the concrete-input check.
         self.input.check_ready()
+    }
+
+    fn cb_addable(&self) -> bool {
+        // A lifted owned device resource is a valid CB entry leaf (no command).
+        true
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -5309,16 +5326,37 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // Resolve the upstream value + its events and re-deposit unchanged — no
-        // device work; deps threaded through so ordering/termination is intact.
-        // In-place identity: the home flows straight through.
+        // CB-mode: identity re-aliases the upstream's sync points under OUR output
+        // cell so a downstream CB consumer finds them, and deposits empty deps (the
+        // ordering is the CB-internal markers). No device work either way.
+        let upstream_cell = self.input.pipe_cell_id();
         let (v, deps, home) = self.input.resolve_home(ec)?;
-        self.out.put_home(v, deps, home);
+        match ec.cb() {
+            CbWalk::Off => {
+                self.out.put_home(v, deps, home);
+            }
+            CbWalk::Build { ext, .. } => {
+                cb_collect_external(ext, &deps);
+                let sps = ec.sp_lookup(upstream_cell);
+                ec.sp_register(self.out.cell_id(), sps);
+                self.out.put_home(v, Deps::new(), home);
+            }
+            CbWalk::LendOnly { ext } => {
+                cb_collect_external(ext, &deps);
+                self.out.put_home(v, Deps::new(), home);
+            }
+        }
         Ok(())
     }
 
     fn check_ready(&self) -> Result<()> {
         self.input.check_ready()
+    }
+
+    fn cb_addable(&self) -> bool {
+        // A structural passthrough over a pipe — always CB-addable (it adds no
+        // command; it aliases the upstream inside the CB).
+        true
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -5751,13 +5789,17 @@ macro_rules! impl_eager_bundle {
             "`]; branches run with no inter-ordering, joined by a marker.")]
         pub struct $name<$($ty: DeviceOp),+> {
             $($field: $ty,)+
+            /// Design-v2 CB home: when this bundle is the outermost CB-eligible node
+            /// of a seam-free subtree, the whole subtree is ONE command buffer homed
+            /// here. See [`CbCache`].
+            cb_cache: CbCache,
         }
 
         #[doc = concat!("Construct an eager [`", stringify!($name),
             "`]. \u{2248} cuda-oxide's `zip!` at this fixed arity.")]
         #[allow(clippy::too_many_arguments)]
         pub fn $ctor<$($ty: DeviceOp),+>($($field: $ty),+) -> $name<$($ty),+> {
-            $name { $($field,)+ }
+            $name { $($field,)+ cb_cache: new_cb_cache() }
         }
 
         impl<$($ty: DeviceOp),+> DeviceOp for $name<$($ty),+>
@@ -5935,6 +5977,21 @@ macro_rules! impl_eager_bundle {
             fn contains_host_seam(&self) -> bool {
                 // OR every branch: a host seam in any one of them must gate.
                 false $(|| self.$field.contains_host_seam())+
+            }
+
+            fn cb_addable(&self) -> bool {
+                // AND every branch: the whole bundle is CB-addable iff every branch
+                // is (a transfer / host seam in any branch disqualifies it).
+                true $(&& self.$field.cb_addable())+
+            }
+
+            fn cb_cache(&self) -> Option<&CbCache> {
+                Some(&self.cb_cache)
+            }
+
+            fn invalidate_cbs(&self) {
+                *self.cb_cache.lock().unwrap() = None;
+                $(self.$field.invalidate_cbs();)+
             }
         }
     };
