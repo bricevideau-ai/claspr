@@ -217,6 +217,26 @@ pub trait DeviceEnqueue: Send + Sized {
     type Output: Send;
     /// Enqueue against `ec` with `deps` as the wait-list; return `(value, Deps)`.
     fn run(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)>;
+
+    /// CB twin of [`run`](Self::run) for the copy leaf: perform the same type
+    /// conversion (an `Uninit` dst returns `Init` — the CB writes every byte at
+    /// enqueue, so the `assume_init` is sound exactly as in `run`) but do NOT enqueue.
+    ///
+    /// - `builder = Some(b)`: RECORD the copy command into `b` (waiting on `waits`);
+    ///   the returned sync point is `Some` on success. Returns `None` overall if the
+    ///   command is unavailable/ineligible (a mixed cl_mem+SVM pair, or the driver
+    ///   lacks the SVM command) — the caller then falls back to the per-op path.
+    /// - `builder = None` (replay): convert types only, no record; sync point `None`.
+    ///
+    /// Default `None` — only the copy ops override it.
+    #[allow(clippy::type_complexity)]
+    fn record_cb(
+        self,
+        _builder: Option<&crate::record::CbBuilder>,
+        _waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
+        None
+    }
 }
 
 // ── Cell<T>: interior-mutable resource slot (the reusable-graph primitive) ──
@@ -9678,6 +9698,10 @@ where
     // both in `into_output`.
     src_pipe: Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src>,
     dst_pipe: Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
+    /// Design-v2 CB home: a copy records `clCommandCopyBufferKHR` (cl_mem↔cl_mem) or
+    /// `clCommandSVMMemcpyKHR` (SVM↔SVM) where the extension provides it; a mixed
+    /// cl_mem/SVM pair or absent PFN falls back to software.
+    cb_cache: CbCache,
 }
 
 /// A value usable as a [`eager_copy_to`] **operand**: a concrete buffer, an
@@ -9783,6 +9807,7 @@ where
         dst: dst.into_copy_input(),
         src_pipe: Pipe::new(),
         dst_pipe: Pipe::new(),
+        cb_cache: new_cb_cache(),
     }
 }
 
@@ -9842,6 +9867,54 @@ where
         // `None`. Either input may be a pipe or concrete — combine their wait-lists.
         let (src, src_deps, src_home) = self.src.resolve_copy(ec)?;
         let (dst, dst_deps, dst_home) = self.dst.resolve_copy(ec)?;
+
+        // ── CB-mode fork (design v2) — record clCommandCopyBufferKHR (cl_mem) or
+        // clCommandSVMMemcpyKHR (SVM) via the copy op's `record_cb` (which also does
+        // the Uninit→Init type conversion). Build records; LendOnly just converts;
+        // an ineligible pair (mixed cl_mem/SVM, absent PFN) falls through to per-op. ─
+        match ec.cb() {
+            CbWalk::Build { builder, ext, .. } => {
+                cb_collect_external(ext, &src_deps);
+                cb_collect_external(ext, &dst_deps);
+                let mut waits = ec.sp_lookup(self.src.pipe_cell_id());
+                waits.extend(ec.sp_lookup(self.dst.pipe_cell_id()));
+                // `record_cb(Some)` ALWAYS returns the type-converted output; the sync
+                // point is `Some` when the command recorded, `None` when the copy was
+                // ineligible (mixed cl_mem/SVM, or absent PFN) — in which case it has
+                // already called `builder.mark_ineligible()`, so the boundary will
+                // DISCARD this CB and re-run the whole span in Off. Either way we
+                // deposit the (lent) buffers with empty deps: on the eligible path the
+                // CB does the copy; on the discard path this deposit is thrown away and
+                // recomputed by the Off re-run. Ordering inside the CB is sync points.
+                let (out, sp) = src
+                    .copy_to(dst)
+                    .record_cb(Some(builder), &waits)
+                    .expect("copy record_cb(Some) always returns the converted output");
+                let (out_src, out_dst) = out.into_parts();
+                if let Some(sp) = sp {
+                    let set = std::collections::BTreeSet::from([sp]);
+                    ec.sp_register(self.src_pipe.cell_id(), set.clone());
+                    ec.sp_register(self.dst_pipe.cell_id(), set);
+                }
+                self.src_pipe.put_home(out_src, Deps::new(), src_home);
+                self.dst_pipe.put_home(out_dst, Deps::new(), dst_home);
+                return Ok(());
+            }
+            CbWalk::LendOnly { .. } => {
+                // Replay: the cached CB does the copy. Convert types only (no builder),
+                // deposit with empty deps.
+                let (out, _none) = src
+                    .copy_to(dst)
+                    .record_cb(None, &std::collections::BTreeSet::new())
+                    .expect("copy record_cb(None) always converts types on replay");
+                let (out_src, out_dst) = out.into_parts();
+                self.src_pipe.put_home(out_src, Deps::new(), src_home);
+                self.dst_pipe.put_home(out_dst, Deps::new(), dst_home);
+                return Ok(());
+            }
+            CbWalk::Off => {}
+        }
+
         let mut deps = src_deps;
         deps.extend(dst_deps);
         // Reuse the closure-layer copy op: it owns the right per-family
@@ -9931,6 +10004,29 @@ where
 
     fn describe(&self, out: &mut Vec<String>) {
         out.push("copy_to".into());
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        Some(&self.cb_cache)
+    }
+
+    fn cb_addable(&self) -> bool {
+        true
+    }
+
+    fn cbable_weight(&self) -> usize {
+        // A copy records one command (clCommandCopyBufferKHR / clCommandSVMMemcpyKHR).
+        1
+    }
+
+    fn cb_restamp(&self, evs: &[Dep]) {
+        // Multi-output: stamp the CB completion event onto BOTH element pipes.
+        if let Some((v, _d, h)) = self.src_pipe.take_home() {
+            self.src_pipe.put_home(v, Vec::from(evs), h);
+        }
+        if let Some((v, _d, h)) = self.dst_pipe.take_home() {
+            self.dst_pipe.put_home(v, Vec::from(evs), h);
+        }
     }
 
     fn bind_slots(&self, binder: &mut SlotBinder) {

@@ -346,3 +346,32 @@ fn mutate_invalidates_and_rebuilds_command_buffer() {
         );
     }
 }
+
+/// A buffer fill then a buffer→buffer copy is a weight-2 all-device span:
+/// `clCommandFillBufferKHR` + `clCommandCopyBufferKHR` in ONE command buffer. Covers
+/// the CopyTo2 CB fork (the buffer-copy device command in a command buffer).
+#[test]
+fn fill_then_copy_runs_as_command_buffer() {
+    use claspr::eager_copy_to;
+    let Some(ctx) = ctx() else { return };
+    let src = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc src");
+    let dst = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc dst");
+
+    // fill(src=13) -> eager_copy_to(src -> dst): fill + copy → weight 2 → CB.
+    let g = fill(src, 13u32).and_then(move |s| eager_copy_to(s, dst));
+    assert_eq!(g.cbable_weight(), 2, "fill + copy = two commands");
+
+    for i in 0..3 {
+        let (_src_co, dst_co): (
+            claspr::eager::Checkout<DeviceSlice<u32>>,
+            claspr::eager::Checkout<DeviceSlice<u32>>,
+        ) = g.sync(&ctx).unwrap_or_else(|e| panic!("sync {i}: {e:?}"));
+        let got = dst_co.map().wait().expect("read dst");
+        assert!(got.iter().all(|&v| v == 13), "iter {i}: {:?}", &got[..8]);
+        drop(got);
+        drop((_src_co, dst_co));
+    }
+    if ctx.has_cl_khr_command_buffer() {
+        assert!(homed_cb(&g), "fill+copy should home a command buffer");
+    }
+}

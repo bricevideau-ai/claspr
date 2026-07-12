@@ -69,3 +69,40 @@ fn svm_fill_then_kernel_runs_as_command_buffer() {
         eprintln!("svm fill+kernel: software fallback (SVM CB commands unavailable)");
     }
 }
+
+/// An SVM fill then an SVM→SVM copy is a weight-2 all-device span:
+/// `clCommandSVMMemFillKHR` + `clCommandSVMMemcpyKHR` in ONE command buffer (where
+/// the driver supports the SVM commands; else software fallback). fill src=9, copy
+/// src→dst, read dst → every element 9.
+#[test]
+fn svm_fill_then_copy_runs_as_command_buffer() {
+    use claspr::eager_copy_to;
+    let Some(ctx) = ctx() else { return };
+    let src = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc src");
+    let dst = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc dst");
+
+    // fill(src=9) -> eager_copy_to(src -> dst): SVM fill + SVM copy → weight 2 → CB.
+    let g = src.fill(9u32).and_then(move |s| eager_copy_to(s, dst));
+    assert_eq!(g.cbable_weight(), 2, "svm fill + copy = two commands");
+
+    for i in 0..3 {
+        let (_src_co, dst_co): (
+            claspr::eager::Checkout<MappedSlice<u32>>,
+            claspr::eager::Checkout<MappedSlice<u32>>,
+        ) = g.sync(&ctx).unwrap_or_else(|e| panic!("sync {i}: {e:?}"));
+        let guard = dst_co.map().wait().expect("map dst");
+        assert!(
+            guard.iter().all(|&v| v == 9),
+            "iter {i}: copy of fill(9); got {:?}",
+            &guard[..8]
+        );
+        drop(guard);
+        drop((_src_co, dst_co));
+    }
+
+    if ctx.has_cl_khr_command_buffer() && homed_cb(&g) {
+        eprintln!("svm fill+copy: recorded a command buffer");
+    } else {
+        eprintln!("svm fill+copy: software fallback");
+    }
+}

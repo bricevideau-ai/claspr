@@ -51,10 +51,27 @@
 
 use crate::eager::{Deps, DeviceEnqueue, wrap_event};
 use crate::exec_ctx::ExecutionContext;
+use crate::record::RecordableBuffer;
 use crate::{
     Buffer, DeviceSlice, DeviceSliceUninit, Launcher, MappedSlice, MappedSliceUninit, MemMode,
     Result, USMSlice, USMSliceUninit,
 };
+
+/// Shared CB-record helper for the copy ops: record a `min(src,dst)`-byte copy of
+/// `src → dst` (both `RecordableBuffer`, so cl_mem or SVM) into `builder` and return
+/// its sync point. `None` when the builder lacks the command / the pair is ineligible
+/// (a mixed cl_mem/SVM copy) — `CbBuilder::copy_buffer` marks itself ineligible then.
+fn record_copy_cmd<S: RecordableBuffer, D: RecordableBuffer>(
+    builder: &crate::record::CbBuilder,
+    src: &S,
+    dst: &D,
+    waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+) -> Option<crate::cl_sync_point_khr> {
+    let sh = src.record_handle();
+    let dh = dst.record_handle();
+    let size = sh.byte_len.min(dh.byte_len);
+    builder.copy_buffer(sh.mem, dh.mem, 0, 0, size, waits)
+}
 use opencl3::event::{Event, retain_event};
 use opencl3::types::{CL_NON_BLOCKING, cl_event};
 use std::ffi::c_void;
@@ -117,6 +134,16 @@ where
         let event = crate::buffer::copy_buffer_enqueue(&src, &mut dst, ec, &raw)?;
         Ok(((src, dst), vec![wrap_event(event)]))
     }
+
+    fn record_cb(
+        mut self,
+        builder: Option<&crate::record::CbBuilder>,
+        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
+        let (src, dst) = self.take();
+        let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
+        Some(((src, dst), sp))
+    }
 }
 
 // ── (DeviceSlice, DeviceSliceUninit) — copy + Uninit→Init ─────────
@@ -153,6 +180,20 @@ where
         let event = crate::buffer::copy_buffer_enqueue(&src, &mut dst, ec, &raw)?;
         Ok(((src, dst), vec![wrap_event(event)]))
     }
+
+    fn record_cb(
+        mut self,
+        builder: Option<&crate::record::CbBuilder>,
+        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
+        let (src, uninit_dst) = self.take();
+        // SAFETY: the recorded copy writes every byte before any downstream stage
+        // observes the buffer (they wait on the CB's completion). Same soundness as
+        // the `run` path's `assume_init`.
+        let dst = unsafe { uninit_dst.assume_init() };
+        let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
+        Some(((src, dst), sp))
+    }
 }
 
 // ── (MappedSlice, MappedSlice) — clEnqueueSVMMemcpy via Tier 1 ────
@@ -182,6 +223,16 @@ where
         let raw: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let event = crate::mapped::svm_copy_enqueue(&src, &dst, ec, &raw)?;
         Ok(((src, dst), vec![wrap_event(event)]))
+    }
+
+    fn record_cb(
+        mut self,
+        builder: Option<&crate::record::CbBuilder>,
+        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
+        let (src, dst) = self.take();
+        let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
+        Some(((src, dst), sp))
     }
 }
 
@@ -214,6 +265,18 @@ where
         let raw: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let event = crate::mapped::svm_copy_enqueue(&src, &dst, ec, &raw)?;
         Ok(((src, dst), vec![wrap_event(event)]))
+    }
+
+    fn record_cb(
+        mut self,
+        builder: Option<&crate::record::CbBuilder>,
+        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
+        let (src, uninit_dst) = self.take();
+        // SAFETY: the recorded copy writes every byte before downstream observes it.
+        let dst = unsafe { uninit_dst.assume_init() };
+        let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
+        Some(((src, dst), sp))
     }
 }
 
@@ -321,6 +384,16 @@ where
         dst.register_use(dst_arc);
         Ok(((src, dst), vec![wrap_event(event)]))
     }
+
+    fn record_cb(
+        mut self,
+        builder: Option<&crate::record::CbBuilder>,
+        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
+        let (src, dst) = self.take();
+        let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
+        Some(((src, dst), sp))
+    }
 }
 
 // (MappedSlice, USMSliceUninit)
@@ -373,6 +446,18 @@ where
         dst.register_use(dst_arc);
         Ok(((src, dst), vec![wrap_event(event)]))
     }
+
+    fn record_cb(
+        mut self,
+        builder: Option<&crate::record::CbBuilder>,
+        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
+        let (src, uninit_dst) = self.take();
+        // SAFETY: the recorded copy writes every byte before downstream observes it.
+        let dst = unsafe { uninit_dst.assume_init() };
+        let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
+        Some(((src, dst), sp))
+    }
 }
 
 // (USMSlice, MappedSlice)
@@ -421,6 +506,16 @@ where
         src.register_use(src_arc);
         dst.register_use(dst_arc);
         Ok(((src, dst), vec![wrap_event(event)]))
+    }
+
+    fn record_cb(
+        mut self,
+        builder: Option<&crate::record::CbBuilder>,
+        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
+        let (src, dst) = self.take();
+        let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
+        Some(((src, dst), sp))
     }
 }
 
@@ -473,6 +568,18 @@ where
         dst.register_use(dst_arc);
         Ok(((src, dst), vec![wrap_event(event)]))
     }
+
+    fn record_cb(
+        mut self,
+        builder: Option<&crate::record::CbBuilder>,
+        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
+        let (src, uninit_dst) = self.take();
+        // SAFETY: the recorded copy writes every byte before downstream observes it.
+        let dst = unsafe { uninit_dst.assume_init() };
+        let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
+        Some(((src, dst), sp))
+    }
 }
 
 // (USMSlice, USMSlice)
@@ -521,6 +628,16 @@ where
         src.register_use(src_arc);
         dst.register_use(dst_arc);
         Ok(((src, dst), vec![wrap_event(event)]))
+    }
+
+    fn record_cb(
+        mut self,
+        builder: Option<&crate::record::CbBuilder>,
+        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
+        let (src, dst) = self.take();
+        let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
+        Some(((src, dst), sp))
     }
 }
 
@@ -572,5 +689,17 @@ where
         src.register_use(src_arc);
         dst.register_use(dst_arc);
         Ok(((src, dst), vec![wrap_event(event)]))
+    }
+
+    fn record_cb(
+        mut self,
+        builder: Option<&crate::record::CbBuilder>,
+        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
+        let (src, uninit_dst) = self.take();
+        // SAFETY: the recorded copy writes every byte before downstream observes it.
+        let dst = unsafe { uninit_dst.assume_init() };
+        let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
+        Some(((src, dst), sp))
     }
 }
