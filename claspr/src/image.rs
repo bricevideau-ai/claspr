@@ -838,7 +838,10 @@ impl<I: ImageEnqueue, E: Send> ImageRead<'_, I, E> {
 pub struct ImageCopy<Src: ImageEnqueue, Dst: ImageEnqueue> {
     src: Input<Src>,
     dst: Input<Dst>,
-    region: [usize; 3],
+    /// The copy extent. `Some` when a concrete-head `copy_to` computed it at build;
+    /// `None` for a pipe-fed graph copy (`eager_image_copy`) where the src image
+    /// isn't concrete at build — then it is derived at execute from the lent src.
+    region: Option<[usize; 3]>,
     src_pipe: Pipe<Src>,
     dst_pipe: Pipe<Dst>,
     /// Design-v2 CB home: an image→image copy records `clCommandCopyImageKHR` where
@@ -868,6 +871,9 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         // to its own element pipe.
         let (src, src_deps, src_home) = self.src.resolve_home(ec)?;
         let (mut dst, dst_deps, dst_home) = self.dst.resolve_home(ec)?;
+        // Region: from the build-time value (concrete `copy_to`) or derived at execute
+        // from the lent src (pipe-fed `eager_image_copy`, no concrete src at build).
+        let region = self.region.unwrap_or_else(|| src.enqueue_region());
 
         // ── CB-mode fork (design v2) — image→image copy via clCommandCopyImageKHR.
         // Absent PFN → ineligible → boundary falls back to per-op. ────────────────
@@ -881,7 +887,7 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
                 let smem = crate::record::MemRef::Buffer(src.image_ref().get());
                 let dmem = crate::record::MemRef::Buffer(dst.image_ref().get());
                 if let Some(sp) =
-                    builder.copy_image(smem, dmem, [0, 0, 0], [0, 0, 0], self.region, &waits)
+                    builder.copy_image(smem, dmem, [0, 0, 0], [0, 0, 0], region, &waits)
                 {
                     // Multi-output: both output pipes gate on this one copy command.
                     let set = std::collections::BTreeSet::from([sp]);
@@ -905,7 +911,7 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         raw.extend(dst_deps.iter().map(|d| d.as_ref().get()));
         // Copy has no native CL_BLOCKING flag — always enqueue non-blocking; a
         // blocking terminal waits on the event via the carried deps.
-        let event = copy_image_enqueue(src.image_ref(), dst.image_mut(), ec, self.region, &raw)?;
+        let event = copy_image_enqueue(src.image_ref(), dst.image_mut(), ec, region, &raw)?;
         let dep = vec![wrap_event(event)];
         self.src_pipe.put_home(src, dep.clone(), src_home);
         self.dst_pipe.put_home(dst, dep, dst_home);
@@ -1345,7 +1351,29 @@ fn image_copy_op<Src: ImageEnqueue, Dst: ImageEnqueue>(
     ImageCopy {
         src: src.into(),
         dst: dst.into(),
-        region,
+        region: Some(region),
+        src_pipe: Pipe::new(),
+        dst_pipe: Pipe::new(),
+        cb_cache: new_cb_cache(),
+    }
+}
+
+/// Pipe-fed image→image copy for a graph: both operands accept a concrete image OR
+/// an upstream `Pipe`/`Checkout`/`slot!` of one (`impl Into<Input<_>>`), so an image
+/// copy can chain off `and_then` (unlike the concrete `copy_to`, which consumes a
+/// concrete image by value). The copy extent is derived at execute from the lent
+/// src image. `Output = (Src, Dst)`: both images rebind out for reuse.
+pub fn eager_image_copy<Src, Dst, S, D>(src: S, dst: D) -> ImageCopy<Src, Dst>
+where
+    Src: ImageEnqueue,
+    Dst: ImageEnqueue,
+    S: Into<Input<Src>>,
+    D: Into<Input<Dst>>,
+{
+    ImageCopy {
+        src: src.into(),
+        dst: dst.into(),
+        region: None, // derived at execute from the lent src
         src_pipe: Pipe::new(),
         dst_pipe: Pipe::new(),
         cb_cache: new_cb_cache(),

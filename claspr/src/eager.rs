@@ -7920,6 +7920,9 @@ pub struct FillMappedUninit<T: Copy, M: MemMode> {
     uninit: Input<MappedSliceUninit<T, M>>,
     value: T,
     out: Pipe<MappedSlice<T, M>>,
+    /// Design-v2 CB home: an SVM fill records `clCommandSVMMemFillKHR` where the
+    /// extension provides it, else falls back to software.
+    cb_cache: CbCache,
 }
 
 /// Build an eager fill-from-uninit leaf over a `MappedSliceUninit`.
@@ -7935,6 +7938,7 @@ where
         uninit: uninit.into(),
         value,
         out: Pipe::new(),
+        cb_cache: new_cb_cache(),
     }
 }
 
@@ -7954,9 +7958,43 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        use crate::record::RecordableBuffer;
         let (uninit, deps) = self.uninit.resolve(ec)?;
         // SAFETY: the SVM fill below writes every byte.
         let buf = unsafe { uninit.assume_init() };
+
+        // ── CB-mode fork (design v2) — SVM fill via clCommandSVMMemFillKHR. Absent
+        // PFN → CbBuilder marks ineligible → boundary falls back to per-op. ────────
+        match ec.cb() {
+            CbWalk::Off => {}
+            CbWalk::Build { builder, ext, .. } => {
+                cb_collect_external(ext, &deps);
+                // A produced-from-uninit buffer has no upstream pipe feeding THIS
+                // value, so no interior sync points to look up (the uninit's own
+                // deps are external, collected above).
+                let waits = std::collections::BTreeSet::new();
+                let handle = buf.record_handle(); // MemRef::Svm
+                let pattern = unsafe {
+                    std::slice::from_raw_parts(
+                        (&self.value as *const T) as *const u8,
+                        std::mem::size_of::<T>(),
+                    )
+                };
+                if let Some(sp) =
+                    builder.fill_buffer(handle.mem, pattern, 0, handle.byte_len, &waits)
+                {
+                    ec.sp_register(self.out.cell_id(), std::collections::BTreeSet::from([sp]));
+                }
+                self.out.put(buf, Deps::new());
+                return Ok(());
+            }
+            CbWalk::LendOnly { ext, .. } => {
+                cb_collect_external(ext, &deps);
+                self.out.put(buf, Deps::new());
+                return Ok(());
+            }
+        }
+
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // SVM fill is always a non-blocking enqueue; Blocking waits here.
         let event = crate::mapped::svm_fill_enqueue(&buf, ec, self.value, &raw)?;
@@ -7974,6 +8012,25 @@ where
 
     fn check_ready(&self) -> Result<()> {
         self.uninit.check_ready()
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        Some(&self.cb_cache)
+    }
+
+    fn cb_addable(&self) -> bool {
+        true
+    }
+
+    fn cbable_weight(&self) -> usize {
+        1
+    }
+
+    fn cb_restamp(&self, evs: &[Dep]) {
+        if let Some((v, deps)) = self.out.take() {
+            let _ = deps;
+            self.out.put(v, Vec::from(evs));
+        }
     }
 
     fn describe(&self, out: &mut Vec<String>) {

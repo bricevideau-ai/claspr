@@ -120,7 +120,8 @@ pub use image::{
     KernelImage2DArrayReadWriteArg, KernelImage2DArrayWriteArg, KernelImage2DReadArg,
     KernelImage2DReadWriteArg, KernelImage2DWriteArg, KernelImage3DReadArg,
     KernelImage3DReadWriteArg, KernelImage3DWriteArg, KernelImageBufferReadArg,
-    KernelImageBufferReadWriteArg, KernelImageBufferWriteArg, ToInputImage, format,
+    KernelImageBufferReadWriteArg, KernelImageBufferWriteArg, ToInputImage, eager_image_copy,
+    format,
 };
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, KernelPointerArg, KernelScalarRefArg,

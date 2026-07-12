@@ -90,16 +90,50 @@ fn image_kernel_chain_runs_as_command_buffer() {
     }
 }
 
+/// An image FILL then image→image COPY is a weight-2 all-device span:
+/// `clCommandFillImageKHR` + `clCommandCopyImageKHR` in ONE command buffer (where the
+/// extension provides the image commands; else software fallback). `eager_image_copy`
+/// is the pipe-fed graph copy (the concrete `copy_to` can't chain off `and_then`).
+#[test]
+fn image_fill_then_copy_runs_as_command_buffer() {
+    let Some(ctx) = ctx() else { return };
+    use claspr::eager_image_copy;
+    use claspr::image::format::R32G32B32A32Uint;
+    let pattern: [u32; 4] = [11, 22, 33, 44];
+
+    let src = Image2D::<ReadWrite, R32G32B32A32Uint>::alloc(&ctx, W, H).expect("alloc src");
+    let dst = Image2D::<ReadWrite, R32G32B32A32Uint>::alloc(&ctx, W, H).expect("alloc dst");
+
+    // fill(src) -> eager_image_copy(src -> dst): two image commands → weight 2 → CB.
+    // Annotate the piped src so `eager_image_copy`'s Src generic is pinned.
+    let g = src.fill(pattern).and_then(
+        move |src: claspr::Pipe<Image2D<ReadWrite, R32G32B32A32Uint>>| eager_image_copy(src, dst),
+    );
+    assert_eq!(g.cbable_weight(), 2, "image fill + copy = two commands");
+
+    type Img = Image2D<ReadWrite, R32G32B32A32Uint>;
+    for i in 0..3 {
+        let (_src_co, dst_co): (claspr::eager::Checkout<Img>, claspr::eager::Checkout<Img>) =
+            g.sync(&ctx).unwrap_or_else(|e| panic!("sync {i}: {e:?}"));
+        let got: Vec<[u32; 4]> = dst_co.read_alloc().wait().expect("read dst");
+        assert_eq!(got.len(), N, "iter {i} len");
+        assert!(
+            got.iter().all(|&px| px == pattern),
+            "iter {i}: copy should carry the fill pattern; got {:?}",
+            &got[..2]
+        );
+        drop((_src_co, dst_co));
+    }
+
+    if ctx.has_cl_khr_command_buffer() && homed_cb(&g) {
+        eprintln!("image fill+copy: recorded a command buffer");
+    } else {
+        eprintln!("image fill+copy: software fallback (image CB commands unavailable)");
+    }
+}
+
 /// An image FILL followed by a kernel that READS the image is a weight-2 all-device
 /// span: `clCommandFillImageKHR` + `clCommandNDRangeKernelKHR` in ONE command buffer.
-/// This exercises the image-fill CB command (>= 0.9.4); where the extension lacks it
-/// the boundary falls back to software (no CB) — still correct. The fill writes a
-/// constant .x, the kernel copies .x into a buffer, so every out element == fill.x.
-///
-/// (An image→image `copy_to` in a graph needs a pipe-fed ImageCopy, which the image
-/// API does not yet expose — copy_to takes a concrete image by value. The
-/// clCommandCopyImageKHR path is wired in the runtime + covered by the SVM/copy
-/// CbBuilder methods; a graph-level image-copy test awaits pipe-fed ImageCopy.)
 #[test]
 fn image_fill_then_kernel_runs_as_command_buffer() {
     let Some(ctx) = ctx() else { return };
