@@ -866,7 +866,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 let iid_tt: TokenStream2 = quote! { #sid };
 
                 let trait_name = quote::format_ident!("KernelImage{}{}Arg", dim, access_segment);
-                let dbound: TokenStream2 = quote! { #gid: ::claspr::#trait_name<#family> };
+                // `+ RecordableBuffer` so the CB-mode fork can read the image's backing
+                // `cl_mem` via `record_handle()` (every owning image type impls it —
+                // `impl_recordable_image!` in image.rs). An image is a single `cl_mem`
+                // arg, set exactly like a buffer object, so no image-specific FFI is
+                // needed — just `CbBuilder::set_mem_arg`.
+                let dbound: TokenStream2 = quote! { #gid: ::claspr::#trait_name<#family> + ::claspr::record::RecordableBuffer };
                 let ibound: TokenStream2 =
                     quote! { #sid: ::claspr::ToInputImage<#family, Buf = #gid> };
                 generics.push((gid_tt.clone(), dbound));
@@ -883,7 +888,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // the lent value and its home threads to the output pipe — the run's
                 // `Checkout` re-arms the SAME `cl_mem` on drop (stable handle across
                 // replays), exactly like an in-place slice kernel arg.
+                let cbcell_ident = quote::format_ident!("__claspr_cbcell{}", arg_gen_idx - 1);
                 input_resolve_eager.push(quote! {
+                    // Capture the upstream pipe cell id BEFORE `resolve_home` shadows
+                    // `#pname` (needed by the CB-mode sync-point lookup), same as slices.
+                    let #cbcell_ident = ::claspr::Input::pipe_cell_id(#pname);
                     let (#pname, #deps_ident, #home_ident) =
                         ::claspr::Input::resolve_home(#pname, ec)?;
                 });
@@ -917,6 +926,28 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         ::claspr::Input::pipe_cell_id(#pname)
                     {
                         __claspr_in_cells.push(__c);
+                    }
+                });
+
+                // CB-mode: an image is a SINGLE `cl_mem` arg (unlike a slice's
+                // pointer+length pair), so it uses `set_mem_arg` (1 slot), and its
+                // `record_handle` is the infallible `RecordableBuffer` one (returns
+                // `BufHandle` directly — no `?`). Otherwise identical to the slice
+                // block: gather the upstream sync points, set the arg, remember the
+                // handle for the output-pipe registration.
+                cb_arg_stmts.push(quote! {
+                    {
+                        let __claspr_h =
+                            ::claspr::record::RecordableBuffer::record_handle(&#pname);
+                        __claspr_cb_waits.extend(__claspr_cb_ec.sp_lookup(#cbcell_ident));
+                        unsafe {
+                            __claspr_cb_builder.set_mem_arg(
+                                __claspr_cb_kernel,
+                                &mut __claspr_cb_argi,
+                                __claspr_h.mem,
+                            )?;
+                        }
+                        __claspr_cb_out_handles.push(__claspr_h);
                     }
                 });
             }
@@ -1188,10 +1219,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     //              add + enqueue nothing.
     // Entry deps (a producer OUTSIDE this CB) are collected into `ext` in both CB
     // modes so the homing node waits on them at clEnqueueCommandBufferKHR.
-    let cb_execute_fork = if has_image_param {
-        // Image kernels can't be CB-recorded; always take the normal path.
-        quote! {}
-    } else {
+    let cb_execute_fork = {
+        // Emitted for EVERY kernel (buffer AND image — an image arg is a single
+        // `cl_mem`, recorded via `set_mem_arg` in `cb_arg_stmts`). In `Off` this is
+        // empty and the normal enqueue runs; in `Build`/`LendOnly` it records into /
+        // lends for the command buffer and returns.
         // Per-output deposit (empty deps) + sync-point register, single vs multi.
         let out_pipe_exprs: Vec<TokenStream2> = if multi_output {
             op_pipe_fields.iter().map(|f| quote! { self.#f }).collect()
@@ -1420,21 +1452,16 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // corresponding input buffer's handle, gated on this launch's sync point.
     // A kernel with an image arg keeps the CB-mode fork disabled (no `record`/CB
     // codegen), so it is NOT CB-addable; a pure buffer/scalar kernel is.
-    let cb_addable_value: TokenStream2 = if has_image_param {
-        quote! { false }
-    } else {
-        quote! { true }
-    };
+    // Every kernel (buffer AND image) is a CB-addable device command — an image arg
+    // is a single `cl_mem`, recorded via `set_mem_arg` in `cb_arg_stmts`, so image
+    // kernels take the CB path like buffer kernels. (`has_image_param` no longer
+    // gates CB-addability; it still gates the legacy software-`record` path below,
+    // which is not wired for images.)
+    let cb_addable_value: TokenStream2 = quote! { true };
 
-    // `cbable_weight`: a kernel records exactly ONE `clCommandNDRangeKernelKHR` — but
-    // an image kernel is not CB-recordable (images aren't recordable yet), so it
-    // records 0, matching the image gate on `cb_addable`. A
-    // kernel is a leaf (no CB-capable children), so this is a constant, not a sum.
-    let cbable_weight_value: TokenStream2 = if has_image_param {
-        quote! { 0 }
-    } else {
-        quote! { 1 }
-    };
+    // `cbable_weight`: every kernel records exactly ONE `clCommandNDRangeKernelKHR`
+    // (buffer or image). A leaf — no CB-capable children — so a constant, not a sum.
+    let cbable_weight_value: TokenStream2 = quote! { 1 };
 
     // `cb_addable()` additionally opts a kernel OUT of the command-buffer path when
     // it carries runtime state the CB command form cannot honor:
@@ -1473,9 +1500,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `output_pipe()` for the default to stamp, so it must iterate its element pipes;
     // a single-output kernel's default (`output_pipe`) already works but we emit an
     // explicit stamp for symmetry. Image kernels take no CB path (no override).
-    let cb_restamp_method: TokenStream2 = if has_image_param {
-        quote! {}
-    } else if multi_output {
+    // Emitted for every kernel (image kernels now take the CB path too): stamp the
+    // CB completion event onto each output pipe so a downstream consumer in a
+    // different/no CB waits on the whole CB (event↔sync-point boundary).
+    let cb_restamp_method: TokenStream2 = if multi_output {
         quote! {
             fn cb_restamp(&self, __claspr_evs: &[::claspr::Dep]) {
                 #(
