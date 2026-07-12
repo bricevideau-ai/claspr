@@ -224,6 +224,12 @@ pub struct CbBuilder {
     /// overhead (an empty CB masquerading as work). `recorded() == 0` → the boundary
     /// skips the CB and just forwards the events the pipes already carry.
     recorded: Mutex<usize>,
+    /// Set true once [`finalize`](Self::finalize) has sealed this builder into a
+    /// [`FinalizedCb`] and handed off the CB handle + retained kernels. Makes
+    /// finalize idempotent (finalize-at-close: the close point seals the CB, and the
+    /// boundary-return frame must NOT re-seal / re-enqueue) and tells [`Drop`] to
+    /// release NOTHING (the `FinalizedCb` now owns the handle + kernels).
+    finalized: Mutex<bool>,
 }
 
 // SAFETY: the CB / queue / kernel handles are opaque handles into the
@@ -253,6 +259,7 @@ impl CbBuilder {
             kernels: Mutex::new(Vec::new()),
             eligible: Mutex::new(true),
             recorded: Mutex::new(0),
+            finalized: Mutex::new(false),
         })
     }
 
@@ -524,12 +531,26 @@ impl CbBuilder {
         *self.eligible.lock().unwrap()
     }
 
-    /// Finalize the live CB into a replayable [`FinalizedCb`]. Consumes the builder
-    /// (a CB is sealed exactly once). Returns `None` if finalize fails or the build
-    /// was marked ineligible — the caller then releases nothing extra (the
-    /// builder's `Drop` releases the CB + kernels).
-    pub fn finalize(self) -> Option<FinalizedCb> {
-        if !self.is_eligible() {
+    /// Finalize the live CB into a replayable [`FinalizedCb`] — **interior-mutable +
+    /// IDEMPOTENT** (`&self`, not `self`). This is what the *finalize-at-close* path
+    /// needs: the span CLOSE point (a `Build`→`Off` transition at a host seam) seals
+    /// + enqueues the CB through a SHARED borrow — the builder is behind `&CbBuilder`
+    /// in [`CbWalk::Build`](crate::exec_ctx::CbWalk), never owned there — while the
+    /// boundary-return frame still holds the same borrow.
+    ///
+    /// Returns `Some(cb)` exactly ONCE (the first call that seals it); every
+    /// subsequent call returns `None` (already sealed → the boundary-return frame
+    /// must reuse the homed [`FinalizedCb`], not re-seal). `None` also on ineligible
+    /// / missing-PFN — the caller then falls back and `Drop` releases the live CB.
+    ///
+    /// After a successful seal the CB handle + retained kernels are OWNED by the
+    /// returned [`FinalizedCb`]; `self`'s [`Drop`] releases nothing (the `finalized`
+    /// flag).
+    pub fn finalize(&self) -> Option<FinalizedCb> {
+        // Idempotency + eligibility gate. Hold the `finalized` lock across the whole
+        // seal so two racing closers can't both hand off the same handle.
+        let mut done = self.finalized.lock().unwrap();
+        if *done || !self.is_eligible() {
             return None;
         }
         let finalize = self.ext.finalize?;
@@ -537,18 +558,16 @@ impl CbBuilder {
         if unsafe { finalize(self.cb) } != opencl_sys::CL_SUCCESS {
             return None;
         }
-        // Move the CB + retained kernels into the FinalizedCb; neutralize `self`'s
-        // Drop so it does not release the handle we just handed over.
-        let cb = self.cb;
-        let queue = self.queue;
         let enqueue = self.ext.enqueue?;
         let release = self.ext.release?;
+        // Hand off the CB handle (Copy) + retained kernels to the FinalizedCb. Mark
+        // sealed BEFORE releasing the lock so `Drop` (and any later `finalize`) skips
+        // the handle we just gave away.
         let kernels = std::mem::take(&mut *self.kernels.lock().unwrap());
-        // Prevent the builder's Drop from releasing what we moved out.
-        std::mem::forget(self);
+        *done = true;
         Some(FinalizedCb {
-            cb,
-            queue,
+            cb: self.cb,
+            queue: self.queue,
             enqueue,
             release,
             kernels,
@@ -558,8 +577,13 @@ impl CbBuilder {
 
 impl Drop for CbBuilder {
     fn drop(&mut self) {
-        // Only reached on the DISCARD path (finalize `forget`s a successful build).
-        // Release the retained kernels, then the CB.
+        // A successful `finalize` set `finalized` and handed the CB + kernels to the
+        // `FinalizedCb`, which now owns them → release NOTHING here. Only the DISCARD
+        // path (never finalized: ineligible / empty-CB guard / finalize failure)
+        // reaches the releases below.
+        if *self.finalized.lock().unwrap() {
+            return;
+        }
         for k in self.kernels.lock().unwrap().drain(..) {
             let _ = unsafe { cl3::kernel::release_kernel(k) };
         }
