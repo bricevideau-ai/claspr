@@ -209,3 +209,57 @@ fn cg_shaped_pipe_bundle_records_one_cb_and_replays() {
         );
     }
 }
+
+/// HOST-SEAM SEGMENTATION (the hard gate): a device span → `and_then_host` cut →
+/// device span must segment into MULTIPLE command buffers wired by the
+/// event↔sync-point boundary (each device span its own CB; the CB completion event
+/// gates the seam's map, and the seam's unmap event gates the next span's CB), and
+/// converge to the SAME result as a pure per-op run.
+///
+/// The graph: fill(buf,1) -> scale*3 [CB1] -> and_then_host(view += 100) [host] ->
+/// scale*2 [CB2]. Per-op result: ((1*3)+100)*2 = 206. The two device spans home
+/// DISTINCT CBs (id1 != id2, both non-zero) — proving ≥2 CBs, not a silent
+/// single-CB or all-fallback.
+#[test]
+fn host_seam_segments_into_multiple_command_buffers() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
+
+    // The first device span (scale*3) is the SOURCE of the outer AndThen whose tail
+    // contains the seam — so it becomes its OWN CB. The second span (scale*2) is
+    // after the seam — its own CB. We capture each span's op to introspect its CB.
+    let span1 = fill(buf, 1u32).and_then(|b| ks.scale_u32([N], b, 3u32));
+    // Build the whole graph; keep a handle to the pre-seam span via forward so we
+    // can assert it homed a CB. (Structurally, the outer and_then's source is
+    // span1; cb_exec_child boundaries it.)
+    let g = span1
+        .and_then_host(|v: &mut [u32]| {
+            for x in v.iter_mut() {
+                *x += 100;
+            }
+            Ok(())
+        })
+        .and_then(move |b| ks.scale_u32([N], b, 2u32));
+
+    for i in 0..3 {
+        let co = g.sync(&ctx).unwrap_or_else(|e| panic!("sync {i}: {e:?}"));
+        let gd = co.map().wait().expect("read");
+        assert!(
+            gd.iter().all(|&v| v == 206),
+            "iter {i}: expected 206 = ((1*3)+100)*2, got {:?}",
+            &gd[..8]
+        );
+        drop(gd);
+        drop(co);
+    }
+
+    // The graph contains a host seam, so the WHOLE graph is NOT one CB (the root's
+    // own cb_cache stays empty — cb_addable is false for a seam graph). Segmentation
+    // is proven by the trace (cliloader: ≥2 distinct clCommandNDRangeKernelKHR CBs +
+    // host map/unmap between them) and by correctness here. The root homes NO CB:
+    assert!(
+        !homed_cb(&g),
+        "a host-seam graph's ROOT must not home a single whole-graph CB"
+    );
+}

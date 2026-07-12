@@ -1335,6 +1335,47 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         quote! { true }
     };
 
+    // CB-mode `cb_restamp` override: stamp the command buffer's single completion
+    // event onto EACH output pipe as its readiness dep, so a downstream consumer in
+    // a DIFFERENT (or no) command buffer waits on the whole CB (the event↔sync-point
+    // boundary: one enqueue event OUT). A MULTI-output kernel has no single
+    // `output_pipe()` for the default to stamp, so it must iterate its element pipes;
+    // a single-output kernel's default (`output_pipe`) already works but we emit an
+    // explicit stamp for symmetry. Image kernels take no CB path (no override).
+    let cb_restamp_method: TokenStream2 = if has_image_param {
+        quote! {}
+    } else if multi_output {
+        quote! {
+            fn cb_restamp(&self, __claspr_ev: &::claspr::Dep) {
+                #(
+                    if let ::core::option::Option::Some((__v, _d, __h)) =
+                        self.#op_pipe_fields.take_home()
+                    {
+                        self.#op_pipe_fields.put_home(
+                            __v,
+                            ::std::vec![::core::clone::Clone::clone(__claspr_ev)],
+                            __h,
+                        );
+                    }
+                )*
+            }
+        }
+    } else {
+        quote! {
+            fn cb_restamp(&self, __claspr_ev: &::claspr::Dep) {
+                if let ::core::option::Option::Some((__v, _d, __h)) =
+                    self.__claspr_out.take_home()
+                {
+                    self.__claspr_out.put_home(
+                        __v,
+                        ::std::vec![::core::clone::Clone::clone(__claspr_ev)],
+                        __h,
+                    );
+                }
+            }
+        }
+    };
+
     let record_method = if has_image_param {
         quote! {}
     } else {
@@ -1629,6 +1670,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     #cb_addable_value
                 }
 
+                #cb_restamp_method
+
                 #record_method
             }
         }
@@ -1754,6 +1797,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     // path — the `record`/CB overrides aren't even emitted then).
                     #cb_addable_value
                 }
+
+                #cb_restamp_method
 
                 #record_method
             }

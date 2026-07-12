@@ -406,21 +406,13 @@ where
 /// This is what makes host-seam graphs segment into sub-tree CBs: the seam feeds
 /// its device source through here in `Off`, so the source span becomes its own CB.
 fn cb_exec_child<O: DeviceOp>(child: &O, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-    if MIDGRAPH_CB
-        && matches!(ec.cb(), CbWalk::Off)
-        && child.cb_cache().is_some()
-        && cb_graph_eligible(child, ec)
+    if matches!(ec.cb(), CbWalk::Off) && child.cb_cache().is_some() && cb_graph_eligible(child, ec)
     {
         cb_boundary_execute(child, ec, mode)
     } else {
         child.execute(ec, mode)
     }
 }
-
-/// TEMPORARY diagnostic flag: gate mid-graph (host-seam) CB boundaries while the
-/// event↔sync-point cross-boundary threading is stabilised. `false` = only the
-/// whole-graph terminal boundary fires (all-device CB works; host-seam runs per-op).
-const MIDGRAPH_CB: bool = false;
 
 /// The gather-position analog of [`cb_exec_child`] — used when a combinator
 /// gathers its TAIL (`AndThen::next`, the terminal-shaped child). If the tail's
@@ -438,10 +430,7 @@ where
     O::Output: Send + 'static,
     O::Checkouts: FromCheckout<O::Output>,
 {
-    if MIDGRAPH_CB
-        && matches!(ec.cb(), CbWalk::Off)
-        && child.cb_cache().is_some()
-        && cb_graph_eligible(child, ec)
+    if matches!(ec.cb(), CbWalk::Off) && child.cb_cache().is_some() && cb_graph_eligible(child, ec)
     {
         cb_boundary_gather(child, ec, mode)
     } else {
@@ -5268,6 +5257,14 @@ where
         self.source.cb_addable() && self.next.cb_addable()
     }
 
+    fn cb_restamp(&self, ev: &Dep) {
+        // A chain's OUTPUT is its tail's output (its own `output_pipe` delegates to
+        // `next`, and for a multi-output tail that is `None` so the default no-ops).
+        // Delegate to the tail so a boundaried chain stamps the CB completion event
+        // onto the pipes a downstream consumer actually reads.
+        self.next.cb_restamp(ev);
+    }
+
     fn invalidate_cbs(&self) {
         // Clear this chain's own homed CB, then recurse (a mutated slot in either
         // child invalidates any CB homed above it — coarse clear-all on this graph).
@@ -6044,7 +6041,10 @@ macro_rules! impl_eager_bundle {
                 // here), so there is no reconstruction / round-trip. The TERMINAL
                 // gather (`gather_checkouts` / `collect`) instead delegates to each
                 // branch's own gather so per-buffer homes are threaded — see below.
-                $( self.$field.execute(ec, ExecMode::Pipelined)?; )+
+                // CB mid-graph boundaries: in `Off`, a fully-addable branch opens its
+                // OWN command buffer (via `cb_exec_child`); already inside a CB it just
+                // forwards; a mixed branch recurses.
+                $( cb_exec_child(&self.$field, ec, ExecMode::Pipelined)?; )+
                 Ok(())
             }
 
@@ -6098,9 +6098,11 @@ macro_rules! impl_eager_bundle {
                 // drop, and the bundle re-runs (the fix: no more "multi-output
                 // branch collapses to home == None"). Branches pipeline; join their
                 // wait-lists into one marker.
+                // CB mid-graph boundaries: a fully-addable branch gathers as its own
+                // command buffer (via `cb_gather_child`); mixed branches recurse.
                 let mut branch_deps: Vec<Deps> = Vec::new();
                 let checkouts = ( $({
-                    let (co, d) = self.$field.gather_checkouts(ec, ExecMode::Pipelined)?;
+                    let (co, d) = cb_gather_child(&self.$field, ec, ExecMode::Pipelined)?;
                     branch_deps.push(d);
                     co
                 },)+ );
@@ -6164,6 +6166,14 @@ macro_rules! impl_eager_bundle {
                 // AND every branch: the whole bundle is CB-addable iff every branch
                 // is (a transfer / host seam in any branch disqualifies it).
                 true $(&& self.$field.cb_addable())+
+            }
+
+            fn cb_restamp(&self, ev: &Dep) {
+                // Stamp the CB completion event onto every branch's output pipe(s) —
+                // delegate to each branch's own `cb_restamp` (a multi-output branch
+                // stamps each element pipe). So a downstream consumer of ANY branch
+                // waits on the one CB enqueue event.
+                $(self.$field.cb_restamp(ev);)+
             }
 
             fn cb_cache(&self) -> Option<&CbCache> {
@@ -9953,7 +9963,7 @@ where
         // every branch re-homes on drop — the mid-graph multi-home replay (#212
         // completion). A single-output source scatters into one pipe with its home
         // preserved (byte-identical to the pre-#212 `collect_home` + `put_home`).
-        let (src_cos, deps) = self.source.gather_checkouts(ec, ExecMode::Pipelined)?;
+        let (src_cos, deps) = cb_gather_child(&self.source, ec, ExecMode::Pipelined)?;
         let (value, homes) = src_cos.split();
         // Reusable: `Arc::clone` the closure so the per-run worker thread gets
         // its OWN owned handle to move in (it runs off the submitting thread).
@@ -10006,7 +10016,7 @@ where
         // branch re-arms on drop. (Distinct from `execute`, which re-scatters into
         // the seam's own element pipes for a DOWNSTREAM consumer; here the terminal
         // takes the checkouts directly.)
-        let (src_cos, deps) = self.source.gather_checkouts(ec, ExecMode::Pipelined)?;
+        let (src_cos, deps) = cb_gather_child(&self.source, ec, ExecMode::Pipelined)?;
         let (value, homes) = src_cos.split();
         let f = Arc::clone(&self.f);
         let (out_value, out_deps) =
@@ -10082,7 +10092,7 @@ where
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // MID-GRAPH re-scatter — twin of `AndThenHost::execute` (see it for the full
         // rationale); the closure additionally gets `&Context`.
-        let (src_cos, deps) = self.source.gather_checkouts(ec, ExecMode::Pipelined)?;
+        let (src_cos, deps) = cb_gather_child(&self.source, ec, ExecMode::Pipelined)?;
         let (value, homes) = src_cos.split();
         // Reusable: `Arc::clone` the closure and clone a fresh `Context` per run,
         // then move both into a fresh one-shot callable for the worker thread.
@@ -10125,7 +10135,7 @@ where
     ) -> Result<(Self::Checkouts, Deps)> {
         // TERMINAL / CHECKOUT gather — the #212 pass-1 path, UNCHANGED (twin of
         // `AndThenHost::gather_checkouts`; closure also gets `&Context`).
-        let (src_cos, deps) = self.source.gather_checkouts(ec, ExecMode::Pipelined)?;
+        let (src_cos, deps) = cb_gather_child(&self.source, ec, ExecMode::Pipelined)?;
         let (value, homes) = src_cos.split();
         let f = Arc::clone(&self.f);
         let context = ec.context().clone();

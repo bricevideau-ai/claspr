@@ -219,6 +219,17 @@ impl<'ctx> ExecutionContext<'ctx> {
     ///
     /// Shares the host-error slot, start gate, worker list, and sync-point edge map
     /// (all `Arc` clones / `Copy`), re-borrowing `context`/`cl_queue` for `'a`.
+    ///
+    /// **Installs a FRESH sync-point edge map** — CRITICAL for the event↔sync-point
+    /// boundary when the graph is split across MULTIPLE command buffers (the
+    /// host-seam case). A `cl_sync_point_khr` is only valid WITHIN the command buffer
+    /// that produced it; a consumer in a DIFFERENT CB must wait on the producing CB's
+    /// enqueue EVENT (external), never its sync point. By starting each CB with an
+    /// empty edge map, a cross-CB consumer's [`sp_lookup`](Self::sp_lookup) finds
+    /// nothing and (correctly) falls back to the enqueue event that
+    /// [`cb_restamp`](crate::DeviceOp::cb_restamp) stamped onto the producer's output
+    /// pipe — collected into THIS CB's external wait-list. Passing a stale sync point
+    /// across CBs is exactly `CL_INVALID_SYNC_POINT_WAIT_LIST_KHR` (-1139).
     pub(crate) fn with_cb<'a>(&'a self, cb: CbWalk<'a>) -> ExecutionContext<'a> {
         ExecutionContext {
             context: self.context,
@@ -228,7 +239,7 @@ impl<'ctx> ExecutionContext<'ctx> {
             start: self.start,
             workers: Arc::clone(&self.workers),
             cb,
-            sp_edges: Arc::clone(&self.sp_edges),
+            sp_edges: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
