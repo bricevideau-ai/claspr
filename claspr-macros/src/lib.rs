@@ -1187,7 +1187,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         quote! {
             match ::claspr::ExecutionContext::cb(ec) {
                 ::claspr::eager::CbWalk::Off => {}
-                ::claspr::eager::CbWalk::Build { builder: __claspr_cb_builder, ext: __claspr_cb_ext } => {
+                ::claspr::eager::CbWalk::Build { builder: __claspr_cb_builder, ext: __claspr_cb_ext, .. } => {
                     let __claspr_cb_ec = ec;
                     #collect_ext
                     let __claspr_cb_kernel = ::claspr::Kernel::get(&self.kernel);
@@ -1222,7 +1222,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     }
                     return ::core::result::Result::Ok(());
                 }
-                ::claspr::eager::CbWalk::LendOnly { ext: __claspr_cb_ext } => {
+                ::claspr::eager::CbWalk::LendOnly { ext: __claspr_cb_ext, .. } => {
                     #collect_ext
                     #(#cb_deposits_lend)*
                     return ::core::result::Result::Ok(());

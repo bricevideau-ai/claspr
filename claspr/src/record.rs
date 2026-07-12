@@ -280,6 +280,15 @@ impl CbBuilder {
         *self.recorded.lock().unwrap()
     }
 
+    /// Whether [`finalize`](Self::finalize) has already sealed this builder. The
+    /// finalize-at-close span opener reads this at return: `true` → the close point
+    /// sealed + enqueued the CB (nothing to do); `false` with `recorded() > 0` and
+    /// eligible → the close never fired (a span with no interior seam) → the opener
+    /// finalizes + enqueues at return itself.
+    pub fn is_finalized(&self) -> bool {
+        *self.finalized.lock().unwrap()
+    }
+
     /// Add a buffer fill to the CB. `mem` must be a `cl_mem` (SVM marks the build
     /// ineligible). Returns the command's sync point, or `None` on any shortfall.
     pub fn fill_buffer(
@@ -533,10 +542,10 @@ impl CbBuilder {
 
     /// Finalize the live CB into a replayable [`FinalizedCb`] — **interior-mutable +
     /// IDEMPOTENT** (`&self`, not `self`). This is what the *finalize-at-close* path
-    /// needs: the span CLOSE point (a `Build`→`Off` transition at a host seam) seals
-    /// + enqueues the CB through a SHARED borrow — the builder is behind `&CbBuilder`
-    /// in [`CbWalk::Build`](crate::exec_ctx::CbWalk), never owned there — while the
-    /// boundary-return frame still holds the same borrow.
+    /// needs: the span CLOSE point (a `Build`→`Off` transition at a host seam)
+    /// seals+enqueues the CB through a SHARED borrow — the builder is behind
+    /// `&CbBuilder` in [`CbWalk::Build`](crate::exec_ctx::CbWalk), never owned there,
+    /// while the boundary-return frame still holds the same borrow.
     ///
     /// Returns `Some(cb)` exactly ONCE (the first call that seals it); every
     /// subsequent call returns `None` (already sealed → the boundary-return frame

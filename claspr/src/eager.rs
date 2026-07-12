@@ -325,6 +325,8 @@ where
 
     // The EXTERNAL cl_event accumulator for THIS command buffer, on this frame.
     let ext: Mutex<Vec<Dep>> = Mutex::new(Vec::new());
+    // The span-closed latch (see `CbWalk::Build::closed`), owned by this frame.
+    let closed = std::sync::atomic::AtomicBool::new(false);
 
     // Is there a valid cached CB for this queue? (Replay fast-path.)
     let cached: Option<Arc<crate::record::FinalizedCb>> = {
@@ -338,8 +340,19 @@ where
     if let Some(cb) = cached {
         // REPLAY: re-walk lend-only (materialize buffers + build Checkouts), then
         // one clEnqueueCommandBufferKHR with the run's external events.
-        let build_ec = ec.with_cb(CbWalk::LendOnly { ext: &ext });
-        let (checkouts, _internal) = op.gather_checkouts(&build_ec, mode)?;
+        let build_ec = ec.with_cb(CbWalk::LendOnly {
+            ext: &ext,
+            cache,
+            closed: &closed,
+        });
+        let (checkouts, internal) = op.gather_checkouts(&build_ec, mode)?;
+        if closed.load(std::sync::atomic::Ordering::SeqCst) {
+            // The span CLOSED mid-walk (an interior seam / transfer): the close point
+            // enqueued the cached span CB before the boundary, and the tail ran in
+            // `Off`. `internal` carries the tail's completion events. Do NOT enqueue
+            // again (that would be `CL_INVALID_OPERATION`).
+            return Ok((checkouts, internal));
+        }
         let waits: Vec<crate::cl_event> = ext
             .lock()
             .unwrap()
@@ -359,8 +372,17 @@ where
     let build_ec = ec.with_cb(CbWalk::Build {
         builder: &builder,
         ext: &ext,
+        cache,
+        closed: &closed,
     });
     let (checkouts, internal) = op.gather_checkouts(&build_ec, mode)?;
+
+    if builder.is_finalized() {
+        // The span CLOSED mid-walk (an interior seam / transfer): the close point
+        // already sealed + enqueued the CB and restamped `source`'s pipes; the tail
+        // ran in `Off`, so `internal` is the correct downstream wait-list.
+        return Ok((checkouts, internal));
+    }
 
     if !builder.is_eligible() {
         // An SVM (or otherwise un-addable) command: the build pass enqueued NOTHING
@@ -419,6 +441,11 @@ where
 /// This is what makes host-seam graphs segment into sub-tree CBs: the seam feeds
 /// its device source through here in `Off`, so the source span becomes its own CB.
 fn cb_exec_child<O: DeviceOp>(child: &O, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+    if cb_span_closed(ec) {
+        // A deeper close already sealed this frame's span CB → run the child in `Off`
+        // (it opens its own fresh boundary if eligible). Never add to a sealed CB.
+        return cb_exec_child(child, &ec.with_cb(CbWalk::Off), mode);
+    }
     if matches!(ec.cb(), CbWalk::Off) && child.cb_cache().is_some() && cb_graph_eligible(child, ec)
     {
         cb_boundary_execute(child, ec, mode)
@@ -443,11 +470,172 @@ where
     O::Output: Send + 'static,
     O::Checkouts: FromCheckout<O::Output>,
 {
+    if cb_span_closed(ec) {
+        // A deeper close already sealed this frame's span CB → gather the child in
+        // `Off` (opens its own fresh boundary if eligible).
+        return cb_gather_child(child, &ec.with_cb(CbWalk::Off), mode);
+    }
     if matches!(ec.cb(), CbWalk::Off) && child.cb_cache().is_some() && cb_graph_eligible(child, ec)
     {
         cb_boundary_gather(child, ec, mode)
     } else {
         child.gather_checkouts(ec, mode)
+    }
+}
+
+/// **Finalize-at-close** (design v2, maximal-span batching). Called at the exact
+/// point a maximal seam-free span CLOSES — an [`AndThen`] executing INSIDE a command
+/// buffer (`Build`/`LendOnly`) whose `next` cannot continue the span (a host seam /
+/// transfer). This SEALS + ENQUEUES the span's command buffer and returns its single
+/// completion event, so the caller can [`cb_restamp`](DeviceOp::cb_restamp) it onto
+/// the span's output pipes BEFORE the seam (run next, in `Off`) reads them — the
+/// whole reason singletons were the prior floor: at boundary-return the seam had
+/// already mapped the outputs with no wait (the race).
+///
+/// - **Build**: [`finalize`](crate::record::CbBuilder::finalize) the live builder
+///   (idempotent — the boundary-return frame sees it already sealed and skips), home
+///   the [`FinalizedCb`](crate::record::FinalizedCb) in the span head's `cache`
+///   (threaded through [`CbWalk`]), enqueue with the span's external deps.
+/// - **LendOnly** (replay): read the cached CB from `cache` and enqueue it.
+///
+/// Returns `Ok(None)` when there is no CB to close (extension absent, or the span
+/// recorded zero commands — the empty-CB case, where the caller keeps the pipes as
+/// the Build pass left them). `Off` is unreachable (only called from a Build/LendOnly
+/// AndThen).
+fn cb_close_span(ec: &ExecutionContext<'_>) -> Result<Option<Dep>> {
+    use crate::Launcher;
+    use std::sync::atomic::Ordering;
+    let (ext, cache, closed, is_build): (
+        &Mutex<Vec<Dep>>,
+        &CbCache,
+        &std::sync::atomic::AtomicBool,
+        bool,
+    ) = match ec.cb() {
+        CbWalk::Build {
+            ext, cache, closed, ..
+        } => (ext, cache, closed, true),
+        CbWalk::LendOnly {
+            ext, cache, closed, ..
+        } => (ext, cache, closed, false),
+        CbWalk::Off => return Ok(None),
+    };
+    let queue = ec.cl_queue().get();
+
+    // IDEMPOTENCY: a span closes EXACTLY once. The close point is deep inside a source
+    // subtree, so several ancestor `AndThen`s may reach `cb_close_before_seam` after
+    // it; only the first actually seals + enqueues. In Build, `finalize` is itself
+    // idempotent, but the LendOnly (replay) path re-reads the cache and would
+    // re-enqueue the SAME CB (`CL_INVALID_OPERATION`) — this latch guards BOTH.
+    if closed.swap(true, Ordering::SeqCst) {
+        return Ok(None);
+    }
+
+    // REPLAY: enqueue the cached span CB (read from the head's cache).
+    if !is_build {
+        let cached: Option<Arc<crate::record::FinalizedCb>> = {
+            let g = cache.lock().unwrap();
+            g.as_ref().filter(|cb| cb.queue() == queue).map(Arc::clone)
+        };
+        let Some(cb) = cached else {
+            // Shouldn't happen (replay implies a homed CB), but stay safe: no CB to
+            // close → caller keeps the Build-pass pipes.
+            return Ok(None);
+        };
+        let waits = drain_ext(ext);
+        let event = cb.enqueue(&waits)?;
+        return Ok(Some(wrap_event(event)));
+    }
+
+    // BUILD: seal the live builder (idempotent), home it, enqueue.
+    let CbWalk::Build { builder, .. } = ec.cb() else {
+        unreachable!("is_build implies Build");
+    };
+    if builder.recorded() == 0 {
+        // Empty span (pure passthroughs): nothing to seal. The caller keeps the
+        // Build-pass pipes (their payloads already carry the upstream events).
+        return Ok(None);
+    }
+    let Some(finalized) = builder.finalize() else {
+        // Ineligible / finalize failure: no CB. The span's leaves added to a builder
+        // that will be discarded → the caller must fall back. Signalled as `None`;
+        // the AndThen close handles the reclaim + Off re-run.
+        return Ok(None);
+    };
+    let finalized = Arc::new(finalized);
+    *cache.lock().unwrap() = Some(Arc::clone(&finalized));
+    let waits = drain_ext(ext);
+    let event = finalized.enqueue(&waits)?;
+    Ok(Some(wrap_event(event)))
+}
+
+/// Drain a CB's external `cl_event` dep accumulator into a raw wait-list for
+/// `clEnqueueCommandBufferKHR`.
+fn drain_ext(ext: &Mutex<Vec<Dep>>) -> Vec<crate::cl_event> {
+    ext.lock()
+        .unwrap()
+        .iter()
+        .map(|d| d.as_ref().get())
+        .collect()
+}
+
+/// Whether `op` (an [`AndThen`]) should OPEN a maximal seam-free span here (design
+/// v2, finalize-at-close). True iff we are in [`Off`](CbWalk::Off), the platform has
+/// the extension, `op` is CB-capable, its leading source is addable
+/// ([`cb_spine_head_addable`](DeviceOp::cb_spine_head_addable)), yet `op` is NOT
+/// wholly addable — i.e. it CONTAINS a host seam further down `next`. The wholly-
+/// addable case (`cb_addable()`) is the existing whole-subtree boundary that the
+/// PARENT's `cb_exec_child`/`cb_gather_child` handles; only the interior-seam
+/// spine-head opens its span from inside its own `execute`/`gather`.
+fn cb_should_open_span<O: DeviceOp>(op: &O, ec: &ExecutionContext<'_>) -> bool {
+    matches!(ec.cb(), CbWalk::Off)
+        && op.cb_cache().is_some()
+        && ec.context().has_cl_khr_command_buffer()
+        && op.cb_spine_head_addable()
+        && !op.cb_addable()
+}
+
+/// The **span-close decision** for an [`AndThen`] running INSIDE a command buffer.
+/// If `next` cannot continue the maximal seam-free span (a host seam / transfer —
+/// [`cb_spine_head_addable`](DeviceOp::cb_spine_head_addable) is false) and we are in
+/// `Build`/`LendOnly`, this SEALS + ENQUEUES the span CB via [`cb_close_span`] and
+/// [`cb_restamp`](DeviceOp::cb_restamp)s its completion event onto `source`'s output
+/// pipes — `source` is the last span node before the seam, and its pipes are exactly
+/// what `next` (the seam) is about to read. Returns `true` iff the span closed here
+/// (the caller must then run `next` in [`Off`](CbWalk::Off)); `false` to continue the
+/// span (run `next` in the same Build/LendOnly `ec`).
+///
+/// Idempotent across ancestor `AndThen`s: once a deeper close sealed the builder, a
+/// higher `AndThen` whose `next` also can't continue re-enters here, gets `None` from
+/// [`cb_close_span`] (already finalized), skips the restamp, and still runs its `next`
+/// in `Off` — so no post-seam op joins the dead builder.
+/// Whether this walk position's span has already CLOSED (its latch is set — see
+/// [`CbWalk::Build`]`::closed`). Once closed, all remaining work under the same
+/// boundary frame must run in [`Off`](CbWalk::Off): a deeper close already sealed +
+/// enqueued the span CB, so no ancestor may keep adding to it. `Off` positions have
+/// no span → never closed.
+fn cb_span_closed(ec: &ExecutionContext<'_>) -> bool {
+    use std::sync::atomic::Ordering;
+    match ec.cb() {
+        CbWalk::Build { closed, .. } | CbWalk::LendOnly { closed, .. } => {
+            closed.load(Ordering::SeqCst)
+        }
+        CbWalk::Off => false,
+    }
+}
+
+fn cb_close_before_seam<S, U>(source: &S, next: &U, ec: &ExecutionContext<'_>) -> Result<bool>
+where
+    S: DeviceOp,
+    U: DeviceOp,
+{
+    match ec.cb() {
+        CbWalk::Build { .. } | CbWalk::LendOnly { .. } if !next.cb_spine_head_addable() => {
+            if let Some(ev) = cb_close_span(ec)? {
+                source.cb_restamp(&[ev]);
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -473,6 +661,7 @@ where
         .cb_cache()
         .expect("cb_boundary_execute: boundary node must carry a cb_cache");
     let ext: Mutex<Vec<Dep>> = Mutex::new(Vec::new());
+    let closed = std::sync::atomic::AtomicBool::new(false);
 
     // Replay fast-path: a valid cached CB for this queue.
     let cached: Option<Arc<crate::record::FinalizedCb>> = {
@@ -484,8 +673,18 @@ where
     };
 
     if let Some(cb) = cached {
-        let build_ec = ec.with_cb(CbWalk::LendOnly { ext: &ext });
+        let build_ec = ec.with_cb(CbWalk::LendOnly {
+            ext: &ext,
+            cache,
+            closed: &closed,
+        });
         op.execute(&build_ec, mode)?;
+        if closed.load(std::sync::atomic::Ordering::SeqCst) {
+            // The span CLOSED mid-walk (an interior seam / transfer): the close point
+            // enqueued the cached span CB before the boundary and restamped
+            // `source`'s pipes; the tail ran in `Off`. Nothing to do at return.
+            return Ok(());
+        }
         let waits: Vec<crate::cl_event> = ext
             .lock()
             .unwrap()
@@ -504,8 +703,17 @@ where
     let build_ec = ec.with_cb(CbWalk::Build {
         builder: &builder,
         ext: &ext,
+        cache,
+        closed: &closed,
     });
     op.execute(&build_ec, mode)?;
+
+    if builder.is_finalized() {
+        // The span CLOSED mid-walk (an interior seam / transfer): the close point
+        // already sealed + enqueued the CB and restamped `source`'s pipes; the tail
+        // ran in `Off`. DONE.
+        return Ok(());
+    }
 
     if !builder.is_eligible() {
         // The build enqueued nothing; the pipes hold the lent buffers with empty
@@ -3559,6 +3767,25 @@ pub trait DeviceOp: Send {
             pipe.put_home(v, evs.to_vec(), home);
         }
     }
+
+    /// Whether this node CONTINUES / HEADS a maximal seam-free command-buffer span
+    /// (design v2, finalize-at-close). The span is the longest prefix of the spine
+    /// whose leading device work is CB-addable; it CLOSES at the first node that
+    /// cannot continue it (a host seam / transfer).
+    ///
+    /// Default = [`cb_addable`](Self::cb_addable): a leaf / fully-addable subtree
+    /// continues the span iff it is entirely addable. An [`AndThen`] overrides it to
+    /// `self.source.cb_spine_head_addable()` — the CHAIN continues the span as long
+    /// as its *leading source* is addable, EVEN THOUGH the whole chain is
+    /// `!cb_addable` (a seam lives further down `next`). That recursion is what lets
+    /// the span span multiple spine `AndThen`s: `dot.and_then(bundle4.and_then(seam))`
+    /// continues (its leading source `dot` is addable), and the span closes exactly
+    /// at the `bundle4.and_then(seam)` level whose `next` is the seam. This is the
+    /// stop rule that batches CG's `[xpby, spmv, dot]` (+ the 0-command `bundle4`
+    /// passthrough) into ONE CB.
+    fn cb_spine_head_addable(&self) -> bool {
+        self.cb_addable()
+    }
 }
 
 /// Builder verbs for composing [`DeviceOp`]s. Blanket-implemented.
@@ -5134,17 +5361,29 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // OPEN a maximal span at SELF (finalize-at-close): a `!cb_addable` chain whose
+        // leading source is addable (`cb_spine_head_addable`) but which CONTAINS a
+        // host seam is the HEAD of a maximal seam-free span. Open ONE CB here and
+        // re-enter in `Build` (or `LendOnly` on replay), where the source/next
+        // dispatch below extends the CB across the addable prefix and CLOSES it at
+        // the seam. A FULLY-addable chain (no interior seam) is caught by the parent's
+        // `cb_exec_child` as a whole-subtree boundary and never reaches here in Off.
+        if cb_should_open_span(self, ec) {
+            return cb_boundary_execute(self, ec, mode);
+        }
         // Source is always upstream → must pipeline (its output feeds `next`).
-        // Only the tail inherits the caller's `mode` (Blocking iff terminal).
-        // Capture the source's output pipe BEFORE moving it, so we can thread any
-        // events the `next` op discarded (see `collect`'s note on orphaned deps).
         let src_pipe = self.source.output_pipe();
         let out_pipe = self.next.output_pipe();
-        // CB mid-graph boundaries (design v2): in `Off` mode a fully-addable child
-        // span opens its OWN command buffer here (via `cb_exec_child`); already
-        // inside a CB (`Build`/`LendOnly`) or a mixed child → plain forward.
         cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
-        cb_exec_child(&self.next, ec, mode)?;
+        // CLOSE the span at the seam (Build/LendOnly + next can't continue): seal +
+        // enqueue the CB and restamp `source`'s pipes with its completion event, then
+        // run `next` in `Off`. Otherwise forward normally (continue the span in Build,
+        // or open a fresh boundary in Off).
+        if cb_close_before_seam(&self.source, &self.next, ec)? {
+            self.next.execute(&ec.with_cb(CbWalk::Off), mode)?;
+        } else {
+            cb_exec_child(&self.next, ec, mode)?;
+        }
         thread_orphaned_source_deps(&src_pipe, &out_pipe);
         Ok(())
     }
@@ -5160,7 +5399,13 @@ where
         // source pipelines; only the tail observes the terminal `mode`.
         let src_pipe = self.source.output_pipe();
         cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
-        let (value, mut deps) = self.next.collect(ec, mode)?;
+        // CLOSE the span at the seam: seal + enqueue + restamp `source`, then collect
+        // `next` in `Off`. Otherwise collect `next` normally (continue in Build).
+        let (value, mut deps) = if cb_close_before_seam(&self.source, &self.next, ec)? {
+            self.next.collect(&ec.with_cb(CbWalk::Off), mode)?
+        } else {
+            self.next.collect(ec, mode)?
+        };
         // ORPHANED DEPS: if the `and_then` closure discarded the source's handle
         // (e.g. `.and_then(|_buf| value(0))`), the source's value + events are
         // still sitting un-taken in its output pipe. Those events MUST still gate
@@ -5193,7 +5438,11 @@ where
         // in exactly as in `collect`.
         let src_pipe = self.source.output_pipe();
         cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
-        let (value, mut deps, home) = self.next.collect_home(ec, mode)?;
+        let (value, mut deps, home) = if cb_close_before_seam(&self.source, &self.next, ec)? {
+            self.next.collect_home(&ec.with_cb(CbWalk::Off), mode)?
+        } else {
+            self.next.collect_home(ec, mode)?
+        };
         if let Some((_discarded, src_deps)) = src_pipe.and_then(|p| p.take()) {
             deps.extend(src_deps);
         }
@@ -5210,17 +5459,28 @@ where
         Self::Output: Send + 'static,
         Self::Checkouts: FromCheckout<Self::Output>,
     {
+        // OPEN a maximal span at SELF (see `execute`): an interior-seam spine-head
+        // reached in gather position (the terminal drives the root through here for a
+        // host-seam graph). Re-enters in `Build`/`LendOnly`; the close below batches
+        // the addable prefix and seals at the seam.
+        if cb_should_open_span(self, ec) {
+            return cb_boundary_gather(self, ec, mode);
+        }
         // Mirror `collect`: delegate to the tail so a multi-output `next` builds
         // its per-element `Checkout` tuple via its OWN `gather_checkouts` override
         // (the default single-pipe drain reads `output_pipe`, which a multi-output
         // op never fills → "op produced no output"). Source pipelines; tail takes
         // the terminal `mode`. Same orphaned-source-deps threading as `collect`.
         let src_pipe = self.source.output_pipe();
-        // Mid-graph CB boundaries: an addable source span opens its own CB (in
-        // `Off`); the tail gathers through `cb_gather_child` so a fully-addable tail
-        // span becomes its own CB too (and a mixed tail recurses).
         cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
-        let (checkouts, mut deps) = cb_gather_child(&self.next, ec, mode)?;
+        // CLOSE the span at the seam: seal + enqueue + restamp `source`, then gather
+        // `next` in `Off`. Otherwise gather `next` normally (continue in Build, or
+        // open a fresh boundary in Off).
+        let (checkouts, mut deps) = if cb_close_before_seam(&self.source, &self.next, ec)? {
+            self.next.gather_checkouts(&ec.with_cb(CbWalk::Off), mode)?
+        } else {
+            cb_gather_child(&self.next, ec, mode)?
+        };
         if let Some((_discarded, src_deps)) = src_pipe.and_then(|p| p.take()) {
             deps.extend(src_deps);
         }
@@ -5289,6 +5549,16 @@ where
         // A chain is CB-addable iff BOTH halves are (a transfer / host seam in
         // either disqualifies the whole subtree — coarse whole-graph gating).
         self.source.cb_addable() && self.next.cb_addable()
+    }
+
+    fn cb_spine_head_addable(&self) -> bool {
+        // The chain CONTINUES / HEADS a maximal seam-free span as long as its
+        // LEADING source can (recursively) — EVEN IF the whole chain is `!cb_addable`
+        // (a seam lives further down `next`). Recursing through `source` (not just
+        // `source.cb_addable()`) lets the span extend across nested spine `AndThen`s
+        // whose own `next` is still addable, closing only at the `AndThen` whose
+        // `next` is the seam.
+        self.source.cb_spine_head_addable()
     }
 
     fn cb_restamp(&self, evs: &[Dep]) {
@@ -5457,7 +5727,7 @@ impl<T: crate::record::RecordableBuffer + Send + 'static> DeviceOp for Lift<T> {
             CbWalk::Off => {
                 self.out.put_home(v, deps, home);
             }
-            CbWalk::Build { ext, .. } | CbWalk::LendOnly { ext } => {
+            CbWalk::Build { ext, .. } | CbWalk::LendOnly { ext, .. } => {
                 // A lifted concrete resource is an ENTRY into the CB — no upstream
                 // producer, so no sync points to register (a consumer's sp_lookup on
                 // our cell yields empty; the CB's external deps carry any real
@@ -5553,7 +5823,7 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
                 ec.sp_register(self.out.cell_id(), sps);
                 self.out.put_home(v, Deps::new(), home);
             }
-            CbWalk::LendOnly { ext } => {
+            CbWalk::LendOnly { ext, .. } => {
                 cb_collect_external(ext, &deps);
                 self.out.put_home(v, Deps::new(), home);
             }
@@ -6618,7 +6888,7 @@ where
         // ── CB-mode fork (design v2) ────────────────────────────────────────
         match ec.cb() {
             CbWalk::Off => {} // fall through to the normal enqueue below.
-            CbWalk::Build { builder, ext } => {
+            CbWalk::Build { builder, ext, .. } => {
                 // Entry deps (a producer OUTSIDE this CB) gate the CB enqueue.
                 cb_collect_external(ext, &deps);
                 let waits = ec.sp_lookup(self.buf.pipe_cell_id());
@@ -6639,7 +6909,7 @@ where
                 self.out.put_home(buf, Deps::new(), home);
                 return Ok(());
             }
-            CbWalk::LendOnly { ext } => {
+            CbWalk::LendOnly { ext, .. } => {
                 cb_collect_external(ext, &deps);
                 // Replay: lend + deposit, add/enqueue nothing (the cached CB runs).
                 self.out.put_home(buf, Deps::new(), home);

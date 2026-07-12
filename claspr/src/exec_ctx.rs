@@ -78,12 +78,36 @@ pub enum CbWalk<'a> {
         /// points), so nothing internal lands here. Owned on the boundary node's
         /// stack; fresh per CB, so nested CBs never mix external deps.
         ext: &'a Mutex<Vec<crate::eager::Dep>>,
+        /// The BOUNDARY node's cb-cache, threaded so the *finalize-at-close* point
+        /// (a `Build`→`Off` transition at a host seam, deep inside this span) can
+        /// HOME the sealed [`FinalizedCb`](crate::record::FinalizedCb) here — the
+        /// span head opened the builder, but the close (a different, deeper node)
+        /// seals it, and replay must find it under the SAME (boundary's) cache. For
+        /// a maximal seam-free span (no interior seam) the close never fires and the
+        /// boundary-return homes here instead.
+        cache: &'a crate::eager::CbCache,
+        /// **Span-closed latch**, owned by the boundary frame. Set once the span's CB
+        /// is sealed + enqueued at its close point. A span closes DEEP inside a source
+        /// subtree (e.g. CG's α reduction closes inside `compute_alpha`, which is an
+        /// *ancestor* `AndThen`'s `source`); without this latch that ancestor would
+        /// keep walking its `next` in `Build` and try to add to / re-enqueue the
+        /// already-sealed CB (`CL_INVALID_OPERATION`). Every `AndThen` /
+        /// `cb_exec_child` / `cb_gather_child` checks it: once latched, ALL remaining
+        /// work runs in [`Off`](CbWalk::Off) (opening its own fresh boundaries).
+        closed: &'a std::sync::atomic::AtomicBool,
     },
     LendOnly {
         /// See [`Build`](CbWalk::Build)`::ext` — the same external-dep accumulator
         /// on the replay pass (the cached CB still needs its external wait-list each
         /// replay, since a host step re-produces fresh events every run).
         ext: &'a Mutex<Vec<crate::eager::Dep>>,
+        /// See [`Build`](CbWalk::Build)`::cache` — on replay the close point READS
+        /// the cached span CB from here and enqueues it (before the seam runs),
+        /// rather than sealing a live builder.
+        cache: &'a crate::eager::CbCache,
+        /// See [`Build`](CbWalk::Build)`::closed` — the replay pass latches identically
+        /// (the close enqueues the cached CB once; ancestors then run in `Off`).
+        closed: &'a std::sync::atomic::AtomicBool,
     },
 }
 
