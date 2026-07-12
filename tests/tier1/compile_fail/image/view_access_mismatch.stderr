@@ -5,11 +5,11 @@ error[E0277]: the trait bound `Image1DBuffer<ReadOnly, R32Uint>: KernelImageBuff
    |                     ^^^^^^^^^^^^ the trait `KernelImageBufferWriteArg<Uint>` is not implemented for `Image1DBuffer<ReadOnly, R32Uint>`
    |
 help: the following other types implement trait `KernelImageBufferWriteArg<SF>`
-  --> claspr/src/image.rs:2618:0
-  ::: claspr/src/image.rs:2619:35
+  --> claspr/src/image.rs:2734:0
+  ::: claspr/src/image.rs:2735:35
    |
    = note: `Image1DBuffer<WriteOnly, F>`
-  ::: claspr/src/image.rs:2627:35
+  ::: claspr/src/image.rs:2743:35
    |
    = note: `Image1DBuffer<ReadWrite, F>`
 note: required by a bound in `claspr_test_image_kernels::dim_buffer_uint::Kernels::fill_pattern`

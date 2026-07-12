@@ -89,3 +89,50 @@ fn image_kernel_chain_runs_as_command_buffer() {
         );
     }
 }
+
+/// An image FILL followed by a kernel that READS the image is a weight-2 all-device
+/// span: `clCommandFillImageKHR` + `clCommandNDRangeKernelKHR` in ONE command buffer.
+/// This exercises the image-fill CB command (>= 0.9.4); where the extension lacks it
+/// the boundary falls back to software (no CB) — still correct. The fill writes a
+/// constant .x, the kernel copies .x into a buffer, so every out element == fill.x.
+///
+/// (An image→image `copy_to` in a graph needs a pipe-fed ImageCopy, which the image
+/// API does not yet expose — copy_to takes a concrete image by value. The
+/// clCommandCopyImageKHR path is wired in the runtime + covered by the SVM/copy
+/// CbBuilder methods; a graph-level image-copy test awaits pipe-fed ImageCopy.)
+#[test]
+fn image_fill_then_kernel_runs_as_command_buffer() {
+    let Some(ctx) = ctx() else { return };
+    let ks = dim2_float::kernels(&ctx).expect("load image kernels");
+    let fill_x: f32 = 7.0;
+
+    let img = Image2D::<ReadWrite, R32Float>::alloc(&ctx, W, H).expect("alloc image");
+    let out = DeviceSlice::<f32>::alloc_zero(&ctx, N).expect("alloc out");
+
+    // img.fill([fill_x; 4]) writes fill_x to every pixel channel; copy_to_buffer reads
+    // .x into out. Fill (image command) + kernel = weight 2 → CB.
+    let g = img
+        .fill([fill_x; 4])
+        .and_then(move |img| ks.copy_to_buffer([W as usize, H as usize], img, out, W, H));
+    assert_eq!(g.cbable_weight(), 2, "image fill + kernel = two commands");
+
+    for i in 0..3 {
+        let (_img_co, out_co) = g.sync(&ctx).unwrap_or_else(|e| panic!("sync {i}: {e:?}"));
+        let got = out_co.map().wait().expect("read out");
+        assert!(
+            got.iter().all(|&v| v == fill_x),
+            "iter {i}: every out element should be the fill .x ({fill_x}); got {:?}",
+            &got[..4]
+        );
+        drop(got);
+        drop((_img_co, out_co));
+    }
+
+    // Where the driver's command buffer supports clCommandFillImageKHR (>= 0.9.4) the
+    // chain homes a real CB; otherwise it falls back to software — both correct.
+    if ctx.has_cl_khr_command_buffer() && homed_cb(&g) {
+        eprintln!("image fill+kernel: recorded a command buffer");
+    } else {
+        eprintln!("image fill+kernel: software fallback (image fill CB command unavailable)");
+    }
+}

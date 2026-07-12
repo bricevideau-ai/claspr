@@ -81,8 +81,10 @@ use std::sync::Mutex;
 
 use opencl_sys::{
     cl_command_buffer_khr, cl_platform_id, cl_sync_point_khr, clCommandCopyBufferKHR_t,
-    clCommandFillBufferKHR_t, clCommandNDRangeKernelKHR_t, clCreateCommandBufferKHR_t,
-    clEnqueueCommandBufferKHR_t, clFinalizeCommandBufferKHR_t, clReleaseCommandBufferKHR_t,
+    clCommandCopyImageKHR_t, clCommandFillBufferKHR_t, clCommandFillImageKHR_t,
+    clCommandNDRangeKernelKHR_t, clCommandSVMMemFillKHR_t, clCommandSVMMemcpyKHR_t,
+    clCreateCommandBufferKHR_t, clEnqueueCommandBufferKHR_t, clFinalizeCommandBufferKHR_t,
+    clReleaseCommandBufferKHR_t,
 };
 
 /// The `cl_khr_command_buffer` entry points, resolved for one platform. Each
@@ -97,6 +99,13 @@ struct CommandBufferExt {
     fill_buffer: clCommandFillBufferKHR_t,
     copy_buffer: clCommandCopyBufferKHR_t,
     ndrange_kernel: clCommandNDRangeKernelKHR_t,
+    // Optional commands (extension >= 0.9.4 / OpenCL 2.0 for SVM). These are NOT in
+    // the mandatory load gate below — a driver lacking them keeps buffer/kernel CBs
+    // working, and the per-command `?` on these `Option`s falls back to software.
+    fill_image: clCommandFillImageKHR_t,
+    copy_image: clCommandCopyImageKHR_t,
+    svm_memfill: clCommandSVMMemFillKHR_t,
+    svm_memcpy: clCommandSVMMemcpyKHR_t,
 }
 
 fn ext_addr(rt: &cl3::OpenClRuntime, platform: cl_platform_id, name: &CStr) -> *mut c_void {
@@ -135,6 +144,18 @@ impl CommandBufferExt {
                     ),
                     ndrange_kernel: std::mem::transmute::<*mut c_void, clCommandNDRangeKernelKHR_t>(
                         ext_addr(rt, platform, c"clCommandNDRangeKernelKHR"),
+                    ),
+                    fill_image: std::mem::transmute::<*mut c_void, clCommandFillImageKHR_t>(
+                        ext_addr(rt, platform, c"clCommandFillImageKHR"),
+                    ),
+                    copy_image: std::mem::transmute::<*mut c_void, clCommandCopyImageKHR_t>(
+                        ext_addr(rt, platform, c"clCommandCopyImageKHR"),
+                    ),
+                    svm_memfill: std::mem::transmute::<*mut c_void, clCommandSVMMemFillKHR_t>(
+                        ext_addr(rt, platform, c"clCommandSVMMemFillKHR"),
+                    ),
+                    svm_memcpy: std::mem::transmute::<*mut c_void, clCommandSVMMemcpyKHR_t>(
+                        ext_addr(rt, platform, c"clCommandSVMMemcpyKHR"),
                     ),
                 }
             };
@@ -289,8 +310,11 @@ impl CbBuilder {
         *self.finalized.lock().unwrap()
     }
 
-    /// Add a buffer fill to the CB. `mem` must be a `cl_mem` (SVM marks the build
-    /// ineligible). Returns the command's sync point, or `None` on any shortfall.
+    /// Add a buffer fill to the CB. A `cl_mem` buffer records via
+    /// `clCommandFillBufferKHR`; an SVM buffer records via `clCommandSVMMemFillKHR`
+    /// (extension >= 0.9.4 — if that PFN is absent, the build is marked ineligible so
+    /// the boundary falls back to software). Returns the command's sync point, or
+    /// `None` on any shortfall.
     pub fn fill_buffer(
         &self,
         mem: MemRef,
@@ -299,29 +323,178 @@ impl CbBuilder {
         size: usize,
         waits: &BTreeSet<cl_sync_point_khr>,
     ) -> Option<cl_sync_point_khr> {
-        let m = match mem {
+        let waits: Vec<cl_sync_point_khr> = waits.iter().copied().collect();
+        let (wptr, n) = wait_ptr(&waits);
+        let mut sp: cl_sync_point_khr = 0;
+        let st = match mem {
+            MemRef::Buffer(m) => {
+                let fill = self.ext.fill_buffer?;
+                // SAFETY: live CB + queue; `m` a valid cl_mem kept alive by the
+                // graph; `pattern` outlives the call; `waits` are markers from this CB.
+                unsafe {
+                    fill(
+                        self.cb,
+                        self.queue,
+                        ptr::null(),
+                        m as opencl_sys::cl_mem,
+                        pattern.as_ptr() as *const c_void,
+                        pattern.len(),
+                        offset,
+                        size,
+                        n,
+                        wptr,
+                        &mut sp,
+                        ptr::null_mut(),
+                    )
+                }
+            }
+            MemRef::Svm(p) => {
+                // `?`: an SVM fill on a driver without the extension-0.9.4 command
+                // falls back (None → boundary discards → software), never a null call.
+                let svm_fill = self.ext.svm_memfill?;
+                // SVM fill has no offset param — offset the pointer directly.
+                let base = unsafe { (p as *mut u8).add(offset) } as *mut c_void;
+                // SAFETY: `p` a valid SVM pointer kept alive by the graph; `pattern`
+                // outlives the call; `waits` are markers from this CB.
+                unsafe {
+                    svm_fill(
+                        self.cb,
+                        self.queue,
+                        ptr::null(),
+                        base,
+                        pattern.as_ptr() as *const c_void,
+                        pattern.len(),
+                        size,
+                        n,
+                        wptr,
+                        &mut sp,
+                        ptr::null_mut(),
+                    )
+                }
+            }
+        };
+        if st != opencl_sys::CL_SUCCESS {
+            self.mark_ineligible();
+            return None;
+        }
+        self.count();
+        Some(sp)
+    }
+
+    /// Add a device-to-device copy to the CB. Buffer↔buffer records via
+    /// `clCommandCopyBufferKHR`; SVM↔SVM via `clCommandSVMMemcpyKHR` (extension
+    /// version 0.9.4+ — absent PFN falls back: ineligible → software). A MIXED
+    /// cl_mem/SVM pair has no single CB command and marks the build ineligible.
+    /// Returns its sync point, or `None` on any shortfall.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_buffer(
+        &self,
+        src: MemRef,
+        dst: MemRef,
+        src_offset: usize,
+        dst_offset: usize,
+        size: usize,
+        waits: &BTreeSet<cl_sync_point_khr>,
+    ) -> Option<cl_sync_point_khr> {
+        let waits: Vec<cl_sync_point_khr> = waits.iter().copied().collect();
+        let (wptr, n) = wait_ptr(&waits);
+        let mut sp: cl_sync_point_khr = 0;
+        let st = match (src, dst) {
+            (MemRef::Buffer(s), MemRef::Buffer(d)) => {
+                let copy = self.ext.copy_buffer?;
+                // SAFETY: live CB + queue; `s`/`d` valid cl_mem kept alive by the
+                // graph; `waits` are markers from this CB.
+                unsafe {
+                    copy(
+                        self.cb,
+                        self.queue,
+                        ptr::null(),
+                        s as opencl_sys::cl_mem,
+                        d as opencl_sys::cl_mem,
+                        src_offset,
+                        dst_offset,
+                        size,
+                        n,
+                        wptr,
+                        &mut sp,
+                        ptr::null_mut(),
+                    )
+                }
+            }
+            (MemRef::Svm(s), MemRef::Svm(d)) => {
+                // `?`: SVM copy on a driver without the 0.9.4 command falls back.
+                let svm_copy = self.ext.svm_memcpy?;
+                // SVM copy has no offset params — offset the pointers directly.
+                let src_ptr = unsafe { (s as *const u8).add(src_offset) } as *const c_void;
+                let dst_ptr = unsafe { (d as *mut u8).add(dst_offset) } as *mut c_void;
+                // SAFETY: `s`/`d` valid SVM pointers kept alive by the graph; `waits`
+                // are markers from this CB.
+                unsafe {
+                    svm_copy(
+                        self.cb,
+                        self.queue,
+                        ptr::null(),
+                        dst_ptr,
+                        src_ptr,
+                        size,
+                        n,
+                        wptr,
+                        &mut sp,
+                        ptr::null_mut(),
+                    )
+                }
+            }
+            // A mixed cl_mem/SVM copy has no single CB command → software fallback.
+            _ => {
+                self.mark_ineligible();
+                return None;
+            }
+        };
+        if st != opencl_sys::CL_SUCCESS {
+            self.mark_ineligible();
+            return None;
+        }
+        self.count();
+        Some(sp)
+    }
+
+    /// Add an image fill to the CB via `clCommandFillImageKHR` (extension present →
+    /// records; absent → ineligible → software). `image` is the image's `cl_mem`;
+    /// `fill_color` is the format-appropriate fill value (4×component); `origin` and
+    /// `region` are 3-element arrays (`clEnqueueFillImage` shape). Returns its sync
+    /// point, or `None` on any shortfall.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_image(
+        &self,
+        image: MemRef,
+        fill_color: &[u8],
+        origin: [usize; 3],
+        region: [usize; 3],
+        waits: &BTreeSet<cl_sync_point_khr>,
+    ) -> Option<cl_sync_point_khr> {
+        // An image is always a `cl_mem` (never SVM).
+        let m = match image {
             MemRef::Buffer(m) => m,
             MemRef::Svm(_) => {
                 self.mark_ineligible();
                 return None;
             }
         };
-        let fill = self.ext.fill_buffer?;
+        let fill = self.ext.fill_image?;
         let waits: Vec<cl_sync_point_khr> = waits.iter().copied().collect();
         let (wptr, n) = wait_ptr(&waits);
         let mut sp: cl_sync_point_khr = 0;
-        // SAFETY: live CB + queue; `m` a valid cl_mem kept alive by the graph;
-        // `pattern` outlives the call; `waits` are markers from this same CB.
+        // SAFETY: live CB + queue; `m` a valid image cl_mem kept alive by the graph;
+        // `fill_color`/`origin`/`region` outlive the call; `waits` are this CB's markers.
         let st = unsafe {
             fill(
                 self.cb,
                 self.queue,
                 ptr::null(),
                 m as opencl_sys::cl_mem,
-                pattern.as_ptr() as *const c_void,
-                pattern.len(),
-                offset,
-                size,
+                fill_color.as_ptr() as *const c_void,
+                origin.as_ptr(),
+                region.as_ptr(),
                 n,
                 wptr,
                 &mut sp,
@@ -336,16 +509,17 @@ impl CbBuilder {
         Some(sp)
     }
 
-    /// Add a device-to-device copy to the CB (both `cl_mem`). Returns its sync
-    /// point, or `None` on any shortfall (SVM marks the build ineligible).
+    /// Add an image→image copy to the CB via `clCommandCopyImageKHR`. `src`/`dst` are
+    /// image `cl_mem`s; `src_origin`/`dst_origin`/`region` are 3-element arrays.
+    /// Returns its sync point, or `None` on any shortfall.
     #[allow(clippy::too_many_arguments)]
-    pub fn copy_buffer(
+    pub fn copy_image(
         &self,
         src: MemRef,
         dst: MemRef,
-        src_offset: usize,
-        dst_offset: usize,
-        size: usize,
+        src_origin: [usize; 3],
+        dst_origin: [usize; 3],
+        region: [usize; 3],
         waits: &BTreeSet<cl_sync_point_khr>,
     ) -> Option<cl_sync_point_khr> {
         let (s, d) = match (src, dst) {
@@ -355,11 +529,11 @@ impl CbBuilder {
                 return None;
             }
         };
-        let copy = self.ext.copy_buffer?;
+        let copy = self.ext.copy_image?;
         let waits: Vec<cl_sync_point_khr> = waits.iter().copied().collect();
         let (wptr, n) = wait_ptr(&waits);
         let mut sp: cl_sync_point_khr = 0;
-        // SAFETY: as `fill_buffer`.
+        // SAFETY: as `fill_image`; both images valid cl_mem kept alive by the graph.
         let st = unsafe {
             copy(
                 self.cb,
@@ -367,9 +541,9 @@ impl CbBuilder {
                 ptr::null(),
                 s as opencl_sys::cl_mem,
                 d as opencl_sys::cl_mem,
-                src_offset,
-                dst_offset,
-                size,
+                src_origin.as_ptr(),
+                dst_origin.as_ptr(),
+                region.as_ptr(),
                 n,
                 wptr,
                 &mut sp,

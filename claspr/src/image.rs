@@ -46,7 +46,10 @@ use crate::Result;
 use crate::access::{KernelAccess, MemMode};
 use crate::buffer::{Buffer, DeviceSlice};
 use crate::context::Context;
-use crate::eager::{Checkout, Deps, DeviceOp, DeviceOpExt, ExecMode, Input, Pipe, wrap_event};
+use crate::eager::{
+    CbCache, CbWalk, Checkout, Deps, DeviceOp, DeviceOpExt, ExecMode, Input, Pipe,
+    cb_collect_external, new_cb_cache, wrap_event,
+};
 use crate::error::Error;
 use crate::exec_ctx::ExecutionContext;
 use crate::launch::KernelArg;
@@ -838,6 +841,9 @@ pub struct ImageCopy<Src: ImageEnqueue, Dst: ImageEnqueue> {
     region: [usize; 3],
     src_pipe: Pipe<Src>,
     dst_pipe: Pipe<Dst>,
+    /// Design-v2 CB home: an image→image copy records `clCommandCopyImageKHR` where
+    /// the extension provides it, else falls back to software.
+    cb_cache: CbCache,
 }
 
 impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
@@ -857,10 +863,44 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        use opencl3::memory::ClMem;
         // In-place on both sides (image copy preserves type) → each home threads
         // to its own element pipe.
         let (src, src_deps, src_home) = self.src.resolve_home(ec)?;
         let (mut dst, dst_deps, dst_home) = self.dst.resolve_home(ec)?;
+
+        // ── CB-mode fork (design v2) — image→image copy via clCommandCopyImageKHR.
+        // Absent PFN → ineligible → boundary falls back to per-op. ────────────────
+        match ec.cb() {
+            CbWalk::Off => {}
+            CbWalk::Build { builder, ext, .. } => {
+                cb_collect_external(ext, &src_deps);
+                cb_collect_external(ext, &dst_deps);
+                let mut waits = ec.sp_lookup(self.src.pipe_cell_id());
+                waits.extend(ec.sp_lookup(self.dst.pipe_cell_id()));
+                let smem = crate::record::MemRef::Buffer(src.image_ref().get());
+                let dmem = crate::record::MemRef::Buffer(dst.image_ref().get());
+                if let Some(sp) =
+                    builder.copy_image(smem, dmem, [0, 0, 0], [0, 0, 0], self.region, &waits)
+                {
+                    // Multi-output: both output pipes gate on this one copy command.
+                    let set = std::collections::BTreeSet::from([sp]);
+                    ec.sp_register(self.src_pipe.cell_id(), set.clone());
+                    ec.sp_register(self.dst_pipe.cell_id(), set);
+                }
+                self.src_pipe.put_home(src, Deps::new(), src_home);
+                self.dst_pipe.put_home(dst, Deps::new(), dst_home);
+                return Ok(());
+            }
+            CbWalk::LendOnly { ext, .. } => {
+                cb_collect_external(ext, &src_deps);
+                cb_collect_external(ext, &dst_deps);
+                self.src_pipe.put_home(src, Deps::new(), src_home);
+                self.dst_pipe.put_home(dst, Deps::new(), dst_home);
+                return Ok(());
+            }
+        }
+
         let mut raw: Vec<crate::cl_event> = src_deps.iter().map(|d| d.as_ref().get()).collect();
         raw.extend(dst_deps.iter().map(|d| d.as_ref().get()));
         // Copy has no native CL_BLOCKING flag — always enqueue non-blocking; a
@@ -920,6 +960,29 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         self.dst.check_ready()
     }
 
+    fn cb_cache(&self) -> Option<&CbCache> {
+        Some(&self.cb_cache)
+    }
+
+    fn cb_addable(&self) -> bool {
+        true
+    }
+
+    fn cbable_weight(&self) -> usize {
+        // An image copy records one clCommandCopyImageKHR (where supported).
+        1
+    }
+
+    fn cb_restamp(&self, evs: &[crate::eager::Dep]) {
+        // Multi-output: stamp the CB completion event onto BOTH element pipes.
+        if let Some((v, _d, h)) = self.src_pipe.take_home() {
+            self.src_pipe.put_home(v, Vec::from(evs), h);
+        }
+        if let Some((v, _d, h)) = self.dst_pipe.take_home() {
+            self.dst_pipe.put_home(v, Vec::from(evs), h);
+        }
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("image_copy".into());
     }
@@ -954,6 +1017,9 @@ pub struct ImageFill<I: ImageEnqueue, T: Copy> {
     region: [usize; 3],
     pattern: [T; 4],
     out: Pipe<I>,
+    /// Design-v2 CB home: an image fill records `clCommandFillImageKHR` where the
+    /// extension provides it, else falls back to software.
+    cb_cache: CbCache,
 }
 
 impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
@@ -968,10 +1034,39 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        use opencl3::memory::ClMem;
         // In-place: the filled image is the lent image → home threads through.
         let (mut img, deps, home) = self.img.resolve_home(ec)?;
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         let pattern = self.pattern;
+
+        // ── CB-mode fork (design v2) — image fill via clCommandFillImageKHR. An
+        // absent PFN marks the build ineligible → boundary falls back to per-op. ──
+        match ec.cb() {
+            CbWalk::Off => {}
+            CbWalk::Build { builder, ext, .. } => {
+                cb_collect_external(ext, &deps);
+                let waits = ec.sp_lookup(self.img.pipe_cell_id());
+                let mem = crate::record::MemRef::Buffer(img.image_ref().get());
+                let color = unsafe {
+                    std::slice::from_raw_parts(
+                        pattern.as_ptr() as *const u8,
+                        std::mem::size_of::<[T; 4]>(),
+                    )
+                };
+                if let Some(sp) = builder.fill_image(mem, color, [0, 0, 0], self.region, &waits) {
+                    ec.sp_register(self.out.cell_id(), std::collections::BTreeSet::from([sp]));
+                }
+                self.out.put_home(img, Deps::new(), home);
+                return Ok(());
+            }
+            CbWalk::LendOnly { ext, .. } => {
+                cb_collect_external(ext, &deps);
+                self.out.put_home(img, Deps::new(), home);
+                return Ok(());
+            }
+        }
+
+        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // Fill has no native CL_BLOCKING flag — always enqueue non-blocking; a
         // blocking terminal waits on the event via the carried deps.
         let event = fill_image_enqueue(
@@ -990,6 +1085,25 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
     /// earlier lending op enqueues (see [`Input::check_ready`]).
     fn check_ready(&self) -> Result<()> {
         self.img.check_ready()
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        Some(&self.cb_cache)
+    }
+
+    fn cb_addable(&self) -> bool {
+        true
+    }
+
+    fn cbable_weight(&self) -> usize {
+        // An image fill records one clCommandFillImageKHR (where supported).
+        1
+    }
+
+    fn cb_restamp(&self, evs: &[crate::eager::Dep]) {
+        if let Some((v, _d, h)) = self.out.take_home() {
+            self.out.put_home(v, Vec::from(evs), h);
+        }
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -1234,6 +1348,7 @@ fn image_copy_op<Src: ImageEnqueue, Dst: ImageEnqueue>(
         region,
         src_pipe: Pipe::new(),
         dst_pipe: Pipe::new(),
+        cb_cache: new_cb_cache(),
     }
 }
 
@@ -1247,6 +1362,7 @@ fn image_fill_op<I: ImageEnqueue, T: Copy>(
         region,
         pattern,
         out: Pipe::new(),
+        cb_cache: new_cb_cache(),
     }
 }
 

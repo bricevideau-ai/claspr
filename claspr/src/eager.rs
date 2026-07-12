@@ -8317,6 +8317,9 @@ pub struct FillMapped<T: Copy, M: MemMode> {
     buf: Input<MappedSlice<T, M>>,
     value: T,
     out: Pipe<MappedSlice<T, M>>,
+    /// Design-v2 CB home: an SVM fill records `clCommandSVMMemFillKHR` where the
+    /// extension provides it (>= 0.9.4), else falls back to software.
+    cb_cache: CbCache,
 }
 
 /// Build an SVM fill leaf over an existing `MappedSlice` (concrete or piped).
@@ -8329,6 +8332,7 @@ where
         buf: buf.into(),
         value,
         out: Pipe::new(),
+        cb_cache: new_cb_cache(),
     }
 }
 
@@ -8348,7 +8352,39 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        use crate::record::RecordableBuffer;
         let (buf, deps, home) = self.buf.resolve_home(ec)?;
+
+        // ── CB-mode fork (design v2) — SVM fill via clCommandSVMMemFillKHR. If the
+        // driver lacks that command, `CbBuilder::fill_buffer` marks the build
+        // ineligible and the boundary falls back to the per-op path below. ──────
+        match ec.cb() {
+            CbWalk::Off => {}
+            CbWalk::Build { builder, ext, .. } => {
+                cb_collect_external(ext, &deps);
+                let waits = ec.sp_lookup(self.buf.pipe_cell_id());
+                let handle = buf.record_handle(); // MemRef::Svm
+                let pattern = unsafe {
+                    std::slice::from_raw_parts(
+                        (&self.value as *const T) as *const u8,
+                        std::mem::size_of::<T>(),
+                    )
+                };
+                if let Some(sp) =
+                    builder.fill_buffer(handle.mem, pattern, 0, handle.byte_len, &waits)
+                {
+                    ec.sp_register(self.out.cell_id(), std::collections::BTreeSet::from([sp]));
+                }
+                self.out.put_home(buf, Deps::new(), home);
+                return Ok(());
+            }
+            CbWalk::LendOnly { ext, .. } => {
+                cb_collect_external(ext, &deps);
+                self.out.put_home(buf, Deps::new(), home);
+                return Ok(());
+            }
+        }
+
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // SVM fill is always a non-blocking enqueue (no native CL_BLOCKING flag);
         // Blocking waits on the returned event here. In-place → home threads.
@@ -8367,6 +8403,25 @@ where
 
     fn check_ready(&self) -> Result<()> {
         self.buf.check_ready()
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        Some(&self.cb_cache)
+    }
+
+    fn cb_addable(&self) -> bool {
+        true
+    }
+
+    fn cbable_weight(&self) -> usize {
+        // An SVM fill records one clCommandSVMMemFillKHR (where supported).
+        1
+    }
+
+    fn cb_restamp(&self, evs: &[Dep]) {
+        if let Some((v, _d, h)) = self.out.take_home() {
+            self.out.put_home(v, Vec::from(evs), h);
+        }
     }
 
     fn describe(&self, out: &mut Vec<String>) {
