@@ -858,6 +858,43 @@ mod tests {
     /// `V` fields must be **bit-identical**. That equality is the proof that
     /// unroll-by-period replay == mutable-swap replay: one meta-kernel, two
     /// execution strategies.
+    /// Pure-host reference implementation of the same simulation — the CPU
+    /// golden. Jacobi double-buffer, one step = (compute both Laplacians from the
+    /// current fields, then the reaction+diffusion update writing the next
+    /// fields), matching `gpu::combine` term-for-term and in the same float
+    /// evaluation order. Returns the final `V` field, like `run_swap` /
+    /// `run_immutable`.
+    ///
+    /// This is NOT expected to be *bit*-identical to the GPU (FMA contraction and
+    /// op-fusion differ between the OpenCL device and host f32), so callers must
+    /// compare with a tolerance. Its purpose is to break the symmetry of the
+    /// swap-vs-immutable equality: when the two GPU strategies disagree, whichever
+    /// one drifts from this golden by more than ordinary CPU/GPU f32 error is the
+    /// incorrect one.
+    fn cpu_reference(steps: usize, feed: f32, kill: f32) -> Vec<f32> {
+        use super::gpu::{DT, DU, DV, laplacian_at};
+        let (mut u, mut v) = initial_fields();
+        let mut u_next = vec![0.0f32; N];
+        let mut v_next = vec![0.0f32; N];
+        for _ in 0..steps {
+            for y in 0..H as u32 {
+                for x in 0..W as u32 {
+                    let i = (y * W as u32 + x) as usize;
+                    let lap_u = laplacian_at(&u, x, y, W as u32, H as u32);
+                    let lap_v = laplacian_at(&v, x, y, W as u32, H as u32);
+                    let uu = u[i];
+                    let vv = v[i];
+                    let uvv = uu * vv * vv;
+                    u_next[i] = uu + DT * (DU * lap_u - uvv + feed * (1.0 - uu));
+                    v_next[i] = vv + DT * (DV * lap_v + uvv - (feed + kill) * vv);
+                }
+            }
+            std::mem::swap(&mut u, &mut u_next);
+            std::mem::swap(&mut v, &mut v_next);
+        }
+        v
+    }
+
     #[test]
     fn swap_and_immutable_agree_bit_for_bit() {
         let Ok(ctx) = Context::any() else {
@@ -872,6 +909,37 @@ mod tests {
         let swap_v = run_swap(&ctx, W, H, STEPS, 0, STEPS + 1, false).expect("run swap variant");
         // Immutable: same steps / params, no frame.
         let imm_v = run_immutable(&ctx, W, H, STEPS, F1, K1, false).expect("run immutable variant");
+
+        // CPU golden — the ground truth for which strategy is physically correct.
+        // Compared with a tolerance (CPU/GPU f32 are not bit-identical). This
+        // DIAGNOSES the swap-vs-immutable race: the strategy that drifts from the
+        // golden is the buggy one. Reported before the strict bit-equality gate so
+        // the verdict is visible even while that gate fails.
+        let gold_v = cpu_reference(STEPS, F1, K1);
+        let dmax = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let swap_vs_gold = dmax(&swap_v, &gold_v);
+        let imm_vs_gold = dmax(&imm_v, &gold_v);
+        eprintln!(
+            "CPU-golden diagnosis: max|swap-gold|={swap_vs_gold:e}  \
+             max|imm-gold|={imm_vs_gold:e}  (STEPS={STEPS})"
+        );
+        // Ordinary CPU/GPU f32 drift over {STEPS} steps of this system stays small;
+        // a dropped-dependency race produces a structurally larger error. This
+        // tolerance separates the two — tighten once the correct baseline is known.
+        const GOLDEN_TOL: f32 = 1.0e-3;
+        assert!(
+            swap_vs_gold < GOLDEN_TOL,
+            "swap strategy diverges from CPU golden: max|Δ|={swap_vs_gold:e} (tol {GOLDEN_TOL:e})"
+        );
+        assert!(
+            imm_vs_gold < GOLDEN_TOL,
+            "immutable strategy diverges from CPU golden: max|Δ|={imm_vs_gold:e} (tol {GOLDEN_TOL:e})"
+        );
 
         // Both must have evolved off the ~0 initial V and be NaN-free.
         assert!(

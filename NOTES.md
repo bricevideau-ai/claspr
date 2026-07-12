@@ -83,13 +83,36 @@ was WRONG): gray-scott swap_and_immutable_agree_bit_for_bit RACES (max|Δ| varie
 1.4e-2..2.1e-2 run-to-run). Bisected: PASSES 6/0 at pre-CB baseline a049ad4 and through
 d11fb78; first FAILS 6/6 at 236d9c0 (the commit that flipped `Pipe::cb_addable()` → true).
 de9fc76 is INSIDE the CB session, not before it — the prior attribution mis-identified the
-baseline. Root cause: 236d9c0 routes pipe-fed graphs through the CB path; gray-scott is a
-pipe-DAG (`bind(Grid)` fans ONE pipe to 3 dispatch sites = FedByPipe out-degree >1; field
-buffers threaded as pipes). The CB walk drops/misorders a dependency across a SHARED
-fan-out pipe edge (invisible to struct nesting) → nondeterministic bit diff. CG is immune
-because it's a pure tuple-threaded fork-tree with NO pipe edges. NEXT: graph dump (struct
-tree + producer→[consumers] pipe-edge table via cell_id) to see which shared edge the CB
-boundary crosses. CG landing itself is cliloader-verified correct (see above).
+baseline. It's a CB regression: 236d9c0 routes pipe-fed graphs through the CB path.
+
+ROOT CAUSE PINNED (2026-07-12, cliloader + CPU golden). It is a MISSING INTRA-CB
+DEPENDENCY (a race), NOT stale cl_mem capture (captured cl_mem is by-design — that is why
+immutable replays and swap rebuilds). Evidence:
+- CPU golden (host port of the kernels) added to swap_and_immutable test. On rusticl/llvmpipe
+  (NO cl_khr_command_buffer → per-op path) swap == immutable == golden BIT-EXACT (max|Δ|=0).
+  So the graph's dependencies are correct; the per-op path enforces them via events.
+- On pocl (CB active): swap == golden (0e0) every run; IMMUTABLE diverges nondeterministically
+  (max|Δ| 1.4e-2 → 4.4e-1 across runs). Nondeterministic magnitude ⇒ race, not fixed staleness.
+- WHY swap is fine: it mutate_binds each step → invalidate_cbs → the CB is REBUILT every step
+  (cliloader: 126 creates = 126 enqueues, 360 recorded kernels for 120 steps). immutable
+  records-once-replays (9 creates, 68 enqueues).
+- THE DROPPED EDGE (cliloader sync_point_wait_list on the immutable unroll-2 CB, 6 kernels):
+    step1 laplacian sp=1 wait=NONE ; laplacian sp=2 wait=NONE ; combine sp=3 wait=[1,2,1,2]
+    step2 laplacian sp=4 wait=NONE ; laplacian sp=5 wait=NONE ; combine sp=6 wait=[4,5,4,5]
+  Step 2's laplacians (sp=4,5) read step 1's combine output (sp=3) but record wait=NONE. The
+  RAW edge across the COMPOSE BOUNDARY between the two unrolled sub-graphs is not lowered into
+  a sync_point. Intra-step deps ARE complete (combine waits on both its laplacians); only the
+  seam between two composed sub-graphs drops it. (cliloader does not print kernel buffer args,
+  so the RAW hazard is inferred from graph structure + the wait=NONE, not from buffer addrs.)
+- FIX TARGET: when joining sub-graphs into one CB, a consumer's incoming pipe/slot edge from a
+  producer in an EARLIER sub-graph of the same CB must become a sync_point on that consumer's
+  command. Today the cross-sub-graph pipe edge is invisible at the point sync_points are
+  assigned. CG is immune: pure tuple-threaded fork-tree, single step per CB, no cross-step
+  pipe edge.
+- The graph-dump binary (examples/gray-scott/src/bin/dump_graph, commit 31cc585) shows the
+  per-step DAG: combine has in-degree 4 (fan-IN convergence), NOT producer fan-out; that
+  intra-step fan-in IS correctly serialized. The bug is the cross-step seam, above.
+CG landing itself is cliloader-verified correct (see above).
 
 --- ORIGINAL DESIGN INTENT (kept as the spec this implemented) ---
 
