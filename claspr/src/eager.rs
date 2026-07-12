@@ -228,6 +228,33 @@ pub trait DeviceEnqueue: Send + Sized {
 /// hold a clone to deposit the value back home.
 pub type Cell<T> = Arc<Mutex<Option<T>>>;
 
+// ── CbCache: the graph-owned home for a node's finalized command buffer ──────
+
+/// A CB-capable node's **owned, interior-mutable home** for the
+/// [`FinalizedCb`](crate::record::FinalizedCb) it built (design v2, CB-as-
+/// execution-mode). Each node that can *create/home* a command buffer — the
+/// combinators (`AndThen`, `Bundle*`, `FanOut`, structural passthroughs) and the
+/// device leaves (`Fill`, `CopyTo2`, the macro-generated kernel `Op`) — carries
+/// one, created empty at build. It is NOT routed through
+/// [`output_pipe`](DeviceOp::output_pipe): the CB-creating node is frequently a
+/// composite whose `output_pipe` is `None` (e.g. CG's root `AndThen` over a
+/// `bundle2`), so the cache must ride the node itself.
+///
+/// The per-node algorithm reads/writes its OWN field: "home it in yourself" =
+/// store here; the replay fast-path "if a CB is homed, and one is given that
+/// matches → do nothing" and "no CB given, homed CB valid → replay" both check
+/// THIS field. It drops with the graph (the `FinalizedCb`'s RAII release), so the
+/// cache needs no global table and cannot ABA. [`mutate_bind`](DeviceOpExt::mutate_bind)
+/// clears the caches of the CB-homing nodes a mutated slot reaches (via the
+/// recursive [`invalidate_cbs`](DeviceOp::invalidate_cbs) walk).
+pub type CbCache = Arc<Mutex<Option<Arc<crate::record::FinalizedCb>>>>;
+
+/// A fresh, empty [`CbCache`] — every CB-capable node initializes its field with
+/// this at build time.
+pub fn new_cb_cache() -> CbCache {
+    Arc::new(Mutex::new(None))
+}
+
 // ── SlotState<T>: the five-state slot cell ─────────────────────────────────
 
 /// The cell behind an [`Input::Slot`] — a **five-state** resource holder, the
@@ -3145,6 +3172,39 @@ pub trait DeviceOp: Send {
     fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
         let _ = ctx;
         Err(Error::NotSupported("op is not device-recordable"))
+    }
+
+    /// This node's OWN [`CbCache`] home, if it is a CB-capable node (design v2).
+    /// Default `None` (a node that never creates/homes a command buffer — host
+    /// seams, transfers, the identity `Pipe`). CB-capable nodes (`AndThen`,
+    /// `Bundle*`, `FanOut`, the structural passthroughs, `Fill`, `CopyTo2`, the
+    /// macro kernel `Op`) override to return `Some(&self.cb_cache)`.
+    ///
+    /// The per-node algorithm reads/writes THIS to "home a CB in yourself" and to
+    /// take the replay fast-path. [`invalidate_cbs`](Self::invalidate_cbs) clears
+    /// it on mutation.
+    fn cb_cache(&self) -> Option<&CbCache> {
+        None
+    }
+
+    /// **Invalidate every homed command buffer reachable in this (sub)graph** —
+    /// called by [`mutate_bind`](DeviceOpExt::mutate_bind) /
+    /// [`mutate_call`](DeviceOpExt::mutate_call) after a slot is re-bound, so the
+    /// next `sync` rebuilds any CB whose captured buffers/args changed.
+    ///
+    /// Clears this node's own [`cb_cache`](Self::cb_cache) (if any), then recurses
+    /// into children (mirroring [`describe`](Self::describe)/[`check_ready`](Self::check_ready)).
+    /// This is the "invalidate all CBs this Slot touches, INCLUDING transitively
+    /// through pipes" rule made precise: a mutated slot lives in a leaf, and every
+    /// CB that captured it is homed in an ANCESTOR node on the same graph the
+    /// recursion reaches from the mutation's terminal — so clearing all cb-caches
+    /// reachable from the graph root covers exactly (and only) the CBs of this
+    /// graph, dropping their `FinalizedCb`s (RAII release). Default: clear own
+    /// cache; combinators override to also recurse into children.
+    fn invalidate_cbs(&self) {
+        if let Some(cache) = self.cb_cache() {
+            *cache.lock().unwrap() = None;
+        }
     }
 }
 
