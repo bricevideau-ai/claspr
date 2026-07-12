@@ -104,14 +104,28 @@ immutable replays and swap rebuilds). Evidence:
   a sync_point. Intra-step deps ARE complete (combine waits on both its laplacians); only the
   seam between two composed sub-graphs drops it. (cliloader does not print kernel buffer args,
   so the RAW hazard is inferred from graph structure + the wait=NONE, not from buffer addrs.)
-- FIX TARGET: when joining sub-graphs into one CB, a consumer's incoming pipe/slot edge from a
-  producer in an EARLIER sub-graph of the same CB must become a sync_point on that consumer's
-  command. Today the cross-sub-graph pipe edge is invisible at the point sync_points are
-  assigned. CG is immune: pure tuple-threaded fork-tree, single step per CB, no cross-step
-  pipe edge.
-- The graph-dump binary (examples/gray-scott/src/bin/dump_graph, commit 31cc585) shows the
-  per-step DAG: combine has in-degree 4 (fan-IN convergence), NOT producer fan-out; that
-  intra-step fan-in IS correctly serialized. The bug is the cross-step seam, above.
+- DIRECT PROOF the per-op path threads the edge (cliloader on rusticl/llvmpipe, immutable
+  test, OUT-OF-ORDER queue so deps MUST be explicit — not queue-order): last step-pair —
+    combine(step1)   waits=[8398,61d8,8398,61d8]  -> PRODUCES event 6408   (line 26450)
+    laplacian(step2) waits=[6408]                                          (line 26481) ✓
+    laplacian(step2) waits=[6408]                                          (line 26505) ✓
+    combine(step2)   waits=[6ef8,f8a8,6ef8,f8a8, 6408,6408]
+  Step-2 laplacians wait on EXACTLY step-1 combine's produced event (6408). The cross-step RAW
+  dependency IS a real event_wait_list entry on the per-op path. So the edge is KNOWN AT
+  RUNTIME (carried in the pipe payload as a cl_event); it is NOT missing from the graph — it is
+  dropped only by the CB record path (wait=NONE on the CB).
+- FIX TARGET (refined): the CB Build walk must lower the SAME runtime pipe-carried cl_event it
+  already resolves (the one the per-op path puts in event_wait_list) into a sync_point, at the
+  point a FedByPipe slot input is resolved during recording. NOT a static graph-model edge —
+  the edge is dynamic (pipe payload at execute time). Today the concrete-Input pipe edge is
+  lowered but the FedByPipe SLOT-fed edge is not. CG is immune: pure tuple-threaded fork-tree,
+  single step per CB, no cross-step slot-fed edge.
+- The graph-dump binary (examples/gray-scott/src/bin/dump_graph, commits 31cc585 + 92a8042)
+  shows: per-step combine has in-degree 4 (fan-IN, correctly serialized); the IMMUTABLE unroll-2
+  dump shows step-2 laplacians with in=[] — the cross-step FedByPipe edge is invisible to the
+  STATIC in_cells introspection too (same blind spot: it walks concrete Inputs, not slot
+  bindings). Static struct can't see it; runtime pipe payload can — hence the fix is at
+  record-time resolution, not in the static model.
 CG landing itself is cliloader-verified correct (see above).
 
 --- ORIGINAL DESIGN INTENT (kept as the spec this implemented) ---
