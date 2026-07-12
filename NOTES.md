@@ -48,12 +48,26 @@ create-once, replayed 5× (clEnqueueNDRangeKernel=0). CG host-seam = 7 distinct 
 no ext → software per-op fallback (converge identically). Guards in
 tests/tier2/tests/cb_execution_mode.rs.
 
-FOLLOW-UPS (deferred): (1) mid-graph spans not perfectly create-once across iters
-(17 CB creates / 5 iters for host-seam — the non-boundary-root spans rebuild; the
-whole-graph all-device CB IS create-once); coalesce adjacent device spans + cache
-mid-graph span CBs. (2) precise per-slot→CB invalidation. (3) SVM CB commands
-(clCommandSVMMem{cpy,Fill}KHR) — currently SVM marks the build ineligible →
-software. (4) `Arced`/`FanOut`/`CopyTo2` cb_addable (currently false → per-op).
+FOLLOW-UPS (deferred): (1) MAXIMAL-SPAN BATCHING for host-seam. Today the inter-seam
+device spans are recorded as SINGLETON CBs (1 kernel each) stitched by events, not as
+ONE CB per maximal seam-free sub-tree. A spine-batching attempt (cb_spine_head_addable
+= source.cb_addable; open-span-at-self; Build→Off close at the seam) DID batch
+[xpby,spmv,dot] into one CB but RACED: a mid-graph span-batching boundary enqueues its
+CB only AFTER `self.gather_checkouts` returns, yet that call descends through the
+batched spine AND into the downstream seam (switched to Off), so the seam's
+clEnqueueMapBuffer(partials) runs BEFORE the CB is enqueued → maps with no wait. Fix =
+FINALIZE-AT-CLOSE: finalize+enqueue the CB at the Build→Off transition (the seam),
+BEFORE running the seam, and restamp the span's output pipes with the CB event there.
+The hard part is the restamp target at close — the pipes the seam is about to read are
+not reachable generically at the close point; needs a per-span type-erased
+Restampable list collected during Build (the pipes each span node registered). Real
+refactor of CbBuilder (interior-mutable finalize) + the CbWalk::Build variant
+(carry cache + closed flag + restamp list). Empty-CB guard (LANDED) already removes
+the pure-passthrough empty CBs. (2) create-once for mid-graph span CBs (all-device
+whole-graph CB IS create-once; host-seam singletons rebuild per iter). (3) precise
+per-slot→CB invalidation. (4) SVM CB commands (clCommandSVMMem{cpy,Fill}KHR) —
+currently SVM marks the build ineligible → software. (5) `Arced`/`FanOut`/`CopyTo2`
+cb_addable (currently false → per-op).
 
 --- ORIGINAL DESIGN INTENT (kept as the spec this implemented) ---
 
