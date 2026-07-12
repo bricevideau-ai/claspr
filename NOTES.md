@@ -71,12 +71,55 @@ replay). Both strategies bit-identical. Mechanism:
 - Interior-close detected at boundary-return via is_finalized()/closed latch — covers
   host seams AND transfer tails (add_u32().and_then(download)).
 
+COMPLETE COMMAND-BUFFER COMMAND SURFACE — LANDED 2026-07-12 (commits e028268,
+a721cb1, af4d66d, adb42f3). EVERY cl_khr_command_buffer command variant is now wired
+and cliloader-proven recording into a CB (each with its sync-point wait-list correct):
+
+  | command                      | CB entry point              | wired by |
+  |------------------------------|-----------------------------|----------|
+  | kernel, buffer args          | clCommandNDRangeKernelKHR   | original |
+  | kernel, IMAGE args           | clCommandNDRangeKernelKHR   | e028268  |
+  | fill, cl_mem buffer          | clCommandFillBufferKHR      | original |
+  | fill, IMAGE                  | clCommandFillImageKHR       | a721cb1  |
+  | fill, SVM (concrete + uninit)| clCommandSVMMemFillKHR      | a721cb1/af4d66d |
+  | copy, cl_mem buffer          | clCommandCopyBufferKHR      | adb42f3  |
+  | copy, IMAGE (incl. graph)    | clCommandCopyImageKHR       | a721cb1/af4d66d |
+  | copy, SVM                    | clCommandSVMMemcpyKHR       | adb42f3  |
+
+KEY FACTS:
+- IMAGES are NOT an FFI gap (unlike SVM). An image kernel arg is a single cl_mem set
+  exactly like a buffer (clSetKernelArg, sizeof(cl_mem)) via set_mem_arg; images already
+  impl RecordableBuffer (record_handle → MemRef::Buffer). Image kernel args = pure
+  macro codegen (populate the Image arm's cb_arg_stmts, flip the 4 gates). Image
+  FILL/COPY *do* need their own PFNs, but those typedefs already exist in opencl-sys
+  0.6.1 — the gap was only claspr's CommandBufferExt loading 3 of them.
+- FFI: the 4 new PFNs (clCommand{FillImage,CopyImage,SVMMemFill,SVMMemcpy}KHR) are
+  loaded into CommandBufferExt as OPTIONAL Option fields — NOT in the mandatory
+  all-present load gate. So a driver lacking them keeps buffer/kernel CBs working, and
+  the per-command `?` on each Option falls back to software. The null-PFN niche IS the
+  version gate (a driver without ext ≥ 0.9.4 resolves them null → None → per-op),
+  no explicit version parsing needed. Local pocl 7.2-pre resolves all four (0.9.6).
+- DeviceEnqueue::record_cb (default None; the copy ops override): a CB twin of `run`
+  that does the same Uninit→Init type conversion but records instead of enqueuing —
+  builder=Some records, builder=None (replay) converts only. This keeps the per-family
+  type conversion in copy.rs instead of reinventing it in CopyTo2.
+- CopyTo2 (buffer+SVM copy) + ImageFill/ImageCopy + FillMapped/FillMappedUninit now
+  carry a cb_cache + CB fork + cbable_weight=1. FillUsmUninit stays per-op (USM fill is
+  a pure HOST op, not a device command → correctly weight 0). eager_image_copy is the
+  pipe-fed graph image copy (concrete copy_to can't chain off and_then; region derived
+  at execute from the lent src).
+- Tests: tests/tier2/tests/{cb_image,cb_svm}.rs + cb_execution_mode::fill_then_copy.
+  Image tests SKIP on rusticl/llvmpipe (rust-gpu image kernels SEGV there) and use 2D
+  images (dodge the rust-gpu vec3-coord 3D/array write bug). Full suite 357/0 on all
+  three ICDs.
+
 FOLLOW-UPS (deferred): (1) bundle-branch spans: a bundle2 of two device branches
 records 2 CBs (one per branch), not 1 — CG β's axpy pair happens to co-batch via the
 spine but the general bundle case is per-branch. (2) precise per-slot→CB invalidation
-(currently coarse clear-all). (3) SVM CB commands (clCommandSVMMem{cpy,Fill}KHR) —
-currently SVM marks the build ineligible → software. (4) `Arced`/`FanOut`/`CopyTo2`
-cb_addable (currently false → per-op). (5) `.after()`/`.after_all()` deps on a
+(currently coarse clear-all). (3) DONE 2026-07-12 — SVM CB commands
+(clCommandSVMMem{cpy,Fill}KHR) now recorded (see COMPLETE COMMAND SURFACE above); was
+"marks ineligible → software". (4) `Arced`/`FanOut` cb_addable still false → per-op
+(CopyTo2 is now DONE, adb42f3). (5) `.after()`/`.after_all()` deps on a
 CB-eligible kernel: currently disqualify the kernel from the CB (cb_addable=false when
 self.deps is non-empty) so it runs per-op (correct — deps validated + threaded — just not
 CB-accelerated). Proper fix: thread self.deps' events into the CB external wait-list
