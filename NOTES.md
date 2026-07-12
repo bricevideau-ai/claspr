@@ -9,7 +9,53 @@ items resolve.
 
 ## Active
 
-### ⚑ DESIGN v2 2026-07-11 (Brice) — CB-as-EXECUTION-MODE (supersedes the record-then-replay/segment-list design below)
+### ✅ LANDED 2026-07-11 — CB-as-EXECUTION-MODE (branch cb-support-20260711)
+
+Automatic, invisible command buffers shipped on `cb-support-20260711` (not pushed).
+No user-facing record()/replay(): `g.sync()` in a loop builds+homes a CB on run 1
+and replays it. Implementation notes so the design intent below reads as history:
+
+- PLUMBING: a 3-state `CbWalk` (Off / Build{builder,ext} / LendOnly{ext}) rides
+  IMMUTABLY in each `ExecutionContext` value; `with_cb()` builds a child ec per
+  recursion arm → CB visibility is POSITIONAL with ZERO signature churn (chosen over
+  an explicit `Option<&mut CbBuilder>` param — same guarantee, ~100 fewer edit
+  sites). `LendOnly` is the replay pass (lend buffers + build Checkouts, add/enqueue
+  nothing) — this is what keeps replay from double-executing. Markers-UP =
+  per-CB `sp_edges` (`HashMap<cell_id, Vec<sync_point>>`), FRESH per CB (a sync
+  point is only valid in its own CB); cl_events still flow through pipes untouched
+  (Dep type + ~89 sites unchanged).
+- CACHE: per-node `cb_cache: Arc<Mutex<Option<Arc<FinalizedCb>>>>` FIELD on each
+  CB-capable node (NOT via output_pipe — a composite creator like CG's root AndThen
+  has output_pipe==None). Drops with the graph (RAII), no global/ABA.
+- EVENT↔SYNC-POINT BOUNDARY: inside a CB, ordering = sync points; the CB exposes ONE
+  external cl_event at clEnqueueCommandBufferKHR. `cb_restamp` stamps that one event
+  onto EACH output pipe (multi-output kernels + bundles override; AndThen delegates
+  to its tail). A cross-CB consumer finds no sync point (fresh per-CB map) and waits
+  on the producing CB's event. Getting this wrong was CL_INVALID_SYNC_POINT_WAIT_LIST
+  (-1139) and a downstream race (download read zeros) — both fixed + regression-guarded.
+- ELIGIBILITY: `cb_addable()` (default FALSE, fail-safe) — device leaves + structural
+  combinators (incl. the bare `Pipe`-as-op, whose missing override was the CG
+  false-positive: it ANDed every bundle to fallback) return true; transfers/host
+  seams stay false → per-op fallback. Coarse whole-subtree gating (per-subtree
+  transfer-bracketing is a follow-up).
+- INVALIDATION: `invalidate_cbs()` (coarse clear-all reachable caches) from
+  mutate_bind/mutate_call. Precise per-slot→CB is a documented follow-up.
+
+VERIFIED (cliloader on pocl): CG all-device = ONE iteration CB, 8 kernels recorded
+create-once, replayed 5× (clEnqueueNDRangeKernel=0). CG host-seam = 7 distinct CBs +
+52 host-seam maps, clEnqueueNDRangeKernel=0. Both converge BIT-IDENTICAL (5 iters,
+|r|=4.722114e-6, max|x-x_true|=1.5152618e-6). 3 ICDs: pocl real CB; rusticl/intel
+no ext → software per-op fallback (converge identically). Guards in
+tests/tier2/tests/cb_execution_mode.rs.
+
+FOLLOW-UPS (deferred): (1) mid-graph spans not perfectly create-once across iters
+(17 CB creates / 5 iters for host-seam — the non-boundary-root spans rebuild; the
+whole-graph all-device CB IS create-once); coalesce adjacent device spans + cache
+mid-graph span CBs. (2) precise per-slot→CB invalidation. (3) SVM CB commands
+(clCommandSVMMem{cpy,Fill}KHR) — currently SVM marks the build ineligible →
+software. (4) `Arced`/`FanOut`/`CopyTo2` cb_addable (currently false → per-op).
+
+--- ORIGINAL DESIGN INTENT (kept as the spec this implemented) ---
 
 THE KEY INSIGHT (Brice): don't separate recording from execution. CB-building is a
 MODE of the same recursive execution walk (execute/collect/gather_checkouts), NOT a
@@ -61,120 +107,6 @@ seam doesn't forward → device sub-CBs + host steps wired by the event/sync-poi
 boundary. THE HARD PART TO GUARD WITH TESTS: the event↔sync-point conversion at CB
 boundaries (missing dep = race; wrong kind = CL error), and the "differs → drop +
 re-parent" bookkeeping (a finalized CB is immutable; don't strand/reuse a stale one).
-
-### (superseded) ⚑ DESIGN 2026-07-11 (Brice) — automatic, invisible, SEGMENTED command buffers
-
-Branch `cb-support-20260711`. Goal: command buffers are an IMPLEMENTATION DETAIL
-users never see. No `record()`/`replay()` surface. A graph is built once and
-`sync`'d in a loop exactly as today; the FIRST `sync` builds a cached replay plan,
-subsequent `sync`s replay it, and any graph mutation (`mutate_bind`/`mutate_call`)
-invalidates the cache so the next `sync` rebuilds. (Immutable CBs only for now —
-no mutable-dispatch rebind yet.)
-
-DONE so far:
-- Phase 0 (a01adc4): `Context::has_cl_khr_command_buffer{,_mutable_dispatch}()`;
-  hard-assert the HW CB path in record_replay; corrected the false "no SVM
-  variants" comment (SVM CB commands EXIST — clCommandSVMMem{cpy,Fill}KHR, OCL
-  2.0+, ext ≥0.9.4 — just not wired yet; software fallback for SVM meanwhile).
-- Phase 1 (aa4c296): `RecordableOp` for structural passthroughs Forward/Lift/
-  Arced (alias a buffer handle in the record edge map, emit no command).
-- Fold (2bd5021): DELETED the `RecordableOp` sub-trait; `record` is now
-  `DeviceOp::record(&self, &mut RecordContext)` with a DEFAULT that errors
-  `NotSupported`. Device leaves + combinators override; host-touching leaves
-  inherit the error. `RecordExt::record()` renamed `record_graph()` (a
-  `DeviceOp::record`/`RecordExt::record` pair collides on `.record()` even at
-  different arity — E0034). `Lift`/`CopyTo2` DeviceOp impls gained a
-  `RecordableBuffer` bound (an override can't tighten `where` past its impl
-  header — E0276; all in-repo uses satisfy it). Green; 10 record_replay pass.
-
-⚑ TWO STOP-AND-REPORT BLOCKERS surfaced while building the segmenter (2026-07-11,
-still open — commits 2-4 NOT landed):
-
-1. CACHE HOME (trigger #2). `sync(&self)` is a blanket `DeviceOpExt` method over
-   arbitrary graph structs; there is NO field to hold a cached `ReplayPlan`, and
-   the multi-output terminal (`bundle2(x, rsnew)` in CG) has NO stable
-   `output_pipe()` (it returns a fresh `Pipe::new()` each call), so it can't be
-   the anchor. Options WITHOUT a user-visible wrapper (Brice forbade an explicit
-   CB surface): (a) global `Mutex<HashMap<anchor_cell_ptr, ReplayPlan>>` keyed by
-   a new `first_leaf_cell()` walk (every leaf's `__claspr_out`/`out` pipe cell is
-   stable; `AndThen::first_leaf = source.first_leaf`) — needs ABA guarding (graph
-   A drops, graph B reuses the freed anchor address) via a liveness `Weak` or a
-   cheap cell-set hash re-checked per sync; mutate_* removes the entry; (b) add a
-   minimal non-user-facing `Arc<Mutex<Option<ReplayPlan>>>` field to the ONE
-   struct every reusable graph is built through — but bare kernels / bundles are
-   valid terminals too, so there is no single such struct; (c) thread the cache
-   Arc through a new `DeviceOp::plan_cache(&self) -> Option<&PlanCache>` returning
-   `None` by default and overridden only by leaves that carry the field — a field
-   addition to every leaf, invasive but not user-visible. RECOMMEND (a) with a
-   liveness `Weak` sentinel (sound, zero struct changes) — needs Brice's ok on a
-   process-global table.
-
-2. HOST-SEAM EXECUTION THROUGH THE CB PLAN (trigger #3/#4 — "the genuinely hard
-   part"). A host step must run the seam's map→closure→unmap over the buffers the
-   PRECEDING device-span CB produced, WITHOUT re-running that device work. But
-   `AndThenHost` obtains its typed `S::Output` (which `Mappable::map(&self)` needs)
-   ONLY via `self.source.gather_checkouts(ec)`, which ENQUEUES the source's device
-   commands. There is no "lend the source's buffers without enqueuing" path, so a
-   segmented plan (source-subtree→CB, seam→HostStep) would DOUBLE-EXECUTE the
-   device source. Fixing this needs AndThenHost refactored to separate
-   "materialize source buffers from their concrete cells (+ attach the CB's
-   completion event as deps)" from "enqueue the source's device commands" — the
-   record edge-map already computes cell→cl_mem, so the seam COULD map raw cl_mems
-   if it exposed an erased "map these handles / run closure / unmap" step, but that
-   touches the delicate start-gate / worker / two-user-event machinery. Until this
-   lands, `solve_host_seam` cannot run THROUGH the CB plan; it still converges on
-   the existing per-op path. Per the trigger, NOT shipping partial/incorrect
-   segmentation. All-device single-CB path (blocker 1 permitting) is unaffected.
-
-THE MODEL (Brice: **CBs are SUB-TREES, not linear segments**). A CB = a MAXIMAL
-sub-tree whose `contains_host_seam() == false`. The plan is built by a recursive
-tree walk, not a linear scan:
-- At a node, if `contains_host_seam()==false` → the WHOLE subtree is ONE
-  `cl_khr_command_buffer` (record it via the existing `RecordableOp` path — every
-  node in it is a device op — and STOP descending). Anchored at the subtree-root
-  `cell_id`.
-- If it DOES contain a seam → it's a boundary composite: RECURSE into its
-  children. Its device-able child subtrees each become their own CB; the seam
-  node itself (`AndThenHost`) is a `HostStep` run the normal per-op way.
-- `HostStep` also covers host↔device transfers (upload seed / download): host→
-  device enqueues as a DEPENDENCY the consuming CB waits on; device→host as a
-  DEPENDENT on the producing CB's completion (Brice's rule: transfers are NOT
-  CB-able, they bracket the CB).
-
-Consequence — MAXIMAL CBs fall out for free (descend only until a subtree is
-seam-free) and the blast radius is small: NO new walk method on all ~43 ops. The
-seam-free fast path records via existing `RecordableOp`; the recursive
-`plan_segmented` is needed ONLY on combinators that CAN contain a seam (`AndThen`,
-`Bundle*`, `FanOut`, passthroughs, and `AndThenHost` as the boundary). Leaves +
-seam-free subtrees never reach the recursion. Dependencies follow the TREE edges
-(cell deps), not a linear order.
-
-CELL ATTRIBUTION is the spine: `cell_id` = `Arc::as_ptr` of a pipe's cell (stable
-per node), already the record edge-map key. The plan carries a
-`cell_id → producing-step` map; a step consuming cell X waits on X's producer
-(CB completion event or host-op event). This IS the dependency graph between the
-non-CB-able nodes and the CBs, expressed purely in cell terms.
-
-THE WALK (`plan_segmented(&self, &mut PlanBuilder)`, a new `DeviceOp` method
-with a DEFAULT that handles the leaf/seam-free case): default impl = "I am a
-seam-free subtree → record me as one CB via `RecordableOp`." Only the
-seam-capable combinators override it to recurse: at `AndThen`/`Bundle`/`FanOut`,
-for each child, if the child subtree is seam-free emit it as a CB, else recurse;
-`AndThenHost` overrides to emit its device source-subtree(s) as CB(s) + itself as
-a HostStep. All-device graph (CG solve_all_device, root seam-free) → the default
-fires at the root → ONE CB, no recursion. Host-seam graph (CG solve_host_seam) →
-recursion yields [CB(device span), HostStep(seam), CB(device span), HostStep] as
-a TREE of steps wired by cell deps.
-
-STORAGE: cached in an interior-mutable cell reachable from the terminal (`sync`
-is `&self`). Each CbSegment stores its finalized CB keyed by segment-root cell.
-`mutate_*` clears the cache. SERIAL REPLAY unchanged — the existing Checkout
-lend/rehome already forbids re-`sync` while buffers are lent, so an immutable CB
-inherits the "graph idle before re-enqueue" constraint for free.
-
-DISPATCH: `sync(&self)` — if a valid cached plan exists, replay it; else build
-the plan (segment walk), cache, execute. A graph with no CB-eligible segment (all
-host/SVM, or no ext) degrades to the current per-op execute path unchanged.
 
 ### ⚑ DECIDED 2026-07-08 (Brice) — DeviceScalar forks settled + CG reduction-strategy parametrization
 
