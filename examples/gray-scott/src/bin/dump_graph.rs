@@ -21,7 +21,7 @@
 //! crate's `OUT_DIR/gpu.rs` via the single `build.rs`. The `g` construction below
 //! is replicated verbatim from `run_swap`, so the dump reflects the real graph.
 
-use claspr::eager::{DeviceOp, DeviceOpExt, GraphNode, graph_edge_table};
+use claspr::eager::{DeviceOp, DeviceOpExt, GraphNode, bundle4, graph_edge_table};
 use claspr::{Context, DeviceSlice, LaunchSpec};
 use claspr::{slot, slots};
 
@@ -133,6 +133,81 @@ fn short_list(ids: &[usize]) -> String {
     format!("[{}]", inner.join(","))
 }
 
+/// Dump one built graph: struct tree (a), pipe-edge table (b), fan-in view (b'),
+/// summary (c). Shared by the per-step (swap) and two-step (immutable) dumps.
+fn dump<G: DeviceOp>(title: &str, g: &G) {
+    let mut nodes: Vec<GraphNode> = Vec::new();
+    g.dump_graph(0, &mut nodes);
+
+    println!("== {title}: STRUCT TREE (source→next, depth-nested) ==");
+    for n in &nodes {
+        println!(
+            "{}{}  out={} in={}  cb_addable={} seam={}",
+            "  ".repeat(n.depth),
+            n.name,
+            short_list(&n.out_cells),
+            short_list(&n.in_cells),
+            n.cb_addable,
+            n.seam,
+        );
+    }
+
+    println!();
+    println!("== PIPE EDGE TABLE (producer cell -> consumer nodes) ==");
+    let table = graph_edge_table(&nodes);
+    let mut shared = 0usize;
+    let mut edges = 0usize;
+    for (producer, consumers) in &table {
+        if consumers.is_empty() {
+            continue;
+        }
+        edges += 1;
+        let consumer_names: Vec<String> =
+            consumers.iter().map(|&i| nodes[i].name.clone()).collect();
+        let flag = if consumers.len() > 1 {
+            shared += 1;
+            format!("  <-- SHARED FAN-OUT (out-degree {})", consumers.len())
+        } else {
+            String::new()
+        };
+        println!(
+            "  {} -> [{}]{}",
+            short(*producer),
+            consumer_names.join(", "),
+            flag
+        );
+    }
+
+    println!();
+    println!("== FAN-IN CONVERGENCE (consumer node <- N producer pipes) ==");
+    let mut converge = 0usize;
+    for n in &nodes {
+        if n.in_cells.len() > 1 {
+            converge += 1;
+            println!(
+                "  {} <- {} producer pipes {}  <-- CONVERGENCE (in-degree {})",
+                n.name,
+                n.in_cells.len(),
+                short_list(&n.in_cells),
+                n.in_cells.len()
+            );
+        }
+    }
+    if converge == 0 {
+        println!("  (none — this is a fork-tree, every consumer reads one producer)");
+    }
+
+    println!();
+    println!(
+        "== SUMMARY ==\n{} nodes, {} pipe edges, {} shared (out-degree>1), \
+         {} convergence points (in-degree>1)",
+        nodes.len(),
+        edges,
+        shared,
+        converge
+    );
+}
+
 fn main() -> claspr::Result<()> {
     let ctx = match Context::any() {
         Ok(c) => c,
@@ -182,86 +257,76 @@ fn main() -> claspr::Result<()> {
         .bind(UOut(u_b))
         .bind(VOut(v_b));
 
-    // ── (a) Indented struct tree. ───────────────────────────────────────────
-    let mut nodes: Vec<GraphNode> = Vec::new();
-    g.dump_graph(0, &mut nodes);
+    dump("PER-STEP graph (run_swap / single step)", &g);
 
-    println!("== gray-scott per-step graph: STRUCT TREE (source→next, depth-nested) ==");
-    for n in &nodes {
-        println!(
-            "{}{}  out={} in={}  cb_addable={} seam={}",
-            "  ".repeat(n.depth),
-            n.name,
-            short_list(&n.out_cells),
-            short_list(&n.in_cells),
-            n.cb_addable,
-            n.seam,
-        );
-    }
+    // ── The IMMUTABLE unroll-by-2 graph (run_immutable, main.rs ~666-728). ────
+    // This is the structure that RACES on pocl. Two full per-step subgraphs are
+    // composed with `and_then`: step 1 value-binds concrete field buffers; step 2
+    // is FED from step 1's four output pipes (Tag(pipe) = FedByPipe), the crossed
+    // A→B→A rotation. The dropped dependency is the cross-step edge: step 2's
+    // laplacians read step 1's combine output, but the CB records their
+    // sync_point_wait_list as empty. This dump shows whether that cross-step pipe
+    // edge is even VISIBLE in the graph's in_cells (i.e. whether the FedByPipe
+    // slot binding surfaces the producer's cell id) — the crux of the root cause.
+    // Fresh Kernels — the per-step `g` above moved `ks` into its closures.
+    let ks_imm = gpu::kernels(&ctx)?;
+    let iu_a = seeded(&ctx, vec![1.0f32; N])?;
+    let iu_b = seeded(&ctx, vec![0.0f32; N])?;
+    let iv_a = seeded(&ctx, vec![0.0f32; N])?;
+    let iv_b = seeded(&ctx, vec![0.0f32; N])?;
+    let lap_u1 = seeded(&ctx, vec![0.0f32; N])?;
+    let lap_v1 = seeded(&ctx, vec![0.0f32; N])?;
+    let lap_u2 = seeded(&ctx, vec![0.0f32; N])?;
+    let lap_v2 = seeded(&ctx, vec![0.0f32; N])?;
 
-    // ── (b) Flat pipe-edge table. ───────────────────────────────────────────
+    // Per-step subgraph with the four field slots left OPEN (invariants Grid/F/K
+    // curried in), matching run_immutable's `curried_kernel`. `ks` is captured;
+    // the launchers clone the context internally, so the returned graph owns
+    // everything it needs.
+    let curried = |ks: &gpu::Kernels, lap_u, lap_v| {
+        ks.laplacian(slot!(Grid), slot!(UIn), lap_u)
+            .and_then(move |(u_in, lap_u_pipe)| {
+                ks.laplacian(slot!(Grid), slot!(VIn), lap_v)
+                    .and_then(move |(v_in, lap_v_pipe)| {
+                        ks.combine(
+                            slot!(Grid),
+                            u_in,
+                            v_in,
+                            lap_u_pipe,
+                            lap_v_pipe,
+                            slot!(UOut),
+                            slot!(VOut),
+                            slot!(F),
+                            slot!(K),
+                        )
+                        .and_then(
+                            |(u_in, v_in, _lap_u, _lap_v, u_out, v_out)| {
+                                bundle4(u_in, v_in, u_out, v_out)
+                            },
+                        )
+                    })
+            })
+            .call((F(F1), K(K1), Grid(LaunchSpec::from([W, H]))))
+    };
+
+    // Compose step 1 (concrete bufs) THEN step 2 (fed from step 1's output pipes).
+    let g_imm = curried(&ks_imm, lap_u1, lap_v1)
+        .call((UIn(iu_a), VIn(iv_a), UOut(iu_b), VOut(iv_b)))
+        .and_then(move |(u_a, v_a, u_b, v_b)| {
+            curried(&ks_imm, lap_u2, lap_v2).call((
+                UIn(u_b),  // read B (step-1 UOut pipe)
+                VIn(v_b),  // read B (step-1 VOut pipe)
+                UOut(u_a), // write A (step-1 UIn pipe)
+                VOut(v_a), // write A (step-1 VIn pipe)
+            ))
+        });
+
     println!();
-    println!("== PIPE EDGE TABLE (producer cell -> consumer nodes) ==");
-    let table = graph_edge_table(&nodes);
-    let mut shared = 0usize;
-    let mut edges = 0usize;
-    for (producer, consumers) in &table {
-        // Only real edges: a producer with at least one consumer.
-        if consumers.is_empty() {
-            continue;
-        }
-        edges += 1;
-        let consumer_names: Vec<String> =
-            consumers.iter().map(|&i| nodes[i].name.clone()).collect();
-        let flag = if consumers.len() > 1 {
-            shared += 1;
-            format!("  <-- SHARED FAN-OUT (out-degree {})", consumers.len())
-        } else {
-            String::new()
-        };
-        println!(
-            "  {} -> [{}]{}",
-            short(*producer),
-            consumer_names.join(", "),
-            flag
-        );
-    }
-
-    // ── (b') Fan-IN convergence view. ───────────────────────────────────────
-    // In gray-scott the non-tree structure is a fan-IN diamond, not fan-OUT: no
-    // single producer pipe feeds two consumers, but `combine` CONVERGES four
-    // upstream pipes (both outputs of BOTH laplacians). A fork-tree (`cg`) never
-    // has in-degree > 1 — every consumer reads exactly one producer. That
-    // convergence across two independent laplacian branches is exactly the shared
-    // edge the source→next maximal-span CB walk must order correctly.
+    println!("################################################################");
     println!();
-    println!("== FAN-IN CONVERGENCE (consumer node <- N producer pipes) ==");
-    let mut converge = 0usize;
-    for n in &nodes {
-        if n.in_cells.len() > 1 {
-            converge += 1;
-            println!(
-                "  {} <- {} producer pipes {}  <-- CONVERGENCE (in-degree {})",
-                n.name,
-                n.in_cells.len(),
-                short_list(&n.in_cells),
-                n.in_cells.len()
-            );
-        }
-    }
-    if converge == 0 {
-        println!("  (none — this is a fork-tree, every consumer reads one producer)");
-    }
-
-    // ── (c) Summary. ────────────────────────────────────────────────────────
-    println!();
-    println!(
-        "== SUMMARY ==\n{} nodes, {} pipe edges, {} shared (out-degree>1), \
-         {} convergence points (in-degree>1)",
-        nodes.len(),
-        edges,
-        shared,
-        converge
+    dump(
+        "IMMUTABLE unroll-by-2 graph (run_immutable — the RACING one)",
+        &g_imm,
     );
 
     Ok(())
