@@ -78,10 +78,18 @@ spine but the general bundle case is per-branch. (2) precise per-slot→CB inval
 currently SVM marks the build ineligible → software. (4) `Arced`/`FanOut`/`CopyTo2`
 cb_addable (currently false → per-op).
 
-PRE-EXISTING (NOT from CB work): gray-scott swap_and_immutable_agree_bit_for_bit RACES
-(max|Δ| varies 7e-3..2.6e-2 run-to-run) — reproduces on de9fc76 (before any CB-session
-work) and on the sound-singletons tag. Independent of finalize-at-close. Needs its own
-investigation; do NOT attribute to the span-batching landing.
+CB-SESSION REGRESSION (corrected 2026-07-12 via git bisect — earlier "pre-existing" note
+was WRONG): gray-scott swap_and_immutable_agree_bit_for_bit RACES (max|Δ| varies
+1.4e-2..2.1e-2 run-to-run). Bisected: PASSES 6/0 at pre-CB baseline a049ad4 and through
+d11fb78; first FAILS 6/6 at 236d9c0 (the commit that flipped `Pipe::cb_addable()` → true).
+de9fc76 is INSIDE the CB session, not before it — the prior attribution mis-identified the
+baseline. Root cause: 236d9c0 routes pipe-fed graphs through the CB path; gray-scott is a
+pipe-DAG (`bind(Grid)` fans ONE pipe to 3 dispatch sites = FedByPipe out-degree >1; field
+buffers threaded as pipes). The CB walk drops/misorders a dependency across a SHARED
+fan-out pipe edge (invisible to struct nesting) → nondeterministic bit diff. CG is immune
+because it's a pure tuple-threaded fork-tree with NO pipe edges. NEXT: graph dump (struct
+tree + producer→[consumers] pipe-edge table via cell_id) to see which shared edge the CB
+boundary crosses. CG landing itself is cliloader-verified correct (see above).
 
 --- ORIGINAL DESIGN INTENT (kept as the spec this implemented) ---
 
