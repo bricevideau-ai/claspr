@@ -5,9 +5,13 @@
 //! This asserts a >= 2-command IMAGE-kernel chain (fill_pattern -> copy_to_buffer)
 //! homes ONE command buffer on a CB-capable device and replays correctly.
 //!
-//! ICD note: rust-gpu image kernels SEGV on rusticl/llvmpipe (a known rust-gpu/llvmpipe
-//! issue), so this test SKIPs there; it runs on pocl 7.2-pre and Intel iris. It uses a
-//! 2D image (not 3D / arrayed) to avoid the rust-gpu vec3-coord write bug on those.
+//! Runs on all three ICDs — via the CB path where the driver's command buffer
+//! advertises the commands (pocl), else per-op (see `ctx`). Both prior image caveats
+//! are fixed: the rusticl/llvmpipe image-kernel SEGV (Mesa 26.1.4 / LLVM 21) and the
+//! 3D/2D-array vec3-coord write bug (a rust-gpu codegen bug — coordinates now widened
+//! to 4 components for Kernel targets on the opencl-kernel-support branch; pocl was
+//! always spec-conformant). This test uses a 2D image simply because that's the
+//! shape the dim2_float test kernels expose.
 
 use claspr::eager::{DeviceOp, DeviceOpExt};
 use claspr::image::format::R32Float;
@@ -18,7 +22,12 @@ const W: u32 = 8;
 const H: u32 = 8;
 const N: usize = (W * H) as usize;
 
-/// Skip on no device, no image support, or rusticl/llvmpipe (image-kernel SEGV).
+/// Skip on no device or no image support. (The old rusticl/llvmpipe rust-gpu
+/// image-kernel SEGV — reference_rusticl_llvmpipe_image2d_segv, 2026-05-14 — is FIXED
+/// as of Mesa 26.1.4 / LLVM 21: verified 2026-07-12 that raymarch, tier1
+/// image_dispatch, and these tests all run clean on llvmpipe, 5/5 no SEGV. llvmpipe's
+/// rusticl advertises no command-buffer commands, so image ops fall back to per-op
+/// there via the null-PFN path — still exercises the image kernels, just not the CB.)
 fn ctx() -> Option<Context> {
     let c = match Context::any() {
         Ok(c) => c,
@@ -29,12 +38,6 @@ fn ctx() -> Option<Context> {
     };
     if !c.device().cl3().image_support().unwrap_or(false) {
         eprintln!("SKIP: device has no image support");
-        return None;
-    }
-    // rust-gpu image kernels SEGV on rusticl/llvmpipe — skip there.
-    let name = c.device().name().unwrap_or_default().to_lowercase();
-    if name.contains("llvmpipe") {
-        eprintln!("SKIP: rust-gpu image kernels SEGV on llvmpipe");
         return None;
     }
     Some(c)
