@@ -9,6 +9,7 @@
 use claspr::Context;
 use claspr::DeviceSlice;
 use claspr::eager::{DeviceOp, DeviceOpExt, fill};
+use claspr_test_kernels::kernels;
 
 const N: usize = 64;
 
@@ -73,4 +74,29 @@ fn fill_runs_as_command_buffer_and_replays() {
             "software (no CB)"
         }
     );
+}
+
+/// A fill→kernel chain (in-place scale) is ONE all-device CB region homed at the
+/// root AndThen. Build then replay across syncs; the buffer holds fill*scale each
+/// run (idempotent — fill resets). The kernel arg-set + ND-range go into the CB.
+#[test]
+fn fill_then_kernel_chain_runs_as_command_buffer() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
+
+    // fill(buf, 2) -> scale_u32(_, 5): 2 -> 10 per run (fill resets each run).
+    let g = fill(buf, 2u32).and_then(|b| ks.scale_u32([N], b, 5u32));
+
+    for i in 0..3 {
+        let co = g.sync(&ctx).unwrap_or_else(|e| panic!("sync {i}: {e:?}"));
+        let gd = co.map().wait().expect("read");
+        assert!(gd.iter().all(|&v| v == 10), "iter {i}: {:?}", &gd[..8]);
+        drop(gd);
+        drop(co);
+    }
+    // The chain's root is the AndThen; it homes the CB when the ext is present.
+    if ctx.has_cl_khr_command_buffer() {
+        assert!(homed_cb(&g), "chain should home a command buffer");
+    }
 }

@@ -42,7 +42,7 @@ pub type SyncPointEdges = Arc<Mutex<HashMap<usize, Vec<cl_sync_point_khr>>>>;
 /// The command-buffer walk mode for a walk position (design v2, CB-as-execution-
 /// mode). Threaded IMMUTABLY in each [`ExecutionContext`] value; positional
 /// visibility comes from each recursion arm building its own child value (see
-/// [`ExecutionContext::with_cb`]).
+/// `ExecutionContext::with_cb`).
 ///
 /// Three states because a REPLAY still has to re-walk the graph to LEND buffers
 /// and build the terminal `Checkout`s (the buffers flow every run for stable
@@ -64,7 +64,7 @@ pub type SyncPointEdges = Arc<Mutex<HashMap<usize, Vec<cl_sync_point_khr>>>>;
 ///   device work — the double-execution hazard the superseded design hit,
 ///   dissolved by making replay a lend-only pass of the SAME walk.
 #[derive(Clone, Copy)]
-pub(crate) enum CbWalk<'a> {
+pub enum CbWalk<'a> {
     Off,
     Build {
         /// The live command buffer this subtree adds its commands to.
@@ -80,8 +80,8 @@ pub(crate) enum CbWalk<'a> {
         ext: &'a Mutex<Vec<crate::eager::Dep>>,
     },
     LendOnly {
-        /// See [`Build::ext`](CbWalk::Build) — the same external-dep accumulator on
-        /// the replay pass (the cached CB still needs its external wait-list each
+        /// See [`Build`](CbWalk::Build)`::ext` — the same external-dep accumulator
+        /// on the replay pass (the cached CB still needs its external wait-list each
         /// replay, since a host step re-produces fresh events every run).
         ext: &'a Mutex<Vec<crate::eager::Dep>>,
     },
@@ -134,7 +134,7 @@ pub struct ExecutionContext<'ctx> {
     /// The **forwarded command buffer** for this walk position (design v2,
     /// CB-as-execution-mode). `Some` iff this op is currently INSIDE a command
     /// buffer being built — set by a CB-creating node for its children's
-    /// sub-`ExecutionContext` (via [`with_cb`](Self::with_cb)), `None` otherwise.
+    /// sub-`ExecutionContext` (via `with_cb`), `None` otherwise.
     ///
     /// This is IMMUTABLE per `ExecutionContext` value — positional visibility comes
     /// from each recursion arm getting its OWN child `ExecutionContext`
@@ -233,8 +233,8 @@ impl<'ctx> ExecutionContext<'ctx> {
     }
 
     /// The CB walk mode at this walk position. The per-node fork reads this to
-    /// decide build / replay-lend / normal-enqueue. See [`with_cb`](Self::with_cb).
-    pub(crate) fn cb(&self) -> CbWalk<'_> {
+    /// decide build / replay-lend / normal-enqueue. See `with_cb`.
+    pub fn cb(&self) -> CbWalk<'_> {
         self.cb
     }
 
@@ -244,7 +244,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// predecessor) or has not run yet. The CB-mode fork uses this as a leaf's
     /// `sync_point_wait_list`. `None` upstream cell (a concrete/slot input, no
     /// pipe) yields no markers.
-    pub(crate) fn sp_lookup(&self, cell_id: Option<usize>) -> Vec<cl_sync_point_khr> {
+    pub fn sp_lookup(&self, cell_id: Option<usize>) -> Vec<cl_sync_point_khr> {
         match cell_id {
             Some(id) => self
                 .sp_edges
@@ -259,7 +259,7 @@ impl<'ctx> ExecutionContext<'ctx> {
 
     /// Register a producer's output command sync point(s) under its output pipe's
     /// `cell_id`, so a CB-internal consumer resolves them via [`sp_lookup`](Self::sp_lookup).
-    pub(crate) fn sp_register(&self, cell_id: usize, sps: Vec<cl_sync_point_khr>) {
+    pub fn sp_register(&self, cell_id: usize, sps: Vec<cl_sync_point_khr>) {
         self.sp_edges.lock().unwrap().insert(cell_id, sps);
     }
 

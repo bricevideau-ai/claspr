@@ -535,6 +535,16 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // set a scalar's bytes. `has_image_param` gates whether the kernel gets a
     // `DeviceOp::record` override at all (images aren't recordable yet).
     let mut record_arg_stmts: Vec<TokenStream2> = Vec::new();
+    // CB-mode (design v2) arg codegen, one statement per arg in signature order.
+    // Runs INSIDE `execute` after `resolve_home` has lent every buffer: it reads
+    // the resolved local (`#pname`, the owned lent buffer/scalar) for its handle,
+    // sets the arg on `__claspr_cb_kernel`, and — for buffer/scalar-ref args —
+    // gathers the upstream producer's sync points (from the ec sp-edge map, keyed
+    // by the input's upstream pipe cell id) into `__claspr_cb_waits`, and remembers
+    // the arg's handle in `__claspr_cb_out_handles` so each output pipe registers
+    // it. Mirrors `record_arg_stmts` but sources handles from the LENT locals (not
+    // a separate edge-map) so CB-build is one pass of the SAME execute walk.
+    let mut cb_arg_stmts: Vec<TokenStream2> = Vec::new();
     let mut has_image_param = false;
     // `(generic_ident, bound_token_stream)` — populated once per
     // slice param + twice per image param, in source order. Drives
@@ -597,7 +607,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // Eager path: resolve to (buffer, deps, home); collect the deps +
                 // home idents. In-place write → the buffer's home threads to its
                 // output pipe so the run's `Checkout` re-arms its concrete cell.
+                let cbcell_ident = quote::format_ident!("__claspr_cbcell{}", arg_gen_idx - 1);
                 input_resolve_eager.push(quote! {
+                    // Capture the upstream pipe cell id BEFORE `resolve_home` shadows
+                    // `#pname` (needed by the CB-mode sync-point lookup).
+                    let #cbcell_ident = ::claspr::Input::pipe_cell_id(#pname);
                     let (#pname, #deps_ident, #home_ident) =
                         ::claspr::Input::resolve_home(#pname, ec)?;
                 });
@@ -624,6 +638,25 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
                 output_homes.push(quote! { #home_ident });
+
+                // CB-mode: set this slice's (cl_mem, len) arg pair from the LENT
+                // local's handle, gather its upstream producer's sync points, and
+                // remember the handle for the output-pipe registration.
+                cb_arg_stmts.push(quote! {
+                    {
+                        let __claspr_h = ::claspr::KernelSliceReadArg::record_handle(&#pname)?;
+                        __claspr_cb_waits.extend(__claspr_cb_ec.sp_lookup(#cbcell_ident));
+                        unsafe {
+                            __claspr_cb_builder.set_buffer_arg(
+                                __claspr_cb_kernel,
+                                &mut __claspr_cb_argi,
+                                __claspr_h.mem,
+                                __claspr_h.byte_len / ::core::mem::size_of::<#elem>(),
+                            )?;
+                        }
+                        __claspr_cb_out_handles.push(__claspr_h);
+                    }
+                });
 
                 // Record path: resolve this slice's buffer (its own concrete
                 // input or the upstream producer's edge), set it as the kernel's
@@ -701,7 +734,9 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 arg_types.push(quote! { ::claspr::Input<#gid_tt> });
                 op_field_init.push(quote! { ::claspr::ToInput::to_input(#pname) });
                 // Output threading / lend / rehome: IDENTICAL to Slice.
+                let cbcell_ident = quote::format_ident!("__claspr_cbcell{}", arg_gen_idx - 1);
                 input_resolve_eager.push(quote! {
+                    let #cbcell_ident = ::claspr::Input::pipe_cell_id(#pname);
                     let (#pname, #deps_ident, #home_ident) =
                         ::claspr::Input::resolve_home(#pname, ec)?;
                 });
@@ -724,6 +759,23 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
                 output_homes.push(quote! { #home_ident });
+
+                // CB-mode: set ONLY the pointer arg (advance by 1), gather upstream
+                // sync points, remember the handle for output-pipe registration.
+                cb_arg_stmts.push(quote! {
+                    {
+                        let __claspr_h = ::claspr::KernelScalarRefArg::record_handle(&#pname)?;
+                        __claspr_cb_waits.extend(__claspr_cb_ec.sp_lookup(#cbcell_ident));
+                        unsafe {
+                            __claspr_cb_builder.set_mem_arg(
+                                __claspr_cb_kernel,
+                                &mut __claspr_cb_argi,
+                                __claspr_h.mem,
+                            )?;
+                        }
+                        __claspr_cb_out_handles.push(__claspr_h);
+                    }
+                });
 
                 // Record path: resolve this scalar-ref's buffer exactly like a
                 // slice, but set ONLY the pointer arg (advance arg index by 1,
@@ -879,6 +931,26 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // validate its `ScalarInput` (unbound is `SlotUnbound`).
                 input_check_ready.push(quote! {
                     ::claspr::ScalarInput::check_ready(#pname)?;
+                });
+
+                // CB-mode: `#pname` is already the resolved owned `#ty` (scalars
+                // resolve before buffers). Set its raw bytes; no handle, no output.
+                cb_arg_stmts.push(quote! {
+                    {
+                        let __claspr_bytes = unsafe {
+                            ::core::slice::from_raw_parts(
+                                (&#pname as *const #ty) as *const u8,
+                                ::core::mem::size_of::<#ty>(),
+                            )
+                        };
+                        unsafe {
+                            __claspr_cb_builder.set_scalar_arg(
+                                __claspr_cb_kernel,
+                                &mut __claspr_cb_argi,
+                                __claspr_bytes,
+                            )?;
+                        }
+                    }
                 });
 
                 // Record path: read the scalar's resolved value, then set its raw
@@ -1060,6 +1132,105 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         .map(|i| quote::format_ident!("__claspr_co{}", i))
         .collect();
 
+    // ── CB-mode (design v2) execute fork — shared by single/multi output ──────
+    //
+    // Emitted ONLY for kernels with no image param (images aren't CB-recordable,
+    // like the record path). Runs INSIDE `execute` after `resolve_home` has lent
+    // every buffer + `scalar_resolve_eager` read every scalar. Branches on the CB
+    // walk mode:
+    //   Off      → nothing (the caller falls through to the normal LaunchOp path).
+    //   Build    → set args on the retained cl_kernel from the LENT locals, add ONE
+    //              ND-range to the builder (waiting on upstream sync points), then
+    //              deposit each output buffer with EMPTY cl_event deps and register
+    //              the launch sync point under each output pipe's cell id.
+    //   LendOnly → deposit each output buffer with empty deps (the cached CB runs);
+    //              add + enqueue nothing.
+    // Entry deps (a producer OUTSIDE this CB) are collected into `ext` in both CB
+    // modes so the homing node waits on them at clEnqueueCommandBufferKHR.
+    let cb_execute_fork = if has_image_param {
+        // Image kernels can't be CB-recorded; always take the normal path.
+        quote! {}
+    } else {
+        // Per-output deposit (empty deps) + sync-point register, single vs multi.
+        let out_pipe_exprs: Vec<TokenStream2> = if multi_output {
+            op_pipe_fields.iter().map(|f| quote! { self.#f }).collect()
+        } else {
+            vec![quote! { self.__claspr_out }]
+        };
+        // The deposit reuses the SAME `#output_expr` / homes the normal path uses.
+        let cb_deposits_build = out_pipe_exprs.iter().enumerate().map(|(i, p)| {
+            let name = &output_names[i];
+            let home = &output_homes[i];
+            quote! {
+                __claspr_cb_ec.sp_register(
+                    ::claspr::Pipe::cell_id(&#p),
+                    ::std::vec![__claspr_cb_sp],
+                );
+                #p.put_home(#name, ::claspr::Deps::new(), #home);
+            }
+        });
+        let cb_deposits_lend: Vec<TokenStream2> = out_pipe_exprs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let name = &output_names[i];
+                let home = &output_homes[i];
+                quote! {
+                    #p.put_home(#name, ::claspr::Deps::new(), #home);
+                }
+            })
+            .collect();
+        // Collect entry (external) deps: every input's deps idents.
+        let collect_ext = quote! {
+            #( ::claspr::eager::cb_collect_external(__claspr_cb_ext, &#input_deps_idents); )*
+        };
+        quote! {
+            match ::claspr::ExecutionContext::cb(ec) {
+                ::claspr::eager::CbWalk::Off => {}
+                ::claspr::eager::CbWalk::Build { builder: __claspr_cb_builder, ext: __claspr_cb_ext } => {
+                    let __claspr_cb_ec = ec;
+                    #collect_ext
+                    let __claspr_cb_kernel = ::claspr::Kernel::get(&self.kernel);
+                    let mut __claspr_cb_argi: ::claspr::cl_uint = 0;
+                    let mut __claspr_cb_waits: ::std::vec::Vec<::claspr::cl_sync_point_khr> =
+                        ::std::vec::Vec::new();
+                    let mut __claspr_cb_out_handles: ::std::vec::Vec<::claspr::BufHandle> =
+                        ::std::vec::Vec::new();
+                    let _ = &mut __claspr_cb_out_handles; // may be unused (no buffer args)
+                    #(#cb_arg_stmts)*
+                    let __claspr_cb_global: ::std::vec::Vec<usize> =
+                        ::claspr::LaunchSpec::global(&__claspr_spec).to_vec();
+                    let __claspr_cb_local: ::std::vec::Vec<usize> =
+                        ::claspr::LaunchSpec::local(&__claspr_spec)
+                            .map(|l| l.to_vec())
+                            .unwrap_or_default();
+                    // SAFETY: kernel valid + args set above; retained by the builder.
+                    if let ::core::option::Option::Some(__claspr_cb_sp) = unsafe {
+                        __claspr_cb_builder.ndrange_kernel(
+                            __claspr_cb_kernel,
+                            &__claspr_cb_global,
+                            &__claspr_cb_local,
+                            &__claspr_cb_waits,
+                        )
+                    } {
+                        #(#cb_deposits_build)*
+                    } else {
+                        // The add failed / marked the builder ineligible; still
+                        // deposit the lent buffers (empty deps) so the boundary's
+                        // ineligible-fallback can rehome + re-run cleanly.
+                        #(#cb_deposits_lend)*
+                    }
+                    return ::core::result::Result::Ok(());
+                }
+                ::claspr::eager::CbWalk::LendOnly { ext: __claspr_cb_ext } => {
+                    #collect_ext
+                    #(#cb_deposits_lend)*
+                    return ::core::result::Result::Ok(());
+                }
+            }
+        }
+    };
+
     let kernels_path = &args.kernels;
 
     // Hidden submodule per kernel: holds the Op struct + impls. The
@@ -1156,6 +1327,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // register each buffer output edge so a downstream op resolves it. A kernel
     // writes in place to its buffer args, so each output pipe carries the
     // corresponding input buffer's handle, gated on this launch's sync point.
+    // A kernel with an image arg keeps the CB-mode fork disabled (no `record`/CB
+    // codegen), so it is NOT CB-addable; a pure buffer/scalar kernel is.
+    let cb_addable_value: TokenStream2 = if has_image_param {
+        quote! { false }
+    } else {
+        quote! { true }
+    };
+
     let record_method = if has_image_param {
         quote! {}
     } else {
@@ -1271,6 +1450,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         ::claspr::ScalarInput::read(&self.spec)?;
                     #(#scalar_resolve_eager)*
                     #(#input_resolve_eager)*
+                    // CB-as-execution-mode fork (design v2): in Build/LendOnly this
+                    // adds to / lends for the command buffer and RETURNS; in Off it
+                    // is empty and we fall through to the normal enqueue below.
+                    #cb_execute_fork
                     // Validate cross-context match for every caller-added dep
                     // (`.after()` / `.after_all()`) against the running queue's
                     // context — a clear panic instead of a cryptic
@@ -1435,6 +1618,17 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     )*
                 }
 
+                fn cb_cache(&self) -> ::core::option::Option<&::claspr::eager::CbCache> {
+                    ::core::option::Option::Some(&self.__claspr_cb_cache)
+                }
+
+                fn cb_addable(&self) -> bool {
+                    // A kernel is a device command → CB-addable, UNLESS it has an
+                    // image arg (images aren't CB-recordable yet, like the record
+                    // path — the `record`/CB overrides aren't even emitted then).
+                    #cb_addable_value
+                }
+
                 #record_method
             }
         }
@@ -1472,6 +1666,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         ::claspr::ScalarInput::read(&self.spec)?;
                     #(#scalar_resolve_eager)*
                     #(#input_resolve_eager)*
+                    // CB-as-execution-mode fork (design v2): in Build/LendOnly this
+                    // adds to / lends for the command buffer and RETURNS; in Off it
+                    // is empty and we fall through to the normal enqueue below.
+                    #cb_execute_fork
                     // Validate cross-context match for every caller-added dep
                     // (`.after()` / `.after_all()`) against the running queue's
                     // context — a clear panic instead of a cryptic
@@ -1544,6 +1742,17 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     #(#input_check_ready)*
                     #grid_check_ready
                     ::core::result::Result::Ok(())
+                }
+
+                fn cb_cache(&self) -> ::core::option::Option<&::claspr::eager::CbCache> {
+                    ::core::option::Option::Some(&self.__claspr_cb_cache)
+                }
+
+                fn cb_addable(&self) -> bool {
+                    // A kernel is a device command → CB-addable, UNLESS it has an
+                    // image arg (images aren't CB-recordable yet, like the record
+                    // path — the `record`/CB overrides aren't even emitted then).
+                    #cb_addable_value
                 }
 
                 #record_method
@@ -1634,7 +1843,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     args: #op_args_tuple_init,
                     deps: ::std::vec::Vec::new(),
                     profile_cb: ::core::option::Option::None,
-                    ctx: ::core::clone::Clone::clone(&self.__claspr_ctx)
+                    ctx: ::core::clone::Clone::clone(&self.__claspr_ctx),
+                    __claspr_cb_cache: ::claspr::eager::new_cb_cache()
                     #op_out_field_init
                 }
             }
@@ -1683,7 +1893,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 /// in-order queue without taking an explicit
                 /// launcher. Cloned from `Kernels`'s context at
                 /// launcher-method emission time.
-                pub ctx: ::claspr::Context
+                pub ctx: ::claspr::Context,
+                /// Design-v2 command-buffer home: when this kernel is the boundary
+                /// of a seam-free CB-eligible subtree, its finalized CB is cached
+                /// here and replayed across syncs. See `claspr::eager::CbCache`.
+                pub __claspr_cb_cache: ::claspr::eager::CbCache
                 #op_out_field_decl
             }
 

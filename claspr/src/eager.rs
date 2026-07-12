@@ -263,7 +263,7 @@ pub fn new_cb_cache() -> CbCache {
 // external cl_events into this CB's ext accumulator", "run the boundary protocol
 // (build-or-replay a CB, home it, enqueue with external deps)" — are here.
 
-use crate::exec_ctx::CbWalk;
+pub use crate::exec_ctx::CbWalk;
 
 /// A leaf in CB-mode collects its resolved input's `cl_event` deps into the CB's
 /// EXTERNAL accumulator (the event↔sync-point boundary): a NON-EMPTY wait-list on
@@ -271,7 +271,7 @@ use crate::exec_ctx::CbWalk;
 /// gate) — those events gate `clEnqueueCommandBufferKHR`, not any CB-internal
 /// command. A producer INSIDE the CB deposited EMPTY deps (its ordering is the
 /// sync points), so this is a no-op for internal edges. Idempotent + cheap.
-pub(crate) fn cb_collect_external(ext: &Mutex<Vec<Dep>>, deps: &Deps) {
+pub fn cb_collect_external(ext: &Mutex<Vec<Dep>>, deps: &Deps) {
     if !deps.is_empty() {
         ext.lock().unwrap().extend(deps.iter().cloned());
     }
@@ -283,7 +283,7 @@ pub(crate) fn cb_collect_external(ext: &Mutex<Vec<Dep>>, deps: &Deps) {
 /// ineligible via [`CbBuilder`], and the boundary discards it — so SVM graphs
 /// transparently fall back to per-op execute without a static type gate here.)
 pub(crate) fn cb_graph_eligible<O: DeviceOp + ?Sized>(op: &O, ec: &ExecutionContext<'_>) -> bool {
-    ec.context().has_cl_khr_command_buffer() && !op.contains_host_seam()
+    ec.context().has_cl_khr_command_buffer() && op.cb_addable()
 }
 
 /// The **CB BOUNDARY protocol** (design v2): gather a maximal CB-eligible subtree
@@ -3310,6 +3310,25 @@ pub trait DeviceOp: Send {
         Err(Error::NotSupported("op is not device-recordable"))
     }
 
+    /// Whether this WHOLE (sub)graph can be added to a command buffer as-is
+    /// (design v2 eligibility): every node is a device command (`fill`, `copy`,
+    /// kernel), a structural passthrough (`forward`/`lift`/`arced`/`Pipe`), or a
+    /// combinator over CB-addable children — and NONE is a host-touching leaf
+    /// (upload/download/host-view/scalar host transfer) or a host seam.
+    ///
+    /// **Default `false`** — a node not KNOWN to be CB-addable disqualifies its
+    /// subtree (fail-safe: an un-forked op would enqueue normally inside a CB walk
+    /// and desynchronize the sync-point ordering). Device leaves + the structural
+    /// combinators override to `true` (combinators AND their children). This is
+    /// coarser than the spec's per-subtree transfer-bracketing (transfers should
+    /// bracket a CB, not disqualify the whole graph) — that finer segmentation is
+    /// a follow-up; today an upload→kernel→download graph runs the whole thing on
+    /// the per-op path (correct, just not CB-accelerated), while a fully device-
+    /// resident graph (CG all-device, gray-scott) takes the CB.
+    fn cb_addable(&self) -> bool {
+        false
+    }
+
     /// This node's OWN [`CbCache`] home, if it is a CB-capable node (design v2).
     /// Default `None` (a node that never creates/homes a command buffer — host
     /// seams, transfers, the identity `Pipe`). CB-capable nodes (`AndThen`,
@@ -3361,7 +3380,11 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         F: FnOnce(Self::Handle) -> U,
     {
         let next = f(self.handle());
-        AndThen { source: self, next }
+        AndThen {
+            source: self,
+            next,
+            cb_cache: new_cb_cache(),
+        }
     }
 
     /// Route this op's `execute` to `device`'s default out-of-order queue
@@ -3568,6 +3591,14 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             // Clean tag ident (`Tg::NAME`), not `type_name::<Tg::Key>()` — the
             // latter would leak the internal `<KeyMarker>` suffix into the message.
             return Err(Error::SlotNoSuchTag(Tg::NAME));
+        }
+        // CB-mode (design v2): a MUTATE re-bound a slot, so any homed command buffer
+        // that captured that slot's buffer/args is stale — clear every CB reachable
+        // in this graph (coarse clear-all; a documented follow-up will make it
+        // per-slot-precise). Set-once `bind` runs at build BEFORE any CB exists, so
+        // it needs no invalidation.
+        if matches!(mode, BindMode::Mutate) {
+            self.invalidate_cbs();
         }
         Ok(self)
     }
@@ -4878,6 +4909,10 @@ fn thread_orphaned_source_deps<A, B>(src_pipe: &Option<Pipe<A>>, out_pipe: &Opti
 pub struct AndThen<S, U> {
     source: S,
     next: U,
+    /// Design-v2 CB home. When this `AndThen` is the outermost CB-eligible node of
+    /// a seam-free subtree (e.g. CG's root chain), the whole subtree is ONE command
+    /// buffer homed here and replayed across syncs. See [`CbCache`].
+    cb_cache: CbCache,
 }
 
 impl<S, U> DeviceOp for AndThen<S, U>
@@ -5040,6 +5075,24 @@ where
         // path this recursion never actually hits the error.
         self.source.record(ctx)?;
         self.next.record(ctx)
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        Some(&self.cb_cache)
+    }
+
+    fn cb_addable(&self) -> bool {
+        // A chain is CB-addable iff BOTH halves are (a transfer / host seam in
+        // either disqualifies the whole subtree — coarse whole-graph gating).
+        self.source.cb_addable() && self.next.cb_addable()
+    }
+
+    fn invalidate_cbs(&self) {
+        // Clear this chain's own homed CB, then recurse (a mutated slot in either
+        // child invalidates any CB homed above it — coarse clear-all on this graph).
+        *self.cb_cache.lock().unwrap() = None;
+        self.source.invalidate_cbs();
+        self.next.invalidate_cbs();
     }
 }
 
@@ -6336,6 +6389,10 @@ where
 
     fn cb_cache(&self) -> Option<&CbCache> {
         Some(&self.cb_cache)
+    }
+
+    fn cb_addable(&self) -> bool {
+        true
     }
 
     fn describe(&self, out: &mut Vec<String>) {

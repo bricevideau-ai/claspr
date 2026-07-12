@@ -345,6 +345,104 @@ impl CbBuilder {
         Some(sp)
     }
 
+    /// Set one buffer `(pointer, len)` argument pair on `kernel` for CB-mode
+    /// build — the CB twin of [`RecordContext::set_buffer_arg`]. Advances
+    /// `arg_index` by 2.
+    ///
+    /// # Safety
+    /// As [`RecordContext::set_buffer_arg`].
+    pub unsafe fn set_buffer_arg(
+        &self,
+        kernel: cl_kernel,
+        arg_index: &mut cl_uint,
+        mem: MemRef,
+        elem_count: usize,
+    ) -> Result<()> {
+        use std::ffi::c_void;
+        match mem {
+            MemRef::Buffer(m) => unsafe {
+                cl3::kernel::set_kernel_arg(
+                    kernel,
+                    *arg_index,
+                    std::mem::size_of::<cl_mem>(),
+                    (&m as *const cl_mem) as *const c_void,
+                )
+            },
+            MemRef::Svm(p) => unsafe {
+                cl3::kernel::set_kernel_arg_svm_pointer(kernel, *arg_index, p as *const c_void)
+            },
+        }
+        .map_err(|s| Error::OpenCl(opencl3::error_codes::ClError(s)))?;
+        *arg_index += 1;
+        unsafe {
+            cl3::kernel::set_kernel_arg(
+                kernel,
+                *arg_index,
+                std::mem::size_of::<usize>(),
+                (&elem_count as *const usize) as *const c_void,
+            )
+        }
+        .map_err(|s| Error::OpenCl(opencl3::error_codes::ClError(s)))?;
+        *arg_index += 1;
+        Ok(())
+    }
+
+    /// Set one scalar-ref buffer POINTER argument on `kernel` for CB-mode build —
+    /// the CB twin of [`RecordContext::set_mem_arg`]. Advances `arg_index` by 1.
+    ///
+    /// # Safety
+    /// As [`RecordContext::set_mem_arg`].
+    pub unsafe fn set_mem_arg(
+        &self,
+        kernel: cl_kernel,
+        arg_index: &mut cl_uint,
+        mem: MemRef,
+    ) -> Result<()> {
+        use std::ffi::c_void;
+        match mem {
+            MemRef::Buffer(m) => unsafe {
+                cl3::kernel::set_kernel_arg(
+                    kernel,
+                    *arg_index,
+                    std::mem::size_of::<cl_mem>(),
+                    (&m as *const cl_mem) as *const c_void,
+                )
+            },
+            MemRef::Svm(p) => unsafe {
+                cl3::kernel::set_kernel_arg_svm_pointer(kernel, *arg_index, p as *const c_void)
+            },
+        }
+        .map_err(|s| Error::OpenCl(opencl3::error_codes::ClError(s)))?;
+        *arg_index += 1;
+        Ok(())
+    }
+
+    /// Set one by-value scalar argument on `kernel` from its raw bytes for CB-mode
+    /// build — the CB twin of [`RecordContext::set_scalar_arg`]. Advances
+    /// `arg_index` by 1.
+    ///
+    /// # Safety
+    /// As [`RecordContext::set_scalar_arg`].
+    pub unsafe fn set_scalar_arg(
+        &self,
+        kernel: cl_kernel,
+        arg_index: &mut cl_uint,
+        bytes: &[u8],
+    ) -> Result<()> {
+        use std::ffi::c_void;
+        unsafe {
+            cl3::kernel::set_kernel_arg(
+                kernel,
+                *arg_index,
+                bytes.len(),
+                bytes.as_ptr() as *const c_void,
+            )
+        }
+        .map_err(|s| Error::OpenCl(opencl3::error_codes::ClError(s)))?;
+        *arg_index += 1;
+        Ok(())
+    }
+
     /// Add an ND-range kernel launch to the CB. The kernel's args must already be
     /// set (the caller sets them at build time, exactly like the software record
     /// path). The kernel is retained for the CB's lifetime. Returns its sync point.
