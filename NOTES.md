@@ -113,9 +113,17 @@ KEY FACTS:
   images (dodge the rust-gpu vec3-coord 3D/array write bug). Full suite 357/0 on all
   three ICDs.
 
-FOLLOW-UPS (deferred): (1) bundle-branch spans: a bundle2 of two device branches
-records 2 CBs (one per branch), not 1 — CG β's axpy pair happens to co-batch via the
-spine but the general bundle case is per-branch. (2) precise per-slot→CB invalidation
+FOLLOW-UPS (deferred): (1) DONE 2026-07-12 — bundle-branch spans: a root bundle (in
+`Off`, fully addable, weight ≥ 2) now OPENS ONE CB via `cb_boundary_execute(self)`
+instead of each branch opening its own via `cb_exec_child`. The boundary re-enters
+`bundle.execute` in `Build`, where each branch takes `cb_exec_child`'s "already inside
+a CB → forward" arm and records into the SAME CB (parallel branches joined by their
+independent sync points); the multi-output `cb_restamp` stamps the one CB event onto
+every branch pipe. cliloader-proven: both scale kernels of a root `bundle2` land in
+ONE command_buffer (was 2). Terminal root-bundle already did this via
+`cb_boundary_gather` (the weight≥2 terminal gate); this closes the mid-graph /
+execute-position case. Guard: cb_execution_mode::root_bundle_records_one_command_buffer.
+(2) precise per-slot→CB invalidation
 (currently coarse clear-all). (3) DONE 2026-07-12 — SVM CB commands
 (clCommandSVMMem{cpy,Fill}KHR) now recorded (see COMPLETE COMMAND SURFACE above); was
 "marks ineligible → software". (4) DONE 2026-07-12 — `Arced`/`ArcSplit`/`FanOut`/`CopyTo2`

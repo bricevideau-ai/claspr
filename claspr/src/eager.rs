@@ -6668,9 +6668,24 @@ macro_rules! impl_eager_bundle {
                 // here), so there is no reconstruction / round-trip. The TERMINAL
                 // gather (`gather_checkouts` / `collect`) instead delegates to each
                 // branch's own gather so per-buffer homes are threaded — see below.
-                // CB mid-graph boundaries: in `Off`, a fully-addable branch opens its
-                // OWN command buffer (via `cb_exec_child`); already inside a CB it just
-                // forwards; a mixed branch recurses.
+
+                // CB boundary: when the WHOLE bundle is a fully-addable device region
+                // and we're in `Off` (nothing above opened a CB), open ONE command
+                // buffer for the bundle. `cb_boundary_execute` re-enters this `execute`
+                // in `Build`, where the guard below is false (not `Off`) so each branch
+                // runs via `cb_exec_child`'s "already inside a CB → forward" arm and
+                // records into the SAME CB — its parallel branches are joined by their
+                // independent sync points, no cross-branch dep. `cb_restamp` (this
+                // impl, below) stamps the one CB event onto every branch pipe. Without
+                // this, each branch would open its OWN CB (per-branch spans) — correct
+                // but N create/finalize/enqueue instead of one.
+                if matches!(ec.cb(), CbWalk::Off)
+                    && ec.context().has_cl_khr_command_buffer()
+                    && self.cbable_weight() >= 2
+                    && self.cb_addable()
+                {
+                    return cb_boundary_execute(self, ec, ExecMode::Pipelined);
+                }
                 $( cb_exec_child(&self.$field, ec, ExecMode::Pipelined)?; )+
                 Ok(())
             }

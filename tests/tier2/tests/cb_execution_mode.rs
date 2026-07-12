@@ -375,3 +375,42 @@ fn fill_then_copy_runs_as_command_buffer() {
         assert!(homed_cb(&g), "fill+copy should home a command buffer");
     }
 }
+
+/// A bundle that is the ROOT of an all-device region (nothing above it opened a CB)
+/// records ALL its branches into ONE command buffer, not one CB per branch. Two
+/// independent in-place scale kernels over concrete buffers, bundled — homed at the
+/// bundle, replayed. (Regression guard for the "bundle-branch per-branch spans"
+/// follow-up: before, a root bundle opened N CBs via cb_exec_child; now the bundle is
+/// itself the boundary and forwards Build to every branch.)
+#[test]
+fn root_bundle_records_one_command_buffer() {
+    use claspr::eager::bundle2;
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let ks = &ks;
+    let a = DeviceSlice::<u32>::from_slice(&ctx, &[2u32; N]).expect("a");
+    let b = DeviceSlice::<u32>::from_slice(&ctx, &[3u32; N]).expect("b");
+
+    // bundle2(scale a*5, scale b*7) is the whole graph: a->10, b->21 each run.
+    // Two kernels → weight 2 → ONE CB at the bundle.
+    let g = bundle2(ks.scale_u32([N], a, 5u32), ks.scale_u32([N], b, 7u32));
+    assert_eq!(g.cbable_weight(), 2, "two scale kernels = two commands");
+
+    for i in 0..3 {
+        let (ca, cb) = g.sync(&ctx).unwrap_or_else(|e| panic!("sync {i}: {e:?}"));
+        let ga = ca.map().wait().expect("read a");
+        let gb = cb.map().wait().expect("read b");
+        // Idempotent: from_slice reseeds each run? No — in-place scale compounds.
+        // Use iteration-aware expected: a starts 2, ×5 each sync.
+        let ea = 2u32.wrapping_mul(5u32.pow(i as u32 + 1));
+        let eb = 3u32.wrapping_mul(7u32.pow(i as u32 + 1));
+        assert!(ga.iter().all(|&v| v == ea), "a iter {i}: {:?}", &ga[..8]);
+        assert!(gb.iter().all(|&v| v == eb), "b iter {i}: {:?}", &gb[..8]);
+        drop(ga);
+        drop(gb);
+        drop((ca, cb));
+    }
+    if ctx.has_cl_khr_command_buffer() {
+        assert!(homed_cb(&g), "root bundle should home a command buffer");
+    }
+}
