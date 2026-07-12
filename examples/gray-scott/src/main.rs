@@ -929,9 +929,13 @@ mod tests {
              max|imm-gold|={imm_vs_gold:e}  (STEPS={STEPS})"
         );
         // Ordinary CPU/GPU f32 drift over {STEPS} steps of this system stays small;
-        // a dropped-dependency race produces a structurally larger error. This
-        // tolerance separates the two — tighten once the correct baseline is known.
-        const GOLDEN_TOL: f32 = 1.0e-3;
+        // a dropped-dependency race produces a structurally larger error. Measured
+        // separation on the per-op path (no cl_khr_command_buffer): rusticl/llvmpipe
+        // = 0, intel-legacy Iris = 2.68e-7 (genuine FMA/rounding drift, deterministic,
+        // swap == imm). A raced immutable CB (pocl) = 1.4e-2..4.4e-1, nondeterministic.
+        // 1e-5 sits ~37x above the largest legitimate drift and ~1400x below the
+        // smallest race — clears real rounding, still catches a subtle dropped dep.
+        const GOLDEN_TOL: f32 = 1.0e-5;
         assert!(
             swap_vs_gold < GOLDEN_TOL,
             "swap strategy diverges from CPU golden: max|Δ|={swap_vs_gold:e} (tol {GOLDEN_TOL:e})"
