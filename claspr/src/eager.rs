@@ -446,7 +446,10 @@ fn cb_exec_child<O: DeviceOp>(child: &O, ec: &ExecutionContext<'_>, mode: ExecMo
         // (it opens its own fresh boundary if eligible). Never add to a sealed CB.
         return cb_exec_child(child, &ec.with_cb(CbWalk::Off), mode);
     }
-    if matches!(ec.cb(), CbWalk::Off) && child.cb_cache().is_some() && cb_graph_eligible(child, ec)
+    if matches!(ec.cb(), CbWalk::Off)
+        && child.cb_cache().is_some()
+        && cb_graph_eligible(child, ec)
+        && child.cb_records_command()
     {
         cb_boundary_execute(child, ec, mode)
     } else {
@@ -475,7 +478,10 @@ where
         // `Off` (opens its own fresh boundary if eligible).
         return cb_gather_child(child, &ec.with_cb(CbWalk::Off), mode);
     }
-    if matches!(ec.cb(), CbWalk::Off) && child.cb_cache().is_some() && cb_graph_eligible(child, ec)
+    if matches!(ec.cb(), CbWalk::Off)
+        && child.cb_cache().is_some()
+        && cb_graph_eligible(child, ec)
+        && child.cb_records_command()
     {
         cb_boundary_gather(child, ec, mode)
     } else {
@@ -592,6 +598,11 @@ fn cb_should_open_span<O: DeviceOp>(op: &O, ec: &ExecutionContext<'_>) -> bool {
         && ec.context().has_cl_khr_command_buffer()
         && op.cb_spine_head_addable()
         && !op.cb_addable()
+        // Skip a span whose addable prefix records NO command (pure passthroughs) —
+        // it would open an empty CB the empty-CB guard just discards (create+release
+        // churn). `cb_records_command` covers the WHOLE subtree, which is a safe
+        // superset here: if the whole graph records nothing there is nothing to batch.
+        && op.cb_records_command()
 }
 
 /// The **span-close decision** for an [`AndThen`] running INSIDE a command buffer.
@@ -3707,6 +3718,21 @@ pub trait DeviceOp: Send {
         false
     }
 
+    /// Whether this (sub)graph records AT LEAST ONE command buffer command (a kernel
+    /// / fill / copy) — as opposed to being a pure structural passthrough (a bare
+    /// `Pipe`, `forward`, `lift`, `arced`, or a bundle of those). Used to AVOID
+    /// opening a command buffer for a passthrough-only span: such a CB would record
+    /// zero commands and be discarded by the empty-CB guard, so the
+    /// `clCreateCommandBuffer`/`clReleaseCommandBuffer` pair is pure churn. The
+    /// boundary-open predicates require this to be `true`.
+    ///
+    /// **Default `false`** — a node that records nothing (structural passthroughs, the
+    /// host-touching leaves) stays out. Command leaves (`fill`, `copy`, the macro
+    /// kernel `Op`) override to `true`; combinators OR over their children.
+    fn cb_records_command(&self) -> bool {
+        false
+    }
+
     /// This node's OWN [`CbCache`] home, if it is a CB-capable node (design v2).
     /// Default `None` (a node that never creates/homes a command buffer — host
     /// seams, transfers, the identity `Pipe`). CB-capable nodes (`AndThen`,
@@ -5551,6 +5577,11 @@ where
         self.source.cb_addable() && self.next.cb_addable()
     }
 
+    fn cb_records_command(&self) -> bool {
+        // The chain records a command iff either half does.
+        self.source.cb_records_command() || self.next.cb_records_command()
+    }
+
     fn cb_spine_head_addable(&self) -> bool {
         // The chain CONTINUES / HEADS a maximal seam-free span as long as its
         // LEADING source can (recursively) — EVEN IF the whole chain is `!cb_addable`
@@ -6472,6 +6503,13 @@ macro_rules! impl_eager_bundle {
                 true $(&& self.$field.cb_addable())+
             }
 
+            fn cb_records_command(&self) -> bool {
+                // OR every branch: a `bundle` of pure passthroughs (CG's
+                // `bundle6(p, ap, …)` / `bundle2(x, rsnew)`) records NOTHING and must
+                // not open an empty CB; a bundle with any command-recording branch does.
+                false $(|| self.$field.cb_records_command())+
+            }
+
             fn cb_restamp(&self, evs: &[Dep]) {
                 // Stamp the CB completion event onto every branch's output pipe(s) —
                 // delegate to each branch's own `cb_restamp` (a multi-output branch
@@ -6944,6 +6982,11 @@ where
     }
 
     fn cb_addable(&self) -> bool {
+        true
+    }
+
+    fn cb_records_command(&self) -> bool {
+        // A fill records a `clCommandFillBufferKHR` into the CB.
         true
     }
 

@@ -1670,6 +1670,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     #cb_addable_value
                 }
 
+                fn cb_records_command(&self) -> bool {
+                    // A kernel records a `clCommandNDRangeKernelKHR` iff it is
+                    // CB-addable (no image arg) — same predicate as `cb_addable`.
+                    #cb_addable_value
+                }
+
                 #cb_restamp_method
 
                 #record_method
@@ -1795,6 +1801,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     // A kernel is a device command → CB-addable, UNLESS it has an
                     // image arg (images aren't CB-recordable yet, like the record
                     // path — the `record`/CB overrides aren't even emitted then).
+                    #cb_addable_value
+                }
+
+                fn cb_records_command(&self) -> bool {
+                    // A kernel records a `clCommandNDRangeKernelKHR` iff it is
+                    // CB-addable (no image arg) — same predicate as `cb_addable`.
                     #cb_addable_value
                 }
 
