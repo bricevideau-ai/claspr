@@ -76,7 +76,17 @@ records 2 CBs (one per branch), not 1 — CG β's axpy pair happens to co-batch 
 spine but the general bundle case is per-branch. (2) precise per-slot→CB invalidation
 (currently coarse clear-all). (3) SVM CB commands (clCommandSVMMem{cpy,Fill}KHR) —
 currently SVM marks the build ineligible → software. (4) `Arced`/`FanOut`/`CopyTo2`
-cb_addable (currently false → per-op).
+cb_addable (currently false → per-op). (5) `.after()`/`.after_all()` deps on a
+CB-eligible kernel: currently disqualify the kernel from the CB (cb_addable=false when
+self.deps is non-empty) so it runs per-op (correct — deps validated + threaded — just not
+CB-accelerated). Proper fix: thread self.deps' events into the CB external wait-list
+(cb_collect_external) at clEnqueueCommandBufferKHR, which needs the deps stored as
+Arc<Event> (Dep) not Event (Event isn't Clone; ext holds Arc<Event> to keep events alive
+to enqueue). Regression guard for the exclusion: tests/tier1/tests/cross_queue.rs. NOTE:
+profiling deps are DIFFERENT — a profiled kernel can NEVER be a CB command (needs a per-op
+marker to time + the CL_QUEUE_PROFILING_ENABLE check); that exclusion is intrinsic, not a
+follow-up. Both regressed at ec8e6e8 (kernel→DeviceOp unification made kernels CB-eligible
+without these guards); fixed 2026-07-12.
 
 *** FIXED 2026-07-12 (commit pending): the race below is RESOLVED. `Input::pipe_cell_id()`
 now returns the upstream pipe's cell_id for a `FedByPipe` SLOT (was `None`), so the CB

@@ -1426,6 +1426,36 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         quote! { true }
     };
 
+    // `cb_addable()` additionally opts a kernel OUT of the command-buffer path when
+    // it carries runtime state the CB command form cannot honor:
+    //
+    //  - a profiling callback (`.profiled(cb)`) needs a real per-op enqueue with a
+    //    completion marker (that is what it times) AND the up-front
+    //    `CL_QUEUE_PROFILING_ENABLE` check; a recorded `clCommandNDRangeKernelKHR`
+    //    has neither and would silently swallow both. This is intrinsic: a CB
+    //    command has no per-op timestamp, so a profiled op can NEVER be a CB command.
+    //
+    //  - caller-supplied `.after()`/`.after_all()` event deps (`self.deps`): these
+    //    are external `cl_event`s that SHOULD ride the CB's external wait-list at
+    //    `clEnqueueCommandBufferKHR` (conceptually just like input-pipe deps via
+    //    `cb_collect_external`). The CB build fork does not thread them yet — `ext`
+    //    holds `Arc<Event>` (to keep events alive to enqueue) but `self.deps` is
+    //    `Vec<Event>` (owned, not `Clone`), so wiring them in needs a data-model
+    //    change (store deps as `Arc<Event>`) deferred as a follow-up. Until then a
+    //    kernel with `.after()` deps stays on the per-op path — CORRECT (deps are
+    //    validated via `assert_same_context` + threaded), just not CB-accelerated.
+    //    A silent drop would be a real correctness bug, so the exclusion is the safe
+    //    floor. FOLLOW-UP: thread self.deps into the CB external wait-list.
+    //
+    // `cb_records_command` keeps the image-only predicate (it is only consulted for
+    // an op already inside a CB, which such an op never is). Regression guards:
+    // tests/tier1/tests/{profile,cross_queue}.rs.
+    let cb_addable_expr: TokenStream2 = quote! {
+        #cb_addable_value
+            && ::core::option::Option::is_none(&self.profile_cb)
+            && ::std::vec::Vec::is_empty(&self.deps)
+    };
+
     // CB-mode `cb_restamp` override: stamp the command buffer's single completion
     // event onto EACH output pipe as its readiness dep, so a downstream consumer in
     // a DIFFERENT (or no) command buffer waits on the whole CB (the event↔sync-point
@@ -1759,8 +1789,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 fn cb_addable(&self) -> bool {
                     // A kernel is a device command → CB-addable, UNLESS it has an
                     // image arg (images aren't CB-recordable yet, like the record
-                    // path — the `record`/CB overrides aren't even emitted then).
-                    #cb_addable_value
+                    // path — the `record`/CB overrides aren't even emitted then) OR
+                    // it carries a profiling callback (profiling needs the per-op
+                    // marker path, not a CB command — see `cb_addable_expr`).
+                    #cb_addable_expr
                 }
 
                 fn cb_records_command(&self) -> bool {
@@ -1895,8 +1927,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 fn cb_addable(&self) -> bool {
                     // A kernel is a device command → CB-addable, UNLESS it has an
                     // image arg (images aren't CB-recordable yet, like the record
-                    // path — the `record`/CB overrides aren't even emitted then).
-                    #cb_addable_value
+                    // path — the `record`/CB overrides aren't even emitted then) OR
+                    // it carries a profiling callback (profiling needs the per-op
+                    // marker path, not a CB command — see `cb_addable_expr`).
+                    #cb_addable_expr
                 }
 
                 fn cb_records_command(&self) -> bool {
