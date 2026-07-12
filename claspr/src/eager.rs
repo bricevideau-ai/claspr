@@ -449,7 +449,10 @@ fn cb_exec_child<O: DeviceOp>(child: &O, ec: &ExecutionContext<'_>, mode: ExecMo
     if matches!(ec.cb(), CbWalk::Off)
         && child.cb_cache().is_some()
         && cb_graph_eligible(child, ec)
-        && child.cb_records_command()
+        // >= 2: a single-command span runs per-op — a CB holding one command is pure
+        // create/finalize/enqueue overhead with no batching benefit. Exact here (the
+        // boundaried span IS the whole child subtree).
+        && child.cbable_weight() >= 2
     {
         cb_boundary_execute(child, ec, mode)
     } else {
@@ -481,7 +484,8 @@ where
     if matches!(ec.cb(), CbWalk::Off)
         && child.cb_cache().is_some()
         && cb_graph_eligible(child, ec)
-        && child.cb_records_command()
+        // >= 2: single-command span runs per-op (see cb_exec_child). Exact here.
+        && child.cbable_weight() >= 2
     {
         cb_boundary_gather(child, ec, mode)
     } else {
@@ -598,11 +602,17 @@ fn cb_should_open_span<O: DeviceOp>(op: &O, ec: &ExecutionContext<'_>) -> bool {
         && ec.context().has_cl_khr_command_buffer()
         && op.cb_spine_head_addable()
         && !op.cb_addable()
-        // Skip a span whose addable prefix records NO command (pure passthroughs) —
-        // it would open an empty CB the empty-CB guard just discards (create+release
-        // churn). `cb_records_command` covers the WHOLE subtree, which is a safe
-        // superset here: if the whole graph records nothing there is nothing to batch.
-        && op.cb_records_command()
+        // >= 2: don't open a span CB that would record a single command (per-op is
+        // cheaper). NOTE: unlike the other boundary sites, here the recorded span is
+        // the maximal seam-free PREFIX of `op`, not its whole subtree — so
+        // `cbable_weight()` (the whole-subtree count) is an OVER-approximation: a
+        // subtree with a 1-command prefix + a post-seam command reports 2 but would
+        // record a 1-command CB. That is the same coarseness the old
+        // `cb_records_command` (>= 1) had here; the runtime empty-CB guard still
+        // discards a 0-command CB, and a rare 1-command interior span is a minor
+        // missed optimization, not a correctness issue. Precise prefix-weight is a
+        // follow-up if it ever matters.
+        && op.cbable_weight() >= 2
 }
 
 /// The **span-close decision** for an [`AndThen`] running INSIDE a command buffer.
@@ -3826,19 +3836,29 @@ pub trait DeviceOp: Send {
         false
     }
 
-    /// Whether this (sub)graph records AT LEAST ONE command buffer command (a kernel
-    /// / fill / copy) — as opposed to being a pure structural passthrough (a bare
-    /// `Pipe`, `forward`, `lift`, `arced`, or a bundle of those). Used to AVOID
-    /// opening a command buffer for a passthrough-only span: such a CB would record
-    /// zero commands and be discarded by the empty-CB guard, so the
-    /// `clCreateCommandBuffer`/`clReleaseCommandBuffer` pair is pure churn. The
-    /// boundary-open predicates require this to be `true`.
+    /// How many command-buffer commands (`clCommand{NDRangeKernel,FillBuffer,
+    /// CopyBuffer}KHR`) this (sub)graph would record if run as ONE command buffer —
+    /// a STATIC weight computed once at construction. Command leaves (`fill`, `copy`,
+    /// the macro kernel `Op`) are `1`; structural passthroughs (`Pipe`, `forward`,
+    /// `lift`, `arced`) and host/transfer leaves are `0`; combinators SUM their
+    /// children. `Arced` forwards its source's weight.
     ///
-    /// **Default `false`** — a node that records nothing (structural passthroughs, the
-    /// host-touching leaves) stays out. Command leaves (`fill`, `copy`, the macro
-    /// kernel `Op`) override to `true`; combinators OR over their children.
-    fn cb_records_command(&self) -> bool {
-        false
+    /// **Static under `mutate`:** topology (node set + `and_then_host` seam
+    /// placement) is fixed at build, and per-node record-ability is a compile-time
+    /// predicate over node TYPE + the image-arg gate + construction-time
+    /// `.profiled()`/`.after()` state — never slot state. A `mutate_bind` changes a
+    /// slot's value or source (`Bound` ↔ `FedByPipe`), i.e. a dependency EDGE, but a
+    /// kernel records exactly one command whether its input is value- or pipe-fed. So
+    /// every subtree's weight is invariant under rebind → CB-capable nodes store it in
+    /// a field, set once by the constructor from the (already-built) children.
+    ///
+    /// The boundary-open predicates require `>= 2`: a span of a single command must
+    /// NOT open a command buffer — one `clCreateCommandBufferKHR` +
+    /// `clFinalizeCommandBufferKHR` + a per-replay `clEnqueueCommandBufferKHR` is pure
+    /// overhead versus enqueuing that one command directly, with zero batching
+    /// benefit. **Default `0`.**
+    fn cbable_weight(&self) -> usize {
+        0
     }
 
     /// This node's OWN [`CbCache`] home, if it is a CB-capable node (design v2).
@@ -3939,10 +3959,12 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         F: FnOnce(Self::Handle) -> U,
     {
         let next = f(self.handle());
+        let cbable_weight = self.cbable_weight() + next.cbable_weight();
         AndThen {
             source: self,
             next,
             cb_cache: new_cb_cache(),
+            cbable_weight,
         }
     }
 
@@ -4365,7 +4387,13 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             // plain gather (the deps are the CB's single completion event). A graph
             // whose root carries no cb_cache, or an SVM/ineligible one, transparently
             // falls back inside `cb_boundary_gather` to the normal per-op path.
-            let result = if cb_graph_eligible(self, &ec) && self.cb_cache().is_some() {
+            // >= 2: a whole-graph span of a single command (e.g. a bare
+            // `fill(buf, v).sync()`) runs per-op — a one-command CB is pure overhead.
+            // Exact here (the span IS the whole graph).
+            let result = if cb_graph_eligible(self, &ec)
+                && self.cb_cache().is_some()
+                && self.cbable_weight() >= 2
+            {
                 cb_boundary_gather(self, &ec, ExecMode::Blocking)
             } else {
                 self.gather_checkouts(&ec, ExecMode::Blocking)
@@ -5472,6 +5500,9 @@ pub struct AndThen<S, U> {
     /// a seam-free subtree (e.g. CG's root chain), the whole subtree is ONE command
     /// buffer homed here and replayed across syncs. See [`CbCache`].
     cb_cache: CbCache,
+    /// Precomputed `source.cbable_weight() + next.cbable_weight()` (static under
+    /// mutate — see [`DeviceOp::cbable_weight`]). Set once by [`and_then`].
+    cbable_weight: usize,
 }
 
 impl<S, U> DeviceOp for AndThen<S, U>
@@ -5712,9 +5743,10 @@ where
         self.source.cb_addable() && self.next.cb_addable()
     }
 
-    fn cb_records_command(&self) -> bool {
-        // The chain records a command iff either half does.
-        self.source.cb_records_command() || self.next.cb_records_command()
+    fn cbable_weight(&self) -> usize {
+        // Precomputed at construction = source.weight + next.weight. Static under
+        // mutate (see the trait doc), so a stored field keeps this O(1).
+        self.cbable_weight
     }
 
     fn cb_spine_head_addable(&self) -> bool {
@@ -6441,13 +6473,17 @@ macro_rules! impl_eager_bundle {
             /// of a seam-free subtree, the whole subtree is ONE command buffer homed
             /// here. See [`CbCache`].
             cb_cache: CbCache,
+            /// Precomputed sum of the branches' [`cbable_weight`](DeviceOp::cbable_weight)
+            /// (static under mutate). Set once by the constructor.
+            cbable_weight: usize,
         }
 
         #[doc = concat!("Construct an eager [`", stringify!($name),
             "`]. \u{2248} cuda-oxide's `zip!` at this fixed arity.")]
         #[allow(clippy::too_many_arguments)]
         pub fn $ctor<$($ty: DeviceOp),+>($($field: $ty),+) -> $name<$($ty),+> {
-            $name { $($field,)+ cb_cache: new_cb_cache() }
+            let cbable_weight = 0 $(+ $field.cbable_weight())+;
+            $name { $($field,)+ cb_cache: new_cb_cache(), cbable_weight }
         }
 
         impl<$($ty: DeviceOp),+> DeviceOp for $name<$($ty),+>
@@ -6638,11 +6674,11 @@ macro_rules! impl_eager_bundle {
                 true $(&& self.$field.cb_addable())+
             }
 
-            fn cb_records_command(&self) -> bool {
-                // OR every branch: a `bundle` of pure passthroughs (CG's
-                // `bundle6(p, ap, …)` / `bundle2(x, rsnew)`) records NOTHING and must
-                // not open an empty CB; a bundle with any command-recording branch does.
-                false $(|| self.$field.cb_records_command())+
+            fn cbable_weight(&self) -> usize {
+                // Precomputed sum of the branches' weights (static under mutate). A
+                // `bundle` of pure passthroughs (CG's `bundle6(p, ap, …)` /
+                // `bundle2(x, rsnew)`) is 0 → never opens a CB.
+                self.cbable_weight
             }
 
             fn cb_restamp(&self, evs: &[Dep]) {
@@ -7120,9 +7156,9 @@ where
         true
     }
 
-    fn cb_records_command(&self) -> bool {
-        // A fill records a `clCommandFillBufferKHR` into the CB.
-        true
+    fn cbable_weight(&self) -> usize {
+        // A fill records exactly one `clCommandFillBufferKHR`.
+        1
     }
 
     fn describe(&self, out: &mut Vec<String>) {

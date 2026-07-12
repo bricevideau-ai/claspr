@@ -50,15 +50,20 @@ fn homed_cb_id<O: DeviceOp>(g: &O) -> usize {
         .unwrap_or(0)
 }
 
-/// A single-`fill` graph is an all-device CB region: first `sync` builds + homes a
-/// CB (on a CB-capable platform), the second replays it. The fill lands both runs.
+/// A single-`fill` graph (cbable_weight == 1) runs PER-OP, NOT as a command buffer —
+/// even on a CB-capable device. A CB holding one command is pure overhead
+/// (create + finalize + a per-replay enqueue) versus enqueuing the one fill directly,
+/// with zero batching benefit. So no CB is homed; the fill still lands correctly and
+/// replays across syncs on the normal per-op path. (Multi-command spans DO take a CB
+/// — see `fill_then_kernel_chain` / `bundle_of_kernels` / the threshold test below.)
 #[test]
-fn fill_runs_as_command_buffer_and_replays() {
+fn single_command_graph_runs_per_op_not_as_command_buffer() {
     let Some(ctx) = ctx() else { return };
     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
     let g = fill(buf, 7u32);
+    assert_eq!(g.cbable_weight(), 1, "a bare fill records one command");
 
-    // First sync: build + home the CB (or software fallback if no extension).
+    // First sync + read.
     let co = g.sync(&ctx).expect("sync 1");
     let g1 = co.map().wait().expect("read 1");
     assert!(g1.iter().all(|&v| v == 7), "fill 1: {:?}", &g1[..8]);
@@ -66,34 +71,50 @@ fn fill_runs_as_command_buffer_and_replays() {
     let built = homed_cb(&g);
     drop(co);
 
-    // Second sync: replay the homed CB (or re-run software).
+    // Second sync: per-op replay (no cached CB), still correct.
     let co = g.sync(&ctx).expect("sync 2");
     let g2 = co.map().wait().expect("read 2");
     assert!(g2.iter().all(|&v| v == 7), "fill 2: {:?}", &g2[..8]);
     drop(g2);
     drop(co);
 
-    // A device advertising the extension MUST have homed a real CB (not silently
-    // fallen back to per-op execute); one lacking it MUST NOT have.
-    if ctx.has_cl_khr_command_buffer() {
-        assert!(
-            built,
-            "device advertises cl_khr_command_buffer but no CB was homed"
-        );
-    } else {
-        assert!(
-            !built,
-            "device lacks cl_khr_command_buffer but a CB was homed"
-        );
-    }
-    eprintln!(
-        "cb-mode fill backend: {}",
-        if built {
-            "command buffer"
-        } else {
-            "software (no CB)"
-        }
+    // The gate is weight-based, not extension-based: a single-command graph homes NO
+    // CB on ANY device (CB-capable or not) — the whole point of this feature.
+    assert!(
+        !built,
+        "single-command graph must NOT home a command buffer (weight 1 < 2); \
+         has_cl_khr_command_buffer={}",
+        ctx.has_cl_khr_command_buffer()
     );
+}
+
+/// The exact `cbable_weight` threshold: a 1-command graph runs per-op (no CB), a
+/// 2-command graph homes a CB (on a CB-capable device). Both are correct; the CB is
+/// only worth its create/finalize overhead once it batches ≥ 2 commands.
+#[test]
+fn cb_opens_at_two_commands_not_one() {
+    let Some(ctx) = ctx() else { return };
+    if !ctx.has_cl_khr_command_buffer() {
+        eprintln!("SKIP: device lacks cl_khr_command_buffer");
+        return;
+    }
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // weight 1: one fill → per-op, no CB.
+    let one = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("one");
+    let g1 = fill(one, 3u32);
+    assert_eq!(g1.cbable_weight(), 1);
+    let co = g1.sync(&ctx).expect("sync g1");
+    drop(co.map().wait().expect("read g1"));
+    assert!(!homed_cb(&g1), "weight-1 graph must not home a CB");
+
+    // weight 2: fill → kernel → CB homed.
+    let two = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("two");
+    let g2 = fill(two, 3u32).and_then(|b| ks.scale_u32([N], b, 4u32));
+    assert_eq!(g2.cbable_weight(), 2);
+    let co = g2.sync(&ctx).expect("sync g2");
+    drop(co.map().wait().expect("read g2"));
+    assert!(homed_cb(&g2), "weight-2 graph must home a CB");
 }
 
 /// A fill→kernel chain (in-place scale) is ONE all-device CB region homed at the
@@ -107,6 +128,7 @@ fn fill_then_kernel_chain_runs_as_command_buffer() {
 
     // fill(buf, 2) -> scale_u32(_, 5): 2 -> 10 per run (fill resets each run).
     let g = fill(buf, 2u32).and_then(|b| ks.scale_u32([N], b, 5u32));
+    assert_eq!(g.cbable_weight(), 2, "fill + kernel = two commands");
 
     for i in 0..3 {
         let co = g.sync(&ctx).unwrap_or_else(|e| panic!("sync {i}: {e:?}"));

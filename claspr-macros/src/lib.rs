@@ -1426,6 +1426,16 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         quote! { true }
     };
 
+    // `cbable_weight`: a kernel records exactly ONE `clCommandNDRangeKernelKHR` — but
+    // an image kernel is not CB-recordable (images aren't recordable yet), so it
+    // records 0, matching the image gate on `cb_addable`. A
+    // kernel is a leaf (no CB-capable children), so this is a constant, not a sum.
+    let cbable_weight_value: TokenStream2 = if has_image_param {
+        quote! { 0 }
+    } else {
+        quote! { 1 }
+    };
+
     // `cb_addable()` additionally opts a kernel OUT of the command-buffer path when
     // it carries runtime state the CB command form cannot honor:
     //
@@ -1447,9 +1457,9 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     //    A silent drop would be a real correctness bug, so the exclusion is the safe
     //    floor. FOLLOW-UP: thread self.deps into the CB external wait-list.
     //
-    // `cb_records_command` keeps the image-only predicate (it is only consulted for
-    // an op already inside a CB, which such an op never is). Regression guards:
-    // tests/tier1/tests/{profile,cross_queue}.rs.
+    // `cbable_weight` keeps the image-only count (it is only consulted for an op
+    // already inside a CB / a boundary decision, which such an op never reaches).
+    // Regression guards: tests/tier1/tests/{profile,cross_queue}.rs.
     let cb_addable_expr: TokenStream2 = quote! {
         #cb_addable_value
             && ::core::option::Option::is_none(&self.profile_cb)
@@ -1795,10 +1805,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     #cb_addable_expr
                 }
 
-                fn cb_records_command(&self) -> bool {
-                    // A kernel records a `clCommandNDRangeKernelKHR` iff it is
-                    // CB-addable (no image arg) — same predicate as `cb_addable`.
-                    #cb_addable_value
+                fn cbable_weight(&self) -> usize {
+                    // A kernel records exactly one `clCommandNDRangeKernelKHR` (0 for
+                    // an image kernel — not CB-recordable yet). A leaf: no children to
+                    // sum. The boundary-open predicates require >= 2 (a one-command
+                    // span runs per-op).
+                    #cbable_weight_value
                 }
 
                 #cb_restamp_method
@@ -1933,10 +1945,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     #cb_addable_expr
                 }
 
-                fn cb_records_command(&self) -> bool {
-                    // A kernel records a `clCommandNDRangeKernelKHR` iff it is
-                    // CB-addable (no image arg) — same predicate as `cb_addable`.
-                    #cb_addable_value
+                fn cbable_weight(&self) -> usize {
+                    // A kernel records exactly one `clCommandNDRangeKernelKHR` (0 for
+                    // an image kernel — not CB-recordable yet). A leaf: no children to
+                    // sum. The boundary-open predicates require >= 2 (a one-command
+                    // span runs per-op).
+                    #cbable_weight_value
                 }
 
                 #cb_restamp_method
