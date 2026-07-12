@@ -1346,14 +1346,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         quote! {}
     } else if multi_output {
         quote! {
-            fn cb_restamp(&self, __claspr_ev: &::claspr::Dep) {
+            fn cb_restamp(&self, __claspr_evs: &[::claspr::Dep]) {
                 #(
                     if let ::core::option::Option::Some((__v, _d, __h)) =
                         self.#op_pipe_fields.take_home()
                     {
                         self.#op_pipe_fields.put_home(
                             __v,
-                            ::std::vec![::core::clone::Clone::clone(__claspr_ev)],
+                            ::std::vec::Vec::from(__claspr_evs),
                             __h,
                         );
                     }
@@ -1362,13 +1362,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         }
     } else {
         quote! {
-            fn cb_restamp(&self, __claspr_ev: &::claspr::Dep) {
+            fn cb_restamp(&self, __claspr_evs: &[::claspr::Dep]) {
                 if let ::core::option::Option::Some((__v, _d, __h)) =
                     self.__claspr_out.take_home()
                 {
                     self.__claspr_out.put_home(
                         __v,
-                        ::std::vec![::core::clone::Clone::clone(__claspr_ev)],
+                        ::std::vec::Vec::from(__claspr_evs),
                         __h,
                     );
                 }

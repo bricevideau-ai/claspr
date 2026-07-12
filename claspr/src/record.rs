@@ -217,6 +217,13 @@ pub struct CbBuilder {
     /// non-eligible builder is discarded and the caller falls back to per-op
     /// execute.
     eligible: Mutex<bool>,
+    /// Count of `clCommand*KHR` commands successfully recorded. Used by the boundary
+    /// to DISCARD an EMPTY command buffer — a span of pure structural passthroughs
+    /// (a bare `Pipe` aliasing an upstream, a `lift` of a device-resident cell) adds
+    /// zero commands, and finalizing + enqueuing such a CB is pure event-sync
+    /// overhead (an empty CB masquerading as work). `recorded() == 0` → the boundary
+    /// skips the CB and just forwards the events the pipes already carry.
+    recorded: Mutex<usize>,
 }
 
 // SAFETY: the CB / queue / kernel handles are opaque handles into the
@@ -245,6 +252,7 @@ impl CbBuilder {
             ext,
             kernels: Mutex::new(Vec::new()),
             eligible: Mutex::new(true),
+            recorded: Mutex::new(0),
         })
     }
 
@@ -252,6 +260,17 @@ impl CbBuilder {
     /// node discards it and falls back to per-op execute.
     fn mark_ineligible(&self) {
         *self.eligible.lock().unwrap() = false;
+    }
+
+    /// Bump the recorded-command counter (called on each successful `clCommand*KHR`).
+    fn count(&self) {
+        *self.recorded.lock().unwrap() += 1;
+    }
+
+    /// How many `clCommand*KHR` commands have been recorded. Zero → the boundary
+    /// discards the CB (empty-CB guard).
+    pub fn recorded(&self) -> usize {
+        *self.recorded.lock().unwrap()
     }
 
     /// Add a buffer fill to the CB. `mem` must be a `cl_mem` (SVM marks the build
@@ -296,6 +315,7 @@ impl CbBuilder {
             self.mark_ineligible();
             return None;
         }
+        self.count();
         Some(sp)
     }
 
@@ -342,6 +362,7 @@ impl CbBuilder {
             self.mark_ineligible();
             return None;
         }
+        self.count();
         Some(sp)
     }
 
@@ -492,6 +513,7 @@ impl CbBuilder {
             self.mark_ineligible();
             return None;
         }
+        self.count();
         Some(sp)
     }
 

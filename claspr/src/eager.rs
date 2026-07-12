@@ -360,7 +360,7 @@ where
         builder: &builder,
         ext: &ext,
     });
-    let (checkouts, _internal) = op.gather_checkouts(&build_ec, mode)?;
+    let (checkouts, internal) = op.gather_checkouts(&build_ec, mode)?;
 
     if !builder.is_eligible() {
         // An SVM (or otherwise un-addable) command: the build pass enqueued NOTHING
@@ -369,6 +369,19 @@ where
         drop(checkouts);
         op.reclaim_undelivered();
         return op.gather_checkouts(ec, mode);
+    }
+
+    if builder.recorded() == 0 {
+        // EMPTY-CB guard: a span of pure structural passthroughs (a bare `Pipe`
+        // aliasing an upstream, `lift`ed device cells) added zero commands.
+        // Finalizing + enqueuing such a CB is pure event-sync overhead. Discard it
+        // (its `Drop` releases the handle) and hand the Checkouts back gated on the
+        // deps the Build-pass gather already produced — a bare `Pipe` branch carries
+        // its UPSTREAM producer's completion event (the earlier span's CB event,
+        // stamped onto the pipe by `cb_restamp`) in `internal`, NOT in `ext` (which
+        // only entry-leaf resolves populate). Returning `internal` keeps the seam /
+        // downstream waiting on the real upstream work.
+        return Ok((checkouts, internal));
     }
 
     let Some(finalized) = builder.finalize() else {
@@ -480,7 +493,7 @@ where
             .map(|d| d.as_ref().get())
             .collect();
         let event = cb.enqueue(&waits)?;
-        op.cb_restamp(&wrap_event(event));
+        op.cb_restamp(&[wrap_event(event)]);
         return Ok(());
     }
 
@@ -501,6 +514,22 @@ where
         op.reclaim_undelivered();
         return op.execute(ec, mode);
     }
+
+    if builder.recorded() == 0 {
+        // EMPTY-CB guard (mid-graph): a pure-passthrough span recorded no commands.
+        // Discard the CB with NO finalize / enqueue. Leave the output pipes exactly
+        // as the Build pass left them — a bare `Pipe` passthrough already carries its
+        // upstream producer's completion event in its payload; only the ext deps (an
+        // entry leaf that crossed into this would-be CB) need stamping on top, so a
+        // downstream consumer waits on the real upstream work. `ext` is usually empty
+        // for a pure-passthrough span (nothing resolved a cross-boundary input).
+        let evs: Deps = std::mem::take(&mut ext.lock().unwrap());
+        if !evs.is_empty() {
+            op.cb_restamp(&evs);
+        }
+        return Ok(());
+    }
+
     let Some(finalized) = builder.finalize() else {
         op.reclaim_undelivered();
         return op.execute(ec, mode);
@@ -514,7 +543,7 @@ where
         .map(|d| d.as_ref().get())
         .collect();
     let event = finalized.enqueue(&waits)?;
-    op.cb_restamp(&wrap_event(event));
+    op.cb_restamp(&[wrap_event(event)]);
     Ok(())
 }
 
@@ -3513,16 +3542,21 @@ pub trait DeviceOp: Send {
     /// completion event, a DOWNSTREAM consumer resolving those pipes needs that
     /// event as its wait-list (the event↔sync-point boundary: OUTSIDE the CB,
     /// ordering is `cl_event`s again). This re-deposits each output value with
-    /// `deps = [ev]`, so the seam / next span waits on the whole CB.
+    /// `deps = evs`, so the seam / next span waits on the whole CB.
+    ///
+    /// `evs` is normally the CB's single completion event; on the EMPTY-CB path
+    /// (a pure-passthrough span that recorded nothing) it is the upstream producers'
+    /// events collected into the span's `ext`, so the downstream still waits on the
+    /// real work that fed the passthroughs.
     ///
     /// Default: the single [`output_pipe`](Self::output_pipe). Multi-output ops
     /// (kernels, bundles, `CopyTo2`, `FanOut`) override to stamp each element pipe —
     /// mirroring [`reclaim_undelivered`](Self::reclaim_undelivered)'s traversal.
-    fn cb_restamp(&self, ev: &Dep) {
+    fn cb_restamp(&self, evs: &[Dep]) {
         if let Some(pipe) = self.output_pipe()
             && let Some((v, _deps, home)) = pipe.take_home()
         {
-            pipe.put_home(v, vec![ev.clone()], home);
+            pipe.put_home(v, evs.to_vec(), home);
         }
     }
 }
@@ -5257,12 +5291,12 @@ where
         self.source.cb_addable() && self.next.cb_addable()
     }
 
-    fn cb_restamp(&self, ev: &Dep) {
+    fn cb_restamp(&self, evs: &[Dep]) {
         // A chain's OUTPUT is its tail's output (its own `output_pipe` delegates to
         // `next`, and for a multi-output tail that is `None` so the default no-ops).
         // Delegate to the tail so a boundaried chain stamps the CB completion event
         // onto the pipes a downstream consumer actually reads.
-        self.next.cb_restamp(ev);
+        self.next.cb_restamp(evs);
     }
 
     fn invalidate_cbs(&self) {
@@ -6168,12 +6202,12 @@ macro_rules! impl_eager_bundle {
                 true $(&& self.$field.cb_addable())+
             }
 
-            fn cb_restamp(&self, ev: &Dep) {
+            fn cb_restamp(&self, evs: &[Dep]) {
                 // Stamp the CB completion event onto every branch's output pipe(s) —
                 // delegate to each branch's own `cb_restamp` (a multi-output branch
                 // stamps each element pipe). So a downstream consumer of ANY branch
                 // waits on the one CB enqueue event.
-                $(self.$field.cb_restamp(ev);)+
+                $(self.$field.cb_restamp(evs);)+
             }
 
             fn cb_cache(&self) -> Option<&CbCache> {
