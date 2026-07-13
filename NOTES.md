@@ -126,6 +126,44 @@ FACTORING ROADMAP — ASSESSED & DECLINED (kept here so future sessions don't re
     Subgraph<O> + use<>` return).
     OPEN FOR REVIEW: marker spelling `subgraph!(..)`; keep both trait+macro (current) vs
     macro-only vs trait-only.
+  - **⭐ THE BIG OPEN ISSUE — backing genericity (Brice, 2026-07-13, UNRESOLVED, next
+    session).** The current `subgraph!` marker pins concrete backing types (e.g.
+    `subgraph!((DeviceSlice<f32>, ...))`), which THROWS AWAY the closure's key power:
+    a closure `|ks, b| ks.scale_u32([N], b, 3)` is generic over the BACKING
+    (`DeviceSlice`/`MappedSlice`/`USMSlice`) AND over concrete-vs-`Pipe`, because the
+    launcher method is `fn scale_u32<D: KernelSliceReadWriteArg<E>, S: ToInput<E,Buf=D>>
+    (..) -> Op<D>` and inference fills it per call. A named meta-kernel pinning
+    `DeviceSlice` monomorphizes that away. Brice: meta-kernels MUST keep this flexibility
+    (incl. accepting `Pipe<D>` to the backing).
+    - **PROVED RECOVERABLE (probed empirically, all compile):** a named subgraph fn CAN
+      stay backing+pipe generic:
+      `fn f<S,D>(ks, b: S) -> impl Subgraph<D> + use<S,D> where S: ToInput<u32,Buf=D>,
+      D: RwBacking<u32>` accepts concrete `DeviceSlice`, concrete `MappedSlice`, AND
+      `Pipe<MappedSlice>` — from ONE definition. (`ToInput` already unifies concrete/pipe;
+      the launcher uses it.) A blanket alias trait collapses the verbose 3-part backing
+      bound: `RwBacking<E>: KernelSliceReadWriteArg<E> + ToInput<E,Buf=Self> +
+      OutputShape<Handle=Pipe<Self>,Checkouts=Checkout<Self>>` (+ `RoBacking<E>` for `&[T]`
+      reads). Every buffer family qualifies free (blanket impl).
+    - **⛔ HARD WALL (probed, fails): the macro CANNOT infer the element type / read-vs-write
+      from the graph body.** `#[meta_kernel]` sees only the fn TOKENS; `ks.scale_u32(..)`
+      is opaque — the element type + access live in `scale_u32`'s GENERATED signature (another
+      crate, resolved by the type-checker AFTER the macro runs). Probed leaving `E` fully
+      generic + letting the body fill it: FAILS (`S: ToInput<u32>` unsatisfied) — Rust
+      bounds must hold AS WRITTEN; inference does NOT flow body→where-clause. So the element
+      type MUST be stated in the marker; "macro analyzes the graph to declare everything"
+      is impossible. Author states element+access (irreducible); macro emits the
+      `<S,D>`+`ToInput`+`RwBacking`+`Subgraph<D>` plumbing (mechanical).
+    - **PROPOSED marker (NOT built — awaiting Brice's answers):** per backing-generic input
+      `b: buf!(rw<u32>)` → macro mints `<S0,D0> where S0: ToInput<u32,Buf=D0>, D0:
+      RwBacking<u32>`, param `b: S0`; output `-> subgraph!(D0)` = that backing. `buf!(D:
+      rw<u32>)` names the backing for sharing/threading across args; multi-backing (read
+      Mapped, write Device) = two named backings. `RwBacking`/`RoBacking` public (plain-Rust
+      path). OPEN QUESTIONS for Brice: (1) is element-type-in-marker (`rw<u32>`) an
+      acceptable floor, or does that tip the balance back to closures being the only
+      fully-inferred option? (2) marker spelling `buf!(rw<u32>)`+`subgraph!(D)` vs one
+      vocabulary; (3) default rw + explicit `ro`, or always-explicit access.
+    - Probe scaffolding was written to tests/tier2/tests/_probe_*.rs and DELETED after each
+      run (not committed) — reproduce from the snippets above if resuming.
 
 (slots.rs extraction: DONE via scoped `pub(crate)` — the driver-relocation refactor
 turned out unnecessary; making the `SlotBinder` inherent surface `pub(crate)` was
