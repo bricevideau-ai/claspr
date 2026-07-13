@@ -462,13 +462,6 @@ where
         Pipe<DeviceScalar<f32>>,
         DeviceScalar<f32>,
     ) -> B,
-    // A's `Output` (the 6-field alpha subgraph) is spelled ONCE here; its `Handle`
-    // and `Checkouts` are then PROJECTED from it via `OutputShape` rather than
-    // re-spelled as parallel `Pipe<_>` / `Checkout<_>` tuples. The `Handle`
-    // projection is what makes `compute_alpha(..).and_then(move |(p, ap, partials,
-    // alpha, nalpha, rsold)| ..)` typecheck (the closure receives `A::Handle`, now
-    // known to be the 6-tuple of pipes); the `Checkouts` projection satisfies the
-    // nested-in-`bundle`/`and_then` `FromCheckout` obligation below.
     // A's Output is the `AlphaOut` alias; its `Handle`/`Checkouts` are PROJECTED from
     // it via `OutputShape` (normalizing to the concrete 6-tuples of `Pipe<_>` /
     // `Checkout<_>`), so the shape is written ONCE. The `Handle` projection lets
