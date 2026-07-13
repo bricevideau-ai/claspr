@@ -49,6 +49,27 @@ green on pocl, gray-scott/cg bit-identical):
   (proc-macro builds them via `format_ident!`). Bundle2..16 + the 2..16 tuple families
   (`FromCheckout`/`CheckoutSplit`/`SeamScatter`/`CallArgs`/`KernelArgs`/`BindAll`) were
   ALREADY macros — no further collapse needed.
+- **GAP FIX — slots in non-kernel positions now actually bind (`bind_slots` coverage).**
+  `slot!(Tag)` is documented to plug into `fill`/`write`/`download`/copy positions, but
+  only the buffer `CopyTo2` + kernel `LaunchOp` overrode `DeviceOp::bind_slots` — every
+  other slot-capable leaf (`Fill`/`FillMapped`/`WriteDevice`/`WriteMapped`/`Download`/
+  `ReadInto`/`TransferToDevice`/`ImageCopy`/`ImageFill`/`ImageDownloadEager`/the 4
+  `Acquire*View*`) type-checked a slot input then failed at runtime `SlotNoSuchTag`.
+  Added `bind_slots` (safe `try_bind_slot` no-op on concrete/pipe) to all of them.
+  Tests: slot_generalization::buffer_slot_in_{write,download}_position_binds_and_rearms,
+  cb_precise_invalidation::fill_slot_position_mutate_clears_its_cb.
+- **GAP FIX — images are first-class reusable-graph slots + image CBs invalidate on
+  mutate.** (1) `SlotEq`+`SlotValue` for the 6 owning image families (image.rs) — an
+  image can now be a `slot!(Tag)` value bound/`mutate_bind`'d like a buffer (move-only,
+  cl_mem identity), not just pipe-fed. (2) `ImageCopy`/`ImageFill` Build arms migrated
+  from the pre-R2 raw `cb_collect_external`+`sp_lookup` to `cb_leaf_build` — they now
+  `note_slot`/`cb_reach_extend`, so a `mutate_bind` of an image slot PRECISELY clears
+  the CB that baked it (was silently no-op'd → stale replay). TDD: failing test →
+  bind_slots → reach fix → green. Test: cb_precise_invalidation::image_slot_mutate_clears_its_cb.
+  (Fill/write leaf-family coherence audit that surfaced these: the fill/write families
+  themselves are coherent — device/SVM fills CB-recordable, USM host, writes non-CB,
+  in-place put_home vs uninit put — no unification forced; the real gap was the
+  bind_slots + image-reach omissions above.)
 
 FACTORING ROADMAP (remaining opportunities found scanning the extracted modules — each
 is a REAL parameterized refactor, not a mechanical collapse, so left for a focused pass):

@@ -16,7 +16,7 @@
 //!
 //! Each test asserts real device behavior (skips silently with no OpenCL device).
 
-use claspr::eager::{DeviceOpExt, download};
+use claspr::eager::{DeviceOpExt, download, write};
 use claspr::{Context, DeviceSlice, Error, LaunchSpec};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
@@ -716,4 +716,77 @@ fn bind_checkout_into_slot_severs_source_adopts_target() {
         "adopted buffer (was 10) scaled by 3 = 30, got {:?}",
         &r[..8]
     );
+}
+
+// ── (D) Buffer slots in NON-KERNEL positions (fill/write/download/copy/…) ─────
+//
+// `slot!(Tag)` is documented to plug into `download`/`fill`/`write`/copy sources, not
+// just kernel args — but every non-kernel leaf except the buffer copy used to skip
+// `DeviceOp::bind_slots`, so a slot in those positions type-checked yet failed at
+// runtime (`SlotNoSuchTag`). Every fill/write/download/transfer/acquire/image leaf now
+// exposes its input(s) to the binder. These two exercise the `write` and `download`
+// positions AND a re-run (correct rearming) — the class the kernel-arg tests above
+// never reached.
+
+/// A buffer slot in a `write()` position: `write(Buf, [5]) -> scale(*2) -> download`.
+/// Bind `Buf`, run (5*2=10), then RE-RUN over the re-armed graph with a fresh `Buf`.
+#[test]
+fn buffer_slot_in_write_position_binds_and_rearms() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let ks = &ks;
+
+    let g = write(slot!(Buf).into_slot_input(), vec![5u32; N])
+        .and_then(|b| ks.scale_u32([N], b, 2u32))
+        .and_then(download);
+
+    g.mutate_bind(Buf(seeded(&ctx, 0)))
+        .expect("bind Buf in a write position");
+    let co1 = g.sync(&ctx).expect("run 1");
+    assert!(
+        co1.iter().all(|&v| v == 10),
+        "write 5 * 2 = 10, got {:?}",
+        &co1[..8]
+    );
+    drop(co1);
+
+    // Fresh Buf over the re-armed graph — proves the write-position slot rehomed and
+    // rebinds cleanly (correct rearming), not just the first bind.
+    g.mutate_bind(Buf(seeded(&ctx, 0))).expect("re-bind Buf");
+    let co2 = g.sync(&ctx).expect("run 2 over re-armed graph");
+    assert!(
+        co2.iter().all(|&v| v == 10),
+        "re-run write 5 * 2 = 10, got {:?}",
+        &co2[..8]
+    );
+    drop(co2);
+}
+
+/// A buffer slot in a `download()` position: `download(Buf)` reads the bound buffer
+/// straight back, and a mutate to a differently-seeded buffer reads the new content.
+#[test]
+fn buffer_slot_in_download_position_binds_and_rearms() {
+    let Some(ctx) = ctx() else { return };
+
+    let g = download(slot!(Buf).into_slot_input());
+
+    g.mutate_bind(Buf(seeded(&ctx, 7)))
+        .expect("bind Buf in a download position");
+    let co = g.sync(&ctx).expect("run 1");
+    assert!(
+        co.iter().all(|&v| v == 7),
+        "download Buf=7, got {:?}",
+        &co[..8]
+    );
+    drop(co);
+
+    g.mutate_bind(Buf(seeded(&ctx, 42)))
+        .expect("re-bind Buf=42");
+    let co = g.sync(&ctx).expect("run 2");
+    assert!(
+        co.iter().all(|&v| v == 42),
+        "download re-bound Buf=42, got {:?}",
+        &co[..8]
+    );
+    drop(co);
 }

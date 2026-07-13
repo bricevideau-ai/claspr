@@ -27,12 +27,16 @@
 //! are empty and the SET assertions are guarded by `has_cl_khr_command_buffer()`.
 //! Results are asserted UNCONDITIONALLY on every path.
 
-use claspr::eager::{DeviceOp, DeviceOpExt, bundle2, fill};
-use claspr::{Context, DeviceSlice};
+use claspr::eager::{Checkout, DeviceOp, DeviceOpExt, bundle2, fill};
+use claspr::image::format::R32G32B32A32Uint;
+use claspr::{Context, DeviceSlice, Image2D, ReadWrite, eager_image_copy};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;
+// Image dims for the image-slot reach test (W*H == N so the pixel count matches).
+const W: u32 = 8;
+const H: u32 = 8;
 
 fn ctx() -> Option<Context> {
     match Context::any() {
@@ -50,6 +54,7 @@ slots! {
     Factor1: u32,
     Factor2: u32,
     Buf: DeviceSlice<u32>,
+    SrcImg: Image2D<ReadWrite, R32G32B32A32Uint>,
 }
 
 /// Every homed `FinalizedCb` id in the graph, as a sorted set (the `Arc` pointers).
@@ -72,6 +77,17 @@ fn seeded(ctx: &Context, v: u32) -> DeviceSlice<u32> {
         .fill(v)
         .wait()
         .expect("seed")
+}
+
+type RgbaImg = Image2D<ReadWrite, R32G32B32A32Uint>;
+
+/// Seed a fresh `W×H` RGBA image with the constant pixel `[base, base+1, base+2, base+3]`.
+fn seeded_image(ctx: &Context, base: u32) -> RgbaImg {
+    RgbaImg::alloc(ctx, W, H)
+        .expect("alloc image")
+        .fill([base, base + 1, base + 2, base + 3])
+        .wait()
+        .expect("seed image")
 }
 
 /// PRECISION: two device regions split by a host seam, each a nested weight-2 chain
@@ -301,4 +317,146 @@ fn bundle_branch_interior_cb_precise_recursion() {
     );
     drop((ra, rb));
     drop((ca, cb));
+}
+
+/// A buffer SLOT in a `fill()` POSITION (not a kernel arg) captured by a CB. Before
+/// the leaf-`bind_slots` fix, `Fill` never offered its buffer input to the binder, so
+/// `mutate_bind(Buf(..))` failed `SlotNoSuchTag` — the `fill`/`write`/`download` slot
+/// positions the docs advertise type-checked but were unbindable. With `bind_slots`
+/// wired (and `Fill` already using `cb_leaf_build`), a filled slot is captured AND
+/// precisely invalidated: mutating `Buf` clears the `fill -> scale` CB. `fill`
+/// overwrites, so the arithmetic is Buf-independent (21 either way) — the id-set is
+/// the load-bearing proof that the mutate reached the CB (a SlotNoSuchTag would panic
+/// the mutate outright, a missed reach would leave the id set unchanged).
+#[test]
+fn fill_slot_position_mutate_clears_its_cb() {
+    let Some(ctx) = ctx() else { return };
+    let has_cb = ctx.has_cl_khr_command_buffer();
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let ks = &ks;
+
+    // weight-2 CB capturing the Buf slot in a FILL position: fill(Buf, 7) -> scale(*3).
+    let g = fill(slot!(Buf).into_slot_input(), 7u32).and_then(|b| ks.scale_u32([N], b, 3u32));
+    if has_cb {
+        assert_eq!(g.cbable_weight(), 2, "fill + scale = weight 2");
+    }
+
+    g.mutate_bind(Buf(seeded(&ctx, 0))).expect("bind Buf");
+    let co = g.sync(&ctx).expect("sync 1");
+    let r1 = co.map().wait().expect("read 1");
+    assert!(
+        r1.iter().all(|&v| v == 21),
+        "fill 7 * 3 = 21: {:?}",
+        &r1[..8]
+    );
+    drop(r1);
+    drop(co);
+
+    let s0 = cb_ids(&g);
+    if has_cb {
+        assert_eq!(s0.len(), 1, "one homed CB, got {}", s0.len());
+    }
+
+    // Mutate Buf to a fresh buffer: the CB baked the old buffer's cl_mem, so it MUST
+    // clear (Fill::bind_slots exposes the slot; Fill's cb_leaf_build note_slots it).
+    g.mutate_bind(Buf(seeded(&ctx, 0))).expect("mutate Buf");
+    let s1 = cb_ids(&g);
+    if has_cb {
+        assert!(
+            s1.is_empty(),
+            "mutating the filled slot must clear its CB: s0={s0:?} s1={s1:?}"
+        );
+    }
+
+    let co = g.sync(&ctx).expect("sync 2");
+    let r2 = co.map().wait().expect("read 2");
+    assert!(
+        r2.iter().all(|&v| v == 21),
+        "after mutate the fresh buffer is filled+scaled: {:?}",
+        &r2[..8]
+    );
+    drop(r2);
+    drop(co);
+}
+
+/// REACH through an IMAGE command. An image slot (`SrcImg`) feeds a weight-2 image
+/// command buffer: `bundle2(copy(SrcImg -> dst), copy(other -> mid))` records ONE CB
+/// (a root bundle records a single CB, not one per branch), and the first branch
+/// BAKES `SrcImg`'s concrete `cl_image` into it. Mutating `SrcImg` to a different
+/// image MUST clear that CB — else replay reads the STALE original image and `dst`
+/// keeps the old pixels. This guards the image ops' precise-invalidation reach:
+/// `ImageCopy`/`ImageFill` must `note_slot`/`cb_reach_extend` via `cb_leaf_build` like
+/// the buffer leaves. Before that fix they recorded the command but never noted the
+/// captured slot, so this mutate silently no-op'd → stale replay. Both branches'
+/// outputs are gathered by the bundle, so `SrcImg` rehomes across the replay. The
+/// `dst` result is the load-bearing correctness proof; the id-set check corroborates.
+#[test]
+fn image_slot_mutate_clears_its_cb() {
+    let Some(ctx) = ctx() else { return };
+    if !ctx.device().cl3().image_support().unwrap_or(false) {
+        eprintln!("SKIP: device has no image support");
+        return;
+    }
+    let has_cb = ctx.has_cl_khr_command_buffer();
+
+    // Two source images pre-seeded to DISTINCT constant pixels; the second bundle
+    // branch (`other -> mid`) exists only to make the bundle weight-2 (one CB).
+    let src_a = seeded_image(&ctx, 11); // [11,12,13,14]
+    let src_b = seeded_image(&ctx, 22); // [22,23,24,25]
+    let other = seeded_image(&ctx, 90);
+    let dst = RgbaImg::alloc(&ctx, W, H).expect("alloc dst");
+    let mid = RgbaImg::alloc(&ctx, W, H).expect("alloc mid");
+
+    let g = bundle2(
+        eager_image_copy(slot!(SrcImg).into_slot_input(), dst),
+        eager_image_copy(other, mid),
+    );
+    if has_cb {
+        assert_eq!(g.cbable_weight(), 2, "two image copies = weight 2");
+    }
+
+    // Read `dst` = the second element of the first branch's (src, dst) output tuple.
+    type Co = Checkout<RgbaImg>;
+    let read_dst = |g: &_, ctx: &Context| -> Vec<[u32; 4]> {
+        let ((_si, d), (_o, _m)): ((Co, Co), (Co, Co)) = DeviceOpExt::sync(g, ctx).expect("sync");
+        let out = d.read_alloc().wait().expect("read dst");
+        drop(((_si, d), (_o, _m)));
+        out
+    };
+
+    // Bind SrcImg = src_a, sync: dst must carry src_a's pixels. Homes the CB.
+    g.mutate_bind(SrcImg(src_a)).expect("bind src_a");
+    let got_a = read_dst(&g, &ctx);
+    assert!(
+        got_a.iter().all(|&px| px == [11, 12, 13, 14]),
+        "SrcImg=src_a: dst should carry src_a pixels; got {:?}",
+        &got_a[..2]
+    );
+
+    let s0 = cb_ids(&g);
+    if has_cb {
+        assert_eq!(s0.len(), 1, "expected one homed image CB, got {}", s0.len());
+    }
+
+    // Mutate SrcImg = src_b. The CB baked src_a's cl_image via the first copy, so it
+    // MUST be cleared. Pre-fix: the image copy never note_slot'd SrcImg, so the CB's
+    // captured-slot set was empty → this mutate cleared nothing → the id set stays
+    // non-empty AND the replay below reads the stale src_a.
+    g.mutate_bind(SrcImg(src_b)).expect("mutate src_b");
+    let s1 = cb_ids(&g);
+    if has_cb {
+        assert!(
+            s1.is_empty(),
+            "mutating the captured image slot must clear its CB: s0={s0:?} s1={s1:?}"
+        );
+    }
+
+    // Replay: dst must now reflect src_b — the load-bearing proof that no stale image
+    // handle survived in a replayed command buffer.
+    let got_b = read_dst(&g, &ctx);
+    assert!(
+        got_b.iter().all(|&px| px == [22, 23, 24, 25]),
+        "after mutate SrcImg=src_b, dst must reflect src_b, not stale src_a; got {:?}",
+        &got_b[..2]
+    );
 }

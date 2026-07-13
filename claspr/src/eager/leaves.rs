@@ -163,6 +163,11 @@ where
         1
     }
 
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // The filled buffer may be a `slot!()` operand (concrete/pipe: no-op).
+        self.buf.try_bind_slot(binder);
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("fill".into());
     }
@@ -563,6 +568,11 @@ where
         self.buf.check_ready()
     }
 
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // The read-back buffer may be a `slot!()` operand (concrete/pipe: no-op).
+        self.buf.try_bind_slot(binder);
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("download".into());
     }
@@ -664,6 +674,11 @@ where
 
     fn check_ready(&self) -> Result<()> {
         self.buf.check_ready()
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // The read-back buffer may be a `slot!()` operand (concrete/pipe: no-op).
+        self.buf.try_bind_slot(binder);
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -807,6 +822,11 @@ where
 
     fn check_ready(&self) -> Result<()> {
         self.buf.check_ready()
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // The source buffer may be a `slot!()` operand (concrete/pipe: no-op).
+        self.buf.try_bind_slot(binder);
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -1288,6 +1308,11 @@ where
         self.buf.check_ready()
     }
 
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // The written-to buffer may be a `slot!()` operand (concrete/pipe: no-op).
+        self.buf.try_bind_slot(binder);
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("write".into());
     }
@@ -1514,6 +1539,11 @@ where
         }
     }
 
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // The filled buffer may be a `slot!()` operand (concrete/pipe: no-op).
+        self.buf.try_bind_slot(binder);
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("fill_mapped".into());
     }
@@ -1608,6 +1638,11 @@ where
 
     fn check_ready(&self) -> Result<()> {
         self.buf.check_ready()
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // The written-to buffer may be a `slot!()` operand (concrete/pipe: no-op).
+        self.buf.try_bind_slot(binder);
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -2050,6 +2085,11 @@ where
         self.img.check_ready()
     }
 
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // The downloaded image may be a `slot!()` operand (concrete/pipe: no-op).
+        self.img.try_bind_slot(binder);
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("image_download".into());
     }
@@ -2121,6 +2161,11 @@ where
         self.buf.check_ready()
     }
 
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // The viewed buffer may be a `slot!()` operand (concrete/pipe: no-op).
+        self.buf.try_bind_slot(binder);
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("acquire_device_view".into());
     }
@@ -2174,6 +2219,11 @@ where
 
     fn check_ready(&self) -> Result<()> {
         self.buf.check_ready()
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // The viewed buffer may be a `slot!()` operand (concrete/pipe: no-op).
+        self.buf.try_bind_slot(binder);
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -2287,6 +2337,11 @@ where
         self.buf.check_ready()
     }
 
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // The viewed buffer may be a `slot!()` operand (concrete/pipe: no-op).
+        self.buf.try_bind_slot(binder);
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         out.push("acquire_mapped_view".into());
     }
@@ -2340,6 +2395,11 @@ where
 
     fn check_ready(&self) -> Result<()> {
         self.buf.check_ready()
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // The viewed buffer may be a `slot!()` operand (concrete/pipe: no-op).
+        self.buf.try_bind_slot(binder);
     }
 
     fn describe(&self, out: &mut Vec<String>) {

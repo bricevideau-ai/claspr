@@ -48,7 +48,7 @@ use crate::buffer::{Buffer, DeviceSlice};
 use crate::context::Context;
 use crate::eager::{
     CbCache, CbWalk, Checkout, Deps, DeviceOp, DeviceOpExt, ExecMode, Input, Pipe,
-    cb_collect_external, new_cb_cache, wrap_event,
+    cb_collect_external, cb_leaf_build, new_cb_cache, wrap_event,
 };
 use crate::error::Error;
 use crate::exec_ctx::ExecutionContext;
@@ -880,10 +880,29 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         match ec.cb() {
             CbWalk::Off => {}
             CbWalk::Build { builder, ext, .. } => {
-                cb_collect_external(ext, &src_deps);
-                cb_collect_external(ext, &dst_deps);
-                let mut waits = ec.sp_lookup(self.src.pipe_cell_id());
-                waits.extend(ec.sp_lookup(self.dst.pipe_cell_id()));
+                // Per-operand `cb_leaf_build` (external deps + waits + the
+                // precise-invalidation reach: note_slot origins + propagate onto the
+                // output cell) — the SAME treatment the buffer `CopyTo2` gets. Using
+                // it (not raw `cb_collect_external`/`sp_lookup`) is what makes a
+                // `mutate_bind` of an image slot invalidate this recorded copy.
+                let mut waits = cb_leaf_build(
+                    ec,
+                    builder,
+                    ext,
+                    &src_deps,
+                    self.src.slot_cell_id(),
+                    self.src.pipe_cell_id(),
+                    self.src_pipe.cell_id(),
+                );
+                waits.extend(cb_leaf_build(
+                    ec,
+                    builder,
+                    ext,
+                    &dst_deps,
+                    self.dst.slot_cell_id(),
+                    self.dst.pipe_cell_id(),
+                    self.dst_pipe.cell_id(),
+                ));
                 let smem = crate::record::MemRef::Buffer(src.image_ref().get());
                 let dmem = crate::record::MemRef::Buffer(dst.image_ref().get());
                 if let Some(sp) =
@@ -964,6 +983,17 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
     fn check_ready(&self) -> Result<()> {
         self.src.check_ready()?;
         self.dst.check_ready()
+    }
+
+    fn bind_slots(&self, binder: &mut crate::SlotBinder) {
+        // src/dst may each be a `slot!()` operand; offer the binder to both (execution
+        // order: src then dst), short-circuiting once it lands. Non-slot (concrete /
+        // pipe) inputs are a no-op in `try_bind_slot`. Mirrors the buffer `CopyTo2`.
+        self.src.try_bind_slot(binder);
+        if binder.is_consumed() {
+            return;
+        }
+        self.dst.try_bind_slot(binder);
     }
 
     fn cb_cache(&self) -> Option<&CbCache> {
@@ -1050,8 +1080,19 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
         match ec.cb() {
             CbWalk::Off => {}
             CbWalk::Build { builder, ext, .. } => {
-                cb_collect_external(ext, &deps);
-                let waits = ec.sp_lookup(self.img.pipe_cell_id());
+                // `cb_leaf_build` (not raw `cb_collect_external`/`sp_lookup`) so a
+                // filled image SLOT is note_slot'd into the CB's captured set and its
+                // reach propagates onto the output — precise invalidation on mutate,
+                // matching the buffer `Fill`.
+                let waits = cb_leaf_build(
+                    ec,
+                    builder,
+                    ext,
+                    &deps,
+                    self.img.slot_cell_id(),
+                    self.img.pipe_cell_id(),
+                    self.out.cell_id(),
+                );
                 let mem = crate::record::MemRef::Buffer(img.image_ref().get());
                 let color = unsafe {
                     std::slice::from_raw_parts(
@@ -1091,6 +1132,12 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
     /// earlier lending op enqueues (see [`Input::check_ready`]).
     fn check_ready(&self) -> Result<()> {
         self.img.check_ready()
+    }
+
+    fn bind_slots(&self, binder: &mut crate::SlotBinder) {
+        // The filled image may be a `slot!()` operand; a concrete/pipe input is a
+        // no-op in `try_bind_slot`.
+        self.img.try_bind_slot(binder);
     }
 
     fn cb_cache(&self) -> Option<&CbCache> {
@@ -2885,6 +2932,50 @@ impl_recordable_image!(Image3D);
 impl_recordable_image!(Image1DArray);
 impl_recordable_image!(Image2DArray);
 impl_recordable_image!(Image1DBuffer);
+
+// ── Slot machinery: images as first-class reusable-graph slots ──────
+//
+// With `RecordableBuffer` above, an owned image already flows into a
+// slot as a PIPE source (`Tag(pipe)` → `FedByPipe`). These two impls
+// make it a full VALUE slot too — `slot!(Tag)` + `bind`/`mutate_bind`
+// with an image value — exactly like the buffer families:
+//   - `SlotEq` (rebind idempotency / crossed-swap detection) by backing
+//     `cl_mem` identity — an image is always a `cl_mem` object, never SVM.
+//   - `SlotValue` MOVE-ONLY (`fill_clone` → `None`): an owned image can't
+//     be in two cells at once, so it is take-once into the first matching
+//     cell, matching `DeviceSlice`/`MappedSlice`/`USMSlice`. (A shared
+//     read-only image would ride an `Arc<…>` clone impl, as `DeviceSlice`
+//     does — added only when a fan-out use appears.)
+// This is what lets a `mutate_bind` of an image slot re-target a built
+// graph AND drive the precise command-buffer invalidation for image
+// commands (see `ImageCopy`/`ImageFill` reach registration).
+macro_rules! impl_image_slot {
+    ($ty:ident) => {
+        impl<A: KernelAccess, F: format::Format> crate::eager::SlotEq for $ty<A, F> {
+            fn slot_eq(&self, other: &Self) -> bool {
+                // Owned images are `cl_mem`-backed; identity is handle equality.
+                self.image.get() == other.image.get()
+            }
+        }
+
+        impl<A, F> crate::eager::SlotValue for $ty<A, F>
+        where
+            A: KernelAccess + Send + 'static,
+            F: format::Format + Send + 'static,
+        {
+            fn fill_clone(&self) -> Option<Box<dyn std::any::Any + Send>> {
+                // Move-only: no clone. The binder takes the single image once.
+                None
+            }
+        }
+    };
+}
+impl_image_slot!(Image1D);
+impl_image_slot!(Image2D);
+impl_image_slot!(Image3D);
+impl_image_slot!(Image1DArray);
+impl_image_slot!(Image2DArray);
+impl_image_slot!(Image1DBuffer);
 
 // ── ToInputImage: a kernel IMAGE arg, concrete-or-pipe ──────────────
 //
