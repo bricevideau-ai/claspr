@@ -10,7 +10,7 @@
 //! is not. The owned `Image1DBuffer` carries the same access-marker
 //! gating, so the access-mismatch check moves to it.)
 
-use claspr::{Context, Image1DBuffer, ReadOnly, image::format::R32Uint};
+use claspr::{image::format::R32Uint, Context, Image1DBuffer, ReadOnly};
 
 fn main() {
     let ctx = Context::any().unwrap();

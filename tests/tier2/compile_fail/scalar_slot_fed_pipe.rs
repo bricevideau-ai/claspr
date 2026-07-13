@@ -8,7 +8,7 @@
 //! type-driven and never leaks onto scalar/launch slots.
 
 use claspr::eager::{DeviceOpExt, Pipe};
-use claspr::{DeviceSlice, slot, slots};
+use claspr::{slot, slots, DeviceSlice};
 use claspr_test_kernels::kernels;
 
 slots! {

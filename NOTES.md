@@ -28,13 +28,23 @@ green on pocl, gray-scott/cg bit-identical):
   combinator calling `cb_*` on generic children (~53 impl splits, ~60 call sites), with
   ZERO object-safety benefit (no `dyn DeviceOp` anywhere). Bad ROI for shrinking a
   read-once trait. The "CB is a skippable layer" goal is met instead by the module split.
+- **R5 — added `ARCHITECTURE.md`** (the layered "to change X, read Y" map) and **pruned
+  `NOTES.md` 3119 → ~120 lines** (resolved history is in git). CLAUDE.md points at it.
+- **Module split 1/n — extracted the CB machinery into `eager/cb.rs`** (636 lines). The
+  `pub use cb::*` re-export keeps the macro-referenced public CB surface at its
+  `::claspr::eager::` path. Pattern proven (incl. the visibility gotcha).
 
-Planned next (this branch): module-split `eager.rs` (11.6k lines) so subsystems are
-separate files an agent can open individually (CB machinery, slots, leaves,
-combinators); collapse the mechanical trait families (18 `KernelImage*Arg`, `Bundle2..16`,
-tuple arities) behind macros/banners; optionally fold in `OutputShape` (derive
-`Handle`/`Checkouts` from `Output`, shrinking generic-subgraph where-clauses — see the
-cg `solve_with` exhibit). Verify all on 3 ICDs + cliloader before promoting.
+VERIFIED (whole branch): all 9 examples build; tier1 91/0 + tier2 309/0 on ALL 3 ICDs
+(pocl, rusticl/llvmpipe, intel_legacy); compile_fail green (force-fresh rlib); CB
+examples (cg/batch-inference/gray-scott) cliloader leak-clean; fmt/clippy/doc clean.
+NOT yet pushed / promoted — awaiting review.
+
+Planned next (proven-pattern, this branch or a follow-up): finish the module split —
+`eager/leaves.rs` (~3k lines; boundary work: leaves interleave with `CopyHome` +
+piped-verb impls + tail combinators) and `eager/slots.rs`; collapse the mechanical trait
+families (18 `KernelImage*Arg`, `Bundle2..16`, tuple arities) behind macros/banners
+(#246); optionally fold in `OutputShape` (derive `Handle`/`Checkouts` from `Output`,
+shrinking generic-subgraph where-clauses — cg `solve_with` exhibit; #238-240).
 
 ---
 
