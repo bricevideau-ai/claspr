@@ -422,6 +422,20 @@ fn solve_host_seam(ctx: &Context, b_host: &[f32]) -> claspr::Result<(Vec<f32>, u
 /// reuses the same buffer), `rsold` threaded on (β needs the OLD value).
 /// `compute_beta` takes the threaded `(r, partials, rsold, beta)` pipes + concrete `rsnew`,
 /// runs `norm2_partial` internally, and produces `rsnew` (the loop-boundary read).
+/// The 6-field output shape of the α subgraph, named ONCE so the `solve_with` bound
+/// can spell it as `Output` and PROJECT `Handle`/`Checkouts` from it via
+/// [`OutputShape`](claspr::eager::OutputShape) — instead of re-writing the parallel
+/// `Pipe<_>` and `Checkout<_>` tuples. (A bare `A::Output` projection would cycle:
+/// bounds on `A` can't reference `A`'s own associated types; a concrete alias can.)
+type AlphaOut = (
+    DeviceSlice<f32>,
+    DeviceSlice<f32>,
+    DeviceSlice<f32>,
+    DeviceScalar<f32>,
+    DeviceScalar<f32>,
+    DeviceScalar<f32>,
+);
+
 #[allow(clippy::type_complexity)]
 fn solve_with<CA, CB, A, B>(
     ctx: &Context,
@@ -448,54 +462,33 @@ where
         Pipe<DeviceScalar<f32>>,
         DeviceScalar<f32>,
     ) -> B,
+    // A's `Output` (the 6-field alpha subgraph) is spelled ONCE here; its `Handle`
+    // and `Checkouts` are then PROJECTED from it via `OutputShape` rather than
+    // re-spelled as parallel `Pipe<_>` / `Checkout<_>` tuples. The `Handle`
+    // projection is what makes `compute_alpha(..).and_then(move |(p, ap, partials,
+    // alpha, nalpha, rsold)| ..)` typecheck (the closure receives `A::Handle`, now
+    // known to be the 6-tuple of pipes); the `Checkouts` projection satisfies the
+    // nested-in-`bundle`/`and_then` `FromCheckout` obligation below.
+    // A's Output is the `AlphaOut` alias; its `Handle`/`Checkouts` are PROJECTED from
+    // it via `OutputShape` (normalizing to the concrete 6-tuples of `Pipe<_>` /
+    // `Checkout<_>`), so the shape is written ONCE. The `Handle` projection lets
+    // `compute_alpha(..).and_then(move |(p, ap, partials, alpha, nalpha, rsold)| ..)`
+    // destructure the 6 pipes; the `Checkouts` projection feeds the `FromCheckout`.
     A: DeviceOp<
-            Output = (
-                DeviceSlice<f32>,
-                DeviceSlice<f32>,
-                DeviceSlice<f32>,
-                DeviceScalar<f32>,
-                DeviceScalar<f32>,
-                DeviceScalar<f32>,
-            ),
-            // `Handle` IS needed here (not just `Output`): the graph builder does
-            // `compute_alpha(..).and_then(move |(p, ap, partials, alpha, nalpha, rsold)| ..)`,
-            // and `and_then`'s closure receives `A::Handle` — so it must be the 6-tuple
-            // of pipes for the destructure to typecheck. `Checkouts` is NOT needed:
-            // this subgraph is composed onward (never a terminal), so nothing names its
-            // per-branch Checkouts. Still ONE place, vs the trait's SIX signature blocks.
-            Handle = (
-                Pipe<DeviceSlice<f32>>,
-                Pipe<DeviceSlice<f32>>,
-                Pipe<DeviceSlice<f32>>,
-                Pipe<DeviceScalar<f32>>,
-                Pipe<DeviceScalar<f32>>,
-                Pipe<DeviceScalar<f32>>,
-            ),
+            Output = AlphaOut,
+            Handle = <AlphaOut as claspr::eager::OutputShape>::Handle,
+            Checkouts = <AlphaOut as claspr::eager::OutputShape>::Checkouts,
         >,
-    // `B`'s `Checkouts` and `Handle` are both pinned: `g.sync()` destructures as
-    // `(Checkout<x>, Checkout<DeviceScalar<f32>>)`, so `Checkouts` must be
-    // `Checkout<DeviceScalar<f32>>`. `Handle` must be `Pipe<DeviceScalar<f32>>`
-    // because the inner `bundle2(x, rsnew)` feeds B's handle into a bundle — Rust
-    // needs a concrete DeviceOp type there. Both concrete `compute_beta`
-    // implementations select their final `rsnew: Pipe<DeviceScalar<f32>>` via
-    // `and_then(|..., rsnew| rsnew)`, so this is always satisfied.
+    // A generic op nested in a `bundle`/`and_then` must prove
+    // `Checkouts: FromCheckout<Output>`; `AlphaOut` names the tuple already spelled.
+    A::Checkouts: claspr::FromCheckout<AlphaOut>,
+    // B's single-scalar shape likewise: `Output` once, `Handle`/`Checkouts` projected.
+    // `g.sync()` destructures B's `Checkouts`; `bundle2(x, rsnew)` feeds B's `Handle`.
     B: DeviceOp<
             Output = DeviceScalar<f32>,
-            Handle = Pipe<DeviceScalar<f32>>,
-            Checkouts = claspr::Checkout<DeviceScalar<f32>>,
+            Handle = <DeviceScalar<f32> as claspr::eager::OutputShape>::Handle,
+            Checkouts = <DeviceScalar<f32> as claspr::eager::OutputShape>::Checkouts,
         >,
-    // `A::Checkouts` is never named (A is composed onward, never a terminal), but a
-    // generic op nested in a `bundle`/`and_then` must prove
-    // `Checkouts: FromCheckout<Output>` — every concrete op satisfies it, but the
-    // compiler can't assume it for a bare `A`. State it (one place).
-    A::Checkouts: claspr::FromCheckout<(
-            DeviceSlice<f32>,
-            DeviceSlice<f32>,
-            DeviceSlice<f32>,
-            DeviceScalar<f32>,
-            DeviceScalar<f32>,
-            DeviceScalar<f32>,
-        )>,
 {
     let kernels = gpu::kernels(ctx)?;
     let ks = &kernels;

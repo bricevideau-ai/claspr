@@ -1973,6 +1973,74 @@ pub trait DeviceOp: Send {
     }
 }
 
+/// The canonical `Handle` / `Checkouts` SHAPE of a [`DeviceOp::Output`].
+///
+/// Every built-in op's [`Handle`](DeviceOp::Handle) and
+/// [`Checkouts`](DeviceOp::Checkouts) are *mechanically determined* by its
+/// [`Output`](DeviceOp::Output): a single-value output has `Handle = Pipe<O>` /
+/// `Checkouts = Checkout<O>` (the trait defaults), and a tuple output has the
+/// element-wise tuple of each. So for EVERY op the identity
+/// `A::Output: OutputShape<Handle = A::Handle, Checkouts = A::Checkouts>` holds.
+///
+/// This trait exposes that shape keyed on the OUTPUT TYPE, so a generic subgraph
+/// bound can pin the shape ONCE via `Output` and *project* `Handle`/`Checkouts`
+/// from it — instead of re-spelling the parallel `Pipe<_>` and `Checkout<_>` tuples
+/// (which for a 6-field subgraph is three copies of the same shape). See
+/// `examples/cg`'s `solve_with`, whose two closure-result bounds shrink from
+/// Output+Handle+Checkouts blocks to `Output` + a one-line `OutputShape` projection.
+pub trait OutputShape {
+    /// The `DeviceOp::Handle` an op producing `Self` has (`Pipe<Self>`, or the
+    /// element-wise tuple of handles).
+    type Handle;
+    /// The `DeviceOp::Checkouts` an op producing `Self` has (`Checkout<Self>`, or the
+    /// element-wise tuple of checkouts).
+    type Checkouts;
+}
+
+/// A single-value output: `Handle = Pipe<Self>`, `Checkouts = Checkout<Self>` — the
+/// [`DeviceOp`] associated-type defaults. Per-family (not a blanket `impl<V>`, which
+/// would collide with the tuple impls under coherence).
+macro_rules! impl_output_shape_leaf {
+    ($($t:ty),+ $(,)?) => { $(
+        impl<T: Send + 'static, M: MemMode> OutputShape for $t {
+            type Handle = Pipe<$t>;
+            type Checkouts = Checkout<$t>;
+        }
+    )+ };
+}
+impl_output_shape_leaf!(DeviceSlice<T, M>, MappedSlice<T, M>, USMSlice<T, M>);
+
+/// A device/mapped/usm SCALAR ([`Scalar<B>`], e.g. `DeviceScalar<T,M>`) output.
+impl<B: Send + 'static> OutputShape for Scalar<B> {
+    type Handle = Pipe<Scalar<B>>;
+    type Checkouts = Checkout<Scalar<B>>;
+}
+
+/// A host-`Vec` output (a `download` terminal's value).
+impl<T: Send + 'static> OutputShape for Vec<T> {
+    type Handle = Pipe<Vec<T>>;
+    type Checkouts = Checkout<Vec<T>>;
+}
+
+/// A tuple output (bundle / multi-branch): the element-wise tuple of each field's
+/// shape — exactly what the bundle/tuple `DeviceOp` impls compute for `Handle` /
+/// `Checkouts`.
+macro_rules! impl_output_shape_tuple {
+    ($($ty:ident),+ $(,)?) => {
+        impl<$($ty: OutputShape),+> OutputShape for ($($ty,)+) {
+            type Handle = ($(<$ty as OutputShape>::Handle,)+);
+            type Checkouts = ($(<$ty as OutputShape>::Checkouts,)+);
+        }
+    };
+}
+impl_output_shape_tuple!(A0, A1);
+impl_output_shape_tuple!(A0, A1, A2);
+impl_output_shape_tuple!(A0, A1, A2, A3);
+impl_output_shape_tuple!(A0, A1, A2, A3, A4);
+impl_output_shape_tuple!(A0, A1, A2, A3, A4, A5);
+impl_output_shape_tuple!(A0, A1, A2, A3, A4, A5, A6);
+impl_output_shape_tuple!(A0, A1, A2, A3, A4, A5, A6, A7);
+
 /// Builder verbs for composing [`DeviceOp`]s. Blanket-implemented.
 pub trait DeviceOpExt: DeviceOp + Sized {
     /// Sequential composition. **Eager**: runs `f` now with the upstream's

@@ -71,20 +71,30 @@ green on pocl, gray-scott/cg bit-identical):
   in-place put_home vs uninit put — no unification forced; the real gap was the
   bind_slots + image-reach omissions above.)
 
-FACTORING ROADMAP (remaining opportunities found scanning the extracted modules — each
-is a REAL parameterized refactor, not a mechanical collapse, so left for a focused pass):
-- **Leaf memory-family unification (biggest):** the device/mapped/usm variants of
-  Fill-uninit (`FillDeviceUninit`/`FillMappedUninit`/`FillUsmUninit`), write-host-data
-  (`WriteDevice{,Uninit}`/`WriteMapped{,Uninit}`/`WriteUsm{,Uninit}`), and alloc-uninit
-  are ~100-line struct+impl blocks repeated ~3× across mem families. They differ by
-  enqueue path + CB-recordability (device fill = weight-1 CB command; USM fill = host op
-  weight-0), so a `leaf_fill!`/`leaf_write!` macro needs per-family hooks. ~15 leaves,
-  could shed ~800 lines of leaves.rs.
-- **Concrete-head terminal boilerplate:** `wait(self)`/`submit(self)` inherent impls
-  repeated on ~12 leaves (`let ctx = concrete_buf_ctx(&self.FIELD)?; self.sync(&ctx)…`),
-  varying only by field + return type — a `concrete_head_terminals!(field, Out)` macro.
-- **`OutputShape`** (user-ergonomics track #238-240): derive `Handle`/`Checkouts` from
-  `Output`, shrinking generic-subgraph where-clauses — cg `solve_with` exhibit.
+- **LANDED — `OutputShape`** (was #238-240): a trait exposing the canonical
+  `Handle`/`Checkouts` shape of a `DeviceOp::Output`, keyed on the output TYPE (leaf →
+  `Pipe<O>`/`Checkout<O>`, tuple → element-wise; matches every op's actual assoc types).
+  A generic subgraph bound now spells its output shape ONCE and PROJECTS Handle/Checkouts
+  from it. `examples/cg` `solve_with`: the 6-field α shape moved to a `type AlphaOut`
+  alias, Handle/Checkouts became `<AlphaOut as OutputShape>::…` projections (was two
+  re-spelled parallel tuples). NB: can't project off `A::Output` (bound-cycle) — a
+  concrete alias is required. Guard: tier2/output_shape.rs asserts Op::Handle/Checkouts
+  == OutputShape<Op::Output> for a leaf + tuple. cg converges on all 3 ICDs.
+
+FACTORING ROADMAP — ASSESSED & DECLINED (kept here so future sessions don't re-litigate):
+- **Leaf memory-family unification** — DECLINED. The fill/write families vary on ~5 axes
+  (input type, output type, in-place-`put_home` vs uninit-`put`, cl_mem vs SVM handle +
+  enqueue fn, CB-recordable vs host); a `leaf_fill!`/`leaf_write!` macro would trade
+  skimmable duplication for a fiddly multi-hook muncher — a NET LOSS for the agent
+  cost-of-entry goal (harder to read one op). The truly-identical alloc-uninit family
+  WAS collapsed (`impl_alloc_uninit!`); fill/write are not identical, so left explicit.
+- **Concrete-head terminal boilerplate** — DECLINED. The ~6 `wait`/`submit` pairs carry
+  useful PER-OP doc comments (each op's Tier-1 spelling, e.g. `buf.fill(v).wait()?` vs
+  `buf.write(d).wait()?`). A macro would either drop those (worse docs → worse
+  cost-of-entry) or need doc-passthrough (negating the ~24-line win). Not worth it.
+- **`meta_kernel!` macro** (#241) — still open: evaluate as sugar over `OutputShape` for
+  auto-declaring subgraph signatures. Deferred (speculative; OutputShape covers the
+  where-clause pain it targeted).
 
 (slots.rs extraction: DONE via scoped `pub(crate)` — the driver-relocation refactor
 turned out unnecessary; making the `SlotBinder` inherent surface `pub(crate)` was
