@@ -301,7 +301,11 @@ where
 ///
 /// This is what makes host-seam graphs segment into sub-tree CBs: the seam feeds
 /// its device source through here in `Off`, so the source span becomes its own CB.
-pub(crate) fn cb_exec_child<O: DeviceOp>(child: &O, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+pub(crate) fn cb_exec_child<O: DeviceOp>(
+    child: &O,
+    ec: &ExecutionContext<'_>,
+    mode: ExecMode,
+) -> Result<()> {
     if cb_span_closed(ec) {
         // A deeper close already sealed this frame's span CB → run the child in `Off`
         // (it opens its own fresh boundary if eligible). Never add to a sealed CB.
@@ -505,7 +509,11 @@ pub(crate) fn cb_span_closed(ec: &ExecutionContext<'_>) -> bool {
     }
 }
 
-pub(crate) fn cb_close_before_seam<S, U>(source: &S, next: &U, ec: &ExecutionContext<'_>) -> Result<bool>
+pub(crate) fn cb_close_before_seam<S, U>(
+    source: &S,
+    next: &U,
+    ec: &ExecutionContext<'_>,
+) -> Result<bool>
 where
     S: DeviceOp,
     U: DeviceOp,
@@ -533,7 +541,11 @@ where
 /// Fills pipes only (returns `()`), like [`DeviceOp::execute`]; the caller
 /// (`AndThen`/bundle) then reads the stamped pipes normally. Falls back to a plain
 /// `execute` if the extension is unreachable or the build is ineligible (SVM).
-pub(crate) fn cb_boundary_execute<O>(op: &O, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()>
+pub(crate) fn cb_boundary_execute<O>(
+    op: &O,
+    ec: &ExecutionContext<'_>,
+    mode: ExecMode,
+) -> Result<()>
 where
     O: DeviceOp,
 {
