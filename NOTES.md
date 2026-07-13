@@ -59,6 +59,22 @@ ROOT CAUSES (essential vs accidental complexity):
    reads everything. NOTES.md (36k tok, 39 sections, 2 months) is largely a resolved-
    decision archive but gets loaded wholesale.
 
+QUANTIFIED (subagent concept-chase, 3 real task traces):
+- Mandatory shared core re-loaded for EVERY task ≈ 10-12k tok (DeviceOp trait + Pipe +
+  Input/resolve_home + ExecutionContext + Deps/ExecMode/CbCache). Essential concepts per
+  task ≈ 6-8; the rest is core re-derivation + mechanical families.
+- "Add a leaf" trace = ~22 distinct defs across 5 files, ~14-16k tok, of which ~70% is the
+  shared core (Fill's own logic is ~120 lines). Kernel-launch trace = 16 defs / 4 files /
+  ~12k. CB-mode trace = ~27 defs / 3 files / ~11k.
+- **~140+ generated trait members** inflate the apparent 73-trait surface (read-one-know-N):
+  KernelImage*Arg 18 traits + 30 impls; Bundle2..16 = 15; the 2..16 tuple families
+  FromCheckout/CheckoutSplit/SeamScatter = 15 each; CallArgs/KernelArgs/BindAll 1..8 = 8
+  each. Genuinely distinct multi-output ops are only 3 (FanOut/CopyTo2/ArcSplit).
+- Sharpest accidental-complexity signal: `CbCache` = ONE type alias (Arc<Mutex<Option<..>>>)
+  surfacing in 8 DeviceOp methods + every leaf struct+execute (~9 touchpoints/op). And the
+  DeviceOp/CbWalk/ExecutionContext CB docs run 2-3× more prose than signatures — much of the
+  89k eager.rs budget is design-rationale an agent reads but rarely needs to EDIT.
+
 REFACTORINGS THAT WOULD ACTUALLY REDUCE AGENT COST (ranked by leverage; NONE is
 eager.rs-split, which is pure cosmetics):
 
