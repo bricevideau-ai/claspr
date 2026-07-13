@@ -92,15 +92,23 @@ FACTORING ROADMAP — ASSESSED & DECLINED (kept here so future sessions don't re
   useful PER-OP doc comments (each op's Tier-1 spelling, e.g. `buf.fill(v).wait()?` vs
   `buf.write(d).wait()?`). A macro would either drop those (worse docs → worse
   cost-of-entry) or need doc-passthrough (negating the ~24-line win). Not worth it.
-- **`meta_kernel!` macro** (#241) — EVALUATED & DECLINED. It would auto-declare a
-  generic subgraph fn's signature (the `CA/CB/A/B` generics + `Fn` bounds + `DeviceOp<
-  Output>` bounds + `OutputShape` projections). But a repo-wide scan found `cg`'s
-  `solve_with` is the ONLY generic-subgraph fn — every other reusable-graph pattern
-  (gray-scott's `get_meta_kernel`/`curried_kernel`, cg's own α/β builder closures)
-  uses type-inferred CLOSURES with ZERO signature boilerplate. So the macro would add
-  a new DSL to learn + opaque macro-expansion errors (a cost-of-entry COST) to save
-  ~15 lines at exactly one site that `OutputShape` already made readable. Closures ARE
-  the ergonomic path. REVISIT TRIGGER: 3+ generic-fn subgraph authors accumulate.
+- **`meta_kernel!` macro** (#241) — BUILT, branch `meta-kernel-macro-20260713`, AWAITING
+  REVIEW. (Earlier "declined" reasoning was WRONG — Brice corrected: closures aren't the
+  ergonomic path, they're a WORKAROUND. gray-scott originally TRIED the generic-fn form
+  and the signature noise forced the retreat to closures. So the survivorship read was
+  backwards: we see closures *because* the fn form was too painful.) Two pieces:
+  - **`Subgraph<O>` trait** (eager.rs, blanket-impl'd): bundles the 4 per-subgraph
+    obligations (`Output=O`, canonical `OutputShape` Handle/Checkouts, `Checkouts:
+    FromCheckout<O>`) into ONE bound. `A: Subgraph<AlphaOut>` replaces cg's 4-line
+    `DeviceOp<Output/Handle/Checkouts>` + `FromCheckout` block. Standard Rust, good errors.
+  - **`#[meta_kernel]` attr proc-macro** (claspr-macros): each `subgraph!(Fn(inputs..) ->
+    Output)` param → a fresh closure generic bounded `Fn(inputs..) -> __Out`, `__Out:
+    Subgraph<Output>`. Author writes NO generics/where-clause — just each subgraph's
+    inputs+output inline. cg `solve_with` converted to it (converges 3 ICDs); guard test
+    tier2/meta_kernel.rs. Verified clippy/doc/fmt + tier1/tier2 green on 3 ICDs. NB minted
+    idents `__MkFn_*`/`__MkOut_*` need `#[allow(non_camel_case_types)]` (macro injects it).
+    OPEN FOR REVIEW: macro marker syntax (`subgraph!(Fn(..) -> O)`); whether to keep BOTH
+    the trait (explicit path) and the macro (sugar), or macro-only.
 
 (slots.rs extraction: DONE via scoped `pub(crate)` — the driver-relocation refactor
 turned out unnecessary; making the `SlotBinder` inherent surface `pub(crate)` was

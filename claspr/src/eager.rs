@@ -2041,6 +2041,46 @@ impl_output_shape_tuple!(A0, A1, A2, A3, A4, A5);
 impl_output_shape_tuple!(A0, A1, A2, A3, A4, A5, A6);
 impl_output_shape_tuple!(A0, A1, A2, A3, A4, A5, A6, A7);
 
+/// A [`DeviceOp`] usable as a **reusable subgraph of output shape `O`** — the single
+/// bound a generic meta-kernel needs for one of its subgraph parameters.
+///
+/// It bundles the four obligations that otherwise have to be spelled out by hand at
+/// every generic-subgraph author (as `examples/cg`'s `solve_with` used to):
+///
+/// 1. `Output = O` — the subgraph produces `O`;
+/// 2. `Handle = <O as OutputShape>::Handle` — so `and_then`'s closure can destructure
+///    its handle (the canonical `Pipe<_>` tuple), which is otherwise a bare unknown
+///    associated type;
+/// 3. `Checkouts = <O as OutputShape>::Checkouts` — so a terminal `sync` names them;
+/// 4. `Checkouts: FromCheckout<O>` — the obligation any op nested in a
+///    `bundle`/`and_then` must satisfy.
+///
+/// Blanket-implemented for every `DeviceOp` whose associated types already ARE the
+/// canonical [`OutputShape`] of its output — i.e. every built-in op — so `A:
+/// Subgraph<MyOut>` is one line in a `where`-clause instead of a four-line
+/// `DeviceOp<Output/Handle/Checkouts>` block plus a `FromCheckout` predicate. The
+/// [`meta_kernel!`](crate::meta_kernel) macro generates exactly this bound per
+/// subgraph parameter.
+pub trait Subgraph<O>:
+    DeviceOp<Output = O, Handle = <O as OutputShape>::Handle, Checkouts = <O as OutputShape>::Checkouts>
+where
+    O: OutputShape,
+    Self::Checkouts: FromCheckout<O>,
+{
+}
+
+impl<O, T> Subgraph<O> for T
+where
+    O: OutputShape,
+    T: DeviceOp<
+            Output = O,
+            Handle = <O as OutputShape>::Handle,
+            Checkouts = <O as OutputShape>::Checkouts,
+        >,
+    T::Checkouts: FromCheckout<O>,
+{
+}
+
 /// Builder verbs for composing [`DeviceOp`]s. Blanket-implemented.
 pub trait DeviceOpExt: DeviceOp + Sized {
     /// Sequential composition. **Eager**: runs `f` now with the upstream's

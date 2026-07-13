@@ -436,53 +436,38 @@ type AlphaOut = (
     DeviceScalar<f32>,
 );
 
-#[allow(clippy::type_complexity)]
-fn solve_with<CA, CB, A, B>(
+// `#[meta_kernel]` writes the generic-subgraph plumbing: each `subgraph!(Fn(inputs..)
+// -> Output)` parameter becomes a fresh closure generic bounded `Fn(inputs..) ->
+// __Out` with `__Out: Subgraph<Output>` (canonical OutputShape handle/checkouts +
+// FromCheckout). So the function form — no hand-written generics or where-clause —
+// is what an author writes, declaring only each subgraph's inputs and output.
+#[claspr::meta_kernel]
+fn solve_with(
     ctx: &Context,
     b_host: &[f32],
     has_host_seam: bool,
-    compute_alpha: CA,
-    compute_beta: CB,
-) -> claspr::Result<(Vec<f32>, usize, f32)>
-where
-    CA: Fn(
-        &gpu::Kernels,
-        Pipe<DeviceSlice<f32>>,
-        Pipe<DeviceSlice<f32>>,
-        DeviceSlice<f32>,
-        DeviceScalar<f32>,
-        DeviceScalar<f32>,
-        DeviceScalar<f32>,
-    ) -> A,
-    CB: Fn(
-        &gpu::Kernels,
-        Pipe<DeviceSlice<f32>>,
-        Pipe<DeviceSlice<f32>>,
-        Pipe<DeviceScalar<f32>>,
-        Pipe<DeviceScalar<f32>>,
-        DeviceScalar<f32>,
-    ) -> B,
-    // A's Output is the `AlphaOut` alias; its `Handle`/`Checkouts` are PROJECTED from
-    // it via `OutputShape` (normalizing to the concrete 6-tuples of `Pipe<_>` /
-    // `Checkout<_>`), so the shape is written ONCE. The `Handle` projection lets
-    // `compute_alpha(..).and_then(move |(p, ap, partials, alpha, nalpha, rsold)| ..)`
-    // destructure the 6 pipes; the `Checkouts` projection feeds the `FromCheckout`.
-    A: DeviceOp<
-            Output = AlphaOut,
-            Handle = <AlphaOut as claspr::eager::OutputShape>::Handle,
-            Checkouts = <AlphaOut as claspr::eager::OutputShape>::Checkouts,
-        >,
-    // A generic op nested in a `bundle`/`and_then` must prove
-    // `Checkouts: FromCheckout<Output>`; `AlphaOut` names the tuple already spelled.
-    A::Checkouts: claspr::FromCheckout<AlphaOut>,
-    // B's single-scalar shape likewise: `Output` once, `Handle`/`Checkouts` projected.
-    // `g.sync()` destructures B's `Checkouts`; `bundle2(x, rsnew)` feeds B's `Handle`.
-    B: DeviceOp<
-            Output = DeviceScalar<f32>,
-            Handle = <DeviceScalar<f32> as claspr::eager::OutputShape>::Handle,
-            Checkouts = <DeviceScalar<f32> as claspr::eager::OutputShape>::Checkouts,
-        >,
-{
+    compute_alpha: subgraph!(
+        Fn(
+            &gpu::Kernels,
+            Pipe<DeviceSlice<f32>>,
+            Pipe<DeviceSlice<f32>>,
+            DeviceSlice<f32>,
+            DeviceScalar<f32>,
+            DeviceScalar<f32>,
+            DeviceScalar<f32>,
+        ) -> AlphaOut
+    ),
+    compute_beta: subgraph!(
+        Fn(
+            &gpu::Kernels,
+            Pipe<DeviceSlice<f32>>,
+            Pipe<DeviceSlice<f32>>,
+            Pipe<DeviceScalar<f32>>,
+            Pipe<DeviceScalar<f32>>,
+            DeviceScalar<f32>,
+        ) -> DeviceScalar<f32>
+    ),
+) -> claspr::Result<(Vec<f32>, usize, f32)> {
     let kernels = gpu::kernels(ctx)?;
     let ks = &kernels;
 

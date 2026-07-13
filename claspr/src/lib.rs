@@ -182,7 +182,7 @@ pub use eager::{
 };
 
 // Stage-3 proc-macro frontend.
-pub use claspr_macros::{device, kernel, kernels};
+pub use claspr_macros::{device, kernel, kernels, meta_kernel};
 
 // Re-exports from opencl3 — the types users actually touch through
 // claspr's API.

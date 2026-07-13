@@ -65,7 +65,7 @@
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{
     Attribute, FnArg, Ident, ItemFn, Pat, PatType, Path, Signature, Token, Type, TypeMacro,
     TypeReference, TypeSlice, Visibility, parse_macro_input, spanned::Spanned,
@@ -102,6 +102,127 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
+}
+
+/// Author a **generic reusable-graph function** (a "meta-kernel") without the
+/// signature plumbing that generic subgraph composition otherwise forces.
+///
+/// A function that composes caller-supplied subgraphs (each a closure returning a
+/// `claspr::eager::DeviceOp`) normally has to declare, per subgraph parameter, a
+/// closure type generic, its result type generic, the `Fn(..) -> R` bound, and the
+/// `R: DeviceOp<Output/Handle/Checkouts>` + `FromCheckout` bounds — enough noise that
+/// the ergonomic escape hatch is to give up on the function form and inline
+/// everything as local closures (as `examples/gray-scott` once had to).
+///
+/// `#[meta_kernel]` restores the function form. Write each subgraph parameter with
+/// the marker type `subgraph!(Fn(inputs..) -> Output)`; the macro rewrites it to a
+/// fresh closure generic and injects the bounds:
+///
+/// ```ignore
+/// #[claspr::meta_kernel]
+/// fn solve_with(
+///     ctx: &Context,
+///     compute_alpha: subgraph!(Fn(&Kernels, Pipe<DeviceSlice<f32>>, /* .. */) -> AlphaOut),
+///     compute_beta:  subgraph!(Fn(&Kernels, /* .. */) -> DeviceScalar<f32>),
+/// ) -> claspr::Result<Vec<f32>> { /* body calls compute_alpha(..) / compute_beta(..) */ }
+/// ```
+///
+/// expands (per parameter `p: subgraph!(Fn(I..) -> O)`) to a generic closure param
+/// `p: __MkFn_p` with `__MkFn_p: Fn(I..) -> __MkOut_p` and
+/// `__MkOut_p: claspr::eager::Subgraph<O>` — the one bound that pins the canonical
+/// `OutputShape` handle/checkouts and the `FromCheckout` obligation. Non-`subgraph!`
+/// parameters and the body are untouched.
+#[proc_macro_attribute]
+pub fn meta_kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let func = parse_macro_input!(item as ItemFn);
+    match expand_meta_kernel(func) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn expand_meta_kernel(mut func: ItemFn) -> syn::Result<TokenStream2> {
+    let mut new_params: Vec<syn::GenericParam> = Vec::new();
+    let mut new_predicates: Vec<syn::WherePredicate> = Vec::new();
+
+    for arg in func.sig.inputs.iter_mut() {
+        let FnArg::Typed(pt) = arg else { continue };
+        // Only rewrite params whose declared type is the `subgraph!(...)` marker.
+        let Type::Macro(TypeMacro { mac }) = &*pt.ty else {
+            continue;
+        };
+        if !mac.path.is_ident("subgraph") {
+            continue;
+        }
+        // The parameter needs a plain name so we can mint readable generic idents.
+        let name = match &*pt.pat {
+            Pat::Ident(pi) => pi.ident.clone(),
+            other => {
+                return Err(syn::Error::new(
+                    other.span(),
+                    "meta_kernel: a `subgraph!(...)` parameter must have a simple name",
+                ));
+            }
+        };
+        // Parse the marker body as an `Fn(inputs..) -> Output` trait bound.
+        let bound: syn::TraitBound = syn::parse2(mac.tokens.clone()).map_err(|e| {
+            syn::Error::new(
+                mac.tokens.span(),
+                format!("meta_kernel: expected `subgraph!(Fn(inputs..) -> Output)` ({e})"),
+            )
+        })?;
+        let seg = bound.path.segments.last().ok_or_else(|| {
+            syn::Error::new(bound.span(), "meta_kernel: malformed subgraph bound")
+        })?;
+        let syn::PathArguments::Parenthesized(sig) = &seg.arguments else {
+            return Err(syn::Error::new(
+                bound.span(),
+                "meta_kernel: subgraph marker must be `Fn(inputs..) -> Output`",
+            ));
+        };
+        let inputs = &sig.inputs;
+        let output = match &sig.output {
+            syn::ReturnType::Type(_, t) => (**t).clone(),
+            syn::ReturnType::Default => {
+                return Err(syn::Error::new(
+                    sig.span(),
+                    "meta_kernel: a subgraph must declare its output — `Fn(..) -> Output`",
+                ));
+            }
+        };
+
+        // Mint per-parameter generics (param names are unique → so are these).
+        let clo = format_ident!("__MkFn_{}", name);
+        let out = format_ident!("__MkOut_{}", name);
+        *pt.ty = syn::parse_quote!(#clo);
+        new_params.push(syn::parse_quote!(#clo));
+        new_params.push(syn::parse_quote!(#out));
+        new_predicates.push(syn::parse_quote!(#clo: ::core::ops::Fn(#inputs) -> #out));
+        new_predicates.push(syn::parse_quote!(#out: ::claspr::eager::Subgraph<#output>));
+    }
+
+    if new_params.is_empty() {
+        return Err(syn::Error::new(
+            func.sig.span(),
+            "meta_kernel: no `subgraph!(Fn(..) -> Output)` parameters found — this \
+             attribute is only useful on a function that takes subgraph closures",
+        ));
+    }
+
+    for g in new_params {
+        func.sig.generics.params.push(g);
+    }
+    let where_clause = func.sig.generics.make_where_clause();
+    for p in new_predicates {
+        where_clause.predicates.push(p);
+    }
+
+    // The minted `__MkFn_*` / `__MkOut_*` type params are deliberately snake-ish for
+    // readable diagnostics; silence the camel-case lint on the generated function.
+    func.attrs
+        .push(syn::parse_quote!(#[allow(non_camel_case_types)]));
+
+    Ok(quote!(#func))
 }
 
 /// Mark a function **or a module** as device-side code — included in
