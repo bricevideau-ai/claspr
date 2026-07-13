@@ -30,16 +30,20 @@ green on pocl, gray-scott/cg bit-identical):
   read-once trait. The "CB is a skippable layer" goal is met instead by the module split.
 - **R5 — added `ARCHITECTURE.md`** (the layered "to change X, read Y" map) and **pruned
   `NOTES.md` 3119 → ~120 lines** (resolved history is in git). CLAUDE.md points at it.
-- **Module split — extracted `eager/cb.rs` (650), `eager/leaves.rs` (3042),
-  `eager/combinators.rs` (2836)**. `eager.rs` 11023 → 5173 lines. `pub use mod::*`
-  keeps macro-referenced public surface at its `::claspr::eager::` path;
-  `AndThen`/`OnDevice`/`AndThenHost*` fields + `run_eager_chain` are `pub(crate)` (their
-  `DeviceOpExt` builders stay in eager.rs).
-- **`eager/slots.rs` DEFERRED (entangled)** — `SlotBinder`'s internals are driven by
-  `fold_bind`/`probe_bind`, which are `DeviceOpExt` TRAIT methods in eager.rs; a clean
-  move needs those drivers relocated to slots.rs as free fns first (rewrite the trait
-  methods as thin wrappers). Attempted + reverted (pub(crate)-everything works but leaks
-  the binder abstraction + touches delicate bind logic). A real refactor, not a move.
+- **Module split — extracted `eager/cb.rs` (650), `eager/leaves.rs` (3092),
+  `eager/combinators.rs` (2836), `eager/slots.rs` (1513)**. `eager.rs` 11023 → **3674
+  lines (−67%)**. `pub use mod::*` keeps macro-referenced public surface at its
+  `::claspr::eager::` path; `AndThen`/`OnDevice`/`AndThenHost*` fields + `run_eager_chain`
+  + the `SlotBinder` internals (fields + inherent methods, scoped — NOT the `SlotValue`
+  trait's same-named `fill_clone`) + `SlotHandle::into_input` + `peek_deferred` are
+  `pub(crate)` (their drivers `fold_bind`/`probe_bind` stay in eager.rs). eager.rs now
+  holds the core only: Deps/Cell, Pipe/Input edge, Rehome, DeviceOp trait + DeviceOpExt
+  + terminals, Checkout, BindAll, CallArg, piped-verb methods.
+- **GAP FIX — device fill-from-uninit is now CB-recordable.** `FillDeviceUninit` writes
+  a `cl_mem` via the same `clCommandFillBufferKHR` as in-place `Fill` but had no CB fork
+  (weight defaulted 0), inconsistent with `Fill` + SVM `FillMappedUninit`. Added the CB
+  fork + weight-1. (`FillUsmUninit` correctly stays host-only — `fill_into` is a host
+  memset, not a device command.) Test: cb_execution_mode::fill_device_uninit_records_into_command_buffer.
 - **R4 — collapsed the 18 hand-written `KernelImage*Arg` marker traits into a
   `kernel_image_arg_traits!` macro + table** (image.rs −110 lines). Names preserved
   (proc-macro builds them via `format_ident!`). Bundle2..16 + the 2..16 tuple families
@@ -58,13 +62,18 @@ is a REAL parameterized refactor, not a mechanical collapse, so left for a focus
 - **Concrete-head terminal boilerplate:** `wait(self)`/`submit(self)` inherent impls
   repeated on ~12 leaves (`let ctx = concrete_buf_ctx(&self.FIELD)?; self.sync(&ctx)…`),
   varying only by field + return type — a `concrete_head_terminals!(field, Out)` macro.
-- **Slots-driver relocation** (enables `eager/slots.rs`, see above).
 - **`OutputShape`** (user-ergonomics track #238-240): derive `Handle`/`Checkouts` from
   `Output`, shrinking generic-subgraph where-clauses — cg `solve_with` exhibit.
 
-VERIFIED (whole branch, tip `85af3b6`): all 9 examples build; claspr + claspr-test-image-kernels
-build clean; tier2 309/0 on pocl (3-ICD sign-off pending). fmt/clippy(-workspace)/doc clean.
-Rollback tag `pre-refactor-agent-cost-20260712`. First 5 commits already FF'd to main
+(slots.rs extraction: DONE via scoped `pub(crate)` — the driver-relocation refactor
+turned out unnecessary; making the `SlotBinder` inherent surface `pub(crate)` was
+sufficient + non-leaky since `SlotBinder` is already crate-internal.)
+
+VERIFIED (whole branch, tip `dddcbd5`): all 9 examples build; claspr + claspr-test-image-kernels
+build clean; **tier1 91/0 + tier2 310/0 on all 3 ICDs** (pocl, rusticl/llvmpipe,
+intel_legacy); `clippy --workspace --all-targets --release -D warnings` + `doc --workspace`
++ fixtures `rustfmt --check` all clean. Rollback tag `pre-refactor-agent-cost-20260712`.
+Earlier commits already FF'd to main
 (`17f575e`); commits since (leaves/combinators/R4) awaiting the 3-ICD run.
 
 ---

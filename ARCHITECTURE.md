@@ -16,12 +16,21 @@ Tier 1 — buffers, images, context, queue        access.rs buffer.rs image.rs
 op / launch — one kernel launch                  op.rs launch.rs
   LaunchOp (clEnqueueNDRangeKernel), KernelArg(s), LaunchSpec
         │
-Tier 2 — the eager device-operation graph        eager.rs   (the big one)
-  DeviceOp trait, combinators, leaves, slots
+Tier 2 — the eager device-operation graph        eager.rs + eager/
+  DeviceOp trait, edge (Pipe/Input), terminals   eager.rs        (core, ~3.7k)
+    combinators (AndThen/Bundle/FanOut/…)         eager/combinators.rs
+    leaf ops (fill/upload/download/copy/…)        eager/leaves.rs
+    typed-slot reuse machinery                    eager/slots.rs
+    command-buffer recording helpers              eager/cb.rs
         │
 CB recording — command-buffer acceleration       record.rs exec_ctx.rs
   CbBuilder/FinalizedCb, CbWalk, sync points
 ```
+
+`eager.rs` was one 11k-line file; it's now split so an agent opens the ~2-3k-line
+submodule for its concern (a leaf → `leaves.rs`, a combinator → `combinators.rs`,
+slots → `slots.rs`, command buffers → `cb.rs`) instead of the whole thing. The
+submodules are re-exported (`pub use <mod>::*`) so external paths are unchanged.
 
 Each layer depends only on the ones below it. A change to Tier 2 rarely needs Tier 1
 internals (just the public `DeviceSlice`/`Image2D`/`Context` types).
@@ -63,7 +72,7 @@ subtree opens ONE command buffer at a boundary and re-enters `execute` in `Build
 
 - `record.rs` — `CbBuilder` (live recording target), `FinalizedCb` (immutable, replayed
   once per `sync`, RAII-released), `BufHandle`/`MemRef`/`RecordableBuffer` (arg handles).
-- `eager.rs` CB helpers (all `cb_*`, one contiguous block): `cb_boundary_execute`/
+- `eager/cb.rs` CB helpers (all `cb_*`): `cb_boundary_execute`/
   `cb_boundary_gather` (open a CB), `cb_leaf_build` (a command leaf's Build prologue —
   external deps + waits + the precise-invalidation reach), `cb_forward_reach` (the
   passthrough twin), the span logic (`cb_should_open_span`/`cb_close_span`).
@@ -78,11 +87,11 @@ subtree opens ONE command buffer at a boundary and re-enters `execute` in `Build
 
 | You want to… | Read | Don't need |
 |---|---|---|
-| add/modify a Tier 2 leaf op (fill/copy/transfer) | the leaf's struct + `impl DeviceOp` in `eager.rs`; `Input`/`Pipe`/home; `cb_leaf_build` if it records | slot internals, other leaves |
+| add/modify a Tier 2 leaf op (fill/copy/transfer) | the leaf's struct + `impl DeviceOp` in `eager/leaves.rs`; `Input`/`Pipe`/home; `cb_leaf_build` if it records | slot internals, other leaves |
 | add a kernel arg kind | `claspr-macros/src/lib.rs` (`classify_param`/`classify_image_param`) + the matching `Kernel*Arg` trait in `launch.rs`/`image.rs` | Tier 2 combinators, CB |
-| change composition (and_then/bundle/fan_out) | the combinator structs + `DeviceOpExt` in `eager.rs` | leaves, Tier 1 |
-| touch slots / bind verbs | the slot machinery in `eager.rs` (`SlotState`/`SlotBinder`/`Input::Slot`/`ScalarInput`) + `tier2_macros.rs` (`slots!`) | CB, leaves |
-| touch command-buffer recording | `record.rs` + the `cb_*` block in `eager.rs` + `exec_ctx.rs` (`CbWalk`, sync points, reach) | slot verbs, Tier 1 |
+| change composition (and_then/bundle/fan_out) | the combinator structs in `eager/combinators.rs` (+ the `DeviceOpExt` builders in `eager.rs`) | leaves, Tier 1 |
+| touch slots / bind verbs | `eager/slots.rs` (`SlotState`/`SlotBinder`/`ScalarInput`) + `Input::Slot` in eager.rs + `tier2_macros.rs` (`slots!`) | CB, leaves |
+| touch command-buffer recording | `record.rs` + `eager/cb.rs` + `exec_ctx.rs` (`CbWalk`, sync points, reach) | slot verbs, Tier 1 |
 | touch access modes / buffer memory | `access.rs` (markers) + `buffer.rs`/`mapped.rs`/`usm.rs` | Tier 2 |
 
 ## Invariants that bite if broken
