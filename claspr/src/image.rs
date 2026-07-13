@@ -1853,170 +1853,60 @@ mod kernel_image_arg_sealed {
 // but the bound has to appear explicitly here for the trait impls
 // to satisfy the supertrait `Send + 'static`.
 
-/// Host-side counterpart for a kernel `&Image!(1D, type=...)`
-/// parameter (kernel declared `ReadOnly`).
-///
-/// Implemented only by `Image1D<ReadOnly, F>` where `F`'s sampled
-/// family matches the kernel-side `type=` keyword. Other access
-/// markers (`WriteOnly`, `ReadWrite`) are intentionally rejected —
-/// see the section comment above for the "exact-access" rationale.
-pub trait KernelImage1DReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
+macro_rules! kernel_image_arg_traits {
+    ($( $name:ident => $doc:literal ),+ $(,)?) => { $(
+        #[doc = $doc]
+        ///
+        /// Marker trait (see the section comment above for the exact-access +
+        /// `SampledTypeFamily`-parameterization rationale). Impl'd only by the
+        /// matching owning `Image*` type via `impl_image_enqueue!`.
+        pub trait $name<SF: format::SampledTypeFamily>:
+            KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
+        {
+        }
+    )+ };
 }
 
-/// Host-side counterpart for a kernel `&mut Image!(1D, ...,
-/// access="write_only")` parameter.
-///
-/// Implemented only by `Image1D<WriteOnly, F>` where `F`'s sampled
-/// family matches. WriteOnly host images can't be read on the
-/// kernel side, but they don't need `ImageReadWrite` capability —
-/// the right choice for OpenCL 1.2 output kernels.
-pub trait KernelImage1DWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel `&mut Image!(1D, ...)`
-/// parameter (kernel declared `ReadWrite` — default for `&mut`).
-///
-/// Implemented only by `Image1D<ReadWrite, F>` where `F`'s sampled
-/// family matches. Requires `ImageReadWrite` capability + OpenCL
-/// 2.0+ device support; the rust-gpu codegen auto-declares the
-/// capability when emitting any `ReadWrite OpTypeImage`.
-pub trait KernelImage1DReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel `&Image!(2D, type=...)`
-/// parameter — see [`KernelImage1DReadArg`] for details.
-pub trait KernelImage2DReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel `&mut Image!(2D, ...,
-/// access="write_only")` parameter — see [`KernelImage1DWriteArg`].
-pub trait KernelImage2DWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel `&mut Image!(2D, ...)`
-/// parameter — see [`KernelImage1DReadWriteArg`].
-pub trait KernelImage2DReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel `&Image!(buffer, type=...)`
-/// parameter — see [`KernelImage1DReadArg`].
-///
-/// Implemented by [`Image1DBuffer<ReadOnly, F>`] and
-/// [`Image1DBuffer<ReadWrite, F>`]. The kernel-side
-/// `image1d_buffer_t` reads/writes typed pixels backed by a
-/// `cl_mem` buffer object — `clCreateImage` with
-/// `CL_MEM_OBJECT_IMAGE1D_BUFFER` shares storage with the buffer
-/// it was created from, so the same data can be read as a typed
-/// 1D image from a kernel and as raw bytes (or typed elements)
-/// through the buffer API.
-pub trait KernelImageBufferReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel `&mut Image!(buffer, ...,
-/// access="write_only")` parameter — see
-/// [`KernelImageBufferReadArg`] for the storage model.
-pub trait KernelImageBufferWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel `&mut Image!(buffer, ...)`
-/// parameter (kernel declared `ReadWrite`) — see
-/// [`KernelImageBufferReadArg`].
-pub trait KernelImageBufferReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel `&Image!(3D, type=...)`
-/// parameter — see [`KernelImage1DReadArg`].
-pub trait KernelImage3DReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel `&mut Image!(3D, ...,
-/// access="write_only")` parameter — see [`KernelImage1DWriteArg`].
-pub trait KernelImage3DWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel `&mut Image!(3D, ...)`
-/// parameter — see [`KernelImage1DReadWriteArg`].
-pub trait KernelImage3DReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-// 1D-array and 2D-array trait families — mirror the dim-1/2/3
-// pattern. Kernel-side coord is one component wider than the
-// non-arrayed form: `Image!(1D, arrayed=true, ...)` takes
-// `IVec2(x, layer)`, `Image!(2D, arrayed=true, ...)` takes
-// `IVec3(x, y, layer)`. Host-side region for upload/download
-// substitutes the array_size dimension for height (1D-array) or
-// depth (2D-array) per the OpenCL spec.
-
-/// Host-side counterpart for a kernel
-/// `&Image!(1D, arrayed=true, type=...)` parameter — see
-/// [`KernelImage1DReadArg`].
-pub trait KernelImage1DArrayReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel
-/// `&mut Image!(1D, arrayed=true, ..., access="write_only")`
-/// parameter — see [`KernelImage1DWriteArg`].
-pub trait KernelImage1DArrayWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel
-/// `&mut Image!(1D, arrayed=true, ...)` parameter — see
-/// [`KernelImage1DReadWriteArg`].
-pub trait KernelImage1DArrayReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel
-/// `&Image!(2D, arrayed=true, type=...)` parameter — see
-/// [`KernelImage1DReadArg`].
-pub trait KernelImage2DArrayReadArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel
-/// `&mut Image!(2D, arrayed=true, ..., access="write_only")`
-/// parameter — see [`KernelImage1DWriteArg`].
-pub trait KernelImage2DArrayWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
-}
-
-/// Host-side counterpart for a kernel
-/// `&mut Image!(2D, arrayed=true, ...)` parameter — see
-/// [`KernelImage1DReadWriteArg`].
-pub trait KernelImage2DArrayReadWriteArg<SF: format::SampledTypeFamily>:
-    KernelArg + Send + 'static + kernel_image_arg_sealed::Sealed
-{
+// Host-side arg traits, one per (dimensionality x access qualifier). The kernel
+// proc-macro selects the variant by `format_ident!("KernelImage{dim}{access}Arg")`,
+// so these names are load-bearing.
+kernel_image_arg_traits! {
+    KernelImage1DReadArg =>
+        "Host arg for a kernel `&Image!(1D, ...)` parameter the kernel declared read_only.",
+    KernelImage1DWriteArg =>
+        "Host arg for a kernel `&Image!(1D, ...)` parameter the kernel declared write_only.",
+    KernelImage1DReadWriteArg =>
+        "Host arg for a kernel `&Image!(1D, ...)` parameter the kernel declared read_write.",
+    KernelImage2DReadArg =>
+        "Host arg for a kernel `&Image!(2D, ...)` parameter the kernel declared read_only.",
+    KernelImage2DWriteArg =>
+        "Host arg for a kernel `&Image!(2D, ...)` parameter the kernel declared write_only.",
+    KernelImage2DReadWriteArg =>
+        "Host arg for a kernel `&Image!(2D, ...)` parameter the kernel declared read_write.",
+    KernelImageBufferReadArg =>
+        "Host arg for a kernel `&Image!(1D-buffer, ...)` parameter the kernel declared read_only.",
+    KernelImageBufferWriteArg =>
+        "Host arg for a kernel `&Image!(1D-buffer, ...)` parameter the kernel declared write_only.",
+    KernelImageBufferReadWriteArg =>
+        "Host arg for a kernel `&Image!(1D-buffer, ...)` parameter the kernel declared read_write.",
+    KernelImage3DReadArg =>
+        "Host arg for a kernel `&Image!(3D, ...)` parameter the kernel declared read_only.",
+    KernelImage3DWriteArg =>
+        "Host arg for a kernel `&Image!(3D, ...)` parameter the kernel declared write_only.",
+    KernelImage3DReadWriteArg =>
+        "Host arg for a kernel `&Image!(3D, ...)` parameter the kernel declared read_write.",
+    KernelImage1DArrayReadArg =>
+        "Host arg for a kernel `&Image!(1D-array, ...)` parameter the kernel declared read_only.",
+    KernelImage1DArrayWriteArg =>
+        "Host arg for a kernel `&Image!(1D-array, ...)` parameter the kernel declared write_only.",
+    KernelImage1DArrayReadWriteArg =>
+        "Host arg for a kernel `&Image!(1D-array, ...)` parameter the kernel declared read_write.",
+    KernelImage2DArrayReadArg =>
+        "Host arg for a kernel `&Image!(2D-array, ...)` parameter the kernel declared read_only.",
+    KernelImage2DArrayWriteArg =>
+        "Host arg for a kernel `&Image!(2D-array, ...)` parameter the kernel declared write_only.",
+    KernelImage2DArrayReadWriteArg =>
+        "Host arg for a kernel `&Image!(2D-array, ...)` parameter the kernel declared read_write.",
 }
 
 // ── Sealed marker impls (one per (Image<dim>D, A, F) combo) ────────
