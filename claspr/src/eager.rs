@@ -3894,28 +3894,6 @@ pub trait DeviceOp: Send {
         false
     }
 
-    /// Record this op's device commands into `ctx` — the **non-consuming twin of
-    /// [`execute`](Self::execute)** used by the command-buffer path (see
-    /// [`crate::record`]). Walk `&self`, resolve inputs from `ctx`'s edge map (a
-    /// concrete buffer, or an upstream producer's output keyed by
-    /// [`cell_id`](Pipe::cell_id)), emit the op's device commands, and register its
-    /// output handle(s) under its output pipe(s) — threading
-    /// [`SyncPoints`](crate::record::SyncPoints) where `execute` threads
-    /// [`Deps`].
-    ///
-    /// **Default: not recordable.** Host-touching leaves (`Upload`/`Download`/the
-    /// host seams) and any op with no device-command lowering inherit this error,
-    /// so a graph that reaches one on the CB path falls back to the per-op execute
-    /// path. Device ops (kernels, `fill`, copy, and the structural combinators)
-    /// override it. This replaces the former `RecordableOp` sub-trait: recordability
-    /// is now a **run-time** property (the default errors) rather than a
-    /// compile-time bound, which is what lets the segmenter walk a mixed graph by
-    /// `&dyn DeviceOp` and record only its seam-free subtrees.
-    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
-        let _ = ctx;
-        Err(Error::NotSupported("op is not device-recordable"))
-    }
-
     /// Whether this WHOLE (sub)graph can be added to a command buffer as-is
     /// (design v2 eligibility): every node is a device command (`fill`, `copy`,
     /// kernel), a structural passthrough (`forward`/`lift`/`arced`/`Pipe`), or a
@@ -5845,17 +5823,6 @@ where
         self.source.contains_host_seam() || self.next.contains_host_seam()
     }
 
-    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
-        // Record source first (registers its outputs), then next (which resolves
-        // its inputs from those edges) — the same source-before-next order as
-        // `execute`. A non-recordable child (a host seam nested in this subtree)
-        // errors via the `DeviceOp::record` default; the segmenter only records a
-        // subtree once `contains_host_seam()` has proven it seam-free, so on the CB
-        // path this recursion never actually hits the error.
-        self.source.record(ctx)?;
-        self.next.record(ctx)
-    }
-
     fn cb_cache(&self) -> Option<&CbCache> {
         Some(&self.cb_cache)
     }
@@ -6094,16 +6061,6 @@ impl<T: crate::record::RecordableBuffer + Send + 'static> DeviceOp for Lift<T> {
     fn describe(&self, out: &mut Vec<String>) {
         out.push("lift".into());
     }
-
-    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
-        // Like `Forward`: a lifted concrete device resource is a chain head with no
-        // command. Resolve its handle from the lift's own `Concrete` cell and
-        // register it under the output pipe so downstream consumers find it.
-        let concrete = self.input.with_concrete(|b| b.record_handle());
-        let (handle, waits) = ctx.resolve_input(concrete, self.input.pipe_cell_id())?;
-        ctx.register_output(self.out.cell_id(), handle, waits);
-        Ok(())
-    }
 }
 
 // ── Forward: select/identity — make one upstream Pipe a single-output op ──
@@ -6192,19 +6149,6 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
         out.push("forward".into());
     }
 
-    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
-        // Identity: no command. `forward` is ALWAYS pipe-fed (its constructor
-        // wraps a `Pipe`), so there is no concrete buffer to read a handle from —
-        // resolve the upstream producer's output and re-register it under our OWN
-        // output pipe's cell, so a downstream consumer resolving from the forwarded
-        // pipe finds the same buffer with the same pending sync points. Purely a
-        // pipe-alias in the edge map — mirrors `execute`'s resolve+re-deposit with
-        // no device work. Passing `None` for the concrete side keeps this override
-        // free of the `RecordableBuffer` bound (which `execute` also doesn't need).
-        let (handle, waits) = ctx.resolve_input(None, self.input.pipe_cell_id())?;
-        ctx.register_output(self.out.cell_id(), handle, waits);
-        Ok(())
-    }
 }
 
 // ── DeviceDynOp: type-erased single-output op for conditional graphs ─────
@@ -6470,28 +6414,6 @@ where
         self.source.contains_host_seam()
     }
 
-    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
-        // `Arc` is a host-side wrap — no command. Record the source (registers
-        // its output buffer under the source pipe's cell), then alias that same
-        // handle under our own output pipe so a downstream reader of the
-        // `Arc<buffer>` resolves to the underlying buffer + its sync points. The
-        // source's own `record` errors (via the default) if it is not recordable;
-        // resolving `None`/`Some(src_cell)` needs no `RecordableBuffer` bound.
-        self.source.record(ctx)?;
-        // `arced` wraps a SINGLE-output source (its `Output` is one buffer it
-        // `Arc`s), so the source always has a single storage pipe to key its edge
-        // by; a multi-output source has no such single cell to alias here.
-        let src_cell = self
-            .source
-            .output_pipe()
-            .ok_or(Error::NotSupported(
-                "record: arced source has no single output pipe (multi-output arced is unsupported)",
-            ))?
-            .cell_id();
-        let (handle, waits) = ctx.resolve_input(None, Some(src_cell))?;
-        ctx.register_output(self.out.cell_id(), handle, waits);
-        Ok(())
-    }
 }
 
 // ── ArcSplit: fan one Arc output to N read-only branches ───────────────
@@ -7569,30 +7491,6 @@ where
         out.push("fill".into());
     }
 
-    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
-        use crate::record::{BufHandle, MemRef};
-        use opencl3::memory::ClMem;
-        // Resolve the buffer: this op's concrete input (chain head) or the
-        // upstream producer's output (mid-chain, in-place fill).
-        let concrete = self.buf.with_concrete(|b| BufHandle {
-            mem: MemRef::Buffer(b.buffer().get()),
-            byte_len: b.byte_len(),
-        });
-        let (handle, waits) = ctx.resolve_input(concrete, self.buf.pipe_cell_id())?;
-        // Byte pattern of the fill value.
-        // SAFETY: `T: Copy`; read its `size_of::<T>()` bytes.
-        let pattern = unsafe {
-            std::slice::from_raw_parts(
-                (&self.value as *const T) as *const u8,
-                std::mem::size_of::<T>(),
-            )
-        }
-        .to_vec();
-        let sp = ctx.fill_buffer(handle.mem, pattern, 0, handle.byte_len, waits);
-        // Fill is in-place: its output is the same buffer, gated on this command.
-        ctx.register_output(self.out.cell_id(), handle, vec![sp]);
-        Ok(())
-    }
 }
 
 impl<T, M> Fill<T, M>
@@ -10461,30 +10359,6 @@ where
         }
     }
 
-    fn record(&self, ctx: &mut crate::record::RecordContext) -> Result<()> {
-        // `record_handle` comes from the `RecordableBuffer` bound on Src/Dst.
-        // Resolve src + dst (own concrete buffer, or upstream producer edge).
-        let src_concrete = self.src.with_concrete(|b| b.record_handle());
-        let (src_h, src_w) = ctx.resolve_input(src_concrete, self.src.pipe_cell_id())?;
-        let dst_concrete = self.dst.with_concrete(|b| b.record_handle());
-        let (dst_h, dst_w) = ctx.resolve_input(dst_concrete, self.dst.pipe_cell_id())?;
-        // The copy moves `min(src,dst)` bytes (both equal in practice).
-        let size = src_h.byte_len.min(dst_h.byte_len);
-        // Merge src + dst producer edges through a set: if both resolve to the same
-        // upstream producer, its sync point must appear ONCE (a wait-list is a set).
-        let waits: Vec<_> = src_w
-            .into_iter()
-            .chain(dst_w)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let sp = ctx.copy_buffer(src_h.mem, dst_h.mem, 0, 0, size, waits);
-        // Output is `(src, dst)`; both element pipes carry their handle, gated on
-        // the copy. (The dst is now initialised — its bytes were written.)
-        ctx.register_output(self.src_pipe.cell_id(), src_h, vec![sp]);
-        ctx.register_output(self.dst_pipe.cell_id(), dst_h, vec![sp]);
-        Ok(())
-    }
 }
 
 // ── Piped-buffer verb methods: a piped buffer behaves as a buffer ───────────
