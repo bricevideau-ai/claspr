@@ -9,6 +9,61 @@ items resolve.
 
 ## Active
 
+### 🔎 INVESTIGATION 2026-07-12 — Tier 2 "gap to entry" refactor scoping (CB now merged, so unblocked)
+
+Brice: "I still find the gap to entry to be huge" (2026-07-09) — wanted a simplification
+pass AFTER CB support lands. CB is merged + verified (+ leak-clean on all 3 ICDs, all 9
+samples, cliloader 2026-07-12), so this is now actionable. Measured the ACTUAL barrier
+(two independent passes — coordinator + Explore subagent — agree):
+
+FACTS (eager.rs @ bcaf04e):
+- 11,722 lines, single file (was 10,354 on 2026-07-09; CB added ~1.4k). 44 `impl DeviceOp`,
+  234 total impls, 52 structs.
+- `DeviceOp` trait: supertrait `Send` only, NO trait-level where-clause. 3 assoc types
+  (`Output: Send` required; `Handle: Clone = Pipe<Output>` and `Checkouts = Checkout<Output>`
+  both DEFAULTED). 4 required members (`Output` + `output_pipe`/`execute`/`describe`); 18
+  provided (all the CB/gather/introspection surface has defaults).
+
+THE GAP IS NOT WHERE THE MEMORY SAID. Refined findings:
+1. **Nobody hand-writes `DeviceOp`.** Zero `impl DeviceOp` in examples/ or tests/ — every op
+   is either the `#[claspr::kernel]` macro output (author writes a plain kernel fn, ZERO
+   DeviceOp code) or a built-in leaf/combinator. So "writing a new op" is NOT the entry gap
+   for the common user. (A hand-rolled NON-kernel leaf like Fill=~10 methods, CopyTo2=~18 +
+   a 6-bound where-clause IS heavy — but that's a FRAMEWORK-author cost, not a user cost.)
+2. **The real user-facing tax is the GENERIC-SUBGRAPH signature.** Exhibit: cg `solve_with`
+   (examples/cg/src/main.rs:426) — a ~70-line where-clause that must spell
+   `A: DeviceOp<Output=(6-tuple), Handle=(6-tuple of Pipe)>`, `B: DeviceOp<Output=,Handle=,
+   Checkouts=>`, AND `A::Checkouts: FromCheckout<(6-tuple)>`. The comment at cg:465 even
+   says "vs the trait's SIX signature blocks."
+3. **ROOT CAUSE of #2: `Handle`/`Checkouts` are not derivable from `Output`.** They default
+   to `Pipe<Output>`/`Checkout<Output>` (fine for SINGLE output), but a TUPLE output must
+   override both to tuples-of-Pipe / tuples-of-Checkout (macro does exactly this,
+   claspr-macros/src/lib.rs:1690/1697 — mechanically, `Handle`=map(Output,Pipe),
+   `Checkouts`=map(Output,Checkout)). There is NO trait mapping Output→Handle→Checkouts, so
+   a generic composer naming a multi-output subgraph must restate all three by hand.
+4. **Closures dodge the tax entirely.** gray-scott's `get_meta_kernel`/`curried_kernel` are
+   LOCAL closures (gray-scott:673/706), fully type-inferred, no signature — the ergonomic
+   escape hatch. Only a NAMED generic fn (cg's testable/reused `solve_with`) pays.
+
+HIGHEST-LEVERAGE TARGETS (measure success by cg's `solve_with` where-clause shrinking, per
+the memory's yardstick — NOT internal LOC):
+- (A) An `OutputShape` trait deriving `Handle` + `Checkouts` from `Output` (single + tuple
+  arities via a tuple-family macro). Then `DeviceOp` could carry `Handle = <Output as
+  OutputShape>::Handle` etc. as the default, and a composer writes `A: DeviceOp<Output=T>`
+  and gets Handle/Checkouts for free — collapsing solve_with's 3 blocks + FromCheckout to 1.
+  RISK: assoc-type defaults referencing other assoc types + coherence on the tuple family;
+  prototype on a scratch branch before committing.
+- (B) Split eager.rs (~11.7k) along the existing section banners: slot machinery (826–1750,
+  2853–3324), edges/Input (1893–2852), DeviceOp trait + terminals (3452–4946), combinators
+  (5583–7411), leaf ops (7412–end). Pure module move, no API change — reduces navigation
+  cost, orthogonal to (A). Do (A) first (it's the actual gap); (B) is cosmetic relief.
+- (C) NOT worth it: reducing the 18 provided-method surface (already all-defaulted, invisible
+  to users) or the required-method count (already only 4).
+
+STATUS: scoping only, NO code. Next step when picking this up: prototype (A)'s `OutputShape`
+on a scratch branch, rewrite cg `solve_with` against it, and diff the where-clause line count
+as the acceptance metric. See [[project_claspr_simplify_gap_to_entry]].
+
 ### ✅ LANDED 2026-07-11 — CB-as-EXECUTION-MODE (branch cb-support-20260711)
 
 Automatic, invisible command buffers shipped on `cb-support-20260711` (not pushed).
