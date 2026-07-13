@@ -2,6 +2,8 @@
 
 Single-source OpenCL with [rust-gpu](https://github.com/Rust-GPU/rust-gpu). Kernel + host code in one Rust file (or split across files), build script extracts the kernel side into a generated sub-crate compiled by rust-gpu, proc-macro emits a typed launch wrapper. Built on top of [`bricevideau-ai/rust-gpu`](https://github.com/bricevideau-ai/rust-gpu) branch `opencl-kernel-support`.
 
+**Before changing runtime code, read `ARCHITECTURE.md`** — the layered map + a "to change X, read Y" index, so you load one subsystem (Tier 1 / op-launch / Tier 2 eager graph / CB recording) instead of the whole tree. This file (`CLAUDE.md`) covers the single-source *compilation pipeline*; `ARCHITECTURE.md` covers the *runtime library*.
+
 ## Workspace
 
 ```
