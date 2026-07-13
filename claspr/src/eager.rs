@@ -324,6 +324,57 @@ pub(crate) fn cb_origins_of(
     origins
 }
 
+/// **CB Build-mode prologue for a single-input → single-output COMMAND leaf** — the
+/// shared bookkeeping every recording leaf (`fill`, SVM fill, a single-output
+/// kernel arg) does before emitting its one `clCommand*KHR`. Factored into ONE
+/// place because it is the precise-invalidation substrate (the subtle, once-buggy
+/// cross-seam reach propagation) and must stay identical across leaves:
+///
+/// 1. thread this span's ENTRY deps (producers outside the CB) into `ext`;
+/// 2. compute the input's sync-point wait-list (returned, for the command);
+/// 3. resolve the input's slot origins ([`cb_origins_of`]) and `note_slot` each
+///    into the live CB (so a `mutate_bind` of that slot invalidates this CB);
+/// 4. propagate those origins onto the OUTPUT cell's reach, so a downstream leaf —
+///    even across a host seam — traces this buffer back to the mutable slot.
+///
+/// The caller then records its command with the returned waits and deposits the
+/// (lent) buffer with empty deps. See [`cb_forward_reach`] for the passthrough
+/// (no-command) twin.
+pub(crate) fn cb_leaf_build(
+    ec: &ExecutionContext<'_>,
+    builder: &crate::record::CbBuilder,
+    ext: &Mutex<Vec<Dep>>,
+    deps: &Deps,
+    in_slot: Option<usize>,
+    in_pipe: Option<usize>,
+    out_cell: usize,
+) -> std::collections::BTreeSet<crate::cl_sync_point_khr> {
+    cb_collect_external(ext, deps);
+    let waits = ec.sp_lookup(in_pipe);
+    let origins = cb_origins_of(ec, in_slot, in_pipe);
+    for &s in &origins {
+        builder.note_slot(s);
+    }
+    ec.cb_reach_extend(out_cell, origins);
+    waits
+}
+
+/// **CB reach propagation for a PASSTHROUGH node** (no recorded command) — the
+/// structural twin of [`cb_leaf_build`] for `forward` / `lift` / `arced` /
+/// `arc_split` / bundles / host seams. A passthrough emits nothing into the CB, so
+/// it neither `note_slot`s nor gathers waits; it only forwards the reach of its
+/// source cell onto `out_cell` so the precise-invalidation origin trail survives
+/// the alias. `src_cell` is the producer whose reach to inherit (a slot origin, if
+/// any, is unioned in).
+pub(crate) fn cb_forward_reach(
+    ec: &ExecutionContext<'_>,
+    in_slot: Option<usize>,
+    src_cell: Option<usize>,
+    out_cell: usize,
+) {
+    ec.cb_reach_extend(out_cell, cb_origins_of(ec, in_slot, src_cell));
+}
+
 /// Whether a graph is CB-eligible RIGHT NOW: the platform advertises
 /// `cl_khr_command_buffer` and the graph has no host seam. (The all-`cl_mem`
 /// requirement is enforced dynamically — an SVM command marks the live builder
@@ -6035,12 +6086,14 @@ impl<T: crate::record::RecordableBuffer + Send + 'static> DeviceOp for Lift<T> {
                 // our cell yields empty; the CB's external deps carry any real
                 // wait). Its own deps (e.g. the start gate) become external deps.
                 cb_collect_external(ext, &deps);
-                // Precise-invalidation reach: forward this lift's slot/pipe origins
-                // onto the output pipe so a downstream leaf in the SAME CB (or across
-                // a seam) traces its buffer back to the mutable slot.
-                let origins =
-                    cb_origins_of(ec, self.input.slot_cell_id(), self.input.pipe_cell_id());
-                ec.cb_reach_extend(self.out.cell_id(), origins);
+                // Passthrough (no command): forward this lift's slot/pipe origins onto
+                // the output pipe so a downstream leaf still traces to the mutable slot.
+                cb_forward_reach(
+                    ec,
+                    self.input.slot_cell_id(),
+                    self.input.pipe_cell_id(),
+                    self.out.cell_id(),
+                );
                 self.out.put_home(v, Deps::new(), home);
             }
         }
@@ -6119,12 +6172,14 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
                 cb_collect_external(ext, &deps);
                 let sps = ec.sp_lookup(upstream_cell);
                 ec.sp_register(self.out.cell_id(), sps);
-                // Precise-invalidation reach: forward the upstream pipe's origins
-                // onto our output cell (identity alias), parallel to the sync-point
-                // re-register above — a `slot!` threaded through this forward keeps
-                // its origin trail unbroken.
-                let origins = cb_origins_of(ec, self.input.slot_cell_id(), upstream_cell);
-                ec.cb_reach_extend(self.out.cell_id(), origins);
+                // Passthrough (identity alias): forward the upstream origins onto our
+                // output cell, parallel to the sync-point re-register above.
+                cb_forward_reach(
+                    ec,
+                    self.input.slot_cell_id(),
+                    upstream_cell,
+                    self.out.cell_id(),
+                );
                 self.out.put_home(v, Deps::new(), home);
             }
             CbWalk::LendOnly { ext, .. } => {
@@ -6148,7 +6203,6 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
     fn describe(&self, out: &mut Vec<String>) {
         out.push("forward".into());
     }
-
 }
 
 // ── DeviceDynOp: type-erased single-output op for conditional graphs ─────
@@ -6345,10 +6399,9 @@ where
                 if let Some(src_cell) = self.source.output_pipe().map(|p| p.cell_id()) {
                     let sps = ec.sp_lookup(Some(src_cell));
                     ec.sp_register(self.out.cell_id(), sps);
-                    // Precise-invalidation reach: forward the source's origins onto
-                    // our cell too (parallel to the sync-point alias).
-                    let origins = ec.cb_reach_of(Some(src_cell));
-                    ec.cb_reach_extend(self.out.cell_id(), origins);
+                    // Passthrough: forward the source's origins onto our cell too
+                    // (parallel to the sync-point alias).
+                    cb_forward_reach(ec, None, Some(src_cell), self.out.cell_id());
                 }
                 self.out.put(Arc::new(v), Deps::new());
             }
@@ -6413,7 +6466,6 @@ where
     fn contains_host_seam(&self) -> bool {
         self.source.contains_host_seam()
     }
-
 }
 
 // ── ArcSplit: fan one Arc output to N read-only branches ───────────────
@@ -6503,14 +6555,11 @@ where
                 // downstream CB consumer of a clone finds them; deposit empty deps.
                 let src_cell = self.source.output_pipe().map(|p| p.cell_id());
                 let sps = src_cell.map(|c| ec.sp_lookup(Some(c))).unwrap_or_default();
-                // Precise-invalidation reach: every branch inherits the source's
-                // origins (parallel to the sync-point alias).
-                let origins = src_cell
-                    .map(|c| ec.cb_reach_of(Some(c)))
-                    .unwrap_or_default();
+                // Passthrough: every branch inherits the source's origins (parallel
+                // to the sync-point alias).
                 for out in &self.outs {
                     ec.sp_register(out.cell_id(), sps.clone());
-                    ec.cb_reach_extend(out.cell_id(), origins.iter().copied());
+                    cb_forward_reach(ec, None, src_cell, out.cell_id());
                     out.put(v.clone(), Deps::new());
                 }
             }
@@ -7137,18 +7186,17 @@ where
         // (no marker — join_marker would ENQUEUE, which the CB build must not do).
         match ec.cb() {
             CbWalk::Build { .. } => {
+                // The collapsed `Vec` output depends on EVERY branch's sync points +
+                // origins — union them onto our one output cell (cb_forward_reach
+                // accumulates across branches).
                 let mut all_sps = std::collections::BTreeSet::new();
-                let mut all_origins = std::collections::BTreeSet::new();
                 for op in &self.ops {
                     if let Some(p) = op.output_pipe() {
                         all_sps.extend(ec.sp_lookup(Some(p.cell_id())));
-                        // Precise-invalidation reach: the collapsed `Vec` output
-                        // depends on every branch's origins.
-                        all_origins.extend(ec.cb_reach_of(Some(p.cell_id())));
+                        cb_forward_reach(ec, None, Some(p.cell_id()), self.out.cell_id());
                     }
                 }
                 ec.sp_register(self.out.cell_id(), all_sps);
-                ec.cb_reach_extend(self.out.cell_id(), all_origins);
                 self.out.put(outputs, Deps::new());
                 return Ok(());
             }
@@ -7414,19 +7462,17 @@ where
         match ec.cb() {
             CbWalk::Off => {} // fall through to the normal enqueue below.
             CbWalk::Build { builder, ext, .. } => {
-                // Entry deps (a producer OUTSIDE this CB) gate the CB enqueue.
-                cb_collect_external(ext, &deps);
-                let waits = ec.sp_lookup(self.buf.pipe_cell_id());
-                // Precise-invalidation reach: this fill's buffer traces to a slot
-                // (in-place fill of a `slot!(Tag)`) or inherits the reach of its
-                // upstream producer's pipe. `note_slot` each origin into the live CB
-                // (so mutating that slot clears this CB), and thread the reach onto
-                // the output pipe so a downstream leaf across a seam picks it up.
-                let origins = cb_origins_of(ec, self.buf.slot_cell_id(), self.buf.pipe_cell_id());
-                for &s in &origins {
-                    builder.note_slot(s);
-                }
-                ec.cb_reach_extend(self.out.cell_id(), origins.iter().copied());
+                // Shared prologue: entry deps + wait-list + precise-invalidation
+                // reach (note_slot origins into the CB, propagate onto the output).
+                let waits = cb_leaf_build(
+                    ec,
+                    builder,
+                    ext,
+                    &deps,
+                    self.buf.slot_cell_id(),
+                    self.buf.pipe_cell_id(),
+                    self.out.cell_id(),
+                );
                 let mem = MemRef::Buffer(buf.buffer().get());
                 // Byte pattern of the fill value (T: Copy).
                 let pattern = unsafe {
@@ -7490,7 +7536,6 @@ where
     fn describe(&self, out: &mut Vec<String>) {
         out.push("fill".into());
     }
-
 }
 
 impl<T, M> Fill<T, M>
@@ -8270,11 +8315,10 @@ where
         match ec.cb() {
             CbWalk::Off => {}
             CbWalk::Build { builder, ext, .. } => {
-                cb_collect_external(ext, &deps);
-                // A produced-from-uninit buffer has no upstream pipe feeding THIS
-                // value, so no interior sync points to look up (the uninit's own
-                // deps are external, collected above).
-                let waits = std::collections::BTreeSet::new();
+                // Produced-from-uninit: no upstream pipe/slot feeds THIS value, so the
+                // prologue degenerates to just collecting external deps (empty waits,
+                // no origins to note/propagate).
+                let waits = cb_leaf_build(ec, builder, ext, &deps, None, None, self.out.cell_id());
                 let handle = buf.record_handle(); // MemRef::Svm
                 let pattern = unsafe {
                     std::slice::from_raw_parts(
@@ -8720,13 +8764,15 @@ where
         match ec.cb() {
             CbWalk::Off => {}
             CbWalk::Build { builder, ext, .. } => {
-                cb_collect_external(ext, &deps);
-                let waits = ec.sp_lookup(self.buf.pipe_cell_id());
-                let origins = cb_origins_of(ec, self.buf.slot_cell_id(), self.buf.pipe_cell_id());
-                for &s in &origins {
-                    builder.note_slot(s);
-                }
-                ec.cb_reach_extend(self.out.cell_id(), origins.iter().copied());
+                let waits = cb_leaf_build(
+                    ec,
+                    builder,
+                    ext,
+                    &deps,
+                    self.buf.slot_cell_id(),
+                    self.buf.pipe_cell_id(),
+                    self.out.cell_id(),
+                );
                 let handle = buf.record_handle(); // MemRef::Svm
                 let pattern = unsafe {
                     std::slice::from_raw_parts(
@@ -10161,22 +10207,27 @@ where
         // an ineligible pair (mixed cl_mem/SVM, absent PFN) falls through to per-op. ─
         match ec.cb() {
             CbWalk::Build { builder, ext, .. } => {
-                cb_collect_external(ext, &src_deps);
-                cb_collect_external(ext, &dst_deps);
-                let mut waits = ec.sp_lookup(self.src.pipe_cell_id());
-                waits.extend(ec.sp_lookup(self.dst.pipe_cell_id()));
-                // Precise-invalidation reach: the CB bakes BOTH the src and dst
-                // handles, so a mutate of either's slot origin makes it stale. Each
-                // output element pipe carries its OWN side's origins downstream.
-                let src_origins =
-                    cb_origins_of(ec, self.src.slot_cell_id(), self.src.pipe_cell_id());
-                let dst_origins =
-                    cb_origins_of(ec, self.dst.slot_cell_id(), self.dst.pipe_cell_id());
-                for &s in src_origins.iter().chain(dst_origins.iter()) {
-                    builder.note_slot(s);
-                }
-                ec.cb_reach_extend(self.src_pipe.cell_id(), src_origins.iter().copied());
-                ec.cb_reach_extend(self.dst_pipe.cell_id(), dst_origins.iter().copied());
+                // Two inputs → two outputs: run the shared prologue per side (each
+                // collects its deps, notes its slot origins into the CB, and
+                // propagates them onto its OWN output pipe); union the wait-lists.
+                let mut waits = cb_leaf_build(
+                    ec,
+                    builder,
+                    ext,
+                    &src_deps,
+                    self.src.slot_cell_id(),
+                    self.src.pipe_cell_id(),
+                    self.src_pipe.cell_id(),
+                );
+                waits.extend(cb_leaf_build(
+                    ec,
+                    builder,
+                    ext,
+                    &dst_deps,
+                    self.dst.slot_cell_id(),
+                    self.dst.pipe_cell_id(),
+                    self.dst_pipe.cell_id(),
+                ));
                 // `record_cb(Some)` ALWAYS returns the type-converted output; the sync
                 // point is `Some` when the command recorded, `None` when the copy was
                 // ineligible (mixed cl_mem/SVM, or absent PFN) — in which case it has
@@ -10358,7 +10409,6 @@ where
             rehome_consumed(v, home);
         }
     }
-
 }
 
 // ── Piped-buffer verb methods: a piped buffer behaves as a buffer ───────────
@@ -10983,10 +11033,8 @@ where
         // until a multi-output-across-seam mutable-CB case needs it; immutable
         // invalidation stays correct because region 1's CB already `note_slot`'d it).
         let src_cell = self.source.output_pipe().map(|p| p.cell_id());
-        let seam_cell = self.output_pipe().map(|p| p.cell_id());
-        if let (Some(sc), Some(dc)) = (src_cell, seam_cell) {
-            let origins = ec.cb_reach_of(Some(sc));
-            ec.cb_reach_extend(dc, origins);
+        if let Some(dc) = self.output_pipe().map(|p| p.cell_id()) {
+            cb_forward_reach(ec, None, src_cell, dc);
         }
         let (value, homes) = src_cos.split();
         // Reusable: `Arc::clone` the closure so the per-run worker thread gets
@@ -11130,10 +11178,8 @@ where
         let (src_cos, deps) = cb_gather_child(&self.source, ec, ExecMode::Pipelined)?;
         // Forward the pre-seam reach across the seam — see `AndThenHost::execute`.
         let src_cell = self.source.output_pipe().map(|p| p.cell_id());
-        let seam_cell = self.output_pipe().map(|p| p.cell_id());
-        if let (Some(sc), Some(dc)) = (src_cell, seam_cell) {
-            let origins = ec.cb_reach_of(Some(sc));
-            ec.cb_reach_extend(dc, origins);
+        if let Some(dc) = self.output_pipe().map(|p| p.cell_id()) {
+            cb_forward_reach(ec, None, src_cell, dc);
         }
         let (value, homes) = src_cos.split();
         // Reusable: `Arc::clone` the closure and clone a fresh `Context` per run,
