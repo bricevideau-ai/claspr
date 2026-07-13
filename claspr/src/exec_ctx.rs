@@ -39,6 +39,19 @@ use std::thread::JoinHandle;
 /// `sync` (a fresh `ExecutionContext` is built per terminal call).
 pub type SyncPointEdges = Arc<Mutex<HashMap<usize, BTreeSet<cl_sync_point_khr>>>>;
 
+/// **Slot-origin reachability** (precise per-slot CB invalidation + the mutable-CB
+/// substrate). Maps a pipe / output cell id → the set of SLOT cell ids the buffer in
+/// that cell is transitively reachable from. Seeded at record time when a leaf
+/// resolves an `Input::Slot` (the cell's origin is that slot), and PROPAGATED per-op:
+/// a kernel unions its input cells' origin-sets into each output pipe cell (output i
+/// carries input i's buffer in place), a passthrough forwards its source's set. A
+/// downstream leaf reading a pipe thus knows which slots its baked buffer traces to —
+/// even across a host seam / `FedByPipe` — so it can `note_slot` them on its CB. Same
+/// shape + lifetime as [`SyncPointEdges`] (`Arc<Mutex<HashMap>>`, keyed by cell id,
+/// live one `sync`, rebuilt each Build pass). The map itself is not needed after the
+/// sync — each CB's `captured_slots` is the durable per-CB projection.
+pub type CbReach = Arc<Mutex<HashMap<usize, BTreeSet<usize>>>>;
+
 /// The command-buffer walk mode for a walk position (design v2, CB-as-execution-
 /// mode). Threaded IMMUTABLY in each [`ExecutionContext`] value; positional
 /// visibility comes from each recursion arm building its own child value (see
@@ -174,6 +187,12 @@ pub struct ExecutionContext<'ctx> {
     /// keyed by unique cell ids, so it is ambient by design (see
     /// [`SyncPointEdges`]).
     sp_edges: SyncPointEdges,
+    /// The slot-origin reachability map ([`CbReach`]). Unlike [`sp_edges`], this is
+    /// SHARED (Arc-cloned) across every child EC — including across CB boundaries —
+    /// because a slot's buffer threaded through a host seam into a DIFFERENT CB must
+    /// carry its origin so the downstream leaf can `note_slot` it. (Sync points are
+    /// CB-local and reset per CB; slot origins are graph-global for one sync.)
+    cb_reach: CbReach,
 }
 
 impl<'ctx> ExecutionContext<'ctx> {
@@ -194,6 +213,7 @@ impl<'ctx> ExecutionContext<'ctx> {
             workers: Arc::new(Mutex::new(Vec::new())),
             cb: CbWalk::Off,
             sp_edges: Arc::new(Mutex::new(HashMap::new())),
+            cb_reach: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -216,6 +236,7 @@ impl<'ctx> ExecutionContext<'ctx> {
         start: Option<crate::cl_event>,
         workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
         sp_edges: SyncPointEdges,
+        cb_reach: CbReach,
     ) -> ExecutionContext<'a> {
         ExecutionContext {
             context,
@@ -229,6 +250,9 @@ impl<'ctx> ExecutionContext<'ctx> {
             // if eligible; here it starts outside any CB.
             cb: CbWalk::Off,
             sp_edges,
+            // Slot origins are graph-global for the sync — share across the routed
+            // sub-chain too (its slots key on their own cell ids; no collision).
+            cb_reach,
         }
     }
 
@@ -264,6 +288,9 @@ impl<'ctx> ExecutionContext<'ctx> {
             workers: Arc::clone(&self.workers),
             cb,
             sp_edges: Arc::new(Mutex::new(HashMap::new())),
+            // SHARED across the CB boundary (unlike sp_edges): a slot threaded across
+            // a seam into this child's CB must carry its origin. See `cb_reach`.
+            cb_reach: Arc::clone(&self.cb_reach),
         }
     }
 
@@ -296,6 +323,37 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// `cell_id`, so a CB-internal consumer resolves them via [`sp_lookup`](Self::sp_lookup).
     pub fn sp_register(&self, cell_id: usize, sps: BTreeSet<cl_sync_point_khr>) {
         self.sp_edges.lock().unwrap().insert(cell_id, sps);
+    }
+
+    /// The slot origins reachable to the buffer in `cell_id` (a pipe / output cell),
+    /// per the [`CbReach`] substrate. Empty for a cell with no recorded origin (a
+    /// concrete buffer, or a producer that hasn't run). `None` cell → empty.
+    pub fn cb_reach_of(&self, cell_id: Option<usize>) -> BTreeSet<usize> {
+        match cell_id {
+            Some(id) => self
+                .cb_reach
+                .lock()
+                .unwrap()
+                .get(&id)
+                .cloned()
+                .unwrap_or_default(),
+            None => BTreeSet::new(),
+        }
+    }
+
+    /// Record that the buffer in `out_cell` is reachable from slot origins `slots`
+    /// (unioned with any already recorded) — the per-op propagation: a leaf extends
+    /// each output pipe cell with its input args' origins; a passthrough forwards its
+    /// source's. Downstream leaves read this via [`cb_reach_of`](Self::cb_reach_of).
+    pub fn cb_reach_extend(&self, out_cell: usize, slots: impl IntoIterator<Item = usize>) {
+        let mut m = self.cb_reach.lock().unwrap();
+        m.entry(out_cell).or_default().extend(slots);
+    }
+
+    /// `Arc` clone of the slot-origin reachability map, for the
+    /// [`OnDevice`](crate::OnDevice) sibling EC constructor.
+    pub(crate) fn cb_reach_handle(&self) -> CbReach {
+        Arc::clone(&self.cb_reach)
     }
 
     /// `Arc` clone of the sync-point edge map, for the [`OnDevice`](crate::OnDevice)

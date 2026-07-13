@@ -38,8 +38,8 @@ and replays it. Implementation notes so the design intent below reads as history
   false-positive: it ANDed every bundle to fallback) return true; transfers/host
   seams stay false → per-op fallback. Coarse whole-subtree gating (per-subtree
   transfer-bracketing is a follow-up).
-- INVALIDATION: `invalidate_cbs()` (coarse clear-all reachable caches) from
-  mutate_bind/mutate_call. Precise per-slot→CB is a documented follow-up.
+- INVALIDATION: `invalidate_cbs(&BTreeSet<slot_id>)` — PRECISE per-slot (was coarse
+  clear-all; upgraded 2026-07-12, see below).
 
 VERIFIED (cliloader on pocl): CG all-device = ONE iteration CB, 8 kernels recorded
 create-once, replayed 5× (clEnqueueNDRangeKernel=0). Both converge BIT-IDENTICAL
@@ -123,8 +123,8 @@ every branch pipe. cliloader-proven: both scale kernels of a root `bundle2` land
 ONE command_buffer (was 2). Terminal root-bundle already did this via
 `cb_boundary_gather` (the weight≥2 terminal gate); this closes the mid-graph /
 execute-position case. Guard: cb_execution_mode::root_bundle_records_one_command_buffer.
-(2) precise per-slot→CB invalidation
-(currently coarse clear-all). (3) DONE 2026-07-12 — SVM CB commands
+(2) DONE 2026-07-12 — precise per-slot→CB invalidation (see PRECISE INVALIDATION
+below; was coarse clear-all). (3) DONE 2026-07-12 — SVM CB commands
 (clCommandSVMMem{cpy,Fill}KHR) now recorded (see COMPLETE COMMAND SURFACE above); was
 "marks ineligible → software". (4) DONE 2026-07-12 — `Arced`/`ArcSplit`/`FanOut`/`CopyTo2`
 are now CB-able (delegate to source/branches: cb_addable/cbable_weight/cb_spine_head
@@ -146,6 +146,38 @@ profiling deps are DIFFERENT — a profiled kernel can NEVER be a CB command (ne
 marker to time + the CL_QUEUE_PROFILING_ENABLE check); that exclusion is intrinsic, not a
 follow-up. Both regressed at ec8e6e8 (kernel→DeviceOp unification made kernels CB-eligible
 without these guards); fixed 2026-07-12.
+
+PRECISE PER-SLOT CB INVALIDATION — LANDED 2026-07-12 (built on a PIPE-REACHABILITY
+substrate, chosen for future mutable-CB reuse; rollback tag
+cb-pre-precise-invalidation-20260712 @ 29c783d). Was coarse "clear EVERY cb_cache in
+the graph on any mutate"; now clears ONLY the CBs whose recorded commands depend on a
+re-bound slot. Mechanism:
+- SLOT IDENTITY: `Input::slot_cell_id()` / `ScalarInput::slot_cell_id()` = `Arc::as_ptr`
+  of the slot cell (stable across re-binds — exactly what `mutate_bind` targets).
+  `SlotBinder::matched_cells` records every cell a fold touched; `fold_bind` on Mutate
+  passes that set to `invalidate_cbs(&BTreeSet<usize>)`.
+- REACH SUBSTRATE: `ExecutionContext::cb_reach` (`HashMap<cell_id, BTreeSet<slot_id>>`),
+  SHARED across CB boundaries (unlike per-CB `sp_edges`). At record time each leaf's
+  Build fork seeds `origins = slot_cell_id ∪ cb_reach_of(pipe_cell_id)` (the `cb_origins_of`
+  helper), `note_slot`s each into the live `CbBuilder`, and `cb_reach_extend`s the output
+  pipe cell. Passthroughs (Forward/Lift/Arced/ArcSplit/FanOut) + host seams
+  (AndThenHost{,WithContext}) forward the reach onto their output cell — so a slot's
+  buffer threaded THROUGH a kernel, across a host seam, into a downstream CB carries its
+  origin the whole way (a captured-slot-SET alone would miss this — the FedByPipe/cross-seam
+  case). `CbBuilder::finalize` freezes the accumulated set into `FinalizedCb.captured_slots`.
+- INVALIDATE: `invalidate_cbs(mutated)` clears a node's cache iff
+  `captured_slots ∩ mutated ≠ ∅` (`FinalizedCb::depends_on_any`), then recurses. Fixed a
+  RECURSION GAP found mid-impl: Arced/ArcSplit/FanOut/Bundle + AndThenHost{,WithContext}
+  now override invalidate_cbs (+ a `#[doc(hidden)]` `collect_cb_ids` twin for tests) to
+  recurse into source/branches — a CB homed deeper (under a seam in their source) was
+  previously missed by the own-cache-only default.
+- TESTS: tests/tier2/tests/cb_precise_invalidation.rs (3): distinct-slots two-region
+  (mutate A clears A's CB, B's Arc survives), buffer-slot-threaded-across-seam (mutate
+  clears BOTH — reach proof, result 42 vs stale 60), bundle-branch interior-CB precise
+  recursion. cliloader on pocl: after mutate Factor1, region-1 CB is
+  release+recreate+finalize+enqueue (rebuilt) while region-2 CB is only re-enqueued
+  (survived). Full tier2 319/0 on all 3 ICDs (pocl real CB; rusticl/intel no ext →
+  per-op, invalidation is a no-op but results identical).
 
 *** FIXED 2026-07-12 (commit pending): the race below is RESOLVED. `Input::pipe_cell_id()`
 now returns the upstream pipe's cell_id for a `FedByPipe` SLOT (was `None`), so the CB

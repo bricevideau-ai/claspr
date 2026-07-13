@@ -251,6 +251,13 @@ pub struct CbBuilder {
     /// boundary-return frame must NOT re-seal / re-enqueue) and tells [`Drop`] to
     /// release NOTHING (the `FinalizedCb` now owns the handle + kernels).
     finalized: Mutex<bool>,
+    /// The set of SLOT cell ids (`Arc::as_ptr` of an `Input::Slot`'s cell) whose
+    /// buffer/scalar this CB baked into a recorded command — INCLUDING slots reached
+    /// transitively through pipes (a `FedByPipe` arg, or a buffer threaded through an
+    /// upstream kernel), noted via [`note_slot`](Self::note_slot). Moved into
+    /// [`FinalizedCb::captured_slots`](FinalizedCb) at finalize; precise per-slot
+    /// invalidation clears this CB iff a mutated slot is in the set.
+    slots: Mutex<std::collections::BTreeSet<usize>>,
 }
 
 // SAFETY: the CB / queue / kernel handles are opaque handles into the
@@ -281,6 +288,7 @@ impl CbBuilder {
             eligible: Mutex::new(true),
             recorded: Mutex::new(0),
             finalized: Mutex::new(false),
+            slots: Mutex::new(std::collections::BTreeSet::new()),
         })
     }
 
@@ -293,6 +301,14 @@ impl CbBuilder {
     /// Bump the recorded-command counter (called on each successful `clCommand*KHR`).
     fn count(&self) {
         *self.recorded.lock().unwrap() += 1;
+    }
+
+    /// Note that this CB baked in a buffer/scalar traceable to slot cell `id`
+    /// (`Arc::as_ptr` of an `Input::Slot`'s cell) — directly or transitively through
+    /// pipes. Drives precise per-slot invalidation: mutating a slot clears exactly
+    /// the CBs whose `captured_slots` contains it. Cheap idempotent set insert.
+    pub fn note_slot(&self, id: usize) {
+        self.slots.lock().unwrap().insert(id);
     }
 
     /// How many `clCommand*KHR` commands have been recorded. Zero → the boundary
@@ -754,6 +770,7 @@ impl CbBuilder {
         // sealed BEFORE releasing the lock so `Drop` (and any later `finalize`) skips
         // the handle we just gave away.
         let kernels = std::mem::take(&mut *self.kernels.lock().unwrap());
+        let captured_slots = std::mem::take(&mut *self.slots.lock().unwrap());
         *done = true;
         Some(FinalizedCb {
             cb: self.cb,
@@ -761,6 +778,7 @@ impl CbBuilder {
             enqueue,
             release,
             kernels,
+            captured_slots,
         })
     }
 }
@@ -800,6 +818,9 @@ pub struct FinalizedCb {
     ) -> opencl_sys::cl_int,
     release: unsafe extern "C" fn(cl_command_buffer_khr) -> opencl_sys::cl_int,
     kernels: Vec<cl_kernel>,
+    /// Slot cell ids this CB baked a buffer/scalar from (directly or transitively
+    /// through pipes). Precise invalidation clears this CB iff a mutated slot is here.
+    captured_slots: std::collections::BTreeSet<usize>,
 }
 
 // SAFETY: as `RecordedCb` — opaque handles + plain fn pointers.
@@ -811,6 +832,12 @@ impl FinalizedCb {
     /// valid for the current sync's queue before replaying.
     pub fn queue(&self) -> cl_command_queue {
         self.queue
+    }
+
+    /// Whether this CB baked a buffer/scalar from ANY slot in `mutated` (directly or
+    /// transitively through pipes) — i.e. a mutate of one of those slots stales it.
+    pub fn depends_on_any(&self, mutated: &std::collections::BTreeSet<usize>) -> bool {
+        !self.captured_slots.is_disjoint(mutated)
     }
 
     /// Enqueue the whole CB on its queue with `wait` as the EXTERNAL `cl_event`

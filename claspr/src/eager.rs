@@ -297,6 +297,33 @@ pub fn cb_collect_external(ext: &Mutex<Vec<Dep>>, deps: &Deps) {
     }
 }
 
+/// The precise-invalidation ORIGIN SET of a leaf's buffer/image arg: which slot
+/// cells a `mutate_bind` of would make a CB that baked this buffer stale. Two
+/// contributions, unioned:
+///
+/// - `slot_id` — the arg IS a `slot!(Tag)` position (in-place fill/copy/kernel of a
+///   bound or fed slot). The slot cell is itself an origin (mutating the tag rebinds
+///   the cell → the baked `cl_mem` changes).
+/// - `pipe_id`'s ambient reach — the arg is fed by an upstream pipe (a direct
+///   `Input::Pipe` OR a `FedByPipe` slot). The upstream producer's reach (the slots
+///   THAT buffer threads back to) propagated onto the pipe's cell at record time.
+///
+/// A `FedByPipe` slot has BOTH: its own cell (the re-bind target) AND the upstream
+/// reach — so both are collected. A plain concrete arg has neither → empty set
+/// (no slot can invalidate a CB over a concrete buffer). This is the per-arg-local
+/// forward map the pipe-reachability substrate composes along the walk.
+pub(crate) fn cb_origins_of(
+    ec: &ExecutionContext<'_>,
+    slot_id: Option<usize>,
+    pipe_id: Option<usize>,
+) -> std::collections::BTreeSet<usize> {
+    let mut origins = ec.cb_reach_of(pipe_id);
+    if let Some(s) = slot_id {
+        origins.insert(s);
+    }
+    origins
+}
+
 /// Whether a graph is CB-eligible RIGHT NOW: the platform advertises
 /// `cl_khr_command_buffer` and the graph has no host seam. (The all-`cl_mem`
 /// requirement is enforced dynamically — an SVM command marks the live builder
@@ -1429,6 +1456,13 @@ pub struct SlotBinder {
     /// conflict/sever still produces its own error via [`outcome`](Self::outcome),
     /// so counting those as matches never masks them.
     matched: usize,
+    /// The slot cell ids (`Arc::as_ptr`) this bind MATCHED — one per matching cell
+    /// (fan-out fills N). Precise per-slot CB invalidation reads this after a `Mutate`
+    /// to clear exactly the CBs whose `captured_slots` intersect the re-bound cells.
+    /// Populated in [`try_bind_slot`](Input::try_bind_slot) alongside `matched`
+    /// (both probe and real passes — harmless in probe, but only the real Mutate pass
+    /// feeds `invalidate_cbs`).
+    matched_cells: Vec<usize>,
     /// **Probe (read-only) mode.** When `true`, [`try_bind_slot`](Input::try_bind_slot)
     /// does NOT fill / take / replace any cell — it only INSPECTS state and records
     /// [`matched`](Self::matched) + [`outcome`](Self::outcome), so the whole
@@ -1517,6 +1551,7 @@ impl SlotBinder {
             }),
             outcome: Ok(()),
             matched: 0,
+            matched_cells: ::std::vec::Vec::new(),
             probe: false,
             severable_cells: Vec::new(),
             feed_pipe: None,
@@ -1544,6 +1579,7 @@ impl SlotBinder {
             clone: Box::new(|_| None),
             outcome: Ok(()),
             matched: 0,
+            matched_cells: ::std::vec::Vec::new(),
             probe: false,
             severable_cells: Vec::new(),
             feed_pipe: Some(Box::new(pipe)),
@@ -1573,6 +1609,7 @@ impl SlotBinder {
             clone: Box::new(|_| None),
             outcome: Ok(()),
             matched: 0,
+            matched_cells: ::std::vec::Vec::new(),
             probe: true,
             severable_cells,
             feed_pipe: None,
@@ -1672,6 +1709,12 @@ impl SlotBinder {
     /// rule (a fan-out tag legitimately matches every site it appears at).
     pub fn matched(&self) -> usize {
         self.matched
+    }
+
+    /// The slot cell ids this bind matched — the input to precise per-slot CB
+    /// invalidation (`fold_bind` passes these to `invalidate_cbs` on a `Mutate`).
+    pub fn matched_cells(&self) -> &[usize] {
+        &self.matched_cells
     }
 
     /// Mark this binder as belonging to the INFALLIBLE, consuming
@@ -2522,6 +2565,19 @@ impl<T> Input<T> {
         }
     }
 
+    /// The identity (`Arc::as_ptr`) of this input's SLOT cell, if it is an
+    /// [`Slot`](Input::Slot) — the key precise per-slot CB invalidation matches a
+    /// mutated tag against (`mutate_bind` re-binds a slot cell; a CB that baked a
+    /// buffer/scalar from this cell is stale). `None` for a concrete or pipe input.
+    /// Independent of the slot's STATE (Unbound/Bound/FedByPipe/…): the cell identity
+    /// is stable across binds, which is exactly what a re-bind targets.
+    pub fn slot_cell_id(&self) -> Option<usize> {
+        match self {
+            Input::Slot { cell, .. } => Some(Arc::as_ptr(cell) as *const () as usize),
+            Input::Concrete(_) | Input::Pipe(_) => None,
+        }
+    }
+
     /// Apply a [`SlotBinder`]'s binding to this input, IFF it is a [`Slot`](Input::Slot)
     /// whose `id` matches the binder's tag — running the verb 2×2 against the slot's
     /// [`SlotState`].
@@ -2579,6 +2635,11 @@ impl<T> Input<T> {
         // turn a ZERO-match `bind` into `SlotNoSuchTag`; a conflict/sever still
         // surfaces via `binder.outcome`, so counting it here cannot mask it.
         binder.matched += 1;
+        // Record the matched cell identity for precise per-slot CB invalidation (a
+        // subsequent `Mutate` clears exactly the CBs that baked a buffer from it).
+        binder
+            .matched_cells
+            .push(Arc::as_ptr(cell) as *const () as usize);
 
         // PROBE (read-only) — the phase-0 dry run of `call`/`mutate_call`. Inspect
         // this cell's state WITHOUT filling / taking / replacing, recording the
@@ -2845,6 +2906,19 @@ impl<V: Clone> ScalarInput<V> {
         }
     }
 
+    /// Stable slot-cell identity for precise CB invalidation — `Some(ptr)` for a
+    /// [`Slot`](ScalarInput::Slot) (the `Arc::as_ptr` of its cell), `None` for a
+    /// `Concrete`. A scalar slot can never thread through a pipe (scalars are
+    /// value-only), so this id IS the whole origin set: a CB that baked this
+    /// scalar's bytes depends on exactly this one slot. The resource analogue is
+    /// [`Input::slot_cell_id`].
+    pub fn slot_cell_id(&self) -> Option<usize> {
+        match self {
+            ScalarInput::Slot { cell, .. } => Some(Arc::as_ptr(cell) as *const () as usize),
+            ScalarInput::Concrete(_) => None,
+        }
+    }
+
     /// **Read-only** pre-flight check: would [`read`](Self::read) succeed right now,
     /// WITHOUT cloning anything out? The non-resource half of the
     /// [`check_ready`](DeviceOp::check_ready) atomicity walk. A `Concrete` value is
@@ -2918,6 +2992,11 @@ impl<V: Send + 'static> ScalarInput<V> {
         // consumed-binder guard, mirroring `Input::try_bind_slot`, so `fold_bind`
         // sees a nonzero count even for a same-tag cell reached after consumption.
         binder.matched += 1;
+        // Scalar-slot cell identity for precise invalidation (a mutated scalar tag
+        // like gray-scott F/K clears the CBs that baked its value).
+        binder
+            .matched_cells
+            .push(Arc::as_ptr(cell) as *const () as usize);
 
         // PROBE (read-only): a scalar/launch slot is only ever `Unbound` or `Bound`
         // (never `Lent`/`Severed` — it is read by clone, never lent or severed), so
@@ -3894,23 +3973,44 @@ pub trait DeviceOp: Send {
         None
     }
 
-    /// **Invalidate every homed command buffer reachable in this (sub)graph** —
-    /// called by [`mutate_bind`](DeviceOpExt::mutate_bind) /
-    /// [`mutate_call`](DeviceOpExt::mutate_call) after a slot is re-bound, so the
-    /// next `sync` rebuilds any CB whose captured buffers/args changed.
+    /// **Invalidate the homed command buffers this (sub)graph holds that depend on a
+    /// re-bound slot** — called by [`mutate_bind`](DeviceOpExt::mutate_bind) /
+    /// [`mutate_call`](DeviceOpExt::mutate_call) with `mutated` = the slot cell ids
+    /// just re-bound (from [`SlotBinder::matched_cells`]). PRECISE: clears this node's
+    /// [`cb_cache`](Self::cb_cache) iff its homed `FinalizedCb` baked a buffer/scalar
+    /// traceable to a mutated slot (`captured_slots ∩ mutated ≠ ∅`), then recurses.
     ///
-    /// Clears this node's own [`cb_cache`](Self::cb_cache) (if any), then recurses
-    /// into children (mirroring [`describe`](Self::describe)/[`check_ready`](Self::check_ready)).
-    /// This is the "invalidate all CBs this Slot touches, INCLUDING transitively
-    /// through pipes" rule made precise: a mutated slot lives in a leaf, and every
-    /// CB that captured it is homed in an ANCESTOR node on the same graph the
-    /// recursion reaches from the mutation's terminal — so clearing all cb-caches
-    /// reachable from the graph root covers exactly (and only) the CBs of this
-    /// graph, dropping their `FinalizedCb`s (RAII release). Default: clear own
-    /// cache; combinators override to also recurse into children.
-    fn invalidate_cbs(&self) {
+    /// `captured_slots` is transitive (it includes slots a CB's buffer reached through
+    /// pipes / across a host seam — the [`CbReach`](crate::exec_ctx::CbReach)
+    /// substrate propagated them at record time and each leaf `note_slot`'d them), so
+    /// this covers the FedByPipe-across-seam case a naive "subtree contains the tag"
+    /// test would miss. An EMPTY `mutated` set (should not happen from a real mutate)
+    /// clears nothing.
+    ///
+    /// Default: clear own cache if it intersects; combinators override to recurse.
+    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
         if let Some(cache) = self.cb_cache() {
-            *cache.lock().unwrap() = None;
+            let mut guard = cache.lock().unwrap();
+            let stale = guard.as_ref().is_some_and(|cb| cb.depends_on_any(mutated));
+            if stale {
+                *guard = None;
+            }
+        }
+    }
+
+    /// **Collect the stable identities of every homed [`FinalizedCb`] in this
+    /// (sub)graph**, appending `(Arc::as_ptr as usize)` for each node that currently
+    /// holds a CB. Test/introspection hook (`#[doc(hidden)]`): it walks the SAME
+    /// node set [`invalidate_cbs`](Self::invalidate_cbs) does, so a test can assert
+    /// that a `mutate_bind` cleared exactly the interior CBs it should (a region-A
+    /// CB's id disappears / changes while region-B's id is untouched). Default:
+    /// push own id if homed; combinators override to recurse into children.
+    #[doc(hidden)]
+    fn collect_cb_ids(&self, out: &mut Vec<usize>) {
+        if let Some(cache) = self.cb_cache()
+            && let Some(arc) = cache.lock().unwrap().as_ref()
+        {
+            out.push(std::sync::Arc::as_ptr(arc) as usize);
         }
     }
 
@@ -4194,12 +4294,15 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             return Err(Error::SlotNoSuchTag(Tg::NAME));
         }
         // CB-mode (design v2): a MUTATE re-bound a slot, so any homed command buffer
-        // that captured that slot's buffer/args is stale — clear every CB reachable
-        // in this graph (coarse clear-all; a documented follow-up will make it
-        // per-slot-precise). Set-once `bind` runs at build BEFORE any CB exists, so
-        // it needs no invalidation.
+        // that captured that slot's buffer/args is stale. PRECISE per-slot: clear only
+        // the CBs whose `captured_slots` include a cell just re-bound (the binder
+        // recorded them in `matched_cells`), covering FedByPipe-across-seam via the
+        // CbReach substrate. Set-once `bind` runs at build BEFORE any CB exists, so it
+        // needs no invalidation.
         if matches!(mode, BindMode::Mutate) {
-            self.invalidate_cbs();
+            let mutated: std::collections::BTreeSet<usize> =
+                binder.matched_cells().iter().copied().collect();
+            self.invalidate_cbs(&mutated);
         }
         Ok(self)
     }
@@ -5787,12 +5890,26 @@ where
         self.next.cb_restamp(evs);
     }
 
-    fn invalidate_cbs(&self) {
-        // Clear this chain's own homed CB, then recurse (a mutated slot in either
-        // child invalidates any CB homed above it — coarse clear-all on this graph).
-        *self.cb_cache.lock().unwrap() = None;
-        self.source.invalidate_cbs();
-        self.next.invalidate_cbs();
+    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
+        // Clear this chain's own homed CB iff it depends on a mutated slot, then
+        // recurse into both children (a CB homed in either sub-position is checked
+        // against `mutated` at its own node).
+        {
+            let mut g = self.cb_cache.lock().unwrap();
+            if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
+                *g = None;
+            }
+        }
+        self.source.invalidate_cbs(mutated);
+        self.next.invalidate_cbs(mutated);
+    }
+
+    fn collect_cb_ids(&self, out: &mut Vec<usize>) {
+        if let Some(arc) = self.cb_cache.lock().unwrap().as_ref() {
+            out.push(std::sync::Arc::as_ptr(arc) as usize);
+        }
+        self.source.collect_cb_ids(out);
+        self.next.collect_cb_ids(out);
     }
 }
 
@@ -5951,6 +6068,12 @@ impl<T: crate::record::RecordableBuffer + Send + 'static> DeviceOp for Lift<T> {
                 // our cell yields empty; the CB's external deps carry any real
                 // wait). Its own deps (e.g. the start gate) become external deps.
                 cb_collect_external(ext, &deps);
+                // Precise-invalidation reach: forward this lift's slot/pipe origins
+                // onto the output pipe so a downstream leaf in the SAME CB (or across
+                // a seam) traces its buffer back to the mutable slot.
+                let origins =
+                    cb_origins_of(ec, self.input.slot_cell_id(), self.input.pipe_cell_id());
+                ec.cb_reach_extend(self.out.cell_id(), origins);
                 self.out.put_home(v, Deps::new(), home);
             }
         }
@@ -6039,6 +6162,12 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
                 cb_collect_external(ext, &deps);
                 let sps = ec.sp_lookup(upstream_cell);
                 ec.sp_register(self.out.cell_id(), sps);
+                // Precise-invalidation reach: forward the upstream pipe's origins
+                // onto our output cell (identity alias), parallel to the sync-point
+                // re-register above — a `slot!` threaded through this forward keeps
+                // its origin trail unbroken.
+                let origins = cb_origins_of(ec, self.input.slot_cell_id(), upstream_cell);
+                ec.cb_reach_extend(self.out.cell_id(), origins);
                 self.out.put_home(v, Deps::new(), home);
             }
             CbWalk::LendOnly { ext, .. } => {
@@ -6272,6 +6401,10 @@ where
                 if let Some(src_cell) = self.source.output_pipe().map(|p| p.cell_id()) {
                     let sps = ec.sp_lookup(Some(src_cell));
                     ec.sp_register(self.out.cell_id(), sps);
+                    // Precise-invalidation reach: forward the source's origins onto
+                    // our cell too (parallel to the sync-point alias).
+                    let origins = ec.cb_reach_of(Some(src_cell));
+                    ec.cb_reach_extend(self.out.cell_id(), origins);
                 }
                 self.out.put(Arc::new(v), Deps::new());
             }
@@ -6288,6 +6421,23 @@ where
 
     fn cb_cache(&self) -> Option<&CbCache> {
         Some(&self.cb_cache)
+    }
+
+    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
+        {
+            let mut g = self.cb_cache.lock().unwrap();
+            if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
+                *g = None;
+            }
+        }
+        self.source.invalidate_cbs(mutated);
+    }
+
+    fn collect_cb_ids(&self, out: &mut Vec<usize>) {
+        if let Some(arc) = self.cb_cache.lock().unwrap().as_ref() {
+            out.push(std::sync::Arc::as_ptr(arc) as usize);
+        }
+        self.source.collect_cb_ids(out);
     }
 
     fn cb_addable(&self) -> bool {
@@ -6429,13 +6579,16 @@ where
             CbWalk::Build { .. } => {
                 // Alias the source's sync points under EVERY branch cell so each
                 // downstream CB consumer of a clone finds them; deposit empty deps.
-                let sps = self
-                    .source
-                    .output_pipe()
-                    .map(|p| ec.sp_lookup(Some(p.cell_id())))
+                let src_cell = self.source.output_pipe().map(|p| p.cell_id());
+                let sps = src_cell.map(|c| ec.sp_lookup(Some(c))).unwrap_or_default();
+                // Precise-invalidation reach: every branch inherits the source's
+                // origins (parallel to the sync-point alias).
+                let origins = src_cell
+                    .map(|c| ec.cb_reach_of(Some(c)))
                     .unwrap_or_default();
                 for out in &self.outs {
                     ec.sp_register(out.cell_id(), sps.clone());
+                    ec.cb_reach_extend(out.cell_id(), origins.iter().copied());
                     out.put(v.clone(), Deps::new());
                 }
             }
@@ -6517,6 +6670,23 @@ where
 
     fn cb_cache(&self) -> Option<&CbCache> {
         Some(&self.cb_cache)
+    }
+
+    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
+        {
+            let mut g = self.cb_cache.lock().unwrap();
+            if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
+                *g = None;
+            }
+        }
+        self.source.invalidate_cbs(mutated);
+    }
+
+    fn collect_cb_ids(&self, out: &mut Vec<usize>) {
+        if let Some(arc) = self.cb_cache.lock().unwrap().as_ref() {
+            out.push(std::sync::Arc::as_ptr(arc) as usize);
+        }
+        self.source.collect_cb_ids(out);
     }
 
     fn cb_addable(&self) -> bool {
@@ -6829,9 +6999,21 @@ macro_rules! impl_eager_bundle {
                 Some(&self.cb_cache)
             }
 
-            fn invalidate_cbs(&self) {
-                *self.cb_cache.lock().unwrap() = None;
-                $(self.$field.invalidate_cbs();)+
+            fn invalidate_cbs(&self, mutated: &::std::collections::BTreeSet<usize>) {
+                {
+                    let mut g = self.cb_cache.lock().unwrap();
+                    if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
+                        *g = None;
+                    }
+                }
+                $(self.$field.invalidate_cbs(mutated);)+
+            }
+
+            fn collect_cb_ids(&self, out: &mut ::std::vec::Vec<usize>) {
+                if let Some(arc) = self.cb_cache.lock().unwrap().as_ref() {
+                    out.push(::std::sync::Arc::as_ptr(arc) as usize);
+                }
+                $(self.$field.collect_cb_ids(out);)+
             }
         }
     };
@@ -7034,12 +7216,17 @@ where
         match ec.cb() {
             CbWalk::Build { .. } => {
                 let mut all_sps = std::collections::BTreeSet::new();
+                let mut all_origins = std::collections::BTreeSet::new();
                 for op in &self.ops {
                     if let Some(p) = op.output_pipe() {
                         all_sps.extend(ec.sp_lookup(Some(p.cell_id())));
+                        // Precise-invalidation reach: the collapsed `Vec` output
+                        // depends on every branch's origins.
+                        all_origins.extend(ec.cb_reach_of(Some(p.cell_id())));
                     }
                 }
                 ec.sp_register(self.out.cell_id(), all_sps);
+                ec.cb_reach_extend(self.out.cell_id(), all_origins);
                 self.out.put(outputs, Deps::new());
                 return Ok(());
             }
@@ -7110,6 +7297,27 @@ where
 
     fn cb_cache(&self) -> Option<&CbCache> {
         Some(&self.cb_cache)
+    }
+
+    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
+        {
+            let mut g = self.cb_cache.lock().unwrap();
+            if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
+                *g = None;
+            }
+        }
+        for op in &self.ops {
+            op.invalidate_cbs(mutated);
+        }
+    }
+
+    fn collect_cb_ids(&self, out: &mut Vec<usize>) {
+        if let Some(arc) = self.cb_cache.lock().unwrap().as_ref() {
+            out.push(std::sync::Arc::as_ptr(arc) as usize);
+        }
+        for op in &self.ops {
+            op.collect_cb_ids(out);
+        }
     }
 
     fn cb_addable(&self) -> bool {
@@ -7287,6 +7495,16 @@ where
                 // Entry deps (a producer OUTSIDE this CB) gate the CB enqueue.
                 cb_collect_external(ext, &deps);
                 let waits = ec.sp_lookup(self.buf.pipe_cell_id());
+                // Precise-invalidation reach: this fill's buffer traces to a slot
+                // (in-place fill of a `slot!(Tag)`) or inherits the reach of its
+                // upstream producer's pipe. `note_slot` each origin into the live CB
+                // (so mutating that slot clears this CB), and thread the reach onto
+                // the output pipe so a downstream leaf across a seam picks it up.
+                let origins = cb_origins_of(ec, self.buf.slot_cell_id(), self.buf.pipe_cell_id());
+                for &s in &origins {
+                    builder.note_slot(s);
+                }
+                ec.cb_reach_extend(self.out.cell_id(), origins.iter().copied());
                 let mem = MemRef::Buffer(buf.buffer().get());
                 // Byte pattern of the fill value (T: Copy).
                 let pattern = unsafe {
@@ -8606,6 +8824,11 @@ where
             CbWalk::Build { builder, ext, .. } => {
                 cb_collect_external(ext, &deps);
                 let waits = ec.sp_lookup(self.buf.pipe_cell_id());
+                let origins = cb_origins_of(ec, self.buf.slot_cell_id(), self.buf.pipe_cell_id());
+                for &s in &origins {
+                    builder.note_slot(s);
+                }
+                ec.cb_reach_extend(self.out.cell_id(), origins.iter().copied());
                 let handle = buf.record_handle(); // MemRef::Svm
                 let pattern = unsafe {
                     std::slice::from_raw_parts(
@@ -10044,6 +10267,18 @@ where
                 cb_collect_external(ext, &dst_deps);
                 let mut waits = ec.sp_lookup(self.src.pipe_cell_id());
                 waits.extend(ec.sp_lookup(self.dst.pipe_cell_id()));
+                // Precise-invalidation reach: the CB bakes BOTH the src and dst
+                // handles, so a mutate of either's slot origin makes it stale. Each
+                // output element pipe carries its OWN side's origins downstream.
+                let src_origins =
+                    cb_origins_of(ec, self.src.slot_cell_id(), self.src.pipe_cell_id());
+                let dst_origins =
+                    cb_origins_of(ec, self.dst.slot_cell_id(), self.dst.pipe_cell_id());
+                for &s in src_origins.iter().chain(dst_origins.iter()) {
+                    builder.note_slot(s);
+                }
+                ec.cb_reach_extend(self.src_pipe.cell_id(), src_origins.iter().copied());
+                ec.cb_reach_extend(self.dst_pipe.cell_id(), dst_origins.iter().copied());
                 // `record_cb(Some)` ALWAYS returns the type-converted output; the sync
                 // point is `Some` when the command recorded, `None` when the copy was
                 // ineligible (mixed cl_mem/SVM, or absent PFN) — in which case it has
@@ -10494,6 +10729,7 @@ where
             parent.start_dep(),
             parent.workers_handle(),
             parent.sp_edges_handle(),
+            parent.cb_reach_handle(),
         );
         // Gather the source against the child EC via `collect` (any arity). The
         // routed sub-chain collapses to OnDevice's single output pipe, so any
@@ -10862,6 +11098,22 @@ where
         // completion). A single-output source scatters into one pipe with its home
         // preserved (byte-identical to the pre-#212 `collect_home` + `put_home`).
         let (src_cos, deps) = cb_gather_child(&self.source, ec, ExecMode::Pipelined)?;
+        // Precise-invalidation reach across the seam (single-output): the seam maps
+        // its source's buffer to host in place and hands the SAME `cl_mem` onward, so
+        // a downstream CB (region 2) bakes a buffer that still traces to the source's
+        // slot origins. `cb_gather_child` above just ran region 1's Build pass, which
+        // populated the source output cell's reach; forward it onto the seam's output
+        // cell so region 2's later Build pass finds it via `cb_reach_of` (the reach map
+        // is SHARED across CB boundaries, unlike sync points). Multi-output seams
+        // re-scatter per branch (their per-branch reach is not threaded here — deferred
+        // until a multi-output-across-seam mutable-CB case needs it; immutable
+        // invalidation stays correct because region 1's CB already `note_slot`'d it).
+        let src_cell = self.source.output_pipe().map(|p| p.cell_id());
+        let seam_cell = self.output_pipe().map(|p| p.cell_id());
+        if let (Some(sc), Some(dc)) = (src_cell, seam_cell) {
+            let origins = ec.cb_reach_of(Some(sc));
+            ec.cb_reach_extend(dc, origins);
+        }
         let (value, homes) = src_cos.split();
         // Reusable: `Arc::clone` the closure so the per-run worker thread gets
         // its OWN owned handle to move in (it runs off the submitting thread).
@@ -10945,6 +11197,17 @@ where
         self.source.bind_slots(binder);
     }
 
+    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
+        // A seam has no cb_cache of its OWN, but its source (a pre-seam device
+        // region) homes CBs — recurse so a mutated slot upstream of the seam clears
+        // the region-1 CB. Without this, the default (own-cache-only) would miss it.
+        self.source.invalidate_cbs(mutated);
+    }
+
+    fn collect_cb_ids(&self, out: &mut Vec<usize>) {
+        self.source.collect_cb_ids(out);
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
         self.source.describe(out);
         out.push("and_then_host".into());
@@ -10991,6 +11254,13 @@ where
         // MID-GRAPH re-scatter — twin of `AndThenHost::execute` (see it for the full
         // rationale); the closure additionally gets `&Context`.
         let (src_cos, deps) = cb_gather_child(&self.source, ec, ExecMode::Pipelined)?;
+        // Forward the pre-seam reach across the seam — see `AndThenHost::execute`.
+        let src_cell = self.source.output_pipe().map(|p| p.cell_id());
+        let seam_cell = self.output_pipe().map(|p| p.cell_id());
+        if let (Some(sc), Some(dc)) = (src_cell, seam_cell) {
+            let origins = ec.cb_reach_of(Some(sc));
+            ec.cb_reach_extend(dc, origins);
+        }
         let (value, homes) = src_cos.split();
         // Reusable: `Arc::clone` the closure and clone a fresh `Context` per run,
         // then move both into a fresh one-shot callable for the worker thread.
@@ -11056,6 +11326,15 @@ where
     fn bind_slots(&self, binder: &mut SlotBinder) {
         // Pass-through: recurse into the source so `bind`/`call` reach its slots.
         self.source.bind_slots(binder);
+    }
+
+    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
+        // See `AndThenHost::invalidate_cbs` — recurse into the pre-seam source's CBs.
+        self.source.invalidate_cbs(mutated);
+    }
+
+    fn collect_cb_ids(&self, out: &mut Vec<usize>) {
+        self.source.collect_cb_ids(out);
     }
 
     fn describe(&self, out: &mut Vec<String>) {

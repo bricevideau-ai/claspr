@@ -9,7 +9,7 @@
 //! and only note whether a CB was homed.
 
 use claspr::eager::{DeviceOp, DeviceOpExt};
-use claspr::{Buffer, Context, MappedSlice, SvmLevel};
+use claspr::{Context, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
 
 const N: usize = 64;
