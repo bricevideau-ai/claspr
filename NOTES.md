@@ -9,6 +9,78 @@ items resolve.
 
 ## Active
 
+### 🔎 INVESTIGATION 2026-07-12 — `meta_kernel!` macro vs `OutputShape` (Brice asked: could a signature-generating macro help, alt/complement to OutputShape?)
+
+VERDICT: `meta_kernel!` is a REAL win and a COMPLEMENT to `OutputShape`, not an
+alternative — they attack different halves of the same gap. Do OutputShape FIRST
+(it's the enabler); meta_kernel! on top erases the last of the boilerplate.
+
+WHAT A `meta_kernel!` WOULD DO: take a named subgraph body (the CG `compute_alpha`/
+`compute_beta` closures, gray-scott's `get_meta_kernel`) and emit a fn/type with the
+`impl DeviceOp<Output=, Handle=, Checkouts=>` signature AUTO-DECLARED, so the author
+writes the body once and the macro fills in the associated-type shapes a hand-written
+generic (`solve_with`) forces you to spell.
+
+EMPIRICAL PROBES (real, against examples/cg, compiled — restored after):
+1. `fn f(..) -> impl DeviceOp<Output=(6-tuple), Handle=(6-tuple of Pipe)> {..}` for a
+   real multi-output subgraph (dot_partial→finish_alpha→bundle6) COMPILES today. So a
+   macro CAN emit a clean named return type — no new language feature needed. ✔
+2. Same fn with `Output=` ONLY (rely on default `Handle=Pipe<Output>`) also compiles —
+   BUT only because nothing consumes the handle.
+3. DECISIVE: a CALLER doing `sub.and_then(|(p,ap,partials,alpha,nalpha,rsold)| ..)` on
+   the Output-only version FAILS to compile: "expected associated type
+   `<.. as DeviceOp>::Handle`, found tuple". rustc's OWN fix suggestion is
+   `Handle = (_, _, _, _, _, _)`. ⇒ You MUST name `Handle` whenever the composed graph
+   is destructured by `and_then` — `Output` alone is never enough for a multi-output op.
+   And Handle is MECHANICALLY the tuple-of-Pipe mirror of Output (rustc says so). ✔
+
+WHY THIS SETTLES THE OutputShape RELATIONSHIP:
+- The pain = spelling `Handle`/`Checkouts` = tuple-mirrors of `Output`. Two ways to kill it:
+  (A) OutputShape: `DeviceOp` defaults `Handle = <Output as OutputShape>::Handle`,
+      `Checkouts = <Output as OutputShape>::Checkouts`. Then `impl DeviceOp<Output=T>`
+      ALONE carries the right derived Handle → probe-3's caller destructure would COMPILE
+      with no Handle= clause. Fixes BOTH named generics AND `impl Trait` returns at the
+      TYPE-SYSTEM level. This is the root-cause fix.
+  (B) meta_kernel!: generates the FULL `Output=/Handle=/Checkouts=` signature textually
+      from the subgraph body. Works TODAY without OutputShape (probe 1). But without
+      OutputShape it must COMPUTE the Handle/Checkouts tuples itself by walking the body's
+      output arity — reimplementing, in macro-land, exactly the Output→shape mapping the
+      kernel proc-macro already does (claspr-macros/src/lib.rs:1690/1697) and that
+      OutputShape would centralize.
+- So: OutputShape makes meta_kernel! DRAMATICALLY simpler (the macro emits just
+  `-> impl DeviceOp<Output=T>` and the trait derives the rest). Without OutputShape,
+  meta_kernel! still works but duplicates the shape logic. ⇒ SEQUENCE: OutputShape first.
+
+WHAT meta_kernel! ADDS THAT OutputShape ALONE DOESN'T:
+- OutputShape removes Handle/Checkouts from the signature, but the author STILL writes
+  `fn compute_alpha(ks, p, ap, ..) -> impl DeviceOp<Output=(6-tuple)>` — the 6-tuple
+  Output + the arg list are still hand-typed. meta_kernel! can INFER the Output from the
+  body's terminal (the `bundle6(...)` / final expr) and generate the whole signature,
+  so the author writes only the body + arg names. That's the last mile.
+- It also gives a NAMED, reusable, testable subgraph (what `solve_with` needs and what
+  gray-scott can only get via inference-only local closures). A macro-named meta-kernel
+  is callable from multiple sites AND has a nameable type for `SolveFn`-style aliases.
+
+RISKS / OPEN QUESTIONS for meta_kernel!:
+- Inferring `Output` from an arbitrary body is HARD in a proc-macro (it'd have to parse
+  the final `bundle_N`/tuple expr and map to types) — may need the author to still
+  declare the output tuple, or restrict bodies to a recognized terminal form. The
+  `#[claspr::kernel]` macro has it easy (it reads the fn signature); a meta-kernel body
+  is free-form graph code. LIKELY landing: author declares the arg list + output TYPES,
+  macro fills Handle/Checkouts (trivial once OutputShape exists) + the `impl DeviceOp`
+  wrapper + lifetime/`+ 'a` plumbing.
+- Slot-bearing meta-kernels (gray-scott's `slot!(Grid)` etc.) + currying (`.call(...)`)
+  must still compose — the macro must not close over the slot surface.
+- Lifetime elision on the returned `impl DeviceOp + 'a` (probe needed the explicit `'a`).
+
+RECOMMENDATION: (1) prototype OutputShape (the root-cause fix; unblocks clean `impl Trait`
+subgraph returns AND shrinks solve_with's where-clause to `A: DeviceOp<Output=T>`).
+(2) THEN evaluate meta_kernel! as sugar on top — its value is real (auto-declares the
+`impl DeviceOp` wrapper + args→output plumbing, gives named reusable subgraphs) but it is
+strictly easier and cleaner once OutputShape exists. Measure both against the same
+yardstick: solve_with's where-clause line count (currently ~70 lines, cg:426–498).
+See [[project_claspr_simplify_gap_to_entry]].
+
 ### 🔎 INVESTIGATION 2026-07-12 — Tier 2 "gap to entry" refactor scoping (CB now merged, so unblocked)
 
 Brice: "I still find the gap to entry to be huge" (2026-07-09) — wanted a simplification
