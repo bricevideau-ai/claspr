@@ -624,6 +624,61 @@ fn run_swap(
 /// so two sets keep the two steps' Laplacians independent and correct. They are
 /// concrete buffers passed by arg into each `get_meta_kernel` call, never rebound.
 ///
+/// The gray-scott per-step meta-kernel as a **named, reusable, testable** subgraph.
+///
+/// This was a local closure inside `run_immutable` — and it *had* to be, because a
+/// closure's graph type is unnameable, so a hand-written `-> impl DeviceOp<..>` return
+/// needed the full `Output`/`Handle`/`Checkouts` shape spelled out, and the noise
+/// pushed it back inline. `-> impl `[`Subgraph`](claspr::eager::Subgraph)`<O>` fixes
+/// that: `O` is the four field buffers, and the one bound pins the canonical
+/// [`OutputShape`](claspr::eager::OutputShape) handle/checkouts + `FromCheckout` — so
+/// callers still destructure a clean `|(u_in, v_in, u_out, v_out)|` and compose it
+/// onward, with no where-clause here. Now it can be reused across sites, aliased, and
+/// unit-tested in isolation (see `meta_kernel_builds_and_runs`), which a closure can't.
+///
+/// Builds the raw three-dispatch DAG with ALL SEVEN slots OPEN (`Grid`/`UIn`/`VIn`/
+/// `UOut`/`VOut`/`F`/`K`), then TRIMS `combine`'s six-output handle to the four field
+/// buffers via `bundle4`. Takes `ks` + the two lap-scratch buffers by arg; the built
+/// graph does NOT borrow `ks` (the launchers clone the context internally).
+fn gray_scott_step(
+    ks: &gpu::Kernels,
+    lap_u: DeviceSlice<f32>,
+    lap_v: DeviceSlice<f32>,
+) -> impl claspr::eager::Subgraph<(
+    DeviceSlice<f32>,
+    DeviceSlice<f32>,
+    DeviceSlice<f32>,
+    DeviceSlice<f32>,
+)> + use<> {
+    // `+ use<>` (edition-2024 precise capturing): the built graph owns everything it
+    // needs — each launcher clones its `Kernel`/context by value — so it does NOT
+    // borrow `ks`. Without it, 2024's RPIT auto-captures `ks`'s lifetime and the
+    // step-2 call inside the `and_then` move-closure trips E0515.
+    use claspr::eager::bundle4;
+    ks.laplacian(slot!(Grid), slot!(UIn), lap_u)
+        .and_then(move |(u_in, lap_u_pipe)| {
+            ks.laplacian(slot!(Grid), slot!(VIn), lap_v)
+                .and_then(move |(v_in, lap_v_pipe)| {
+                    ks.combine(
+                        slot!(Grid),
+                        u_in,       // pipe: U field (read)
+                        v_in,       // pipe: V field (read)
+                        lap_u_pipe, // pipe: U-Laplacian
+                        lap_v_pipe, // pipe: V-Laplacian
+                        slot!(UOut),
+                        slot!(VOut),
+                        slot!(F),
+                        slot!(K),
+                    )
+                    // 4-of-6 TRIM: re-expose ONLY the four FIELD pipes so the caller
+                    // sees `(u_in, v_in, u_out, v_out)`, not the lap-scratch placeholders.
+                    .and_then(|(u_in, v_in, _lap_u, _lap_v, u_out, v_out)| {
+                        bundle4(u_in, v_in, u_out, v_out)
+                    })
+                })
+        })
+}
+
 /// `steps` must be EVEN (the unroll period is 2). Returns the final `V` field.
 fn run_immutable(
     ctx: &Context,
@@ -634,8 +689,6 @@ fn run_immutable(
     kill_rate: f32,
     write_frame: bool,
 ) -> claspr::Result<Vec<f32>> {
-    use claspr::eager::bundle4;
-
     assert_eq!(
         grid_w * grid_h,
         N,
@@ -663,68 +716,35 @@ fn run_immutable(
     let lap_u2 = seeded(ctx, vec![0.0f32; N])?;
     let lap_v2 = seeded(ctx, vec![0.0f32; N])?;
 
-    // ── The per-step subgraph as TWO curried closures (bind-by-name meta-kernel). ──
-    //
-    // `get_meta_kernel` builds the raw three-dispatch DAG with ALL SEVEN input
-    // slots OPEN, then TRIMS `combine`'s six-output handle down to the four FIELD
-    // buffers via a `bundle4` re-expose — so the compose site destructures a clean
-    // `|(u_a, v_a, u_b, v_b)|` with no lap-scratch placeholders. It takes `ks` +
-    // its two lap-scratch buffers by arg (fresh per call); the returned graph does
-    // NOT borrow `ks` (the launchers clone the context/kernels internally).
-    let get_meta_kernel = |ks: &gpu::Kernels, lap_u, lap_v| {
-        ks.laplacian(slot!(Grid), slot!(UIn), lap_u)
-            .and_then(move |(u_in, lap_u_pipe)| {
-                ks.laplacian(slot!(Grid), slot!(VIn), lap_v)
-                    .and_then(move |(v_in, lap_v_pipe)| {
-                        ks.combine(
-                            slot!(Grid),
-                            u_in,       // pipe: U field (read)
-                            v_in,       // pipe: V field (read)
-                            lap_u_pipe, // pipe: U-Laplacian
-                            lap_v_pipe, // pipe: V-Laplacian
-                            slot!(UOut),
-                            slot!(VOut),
-                            slot!(F),
-                            slot!(K),
-                        )
-                        // 4-of-6 TRIM: `combine`'s handle is 6 pipes
-                        // (u_in, v_in, lap_u, lap_v, u_out, v_out); re-expose ONLY the
-                        // four FIELD pipes so the caller sees `(u_in, v_in, u_out, v_out)`.
-                        .and_then(
-                            |(u_in, v_in, _lap_u, _lap_v, u_out, v_out)| {
-                                bundle4(u_in, v_in, u_out, v_out)
-                            },
-                        )
-                    })
-            })
-    };
-
-    // `curried_kernel` partially binds the INVARIANTS that never rotate — `Grid`,
-    // `F`, `K` — via set-once `call`, leaving ONLY the four field slots open for
-    // the step-specific `call` at the call site.
-    let curried_kernel = |ks: &gpu::Kernels, lap_u, lap_v| {
-        get_meta_kernel(ks, lap_u, lap_v).call((
+    // ── Build the TWO-step meta-kernel from the NAMED `gray_scott_step` fn. ──
+    //   Each step: a fresh `gray_scott_step(...)` (reusable `impl Subgraph<..>`), then
+    //   a set-once `call` of the INVARIANTS (`Grid`, `F`, `K`), then a `call` of the
+    //   four field slots.
+    //   STEP 1 (read A, write B): value-bind the four field slots to concrete bufs.
+    //   STEP 2 (read B, write A): feed the same four slots from step-1's output
+    //     pipes — the crossed rotation is VISIBLE in the `Tag(pipe)` args.
+    // Over the pair the buffer roles are identity (A→B→A), so the graph is bound
+    // ONCE at build and replays with NO per-step rebinding. A small `invariants`
+    // helper keeps the repeated `(Grid, F, K)` currying tuple in one place.
+    let invariants = || {
+        (
             F(feed_rate),
             K(kill_rate),
             Grid(LaunchSpec::from([grid_w, grid_h])),
-        ))
+        )
     };
-
-    // ── Build the TWO-step meta-kernel by composing `curried_kernel` with itself. ──
-    //   STEP 1 (read A, write B): value-bind the four field slots to concrete bufs.
-    //   STEP 2 (read B, write A): feed the same four slots from step-1's output
-    //     pipes — the crossed rotation is VISIBLE right in the `Tag(pipe)` args.
-    // Over the pair the buffer roles are identity (A→B→A), so the graph is bound
-    // ONCE at build and replays with NO per-step rebinding.
-    let g = curried_kernel(&ks, lap_u1, lap_v1)
+    let g = gray_scott_step(&ks, lap_u1, lap_v1)
+        .call(invariants())
         .call((UIn(u_a), VIn(v_a), UOut(u_b), VOut(v_b)))
         .and_then(move |(u_a, v_a, u_b, v_b)| {
-            curried_kernel(&ks, lap_u2, lap_v2).call((
-                UIn(u_b),  // read B
-                VIn(v_b),  // read B
-                UOut(u_a), // write back into A
-                VOut(v_a), // write back into A
-            ))
+            gray_scott_step(&ks, lap_u2, lap_v2)
+                .call(invariants())
+                .call((
+                    UIn(u_b),  // read B
+                    VIn(v_b),  // read B
+                    UOut(u_a), // write back into A
+                    VOut(v_a), // write back into A
+                ))
         });
 
     // ── Replay the TWO-step graph steps/2 times via plain sync(). ───────────
@@ -848,6 +868,47 @@ mod tests {
             sum_v > 1.0,
             "V must grow from the ~0 initial condition (the reaction ran); sum_v={sum_v}"
         );
+    }
+
+    /// The payoff of naming the per-step meta-kernel: `gray_scott_step` — a former
+    /// inline closure, now a reusable `impl Subgraph<O>` — can be built, bound, and
+    /// run **in isolation**, with none of `run_immutable`/`run_swap`'s double-buffer
+    /// scaffolding. (A closure's unnameable graph type can't be returned from a fn,
+    /// so this unit test was impossible before.) One step from the seeded IC must
+    /// stay finite, in range, and actually change the V field.
+    #[test]
+    fn meta_kernel_builds_and_runs() {
+        let Ok(ctx) = Context::any() else {
+            eprintln!("SKIP: no OpenCL device");
+            return;
+        };
+        let ks = gpu::kernels(&ctx).expect("load kernels");
+        let (u0, v0) = initial_fields();
+        let v0_before = v0.clone();
+
+        // Build the NAMED subgraph standalone; bind all seven slots (three invariants
+        // then the four fields) via two set-once `call`s; run ONE step.
+        let g = gray_scott_step(
+            &ks,
+            seeded(&ctx, vec![0.0f32; N]).expect("lap_u"),
+            seeded(&ctx, vec![0.0f32; N]).expect("lap_v"),
+        )
+        .call((F(0.037), K(0.06), Grid(LaunchSpec::from([W, H]))))
+        .call((
+            UIn(seeded(&ctx, u0).expect("u_in")),
+            VIn(seeded(&ctx, v0).expect("v_in")),
+            UOut(seeded(&ctx, vec![0.0f32; N]).expect("u_out")),
+            VOut(seeded(&ctx, vec![0.0f32; N]).expect("v_out")),
+        ));
+        let (_u_in, _v_in, _u_out, v_out) = g.sync(&ctx).expect("sync one step");
+        let v = read_field(&v_out).expect("read v_out");
+
+        assert!(!v.iter().any(|x| x.is_nan()), "V must be NaN-free");
+        assert!(
+            v.iter().all(|&x| (-0.5..=1.5).contains(&x)),
+            "V must stay in a sane range after one step"
+        );
+        assert!(v != v0_before, "one step must actually change the V field");
     }
 
     /// **The thesis proof.** The two graph shapes — mutable-swap replay
