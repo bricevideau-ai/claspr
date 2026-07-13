@@ -9,6 +9,101 @@ items resolve.
 
 ## Active
 
+### 🔎 INVESTIGATION 2026-07-12 — ARCHITECTURAL cost-of-entry for SUB-AGENTS (the real target — reduce the ~200k tokens an agent burns before it can code)
+
+REFRAME (Brice): the gap-to-entry work is NOT about user signature ergonomics — it's
+that a sub-agent must read ~200k tokens (+ time) before making ANY meaningful change.
+Documentation didn't fix it ⇒ the ARCHITECTURE is likely too complex. OutputShape /
+meta_kernel! / eager.rs-split barely touch this (they help USERS write graphs; they
+don't shrink what an AGENT must LOAD to edit internals).
+
+MEASURED (2026-07-12, coordinator + 2 subagents agree):
+- Orientation token budget: eager.rs ~89k tok (11,722 lines, 41% comments), NOTES.md
+  ~36k, claspr-macros ~18k, record.rs ~8k. Reading just these ≈ 150k; chasing
+  definitions across files pushes past 200k. Whole src tree = 30,955 LOC.
+- Public concept count: **73 public traits** crate-wide; eager.rs alone = 20 traits,
+  48 structs, 110 pub fns, 7 enums.
+- **~70% of the load to understand even the SIMPLEST leaf (Fill) is the SHARED CORE**,
+  not the leaf. Tracing "add a leaf" pulls in ~22 distinct definitions across 5 files;
+  the DeviceOp trait ALONE is ~536 lines / 6-7k tokens of doc. (subagent trace)
+- DeviceOp mixes ~5 subsystems in ONE trait: execution/gather (8 methods),
+  command-buffer (5), slot/binding (2), introspection (3), legacy record (1), + assoc
+  types. So understanding ANY op forces loading ALL subsystems — the trait is the
+  chokepoint through which every concern is threaded.
+- Even Fill::execute interleaves 4 subsystems inline (home dance ×10, CB 3-arm fork,
+  sync-points, reach). Abstractions are INTERLEAVED, not LAYERED.
+
+ROOT CAUSES (essential vs accidental complexity):
+1. **God-trait.** `DeviceOp` (25 members) is the single abstraction for execution +
+   command-buffer recording + slot-binding + host-seam + introspection + legacy record.
+   An agent can't load a slice of it; it's all-or-nothing. This is THE structural driver.
+2. **Interleaving, not layering.** Every leaf's `execute` hand-writes the same 3-arm
+   `match ec.cb()` CB fork + home-threading (`match ec.cb()` ×12, `CbWalk::Build` ×15,
+   `put_home` ×50, `cb_collect_external` ×12 across ~28 leaves). ~25 leaves each
+   re-implement near-identical CB/home boilerplate — mechanical repetition an agent must
+   re-read per op, and a shared executor helper could absorb.
+3. **Two live recording models.** Legacy `RecordContext`/`RecordExt`/`record_graph()`
+   (explicit record→replay, ~525 lines in record.rs + `fn record` on every op + a test +
+   public export) coexists with the NEW CB-as-execution-mode (automatic). An agent must
+   learn BOTH and figure out which to touch. The legacy path may now be redundant.
+4. **Slot machinery is the largest cross-cutting surface** (~1586 line-mentions in
+   eager.rs vs ~343 for CB): Input's 4 states (Concrete/Slot/Pipe/FedByPipe) × the
+   4-verb bind matrix × Checkout/home/sever × SlotBinder — threaded through every op.
+5. **Concept sprawl inflated by MECHANICAL trait families.** 73 traits, but a large
+   share are near-identical generated/boilerplate members: 18 hand-written
+   `KernelImage<dim><access>Arg` traits (Read/Write/RW × 1D/2D/3D/Array/Buffer), Bundle2..16
+   (15 combinators), tuple `CallArgs`/`KernelArgs` arities. These inflate the APPARENT
+   concept count without adding conceptual load — but an agent still scans them.
+6. **No architecture map for MODIFIERS.** There's a `prelude` (for USING the API) and a
+   162-line CLAUDE.md, but no layered "read THIS to change internals" doc — so an agent
+   reads everything. NOTES.md (36k tok, 39 sections, 2 months) is largely a resolved-
+   decision archive but gets loaded wholesale.
+
+REFACTORINGS THAT WOULD ACTUALLY REDUCE AGENT COST (ranked by leverage; NONE is
+eager.rs-split, which is pure cosmetics):
+
+R1 (HIGHEST) — **Split the `DeviceOp` god-trait into a small REQUIRED core + optional
+   capability traits.** Core = `Output`/`execute`/`output_pipe`/`describe` (what a leaf
+   MUST provide). Move command-buffer (`cb_*` ×8), introspection (`dump_graph`/
+   `node_label`), and slot (`bind_slots`) concerns into separate traits with blanket/
+   default impls. Then an agent editing a leaf loads ONLY the core (~2k tok) + the one
+   capability it touches — not all 25 members + 5 subsystems. This is the single biggest
+   lever: it turns "understand everything" into "understand one layer."
+
+R2 — **Extract a shared leaf-executor helper** so leaves stop hand-writing the 3-arm CB
+   fork + home dance. A `leaf_execute(&self, ec, mode, record_cmd_closure)` (or a macro)
+   that owns the `match ec.cb()` / put_home / cb_collect_external / reach boilerplate;
+   each leaf supplies only its actual command (fill/copy/kernel). Collapses ~25×~40 lines
+   of near-duplicate code an agent currently must read per op, and localizes the CB
+   subsystem to ONE place.
+
+R3 — **Delete or quarantine the legacy `RecordContext`/`RecordExt` path IF redundant
+   with CB-as-execution-mode.** First verify it offers nothing CB doesn't (the
+   record_replay test + explicit record_graph() API). If redundant: remove `fn record`
+   from the trait + the ~525 record.rs lines + the export. If still needed: move it
+   behind a feature/module and document "you almost never touch this." Either way stops
+   an agent from learning two recording models.
+
+R4 — **Collapse mechanical trait families with macros + document them as "generated."**
+   The 18 KernelImage*Arg traits → one `impl_kernel_image_arg!` macro invocation table;
+   mark Bundle2..16 / tuple-arity families with a one-line "mechanical family, read one
+   member" banner. Shrinks the apparent 73-trait surface an agent scans.
+
+R5 — **Add an ARCHITECTURE.md layer map + prune NOTES.md to an active-only doc.** A
+   ~1-page "the code has 4 layers: access/buffer (Tier 1) → op/launch → eager graph
+   (Tier 2) → CB recording; to change X read only Y" map, so an agent loads a subsystem
+   not the whole tree. Move resolved NOTES sections to a separate ARCHIVE (git already
+   has the history) so the loaded rolling doc is ~5k not ~36k.
+
+SEQUENCING: R1 is the structural keystone (do first, on a scratch branch — it's a big
+trait refactor touching all 44 impls, but mostly mechanical moves). R2 rides on R1. R3
+is independent + quick (verify-then-delete). R4/R5 are low-risk doc/macro wins doable
+anytime. eager.rs-split (#242) becomes trivial + more valuable AFTER R1/R2 shrink each
+op. Measure success by RE-RUNNING the "add a leaf" trace: distinct-definitions-to-read
+should drop from ~22 across 5 files to a core handful. This is a SEPARATE track from the
+OutputShape/meta_kernel user-ergonomics work below — different goal (agent load vs user
+signatures), though R1 and OutputShape are compatible.
+
 ### 🔎 INVESTIGATION 2026-07-12 — `meta_kernel!` macro vs `OutputShape` (Brice asked: could a signature-generating macro help, alt/complement to OutputShape?)
 
 VERDICT: `meta_kernel!` is a REAL win and a COMPLEMENT to `OutputShape`, not an
