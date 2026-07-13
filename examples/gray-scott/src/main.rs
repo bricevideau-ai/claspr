@@ -629,31 +629,30 @@ fn run_swap(
 /// This was a local closure inside `run_immutable` — and it *had* to be, because a
 /// closure's graph type is unnameable, so a hand-written `-> impl DeviceOp<..>` return
 /// needed the full `Output`/`Handle`/`Checkouts` shape spelled out, and the noise
-/// pushed it back inline. `-> impl `[`Subgraph`](claspr::eager::Subgraph)`<O>` fixes
-/// that: `O` is the four field buffers, and the one bound pins the canonical
-/// [`OutputShape`](claspr::eager::OutputShape) handle/checkouts + `FromCheckout` — so
-/// callers still destructure a clean `|(u_in, v_in, u_out, v_out)|` and compose it
-/// onward, with no where-clause here. Now it can be reused across sites, aliased, and
-/// unit-tested in isolation (see `meta_kernel_builds_and_runs`), which a closure can't.
+/// pushed it back inline. `#[claspr::meta_kernel]` + `-> subgraph!(O)` fixes that: it
+/// expands to `impl Subgraph<O> + use<>`, pinning the canonical
+/// [`OutputShape`](claspr::eager::OutputShape) handle/checkouts + `FromCheckout` (so
+/// callers still destructure a clean `|(u_in, v_in, u_out, v_out)|`) AND supplying the
+/// edition-2024 `+ use<>` precise-capture for free. `O` is the four field buffers. Now
+/// it can be reused across sites, aliased, and unit-tested in isolation (see
+/// `meta_kernel_builds_and_runs`), which a closure can't.
 ///
 /// Builds the raw three-dispatch DAG with ALL SEVEN slots OPEN (`Grid`/`UIn`/`VIn`/
 /// `UOut`/`VOut`/`F`/`K`), then TRIMS `combine`'s six-output handle to the four field
 /// buffers via `bundle4`. Takes `ks` + the two lap-scratch buffers by arg; the built
-/// graph does NOT borrow `ks` (the launchers clone the context internally).
+/// graph does NOT borrow `ks` (the launchers clone the context internally — which is
+/// why `-> subgraph!(..)`'s generated `use<>` captures no lifetime).
+#[claspr::meta_kernel]
 fn gray_scott_step(
     ks: &gpu::Kernels,
     lap_u: DeviceSlice<f32>,
     lap_v: DeviceSlice<f32>,
-) -> impl claspr::eager::Subgraph<(
+) -> subgraph!((
     DeviceSlice<f32>,
     DeviceSlice<f32>,
     DeviceSlice<f32>,
     DeviceSlice<f32>,
-)> + use<> {
-    // `+ use<>` (edition-2024 precise capturing): the built graph owns everything it
-    // needs — each launcher clones its `Kernel`/context by value — so it does NOT
-    // borrow `ks`. Without it, 2024's RPIT auto-captures `ks`'s lifetime and the
-    // step-2 call inside the `and_then` move-closure trips E0515.
+)) {
     use claspr::eager::bundle4;
     ks.laplacian(slot!(Grid), slot!(UIn), lap_u)
         .and_then(move |(u_in, lap_u_pipe)| {

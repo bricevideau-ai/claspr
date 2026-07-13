@@ -104,19 +104,29 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-/// Author a **generic reusable-graph function** (a "meta-kernel") without the
-/// signature plumbing that generic subgraph composition otherwise forces.
+/// Author reusable-graph functions ("meta-kernels") without the signature plumbing
+/// that generic subgraph composition otherwise forces. The `subgraph!(..)` marker is
+/// used in TWO positions, and `#[meta_kernel]` rewrites both:
 ///
-/// A function that composes caller-supplied subgraphs (each a closure returning a
-/// `claspr::eager::DeviceOp`) normally has to declare, per subgraph parameter, a
-/// closure type generic, its result type generic, the `Fn(..) -> R` bound, and the
-/// `R: DeviceOp<Output/Handle/Checkouts>` + `FromCheckout` bounds — enough noise that
-/// the ergonomic escape hatch is to give up on the function form and inline
-/// everything as local closures (as `examples/gray-scott` once had to).
+/// **PRODUCER — a fn that RETURNS a graph.** Write `-> subgraph!(Output)`; it becomes
+/// `-> impl claspr::eager::Subgraph<Output> + use<TypeParams>`. That pins the canonical
+/// `OutputShape` handle/checkouts + `FromCheckout` (so callers destructure the graph's
+/// handle and compose it onward) AND supplies the edition-2024 `+ use<>` precise-capture
+/// (a graph owns its `Kernel`/context by value — it must NOT auto-capture the `&Kernels`
+/// lifetime, or a producer called inside an `and_then` move-closure trips E0515). This
+/// makes a former-inline meta-kernel a NAMED, reusable, unit-testable fn.
 ///
-/// `#[meta_kernel]` restores the function form. Write each subgraph parameter with
-/// the marker type `subgraph!(Fn(inputs..) -> Output)`; the macro rewrites it to a
-/// fresh closure generic and injects the bounds:
+/// ```ignore
+/// #[claspr::meta_kernel]
+/// fn gray_scott_step(ks: &Kernels, lap_u: DeviceSlice<f32>, lap_v: DeviceSlice<f32>)
+///     -> subgraph!((DeviceSlice<f32>, DeviceSlice<f32>, DeviceSlice<f32>, DeviceSlice<f32>))
+/// { /* build + return the graph */ }
+/// ```
+///
+/// **CONSUMER — a fn generic over caller-supplied subgraphs.** Write each such
+/// parameter `p: subgraph!(Fn(inputs..) -> Output)`; it becomes a fresh closure generic
+/// `p: __MkFn_p` with `__MkFn_p: Fn(inputs..) -> __MkOut_p` and
+/// `__MkOut_p: Subgraph<Output>` — no hand-written generics or `where`-clause.
 ///
 /// ```ignore
 /// #[claspr::meta_kernel]
@@ -127,11 +137,8 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ) -> claspr::Result<Vec<f32>> { /* body calls compute_alpha(..) / compute_beta(..) */ }
 /// ```
 ///
-/// expands (per parameter `p: subgraph!(Fn(I..) -> O)`) to a generic closure param
-/// `p: __MkFn_p` with `__MkFn_p: Fn(I..) -> __MkOut_p` and
-/// `__MkOut_p: claspr::eager::Subgraph<O>` — the one bound that pins the canonical
-/// `OutputShape` handle/checkouts and the `FromCheckout` obligation. Non-`subgraph!`
-/// parameters and the body are untouched.
+/// A single fn may use both (take subgraphs AND return one). At least one `subgraph!`
+/// marker is required; non-`subgraph!` parameters and the body are untouched.
 #[proc_macro_attribute]
 pub fn meta_kernel(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
@@ -201,17 +208,58 @@ fn expand_meta_kernel(mut func: ItemFn) -> syn::Result<TokenStream2> {
         new_predicates.push(syn::parse_quote!(#out: ::claspr::eager::Subgraph<#output>));
     }
 
-    if new_params.is_empty() {
-        return Err(syn::Error::new(
-            func.sig.span(),
-            "meta_kernel: no `subgraph!(Fn(..) -> Output)` parameters found — this \
-             attribute is only useful on a function that takes subgraph closures",
-        ));
-    }
+    let had_params = !new_params.is_empty();
 
+    // Inject the consumer generics FIRST so the producer-return `use<>` below can
+    // capture the minted `__MkOut_*` types too (a fn that both takes AND returns
+    // subgraphs). Predicates are pushed after the return rewrite (order-independent).
     for g in new_params {
         func.sig.generics.params.push(g);
     }
+
+    // ── PRODUCER position: `-> subgraph!(O)` → `impl Subgraph<O> + use<type-params>`.
+    // The graph owns its `Kernel`/context by value, so it captures every TYPE param
+    // (typed data flows into it) but NO lifetimes (it doesn't borrow `&Kernels`) —
+    // the `+ use<>` that opts out of edition-2024 RPIT lifetime auto-capture (else a
+    // producer called inside an `and_then` move-closure trips E0515).
+    let producer_out: Option<Type> = match &func.sig.output {
+        syn::ReturnType::Type(_, ty) => match &**ty {
+            Type::Macro(TypeMacro { mac }) if mac.path.is_ident("subgraph") => {
+                Some(syn::parse2(mac.tokens.clone()).map_err(|e| {
+                    syn::Error::new(
+                        mac.tokens.span(),
+                        format!(
+                            "meta_kernel: expected `subgraph!(Output)` in return position ({e})"
+                        ),
+                    )
+                })?)
+            }
+            _ => None,
+        },
+        syn::ReturnType::Default => None,
+    };
+    let had_return = producer_out.is_some();
+    if let Some(out_ty) = producer_out {
+        let caps: Vec<Ident> = func
+            .sig
+            .generics
+            .type_params()
+            .map(|p| p.ident.clone())
+            .collect();
+        func.sig.output = syn::parse_quote!(
+            -> impl ::claspr::eager::Subgraph<#out_ty> + use<#(#caps),*>
+        );
+    }
+
+    if !had_params && !had_return {
+        return Err(syn::Error::new(
+            func.sig.span(),
+            "meta_kernel: found no `subgraph!(...)` marker — use it on a subgraph \
+             PARAMETER (`p: subgraph!(Fn(..) -> O)`), the RETURN type \
+             (`-> subgraph!(O)`), or both",
+        ));
+    }
+
     let where_clause = func.sig.generics.make_where_clause();
     for p in new_predicates {
         where_clause.predicates.push(p);

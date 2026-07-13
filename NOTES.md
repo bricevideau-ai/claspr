@@ -101,14 +101,31 @@ FACTORING ROADMAP — ASSESSED & DECLINED (kept here so future sessions don't re
     obligations (`Output=O`, canonical `OutputShape` Handle/Checkouts, `Checkouts:
     FromCheckout<O>`) into ONE bound. `A: Subgraph<AlphaOut>` replaces cg's 4-line
     `DeviceOp<Output/Handle/Checkouts>` + `FromCheckout` block. Standard Rust, good errors.
-  - **`#[meta_kernel]` attr proc-macro** (claspr-macros): each `subgraph!(Fn(inputs..) ->
-    Output)` param → a fresh closure generic bounded `Fn(inputs..) -> __Out`, `__Out:
-    Subgraph<Output>`. Author writes NO generics/where-clause — just each subgraph's
-    inputs+output inline. cg `solve_with` converted to it (converges 3 ICDs); guard test
-    tier2/meta_kernel.rs. Verified clippy/doc/fmt + tier1/tier2 green on 3 ICDs. NB minted
-    idents `__MkFn_*`/`__MkOut_*` need `#[allow(non_camel_case_types)]` (macro injects it).
-    OPEN FOR REVIEW: macro marker syntax (`subgraph!(Fn(..) -> O)`); whether to keep BOTH
-    the trait (explicit path) and the macro (sugar), or macro-only.
+  - **`#[meta_kernel]` attr proc-macro** (claspr-macros): the `subgraph!(..)` marker is
+    ONE spelling used in TWO positions (Brice's original vision), and the attribute
+    rewrites both:
+    - **PRODUCER** `-> subgraph!(O)` → `impl Subgraph<O> + use<TypeParams>`. Names a
+      graph-returning fn AND auto-supplies the edition-2024 `+ use<>` precise-capture
+      (graph owns Kernels by value → must not capture the `&Kernels` lifetime, else a
+      producer called in an `and_then` move-closure trips E0515). `examples/gray-scott`
+      `gray_scott_step` converted from an inline closure to `#[meta_kernel] fn … ->
+      subgraph!((4 buffers))`; now reusable + UNIT-TESTED in isolation
+      (`meta_kernel_builds_and_runs`); `swap_and_immutable_agree_bit_for_bit` still passes.
+    - **CONSUMER** param `p: subgraph!(Fn(inputs..) -> O)` → a fresh closure generic
+      `Fn(inputs..) -> __MkOut`, `__MkOut: Subgraph<O>` (no hand-written generics/where).
+      cg `solve_with` uses it (converges 3 ICDs); guard test tier2/meta_kernel.rs.
+    Verified: clippy(changed crates)/doc/fmt clean + full tier1/tier2 green on pocl. NB
+    minted `__MkFn_*`/`__MkOut_*` need `#[allow(non_camel_case_types)]` (macro injects it).
+  - **Trade-offs settled:** (a) do NOT wire `OutputShape` as the `DeviceOp::Handle`
+    default — it needs `Self::Output: OutputShape` on the core trait, cascading that
+    bound through every generic combinator (`S::Output`/`U::Output`/`[S::Output;N]`/…) —
+    the same bad-ROI cascade R1 was rejected for; the additive `Subgraph<O>` gets the
+    win only where you author a subgraph. (b) `+ use<>` papercut is now SOLVED by the
+    producer macro (auto-emitted). (c) `Subgraph<O>` stays public — the plain-Rust path
+    for anyone who'd rather not use the macro (`A: Subgraph<O>` bound / `-> impl
+    Subgraph<O> + use<>` return).
+    OPEN FOR REVIEW: marker spelling `subgraph!(..)`; keep both trait+macro (current) vs
+    macro-only vs trait-only.
 
 (slots.rs extraction: DONE via scoped `pub(crate)` — the driver-relocation refactor
 turned out unnecessary; making the `SlotBinder` inherent surface `pub(crate)` was
