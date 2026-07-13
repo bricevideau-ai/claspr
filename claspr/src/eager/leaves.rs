@@ -1829,206 +1829,93 @@ where
     }
 }
 
-// ── Leaf: alloc an uninit USMSlice (eager UsmSliceAllocUninit) ──────────────
+// ── Leaf: alloc an uninit slice (Device / Mapped / USM) ─────────────────────
+//
+// Producing SOURCE leaf: allocation happens at execute (`<Buf>::alloc_uninit`),
+// so the uninit is a graph-produced value a downstream `fill_*_uninit` /
+// `write_*_uninit` consumes. The three memory families are identical except the
+// buffer type + names, so one macro emits all of them. `mapped_alloc_uninit` on a
+// no-SVM device surfaces `Error::SvmNotAvailable` at the graph TERMINAL (the
+// `alloc_uninit` call), not eagerly. `_as` takes an explicit access-marker witness;
+// the bare ctor defaults to `ReadWrite` (turbofish-free).
 
-/// Allocate a [`USMSliceUninit<T, M>`]. Source leaf; allocation is pure host
-/// code (`USMSlice::alloc_uninit`) — no enqueue, no event (mode N/A). Mirrors
-/// [`Upload`]'s synchronous-create shape.
-pub struct UsmAllocUninit<T, M: MemMode = ReadWrite> {
-    len: usize,
-    out: Pipe<USMSliceUninit<T, M>>,
-    _t: PhantomData<fn() -> (T, M)>,
+macro_rules! impl_alloc_uninit {
+    ($Op:ident, $Buf:ident, $Uninit:ident, $ctor:ident, $ctor_as:ident, $label:literal) => {
+        #[doc = concat!("Graph leaf that allocates a `", stringify!($Uninit), "<T, M>` at execute. Build via [`", stringify!($ctor), "`].")]
+        pub struct $Op<T, M: MemMode = ReadWrite> {
+            len: usize,
+            out: Pipe<$Uninit<T, M>>,
+            _t: PhantomData<fn() -> (T, M)>,
+        }
+
+        #[doc = concat!("Build an eager uninit-`", stringify!($Buf), "` alloc leaf with the default [`ReadWrite`] marker (no turbofish). For a non-default marker use [`", stringify!($ctor_as), "`].")]
+        pub fn $ctor<T: Send + 'static>(len: usize) -> $Op<T, ReadWrite> {
+            $ctor_as(len, ReadWrite)
+        }
+
+        #[doc = concat!("Build an eager uninit-`", stringify!($Buf), "` alloc leaf with an explicit access marker inferred from the `marker` witness.")]
+        pub fn $ctor_as<T, M>(len: usize, marker: M) -> $Op<T, M>
+        where
+            T: Send + 'static,
+            M: MemMode + Send + 'static,
+        {
+            let _ = marker;
+            $Op { len, out: Pipe::new(), _t: PhantomData }
+        }
+
+        impl<T, M> DeviceOp for $Op<T, M>
+        where
+            T: Send + 'static,
+            M: MemMode + Send + 'static,
+        {
+            type Output = $Uninit<T, M>;
+
+            fn output_pipe(&self) -> Option<Pipe<$Uninit<T, M>>> {
+                Some(self.out.clone())
+            }
+
+            fn handle(&self) -> Self::Handle {
+                self.out.clone()
+            }
+
+            fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+                // alloc_uninit is pure host code — no in-flight event, mode N/A.
+                let uninit = $Buf::<T, M>::alloc_uninit(ec.context(), self.len)?;
+                self.out.put(uninit, Deps::new());
+                Ok(())
+            }
+
+            fn describe(&self, out: &mut Vec<String>) {
+                out.push(format!(concat!($label, "(len={})"), self.len));
+            }
+        }
+    };
 }
 
-/// Build an eager uninit-USM alloc leaf with the **default [`ReadWrite`]
-/// marker** — no turbofish: `usm_alloc_uninit(N)`. For a non-default marker use
-/// [`usm_alloc_uninit_as`] with a marker witness.
-pub fn usm_alloc_uninit<T>(len: usize) -> UsmAllocUninit<T, ReadWrite>
-where
-    T: Send + 'static,
-{
-    usm_alloc_uninit_as(len, ReadWrite)
-}
-
-/// Build an eager uninit-USM alloc leaf with an **explicit access marker**,
-/// inferred from the `marker` witness. The default-marker shorthand is
-/// [`usm_alloc_uninit`].
-pub fn usm_alloc_uninit_as<T, M>(len: usize, marker: M) -> UsmAllocUninit<T, M>
-where
-    T: Send + 'static,
-    M: MemMode + Send + 'static,
-{
-    let _ = marker;
-    UsmAllocUninit {
-        len,
-        out: Pipe::new(),
-        _t: PhantomData,
-    }
-}
-
-impl<T, M> DeviceOp for UsmAllocUninit<T, M>
-where
-    T: Send + 'static,
-    M: MemMode + Send + 'static,
-{
-    type Output = USMSliceUninit<T, M>;
-
-    fn output_pipe(&self) -> Option<Pipe<USMSliceUninit<T, M>>> {
-        Some(self.out.clone())
-    }
-
-    fn handle(&self) -> Self::Handle {
-        self.out.clone()
-    }
-
-    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // alloc_uninit is pure host code — no in-flight event, mode N/A.
-        let uninit = USMSlice::<T, M>::alloc_uninit(ec.context(), self.len)?;
-        self.out.put(uninit, Deps::new());
-        Ok(())
-    }
-
-    fn describe(&self, out: &mut Vec<String>) {
-        out.push(format!("usm_alloc_uninit(len={})", self.len));
-    }
-}
-
-// ── Leaf: alloc an uninit DeviceSlice (eager DeviceSliceAllocUninit) ─────────
-
-/// Allocate a [`DeviceSliceUninit<T, M>`] inside the graph. Producing source
-/// leaf; allocation happens at execute (`DeviceSlice::alloc_uninit`), so the
-/// uninit is a graph-produced value a downstream `fill_device_uninit` /
-/// `write_device_uninit` consumes — the eager analog of the old layer's
-/// `DeviceSliceAllocUninit`. Mirrors [`UsmAllocUninit`].
-pub struct DeviceAllocUninit<T, M: MemMode = ReadWrite> {
-    len: usize,
-    out: Pipe<DeviceSliceUninit<T, M>>,
-    _t: PhantomData<fn() -> (T, M)>,
-}
-
-/// Build an eager uninit-`DeviceSlice` alloc leaf with the **default
-/// [`ReadWrite`] marker** — no turbofish: `device_alloc_uninit(N)`. For a
-/// non-default marker use [`device_alloc_uninit_as`] with a marker witness.
-pub fn device_alloc_uninit<T>(len: usize) -> DeviceAllocUninit<T, ReadWrite>
-where
-    T: Send + 'static,
-{
-    device_alloc_uninit_as(len, ReadWrite)
-}
-
-/// Build an eager uninit-`DeviceSlice` alloc leaf with an **explicit access
-/// marker**, inferred from the `marker` witness. The default-marker shorthand
-/// is [`device_alloc_uninit`].
-pub fn device_alloc_uninit_as<T, M>(len: usize, marker: M) -> DeviceAllocUninit<T, M>
-where
-    T: Send + 'static,
-    M: MemMode + Send + 'static,
-{
-    let _ = marker;
-    DeviceAllocUninit {
-        len,
-        out: Pipe::new(),
-        _t: PhantomData,
-    }
-}
-
-impl<T, M> DeviceOp for DeviceAllocUninit<T, M>
-where
-    T: Send + 'static,
-    M: MemMode + Send + 'static,
-{
-    type Output = DeviceSliceUninit<T, M>;
-
-    fn output_pipe(&self) -> Option<Pipe<DeviceSliceUninit<T, M>>> {
-        Some(self.out.clone())
-    }
-
-    fn handle(&self) -> Self::Handle {
-        self.out.clone()
-    }
-
-    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // alloc_uninit is pure host code — no in-flight event, mode N/A.
-        let uninit = DeviceSlice::<T, M>::alloc_uninit(ec.context(), self.len)?;
-        self.out.put(uninit, Deps::new());
-        Ok(())
-    }
-
-    fn describe(&self, out: &mut Vec<String>) {
-        out.push(format!("device_alloc_uninit(len={})", self.len));
-    }
-}
-
-// ── Leaf: alloc an uninit MappedSlice (eager MappedSliceAllocUninit) ─────────
-
-/// Allocate a [`MappedSliceUninit<T, M>`] inside the graph. Producing source
-/// leaf; allocation happens at execute (`MappedSlice::alloc_uninit`), which on a
-/// no-SVM device surfaces [`Error::SvmNotAvailable`] **at the graph terminal**
-/// (not eagerly) — the eager analog of the old layer's `MappedSliceAllocUninit`.
-/// A downstream `fill_mapped_uninit` / `write_mapped_uninit` consumes the result.
-pub struct MappedAllocUninit<T, M: MemMode = ReadWrite> {
-    len: usize,
-    out: Pipe<MappedSliceUninit<T, M>>,
-    _t: PhantomData<fn() -> (T, M)>,
-}
-
-/// Build an eager uninit-`MappedSlice` alloc leaf with the **default
-/// [`ReadWrite`] marker** — no turbofish: `mapped_alloc_uninit(N)`. For a
-/// non-default marker use [`mapped_alloc_uninit_as`] with a marker witness.
-pub fn mapped_alloc_uninit<T>(len: usize) -> MappedAllocUninit<T, ReadWrite>
-where
-    T: Send + 'static,
-{
-    mapped_alloc_uninit_as(len, ReadWrite)
-}
-
-/// Build an eager uninit-`MappedSlice` alloc leaf with an **explicit access
-/// marker**, inferred from the `marker` witness. The default-marker shorthand
-/// is [`mapped_alloc_uninit`].
-pub fn mapped_alloc_uninit_as<T, M>(len: usize, marker: M) -> MappedAllocUninit<T, M>
-where
-    T: Send + 'static,
-    M: MemMode + Send + 'static,
-{
-    let _ = marker;
-    MappedAllocUninit {
-        len,
-        out: Pipe::new(),
-        _t: PhantomData,
-    }
-}
-
-impl<T, M> DeviceOp for MappedAllocUninit<T, M>
-where
-    T: Send + 'static,
-    M: MemMode + Send + 'static,
-{
-    type Output = MappedSliceUninit<T, M>;
-
-    fn output_pipe(&self) -> Option<Pipe<MappedSliceUninit<T, M>>> {
-        Some(self.out.clone())
-    }
-
-    fn handle(&self) -> Self::Handle {
-        self.out.clone()
-    }
-
-    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // alloc_uninit is pure host code; on a no-SVM device it returns
-        // `SvmNotAvailable` here (at execute → surfaces at the terminal).
-        let uninit = MappedSlice::<T, M>::alloc_uninit(ec.context(), self.len)?;
-        self.out.put(uninit, Deps::new());
-        Ok(())
-    }
-
-    fn describe(&self, out: &mut Vec<String>) {
-        out.push(format!("mapped_alloc_uninit(len={})", self.len));
-    }
-}
-
-// ════════════════════════════════════════════════════════════════════════
-// image_transfer.rs ports — image upload / download
-// ════════════════════════════════════════════════════════════════════════
+impl_alloc_uninit!(
+    DeviceAllocUninit,
+    DeviceSlice,
+    DeviceSliceUninit,
+    device_alloc_uninit,
+    device_alloc_uninit_as,
+    "device_alloc_uninit"
+);
+impl_alloc_uninit!(
+    MappedAllocUninit,
+    MappedSlice,
+    MappedSliceUninit,
+    mapped_alloc_uninit,
+    mapped_alloc_uninit_as,
+    "mapped_alloc_uninit"
+);
+impl_alloc_uninit!(
+    UsmAllocUninit,
+    USMSlice,
+    USMSliceUninit,
+    usm_alloc_uninit,
+    usm_alloc_uninit_as,
+    "usm_alloc_uninit"
+);
 
 // ── Leaf: image upload (host pixels → image I) ──────────────────────────────
 
