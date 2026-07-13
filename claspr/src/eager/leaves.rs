@@ -827,6 +827,10 @@ pub struct FillDeviceUninit<T: Copy, M: MemMode> {
     uninit: Input<DeviceSliceUninit<T, M>>,
     value: T,
     out: Pipe<DeviceSlice<T, M>>,
+    /// Design-v2 CB home — a device fill-from-uninit records the SAME
+    /// `clCommandFillBufferKHR` an in-place [`Fill`] does (it writes a `cl_mem`),
+    /// so it is a CB command like `Fill`/`FillMappedUninit`. See [`CbCache`].
+    cb_cache: CbCache,
 }
 
 /// Build an eager fill-from-uninit leaf over a `DeviceSliceUninit`.
@@ -842,6 +846,7 @@ where
         uninit: uninit.into(),
         value,
         out: Pipe::new(),
+        cb_cache: new_cb_cache(),
     }
 }
 
@@ -861,10 +866,42 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        use crate::record::MemRef;
+        use opencl3::memory::ClMem;
         let (uninit, deps) = self.uninit.resolve(ec)?;
         // SAFETY: the fill below writes every byte; downstream gates on the
         // returned fill event (Pipelined) or the driver waits (Blocking).
         let mut buf = unsafe { uninit.assume_init() };
+
+        // ── CB-mode fork (design v2) — records `clCommandFillBufferKHR`, exactly
+        // like in-place `Fill` (this writes a `cl_mem` too, just one produced from
+        // an uninit alloc). Produced-from-uninit has no upstream slot/pipe reach,
+        // so the prologue degenerates to (None, None). ──────────────────────────
+        match ec.cb() {
+            CbWalk::Off => {}
+            CbWalk::Build { builder, ext, .. } => {
+                let waits = cb_leaf_build(ec, builder, ext, &deps, None, None, self.out.cell_id());
+                let mem = MemRef::Buffer(buf.buffer().get());
+                let pattern = unsafe {
+                    std::slice::from_raw_parts(
+                        (&self.value as *const T) as *const u8,
+                        std::mem::size_of::<T>(),
+                    )
+                };
+                let byte_len = buf.byte_len();
+                if let Some(sp) = builder.fill_buffer(mem, pattern, 0, byte_len, &waits) {
+                    ec.sp_register(self.out.cell_id(), std::collections::BTreeSet::from([sp]));
+                }
+                self.out.put(buf, Deps::new());
+                return Ok(());
+            }
+            CbWalk::LendOnly { ext, .. } => {
+                cb_collect_external(ext, &deps);
+                self.out.put(buf, Deps::new());
+                return Ok(());
+            }
+        }
+
         let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
         // Fill has no native CL_BLOCKING flag — enqueue, then wait on Blocking.
         let event = crate::buffer::fill_buffer_enqueue(&mut buf, ec, self.value, &raw)?;
@@ -882,6 +919,19 @@ where
 
     fn check_ready(&self) -> Result<()> {
         self.uninit.check_ready()
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        Some(&self.cb_cache)
+    }
+
+    fn cb_addable(&self) -> bool {
+        true
+    }
+
+    fn cbable_weight(&self) -> usize {
+        // One `clCommandFillBufferKHR`.
+        1
     }
 
     fn describe(&self, out: &mut Vec<String>) {

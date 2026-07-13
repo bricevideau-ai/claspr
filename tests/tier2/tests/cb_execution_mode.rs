@@ -414,3 +414,41 @@ fn root_bundle_records_one_command_buffer() {
         assert!(homed_cb(&g), "root bundle should home a command buffer");
     }
 }
+
+/// GAP FIX: a device fill-FROM-UNINIT records `clCommandFillBufferKHR` into a
+/// command buffer, exactly like an in-place `fill`. Both write a `cl_mem`, so a
+/// `fill_device_uninit(concrete_uninit, v) -> scale` span must be ONE CB (weight 2).
+/// Before the fix `FillDeviceUninit` had no CB fork (`cbable_weight` defaulted to 0),
+/// so this span was weight-1 and never opened a command buffer — an inconsistency
+/// with in-place `Fill` and the SVM `FillMappedUninit`, both of which record.
+#[test]
+fn fill_device_uninit_records_into_command_buffer() {
+    use claspr::eager::fill_device_uninit;
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+
+    // A CONCRETE uninit buffer (alloc'd up front) makes the fill a CB-span HEAD —
+    // like `fill` over a concrete buffer. (A graph-produced `device_alloc_uninit`
+    // head is a host op and would disqualify the span, same as `upload`.)
+    let uninit = DeviceSlice::<u32>::alloc_uninit(&ctx, N).expect("alloc_uninit");
+
+    // fill_device_uninit(7) -> scale(*3): fill + kernel = two device commands.
+    let g = fill_device_uninit(uninit, 7u32).and_then(|b| ks.scale_u32([N], b, 3u32));
+    assert_eq!(
+        g.cbable_weight(),
+        2,
+        "device fill-from-uninit + kernel = two CB commands (fill must be weight-1)"
+    );
+
+    let co = g.sync(&ctx).expect("sync");
+    let out = co.map().wait().expect("read");
+    assert!(out.iter().all(|&v| v == 21), "7*3=21: {:?}", &out[..8]);
+    drop(out);
+    drop(co);
+    if ctx.has_cl_khr_command_buffer() {
+        assert!(
+            homed_cb(&g),
+            "device fill-from-uninit + kernel should home ONE command buffer"
+        );
+    }
+}
