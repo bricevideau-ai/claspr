@@ -30,21 +30,42 @@ green on pocl, gray-scott/cg bit-identical):
   read-once trait. The "CB is a skippable layer" goal is met instead by the module split.
 - **R5 — added `ARCHITECTURE.md`** (the layered "to change X, read Y" map) and **pruned
   `NOTES.md` 3119 → ~120 lines** (resolved history is in git). CLAUDE.md points at it.
-- **Module split 1/n — extracted the CB machinery into `eager/cb.rs`** (636 lines). The
-  `pub use cb::*` re-export keeps the macro-referenced public CB surface at its
-  `::claspr::eager::` path. Pattern proven (incl. the visibility gotcha).
+- **Module split — extracted `eager/cb.rs` (650), `eager/leaves.rs` (3042),
+  `eager/combinators.rs` (2836)**. `eager.rs` 11023 → 5173 lines. `pub use mod::*`
+  keeps macro-referenced public surface at its `::claspr::eager::` path;
+  `AndThen`/`OnDevice`/`AndThenHost*` fields + `run_eager_chain` are `pub(crate)` (their
+  `DeviceOpExt` builders stay in eager.rs).
+- **`eager/slots.rs` DEFERRED (entangled)** — `SlotBinder`'s internals are driven by
+  `fold_bind`/`probe_bind`, which are `DeviceOpExt` TRAIT methods in eager.rs; a clean
+  move needs those drivers relocated to slots.rs as free fns first (rewrite the trait
+  methods as thin wrappers). Attempted + reverted (pub(crate)-everything works but leaks
+  the binder abstraction + touches delicate bind logic). A real refactor, not a move.
+- **R4 — collapsed the 18 hand-written `KernelImage*Arg` marker traits into a
+  `kernel_image_arg_traits!` macro + table** (image.rs −110 lines). Names preserved
+  (proc-macro builds them via `format_ident!`). Bundle2..16 + the 2..16 tuple families
+  (`FromCheckout`/`CheckoutSplit`/`SeamScatter`/`CallArgs`/`KernelArgs`/`BindAll`) were
+  ALREADY macros — no further collapse needed.
 
-VERIFIED (whole branch): all 9 examples build; tier1 91/0 + tier2 309/0 on ALL 3 ICDs
-(pocl, rusticl/llvmpipe, intel_legacy); compile_fail green (force-fresh rlib); CB
-examples (cg/batch-inference/gray-scott) cliloader leak-clean; fmt/clippy/doc clean.
-NOT yet pushed / promoted — awaiting review.
+FACTORING ROADMAP (remaining opportunities found scanning the extracted modules — each
+is a REAL parameterized refactor, not a mechanical collapse, so left for a focused pass):
+- **Leaf memory-family unification (biggest):** the device/mapped/usm variants of
+  Fill-uninit (`FillDeviceUninit`/`FillMappedUninit`/`FillUsmUninit`), write-host-data
+  (`WriteDevice{,Uninit}`/`WriteMapped{,Uninit}`/`WriteUsm{,Uninit}`), and alloc-uninit
+  are ~100-line struct+impl blocks repeated ~3× across mem families. They differ by
+  enqueue path + CB-recordability (device fill = weight-1 CB command; USM fill = host op
+  weight-0), so a `leaf_fill!`/`leaf_write!` macro needs per-family hooks. ~15 leaves,
+  could shed ~800 lines of leaves.rs.
+- **Concrete-head terminal boilerplate:** `wait(self)`/`submit(self)` inherent impls
+  repeated on ~12 leaves (`let ctx = concrete_buf_ctx(&self.FIELD)?; self.sync(&ctx)…`),
+  varying only by field + return type — a `concrete_head_terminals!(field, Out)` macro.
+- **Slots-driver relocation** (enables `eager/slots.rs`, see above).
+- **`OutputShape`** (user-ergonomics track #238-240): derive `Handle`/`Checkouts` from
+  `Output`, shrinking generic-subgraph where-clauses — cg `solve_with` exhibit.
 
-Planned next (proven-pattern, this branch or a follow-up): finish the module split —
-`eager/leaves.rs` (~3k lines; boundary work: leaves interleave with `CopyHome` +
-piped-verb impls + tail combinators) and `eager/slots.rs`; collapse the mechanical trait
-families (18 `KernelImage*Arg`, `Bundle2..16`, tuple arities) behind macros/banners
-(#246); optionally fold in `OutputShape` (derive `Handle`/`Checkouts` from `Output`,
-shrinking generic-subgraph where-clauses — cg `solve_with` exhibit; #238-240).
+VERIFIED (whole branch, tip `85af3b6`): all 9 examples build; claspr + claspr-test-image-kernels
+build clean; tier2 309/0 on pocl (3-ICD sign-off pending). fmt/clippy(-workspace)/doc clean.
+Rollback tag `pre-refactor-agent-cost-20260712`. First 5 commits already FF'd to main
+(`17f575e`); commits since (leaves/combinators/R4) awaiting the 3-ICD run.
 
 ---
 
