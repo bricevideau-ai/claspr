@@ -92,9 +92,15 @@ FACTORING ROADMAP — ASSESSED & DECLINED (kept here so future sessions don't re
   useful PER-OP doc comments (each op's Tier-1 spelling, e.g. `buf.fill(v).wait()?` vs
   `buf.write(d).wait()?`). A macro would either drop those (worse docs → worse
   cost-of-entry) or need doc-passthrough (negating the ~24-line win). Not worth it.
-- **`meta_kernel!` macro** (#241) — still open: evaluate as sugar over `OutputShape` for
-  auto-declaring subgraph signatures. Deferred (speculative; OutputShape covers the
-  where-clause pain it targeted).
+- **`meta_kernel!` macro** (#241) — EVALUATED & DECLINED. It would auto-declare a
+  generic subgraph fn's signature (the `CA/CB/A/B` generics + `Fn` bounds + `DeviceOp<
+  Output>` bounds + `OutputShape` projections). But a repo-wide scan found `cg`'s
+  `solve_with` is the ONLY generic-subgraph fn — every other reusable-graph pattern
+  (gray-scott's `get_meta_kernel`/`curried_kernel`, cg's own α/β builder closures)
+  uses type-inferred CLOSURES with ZERO signature boilerplate. So the macro would add
+  a new DSL to learn + opaque macro-expansion errors (a cost-of-entry COST) to save
+  ~15 lines at exactly one site that `OutputShape` already made readable. Closures ARE
+  the ergonomic path. REVISIT TRIGGER: 3+ generic-fn subgraph authors accumulate.
 
 (slots.rs extraction: DONE via scoped `pub(crate)` — the driver-relocation refactor
 turned out unnecessary; making the `SlotBinder` inherent surface `pub(crate)` was
