@@ -23,6 +23,18 @@ use super::*;
 /// threaded by its own override. A `None` on either side is therefore a no-op —
 /// byte-identical to the pre-Option behaviour, where a multi-output op returned a
 /// fresh never-filled `Pipe::new()` that `take()` always drained as empty.
+/// Merge a discarded `AndThen` source's leftover deps into the `deps` a
+/// value-returning walk (`collect`/`collect_home`/`gather_checkouts`) hands back.
+/// The source pipe was run for effect (its buffer threaded onward via `and_then`);
+/// if it still holds undrained events, they must gate downstream. The
+/// [`execute`](AndThen) twin instead stamps them onto its OUTPUT pipe (no return
+/// value) — see [`thread_orphaned_source_deps`].
+fn merge_orphaned_source_deps<A>(src_pipe: &Option<Pipe<A>>, deps: &mut Deps) {
+    if let Some((_discarded, src_deps)) = src_pipe.as_ref().and_then(|p| p.take()) {
+        deps.extend(src_deps);
+    }
+}
+
 fn thread_orphaned_source_deps<A, B>(src_pipe: &Option<Pipe<A>>, out_pipe: &Option<Pipe<B>>) {
     // Multi-output source (`None`) → no single pipe to thread; or the source pipe
     // was consumed by `next` (the normal case) → nothing to thread.
@@ -132,9 +144,7 @@ where
         // closure layer got this for free by passing `prior_evts` into
         // `next.execute`.) The discarded value drops here — the closure didn't
         // want it; its `cl_mem` is retained by any in-flight unmap until done.
-        if let Some((_discarded, src_deps)) = src_pipe.and_then(|p| p.take()) {
-            deps.extend(src_deps);
-        }
+        merge_orphaned_source_deps(&src_pipe, &mut deps);
         Ok((value, deps))
     }
 
@@ -160,9 +170,7 @@ where
         } else {
             self.next.collect_home(ec, mode)?
         };
-        if let Some((_discarded, src_deps)) = src_pipe.and_then(|p| p.take()) {
-            deps.extend(src_deps);
-        }
+        merge_orphaned_source_deps(&src_pipe, &mut deps);
         Ok((value, deps, home))
     }
 
@@ -198,9 +206,7 @@ where
         } else {
             cb_gather_child(&self.next, ec, mode)?
         };
-        if let Some((_discarded, src_deps)) = src_pipe.and_then(|p| p.take()) {
-            deps.extend(src_deps);
-        }
+        merge_orphaned_source_deps(&src_pipe, &mut deps);
         Ok((checkouts, deps))
     }
 
