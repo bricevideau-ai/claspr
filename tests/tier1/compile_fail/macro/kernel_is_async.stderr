@@ -1,0 +1,8 @@
+error: a `#[claspr::kernel]` fn cannot be `async` — a kernel is a device entry point
+ --> compile_fail/macro/kernel_is_async.rs:9:9
+  |
+9 |         async fn is_async(
+  |         ^^^^^
+
+error: aborting due to 1 previous error
+

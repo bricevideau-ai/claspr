@@ -448,7 +448,58 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<AttrArgs> {
     Ok(AttrArgs { kernels })
 }
 
+/// Reject kernel-fn signature features the translation can't express, with a
+/// span-attributed error AT THE MACRO BOUNDARY — otherwise they are silently
+/// dropped/ignored and surface as a confusing downstream trait/type error in
+/// generated code the user never wrote. A `#[claspr::kernel]` is a device entry
+/// point: no generics/lifetimes, no return type, not `async`/`unsafe`/`extern`,
+/// no variadics. (Buffer/scalar/builtin params are validated per-param later by
+/// `classify_param`.)
+fn validate_kernel_sig(sig: &Signature) -> syn::Result<()> {
+    if sig.asyncness.is_some() {
+        return Err(syn::Error::new_spanned(
+            sig.asyncness,
+            "a `#[claspr::kernel]` fn cannot be `async` — a kernel is a device entry point",
+        ));
+    }
+    if sig.unsafety.is_some() {
+        return Err(syn::Error::new_spanned(
+            sig.unsafety,
+            "a `#[claspr::kernel]` fn cannot be `unsafe`",
+        ));
+    }
+    if sig.abi.is_some() {
+        return Err(syn::Error::new_spanned(
+            &sig.abi,
+            "a `#[claspr::kernel]` fn cannot carry an `extern` ABI",
+        ));
+    }
+    if sig.variadic.is_some() {
+        return Err(syn::Error::new_spanned(
+            &sig.variadic,
+            "a `#[claspr::kernel]` fn cannot be variadic",
+        ));
+    }
+    if !sig.generics.params.is_empty() || sig.generics.where_clause.is_some() {
+        return Err(syn::Error::new_spanned(
+            &sig.generics,
+            "a `#[claspr::kernel]` fn cannot be generic (no type/lifetime/const \
+             parameters or `where` clauses) — the host wrapper picks its own generics \
+             from the buffer/image params",
+        ));
+    }
+    if let syn::ReturnType::Type(_, ty) = &sig.output {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "a `#[claspr::kernel]` fn cannot return a value — a kernel writes through \
+             its buffer/image args, so the signature must return `()`",
+        ));
+    }
+    Ok(())
+}
+
 fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
+    validate_kernel_sig(&func.sig)?;
     let name = &func.sig.ident;
 
     // Per-host-param accumulators. The single emitted method takes

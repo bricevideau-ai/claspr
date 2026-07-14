@@ -1,0 +1,8 @@
+error: a `#[claspr::kernel]` fn cannot return a value — a kernel writes through its buffer/image args, so the signature must return `()`
+  --> compile_fail/macro/kernel_returns_value.rs:13:14
+   |
+13 |         ) -> u32;
+   |              ^^^
+
+error: aborting due to 1 previous error
+
