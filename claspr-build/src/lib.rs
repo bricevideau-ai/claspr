@@ -207,6 +207,99 @@ impl SpirvBuilderSettings {
     }
 }
 
+/// Stamp the chainable SPIR-V config surface — the setters (`target_env` /
+/// `capability` / `panic_strategy` / `spirv_metadata` / `with`) and presets
+/// (`opencl12` / `opencl20_groups` / `image` / `with_f64`) — as INHERENT methods
+/// on a builder that holds a `settings: SpirvBuilderSettings` field.
+///
+/// [`CompileBuilder`] and [`HostBuilder`] differ only in their terminal call
+/// (`write_to` vs `write`); every config method is otherwise identical. Keeping
+/// them inherent (via this macro, not a trait) means callers need no extra `use`
+/// and no private type leaks into a public trait signature — while the bodies +
+/// docs live in exactly one place, so they can't drift.
+macro_rules! spirv_build_config_methods {
+    () => {
+        /// Set the SPIR-V target environment string passed to rust-gpu
+        /// (e.g. `"spirv-unknown-opencl2.0"`). Call order is irrelevant —
+        /// settings accumulate and apply at the terminal call.
+        pub fn target_env(mut self, target: impl Into<String>) -> Self {
+            self.settings.target_env = target.into();
+            self
+        }
+
+        /// Add a SPIR-V capability the kernels need (e.g. `Capability::Float64`).
+        pub fn capability(mut self, cap: Capability) -> Self {
+            self.settings.capabilities.push(cap);
+            self
+        }
+
+        /// Set the panic strategy used by SPIR-T to lower `panic!`/`abort`.
+        pub fn panic_strategy(mut self, strategy: ShaderPanicStrategy) -> Self {
+            self.settings.panic_strategy = Some(strategy);
+            self
+        }
+
+        /// Control what debug metadata (`OpName` / `OpLine`) is emitted into the
+        /// SPIR-V binary. claspr-build defaults to [`SpirvMetadata::NameVariables`]
+        /// so kernel-arg names survive `clGetKernelArgInfo` round-trip —
+        /// spirv-builder's own default of [`SpirvMetadata::None`] silently breaks
+        /// arg-name introspection.
+        ///
+        /// - [`SpirvMetadata::None`] — strip everything. Smallest binary; no arg
+        ///   names recoverable from the ICD.
+        /// - [`SpirvMetadata::NameVariables`] (default) — `OpName` for interface
+        ///   variables. Few-hundred-bytes-per-kernel cost; arg names become
+        ///   recoverable on PoCL ≥ 7.2 / Intel NEO / rusticl.
+        /// - [`SpirvMetadata::Full`] — `OpName` + `OpLine`. Useful for source-line
+        ///   backtraces in driver diagnostics. Trips SPIRV-LLVM-Translator on
+        ///   PoCL ≤ 7.2-pre with an unimplemented-opcode assertion; use sparingly
+        ///   until that is fixed upstream.
+        pub fn spirv_metadata(mut self, metadata: SpirvMetadata) -> Self {
+            self.settings.spirv_metadata = metadata;
+            self
+        }
+
+        /// Escape hatch for settings claspr-build doesn't wrap. Multiple `with`
+        /// calls accumulate; closures fire in call order at terminal-call time,
+        /// after the inherent setters and presets have been applied.
+        pub fn with(mut self, f: impl Fn(SpirvBuilder) -> SpirvBuilder + 'static) -> Self {
+            self.settings.customizers.push(Box::new(f));
+            self
+        }
+
+        /// Preset — OpenCL 1.2 with `panic!` lowered to printf-then-exit.
+        pub fn opencl12(self) -> Self {
+            self.target_env("spirv-unknown-opencl1.2").panic_strategy(
+                ShaderPanicStrategy::DebugPrintfThenExit {
+                    print_inputs: true,
+                    print_backtrace: true,
+                },
+            )
+        }
+
+        /// Preset — OpenCL 2.0 + `Groups` capability for subgroup / workgroup
+        /// collective kernels with barriers (uses the UB-via-unreachable panic
+        /// strategy to avoid divergence at barriers).
+        pub fn opencl20_groups(self) -> Self {
+            self.target_env("spirv-unknown-opencl2.0")
+                .capability(Capability::Groups)
+                .panic_strategy(
+                    ShaderPanicStrategy::UNSOUND_DO_NOT_USE_UndefinedBehaviorViaUnreachable,
+                )
+        }
+
+        /// Preset — image kernels: OpenCL 1.2 target, no panic strategy.
+        pub fn image(self) -> Self {
+            self.target_env("spirv-unknown-opencl1.2")
+        }
+
+        /// Convenience — add the `Float64` capability.
+        pub fn with_f64(self) -> Self {
+            self.capability(Capability::Float64)
+        }
+    };
+}
+
 /// Builder for compiling a kernel crate at build time and emitting
 /// generated Rust source.
 ///
@@ -236,86 +329,10 @@ impl CompileBuilder {
         }
     }
 
-    /// Set the SPIR-V target environment string passed to rust-gpu
-    /// (e.g. `"spirv-unknown-opencl2.0"`). Call order is irrelevant —
-    /// settings accumulate and apply when [`write_to`][Self::write_to] runs.
-    pub fn target_env(mut self, target: impl Into<String>) -> Self {
-        self.settings.target_env = target.into();
-        self
-    }
-
-    /// Add a SPIR-V capability the kernel needs (e.g. `Capability::Float64`).
-    pub fn capability(mut self, cap: Capability) -> Self {
-        self.settings.capabilities.push(cap);
-        self
-    }
-
-    /// Set the panic strategy used by SPIR-T to lower `panic!`/`abort`.
-    pub fn panic_strategy(mut self, strategy: ShaderPanicStrategy) -> Self {
-        self.settings.panic_strategy = Some(strategy);
-        self
-    }
-
-    /// Control what debug metadata (`OpName` / `OpLine`) is emitted
-    /// into the SPIR-V binary. claspr-build defaults to
-    /// [`SpirvMetadata::NameVariables`] so kernel-arg names survive
-    /// `clGetKernelArgInfo` round-trip — spirv-builder's own
-    /// default of [`SpirvMetadata::None`] silently breaks
-    /// arg-name introspection.
-    ///
-    /// - [`SpirvMetadata::None`] — strip everything. Smallest
-    ///   binary; no arg names recoverable from the ICD.
-    /// - [`SpirvMetadata::NameVariables`] (default) — `OpName`
-    ///   for interface variables. Few-hundred-bytes-per-kernel
-    ///   cost; arg names become recoverable on PoCL ≥ 7.2 / Intel
-    ///   NEO / rusticl.
-    /// - [`SpirvMetadata::Full`] — `OpName` + `OpLine`. Useful for
-    ///   source-line backtraces in driver diagnostics. Trips
-    ///   SPIRV-LLVM-Translator on PoCL ≤ 7.2-pre with an
-    ///   unimplemented-opcode assertion; use sparingly until that
-    ///   is fixed upstream.
-    pub fn spirv_metadata(mut self, metadata: SpirvMetadata) -> Self {
-        self.settings.spirv_metadata = metadata;
-        self
-    }
-
-    /// Escape hatch for settings claspr-build doesn't wrap. Multiple
-    /// `with` calls accumulate; closures fire in call order at
-    /// terminal-call time, after the inherent setters and presets
-    /// have been applied.
-    pub fn with(mut self, f: impl Fn(SpirvBuilder) -> SpirvBuilder + 'static) -> Self {
-        self.settings.customizers.push(Box::new(f));
-        self
-    }
-
-    /// Preset — OpenCL 1.2 with `panic!` lowered to printf-then-exit.
-    pub fn opencl12(self) -> Self {
-        self.target_env("spirv-unknown-opencl1.2").panic_strategy(
-            ShaderPanicStrategy::DebugPrintfThenExit {
-                print_inputs: true,
-                print_backtrace: true,
-            },
-        )
-    }
-
-    /// Preset — OpenCL 2.0 + `Groups` capability for subgroup / workgroup
-    /// collective kernels with barriers (uses the UB-via-unreachable
-    /// panic strategy to avoid divergence at barriers).
-    pub fn opencl20_groups(self) -> Self {
-        self.target_env("spirv-unknown-opencl2.0")
-            .capability(Capability::Groups)
-            .panic_strategy(ShaderPanicStrategy::UNSOUND_DO_NOT_USE_UndefinedBehaviorViaUnreachable)
-    }
-
-    /// Preset — image kernels: OpenCL 1.2 target, no panic strategy.
-    pub fn image(self) -> Self {
-        self.target_env("spirv-unknown-opencl1.2")
-    }
-
-    /// Convenience — add the `Float64` capability.
-    pub fn with_f64(self) -> Self {
-        self.capability(Capability::Float64)
-    }
+    // Chainable SPIR-V config setters/presets (`target_env`, `capability`,
+    // `opencl12`, `with_f64`, …) — shared verbatim with `HostBuilder` via the
+    // macro so they can't drift. Inherent, so callers need no extra `use`.
+    spirv_build_config_methods!();
 
     /// Compile the kernel crate, then write a generated Rust source
     /// file to `out_path` containing:
@@ -562,71 +579,9 @@ impl HostBuilder {
         }
     }
 
-    /// Set the SPIR-V target environment string.
-    pub fn target_env(mut self, target: impl Into<String>) -> Self {
-        self.settings.target_env = target.into();
-        self
-    }
-
-    /// Add a SPIR-V capability the kernels need.
-    pub fn capability(mut self, cap: Capability) -> Self {
-        self.settings.capabilities.push(cap);
-        self
-    }
-
-    /// Set the panic strategy.
-    pub fn panic_strategy(mut self, strategy: ShaderPanicStrategy) -> Self {
-        self.settings.panic_strategy = Some(strategy);
-        self
-    }
-
-    /// Control what debug metadata (`OpName` / `OpLine`) is emitted
-    /// into the SPIR-V binary. See
-    /// [`CompileBuilder::spirv_metadata`] for the full rationale —
-    /// claspr-build defaults to [`SpirvMetadata::NameVariables`]
-    /// for arg-name introspection.
-    pub fn spirv_metadata(mut self, metadata: SpirvMetadata) -> Self {
-        self.settings.spirv_metadata = metadata;
-        self
-    }
-
-    /// Escape hatch for settings claspr-build doesn't wrap. Multiple
-    /// `with` calls accumulate; closures fire in call order at build
-    /// time, after the inherent setters and presets have been
-    /// applied. Each device module's [`SpirvBuilder`] gets the
-    /// customizations independently.
-    pub fn with(mut self, f: impl Fn(SpirvBuilder) -> SpirvBuilder + 'static) -> Self {
-        self.settings.customizers.push(Box::new(f));
-        self
-    }
-
-    /// Preset — OpenCL 1.2 with `panic!` lowered to printf-then-exit.
-    pub fn opencl12(self) -> Self {
-        self.target_env("spirv-unknown-opencl1.2").panic_strategy(
-            ShaderPanicStrategy::DebugPrintfThenExit {
-                print_inputs: true,
-                print_backtrace: true,
-            },
-        )
-    }
-
-    /// Preset — OpenCL 2.0 + `Groups` capability for subgroup / workgroup
-    /// collective kernels with barriers.
-    pub fn opencl20_groups(self) -> Self {
-        self.target_env("spirv-unknown-opencl2.0")
-            .capability(Capability::Groups)
-            .panic_strategy(ShaderPanicStrategy::UNSOUND_DO_NOT_USE_UndefinedBehaviorViaUnreachable)
-    }
-
-    /// Preset — image kernels: OpenCL 1.2 target, no panic strategy.
-    pub fn image(self) -> Self {
-        self.target_env("spirv-unknown-opencl1.2")
-    }
-
-    /// Convenience — add the `Float64` capability.
-    pub fn with_f64(self) -> Self {
-        self.capability(Capability::Float64)
-    }
+    // Chainable SPIR-V config setters/presets — shared verbatim with
+    // `CompileBuilder` via the macro (see there). Inherent: no extra `use`.
+    spirv_build_config_methods!();
 
     /// Discover every `#[claspr::device] mod <name>` in the host
     /// source, generate one kernel sub-crate per module, compile each
