@@ -225,6 +225,150 @@ pub mod format {
 /// `A` is one of [`ReadOnly`] / [`WriteOnly`] / [`ReadWrite`] —
 /// matching the kernel-side access qualifier rust-gpu emits for
 /// `&Image` vs `&mut Image` parameters. `F` is a
+/// Emit the eight host-side transfer verbs shared by EVERY image
+/// family — `read` / `read_bytes` / `read_alloc` / `read_bytes_alloc`
+/// / `write` / `write_bytes` / `copy_to` / `fill` — into an
+/// `impl $ty<A, F>` block. These bodies are byte-identical across the
+/// six families except for (a) the diagnostic label and (b) the pixel
+/// extent, so the macro takes:
+///
+/// - `$ty` — the family struct (also the `copy_to` dst family),
+/// - `$label` — the diagnostic string (`"Image2D"` etc.),
+/// - `|$s| $region` — the `[usize; 3]` upload/download region, in the
+///   SAME shape as [`impl_image_enqueue!`] (the `read_alloc` /
+///   `read_bytes_alloc` verbs need it inline — they don't carry the
+///   `ImageEnqueue` bound the enqueue verbs do).
+///
+/// `pixel_count` is derived once as `region.iter().product()` — the
+/// per-family `w`, `w*h`, `w*h*d`, `w*array`, `w*h*array` expressions
+/// all fall out of the product of the region a family already declares,
+/// so there is no separate dimension formula to keep in sync.
+///
+/// Family-specific items (`alloc`, the `width()`/`height()`/…
+/// accessors, `image()`) stay hand-written in a sibling `impl` block —
+/// only the uniform verb surface is stamped here.
+macro_rules! impl_image_verbs {
+    ($ty:ident, $label:literal, |$s:ident| $region:expr) => {
+        impl<A: KernelAccess, F: format::Format> $ty<A, F> {
+            /// Begin reading this image into a caller-supplied
+            /// `&mut [F::Pixel]` of `width * … ` pixels. Returns a lazy
+            /// [`ImageRead`] graph node — pick a terminal (`.wait()`
+            /// blocking, `.submit()` non-blocking, or
+            /// `.wait_on`/`.submit_on`).
+            pub fn read<'a>(self, dst: &'a mut [F::Pixel]) -> Result<ImageRead<'a, Self, F::Pixel>>
+            where
+                Self: ImageEnqueue,
+                F::Pixel: Send,
+            {
+                let region = self.enqueue_region();
+                let pixel_count: usize = region.iter().product();
+                image_read_op(self, region, dst, pixel_count, $label)
+            }
+
+            /// Same as [`read`](Self::read) but raw bytes — caller-supplied
+            /// `&mut [u8]` of `pixel_count * size_of::<F::Pixel>()` bytes.
+            pub fn read_bytes<'a>(self, dst: &'a mut [u8]) -> Result<ImageRead<'a, Self, u8>>
+            where
+                Self: ImageEnqueue,
+            {
+                let region = self.enqueue_region();
+                let pixel_count: usize = region.iter().product();
+                let expected = pixel_count * std::mem::size_of::<F::Pixel>();
+                image_read_bytes_op(self, region, dst, expected, $label)
+            }
+
+            /// Convenience — `read` into a fresh `Vec`. The Op allocates
+            /// and the terminal yields the `Vec`.
+            pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
+            where
+                F::Pixel: Default + Copy,
+            {
+                let region = {
+                    let $s = self;
+                    $region
+                };
+                ImageReadAlloc {
+                    image: &self.image,
+                    ctx: &self.ctx,
+                    pixel_count: region.iter().product(),
+                    region,
+                    _format: PhantomData::<F>,
+                }
+            }
+
+            /// Same as [`read_alloc`](Self::read_alloc) but returns raw bytes.
+            pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
+                let region = {
+                    let $s = self;
+                    $region
+                };
+                let pixel_count: usize = region.iter().product();
+                ImageReadBytesAlloc {
+                    image: &self.image,
+                    ctx: &self.ctx,
+                    region,
+                    byte_len: pixel_count * std::mem::size_of::<F::Pixel>(),
+                    _format: PhantomData::<F>,
+                }
+            }
+
+            /// Begin writing a typed pixel slice to this image.
+            /// `pixels.len()` must equal the pixel extent (asserted).
+            /// Returns the [`ImageWrite`] graph node.
+            pub fn write<'a>(self, pixels: &'a [F::Pixel]) -> ImageWrite<'a, Self, F::Pixel>
+            where
+                Self: ImageEnqueue,
+                F::Pixel: Send + Sync,
+            {
+                let region = self.enqueue_region();
+                let pixel_count: usize = region.iter().product();
+                image_write_op(self, region, pixels, pixel_count, $label)
+            }
+
+            /// Same as [`write`](Self::write) but raw bytes — must be
+            /// exactly `pixel_count * size_of::<F::Pixel>()` bytes.
+            pub fn write_bytes<'a>(self, bytes: &'a [u8]) -> ImageWrite<'a, Self, u8>
+            where
+                Self: ImageEnqueue,
+            {
+                let region = self.enqueue_region();
+                let pixel_count: usize = region.iter().product();
+                let expected = pixel_count * std::mem::size_of::<F::Pixel>();
+                image_write_bytes_op(self, region, bytes, expected, $label)
+            }
+
+            /// Begin copying this image into `dst`. Both images must have
+            /// the same dimensions and format-compatible pixel sizes
+            /// (`clEnqueueCopyImage` surfaces format mismatches as
+            /// `CL_IMAGE_FORMAT_MISMATCH` at terminal time).
+            pub fn copy_to<A2: KernelAccess + Send + 'static>(
+                self,
+                dst: $ty<A2, F>,
+            ) -> ImageCopy<Self, $ty<A2, F>>
+            where
+                Self: ImageEnqueue,
+                F: Send + 'static,
+            {
+                let region = self.enqueue_region();
+                image_copy_op(self, dst, region)
+            }
+
+            /// Begin filling every pixel with `pattern`. The 4-component
+            /// pattern follows OpenCL's `clEnqueueFillImage` shape —
+            /// match `T` to the format's `SampledTypeFamily` (`u32` for
+            /// `Uint`, `i32` for `Sint`, `f32` for `Float` / `Unorm` /
+            /// `Snorm`).
+            pub fn fill<T: Copy + Send + 'static>(self, pattern: [T; 4]) -> ImageFill<Self, T>
+            where
+                Self: ImageEnqueue,
+            {
+                let region = self.enqueue_region();
+                image_fill_op(self, region, pattern)
+            }
+        }
+    };
+}
+
 /// [`Format`](format::Format) ZST that picks the channel order +
 /// channel type and the per-pixel host element type used by
 /// [`read`](Image2D::read) / [`read_alloc`](Image2D::read_alloc).
@@ -270,115 +414,6 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
             _access: PhantomData,
             _format: PhantomData,
         })
-    }
-
-    /// Begin reading this image into a caller-supplied
-    /// `Vec<F::Pixel>` of length `width * height`. Returns a lazy
-    /// [`ImageRead`] graph node — pick a terminal (`.wait()` blocking,
-    /// `.submit()` non-blocking, or `.wait_on`/`.submit_on`).
-    pub fn read<'a>(self, dst: &'a mut [F::Pixel]) -> Result<ImageRead<'a, Self, F::Pixel>>
-    where
-        Self: ImageEnqueue,
-        F::Pixel: Send,
-    {
-        let pixel_count = (self.width as usize) * (self.height as usize);
-        let region = self.enqueue_region();
-        image_read_op(self, region, dst, pixel_count, "Image2D")
-    }
-
-    /// Same as [`read`](Self::read) but raw bytes — caller-supplied
-    /// `&mut [u8]` of length `width * height * size_of::<F::Pixel>()`.
-    pub fn read_bytes<'a>(self, dst: &'a mut [u8]) -> Result<ImageRead<'a, Self, u8>>
-    where
-        Self: ImageEnqueue,
-    {
-        let pixel_count = (self.width as usize) * (self.height as usize);
-        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        let region = self.enqueue_region();
-        image_read_bytes_op(self, region, dst, expected, "Image2D")
-    }
-
-    /// Convenience — `read` into a fresh `Vec`. The Op allocates
-    /// and the terminal yields the `Vec`. Matches the existing
-    /// `download(&launcher)` ergonomics in a lazy-builder shape.
-    pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
-    where
-        F::Pixel: Default + Copy,
-    {
-        ImageReadAlloc {
-            image: &self.image,
-            ctx: &self.ctx,
-            region: [self.width as usize, self.height as usize, 1],
-            pixel_count: (self.width as usize) * (self.height as usize),
-            _format: PhantomData::<F>,
-        }
-    }
-
-    /// Same as [`read_alloc`](Self::read_alloc) but returns raw bytes.
-    pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
-        ImageReadBytesAlloc {
-            image: &self.image,
-            ctx: &self.ctx,
-            region: [self.width as usize, self.height as usize, 1],
-            byte_len: (self.width as usize)
-                * (self.height as usize)
-                * std::mem::size_of::<F::Pixel>(),
-            _format: PhantomData::<F>,
-        }
-    }
-
-    /// Begin writing a typed pixel slice to this image. `pixels.len()`
-    /// must equal `width * height` (asserted). Returns the [`ImageWrite`]
-    /// graph node.
-    pub fn write<'a>(self, pixels: &'a [F::Pixel]) -> ImageWrite<'a, Self, F::Pixel>
-    where
-        Self: ImageEnqueue,
-        F::Pixel: Send + Sync,
-    {
-        let pixel_count = (self.width as usize) * (self.height as usize);
-        let region = self.enqueue_region();
-        image_write_op(self, region, pixels, pixel_count, "Image2D")
-    }
-
-    /// Same as [`write`](Self::write) but raw bytes — must be
-    /// exactly `width * height * size_of::<F::Pixel>()` bytes.
-    pub fn write_bytes<'a>(self, bytes: &'a [u8]) -> ImageWrite<'a, Self, u8>
-    where
-        Self: ImageEnqueue,
-    {
-        let pixel_count = (self.width as usize) * (self.height as usize);
-        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        let region = self.enqueue_region();
-        image_write_bytes_op(self, region, bytes, expected, "Image2D")
-    }
-
-    /// Begin copying this image into `dst`. Both images must have
-    /// the same dimensions and format-compatible pixel sizes
-    /// (`clEnqueueCopyImage` surfaces format mismatches as
-    /// `CL_IMAGE_FORMAT_MISMATCH` at terminal time).
-    pub fn copy_to<A2: KernelAccess + Send + 'static>(
-        self,
-        dst: Image2D<A2, F>,
-    ) -> ImageCopy<Self, Image2D<A2, F>>
-    where
-        Self: ImageEnqueue,
-        F: Send + 'static,
-    {
-        let region = self.enqueue_region();
-        image_copy_op(self, dst, region)
-    }
-
-    /// Begin filling every pixel with `pattern`. The 4-component
-    /// pattern follows OpenCL's `clEnqueueFillImage` shape —
-    /// match `T` to the format's `SampledTypeFamily` (`u32` for
-    /// `Uint`, `i32` for `Sint`, `f32` for `Float` / `Unorm` /
-    /// `Snorm`).
-    pub fn fill<T: Copy + Send + 'static>(self, pattern: [T; 4]) -> ImageFill<Self, T>
-    where
-        Self: ImageEnqueue,
-    {
-        let region = self.enqueue_region();
-        image_fill_op(self, region, pattern)
     }
 
     /// Width in pixels.
@@ -668,6 +703,33 @@ impl_image_enqueue!(Image2DArray, |s| [
     s.array_size as usize
 ]);
 impl_image_enqueue!(Image1DBuffer, |s| [s.width as usize, 1, 1]);
+
+// The eight shared transfer verbs, one invocation per family. The region shape
+// here matches each family's `impl_image_enqueue!` region above (it is the same
+// upload/download extent); `pixel_count` is `region.iter().product()` inside the
+// macro, so the per-family dimension formula lives in exactly one place.
+impl_image_verbs!(Image2D, "Image2D", |s| [
+    s.width as usize,
+    s.height as usize,
+    1
+]);
+impl_image_verbs!(Image1D, "Image1D", |s| [s.width as usize, 1, 1]);
+impl_image_verbs!(Image3D, "Image3D", |s| [
+    s.width as usize,
+    s.height as usize,
+    s.depth as usize
+]);
+impl_image_verbs!(Image1DArray, "Image1DArray", |s| [
+    s.width as usize,
+    s.array_size as usize,
+    1
+]);
+impl_image_verbs!(Image2DArray, "Image2DArray", |s| [
+    s.width as usize,
+    s.height as usize,
+    s.array_size as usize
+]);
+impl_image_verbs!(Image1DBuffer, "Image1DBuffer", |s| [s.width as usize, 1, 1]);
 
 /// Recover the owning [`Context`] from a concrete-head image-op input, or a
 /// clear "pipe-fed" error for the no-launcher concrete-head terminals.
@@ -1548,95 +1610,6 @@ impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
         })
     }
 
-    /// See [`Image2D::read`] — same shape, 1D region.
-    pub fn read<'a>(self, dst: &'a mut [F::Pixel]) -> Result<ImageRead<'a, Self, F::Pixel>>
-    where
-        Self: ImageEnqueue,
-        F::Pixel: Send,
-    {
-        let pixel_count = self.width as usize;
-        let region = self.enqueue_region();
-        image_read_op(self, region, dst, pixel_count, "Image1D")
-    }
-
-    /// See [`Image2D::read_bytes`].
-    pub fn read_bytes<'a>(self, dst: &'a mut [u8]) -> Result<ImageRead<'a, Self, u8>>
-    where
-        Self: ImageEnqueue,
-    {
-        let expected = (self.width as usize) * std::mem::size_of::<F::Pixel>();
-        let region = self.enqueue_region();
-        image_read_bytes_op(self, region, dst, expected, "Image1D")
-    }
-
-    /// See [`Image2D::read_alloc`].
-    pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
-    where
-        F::Pixel: Default + Copy,
-    {
-        ImageReadAlloc {
-            image: &self.image,
-            ctx: &self.ctx,
-            region: [self.width as usize, 1, 1],
-            pixel_count: self.width as usize,
-            _format: PhantomData::<F>,
-        }
-    }
-
-    /// See [`Image2D::read_bytes_alloc`].
-    pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
-        ImageReadBytesAlloc {
-            image: &self.image,
-            ctx: &self.ctx,
-            region: [self.width as usize, 1, 1],
-            byte_len: (self.width as usize) * std::mem::size_of::<F::Pixel>(),
-            _format: PhantomData::<F>,
-        }
-    }
-
-    /// See [`Image2D::write`].
-    pub fn write<'a>(self, pixels: &'a [F::Pixel]) -> ImageWrite<'a, Self, F::Pixel>
-    where
-        Self: ImageEnqueue,
-        F::Pixel: Send + Sync,
-    {
-        let pixel_count = self.width as usize;
-        let region = self.enqueue_region();
-        image_write_op(self, region, pixels, pixel_count, "Image1D")
-    }
-
-    /// See [`Image2D::write_bytes`].
-    pub fn write_bytes<'a>(self, bytes: &'a [u8]) -> ImageWrite<'a, Self, u8>
-    where
-        Self: ImageEnqueue,
-    {
-        let expected = (self.width as usize) * std::mem::size_of::<F::Pixel>();
-        let region = self.enqueue_region();
-        image_write_bytes_op(self, region, bytes, expected, "Image1D")
-    }
-
-    /// See [`Image2D::copy_to`].
-    pub fn copy_to<A2: KernelAccess + Send + 'static>(
-        self,
-        dst: Image1D<A2, F>,
-    ) -> ImageCopy<Self, Image1D<A2, F>>
-    where
-        Self: ImageEnqueue,
-        F: Send + 'static,
-    {
-        let region = self.enqueue_region();
-        image_copy_op(self, dst, region)
-    }
-
-    /// See [`Image2D::fill`].
-    pub fn fill<T: Copy + Send + 'static>(self, pattern: [T; 4]) -> ImageFill<Self, T>
-    where
-        Self: ImageEnqueue,
-    {
-        let region = self.enqueue_region();
-        image_fill_op(self, region, pattern)
-    }
-
     /// Width in pixels.
     pub fn width(&self) -> u32 {
         self.width
@@ -1696,107 +1669,6 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
             _access: PhantomData,
             _format: PhantomData,
         })
-    }
-
-    /// See [`Image2D::read`] — same shape, 3D region.
-    pub fn read<'a>(self, dst: &'a mut [F::Pixel]) -> Result<ImageRead<'a, Self, F::Pixel>>
-    where
-        Self: ImageEnqueue,
-        F::Pixel: Send,
-    {
-        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
-        let region = self.enqueue_region();
-        image_read_op(self, region, dst, pixel_count, "Image3D")
-    }
-
-    /// See [`Image2D::read_bytes`].
-    pub fn read_bytes<'a>(self, dst: &'a mut [u8]) -> Result<ImageRead<'a, Self, u8>>
-    where
-        Self: ImageEnqueue,
-    {
-        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
-        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        let region = self.enqueue_region();
-        image_read_bytes_op(self, region, dst, expected, "Image3D")
-    }
-
-    /// See [`Image2D::read_alloc`].
-    pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
-    where
-        F::Pixel: Default + Copy,
-    {
-        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
-        ImageReadAlloc {
-            image: &self.image,
-            ctx: &self.ctx,
-            region: [
-                self.width as usize,
-                self.height as usize,
-                self.depth as usize,
-            ],
-            pixel_count,
-            _format: PhantomData::<F>,
-        }
-    }
-
-    /// See [`Image2D::read_bytes_alloc`].
-    pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
-        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
-        ImageReadBytesAlloc {
-            image: &self.image,
-            ctx: &self.ctx,
-            region: [
-                self.width as usize,
-                self.height as usize,
-                self.depth as usize,
-            ],
-            byte_len: pixel_count * std::mem::size_of::<F::Pixel>(),
-            _format: PhantomData::<F>,
-        }
-    }
-
-    /// See [`Image2D::write`].
-    pub fn write<'a>(self, pixels: &'a [F::Pixel]) -> ImageWrite<'a, Self, F::Pixel>
-    where
-        Self: ImageEnqueue,
-        F::Pixel: Send + Sync,
-    {
-        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
-        let region = self.enqueue_region();
-        image_write_op(self, region, pixels, pixel_count, "Image3D")
-    }
-
-    /// See [`Image2D::write_bytes`].
-    pub fn write_bytes<'a>(self, bytes: &'a [u8]) -> ImageWrite<'a, Self, u8>
-    where
-        Self: ImageEnqueue,
-    {
-        let pixel_count = (self.width as usize) * (self.height as usize) * (self.depth as usize);
-        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        let region = self.enqueue_region();
-        image_write_bytes_op(self, region, bytes, expected, "Image3D")
-    }
-
-    /// See [`Image2D::copy_to`].
-    pub fn copy_to<A2: KernelAccess + Send + 'static>(
-        self,
-        dst: Image3D<A2, F>,
-    ) -> ImageCopy<Self, Image3D<A2, F>>
-    where
-        Self: ImageEnqueue,
-        F: Send + 'static,
-    {
-        let region = self.enqueue_region();
-        image_copy_op(self, dst, region)
-    }
-
-    /// See [`Image2D::fill`].
-    pub fn fill<T: Copy + Send + 'static>(self, pattern: [T; 4]) -> ImageFill<Self, T>
-    where
-        Self: ImageEnqueue,
-    {
-        let region = self.enqueue_region();
-        image_fill_op(self, region, pattern)
     }
 
     /// Width in pixels.
@@ -2086,100 +1958,6 @@ impl<A: KernelAccess, F: format::Format> Image1DArray<A, F> {
         })
     }
 
-    /// See [`Image2D::read`] — region is `[width, array_size, 1]`
-    /// per OpenCL spec; layers are laid out contiguously: layer-0
-    /// first, then layer-1, etc.
-    pub fn read<'a>(self, dst: &'a mut [F::Pixel]) -> Result<ImageRead<'a, Self, F::Pixel>>
-    where
-        Self: ImageEnqueue,
-        F::Pixel: Send,
-    {
-        let pixel_count = (self.width as usize) * (self.array_size as usize);
-        let region = self.enqueue_region();
-        image_read_op(self, region, dst, pixel_count, "Image1DArray")
-    }
-
-    /// See [`Image2D::read_bytes`].
-    pub fn read_bytes<'a>(self, dst: &'a mut [u8]) -> Result<ImageRead<'a, Self, u8>>
-    where
-        Self: ImageEnqueue,
-    {
-        let pixel_count = (self.width as usize) * (self.array_size as usize);
-        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        let region = self.enqueue_region();
-        image_read_bytes_op(self, region, dst, expected, "Image1DArray")
-    }
-
-    /// See [`Image2D::read_alloc`].
-    pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
-    where
-        F::Pixel: Default + Copy,
-    {
-        ImageReadAlloc {
-            image: &self.image,
-            ctx: &self.ctx,
-            region: [self.width as usize, self.array_size as usize, 1],
-            pixel_count: (self.width as usize) * (self.array_size as usize),
-            _format: PhantomData::<F>,
-        }
-    }
-
-    /// See [`Image2D::read_bytes_alloc`].
-    pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
-        let pixel_count = (self.width as usize) * (self.array_size as usize);
-        ImageReadBytesAlloc {
-            image: &self.image,
-            ctx: &self.ctx,
-            region: [self.width as usize, self.array_size as usize, 1],
-            byte_len: pixel_count * std::mem::size_of::<F::Pixel>(),
-            _format: PhantomData::<F>,
-        }
-    }
-
-    /// See [`Image2D::write`].
-    pub fn write<'a>(self, pixels: &'a [F::Pixel]) -> ImageWrite<'a, Self, F::Pixel>
-    where
-        Self: ImageEnqueue,
-        F::Pixel: Send + Sync,
-    {
-        let pixel_count = (self.width as usize) * (self.array_size as usize);
-        let region = self.enqueue_region();
-        image_write_op(self, region, pixels, pixel_count, "Image1DArray")
-    }
-
-    /// See [`Image2D::write_bytes`].
-    pub fn write_bytes<'a>(self, bytes: &'a [u8]) -> ImageWrite<'a, Self, u8>
-    where
-        Self: ImageEnqueue,
-    {
-        let pixel_count = (self.width as usize) * (self.array_size as usize);
-        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        let region = self.enqueue_region();
-        image_write_bytes_op(self, region, bytes, expected, "Image1DArray")
-    }
-
-    /// See [`Image2D::copy_to`].
-    pub fn copy_to<A2: KernelAccess + Send + 'static>(
-        self,
-        dst: Image1DArray<A2, F>,
-    ) -> ImageCopy<Self, Image1DArray<A2, F>>
-    where
-        Self: ImageEnqueue,
-        F: Send + 'static,
-    {
-        let region = self.enqueue_region();
-        image_copy_op(self, dst, region)
-    }
-
-    /// See [`Image2D::fill`].
-    pub fn fill<T: Copy + Send + 'static>(self, pattern: [T; 4]) -> ImageFill<Self, T>
-    where
-        Self: ImageEnqueue,
-    {
-        let region = self.enqueue_region();
-        image_fill_op(self, region, pattern)
-    }
-
     /// Width in pixels (per layer).
     pub fn width(&self) -> u32 {
         self.width
@@ -2258,114 +2036,6 @@ impl<A: KernelAccess, F: format::Format> Image2DArray<A, F> {
             _access: PhantomData,
             _format: PhantomData,
         })
-    }
-
-    /// See [`Image2D::read`] — 2D-array region is
-    /// `[width, height, array_size]`.
-    pub fn read<'a>(self, dst: &'a mut [F::Pixel]) -> Result<ImageRead<'a, Self, F::Pixel>>
-    where
-        Self: ImageEnqueue,
-        F::Pixel: Send,
-    {
-        let pixel_count =
-            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
-        let region = self.enqueue_region();
-        image_read_op(self, region, dst, pixel_count, "Image2DArray")
-    }
-
-    /// See [`Image2D::read_bytes`].
-    pub fn read_bytes<'a>(self, dst: &'a mut [u8]) -> Result<ImageRead<'a, Self, u8>>
-    where
-        Self: ImageEnqueue,
-    {
-        let pixel_count =
-            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
-        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        let region = self.enqueue_region();
-        image_read_bytes_op(self, region, dst, expected, "Image2DArray")
-    }
-
-    /// See [`Image2D::read_alloc`].
-    pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
-    where
-        F::Pixel: Default + Copy,
-    {
-        let pixel_count =
-            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
-        ImageReadAlloc {
-            image: &self.image,
-            ctx: &self.ctx,
-            region: [
-                self.width as usize,
-                self.height as usize,
-                self.array_size as usize,
-            ],
-            pixel_count,
-            _format: PhantomData::<F>,
-        }
-    }
-
-    /// See [`Image2D::read_bytes_alloc`].
-    pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
-        let pixel_count =
-            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
-        ImageReadBytesAlloc {
-            image: &self.image,
-            ctx: &self.ctx,
-            region: [
-                self.width as usize,
-                self.height as usize,
-                self.array_size as usize,
-            ],
-            byte_len: pixel_count * std::mem::size_of::<F::Pixel>(),
-            _format: PhantomData::<F>,
-        }
-    }
-
-    /// See [`Image2D::write`].
-    pub fn write<'a>(self, pixels: &'a [F::Pixel]) -> ImageWrite<'a, Self, F::Pixel>
-    where
-        Self: ImageEnqueue,
-        F::Pixel: Send + Sync,
-    {
-        let pixel_count =
-            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
-        let region = self.enqueue_region();
-        image_write_op(self, region, pixels, pixel_count, "Image2DArray")
-    }
-
-    /// See [`Image2D::write_bytes`].
-    pub fn write_bytes<'a>(self, bytes: &'a [u8]) -> ImageWrite<'a, Self, u8>
-    where
-        Self: ImageEnqueue,
-    {
-        let pixel_count =
-            (self.width as usize) * (self.height as usize) * (self.array_size as usize);
-        let expected = pixel_count * std::mem::size_of::<F::Pixel>();
-        let region = self.enqueue_region();
-        image_write_bytes_op(self, region, bytes, expected, "Image2DArray")
-    }
-
-    /// See [`Image2D::copy_to`].
-    pub fn copy_to<A2: KernelAccess + Send + 'static>(
-        self,
-        dst: Image2DArray<A2, F>,
-    ) -> ImageCopy<Self, Image2DArray<A2, F>>
-    where
-        Self: ImageEnqueue,
-        F: Send + 'static,
-    {
-        let region = self.enqueue_region();
-        image_copy_op(self, dst, region)
-    }
-
-    /// See [`Image2D::fill`].
-    pub fn fill<T: Copy + Send + 'static>(self, pattern: [T; 4]) -> ImageFill<Self, T>
-    where
-        Self: ImageEnqueue,
-    {
-        let region = self.enqueue_region();
-        image_fill_op(self, region, pattern)
     }
 
     /// Width in pixels (per layer).
@@ -2509,96 +2179,6 @@ impl<A: KernelAccess, F: format::Format> Image1DBuffer<A, F> {
             _access: PhantomData,
             _format: PhantomData,
         })
-    }
-
-    /// See [`Image2D::read`] — image-buffer goes through the image
-    /// path (`clEnqueueReadImage`), region is `[width, 1, 1]`.
-    pub fn read<'a>(self, dst: &'a mut [F::Pixel]) -> Result<ImageRead<'a, Self, F::Pixel>>
-    where
-        Self: ImageEnqueue,
-        F::Pixel: Send,
-    {
-        let pixel_count = self.width as usize;
-        let region = self.enqueue_region();
-        image_read_op(self, region, dst, pixel_count, "Image1DBuffer")
-    }
-
-    /// See [`Image2D::read_bytes`].
-    pub fn read_bytes<'a>(self, dst: &'a mut [u8]) -> Result<ImageRead<'a, Self, u8>>
-    where
-        Self: ImageEnqueue,
-    {
-        let expected = (self.width as usize) * std::mem::size_of::<F::Pixel>();
-        let region = self.enqueue_region();
-        image_read_bytes_op(self, region, dst, expected, "Image1DBuffer")
-    }
-
-    /// See [`Image2D::read_alloc`].
-    pub fn read_alloc(&self) -> ImageReadAlloc<'_, F>
-    where
-        F::Pixel: Default + Copy,
-    {
-        ImageReadAlloc {
-            image: &self.image,
-            ctx: &self.ctx,
-            region: [self.width as usize, 1, 1],
-            pixel_count: self.width as usize,
-            _format: PhantomData::<F>,
-        }
-    }
-
-    /// See [`Image2D::read_bytes_alloc`].
-    pub fn read_bytes_alloc(&self) -> ImageReadBytesAlloc<'_, F> {
-        ImageReadBytesAlloc {
-            image: &self.image,
-            ctx: &self.ctx,
-            region: [self.width as usize, 1, 1],
-            byte_len: (self.width as usize) * std::mem::size_of::<F::Pixel>(),
-            _format: PhantomData::<F>,
-        }
-    }
-
-    /// See [`Image2D::write`].
-    pub fn write<'a>(self, pixels: &'a [F::Pixel]) -> ImageWrite<'a, Self, F::Pixel>
-    where
-        Self: ImageEnqueue,
-        F::Pixel: Send + Sync,
-    {
-        let pixel_count = self.width as usize;
-        let region = self.enqueue_region();
-        image_write_op(self, region, pixels, pixel_count, "Image1DBuffer")
-    }
-
-    /// See [`Image2D::write_bytes`].
-    pub fn write_bytes<'a>(self, bytes: &'a [u8]) -> ImageWrite<'a, Self, u8>
-    where
-        Self: ImageEnqueue,
-    {
-        let expected = (self.width as usize) * std::mem::size_of::<F::Pixel>();
-        let region = self.enqueue_region();
-        image_write_bytes_op(self, region, bytes, expected, "Image1DBuffer")
-    }
-
-    /// See [`Image2D::copy_to`].
-    pub fn copy_to<A2: KernelAccess + Send + 'static>(
-        self,
-        dst: Image1DBuffer<A2, F>,
-    ) -> ImageCopy<Self, Image1DBuffer<A2, F>>
-    where
-        Self: ImageEnqueue,
-        F: Send + 'static,
-    {
-        let region = self.enqueue_region();
-        image_copy_op(self, dst, region)
-    }
-
-    /// See [`Image2D::fill`].
-    pub fn fill<T: Copy + Send + 'static>(self, pattern: [T; 4]) -> ImageFill<Self, T>
-    where
-        Self: ImageEnqueue,
-    {
-        let region = self.enqueue_region();
-        image_fill_op(self, region, pattern)
     }
 
     /// Width in pixels.
