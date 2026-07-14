@@ -146,6 +146,33 @@ clean; image-pipeline + collatz run clean; gray-scott run_swap vs run_immutable
 BIT-IDENTICAL (exercises mutate + CB precise-invalidation through the shared origin
 capture). NOT yet FF'd to main.
 
+### ✅ READY-TO-FF 2026-07-14 — complexity hotspot pass (same branch)
+
+Metric-driven follow-up to round 2, using Mozilla `rust-code-analysis-cli` (built from
+git `--locked` on a stable toolchain — the published crate mis-resolves tree-sitter;
+lives at `/tmp/rca/bin`) to rank functions by cognitive/cyclomatic complexity and target
+the worst. 5 commits, each behavior-preserving:
+
+- **`Input::try_bind_slot`** (cog 39→7, THE worst function): split the 3 mutually-exclusive
+  binder kinds into `probe_bind` / `feed_bind` / `apply_value_bind` (the last is the
+  irreducible 5-state × 2-mode matrix, cog 22, isolated). Orchestrator is now a flat
+  guarded sequence.
+- **`wait_on`** (cog 28→14): extracted the byte-identical terminal tail (wait-on-deps +
+  stash-beats-cascade reconcile) into `wait_deps_reconcile`; the two enqueue STRATEGIES
+  (fast / start-gate) stay inline (genuine variance).
+- **`expand_kernel`** (cyc 66→23, cog 33→13; was the workspace's #1): 3 stages — (1) lift
+  the ~1050-line emission half into `emit_kernel_launch` across the clean producer/consumer
+  seam via a passive `KernelParts` carrier (pure move); (2) merge the output-arity
+  trichotomy into one `match`; (3) collapse `cb_restamp_method`'s single/multi fork into one
+  `#(...)*` over a 1-or-N pipe list. `emit_kernel_launch` inherits cyc 39/cog 18.
+
+Runtime hotspots (`try_bind_slot`/`wait_on`) verified via tier1+tier2 on 3 ICDs + gray-scott
+bit-identity. Macro refactor verified via **`cargo expand` byte-diff** of claspr-test-kernels
+AND claspr-test-image-kernels (token-identical each stage) — no compile_fail golden
+references the macro crate, so no re-bless (confirmed). Remaining top hotspots are all in the
+proc-macro (`parse_image_tokens` cog 32, `read_image_access_attr` cog 17) + the isolated
+`apply_value_bind` (cog 22). NOT yet FF'd to main.
+
 ---
 
 ## Deferred
