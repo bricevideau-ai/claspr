@@ -49,7 +49,7 @@
 //! late-bind-launcher pattern, every Tier 2 op should produce an
 //! Event that downstream stages can wait on.)
 
-use crate::eager::{Deps, DeviceEnqueue, wrap_event};
+use crate::eager::{Deps, DeviceEnqueue, deps_to_wait_list, single_dep};
 use crate::exec_ctx::ExecutionContext;
 use crate::record::RecordableBuffer;
 use crate::{
@@ -130,9 +130,9 @@ where
 
     fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, mut dst) = self.take();
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         let event = crate::buffer::copy_buffer_enqueue(&src, &mut dst, ec, &raw)?;
-        Ok(((src, dst), vec![wrap_event(event)]))
+        Ok(((src, dst), single_dep(event)))
     }
 
     fn record_cb(
@@ -176,9 +176,9 @@ where
         // (they wait on the returned event via Deps). No read can
         // observe uninit bytes.
         let mut dst = unsafe { uninit_dst.assume_init() };
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         let event = crate::buffer::copy_buffer_enqueue(&src, &mut dst, ec, &raw)?;
-        Ok(((src, dst), vec![wrap_event(event)]))
+        Ok(((src, dst), single_dep(event)))
     }
 
     fn record_cb(
@@ -220,9 +220,9 @@ where
 
     fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
         let (src, dst) = self.take();
-        let raw: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         let event = crate::mapped::svm_copy_enqueue(&src, &dst, ec, &raw)?;
-        Ok(((src, dst), vec![wrap_event(event)]))
+        Ok(((src, dst), single_dep(event)))
     }
 
     fn record_cb(
@@ -262,9 +262,9 @@ where
         let (src, uninit_dst) = self.take();
         // SAFETY: copy_to below writes every byte of dst.
         let dst = unsafe { uninit_dst.assume_init() };
-        let raw: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         let event = crate::mapped::svm_copy_enqueue(&src, &dst, ec, &raw)?;
-        Ok(((src, dst), vec![wrap_event(event)]))
+        Ok(((src, dst), single_dep(event)))
     }
 
     fn record_cb(
@@ -362,7 +362,7 @@ where
             });
         }
         let size = cross_type_byte_count::<T>(src.len());
-        let raw_deps: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw_deps = deps_to_wait_list(&deps);
         // SAFETY: src.ptr() is a live SVM allocation in ec's context;
         // dst.ptr() is a live host pointer (USMSlice requires
         // fine-grain-system SVM, where host pointers are valid SVM
@@ -382,7 +382,7 @@ where
         let dst_arc = unsafe { retain_for_register(&event)? };
         src.register_use(src_arc);
         dst.register_use(dst_arc);
-        Ok(((src, dst), vec![wrap_event(event)]))
+        Ok(((src, dst), single_dep(event)))
     }
 
     fn record_cb(
@@ -429,7 +429,7 @@ where
         // SAFETY: the SVM memcpy below writes every byte of dst.
         let dst = unsafe { uninit_dst.assume_init() };
         let size = cross_type_byte_count::<T>(src.len());
-        let raw_deps: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw_deps = deps_to_wait_list(&deps);
         // SAFETY: same as the Init variant above.
         let event = unsafe {
             svm_memcpy_async(
@@ -444,7 +444,7 @@ where
         let dst_arc = unsafe { retain_for_register(&event)? };
         src.register_use(src_arc);
         dst.register_use(dst_arc);
-        Ok(((src, dst), vec![wrap_event(event)]))
+        Ok(((src, dst), single_dep(event)))
     }
 
     fn record_cb(
@@ -491,7 +491,7 @@ where
             });
         }
         let size = cross_type_byte_count::<T>(src.len());
-        let raw_deps: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw_deps = deps_to_wait_list(&deps);
         let event = unsafe {
             svm_memcpy_async(
                 ec,
@@ -505,7 +505,7 @@ where
         let dst_arc = unsafe { retain_for_register(&event)? };
         src.register_use(src_arc);
         dst.register_use(dst_arc);
-        Ok(((src, dst), vec![wrap_event(event)]))
+        Ok(((src, dst), single_dep(event)))
     }
 
     fn record_cb(
@@ -552,7 +552,7 @@ where
         // SAFETY: the SVM memcpy below writes every byte of dst.
         let dst = unsafe { uninit_dst.assume_init() };
         let size = cross_type_byte_count::<T>(src.len());
-        let raw_deps: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw_deps = deps_to_wait_list(&deps);
         let event = unsafe {
             svm_memcpy_async(
                 ec,
@@ -566,7 +566,7 @@ where
         let dst_arc = unsafe { retain_for_register(&event)? };
         src.register_use(src_arc);
         dst.register_use(dst_arc);
-        Ok(((src, dst), vec![wrap_event(event)]))
+        Ok(((src, dst), single_dep(event)))
     }
 
     fn record_cb(
@@ -613,7 +613,7 @@ where
             });
         }
         let size = cross_type_byte_count::<T>(src.len());
-        let raw_deps: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw_deps = deps_to_wait_list(&deps);
         let event = unsafe {
             svm_memcpy_async(
                 ec,
@@ -627,7 +627,7 @@ where
         let dst_arc = unsafe { retain_for_register(&event)? };
         src.register_use(src_arc);
         dst.register_use(dst_arc);
-        Ok(((src, dst), vec![wrap_event(event)]))
+        Ok(((src, dst), single_dep(event)))
     }
 
     fn record_cb(
@@ -674,7 +674,7 @@ where
         // SAFETY: the SVM memcpy below writes every byte of dst.
         let dst = unsafe { uninit_dst.assume_init() };
         let size = cross_type_byte_count::<T>(src.len());
-        let raw_deps: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw_deps = deps_to_wait_list(&deps);
         let event = unsafe {
             svm_memcpy_async(
                 ec,
@@ -688,7 +688,7 @@ where
         let dst_arc = unsafe { retain_for_register(&event)? };
         src.register_use(src_arc);
         dst.register_use(dst_arc);
-        Ok(((src, dst), vec![wrap_event(event)]))
+        Ok(((src, dst), single_dep(event)))
     }
 
     fn record_cb(

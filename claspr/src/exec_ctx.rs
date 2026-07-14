@@ -90,7 +90,7 @@ pub enum CbWalk<'a> {
         /// deposit EMPTY `cl_event` deps (their ordering is the CB-internal sync
         /// points), so nothing internal lands here. Owned on the boundary node's
         /// stack; fresh per CB, so nested CBs never mix external deps.
-        ext: &'a Mutex<Vec<crate::eager::Dep>>,
+        ext: &'a Mutex<crate::eager::Deps>,
         /// The BOUNDARY node's cb-cache, threaded so the *finalize-at-close* point
         /// (a `Build`→`Off` transition at a host seam, deep inside this span) can
         /// HOME the sealed [`FinalizedCb`](crate::record::FinalizedCb) here — the
@@ -113,7 +113,7 @@ pub enum CbWalk<'a> {
         /// See [`Build`](CbWalk::Build)`::ext` — the same external-dep accumulator
         /// on the replay pass (the cached CB still needs its external wait-list each
         /// replay, since a host step re-produces fresh events every run).
-        ext: &'a Mutex<Vec<crate::eager::Dep>>,
+        ext: &'a Mutex<crate::eager::Deps>,
         /// See [`Build`](CbWalk::Build)`::cache` — on replay the close point READS
         /// the cached span CB from here and enqueues it (before the seam runs),
         /// rather than sealing a live builder.

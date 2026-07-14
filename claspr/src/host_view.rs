@@ -45,7 +45,7 @@
 //! (no writeback on unmap).
 
 use crate::access::{HostReadable, HostWritable, MemMode};
-use crate::eager::{Deps, DeviceEnqueue, deps_as_events, wrap_event};
+use crate::eager::{Deps, DeviceEnqueue, deps_as_events, deps_to_wait_list, single_dep};
 use crate::exec_ctx::ExecutionContext;
 use crate::map_primitive;
 use crate::mappable::Mappable;
@@ -200,7 +200,7 @@ where
         let cl_mem = buf.buffer().get();
         let len = Buffer::len(&buf);
         let size = len * std::mem::size_of::<T>();
-        let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let wait_list = deps_to_wait_list(&deps);
         // SAFETY: cl_mem is live (we hold the DeviceSlice); the
         // map size matches the allocation's byte length; wait_list
         // stays alive for the call.
@@ -223,7 +223,7 @@ where
             unmap_done: false,
             _access: PhantomData,
         };
-        Ok((view, vec![wrap_event(map_event)]))
+        Ok((view, single_dep(map_event)))
     }
 }
 
@@ -352,7 +352,7 @@ where
             .take()
             .expect("DeviceSliceHostView already released");
         let q_raw = ctx.cl_queue().get();
-        let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let wait_list = deps_to_wait_list(&deps);
         // SAFETY: host_ptr is the mapped pointer from acquire;
         // cl_mem is the buffer it was mapped from.
         let unmap_event = unsafe {
@@ -365,7 +365,7 @@ where
         };
         view.unmap_done = true; // suppress Drop's defensive unmap
         // view drops here — only the RetainedQueue release fires.
-        Ok((buf, vec![wrap_event(unmap_event)]))
+        Ok((buf, single_dep(unmap_event)))
     }
 }
 
@@ -523,7 +523,7 @@ where
         let ptr = buf.ptr();
         // Retain the queue for the view's defensive Drop-time unmap.
         let queue = RetainedQueue::from_queue(ctx.cl_queue())?;
-        let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let wait_list = deps_to_wait_list(&deps);
         // SAFETY: non-blocking SVM map. `ptr` came from clSVMAlloc on
         // the same context; `size` is the allocation's exact byte
         // length. Wait-list events stay alive across the call via the
@@ -544,7 +544,7 @@ where
             unmap_done: false,
             _access: PhantomData,
         };
-        Ok((view, vec![wrap_event(map_event)]))
+        Ok((view, single_dep(map_event)))
     }
 }
 
@@ -663,7 +663,7 @@ where
             .take()
             .expect("MappedSliceHostView already released");
         let q_raw = ctx.cl_queue().get();
-        let wait_list: Vec<cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let wait_list = deps_to_wait_list(&deps);
         // SAFETY: ptr was mapped in acquire; unmap exactly once.
         let unmap_event = unsafe { map_primitive::svm_unmap(q_raw, buf.ptr().cast(), &wait_list)? };
         view.unmap_done = true; // suppress Drop's defensive unmap
@@ -674,7 +674,7 @@ where
         let arc_event = std::sync::Arc::new(unmap_event);
         buf.register_use(std::sync::Arc::clone(&arc_event));
         // view drops here — only the retained queue release fires.
-        Ok((buf, vec![arc_event]))
+        Ok((buf, Deps::from([crate::eager::Dep::from_arc(arc_event)])))
     }
 }
 

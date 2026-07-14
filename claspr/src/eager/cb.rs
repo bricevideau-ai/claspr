@@ -76,7 +76,7 @@ pub use crate::exec_ctx::CbWalk;
 /// gate) — those events gate `clEnqueueCommandBufferKHR`, not any CB-internal
 /// command. A producer INSIDE the CB deposited EMPTY deps (its ordering is the
 /// sync points), so this is a no-op for internal edges. Idempotent + cheap.
-pub fn cb_collect_external(ext: &Mutex<Vec<Dep>>, deps: &Deps) {
+pub fn cb_collect_external(ext: &Mutex<Deps>, deps: &Deps) {
     if !deps.is_empty() {
         ext.lock().unwrap().extend(deps.iter().cloned());
     }
@@ -128,7 +128,7 @@ pub(crate) fn cb_origins_of(
 pub(crate) fn cb_leaf_build(
     ec: &ExecutionContext<'_>,
     builder: &crate::record::CbBuilder,
-    ext: &Mutex<Vec<Dep>>,
+    ext: &Mutex<Deps>,
     deps: &Deps,
     in_slot: Option<usize>,
     in_pipe: Option<usize>,
@@ -207,7 +207,7 @@ where
         .expect("cb_boundary_gather: boundary node must carry a cb_cache");
 
     // The EXTERNAL cl_event accumulator for THIS command buffer, on this frame.
-    let ext: Mutex<Vec<Dep>> = Mutex::new(Vec::new());
+    let ext: Mutex<Deps> = Mutex::new(Deps::new());
     // The span-closed latch (see `CbWalk::Build::closed`), owned by this frame.
     let closed = std::sync::atomic::AtomicBool::new(false);
 
@@ -236,14 +236,9 @@ where
             // again (that would be `CL_INVALID_OPERATION`).
             return Ok((checkouts, internal));
         }
-        let waits: Vec<crate::cl_event> = ext
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|d| d.as_ref().get())
-            .collect();
+        let waits = drain_ext(&ext);
         let event = cb.enqueue(&waits)?;
-        return Ok((checkouts, vec![wrap_event(event)]));
+        return Ok((checkouts, single_dep(event)));
     }
 
     // BUILD: create a live CB, re-walk adding each command, finalize, home, enqueue.
@@ -299,14 +294,9 @@ where
     // HOME the CB in the boundary node's OWN cache (drops with the graph).
     *cache.lock().unwrap() = Some(Arc::clone(&finalized));
 
-    let waits: Vec<crate::cl_event> = ext
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|d| d.as_ref().get())
-        .collect();
+    let waits = drain_ext(&ext);
     let event = finalized.enqueue(&waits)?;
-    Ok((checkouts, vec![wrap_event(event)]))
+    Ok((checkouts, single_dep(event)))
 }
 
 /// Run a combinator's CHILD, opening a mid-graph command buffer for it when
@@ -403,7 +393,7 @@ pub(crate) fn cb_close_span(ec: &ExecutionContext<'_>) -> Result<Option<Dep>> {
     use crate::Launcher;
     use std::sync::atomic::Ordering;
     let (ext, cache, closed, is_build): (
-        &Mutex<Vec<Dep>>,
+        &Mutex<Deps>,
         &CbCache,
         &std::sync::atomic::AtomicBool,
         bool,
@@ -465,14 +455,10 @@ pub(crate) fn cb_close_span(ec: &ExecutionContext<'_>) -> Result<Option<Dep>> {
     Ok(Some(wrap_event(event)))
 }
 
-/// Drain a CB's external `cl_event` dep accumulator into a raw wait-list for
+/// Drain a CB's external dep accumulator into a raw `cl_event` wait-list for
 /// `clEnqueueCommandBufferKHR`.
-fn drain_ext(ext: &Mutex<Vec<Dep>>) -> Vec<crate::cl_event> {
-    ext.lock()
-        .unwrap()
-        .iter()
-        .map(|d| d.as_ref().get())
-        .collect()
+fn drain_ext(ext: &Mutex<Deps>) -> Vec<crate::cl_event> {
+    deps_to_wait_list(&ext.lock().unwrap())
 }
 
 /// Whether `op` (an [`AndThen`]) should OPEN a maximal seam-free span here (design
@@ -543,7 +529,7 @@ where
     match ec.cb() {
         CbWalk::Build { .. } | CbWalk::LendOnly { .. } if !next.cb_spine_head_addable() => {
             if let Some(ev) = cb_close_span(ec)? {
-                source.cb_restamp(&[ev]);
+                source.cb_restamp(&Deps::from([ev]));
             }
             Ok(true)
         }
@@ -576,7 +562,7 @@ where
     let cache = op
         .cb_cache()
         .expect("cb_boundary_execute: boundary node must carry a cb_cache");
-    let ext: Mutex<Vec<Dep>> = Mutex::new(Vec::new());
+    let ext: Mutex<Deps> = Mutex::new(Deps::new());
     let closed = std::sync::atomic::AtomicBool::new(false);
 
     // Replay fast-path: a valid cached CB for this queue.
@@ -601,14 +587,9 @@ where
             // `source`'s pipes; the tail ran in `Off`. Nothing to do at return.
             return Ok(());
         }
-        let waits: Vec<crate::cl_event> = ext
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|d| d.as_ref().get())
-            .collect();
+        let waits = drain_ext(&ext);
         let event = cb.enqueue(&waits)?;
-        op.cb_restamp(&[wrap_event(event)]);
+        op.cb_restamp(&single_dep(event));
         return Ok(());
     }
 
@@ -660,13 +641,8 @@ where
     };
     let finalized = Arc::new(finalized);
     *cache.lock().unwrap() = Some(Arc::clone(&finalized));
-    let waits: Vec<crate::cl_event> = ext
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|d| d.as_ref().get())
-        .collect();
+    let waits = drain_ext(&ext);
     let event = finalized.enqueue(&waits)?;
-    op.cb_restamp(&[wrap_event(event)]);
+    op.cb_restamp(&single_dep(event));
     Ok(())
 }

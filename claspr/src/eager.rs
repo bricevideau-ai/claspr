@@ -173,17 +173,76 @@ use std::sync::{Arc, Mutex};
 
 // ── Deps: the event wait-list threaded through the graph ────────────────
 
-/// A single tracked event in a [`Deps`] chain. `Arc`-wrapped so it can be
-/// cheaply shared across parallel branches in `bundle!` / `fan_out` without
-/// extra `clRetainEvent` calls.
-pub type Dep = Arc<crate::Event>;
+/// A single tracked event in a [`Deps`] set. `Arc`-wrapped so it can be cheaply
+/// shared across parallel branches in `bundle!` / `fan_out` without extra
+/// `clRetainEvent` calls.
+///
+/// A newtype (not a bare `Arc<Event>`) so it can be a [`BTreeSet`](std::collections::BTreeSet) key: `Ord`/`Eq`
+/// are by the underlying `cl_event` POINTER identity, which is exactly the dedup a
+/// wait-list wants (the same event depended on twice is one wait, not two). It
+/// [`AsRef<Event>`] and derefs to the `Arc<Event>`, so existing `.as_ref().get()`
+/// call sites are unchanged.
+#[derive(Clone, Debug)]
+pub struct Dep(Arc<crate::Event>);
 
-/// The wait-list / produced-event list threaded through every op's
-/// [`execute`](DeviceOp::execute). Empty at chain start; one element per device
-/// op the previous step enqueued; multi-element after a parallel join
-/// (`bundle`/`fan_out`) collapses children's events into the marker that joins
-/// them.
-pub type Deps = Vec<Dep>;
+impl Dep {
+    /// The raw `cl_event` handle — the wait-list element handed to OpenCL.
+    pub fn get(&self) -> crate::cl_event {
+        self.0.get()
+    }
+
+    /// Wrap an already-`Arc`'d event as a [`Dep`] — for the paths that must ALSO
+    /// retain the `Arc` elsewhere (e.g. `register_use` on an SVM buffer, or a
+    /// user-event kept to signal later), so the event isn't cloned into a second
+    /// `Arc`.
+    pub fn from_arc(event: Arc<crate::Event>) -> Self {
+        Dep(event)
+    }
+}
+
+impl AsRef<crate::Event> for Dep {
+    fn as_ref(&self) -> &crate::Event {
+        self.0.as_ref()
+    }
+}
+
+impl std::ops::Deref for Dep {
+    type Target = Arc<crate::Event>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// Identity by the backing `cl_event` pointer — two `Dep`s are "the same wait" iff
+// they name the same OpenCL event. This is what makes [`Deps`] a dedup'ing set.
+impl PartialEq for Dep {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.get() == other.0.get()
+    }
+}
+impl Eq for Dep {}
+impl PartialOrd for Dep {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Dep {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.0.get() as usize).cmp(&(other.0.get() as usize))
+    }
+}
+
+/// The wait-list / produced-event **set** threaded through every op's
+/// [`execute`](DeviceOp::execute). Empty at chain start; one element per device op
+/// the previous step enqueued; multi-element after a parallel join
+/// (`bundle`/`fan_out`) collapses children's events into the marker that joins them.
+///
+/// A [`BTreeSet`](std::collections::BTreeSet) (not a `Vec`): events are an unordered wait-list, and the same
+/// event reaching a node via two paths must produce ONE wait, not a duplicate — the
+/// set dedups by `cl_event` identity for free (mirrors how CB sync points are a
+/// `BTreeSet<cl_sync_point_khr>`). Convert to the raw OpenCL wait-list ONLY at an
+/// enqueue boundary, via [`deps_to_wait_list`].
+pub type Deps = std::collections::BTreeSet<Dep>;
 
 /// Borrow each [`Dep`] as `&Event` for an `after_all(...)` call on a Tier 1 op
 /// builder.
@@ -191,9 +250,26 @@ pub fn deps_as_events(deps: &Deps) -> impl Iterator<Item = &crate::Event> {
     deps.iter().map(|d| d.as_ref())
 }
 
+/// Convert a [`Deps`] set into the raw `cl_event` wait-list an OpenCL enqueue takes.
+/// This is the ONE place `Deps` crosses the FFI boundary into a `Vec` — every
+/// `clEnqueue*` / `clCommand*` consumer calls this instead of re-spelling
+/// `deps.iter().map(|d| d.as_ref().get()).collect()`.
+pub fn deps_to_wait_list(deps: &Deps) -> Vec<crate::cl_event> {
+    deps.iter().map(|d| d.get()).collect()
+}
+
 /// Wrap an opencl3 [`Event`](crate::Event) in a [`Dep`].
 pub fn wrap_event(event: crate::Event) -> Dep {
-    Arc::new(event)
+    Dep(Arc::new(event))
+}
+
+/// A single-element [`Deps`] set from one freshly-produced event — the common
+/// "this op enqueued one command, here is its completion event" result. Replaces
+/// the old `single_dep(event)` now that [`Deps`] is a set.
+pub fn single_dep(event: crate::Event) -> Deps {
+    let mut d = Deps::new();
+    d.insert(wrap_event(event));
+    d
 }
 
 // ── DeviceEnqueue: minimal raw-enqueue contract for delegated primitives ──
@@ -792,7 +868,7 @@ impl<T> Input<T> {
                 // refcount, balanced by the wrapped `Event`'s Drop.
                 unsafe { opencl3::event::retain_event(raw) }
                     .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?;
-                Ok((v, vec![wrap_event(crate::Event::new(raw))], home))
+                Ok((v, single_dep(crate::Event::new(raw)), home))
             }
             None => Ok((v, Deps::new(), home)),
         }
@@ -1943,11 +2019,11 @@ pub trait DeviceOp: Send {
     /// Default: the single [`output_pipe`](Self::output_pipe). Multi-output ops
     /// (kernels, bundles, `CopyTo2`, `FanOut`) override to stamp each element pipe —
     /// mirroring [`reclaim_undelivered`](Self::reclaim_undelivered)'s traversal.
-    fn cb_restamp(&self, evs: &[Dep]) {
+    fn cb_restamp(&self, evs: &Deps) {
         if let Some(pipe) = self.output_pipe()
             && let Some((v, _deps, home)) = pipe.take_home()
         {
-            pipe.put_home(v, evs.to_vec(), home);
+            pipe.put_home(v, evs.clone(), home);
         }
     }
 
@@ -2638,7 +2714,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
         // Gather non-blocking (Pipelined); a host-seam setup error surfaces here.
         let (_output, deps) = self.collect(&ec, ExecMode::Pipelined)?;
-        let wait_list: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let wait_list = deps_to_wait_list(&deps);
         // SAFETY: the cl_events are held alive by `deps` across this call.
         let marker = unsafe { ec.cl_queue().enqueue_marker_with_wait_list(&wait_list) }
             .map_err(Error::OpenCl)?;

@@ -128,7 +128,7 @@ where
             }
         }
 
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         // Fill has no native CL_BLOCKING flag (it's always enqueue + optional
         // wait — exactly what the old `FillOp::wait_on` did internally), so both
         // modes enqueue non-blocking; Blocking then waits on the event here.
@@ -140,7 +140,7 @@ where
                 self.out.put_home(buf, Deps::new(), home);
             }
             ExecMode::Pipelined => {
-                self.out.put_home(buf, vec![wrap_event(event)], home);
+                self.out.put_home(buf, single_dep(event), home);
             }
         }
         Ok(())
@@ -540,7 +540,7 @@ where
         // output pipe.)
         let (buf, deps, home) = self.buf.resolve_home(ec)?;
         let mut host = vec![T::default(); buf.len()];
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         match mode {
             // Terminal: native blocking read (CL_BLOCKING) — the driver waits,
             // the host Vec is valid on return, no event. Matches Tier-1
@@ -558,7 +558,7 @@ where
             ExecMode::Pipelined => {
                 let event = crate::buffer::read_buffer_enqueue(&buf, ec, &mut host, false, &raw)?;
                 rehome_consumed(buf, home);
-                self.out.put(host, vec![wrap_event(event)]);
+                self.out.put(host, single_dep(event));
             }
         }
         Ok(())
@@ -654,7 +654,7 @@ where
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (buf, deps, home) = self.buf.resolve_home(ec)?;
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         let mut dst = self.dst.lock().unwrap();
         // In-place: the buffer is read and handed back unchanged → home threads.
         match mode {
@@ -666,7 +666,7 @@ where
             // Pipelined: non-blocking; the event gates `dst` being valid.
             ExecMode::Pipelined => {
                 let event = crate::buffer::read_buffer_enqueue(&buf, ec, &mut dst, false, &raw)?;
-                self.out.put_home(buf, vec![wrap_event(event)], home);
+                self.out.put_home(buf, single_dep(event), home);
             }
         }
         Ok(())
@@ -814,9 +814,9 @@ where
         // mode is ignored; the chain terminal's `into_output` does the final
         // wait. The migrate body mirrors the closure layer's
         // `transfer_to_device.rs` exactly.
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         let event = crate::buffer::migrate_buffer_enqueue(&buf, &*target_q, &raw)?;
-        self.out.put_home(buf, vec![wrap_event(event)], home);
+        self.out.put_home(buf, single_dep(event), home);
         Ok(())
     }
 
@@ -922,7 +922,7 @@ where
             }
         }
 
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         // Fill has no native CL_BLOCKING flag — enqueue, then wait on Blocking.
         let event = crate::buffer::fill_buffer_enqueue(&mut buf, ec, self.value, &raw)?;
         match mode {
@@ -931,7 +931,7 @@ where
                 self.out.put(buf, Deps::new());
             }
             ExecMode::Pipelined => {
-                self.out.put(buf, vec![wrap_event(event)]);
+                self.out.put(buf, single_dep(event));
             }
         }
         Ok(())
@@ -1041,7 +1041,7 @@ where
             }
         }
 
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         // SVM fill is always a non-blocking enqueue; Blocking waits here.
         let event = crate::mapped::svm_fill_enqueue(&buf, ec, self.value, &raw)?;
         match mode {
@@ -1050,7 +1050,7 @@ where
                 self.out.put(buf, Deps::new());
             }
             ExecMode::Pipelined => {
-                self.out.put(buf, vec![wrap_event(event)]);
+                self.out.put(buf, single_dep(event));
             }
         }
         Ok(())
@@ -1072,10 +1072,10 @@ where
         1
     }
 
-    fn cb_restamp(&self, evs: &[Dep]) {
+    fn cb_restamp(&self, evs: &Deps) {
         if let Some((v, deps)) = self.out.take() {
             let _ = deps;
-            self.out.put(v, Vec::from(evs));
+            self.out.put(v, evs.clone());
         }
     }
 
@@ -1194,7 +1194,7 @@ where
         // SAFETY: the write below covers every byte; downstream gates on the
         // returned write event (Pipelined) or the driver waits (Blocking).
         let mut buf = unsafe { uninit.assume_init() };
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         match mode {
             ExecMode::Blocking => {
                 crate::buffer::write_buffer_enqueue(&mut buf, ec, self.src.as_slice(), true, &raw)?;
@@ -1209,7 +1209,7 @@ where
                     false,
                     &raw,
                 )?;
-                self.out.put(buf, vec![wrap_event(event)]);
+                self.out.put(buf, single_dep(event));
             }
         }
         Ok(())
@@ -1280,7 +1280,7 @@ where
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (mut buf, deps, home) = self.buf.resolve_home(ec)?;
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         // In-place: the written buffer is the lent buffer → home threads through.
         match mode {
             ExecMode::Blocking => {
@@ -1298,7 +1298,7 @@ where
                     false,
                     &raw,
                 )?;
-                self.out.put_home(buf, vec![wrap_event(event)], home);
+                self.out.put_home(buf, single_dep(event), home);
             }
         }
         Ok(())
@@ -1387,7 +1387,7 @@ where
         let (uninit, deps) = self.uninit.resolve(ec)?;
         // SAFETY: the SVM write below covers every byte.
         let buf = unsafe { uninit.assume_init() };
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         // SVM write is always a non-blocking enqueue (no native CL_BLOCKING flag);
         // Blocking waits on the returned event here, Pipelined threads it
         // downstream. `self.src` is valid for the whole `sync` — no keep-alive.
@@ -1398,7 +1398,7 @@ where
                 self.out.put(buf, Deps::new());
             }
             ExecMode::Pipelined => {
-                self.out.put(buf, vec![wrap_event(event)]);
+                self.out.put(buf, single_dep(event));
             }
         }
         Ok(())
@@ -1500,7 +1500,7 @@ where
             }
         }
 
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         // SVM fill is always a non-blocking enqueue (no native CL_BLOCKING flag);
         // Blocking waits on the returned event here. In-place → home threads.
         let event = crate::mapped::svm_fill_enqueue(&buf, ec, self.value, &raw)?;
@@ -1510,7 +1510,7 @@ where
                 self.out.put_home(buf, Deps::new(), home);
             }
             ExecMode::Pipelined => {
-                self.out.put_home(buf, vec![wrap_event(event)], home);
+                self.out.put_home(buf, single_dep(event), home);
             }
         }
         Ok(())
@@ -1533,9 +1533,9 @@ where
         1
     }
 
-    fn cb_restamp(&self, evs: &[Dep]) {
+    fn cb_restamp(&self, evs: &Deps) {
         if let Some((v, _d, h)) = self.out.take_home() {
-            self.out.put_home(v, Vec::from(evs), h);
+            self.out.put_home(v, evs.clone(), h);
         }
     }
 
@@ -1619,7 +1619,7 @@ where
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (buf, deps, home) = self.buf.resolve_home(ec)?;
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         // SVM write is always a non-blocking enqueue; Blocking waits on the event
         // here, Pipelined threads it downstream. `self.src` is valid for the whole
         // `sync` — no keep-alive callback needed. In-place → home threads through.
@@ -1630,7 +1630,7 @@ where
                 self.out.put_home(buf, Deps::new(), home);
             }
             ExecMode::Pipelined => {
-                self.out.put_home(buf, vec![wrap_event(event)], home);
+                self.out.put_home(buf, single_dep(event), home);
             }
         }
         Ok(())
@@ -2014,7 +2014,7 @@ where
             false,
             &[],
         )?;
-        self.out.put(img, vec![wrap_event(event)]);
+        self.out.put(img, single_dep(event));
         Ok(())
     }
 
@@ -2068,7 +2068,7 @@ where
         let pixel_count = img.pixel_count();
         let region = img.enqueue_region();
         let mut pixels = vec![<I::Pixel as Default>::default(); pixel_count];
-        let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+        let raw = deps_to_wait_list(&deps);
         let event = crate::image::read_image_enqueue(
             img.image_ref(),
             ec,
@@ -2077,7 +2077,7 @@ where
             false,
             &raw,
         )?;
-        self.out.put(pixels, vec![wrap_event(event)]);
+        self.out.put(pixels, single_dep(event));
         Ok(())
     }
 
@@ -2996,13 +2996,13 @@ where
         1
     }
 
-    fn cb_restamp(&self, evs: &[Dep]) {
+    fn cb_restamp(&self, evs: &Deps) {
         // Multi-output: stamp the CB completion event onto BOTH element pipes.
         if let Some((v, _d, h)) = self.src_pipe.take_home() {
-            self.src_pipe.put_home(v, Vec::from(evs), h);
+            self.src_pipe.put_home(v, evs.clone(), h);
         }
         if let Some((v, _d, h)) = self.dst_pipe.take_home() {
-            self.dst_pipe.put_home(v, Vec::from(evs), h);
+            self.dst_pipe.put_home(v, evs.clone(), h);
         }
     }
 

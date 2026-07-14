@@ -1503,14 +1503,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // different/no CB waits on the whole CB (event↔sync-point boundary).
     let cb_restamp_method: TokenStream2 = if multi_output {
         quote! {
-            fn cb_restamp(&self, __claspr_evs: &[::claspr::Dep]) {
+            fn cb_restamp(&self, __claspr_evs: &::claspr::Deps) {
                 #(
                     if let ::core::option::Option::Some((__v, _d, __h)) =
                         self.#op_pipe_fields.take_home()
                     {
                         self.#op_pipe_fields.put_home(
                             __v,
-                            ::std::vec::Vec::from(__claspr_evs),
+                            ::core::clone::Clone::clone(__claspr_evs),
                             __h,
                         );
                     }
@@ -1519,13 +1519,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         }
     } else {
         quote! {
-            fn cb_restamp(&self, __claspr_evs: &[::claspr::Dep]) {
+            fn cb_restamp(&self, __claspr_evs: &::claspr::Deps) {
                 if let ::core::option::Option::Some((__v, _d, __h)) =
                     self.__claspr_out.take_home()
                 {
                     self.__claspr_out.put_home(
                         __v,
-                        ::std::vec::Vec::from(__claspr_evs),
+                        ::core::clone::Clone::clone(__claspr_evs),
                         __h,
                     );
                 }
@@ -1634,7 +1634,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     #(
                         self.#op_pipe_fields.put_home(
                             #output_names,
-                            ::std::vec![::core::clone::Clone::clone(&__claspr_dep)],
+                            ::core::iter::once(::core::clone::Clone::clone(&__claspr_dep))
+                                .collect(),
                             #output_homes,
                         );
                     )*
@@ -1653,7 +1654,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         let #op_pipe_fields = ::core::clone::Clone::clone(&self.#op_pipe_fields);
                     )*
                     self.execute(ec, mode)?;
-                    let mut __claspr_deps: ::claspr::Deps = ::std::vec::Vec::new();
+                    let mut __claspr_deps: ::claspr::Deps = ::claspr::Deps::new();
                     #(
                         let (#output_names, __claspr_d) = #op_pipe_fields
                             .take()
@@ -1700,7 +1701,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         let #op_pipe_fields = ::core::clone::Clone::clone(&self.#op_pipe_fields);
                     )*
                     self.execute(ec, mode)?;
-                    let mut __claspr_deps: ::claspr::Deps = ::std::vec::Vec::new();
+                    let mut __claspr_deps: ::claspr::Deps = ::claspr::Deps::new();
                     #(
                         let (#output_names, __claspr_d, __claspr_h) = #op_pipe_fields
                             .take_home()
@@ -1861,7 +1862,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     // `Checkout` drop).
                     self.__claspr_out.put_home(
                         #output_expr,
-                        ::std::vec![::claspr::wrap_event(event)],
+                        ::claspr::single_dep(event),
                         #single_output_home,
                     );
                     ::core::result::Result::Ok(())

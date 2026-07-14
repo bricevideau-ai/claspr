@@ -300,7 +300,7 @@ where
         self.source.cb_spine_head_addable()
     }
 
-    fn cb_restamp(&self, evs: &[Dep]) {
+    fn cb_restamp(&self, evs: &Deps) {
         // A chain's OUTPUT is its tail's output (its own `output_pipe` delegates to
         // `next`, and for a multi-output tail that is `None` so the default no-ops).
         // Delegate to the tail so a boundaried chain stamps the CB completion event
@@ -836,10 +836,10 @@ where
         self.source.cb_spine_head_addable()
     }
 
-    fn cb_restamp(&self, evs: &[Dep]) {
+    fn cb_restamp(&self, evs: &Deps) {
         // Stamp the CB completion event onto our output pipe for a cross-CB consumer.
         if let Some((v, _d)) = self.out.take() {
-            self.out.put(v, Vec::from(evs));
+            self.out.put(v, evs.clone());
         }
     }
 
@@ -1051,11 +1051,11 @@ where
         self.source.cb_spine_head_addable()
     }
 
-    fn cb_restamp(&self, evs: &[Dep]) {
+    fn cb_restamp(&self, evs: &Deps) {
         // Multi-output: stamp the CB completion event onto every branch pipe.
         for out in &self.outs {
             if let Some((v, _d)) = out.take() {
-                out.put(v, Vec::from(evs));
+                out.put(v, evs.clone());
             }
         }
     }
@@ -1083,7 +1083,7 @@ fn join_marker(ec: &ExecutionContext<'_>, branch_deps: &[Deps]) -> Result<Deps> 
     // until this call returns.
     let marker =
         unsafe { ec.cl_queue().enqueue_marker_with_wait_list(&all) }.map_err(Error::OpenCl)?;
-    Ok(vec![wrap_event(marker)])
+    Ok(single_dep(marker))
 }
 
 /// Reduce a gathered op's [`Deps`] to a single owned [`Event`](crate::Event) — used by the
@@ -1094,7 +1094,7 @@ fn join_marker(ec: &ExecutionContext<'_>, branch_deps: &[Deps]) -> Result<Deps> 
 /// multi-output launch). Empty deps → a bare marker (fires immediately).
 pub fn deps_into_single_event(ec: &ExecutionContext<'_>, deps: Deps) -> Result<crate::Event> {
     use crate::Launcher;
-    let raw: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+    let raw = deps_to_wait_list(&deps);
     // SAFETY: the cl_event handles are held alive by `deps` across this call.
     let marker =
         unsafe { ec.cl_queue().enqueue_marker_with_wait_list(&raw) }.map_err(Error::OpenCl)?;
@@ -1336,7 +1336,7 @@ macro_rules! impl_eager_bundle {
                 self.cbable_weight
             }
 
-            fn cb_restamp(&self, evs: &[Dep]) {
+            fn cb_restamp(&self, evs: &Deps) {
                 // Stamp the CB completion event onto every branch's output pipe(s) —
                 // delegate to each branch's own `cb_restamp` (a multi-output branch
                 // stamps each element pipe). So a downstream consumer of ANY branch
@@ -1665,10 +1665,10 @@ where
         self.ops.iter().map(|op| op.cbable_weight()).sum()
     }
 
-    fn cb_restamp(&self, evs: &[Dep]) {
+    fn cb_restamp(&self, evs: &Deps) {
         // Single output pipe (the Vec) — stamp the CB completion event onto it.
         if let Some((v, _d)) = self.out.take() {
-            self.out.put(v, Vec::from(evs));
+            self.out.put(v, evs.clone());
         }
     }
 
@@ -1964,7 +1964,7 @@ where
     let q = ec.cl_queue();
     // Non-blocking maps with the upstream events as wait-list — the worker waits
     // these (host-side, on its own thread) before reading the mapped memory.
-    let source_cl: Vec<crate::cl_event> = source_deps.iter().map(|d| d.as_ref().get()).collect();
+    let source_cl = deps_to_wait_list(&source_deps);
     let (mut handle, map_events) = source_value.map(q, &source_cl)?;
 
     // `fire` gates the unmaps (always completed CL_COMPLETE — one clean unmap per
@@ -2022,7 +2022,7 @@ where
     // buffers (scalar / unit), there are no unmaps and `fire` gates nothing — but
     // `proceed` still gives downstream its proceed/abort gate.
     let mut deps_out: Deps = unmap_events.into_iter().map(wrap_event).collect();
-    deps_out.push(proceed);
+    deps_out.insert(Dep::from_arc(proceed));
     Ok((source_value, deps_out))
 }
 
@@ -2396,8 +2396,7 @@ where
         // The marker waits for the source op's events, so the timestamps
         // reflect the source's wall-clock duration (first command queued to
         // last command finished).
-        let wait_list: Vec<crate::cl_event> =
-            source_deps.iter().map(|d| d.as_ref().get()).collect();
+        let wait_list = deps_to_wait_list(&source_deps);
         // SAFETY: cl_event handles are valid — held by `source_deps` Arcs until
         // this call returns.
         let marker = unsafe { ec.cl_queue().enqueue_marker_with_wait_list(&wait_list) }
@@ -2414,7 +2413,7 @@ where
         // The marker becomes this op's completion event for downstream
         // chaining (it subsumes the source's events); thread the source's home so
         // the terminal `Checkout` rehomes it and the graph re-arms.
-        self.out.put_home(value, vec![wrap_event(marker)], home);
+        self.out.put_home(value, single_dep(marker), home);
         Ok(())
     }
 
@@ -2634,7 +2633,7 @@ where
     //    whole point is that the *entire* graph is committed before anything
     //    runs). The marker enqueue is non-blocking, so wiring it while `start`
     //    is still held does not deadlock.
-    let wait_list: Vec<crate::cl_event> = deps.iter().map(|d| d.as_ref().get()).collect();
+    let wait_list = deps_to_wait_list(&deps);
     let marker = match unsafe { queue.raw().enqueue_marker_with_wait_list(&wait_list) } {
         Ok(ev) => ev,
         Err(code) => {
