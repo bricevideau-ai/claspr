@@ -138,3 +138,23 @@ fn main() -> claspr::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exercise the multi-device (or partitioned / single-device fallback) path
+    /// under `cargo test`: `run` performs the two-queue upload, cross-buffer copy,
+    /// and read-back, asserting the round-trips internally, and returns `true` when
+    /// it actually ran. Previously those asserts lived only in `main`, so the suite
+    /// never covered this path.
+    #[test]
+    fn two_device_round_trip() {
+        // `run`'s internal assert_eq!s validate correctness; a `false` return means
+        // no device was available → SKIP.
+        let ran = run().expect("two-device run");
+        if !ran {
+            eprintln!("SKIP: no OpenCL device");
+        }
+    }
+}

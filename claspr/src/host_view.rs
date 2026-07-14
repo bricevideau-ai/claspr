@@ -299,8 +299,12 @@ impl<T, M: MemMode, A: MapAccess> Drop for DeviceSliceHostView<T, M, A> {
             };
             match res {
                 Ok(ev) => {
-                    let _ = ev.wait();
-                    // `ev` drops here, releasing the cl_event.
+                    // A failed WAIT on the defensive unmap is a real failure too —
+                    // record it, same as the failed-enqueue arm below (the previous
+                    // `let _ = ev.wait()` silently swallowed it). `ev` drops after.
+                    if ev.wait().is_err() {
+                        buf.ctx().record_err();
+                    }
                 }
                 Err(_) => buf.ctx().record_err(),
             }
@@ -581,7 +585,11 @@ impl<T, M: MemMode, A: MapAccess> Drop for MappedSliceHostView<T, M, A> {
             let res = unsafe { map_primitive::svm_unmap(self.queue.raw(), buf.ptr().cast(), &[]) };
             match res {
                 Ok(evt) => {
-                    let _ = evt.wait();
+                    // A failed WAIT is a real failure too — record it, like the
+                    // failed-enqueue arm (was a silent `let _ = evt.wait()`).
+                    if evt.wait().is_err() {
+                        buf.ctx().record_err();
+                    }
                     buf.register_use(std::sync::Arc::new(evt));
                 }
                 Err(_) => {

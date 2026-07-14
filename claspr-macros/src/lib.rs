@@ -2710,11 +2710,15 @@ fn read_image_access_attr(attrs: &[Attribute]) -> Option<String> {
             if eq.as_char() != '=' {
                 continue;
             }
-            // Literal::to_string includes the surrounding quotes —
-            // strip them. We accept double-quoted strings only.
-            let s = lit.to_string();
-            if let Some(inner) = s.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
-                return Some(inner.to_string());
+            // Parse the literal token as a `syn::LitStr` and take its decoded
+            // value — this handles plain (`"write_only"`), raw (`r"write_only"`),
+            // and escaped forms uniformly. (The former hand-rolled
+            // `strip_prefix('"')` silently missed raw string literals, treating
+            // `image_access = r"..."` as attribute-absent.)
+            let lit_ts =
+                proc_macro2::TokenStream::from(proc_macro2::TokenTree::Literal((*lit).clone()));
+            if let Ok(s) = syn::parse2::<syn::LitStr>(lit_ts) {
+                return Some(s.value());
             }
         }
     }
@@ -2811,4 +2815,46 @@ fn parse_image_tokens(tokens: TokenStream2) -> (Option<String>, Option<String>, 
         i += 1;
     }
     (dim, type_, arrayed)
+}
+
+#[cfg(test)]
+mod read_image_access_attr_tests {
+    use super::read_image_access_attr;
+    use quote::quote;
+
+    // Build the `#[spirv(image_access = <lit>)]` attribute list from a literal
+    // token written verbatim, so we can feed plain and RAW string literals.
+    fn attr_with(lit: proc_macro2::TokenStream) -> Vec<syn::Attribute> {
+        let attr: syn::Attribute = syn::parse_quote!(#[spirv(image_access = #lit)]);
+        vec![attr]
+    }
+
+    #[test]
+    fn plain_string_literal() {
+        let attrs = attr_with(quote! { "write_only" });
+        assert_eq!(
+            read_image_access_attr(&attrs).as_deref(),
+            Some("write_only")
+        );
+    }
+
+    #[test]
+    fn raw_string_literal_is_recognized() {
+        // The regression: `r"write_only"` was silently treated as absent by the
+        // old `strip_prefix('"')` path (the leading `r` broke the strip).
+        let attrs = attr_with(quote! { r"write_only" });
+        assert_eq!(
+            read_image_access_attr(&attrs).as_deref(),
+            Some("write_only")
+        );
+    }
+
+    #[test]
+    fn absent_attribute_is_none() {
+        let attr: syn::Attribute = syn::parse_quote!(#[spirv(cross_workgroup)]);
+        assert_eq!(read_image_access_attr(&[attr]), None);
+        // A non-spirv attribute is also ignored.
+        let other: syn::Attribute = syn::parse_quote!(#[inline]);
+        assert_eq!(read_image_access_attr(&[other]), None);
+    }
 }

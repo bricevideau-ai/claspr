@@ -33,18 +33,20 @@ const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 720;
 const MAX_ITER: u32 = 256;
 
-fn run() -> claspr::Result<bool> {
+/// Run the two-library pipeline and return the Sobel output pixels (RGBA8), or
+/// `None` if there's no image-capable device (so the test can SKIP gracefully).
+fn run() -> claspr::Result<Option<Vec<u8>>> {
     let ctx = match Context::any() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("SKIP: no OpenCL device ({e})");
-            return Ok(false);
+            return Ok(None);
         }
     };
 
     if !ctx.device().cl3().image_support().unwrap_or(false) {
         eprintln!("SKIP: device has no image support");
-        return Ok(false);
+        return Ok(None);
     }
 
     // Each library exposes its own typed launch handle. Loaded once
@@ -80,15 +82,46 @@ fn run() -> claspr::Result<bool> {
         .wait()?;
 
     let pixels = edges.read_bytes_alloc().wait()?;
-    let ppm_path = "image-pipeline.ppm";
-    write_ppm_rgba8(ppm_path, WIDTH, HEIGHT, &pixels)?;
-    println!(
-        "image-pipeline: wrote {ppm_path} ({WIDTH}x{HEIGHT}, mandelbrot → sobel via two library crates)",
-    );
-    Ok(true)
+    Ok(Some(pixels))
 }
 
 fn main() -> claspr::Result<()> {
-    let _ = run()?;
+    if let Some(pixels) = run()? {
+        let ppm_path = "image-pipeline.ppm";
+        write_ppm_rgba8(ppm_path, WIDTH, HEIGHT, &pixels)?;
+        println!(
+            "image-pipeline: wrote {ppm_path} ({WIDTH}x{HEIGHT}, mandelbrot → sobel via two library crates)",
+        );
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end regression for the cross-crate library composition: the
+    /// mandelbrot→sobel pipeline runs without error and produces a full-size
+    /// RGBA8 buffer that isn't uniformly blank — i.e. both library kernels
+    /// actually executed and the second read the first's output. Guards against
+    /// composition regressions that `cargo run` would print-but-not-catch.
+    #[test]
+    fn pipeline_produces_nonblank_output() {
+        let Some(pixels) = run().expect("pipeline run") else {
+            return; // no image-capable device — SKIP
+        };
+        assert_eq!(
+            pixels.len(),
+            (WIDTH * HEIGHT * 4) as usize,
+            "output must be a full WIDTH*HEIGHT RGBA8 buffer"
+        );
+        // Sobel edge magnitudes on a Mandelbrot render are non-uniform: some
+        // pixels are edges (bright), most aren't (dark). A pipeline that silently
+        // produced nothing would leave an all-equal buffer.
+        let first = pixels[0];
+        assert!(
+            pixels.iter().any(|&b| b != first),
+            "edge-detected output must not be a uniform buffer"
+        );
+    }
 }
