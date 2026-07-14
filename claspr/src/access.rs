@@ -198,26 +198,9 @@ pub trait UploadReseed: MemMode {
     /// See the trait docs.
     const RESEED_ON_REPLAY: bool;
 }
-// Kernel-writable markers re-seed each run (the kernel may have mutated them).
-impl UploadReseed for ReadWrite {
-    const RESEED_ON_REPLAY: bool = true;
-}
-impl UploadReseed for HostReadOnly {
-    const RESEED_ON_REPLAY: bool = true;
-}
-impl UploadReseed for DeviceScratch {
-    const RESEED_ON_REPLAY: bool = true;
-}
-impl UploadReseed for WriteOnly {
-    const RESEED_ON_REPLAY: bool = true;
-}
-// Kernel read-only markers seed once (their contents never change device-side).
-impl UploadReseed for ReadOnly {
-    const RESEED_ON_REPLAY: bool = false;
-}
-impl UploadReseed for Frozen {
-    const RESEED_ON_REPLAY: bool = false;
-}
+// The per-marker `RESEED_ON_REPLAY` value (kernel-writable → re-seed each run;
+// kernel read-only → seed once) is set from the `reseed:` column of the
+// `capabilities!` table at the bottom of this module.
 
 // ── Kernel-side classification traits ──────────────────────────────
 //
@@ -246,26 +229,8 @@ pub trait KernelReadable: KernelAccess {}
 /// The kernel may write through this access mode.
 pub trait KernelWritable: KernelAccess {}
 
-// ReadWrite: read AND write
-impl KernelReadable for ReadWrite {}
-impl KernelWritable for ReadWrite {}
-
-// ReadOnly: read only
-impl KernelReadable for ReadOnly {}
-
-// WriteOnly (image-only): write only — explicitly NOT readable
-impl KernelWritable for WriteOnly {}
-
-// HostReadOnly: kernel side is RW
-impl KernelReadable for HostReadOnly {}
-impl KernelWritable for HostReadOnly {}
-
-// Frozen: kernel side is read-only
-impl KernelReadable for Frozen {}
-
-// DeviceScratch: kernel side is RW (host side is what's restricted)
-impl KernelReadable for DeviceScratch {}
-impl KernelWritable for DeviceScratch {}
+// The per-marker `KernelReadable` / `KernelWritable` impls are emitted from the
+// `kernel:` column of the `capabilities!` table at the bottom of this module.
 
 // ── Host-side classification traits ────────────────────────────────
 //
@@ -288,22 +253,10 @@ pub trait HostReadable: HostAccess {}
 /// The host may write the buffer's bytes.
 pub trait HostWritable: HostAccess {}
 
-// ReadWrite / ReadOnly / WriteOnly: default host access = RW
-impl HostReadable for ReadWrite {}
-impl HostWritable for ReadWrite {}
-impl HostReadable for ReadOnly {}
-impl HostWritable for ReadOnly {}
-impl HostReadable for WriteOnly {}
-impl HostWritable for WriteOnly {}
-
-// HostReadOnly: host-read-only
-impl HostReadable for HostReadOnly {}
-
-// Frozen: host-read-only
-impl HostReadable for Frozen {}
-
-// DeviceScratch: host-no-access — neither readable nor writable from
-// the host. Don't impl either trait.
+// The per-marker `HostReadable` / `HostWritable` impls are emitted from the
+// `host:` column of the `capabilities!` table at the bottom of this module.
+// (`DeviceScratch` is `CL_MEM_HOST_NO_ACCESS` — neither, so its row lists no
+// host capability.)
 
 // ── Fillable: the fill-strategy DISPATCH trait ──
 //
@@ -334,22 +287,10 @@ pub enum FillStrategy {
 pub trait Fillable: MemMode {
     const FILL_STRATEGY: FillStrategy;
 }
-impl Fillable for ReadWrite {
-    const FILL_STRATEGY: FillStrategy = FillStrategy::Runtime;
-}
-impl Fillable for ReadOnly {
-    const FILL_STRATEGY: FillStrategy = FillStrategy::Runtime;
-}
-impl Fillable for HostReadOnly {
-    const FILL_STRATEGY: FillStrategy = FillStrategy::DeviceKernel;
-}
-impl Fillable for DeviceScratch {
-    const FILL_STRATEGY: FillStrategy = FillStrategy::DeviceKernel;
-}
-impl Fillable for WriteOnly {
-    const FILL_STRATEGY: FillStrategy = FillStrategy::Runtime;
-}
-// Frozen: NOT impl Fillable — no write path exists.
+// The per-marker `Fillable` impls (and their `FILL_STRATEGY`) come from the
+// `fill:` column of the `capabilities!` table at the bottom of this module.
+// `Frozen`'s row lists no `fill:` — no write path exists, so it stays absent
+// (a `Frozen.fill(..)` is a compile error).
 
 // No `FillablePattern` trait — fill bound is plain `T: Copy +
 // Send + 'static`. The dispatch in `FillOp::into_event` reads
@@ -443,4 +384,60 @@ impl KernelAccess for DeviceScratch {
 }
 impl HostAccess for DeviceScratch {
     const HOST_FLAGS: cl_mem_flags = CL_MEM_HOST_NO_ACCESS;
+}
+
+// ── The capability table ─────────────────────────────────────────────
+//
+// Each marker's four capability-trait impls (KernelReadable/Writable,
+// HostReadable/Writable), its UploadReseed value, and its optional Fillable
+// strategy are all one axis of the SAME 6×N access model. Written out as 29
+// separate `impl` blocks that model was scattered — checking "can the host write
+// a HostReadOnly buffer?" meant grepping four trait sections. The `capabilities!`
+// table below states each marker as ONE row, so the whole model reads as the
+// truth table it is, and a new marker or a corrected cell is a one-line edit
+// instead of four coordinated impls that can drift apart.
+//
+// Column semantics (all defined above): `kernel:`/`host:` list the read/write
+// capabilities the marker has on that axis (a missing entry = no impl = a
+// compile error at the gated call); `reseed:` is `UploadReseed::RESEED_ON_REPLAY`;
+// `fill:` is `Fillable::FILL_STRATEGY` (a row with NO `fill:` does not impl
+// `Fillable` at all — `Frozen`, which has no write path).
+macro_rules! capabilities {
+    // Internal cap-token dispatch: map the bare `read` / `write` tokens in a
+    // row's `kernel:` / `host:` list to the matching marker-trait impl.
+    (@kcap $ty:ident, read) => { impl KernelReadable for $ty {} };
+    (@kcap $ty:ident, write) => { impl KernelWritable for $ty {} };
+    (@hcap $ty:ident, read) => { impl HostReadable for $ty {} };
+    (@hcap $ty:ident, write) => { impl HostWritable for $ty {} };
+
+    ( $(
+        $ty:ident {
+            kernel: [ $( $k:ident ),* $(,)? ],
+            host:   [ $( $h:ident ),* $(,)? ],
+            reseed: $reseed:literal
+            $(, fill: $fill:ident )?
+        }
+    ),* $(,)? ) => {
+        $(
+            $( capabilities!(@kcap $ty, $k); )*
+            $( capabilities!(@hcap $ty, $h); )*
+            impl UploadReseed for $ty {
+                const RESEED_ON_REPLAY: bool = $reseed;
+            }
+            $(
+                impl Fillable for $ty {
+                    const FILL_STRATEGY: FillStrategy = FillStrategy::$fill;
+                }
+            )?
+        )*
+    };
+}
+
+capabilities! {
+    ReadWrite     { kernel: [read, write], host: [read, write], reseed: true,  fill: Runtime },
+    ReadOnly      { kernel: [read],        host: [read, write], reseed: false, fill: Runtime },
+    WriteOnly     { kernel: [write],       host: [read, write], reseed: true,  fill: Runtime },
+    HostReadOnly  { kernel: [read, write], host: [read],        reseed: true,  fill: DeviceKernel },
+    Frozen        { kernel: [read],        host: [read],        reseed: false },
+    DeviceScratch { kernel: [read, write], host: [],            reseed: true,  fill: DeviceKernel },
 }
