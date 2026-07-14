@@ -270,6 +270,37 @@ pub fn single_dep(event: crate::Event) -> Deps {
     d
 }
 
+/// The terminal wait + error reconciliation shared by both `wait_on` paths
+/// (fast/no-seam and start-gated/seam). Blocks on every completion event in
+/// `deps`, then decides the caller-facing result:
+///
+/// - a worker's stashed rich error (`ec.take_host_error()`) is authoritative and
+///   wins over a raw cl_event cascade — a failing host seam may signal a negative
+///   user event whose status does NOT cascade to us (pocl), so a non-empty stash
+///   is itself the failure signal even when every `wait()` "succeeded";
+/// - otherwise the first `wait()` failure (as `Error::OpenCl`) surfaces;
+/// - otherwise `Ok(checkouts)`.
+///
+/// Blocking-mode leaves already waited inline, but pipelined upstream stages (and
+/// kernels, which have no native blocking enqueue) carry events here, so the wait
+/// is always needed. Factored out so the two enqueue strategies share ONE copy of
+/// the stash-beats-cascade precedence (a subtle invariant that must not drift).
+fn wait_deps_reconcile<C>(deps: &Deps, ec: &ExecutionContext<'_>, checkouts: C) -> Result<C> {
+    let mut wait_err: Option<Error> = None;
+    for d in deps {
+        if let Err(code) = d.as_ref().wait() {
+            wait_err.get_or_insert(Error::OpenCl(code));
+        }
+    }
+    match ec.take_host_error() {
+        Some(rust_err) => Err(rust_err),
+        None => match wait_err {
+            Some(cascade) => Err(cascade),
+            None => Ok(checkouts),
+        },
+    }
+}
+
 // ── DeviceEnqueue: minimal raw-enqueue contract for delegated primitives ──
 //
 // A handful of eager leaves (the host-view acquire/release ops in `host_view.rs`
@@ -2574,27 +2605,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
                     // re-lend finds it. The terminal's OWN output was already drained
                     // into `checkouts`, so this only touches intermediates.
                     self.reclaim_undelivered();
-                    // Blocking-mode leaves already waited inline, but pipelined
-                    // upstream stages (and kernels, which have no native blocking
-                    // enqueue) carry events here — wait on them so every command is
-                    // complete before the Checkout(s) are observed.
-                    let mut wait_err: Option<Error> = None;
-                    for d in &deps {
-                        if let Err(code) = d.as_ref().wait() {
-                            wait_err.get_or_insert(Error::OpenCl(code));
-                        }
-                    }
-                    // Even on a "successful" wait, a worker may have stashed an
-                    // error the wait did NOT surface (pocl does not cascade
-                    // negative user-event status). A non-empty slot is itself the
-                    // failure signal — check it. (Same as the async terminal.)
-                    match ec.take_host_error() {
-                        Some(rust_err) => Err(rust_err),
-                        None => match wait_err {
-                            Some(cascade) => Err(cascade),
-                            None => Ok(checkouts),
-                        },
-                    }
+                    wait_deps_reconcile(&deps, &ec, checkouts)
                 }
             };
         }
@@ -2636,9 +2647,13 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         self.reclaim_undelivered();
 
         // Wait on the chain's completion events (NOT clFinish — clFinish on a
-        // terminated command is the pocl hang). A negative `proceed` from a
-        // failing seam surfaces here as a cl_event cascade; we reconcile it with
-        // the stashed rich error below.
+        // terminated command is the pocl hang). A negative `proceed` from a failing
+        // seam surfaces as a cl_event cascade; `wait_deps_reconcile` reconciles it
+        // with the stashed rich error. Workers are joined AFTER the device wait but
+        // BEFORE reading the host-error slot, so no worker's late CL calls
+        // (signalling its user events, then dropping its retained queue) race the
+        // caller dropping the Context — hence the wait/join/reconcile split here vs.
+        // the fast path's single call.
         let mut wait_err: Option<Error> = None;
         for d in &deps {
             if let Err(code) = d.as_ref().wait() {
@@ -2646,15 +2661,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             }
         }
         drop(deps);
-
-        // Join host-seam workers AFTER the device wait, so no worker's late CL
-        // calls (signalling its user events, then dropping its retained queue)
-        // race the caller dropping the Context.
         ec.join_workers();
-
-        // The host-error slot is the authoritative caller-facing error (a worker
-        // may have failed without the cl_event cascade reaching us — pocl). Prefer
-        // it over the cascade, mirroring the fast path.
         match ec.take_host_error() {
             Some(rust_err) => Err(rust_err),
             None => match wait_err {
