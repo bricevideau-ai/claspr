@@ -1576,35 +1576,29 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
     // Emitted for every kernel (image kernels now take the CB path too): stamp the
     // CB completion event onto each output pipe so a downstream consumer in a
     // different/no CB waits on the whole CB (event↔sync-point boundary).
-    let cb_restamp_method: TokenStream2 = if multi_output {
-        quote! {
-            fn cb_restamp(&self, __claspr_evs: &::claspr::Deps) {
-                #(
-                    if let ::core::option::Option::Some((__v, _d, __h)) =
-                        self.#op_pipe_fields.take_home()
-                    {
-                        self.#op_pipe_fields.put_home(
-                            __v,
-                            ::core::clone::Clone::clone(__claspr_evs),
-                            __h,
-                        );
-                    }
-                )*
-            }
-        }
+    // The output pipe access expression(s), single (`self.__claspr_out`) or one
+    // per element (`self.__claspr_op{n}`) — the same 1-or-N list `cb_execute_fork`
+    // builds. Driving the restamp body over it with `#(...)*` collapses the former
+    // single/multi fork: a 1-element list expands byte-identically to the old
+    // single arm (the repetition meta-syntax emits no tokens of its own).
+    let restamp_pipes: Vec<TokenStream2> = if multi_output {
+        op_pipe_fields.iter().map(|f| quote! { self.#f }).collect()
     } else {
-        quote! {
-            fn cb_restamp(&self, __claspr_evs: &::claspr::Deps) {
+        vec![quote! { self.__claspr_out }]
+    };
+    let cb_restamp_method: TokenStream2 = quote! {
+        fn cb_restamp(&self, __claspr_evs: &::claspr::Deps) {
+            #(
                 if let ::core::option::Option::Some((__v, _d, __h)) =
-                    self.__claspr_out.take_home()
+                    #restamp_pipes.take_home()
                 {
-                    self.__claspr_out.put_home(
+                    #restamp_pipes.put_home(
                         __v,
                         ::core::clone::Clone::clone(__claspr_evs),
                         __h,
                     );
                 }
-            }
+            )*
         }
     };
 
