@@ -1,4 +1,4 @@
-//! Regression guard for the Arc-as-writable hole (spike fix `c4d1711`).
+//! Regression guard for the Arc-as-writable hole (fixed in `c4d1711`).
 //!
 //! `Arc<DeviceSlice<T, M>>` implements ONLY `KernelSliceReadArg<T>`, never
 //! the read-write variant — so two kernels can never write the same `cl_mem`

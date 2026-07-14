@@ -1,6 +1,6 @@
 //! Engine-level proof for the unified `Tag(value)`/`Tag(pipe)` constructor, the
 //! consuming set-once `bind` / `call` verbs, and the [`SlotState::FedByPipe`] slot
-//! state (promoted from spike #194).
+//! state.
 //!
 //! Three interlocking pieces are exercised here:
 //!

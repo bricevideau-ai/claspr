@@ -32,8 +32,9 @@
 //! device (via `transfer_to_device` or `.on_device(...)`), the
 //! shared weights need to live in *each* device's memory. The
 //! per-branch upload pattern is correct there: each branch uploads
-//! into its target device's memory. See `scenario_14_cross_device`
-//! in the combinator spike for the multi-device shape.
+//! into its target device's memory. See the `two-device` example (and
+//! the `eager_transfer_to_device` / `eager_on_device_suite` tests) for
+//! the multi-device shape.
 //!
 //! Single-device `fan_out` (this example) has no such constraint
 //! — all branches enqueue onto the same OOO queue on the same

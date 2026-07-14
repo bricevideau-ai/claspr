@@ -1285,7 +1285,7 @@ impl<T> Input<T> {
             // Both verbs fill a virgin / re-arm a bound cell → OK. `Set` on `Bound`
             // is the value-dependent residual (treated OK here). A `FedByPipe` cell
             // is treated like `Bound`: a value bind over it would overwrite (Mutate)
-            // / conflict (Set), but the spike never value-binds a pipe-fed slot, so
+            // / conflict (Set), but the runtime never value-binds a pipe-fed slot, so
             // it is inert here (a `feed` binder — the only writer of this state — is
             // never a probe).
             SlotState::Unbound | SlotState::Bound(_) | SlotState::FedByPipe(_) => {}
@@ -1400,7 +1400,7 @@ impl<T> Input<T> {
             }
             // A value bind onto a pipe-fed slot. `Set` conflicts (the slot is already
             // sourced by an upstream pipe); `Mutate` overwrites the pipe source with
-            // the value. The spike never value-binds a pipe-fed slot, so this arm is
+            // the value. The runtime never value-binds a pipe-fed slot, so this arm is
             // inert in practice — present only for exhaustiveness + correctness (a
             // value bind should not silently no-op over a live feed).
             SlotState::FedByPipe(_) => match binder.mode {

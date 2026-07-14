@@ -87,7 +87,7 @@ pub enum SlotState<T> {
     ///
     /// A `FedByPipe` slot is never `Bound`/`Lent`/`Severed` under normal use, so the
     /// bind-time verb-2×2 arms for it are inert-but-spelled (a value bind onto a
-    /// pipe-fed slot is a misuse the spike never performs; see
+    /// pipe-fed slot is a misuse the runtime never performs; see
     /// [`try_bind_slot`](Input::try_bind_slot)).
     FedByPipe(Pipe<T>),
 }
