@@ -1,14 +1,14 @@
 //! `KernelArgs` (claspr/src/launch.rs) only has tuple impls up to
-//! arity 8, so a kernel with 9+ runtime args (buffers + images +
+//! arity 16, so a kernel with 17+ runtime args (buffers + images +
 //! scalars, the grid excluded) is unsupported. The `#[claspr::kernel]`
 //! / `claspr::kernels!` expansion must surface a friendly,
 //! span-attributed error at the kernel definition BEFORE the cryptic
-//! downstream `KernelArgs is not implemented for (A, …, I)` trait error
+//! downstream `KernelArgs is not implemented for (A, …, Q)` trait error
 //! can fire.
 //!
-//! This kernel has 9 runtime args (one buffer + eight scalars) plus a
+//! This kernel has 17 runtime args (one buffer + sixteen scalars) plus a
 //! `#[spirv(global_invocation_id)]` builtin (dropped) — so the count is
-//! 9, one over the ceiling of 8.
+//! 17, one over the ceiling of 16.
 
 use claspr::kernels;
 
@@ -25,6 +25,14 @@ kernels! {
             f: u32,
             g: u32,
             h: u32,
+            i: u32,
+            j: u32,
+            k: u32,
+            l: u32,
+            m: u32,
+            n: u32,
+            o: u32,
+            p: u32,
         );
     }
 }

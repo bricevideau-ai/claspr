@@ -21,7 +21,7 @@
 //!
 //! ## Tuples
 //!
-//! [`KernelArgs`] is implemented for tuples of arity 0 through 8.
+//! [`KernelArgs`] is implemented for tuples of arity 0 through 16.
 //! Pass kernel arguments as a typed tuple at the launch site:
 //!
 //! ```ignore
@@ -571,7 +571,7 @@ impl KernelArg for LocalBuffer {
 
 /// A tuple of [`KernelArg`]s, set in order on launch.
 ///
-/// Implemented for tuples up to arity 8. Pass an empty tuple `()` for
+/// Implemented for tuples up to arity 16. Pass an empty tuple `()` for
 /// kernels with no arguments.
 pub trait KernelArgs {
     /// Set every element of the tuple in order.
@@ -614,6 +614,14 @@ impl_kernel_args_tuple!(A, B, C, D, E);
 impl_kernel_args_tuple!(A, B, C, D, E, F);
 impl_kernel_args_tuple!(A, B, C, D, E, F, G);
 impl_kernel_args_tuple!(A, B, C, D, E, F, G, H);
+impl_kernel_args_tuple!(A, B, C, D, E, F, G, H, I);
+impl_kernel_args_tuple!(A, B, C, D, E, F, G, H, I, J);
+impl_kernel_args_tuple!(A, B, C, D, E, F, G, H, I, J, K);
+impl_kernel_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
+impl_kernel_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M);
+impl_kernel_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
+impl_kernel_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
+impl_kernel_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
 
 // ── LaunchSpec + IntoLaunchSpec ───────────────────────────────────────
 

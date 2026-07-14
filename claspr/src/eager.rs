@@ -2390,7 +2390,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// — the same tag constructor fed a [`Pipe`], installing
     /// [`FedByPipe`](SlotState::FedByPipe)), so one tuple freely MIXES concrete binds
     /// and upstream-pipe wiring (the crossed rotation visible in the arg list). This
-    /// is dispatched through [`CallArgs`] / [`CallArg`] (arity 1..=8), NOT the fluent
+    /// is dispatched through [`CallArgs`] / [`CallArg`] (arity 1..=16), NOT the fluent
     /// [`BindAll`] path (which now serves only [`mutate_bind`](Self::mutate_bind) /
     /// [`mutate_call`](Self::mutate_call)).
     ///
@@ -2804,7 +2804,7 @@ impl<T: DeviceOp> DeviceOpExt for T {}
 ///
 /// `mutate_all` has no `SlotConflict` leg (mutate overwrites), so it is FULLY
 /// all-or-nothing. Order does not matter for *success*: every element binds its own
-/// tag independently. Implemented for tuples of arity 1..=8 (mirroring
+/// tag independently. Implemented for tuples of arity 1..=16 (mirroring
 /// [`KernelArgs`](crate::KernelArgs)). See the `mutate_all_body!` macro for the three
 /// phases (probe → sever → fold).
 ///
@@ -2882,6 +2882,14 @@ impl_bind_all_tuple!(A, B, C, D, E);
 impl_bind_all_tuple!(A, B, C, D, E, F);
 impl_bind_all_tuple!(A, B, C, D, E, F, G);
 impl_bind_all_tuple!(A, B, C, D, E, F, G, H);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
 
 // ── CallArg / CallArgs: the mixed value-or-feed tuple for `bind` / `call` ────
 
@@ -2933,7 +2941,7 @@ pub trait CallArg {
 /// A tuple of [`CallArg`]s — the argument to [`call`](DeviceOpExt::call) (and, as a
 /// 1-tuple, [`bind`](DeviceOpExt::bind)). Each element is INDEPENDENTLY a value tag
 /// (`Buf(v)`) or a pipe feed (`Buf(pipe)`), applied left-to-right, infallibly.
-/// Implemented for arities 1..=8 (mirroring [`BindAll`]).
+/// Implemented for arities 1..=16 (mirroring [`BindAll`]).
 pub trait CallArgs {
     /// Apply every element to `g` (infallibly, in tuple order).
     fn apply_all<Op: DeviceOp>(self, g: &Op);
@@ -2960,6 +2968,14 @@ impl_call_args_tuple!(A, B, C, D, E);
 impl_call_args_tuple!(A, B, C, D, E, F);
 impl_call_args_tuple!(A, B, C, D, E, F, G);
 impl_call_args_tuple!(A, B, C, D, E, F, G, H);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
 
 // ── Checkout: runtime guard over one run's output ───────────────────────
 

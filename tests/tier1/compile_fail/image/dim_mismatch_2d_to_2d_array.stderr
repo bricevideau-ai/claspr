@@ -5,11 +5,11 @@ error[E0277]: the trait bound `Image2D<WriteOnly, R32Uint>: KernelImage2DArrayWr
    |                     ^^^^^^^^^^^^ the trait `KernelImage2DArrayWriteArg<Uint>` is not implemented for `Image2D<WriteOnly, R32Uint>`
    |
 help: the following other types implement trait `KernelImage2DArrayWriteArg<SF>`
-  --> claspr/src/image.rs:2456:0
-  ::: claspr/src/image.rs:2457:34
+  --> claspr/src/image.rs:2453:0
+  ::: claspr/src/image.rs:2454:34
    |
    = note: `Image2DArray<WriteOnly, F>`
-  ::: claspr/src/image.rs:2465:34
+  ::: claspr/src/image.rs:2462:34
    |
    = note: `Image2DArray<ReadWrite, F>`
 note: required by a bound in `claspr_test_image_kernels::dim2_array_uint::Kernels::fill_pattern`

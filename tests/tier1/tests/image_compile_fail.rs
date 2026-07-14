@@ -69,8 +69,8 @@ fn main() -> Result<()> {
 
     // Macro-level diagnostics (no kernel crate needed — a `claspr::kernels!`
     // invocation exercises `expand_kernel` at host compile time, so only the
-    // `claspr` extern is required). `compile_fail/macro` covers the >8
-    // runtime-arg friendly error; `compile_pass/macro` pins the 8-arg
+    // `claspr` extern is required). `compile_fail/macro` covers the >16
+    // runtime-arg friendly error; `compile_pass/macro` pins the 16-arg
     // boundary as still-valid.
     let macro_fail_config = make_config("compile_fail/macro", Mode::Fail, &args, &externs);
     let macro_pass_config = make_config("compile_pass/macro", Mode::Pass, &args, &externs);

@@ -125,14 +125,14 @@
 //!
 //! ## The arity budget (why Du/Dv are consts)
 //!
-//! The OpenCL `KernelArgs` tuple impls top out at arity 8. `combine` spends ALL
-//! EIGHT on what genuinely varies per step or per regime: the six buffers
-//! (`u_in, v_in, lap_u, lap_v, u_out, v_out`) plus the two reaction scalars
-//! `F`, `k`. There is no room left to also pass `Du`/`Dv`, so the diffusion
-//! constants — which are fixed for the whole run anyway — are baked in as
-//! `gpu::DU`/`gpu::DV` compile-time consts, alongside `gpu::DT` and the grid
-//! size `gpu::W`/`gpu::H`. `laplacian` is comfortably under the ceiling (its
-//! kernel args are just `field_in` + `lap_out`; the grid rides the launch slot).
+//! `combine` passes the eight things that genuinely VARY per step or per regime:
+//! the six buffers (`u_in, v_in, lap_u, lap_v, u_out, v_out`) plus the two reaction
+//! scalars `F`, `k`. The run-fixed diffusion constants `Du`/`Dv` (and `Dt`, grid
+//! size) are baked in as `gpu::DU`/`gpu::DV`/`gpu::DT`/`gpu::W`/`gpu::H`
+//! compile-time consts — not because of an arg-count ceiling (`KernelArgs` goes to
+//! 16), but because they never change, so spending kernel args on them would be
+//! waste. `laplacian`'s args are just `field_in` + `lap_out` (the grid rides the
+//! launch slot).
 //!
 //! ## Output
 //!
@@ -157,10 +157,9 @@ use claspr::{slot, slots};
 #[claspr::device]
 mod gpu {
     /// Grid dimensions, time step, and diffusion rates are compile-time
-    /// constants of the meta-kernel. The OpenCL `KernelArgs` tuple impls top out
-    /// at arity 8, and `combine` spends all eight on what actually VARIES at
-    /// runtime — the six field/scratch buffers plus the two scalar slots `F`,
-    /// `k`. So the rest is baked in: `dt = 1.0` is the standard Gray-Scott step,
+    /// constants of the meta-kernel — `combine`'s eight kernel args carry only what
+    /// VARIES at runtime (the six field/scratch buffers plus the two scalar slots
+    /// `F`, `k`). So the rest is baked in: `dt = 1.0` is the standard Gray-Scott step,
     /// `DU`/`DV` are the (fixed) diffusion rates, and `W`/`H` the grid extent.
     /// Host code mirrors `W`/`H` with its own constants.
     pub const W: u32 = 256;

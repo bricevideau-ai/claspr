@@ -90,7 +90,7 @@ idiom, device scalars). Its worked examples: `examples/gray-scott` (reusable gra
 - `claspr/src/tier2_macros.rs` — the `slots!` / `slot!` macros, including the per-tag `Tag`, `IntoBound`, and `CallArg` impls (value + `Checkout` + `Pipe` sources) each tag emits.
 - `claspr-build/src/lib.rs` — both `compile()` (separate kernel crate) and `compile_from_host()` (single-source extraction) live here. The translation logic (`translate_and_inline`, `resolve_module_file`, `is_claspr_kernel_attr`, `is_claspr_device_attr`) is the most-likely-to-change surface as new kernel patterns surface; multi-file resolution rules also live there.
 - `claspr-macros/src/lib.rs` — `#[kernel]` + `#[device]`. The kernel signature → host wrapper translation lives in `classify_param`, `classify_image_param`, `slice_element_ty` (plus `parse_image_tokens`/`read_image_access_attr` for images). The device-on-mod injection (include! + `kernels()` fn) lives in the `device` proc-macro body.
-- `claspr/src/launch.rs` — `KernelArg` / `KernelArgs` / `LaunchSpec` / `IntoLaunchSpec`. Tuple impls are macro-emitted up to arity 8.
+- `claspr/src/launch.rs` — `KernelArg` / `KernelArgs` / `LaunchSpec` / `IntoLaunchSpec`. Tuple impls are macro-emitted up to arity 16.
 - `examples/raymarch/src/main.rs` + `src/gpu/scene.rs` + `src/gpu/shading.rs` — multi-file device-module reference. Cross-file `use super::scene::...` works because the build script preserves module structure during inlining.
 - `examples/image-pipeline/src/main.rs` — library-composition reference. Pulls two kernel libraries and chains their launches.
 

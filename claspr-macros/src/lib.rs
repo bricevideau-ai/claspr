@@ -1043,18 +1043,18 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     }
 
     // Runtime-arg ceiling. `KernelArgs` (claspr/src/launch.rs) has tuple
-    // impls only up to arity 8, so a kernel with more than 8 *runtime*
+    // impls only up to arity 16, so a kernel with more than 16 *runtime*
     // args (buffers + images + scalars) would otherwise fail as a cryptic
-    // `KernelArgs is not implemented for (A, …, I)` trait error deep inside
+    // `KernelArgs is not implemented for (A, …, Q)` trait error deep inside
     // this macro's generated `execute` — code the user never wrote. Count
     // the SAME things the launch tuple carries: `arg_gen_idx` advanced once
     // per Slice / Image / Scalar param and never for a `Builtin` (which
     // `continue`s above). The grid is NOT a fn param — it's the launcher
     // method's separate first arg (`self.spec`) — so it's already excluded.
     // Surface a friendly, span-attributed error at the kernel definition
-    // BEFORE the downstream trait error can fire. 8 is the max (still OK);
-    // 9 errors.
-    const MAX_RUNTIME_ARGS: usize = 8;
+    // BEFORE the downstream trait error can fire. 16 is the max (still OK);
+    // 17 errors. Keep in lockstep with the `impl_kernel_args_tuple!` count.
+    const MAX_RUNTIME_ARGS: usize = 16;
     let runtime_arg_count = arg_gen_idx;
     if runtime_arg_count > MAX_RUNTIME_ARGS {
         return Err(syn::Error::new(
