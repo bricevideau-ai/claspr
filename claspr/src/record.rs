@@ -152,12 +152,12 @@ impl CommandBufferExt {
 // makes the per-node CB-visibility POSITIONAL without any save/restore.
 
 /// A live `cl_khr_command_buffer` being built by the execution walk. Each device
-/// leaf that is "in CB mode" calls [`fill_buffer`](Self::fill_buffer) /
-/// [`copy_buffer`](Self::copy_buffer) / [`ndrange_kernel`](Self::ndrange_kernel),
-/// which add a `clCommand*KHR` to the buffer and return the command's
-/// [`cl_sync_point_khr`] MARKER; a consumer inside the same CB waits on its
-/// producer's markers. When the walk completes, the homing node calls
-/// [`finalize`](Self::finalize) to seal it into a [`FinalizedCb`].
+/// leaf that is "in CB mode" calls the crate-internal `fill_buffer` /
+/// `copy_buffer` / [`ndrange_kernel`](Self::ndrange_kernel), which add a
+/// `clCommand*KHR` to the buffer and return the command's [`cl_sync_point_khr`]
+/// MARKER; a consumer inside the same CB waits on its producer's markers. When the
+/// walk completes, the homing node calls [`finalize`](Self::finalize) to seal it
+/// into a [`FinalizedCb`].
 pub struct CbBuilder {
     cb: cl_command_buffer_khr,
     queue: cl_command_queue,
@@ -265,7 +265,7 @@ impl CbBuilder {
     /// (extension >= 0.9.4 — if that PFN is absent, the build is marked ineligible so
     /// the boundary falls back to software). Returns the command's sync point, or
     /// `None` on any shortfall.
-    pub fn fill_buffer(
+    pub(crate) fn fill_buffer(
         &self,
         mem: MemRef,
         pattern: &[u8],
@@ -337,7 +337,7 @@ impl CbBuilder {
     /// cl_mem/SVM pair has no single CB command and marks the build ineligible.
     /// Returns its sync point, or `None` on any shortfall.
     #[allow(clippy::too_many_arguments)]
-    pub fn copy_buffer(
+    pub(crate) fn copy_buffer(
         &self,
         src: MemRef,
         dst: MemRef,
@@ -414,7 +414,7 @@ impl CbBuilder {
     /// `region` are 3-element arrays (`clEnqueueFillImage` shape). Returns its sync
     /// point, or `None` on any shortfall.
     #[allow(clippy::too_many_arguments)]
-    pub fn fill_image(
+    pub(crate) fn fill_image(
         &self,
         image: MemRef,
         fill_color: &[u8],
@@ -463,7 +463,7 @@ impl CbBuilder {
     /// image `cl_mem`s; `src_origin`/`dst_origin`/`region` are 3-element arrays.
     /// Returns its sync point, or `None` on any shortfall.
     #[allow(clippy::too_many_arguments)]
-    pub fn copy_image(
+    pub(crate) fn copy_image(
         &self,
         src: MemRef,
         dst: MemRef,
