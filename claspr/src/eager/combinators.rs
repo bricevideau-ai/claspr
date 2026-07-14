@@ -1837,7 +1837,7 @@ where
     }
 }
 
-// ── AndThenHost / AndThenHostWithContext: the host seam ──
+// ── AndThenHost: the host seam (with/without &Context, one type) ──
 
 /// Run a host closure on a borrowed [`Mappable::View`](crate::mappable::Mappable::View) of the upstream output,
 /// in chain order — built by [`and_then_host`](DeviceOpExt::and_then_host).
@@ -1864,32 +1864,38 @@ where
 /// synchronous unmap so the buffer is left clean. This mirrors the old
 /// closure-layer `and_then_host.rs` exactly. (Distinct from any future
 /// host-VALUE seam, which would be pure host compute with no map.)
-pub struct AndThenHost<S: DeviceOp, F>
+/// The boxed host-seam closure. ALWAYS `Fn(&Context, View)` internally — the
+/// no-context builder ([`and_then_host`](DeviceOpExt::and_then_host)) wraps a
+/// `Fn(View)` into `move |_ctx, view| f(view)` at construction, so ONE struct +
+/// impl serves both `and_then_host` and `and_then_host_with_context`. Boxed
+/// (`dyn`) rather than a generic `F` so the two builders produce the SAME type
+/// (their wrapper-closure types differ and are unnameable). `Arc` so a replay
+/// worker thread gets its own owned handle to move in.
+pub(crate) type HostSeamFn<O> = Arc<
+    dyn for<'a> Fn(&Context, <O as crate::mappable::Mappable>::View<'a>) -> Result<()>
+        + Send
+        + Sync,
+>;
+
+/// The **host-seam** node behind [`and_then_host`](DeviceOpExt::and_then_host) /
+/// [`and_then_host_with_context`](DeviceOpExt::and_then_host_with_context): runs a
+/// host closure over the source's mapped value mid-graph, then re-scatters the
+/// (seam-mutated) value + per-branch homes downstream. The closure is stored boxed
+/// (always `Fn(&Context, View)` internally — the no-context builder wraps its
+/// `Fn(View)` closure), so the with-context and without-context spellings are ONE type.
+pub struct AndThenHost<S: DeviceOp>
 where
     S::Output: crate::mappable::Mappable,
     S::Checkouts: SeamScatter<Value = S::Output>,
 {
     pub(crate) source: S,
-    pub(crate) f: Arc<F>,
+    pub(crate) f: HostSeamFn<S::Output>,
     // The per-branch, pipe-shaped downstream handle — `Pipe<O>` for a
     // single-output source (the pre-#212 default), a tuple of pipes for a bundle /
     // multi-output source. `execute` scatters the seam-mutated value+homes into
     // these, so downstream can route each written branch to its own kernel AND
     // every branch re-homes across replays. Owned (not `Pipe::new()` per run) so
     // `handle()` hands out stable pipe identities.
-    pub(crate) handle: <S::Checkouts as SeamScatter>::Handle,
-}
-
-/// Like [`AndThenHost`] but the closure also receives `&Context` — built by
-/// [`and_then_host_with_context`](DeviceOpExt::and_then_host_with_context).
-pub struct AndThenHostWithContext<S: DeviceOp, F>
-where
-    S::Output: crate::mappable::Mappable,
-    S::Checkouts: SeamScatter<Value = S::Output>,
-{
-    pub(crate) source: S,
-    pub(crate) f: Arc<F>,
-    // See `AndThenHost::handle`.
     pub(crate) handle: <S::Checkouts as SeamScatter>::Handle,
 }
 
@@ -2118,7 +2124,7 @@ where
     }
 }
 
-impl<S, F> DeviceOp for AndThenHost<S, F>
+impl<S> DeviceOp for AndThenHost<S>
 where
     S: DeviceOp,
     S::Output: crate::mappable::Mappable,
@@ -2139,10 +2145,6 @@ where
     // output source's `Checkouts` satisfies it via the recursive `FromCheckout`
     // family, a single-output source via the identity impl.
     S::Checkouts: FromCheckout<S::Output>,
-    F: for<'a> Fn(<S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
-        + Send
-        + Sync
-        + 'static,
 {
     type Output = S::Output;
     // The downstream-facing handle is the source's per-branch PIPE shape (via
@@ -2198,10 +2200,13 @@ where
         // Reusable: `Arc::clone` the closure so the per-run worker thread gets
         // its OWN owned handle to move in (it runs off the submitting thread).
         // `run_host_seam` keeps its `FnOnce` param — the clone is a fresh
-        // one-shot callable per replay; the closure itself (`Fn`) re-runs.
+        // one-shot callable per replay; the closure itself (`Fn`) re-runs. A fresh
+        // `Context` is cloned per run and moved in (the closure always takes
+        // `&Context` internally — see `HostSeamFn`).
         let f = Arc::clone(&self.f);
+        let context = ec.context().clone();
         let (out_value, out_deps) =
-            run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(view))?;
+            run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(&context, view))?;
         <S::Checkouts as SeamScatter>::scatter(&self.handle, out_value, homes, &out_deps);
         Ok(())
     }
@@ -2249,8 +2254,9 @@ where
         let (src_cos, deps) = cb_gather_child(&self.source, ec, ExecMode::Pipelined)?;
         let (value, homes) = src_cos.split();
         let f = Arc::clone(&self.f);
+        let context = ec.context().clone();
         let (out_value, out_deps) =
-            run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(view))?;
+            run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(&context, view))?;
         let checkouts = <S::Checkouts as CheckoutSplit>::reassemble(out_value, homes);
         Ok((checkouts, out_deps))
     }
@@ -2291,133 +2297,6 @@ where
     fn describe(&self, out: &mut Vec<String>) {
         self.source.describe(out);
         out.push("and_then_host".into());
-    }
-
-    fn contains_host_seam(&self) -> bool {
-        true
-    }
-}
-
-impl<S, F> DeviceOp for AndThenHostWithContext<S, F>
-where
-    S: DeviceOp,
-    S::Output: crate::mappable::Mappable,
-    // Same `CheckoutSplit` + `SeamScatter` bounds as `AndThenHost` — see its impl
-    // for the rationale (terminal split/reassemble + mid-graph re-scatter).
-    // Single-output source keeps the #211 / pre-#212 paths identical.
-    S::Checkouts: CheckoutSplit<Value = S::Output>,
-    S::Checkouts: SeamScatter<Value = S::Output>,
-    // The source's own `gather_checkouts` needs this bound too — a bundle/multi-
-    // output source's `Checkouts` satisfies it via the recursive `FromCheckout`
-    // family, a single-output source via the identity impl.
-    S::Checkouts: FromCheckout<S::Output>,
-    F: for<'a> Fn(&Context, <S::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
-        + Send
-        + Sync
-        + 'static,
-{
-    type Output = S::Output;
-    // See `AndThenHost` — per-branch pipe handle downstream, per-branch checkouts
-    // at the terminal.
-    type Handle = <S::Checkouts as SeamScatter>::Handle;
-    type Checkouts = S::Checkouts;
-
-    fn output_pipe(&self) -> Option<Pipe<S::Output>> {
-        <S::Checkouts as SeamScatter>::output_pipe_view(&self.handle)
-    }
-
-    fn handle(&self) -> Self::Handle {
-        self.handle.clone()
-    }
-
-    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        // MID-GRAPH re-scatter — twin of `AndThenHost::execute` (see it for the full
-        // rationale); the closure additionally gets `&Context`.
-        let (src_cos, deps) = cb_gather_child(&self.source, ec, ExecMode::Pipelined)?;
-        // Forward the pre-seam reach across the seam — see `AndThenHost::execute`.
-        let src_cell = self.source.output_pipe().map(|p| p.cell_id());
-        if let Some(dc) = self.output_pipe().map(|p| p.cell_id()) {
-            cb_forward_reach(ec, None, src_cell, dc);
-        }
-        let (value, homes) = src_cos.split();
-        // Reusable: `Arc::clone` the closure and clone a fresh `Context` per run,
-        // then move both into a fresh one-shot callable for the worker thread.
-        // The closure (`Fn`) re-runs on every replay; captures are borrowed via
-        // the Arc rather than move-consumed.
-        let f = Arc::clone(&self.f);
-        let context = ec.context().clone();
-        let (out_value, out_deps) =
-            run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(&context, view))?;
-        <S::Checkouts as SeamScatter>::scatter(&self.handle, out_value, homes, &out_deps);
-        Ok(())
-    }
-
-    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(S::Output, Deps)>
-    where
-        Self: Sized,
-    {
-        self.execute(ec, mode)?;
-        <S::Checkouts as SeamScatter>::reconstruct(&self.handle)
-    }
-
-    #[allow(clippy::type_complexity)]
-    fn collect_home(
-        &self,
-        ec: &ExecutionContext<'_>,
-        mode: ExecMode,
-    ) -> Result<(S::Output, Deps, Option<BoxedHome<S::Output>>)>
-    where
-        Self: Sized,
-        S::Output: Send + 'static,
-    {
-        self.execute(ec, mode)?;
-        <S::Checkouts as SeamScatter>::reconstruct_home(&self.handle)
-    }
-
-    fn gather_checkouts(
-        &self,
-        ec: &ExecutionContext<'_>,
-        _mode: ExecMode,
-    ) -> Result<(Self::Checkouts, Deps)> {
-        // TERMINAL / CHECKOUT gather — the #212 pass-1 path, UNCHANGED (twin of
-        // `AndThenHost::gather_checkouts`; closure also gets `&Context`).
-        let (src_cos, deps) = cb_gather_child(&self.source, ec, ExecMode::Pipelined)?;
-        let (value, homes) = src_cos.split();
-        let f = Arc::clone(&self.f);
-        let context = ec.context().clone();
-        let (out_value, out_deps) =
-            run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(&context, view))?;
-        let checkouts = <S::Checkouts as CheckoutSplit>::reassemble(out_value, homes);
-        Ok((checkouts, out_deps))
-    }
-
-    fn reclaim_undelivered(&self) {
-        // Mid-graph mop-up — twin of `AndThenHost::reclaim_undelivered`.
-        <S::Checkouts as SeamScatter>::reclaim(&self.handle);
-        self.source.reclaim_undelivered();
-    }
-
-    fn check_ready(&self) -> Result<()> {
-        self.source.check_ready()
-    }
-
-    fn bind_slots(&self, binder: &mut SlotBinder) {
-        // Pass-through: recurse into the source so `bind`/`call` reach its slots.
-        self.source.bind_slots(binder);
-    }
-
-    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
-        // See `AndThenHost::invalidate_cbs` — recurse into the pre-seam source's CBs.
-        self.source.invalidate_cbs(mutated);
-    }
-
-    fn collect_cb_ids(&self, out: &mut Vec<usize>) {
-        self.source.collect_cb_ids(out);
-    }
-
-    fn describe(&self, out: &mut Vec<String>) {
-        self.source.describe(out);
-        out.push("and_then_host_with_context".into());
     }
 
     fn contains_host_seam(&self) -> bool {

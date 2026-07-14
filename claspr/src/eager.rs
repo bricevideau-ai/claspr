@@ -2104,7 +2104,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// clones its captures rather than move-consuming them (the right constraint
     /// for something that runs more than once). The engine keeps the closure in an
     /// `Arc` and hands the per-run worker thread its own owned handle.
-    fn and_then_host<F>(self, f: F) -> AndThenHost<Self, F>
+    fn and_then_host<F>(self, f: F) -> AndThenHost<Self>
     where
         Self::Output: crate::mappable::Mappable,
         Self::Checkouts: SeamScatter<Value = Self::Output>,
@@ -2113,21 +2113,23 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             + Sync
             + 'static,
     {
+        // Wrap the no-context closure into the canonical `Fn(&Context, View)` shape
+        // (see `HostSeamFn`), so `AndThenHost` is ONE type for both builders.
         AndThenHost {
             source: self,
-            f: Arc::new(f),
+            f: Arc::new(move |_ctx: &Context, view| f(view)),
             handle: <Self::Checkouts as SeamScatter>::empty_handle(),
         }
     }
 
     /// Like [`and_then_host`](Self::and_then_host) but the closure also receives
-    /// the running [`Context`] (e.g. to read device props). See
-    /// [`AndThenHostWithContext`].
+    /// the running [`Context`] (e.g. to read device props). Builds the SAME
+    /// [`AndThenHost`] node (its stored closure always takes `&Context`).
     ///
     /// **Reusable / replayable** — same as [`and_then_host`](Self::and_then_host):
     /// the closure is `Fn`, the graph replays, and the closure re-runs each
     /// `sync` (borrow / `Arc` / clone captures, don't move-consume them).
-    fn and_then_host_with_context<F>(self, f: F) -> AndThenHostWithContext<Self, F>
+    fn and_then_host_with_context<F>(self, f: F) -> AndThenHost<Self>
     where
         Self::Output: crate::mappable::Mappable,
         Self::Checkouts: SeamScatter<Value = Self::Output>,
@@ -2139,7 +2141,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             + Sync
             + 'static,
     {
-        AndThenHostWithContext {
+        AndThenHost {
             source: self,
             f: Arc::new(f),
             handle: <Self::Checkouts as SeamScatter>::empty_handle(),
