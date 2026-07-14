@@ -30,6 +30,20 @@ fn concrete_buf_ctx<T, M: MemMode>(buf: &Input<DeviceSlice<T, M>>) -> Result<Con
         ))
 }
 
+/// The raw bytes of a `Copy` fill value, for recording a `clCommandFillBufferKHR`
+/// pattern. The one `unsafe` the fill leaves' CB path needs, stated once: the slice
+/// borrows `value` (so the caller must keep it alive across the record call — every
+/// fill leaf holds `self.value` for the whole `execute`), and reads exactly
+/// `size_of::<T>()` bytes of a `T: Copy`, which has no padding-exposure or
+/// drop-glue concerns.
+fn value_pattern_bytes<T: Copy>(value: &T) -> &[u8] {
+    // SAFETY: `T: Copy` ⇒ plain bytes, no drop glue; `size_of::<T>()` bytes are all
+    // within `value`; the returned slice's lifetime is tied to `value`'s borrow.
+    unsafe {
+        std::slice::from_raw_parts((value as *const T) as *const u8, std::mem::size_of::<T>())
+    }
+}
+
 /// SVM analog of [`concrete_buf_ctx`]: recover the owning [`Context`] from a
 /// concrete-head [`Input<MappedSlice>`], or a clear "pipe-fed" error.
 fn concrete_svm_ctx<T, M: MemMode>(buf: &Input<MappedSlice<T, M>>) -> Result<Context> {
@@ -105,12 +119,7 @@ where
                 );
                 let mem = MemRef::Buffer(buf.buffer().get());
                 // Byte pattern of the fill value (T: Copy).
-                let pattern = unsafe {
-                    std::slice::from_raw_parts(
-                        (&self.value as *const T) as *const u8,
-                        std::mem::size_of::<T>(),
-                    )
-                };
+                let pattern = value_pattern_bytes(&self.value);
                 let byte_len = buf.byte_len();
                 if let Some(sp) = builder.fill_buffer(mem, pattern, 0, byte_len, &waits) {
                     ec.sp_register(self.out.cell_id(), std::collections::BTreeSet::from([sp]));
@@ -902,12 +911,7 @@ where
             CbWalk::Build { builder, ext, .. } => {
                 let waits = cb_leaf_build(ec, builder, ext, &deps, None, None, self.out.cell_id());
                 let mem = MemRef::Buffer(buf.buffer().get());
-                let pattern = unsafe {
-                    std::slice::from_raw_parts(
-                        (&self.value as *const T) as *const u8,
-                        std::mem::size_of::<T>(),
-                    )
-                };
+                let pattern = value_pattern_bytes(&self.value);
                 let byte_len = buf.byte_len();
                 if let Some(sp) = builder.fill_buffer(mem, pattern, 0, byte_len, &waits) {
                     ec.sp_register(self.out.cell_id(), std::collections::BTreeSet::from([sp]));
@@ -1020,12 +1024,7 @@ where
                 // no origins to note/propagate).
                 let waits = cb_leaf_build(ec, builder, ext, &deps, None, None, self.out.cell_id());
                 let handle = buf.record_handle(); // MemRef::Svm
-                let pattern = unsafe {
-                    std::slice::from_raw_parts(
-                        (&self.value as *const T) as *const u8,
-                        std::mem::size_of::<T>(),
-                    )
-                };
+                let pattern = value_pattern_bytes(&self.value);
                 if let Some(sp) =
                     builder.fill_buffer(handle.mem, pattern, 0, handle.byte_len, &waits)
                 {
@@ -1479,12 +1478,7 @@ where
                     self.out.cell_id(),
                 );
                 let handle = buf.record_handle(); // MemRef::Svm
-                let pattern = unsafe {
-                    std::slice::from_raw_parts(
-                        (&self.value as *const T) as *const u8,
-                        std::mem::size_of::<T>(),
-                    )
-                };
+                let pattern = value_pattern_bytes(&self.value);
                 if let Some(sp) =
                     builder.fill_buffer(handle.mem, pattern, 0, handle.byte_len, &waits)
                 {

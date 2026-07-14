@@ -671,70 +671,18 @@ pub(crate) fn fill_via_kernel_svm<T: Copy, L: Launcher + ?Sized>(
     count: usize,
     deps: &[cl_event],
 ) -> Result<Event> {
-    use opencl3::kernel::{ExecuteKernel, Kernel};
-    let pattern_size = std::mem::size_of::<T>();
-    let count_u32 =
-        u32::try_from(count).map_err(|_| Error::InvalidArgument("fill count exceeds u32::MAX"))?;
-    let program = ctx.fill_program()?;
-
-    if let Some(name) = crate::fill_kernel::fast_path_kernel_name(pattern_size) {
-        let kernel = Kernel::create(program, name)?;
-        let mut exec = ExecuteKernel::new(&kernel);
-        // SAFETY: arg 0 = SVM pointer (matches the kernel's
-        // `__global X*` arg). arg 1 = pattern by value. arg 2 =
-        // element count.
-        unsafe {
+    // Kernel arg 0 is the SVM data pointer; everything else is shared.
+    // SAFETY: `set_arg_svm` matches the kernel's `__global X*` arg 0.
+    crate::fill_kernel::fill_via_kernel(
+        ctx,
+        launcher,
+        |exec| unsafe {
             exec.set_arg_svm(svm_ptr);
-            exec.set_arg(pattern);
-            exec.set_arg(&count_u32);
-            exec.set_global_work_size(count);
-            exec.set_event_wait_list(deps);
-            Ok(exec.enqueue_nd_range(launcher.cl_queue())?)
-        }
-    } else {
-        // Byte-generic path: pattern as a small read-only buffer,
-        // memcpy bytes in via blocking write, then launch
-        // claspr_fill_bytes with the SVM data pointer + pattern
-        // buffer.
-        let pattern_size_u32 = u32::try_from(pattern_size)
-            .map_err(|_| Error::InvalidArgument("fill pattern size exceeds u32::MAX"))?;
-        // SAFETY: pattern is a live &T; read `pattern_size` bytes.
-        let pattern_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(pattern as *const T as *const u8, pattern_size) };
-        use opencl3::memory::{Buffer as ClBuffer, CL_MEM_READ_ONLY};
-        use opencl3::types::CL_BLOCKING;
-        let mut pattern_buf = unsafe {
-            ClBuffer::<u8>::create(
-                ctx.raw_context(),
-                CL_MEM_READ_ONLY,
-                pattern_size,
-                std::ptr::null_mut(),
-            )?
-        };
-        let _write_evt = unsafe {
-            launcher.cl_queue().enqueue_write_buffer(
-                &mut pattern_buf,
-                CL_BLOCKING,
-                0,
-                pattern_bytes,
-                &[],
-            )?
-        };
-        let kernel = Kernel::create(program, crate::fill_kernel::KERNEL_BYTES)?;
-        let mut exec = ExecuteKernel::new(&kernel);
-        // SAFETY: arg 0 = SVM pointer (data), arg 1 = pattern
-        // buffer, arg 2 = pattern byte count, arg 3 = slot count.
-        let event = unsafe {
-            exec.set_arg_svm(svm_ptr);
-            exec.set_arg(&pattern_buf);
-            exec.set_arg(&pattern_size_u32);
-            exec.set_arg(&count_u32);
-            exec.set_global_work_size(count);
-            exec.set_event_wait_list(deps);
-            exec.enqueue_nd_range(launcher.cl_queue())?
-        };
-        Ok(event)
-    }
+        },
+        pattern,
+        count,
+        deps,
+    )
 }
 
 /// Raw `clEnqueueSVMMemcpy` with a host source pointer over `owner` —

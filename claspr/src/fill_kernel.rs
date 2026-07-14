@@ -90,3 +90,86 @@ pub(crate) fn fast_path_kernel_name(pattern_size: usize) -> Option<&'static str>
 /// that aren't in the fast-path set (1/2/4/8/16) — e.g. 12-byte
 /// vec3-padded types, 32-byte vec8 types, arbitrary user structs.
 pub(crate) const KERNEL_BYTES: &str = "claspr_fill_bytes";
+
+/// Launch the built-in fill kernel: fast-path per-size kernel when the pattern width
+/// matches, else the byte-generic [`KERNEL_BYTES`] fallback (which uploads the pattern
+/// bytes into a small buffer first). `set_data_arg` sets kernel arg 0 — the ONLY
+/// difference between the `cl_mem` (`exec.set_arg(buffer)`) and SVM
+/// (`exec.set_arg_svm(ptr)`) callers — so both `DeviceSlice` and `MappedSlice` fills
+/// share this one launch path. Non-blocking; returns the launch event.
+pub(crate) fn fill_via_kernel<T: Copy, L: crate::Launcher + ?Sized>(
+    ctx: &crate::Context,
+    launcher: &L,
+    set_data_arg: impl Fn(&mut opencl3::kernel::ExecuteKernel),
+    pattern: &T,
+    count: usize,
+    deps: &[opencl3::types::cl_event],
+) -> crate::Result<crate::Event> {
+    use crate::error::Error;
+    use opencl3::kernel::{ExecuteKernel, Kernel};
+    use opencl3::memory::{Buffer as ClBuffer, CL_MEM_READ_ONLY};
+    use opencl3::types::CL_BLOCKING;
+
+    let pattern_size = std::mem::size_of::<T>();
+    let count_u32 =
+        u32::try_from(count).map_err(|_| Error::InvalidArgument("fill count exceeds u32::MAX"))?;
+    let program = ctx.fill_program()?;
+
+    if let Some(name) = fast_path_kernel_name(pattern_size) {
+        let kernel = Kernel::create(program, name)?;
+        let mut exec = ExecuteKernel::new(&kernel);
+        // SAFETY: arg 0 is the data buffer/SVM pointer (element size `pattern_size`,
+        // set by the caller's `set_data_arg`); arg 1 is the pattern by value (size
+        // matches); arg 2 is the element count. The kernel writes `count` elements.
+        unsafe {
+            set_data_arg(&mut exec);
+            exec.set_arg(pattern);
+            exec.set_arg(&count_u32);
+            exec.set_global_work_size(count);
+            exec.set_event_wait_list(deps);
+            Ok(exec.enqueue_nd_range(launcher.cl_queue())?)
+        }
+    } else {
+        // Byte-generic path: upload the pattern bytes into a tiny read-only buffer,
+        // then launch `claspr_fill_bytes` with (data, pattern_buf, pattern_size, count).
+        let pattern_size_u32 = u32::try_from(pattern_size)
+            .map_err(|_| Error::InvalidArgument("fill pattern size exceeds u32::MAX"))?;
+        // SAFETY: `pattern` is a live `&T`; read `pattern_size` bytes of its repr.
+        let pattern_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(pattern as *const T as *const u8, pattern_size) };
+        // SAFETY: fresh buffer in ctx's CL context; the blocking write and the kernel
+        // both go through `launcher.cl_queue`, so the launch is serialized after it.
+        let mut pattern_buf = unsafe {
+            ClBuffer::<u8>::create(
+                ctx.raw_context(),
+                CL_MEM_READ_ONLY,
+                pattern_size,
+                std::ptr::null_mut(),
+            )?
+        };
+        let _write_evt = unsafe {
+            launcher.cl_queue().enqueue_write_buffer(
+                &mut pattern_buf,
+                CL_BLOCKING,
+                0,
+                pattern_bytes,
+                &[],
+            )?
+        };
+        let kernel = Kernel::create(program, KERNEL_BYTES)?;
+        let mut exec = ExecuteKernel::new(&kernel);
+        // SAFETY: arg 0 = data (buffer/SVM, via `set_data_arg`), arg 1 = pattern
+        // buffer, arg 2 = pattern byte count, arg 3 = element count.
+        let event = unsafe {
+            set_data_arg(&mut exec);
+            exec.set_arg(&pattern_buf);
+            exec.set_arg(&pattern_size_u32);
+            exec.set_arg(&count_u32);
+            exec.set_global_work_size(count);
+            exec.set_event_wait_list(deps);
+            exec.enqueue_nd_range(launcher.cl_queue())?
+        };
+        // `pattern_buf` drops here; OpenCL retains the cl_mem for the in-flight kernel.
+        Ok(event)
+    }
+}
