@@ -848,6 +848,32 @@ impl SlotBinder {
         self.value.take()
     }
 
+    /// Produce the concrete value to deposit into ONE matching cell, downcast to `V`.
+    /// The shared take-or-clone-and-downcast step used by BOTH the 5-state resource
+    /// [`Input::try_bind_slot`](crate::Input::try_bind_slot) and the 2-state scalar
+    /// [`ScalarInput::try_bind_slot`] — the value-extraction scaffolding is identical
+    /// (only their state-machine arms differ). `fanout` (from [`is_fanout`](Self::is_fanout),
+    /// passed in so its clone isn't recomputed) selects clone-into-this-cell vs
+    /// move-out-once. Returns `None` on the impossible downcast mismatch (the tag's
+    /// `Key` TypeId already pinned `V`); on a move-path mismatch the taken value is put
+    /// back so a correctly-typed slot can still see it.
+    pub(crate) fn provide<V: 'static>(&mut self, fanout: bool) -> Option<V> {
+        let boxed = if fanout {
+            self.fill_clone()?
+        } else {
+            self.take_value()?
+        };
+        match boxed.downcast::<V>() {
+            Ok(v) => Some(*v),
+            Err(boxed) => {
+                if !fanout {
+                    self.value = Some(boxed);
+                }
+                None
+            }
+        }
+    }
+
     /// Whether this binder fans out (clone into every matching cell, never
     /// consumed) rather than moving once. Drives the `bind_slots` walk: a fan-out
     /// binder must visit ALL cells (no early `is_consumed` stop).
@@ -1099,22 +1125,8 @@ impl<V: Send + 'static> ScalarInput<V> {
         // Same fan-out-vs-move discipline as `Input::try_bind_slot`, but a scalar
         // value is always clone-able, so this is effectively always the clone path.
         let fanout = binder.is_fanout();
-        let provide = |binder: &mut SlotBinder| -> Option<V> {
-            let boxed = if fanout {
-                binder.fill_clone()?
-            } else {
-                binder.take_value()?
-            };
-            match boxed.downcast::<V>() {
-                Ok(v) => Some(*v),
-                Err(boxed) => {
-                    if !fanout {
-                        binder.value = Some(boxed);
-                    }
-                    None
-                }
-            }
-        };
+        // The shared take-or-clone-and-downcast step (see `SlotBinder::provide`).
+        let provide = |binder: &mut SlotBinder| -> Option<V> { binder.provide::<V>(fanout) };
 
         let mut guard = cell.lock().unwrap();
         match &*guard {

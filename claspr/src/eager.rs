@@ -1285,26 +1285,8 @@ impl<T> Input<T> {
         // Returns `None` only on the impossible downcast mismatch (TypeId already
         // pinned `T == Tag::Value`).
         let fanout = binder.is_fanout();
-        let provide = |binder: &mut SlotBinder| -> Option<T> {
-            let boxed = if fanout {
-                // Clone into THIS cell; the binder stays armed for the rest.
-                binder.fill_clone()?
-            } else {
-                // Move the single value out; the binder is now consumed.
-                binder.take_value()?
-            };
-            match boxed.downcast::<T>() {
-                Ok(v) => Some(*v),
-                // Downcast can't fail (TypeId matched). If it ever did and we had
-                // TAKEN the value, put it back so a correctly-typed slot can see it.
-                Err(boxed) => {
-                    if !fanout {
-                        binder.value = Some(boxed);
-                    }
-                    None
-                }
-            }
-        };
+        // The shared take-or-clone-and-downcast step (see `SlotBinder::provide`).
+        let provide = |binder: &mut SlotBinder| -> Option<T> { binder.provide::<T>(fanout) };
 
         let mut guard = cell.lock().unwrap();
         match &*guard {
