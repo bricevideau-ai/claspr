@@ -160,6 +160,31 @@ pub(crate) fn cb_forward_reach(
     ec.cb_reach_extend(out_cell, cb_origins_of(ec, in_slot, src_cell));
 }
 
+/// **The full passthrough Build-arm forward**: alias the source cell's sync points
+/// onto `out_cell` AND forward its precise-invalidation reach. A structural
+/// passthrough (`forward` / `arced` / `arc_split` / bundle branch) that aliases one
+/// producer cell onto its output MUST do BOTH, always together:
+///
+/// - **sync-point alias** (`sp_lookup` → `sp_register`): a downstream CB consumer of
+///   this passthrough's output cell reads its wait-list from that cell's sync points;
+///   miss it and the consumer loses its in-CB ordering.
+/// - **reach forward** ([`cb_forward_reach`]): carry the origin trail so a
+///   `mutate_bind` of an upstream slot still invalidates a CB that baked this buffer;
+///   miss it and slot invalidation silently no-ops.
+///
+/// Forgetting either half is a distinct latent bug, so they live in one call. (The
+/// reach-only cases — a chain-ENTRY `lift` with no upstream sync points, or a
+/// mid-graph host seam — call [`cb_forward_reach`] directly instead.)
+pub(crate) fn cb_forward_passthrough(
+    ec: &ExecutionContext<'_>,
+    in_slot: Option<usize>,
+    src_cell: Option<usize>,
+    out_cell: usize,
+) {
+    ec.sp_register(out_cell, ec.sp_lookup(src_cell));
+    cb_forward_reach(ec, in_slot, src_cell, out_cell);
+}
+
 /// Whether a graph is CB-eligible RIGHT NOW: the platform advertises
 /// `cl_khr_command_buffer` and the graph has no host seam. (The all-`cl_mem`
 /// requirement is enforced dynamically — an SVM command marks the live builder

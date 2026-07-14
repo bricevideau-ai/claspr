@@ -562,11 +562,9 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
             }
             CbWalk::Build { ext, .. } => {
                 cb_collect_external(ext, &deps);
-                let sps = ec.sp_lookup(upstream_cell);
-                ec.sp_register(self.out.cell_id(), sps);
-                // Passthrough (identity alias): forward the upstream origins onto our
-                // output cell, parallel to the sync-point re-register above.
-                cb_forward_reach(
+                // Passthrough (identity alias): alias the upstream sync points onto our
+                // output cell AND forward its origin reach — the always-together pair.
+                cb_forward_passthrough(
                     ec,
                     self.input.slot_cell_id(),
                     upstream_cell,
@@ -789,11 +787,7 @@ where
                 // CB consumer of the `Arc<buffer>` finds them (mirrors Forward). The
                 // source's single output pipe carries them (arced wraps single-output).
                 if let Some(src_cell) = self.source.output_pipe().map(|p| p.cell_id()) {
-                    let sps = ec.sp_lookup(Some(src_cell));
-                    ec.sp_register(self.out.cell_id(), sps);
-                    // Passthrough: forward the source's origins onto our cell too
-                    // (parallel to the sync-point alias).
-                    cb_forward_reach(ec, None, Some(src_cell), self.out.cell_id());
+                    cb_forward_passthrough(ec, None, Some(src_cell), self.out.cell_id());
                 }
                 self.out.put(Arc::new(v), Deps::new());
             }
@@ -936,15 +930,11 @@ where
                 }
             }
             CbWalk::Build { .. } => {
-                // Alias the source's sync points under EVERY branch cell so each
-                // downstream CB consumer of a clone finds them; deposit empty deps.
+                // Every branch cell inherits the source's sync points AND origin reach
+                // so each downstream CB consumer of a clone finds them; empty deps.
                 let src_cell = self.source.output_pipe().map(|p| p.cell_id());
-                let sps = src_cell.map(|c| ec.sp_lookup(Some(c))).unwrap_or_default();
-                // Passthrough: every branch inherits the source's origins (parallel
-                // to the sync-point alias).
                 for out in &self.outs {
-                    ec.sp_register(out.cell_id(), sps.clone());
-                    cb_forward_reach(ec, None, src_cell, out.cell_id());
+                    cb_forward_passthrough(ec, None, src_cell, out.cell_id());
                     out.put(v.clone(), Deps::new());
                 }
             }
