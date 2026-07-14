@@ -2666,9 +2666,15 @@ where
                 self.dst_pipe.put_home(out_dst, Deps::new(), dst_home);
                 return Ok(());
             }
-            CbWalk::LendOnly { .. } => {
+            CbWalk::LendOnly { ext, .. } => {
                 // Replay: the cached CB does the copy. Convert types only (no builder),
-                // deposit with empty deps.
+                // deposit with empty deps. A producer OUTSIDE this CB may have handed
+                // either operand a FRESH external dep this run — collect both sides'
+                // deps into `ext` so the homing node waits on them at
+                // clEnqueueCommandBufferKHR (same as every sibling CB-able leaf's
+                // LendOnly arm; omitting it silently drops the dep → producer race).
+                cb_collect_external(ext, &src_deps);
+                cb_collect_external(ext, &dst_deps);
                 let (out, _none) = src
                     .copy_to(dst)
                     .record_cb(None, &std::collections::BTreeSet::new())
