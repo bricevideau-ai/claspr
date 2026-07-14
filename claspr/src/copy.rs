@@ -55,7 +55,7 @@ fn record_copy_cmd<S: RecordableBuffer, D: RecordableBuffer>(
     builder: &crate::record::CbBuilder,
     src: &S,
     dst: &D,
-    waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+    waits: &crate::exec_ctx::SyncPoints,
 ) -> Option<crate::cl_sync_point_khr> {
     let sh = src.record_handle();
     let dh = dst.record_handle();
@@ -128,7 +128,7 @@ where
     fn record_cb(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
-        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+        waits: &crate::exec_ctx::SyncPoints,
     ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
         let (src, dst) = self.take();
         let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
@@ -174,7 +174,7 @@ where
     fn record_cb(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
-        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+        waits: &crate::exec_ctx::SyncPoints,
     ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
         let (src, uninit_dst) = self.take();
         // SAFETY: the recorded copy writes every byte before any downstream stage
@@ -218,7 +218,7 @@ where
     fn record_cb(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
-        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+        waits: &crate::exec_ctx::SyncPoints,
     ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
         let (src, dst) = self.take();
         let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
@@ -260,7 +260,7 @@ where
     fn record_cb(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
-        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+        waits: &crate::exec_ctx::SyncPoints,
     ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
         let (src, uninit_dst) = self.take();
         // SAFETY: the recorded copy writes every byte before downstream observes it.
@@ -378,7 +378,7 @@ where
     fn record_cb(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
-        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+        waits: &crate::exec_ctx::SyncPoints,
     ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
         let (src, dst) = self.take();
         let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
@@ -440,7 +440,7 @@ where
     fn record_cb(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
-        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+        waits: &crate::exec_ctx::SyncPoints,
     ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
         let (src, uninit_dst) = self.take();
         // SAFETY: the recorded copy writes every byte before downstream observes it.
@@ -501,7 +501,7 @@ where
     fn record_cb(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
-        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+        waits: &crate::exec_ctx::SyncPoints,
     ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
         let (src, dst) = self.take();
         let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
@@ -562,7 +562,7 @@ where
     fn record_cb(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
-        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+        waits: &crate::exec_ctx::SyncPoints,
     ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
         let (src, uninit_dst) = self.take();
         // SAFETY: the recorded copy writes every byte before downstream observes it.
@@ -623,7 +623,7 @@ where
     fn record_cb(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
-        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+        waits: &crate::exec_ctx::SyncPoints,
     ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
         let (src, dst) = self.take();
         let sp = builder.and_then(|b| record_copy_cmd(b, &src, &dst, waits));
@@ -684,7 +684,7 @@ where
     fn record_cb(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
-        waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+        waits: &crate::exec_ctx::SyncPoints,
     ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
         let (src, uninit_dst) = self.take();
         // SAFETY: the recorded copy writes every byte before downstream observes it.

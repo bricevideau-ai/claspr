@@ -133,7 +133,7 @@ pub(crate) fn cb_leaf_build(
     in_slot: Option<usize>,
     in_pipe: Option<usize>,
     out_cell: usize,
-) -> std::collections::BTreeSet<crate::cl_sync_point_khr> {
+) -> crate::exec_ctx::SyncPoints {
     cb_collect_external(ext, deps);
     let waits = ec.sp_lookup(in_pipe);
     let origins = cb_origins_of(ec, in_slot, in_pipe);

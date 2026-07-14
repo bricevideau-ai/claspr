@@ -37,7 +37,22 @@ use std::thread::JoinHandle;
 /// unlike the CB-visibility, which must be per-subtree. `cl_event` deps still
 /// flow through the pipes; only these CB-internal markers ride here. Live for one
 /// `sync` (a fresh `ExecutionContext` is built per terminal call).
-pub type SyncPointEdges = Arc<Mutex<HashMap<usize, BTreeSet<cl_sync_point_khr>>>>;
+pub type SyncPointEdges = Arc<Mutex<HashMap<usize, SyncPoints>>>;
+
+/// A set of CB-internal ordering markers — a command's `sync_point_wait_list` /
+/// produced sync points. The sync-point twin of [`Deps`](crate::eager::Deps) (the
+/// `cl_event` set): CB-INTERNAL ordering is `cl_sync_point_khr`s, CROSS-CB ordering
+/// is `cl_event`s. A `BTreeSet` so waits dedup by identity; converted to a raw slice
+/// only at the `clCommand*KHR` call, via [`sync_points_to_wait_list`].
+pub type SyncPoints = BTreeSet<cl_sync_point_khr>;
+
+/// Convert a [`SyncPoints`] set into the raw `cl_sync_point_khr` wait-list a
+/// `clCommand*KHR` call takes — the sync-point twin of
+/// [`deps_to_wait_list`](crate::eager::deps_to_wait_list). The ONE place a
+/// `SyncPoints` set crosses the FFI boundary into a `Vec`.
+pub fn sync_points_to_wait_list(waits: &SyncPoints) -> Vec<cl_sync_point_khr> {
+    waits.iter().copied().collect()
+}
 
 /// **Slot-origin reachability** (precise per-slot CB invalidation + the mutable-CB
 /// substrate). Maps a pipe / output cell id → the set of SLOT cell ids the buffer in
@@ -306,7 +321,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// predecessor) or has not run yet. The CB-mode fork uses this as a leaf's
     /// `sync_point_wait_list`. `None` upstream cell (a concrete/slot input, no
     /// pipe) yields no markers.
-    pub fn sp_lookup(&self, cell_id: Option<usize>) -> BTreeSet<cl_sync_point_khr> {
+    pub fn sp_lookup(&self, cell_id: Option<usize>) -> SyncPoints {
         match cell_id {
             Some(id) => self
                 .sp_edges
@@ -321,7 +336,7 @@ impl<'ctx> ExecutionContext<'ctx> {
 
     /// Register a producer's output command sync point(s) under its output pipe's
     /// `cell_id`, so a CB-internal consumer resolves them via [`sp_lookup`](Self::sp_lookup).
-    pub fn sp_register(&self, cell_id: usize, sps: BTreeSet<cl_sync_point_khr>) {
+    pub fn sp_register(&self, cell_id: usize, sps: SyncPoints) {
         self.sp_edges.lock().unwrap().insert(cell_id, sps);
     }
 

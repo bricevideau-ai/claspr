@@ -25,8 +25,8 @@
 //! lacking an SVM/image command PFN) resolves the entry point null, and the graph
 //! falls back to the per-op `execute` path — same results, no CB acceleration.
 use crate::error::{Error, Result};
+use crate::exec_ctx::{SyncPoints, sync_points_to_wait_list};
 use opencl3::types::{cl_command_queue, cl_event, cl_kernel, cl_mem, cl_uint};
-use std::collections::BTreeSet;
 use std::ffi::{CStr, c_void};
 use std::ptr;
 use std::sync::Mutex;
@@ -268,9 +268,9 @@ impl CbBuilder {
         pattern: &[u8],
         offset: usize,
         size: usize,
-        waits: &BTreeSet<cl_sync_point_khr>,
+        waits: &SyncPoints,
     ) -> Option<cl_sync_point_khr> {
-        let waits: Vec<cl_sync_point_khr> = waits.iter().copied().collect();
+        let waits = sync_points_to_wait_list(waits);
         let (wptr, n) = wait_ptr(&waits);
         let mut sp: cl_sync_point_khr = 0;
         let st = match mem {
@@ -341,9 +341,9 @@ impl CbBuilder {
         src_offset: usize,
         dst_offset: usize,
         size: usize,
-        waits: &BTreeSet<cl_sync_point_khr>,
+        waits: &SyncPoints,
     ) -> Option<cl_sync_point_khr> {
-        let waits: Vec<cl_sync_point_khr> = waits.iter().copied().collect();
+        let waits = sync_points_to_wait_list(waits);
         let (wptr, n) = wait_ptr(&waits);
         let mut sp: cl_sync_point_khr = 0;
         let st = match (src, dst) {
@@ -417,7 +417,7 @@ impl CbBuilder {
         fill_color: &[u8],
         origin: [usize; 3],
         region: [usize; 3],
-        waits: &BTreeSet<cl_sync_point_khr>,
+        waits: &SyncPoints,
     ) -> Option<cl_sync_point_khr> {
         // An image is always a `cl_mem` (never SVM).
         let m = match image {
@@ -428,7 +428,7 @@ impl CbBuilder {
             }
         };
         let fill = self.ext.fill_image?;
-        let waits: Vec<cl_sync_point_khr> = waits.iter().copied().collect();
+        let waits = sync_points_to_wait_list(waits);
         let (wptr, n) = wait_ptr(&waits);
         let mut sp: cl_sync_point_khr = 0;
         // SAFETY: live CB + queue; `m` a valid image cl_mem kept alive by the graph;
@@ -467,7 +467,7 @@ impl CbBuilder {
         src_origin: [usize; 3],
         dst_origin: [usize; 3],
         region: [usize; 3],
-        waits: &BTreeSet<cl_sync_point_khr>,
+        waits: &SyncPoints,
     ) -> Option<cl_sync_point_khr> {
         let (s, d) = match (src, dst) {
             (MemRef::Buffer(s), MemRef::Buffer(d)) => (s, d),
@@ -477,7 +477,7 @@ impl CbBuilder {
             }
         };
         let copy = self.ext.copy_image?;
-        let waits: Vec<cl_sync_point_khr> = waits.iter().copied().collect();
+        let waits = sync_points_to_wait_list(waits);
         let (wptr, n) = wait_ptr(&waits);
         let mut sp: cl_sync_point_khr = 0;
         // SAFETY: as `fill_image`; both images valid cl_mem kept alive by the graph.
@@ -616,7 +616,7 @@ impl CbBuilder {
         kernel: cl_kernel,
         global: &[usize],
         local: &[usize],
-        waits: &BTreeSet<cl_sync_point_khr>,
+        waits: &SyncPoints,
     ) -> Option<cl_sync_point_khr> {
         let ndr = self.ext.ndrange_kernel?;
         // Own a refcount for the CB's lifetime.
@@ -629,7 +629,7 @@ impl CbBuilder {
         // wait-list is a SET (wait for all markers; order irrelevant) — carrying it
         // as a `BTreeSet` up to here means a consumer reading two pipes of one
         // producer can't submit that marker twice.
-        let waits: Vec<cl_sync_point_khr> = waits.iter().copied().collect();
+        let waits = sync_points_to_wait_list(waits);
         let (wptr, n) = wait_ptr(&waits);
         let mut sp: cl_sync_point_khr = 0;
         // SAFETY: live CB + queue; kernel valid + args set + retained; `waits` are

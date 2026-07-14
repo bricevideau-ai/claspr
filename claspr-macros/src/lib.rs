@@ -1269,8 +1269,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     // producer's sync point twice. A wait-list is semantically a set
                     // (wait for ALL listed markers; order irrelevant), so accumulating
                     // into a `BTreeSet` makes duplicates impossible at the source.
-                    let mut __claspr_cb_waits: ::std::collections::BTreeSet<::claspr::cl_sync_point_khr> =
-                        ::std::collections::BTreeSet::new();
+                    let mut __claspr_cb_waits: ::claspr::exec_ctx::SyncPoints =
+                        ::claspr::exec_ctx::SyncPoints::new();
                     let mut __claspr_cb_out_handles: ::std::vec::Vec<::claspr::BufHandle> =
                         ::std::vec::Vec::new();
                     let _ = &mut __claspr_cb_out_handles; // may be unused (no buffer args)

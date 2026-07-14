@@ -305,7 +305,7 @@ pub trait DeviceEnqueue: Send + Sized {
     fn record_cb(
         self,
         _builder: Option<&crate::record::CbBuilder>,
-        _waits: &std::collections::BTreeSet<crate::cl_sync_point_khr>,
+        _waits: &crate::exec_ctx::SyncPoints,
     ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
         None
     }
