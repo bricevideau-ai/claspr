@@ -1217,81 +1217,103 @@ impl<T> Input<T> {
             .matched_cells
             .push(Arc::as_ptr(cell) as *const () as usize);
 
-        // PROBE (read-only) — the phase-0 dry run of `call`/`mutate_call`. Inspect
-        // this cell's state WITHOUT filling / taking / replacing, recording the
-        // verdict the phase-2 fold WOULD produce on the POST-sever state (a `Lent`
-        // cell that a tuple `Checkout` will sever is predicted as `Severed`; see
-        // `probe_lent`). It records into `binder.outcome` exactly like the real fold,
-        // so `fold_probe` surfaces the first error having severed / mutated NOTHING.
-        // The value-equality leg of `Set` on a `Bound` cell is the ONE case a probe
-        // cannot decide (the value lives in an unsevered `Checkout`) — a probe treats
-        // `Bound` as OK and lets phase 2 catch a genuine `SlotConflict`; that is the
-        // documented residual (see `call`/`mutate_call` docs).
+        // Three mutually-exclusive kinds of binder, each its own phase (all leave
+        // the walk free to visit the next cell — none of these consumes):
+        //   1. PROBE — read-only dry run; never touches the cell.
+        //   2. FEED  — installs a `FedByPipe` source; fan-out, no value.
+        //   3. VALUE — the ordinary set/mutate bind; the state × mode matrix.
         if binder.is_probe() {
-            let cell_id = Arc::as_ptr(cell) as usize;
-            match &*cell.lock().unwrap() {
-                // Both verbs fill a virgin / re-arm a bound cell → OK. `Set` on
-                // `Bound` is the value-dependent residual (treated OK here). A
-                // `FedByPipe` cell is treated like `Bound` for a value-bind probe: a
-                // value bind over it would overwrite under `Mutate` / conflict-ish
-                // under `Set`, but the spike never value-binds a pipe-fed slot, so it
-                // is inert here (a `feed` binder, which is the only writer of this
-                // state, is never a probe).
-                SlotState::Unbound | SlotState::Bound(_) | SlotState::FedByPipe(_) => {}
-                // `Set` rejects a severed slot; `Mutate` re-arms it.
-                SlotState::Severed => {
-                    if binder.mode == BindMode::Set {
-                        binder.outcome = Err(Error::SlotSevered(name));
-                    }
-                }
-                // Post-sever prediction: tuple-held → Severed (Set fails / Mutate
-                // OK); external-held → stays Lent (both fail SlotCheckedOut).
-                SlotState::Lent => {
-                    if let Err(e) = binder.probe_lent(cell_id, name) {
-                        binder.outcome = Err(e);
-                    }
-                }
-            }
-            // A probe never consumes: return so the walk visits the next cell too.
+            Self::probe_bind(binder, cell, name);
             return;
         }
-
-        // PIPE-FEED install (the `feed` verb). Deposit `FedByPipe(pipe.clone())` into
-        // THIS cell — a fan-out, so every matching site is fed. Unconditional over
-        // the current state: the common case installs onto a virgin (`Unbound`) slot
-        // freshly built by the subgraph; re-feeding an already-`FedByPipe` cell (a
-        // graph fed a second time) just re-installs the same-or-new pipe. `Lent`
-        // should not occur (a pipe-fed slot is never lent to a `Checkout`), but
-        // overwriting it is still sound — the pipe is drained fresh next run. Handled
-        // BEFORE the `value.is_none()` early-bail below (a feed binder carries no
-        // value, so it would otherwise be misread as "consumed" and skip every cell).
-        if let Some(boxed) = &binder.feed_pipe {
-            if let Some(pipe) = boxed.downcast_ref::<Pipe<T>>() {
-                *cell.lock().unwrap() = SlotState::FedByPipe(pipe.clone());
-            }
+        if binder.feed_pipe.is_some() {
+            Self::feed_bind(binder, cell);
             return;
         }
-
         // A move-only binder is consumed after its single value lands; bail. A
-        // fan-out binder never sets `value = None`, so it keeps filling cells.
+        // fan-out binder never sets `value = None`, so it keeps filling cells. (Kept
+        // out of `apply_value_bind` so a consumed move-only skips the cell lock.)
         if binder.value.is_none() {
             return;
         }
+        Self::apply_value_bind(binder, cell, name);
+    }
 
-        // Produce the value to deposit (only when we will actually fill): a fan-out
-        // binder CLONES (so it can fill the next cell too); a move-only binder TAKES
-        // its single value. `provide` is called at most once per cell, lazily, so an
-        // idempotent no-op / conflict / sever-reject path costs no clone or move.
-        // Returns `None` only on the impossible downcast mismatch (TypeId already
-        // pinned `T == Tag::Value`).
+    /// Phase 1 — the read-only PROBE (phase-0 dry run of `call`/`mutate_call`).
+    /// Inspect the cell's state WITHOUT filling / taking / replacing, recording the
+    /// verdict the phase-2 fold WOULD produce on the POST-sever state (a `Lent` cell
+    /// a tuple `Checkout` will sever is predicted as `Severed`; see `probe_lent`).
+    /// Records into `binder.outcome` exactly like the real fold, so `fold_probe`
+    /// surfaces the first error having severed / mutated NOTHING. The value-equality
+    /// leg of `Set` on a `Bound` cell is the ONE case a probe cannot decide (the
+    /// value lives in an unsevered `Checkout`) — treated OK here, leaving phase 2 to
+    /// catch a genuine `SlotConflict`; that is the documented residual.
+    fn probe_bind(binder: &mut SlotBinder, cell: &SlotCell<T>, name: &'static str) {
+        let cell_id = Arc::as_ptr(cell) as usize;
+        match &*cell.lock().unwrap() {
+            // Both verbs fill a virgin / re-arm a bound cell → OK. `Set` on `Bound`
+            // is the value-dependent residual (treated OK here). A `FedByPipe` cell
+            // is treated like `Bound`: a value bind over it would overwrite (Mutate)
+            // / conflict (Set), but the spike never value-binds a pipe-fed slot, so
+            // it is inert here (a `feed` binder — the only writer of this state — is
+            // never a probe).
+            SlotState::Unbound | SlotState::Bound(_) | SlotState::FedByPipe(_) => {}
+            // `Set` rejects a severed slot; `Mutate` re-arms it.
+            SlotState::Severed => {
+                if binder.mode == BindMode::Set {
+                    binder.outcome = Err(Error::SlotSevered(name));
+                }
+            }
+            // Post-sever prediction: tuple-held → Severed (Set fails / Mutate OK);
+            // external-held → stays Lent (both fail SlotCheckedOut).
+            SlotState::Lent => {
+                if let Err(e) = binder.probe_lent(cell_id, name) {
+                    binder.outcome = Err(e);
+                }
+            }
+        }
+    }
+
+    /// Phase 2 — PIPE-FEED install (the `feed` verb). Deposit
+    /// `FedByPipe(pipe.clone())` into this cell — a fan-out, so every matching site
+    /// is fed. Unconditional over the current state: the common case installs onto a
+    /// virgin (`Unbound`) slot freshly built by the subgraph; re-feeding an
+    /// already-`FedByPipe` cell just re-installs the same-or-new pipe. `Lent` should
+    /// not occur (a pipe-fed slot is never lent to a `Checkout`), but overwriting it
+    /// is still sound — the pipe is drained fresh next run. Runs BEFORE the
+    /// `value.is_none()` bail (a feed binder carries no value, so it would otherwise
+    /// be misread as "consumed" and skip every cell).
+    fn feed_bind(binder: &mut SlotBinder, cell: &SlotCell<T>)
+    where
+        T: 'static,
+    {
+        if let Some(boxed) = &binder.feed_pipe
+            && let Some(pipe) = boxed.downcast_ref::<Pipe<T>>()
+        {
+            *cell.lock().unwrap() = SlotState::FedByPipe(pipe.clone());
+        }
+    }
+
+    /// Phase 3 — the ordinary VALUE bind: resolve the state × mode matrix, filling /
+    /// overwriting / conflicting per the table in [`try_bind_slot`]'s docs. Called
+    /// only for a non-probe, non-feed binder that still carries a value. A fan-out
+    /// binder CLONES its value (so it can fill the next cell too); a move-only binder
+    /// TAKES its single value. `provide` is called at most once per cell, lazily, so
+    /// an idempotent no-op / conflict / sever-reject path costs no clone or move.
+    fn apply_value_bind(binder: &mut SlotBinder, cell: &SlotCell<T>, name: &'static str)
+    where
+        T: Send + 'static,
+    {
         let fanout = binder.is_fanout();
         // The shared take-or-clone-and-downcast step (see `SlotBinder::provide`).
+        // Returns `None` only on the impossible downcast mismatch (TypeId already
+        // pinned `T == Tag::Value`).
         let provide = |binder: &mut SlotBinder| -> Option<T> { binder.provide::<T>(fanout) };
 
         let mut guard = cell.lock().unwrap();
         match &*guard {
-            // Virgin — never bound. Both verbs fill it (a `bind` is the slot's
-            // first declaration).
+            // Virgin — never bound. Both verbs fill it (a `bind` is the slot's first
+            // declaration).
             SlotState::Unbound => {
                 if let Some(new) = provide(binder) {
                     *guard = SlotState::Bound(new);
@@ -1339,17 +1361,17 @@ impl<T> Input<T> {
                 }
             },
             // The value is in the caller's hands (a live `Checkout`). Re-binding
-            // would let the Checkout's drop rehome the OLD buffer over the NEW one
-            // — a silent clobber — so BOTH verbs hard-error. (Buffer slots only;
+            // would let the Checkout's drop rehome the OLD buffer over the NEW one —
+            // a silent clobber — so BOTH verbs hard-error. (Buffer slots only;
             // non-resource slots are never `Lent`.)
             SlotState::Lent => {
                 binder.outcome = Err(Error::SlotCheckedOut(name));
             }
-            // A value bind onto a pipe-fed slot. `Set` conflicts (the slot is
-            // already sourced by an upstream pipe); `Mutate` overwrites the pipe
-            // source with the value. The spike never value-binds a pipe-fed slot, so
-            // this arm is inert in practice — present only for exhaustiveness +
-            // correctness (a value bind should not silently no-op over a live feed).
+            // A value bind onto a pipe-fed slot. `Set` conflicts (the slot is already
+            // sourced by an upstream pipe); `Mutate` overwrites the pipe source with
+            // the value. The spike never value-binds a pipe-fed slot, so this arm is
+            // inert in practice — present only for exhaustiveness + correctness (a
+            // value bind should not silently no-op over a live feed).
             SlotState::FedByPipe(_) => match binder.mode {
                 BindMode::Set => {
                     binder.outcome = Err(Error::SlotConflict(name));
