@@ -100,7 +100,7 @@ where
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         use crate::record::MemRef;
         use opencl3::memory::ClMem;
-        let (mut buf, deps, home) = self.buf.resolve_home(ec)?;
+        let (buf, deps, home) = self.buf.resolve_home(ec)?;
 
         // ── CB-mode fork (design v2) ────────────────────────────────────────
         match ec.cb() {
@@ -138,17 +138,22 @@ where
         }
 
         let raw = deps_to_wait_list(&deps);
-        // Fill has no native CL_BLOCKING flag (it's always enqueue + optional
-        // wait — exactly what the old `FillOp::wait_on` did internally), so both
-        // modes enqueue non-blocking; Blocking then waits on the event here.
+        // Guard the lent buffer across the fallible enqueue/wait: a failure here
+        // rehomes it to its origin cell (via the guard's drop on the `?` unwind)
+        // instead of stranding the cell in `Lent`. The success paths `disarm` and
+        // deposit. Fill has no native CL_BLOCKING flag (always enqueue + optional
+        // wait), so both modes enqueue non-blocking; Blocking then waits here.
         // In-place: the filled buffer is the lent buffer → home threads through.
-        let event = crate::buffer::fill_buffer_enqueue(&mut buf, ec, self.value, &raw)?;
+        let mut guard = crate::eager::LentGuard::new(buf, home);
+        let event = crate::buffer::fill_buffer_enqueue(guard.value_mut(), ec, self.value, &raw)?;
         match mode {
             ExecMode::Blocking => {
                 event.wait().map_err(Error::OpenCl)?;
+                let (buf, home) = guard.disarm();
                 self.out.put_home(buf, Deps::new(), home);
             }
             ExecMode::Pipelined => {
+                let (buf, home) = guard.disarm();
                 self.out.put_home(buf, single_dep(event), home);
             }
         }
@@ -550,12 +555,18 @@ where
         let (buf, deps, home) = self.buf.resolve_home(ec)?;
         let mut host = vec![T::default(); buf.len()];
         let raw = deps_to_wait_list(&deps);
+        // Guard the lent buffer across the fallible read: a failed enqueue rehomes
+        // it (guard drop on `?`) rather than stranding the origin cell in `Lent`.
+        // On success we `disarm` and `rehome_consumed` (the device buffer returns to
+        // its cell; the host `Vec` is the homeless output).
+        let guard = crate::eager::LentGuard::new(buf, home);
         match mode {
             // Terminal: native blocking read (CL_BLOCKING) — the driver waits,
             // the host Vec is valid on return, no event. Matches Tier-1
             // `ReadOp::wait_on`; restores parity for `…download().sync()`.
             ExecMode::Blocking => {
-                crate::buffer::read_buffer_enqueue(&buf, ec, &mut host, true, &raw)?;
+                crate::buffer::read_buffer_enqueue(guard.value(), ec, &mut host, true, &raw)?;
+                let (buf, home) = guard.disarm();
                 rehome_consumed(buf, home);
                 self.out.put(host, Deps::new());
             }
@@ -565,7 +576,9 @@ where
             // in-flight read still holds the live `cl_mem` via the OpenCL queue, so
             // returning the handle to its cell here does not race the read.
             ExecMode::Pipelined => {
-                let event = crate::buffer::read_buffer_enqueue(&buf, ec, &mut host, false, &raw)?;
+                let event =
+                    crate::buffer::read_buffer_enqueue(guard.value(), ec, &mut host, false, &raw)?;
+                let (buf, home) = guard.disarm();
                 rehome_consumed(buf, home);
                 self.out.put(host, single_dep(event));
             }
@@ -666,15 +679,20 @@ where
         let raw = deps_to_wait_list(&deps);
         let mut dst = self.dst.lock().unwrap();
         // In-place: the buffer is read and handed back unchanged → home threads.
+        // Guard across the fallible read so a failure rehomes rather than strands.
+        let guard = crate::eager::LentGuard::new(buf, home);
         match mode {
             // Terminal: native blocking read — `dst` is valid on return, no event.
             ExecMode::Blocking => {
-                crate::buffer::read_buffer_enqueue(&buf, ec, &mut dst, true, &raw)?;
+                crate::buffer::read_buffer_enqueue(guard.value(), ec, &mut dst, true, &raw)?;
+                let (buf, home) = guard.disarm();
                 self.out.put_home(buf, Deps::new(), home);
             }
             // Pipelined: non-blocking; the event gates `dst` being valid.
             ExecMode::Pipelined => {
-                let event = crate::buffer::read_buffer_enqueue(&buf, ec, &mut dst, false, &raw)?;
+                let event =
+                    crate::buffer::read_buffer_enqueue(guard.value(), ec, &mut dst, false, &raw)?;
+                let (buf, home) = guard.disarm();
                 self.out.put_home(buf, single_dep(event), home);
             }
         }
@@ -808,6 +826,9 @@ where
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // In-place: the migrated buffer is the same buffer → home threads through.
         let (buf, deps, home) = self.buf.resolve_home(ec)?;
+        // Guard the lent buffer across BOTH fallible steps below (queue resolution
+        // AND the migrate enqueue): either failing rehomes rather than strands.
+        let guard = crate::eager::LentGuard::new(buf, home);
         // Resolve the target device (concrete, or by index into the running
         // context's device list) before resolving its queue.
         let device = match &self.target {
@@ -824,7 +845,8 @@ where
         // wait. The migrate body mirrors the closure layer's
         // `transfer_to_device.rs` exactly.
         let raw = deps_to_wait_list(&deps);
-        let event = crate::buffer::migrate_buffer_enqueue(&buf, &*target_q, &raw)?;
+        let event = crate::buffer::migrate_buffer_enqueue(guard.value(), &*target_q, &raw)?;
+        let (buf, home) = guard.disarm();
         self.out.put_home(buf, single_dep(event), home);
         Ok(())
     }
@@ -1278,12 +1300,21 @@ where
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        let (mut buf, deps, home) = self.buf.resolve_home(ec)?;
+        let (buf, deps, home) = self.buf.resolve_home(ec)?;
         let raw = deps_to_wait_list(&deps);
         // In-place: the written buffer is the lent buffer → home threads through.
+        // Guard across the fallible write so a failure rehomes rather than strands.
+        let mut guard = crate::eager::LentGuard::new(buf, home);
         match mode {
             ExecMode::Blocking => {
-                crate::buffer::write_buffer_enqueue(&mut buf, ec, self.src.as_slice(), true, &raw)?;
+                crate::buffer::write_buffer_enqueue(
+                    guard.value_mut(),
+                    ec,
+                    self.src.as_slice(),
+                    true,
+                    &raw,
+                )?;
+                let (buf, home) = guard.disarm();
                 self.out.put_home(buf, Deps::new(), home);
             }
             ExecMode::Pipelined => {
@@ -1291,12 +1322,13 @@ where
                 // (the op lives in the graph; the terminal waits before returning),
                 // so no per-run keep-alive callback is needed.
                 let event = crate::buffer::write_buffer_enqueue(
-                    &mut buf,
+                    guard.value_mut(),
                     ec,
                     self.src.as_slice(),
                     false,
                     &raw,
                 )?;
+                let (buf, home) = guard.disarm();
                 self.out.put_home(buf, single_dep(event), home);
             }
         }
@@ -1495,15 +1527,20 @@ where
         }
 
         let raw = deps_to_wait_list(&deps);
-        // SVM fill is always a non-blocking enqueue (no native CL_BLOCKING flag);
-        // Blocking waits on the returned event here. In-place → home threads.
-        let event = crate::mapped::svm_fill_enqueue(&buf, ec, self.value, &raw)?;
+        // Guard across the fallible enqueue/wait so a failure rehomes the lent SVM
+        // buffer rather than stranding its origin cell. SVM fill is always a
+        // non-blocking enqueue (no native CL_BLOCKING flag); Blocking waits on the
+        // returned event here. In-place → home threads.
+        let guard = crate::eager::LentGuard::new(buf, home);
+        let event = crate::mapped::svm_fill_enqueue(guard.value(), ec, self.value, &raw)?;
         match mode {
             ExecMode::Blocking => {
                 event.wait().map_err(Error::OpenCl)?;
+                let (buf, home) = guard.disarm();
                 self.out.put_home(buf, Deps::new(), home);
             }
             ExecMode::Pipelined => {
+                let (buf, home) = guard.disarm();
                 self.out.put_home(buf, single_dep(event), home);
             }
         }
@@ -1614,16 +1651,20 @@ where
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (buf, deps, home) = self.buf.resolve_home(ec)?;
         let raw = deps_to_wait_list(&deps);
-        // SVM write is always a non-blocking enqueue; Blocking waits on the event
-        // here, Pipelined threads it downstream. `self.src` is valid for the whole
-        // `sync` — no keep-alive callback needed. In-place → home threads through.
-        let event = crate::mapped::svm_write_enqueue(&buf, ec, self.src.as_slice(), &raw)?;
+        // Guard across the fallible enqueue/wait so a failure rehomes rather than
+        // strands. SVM write is always a non-blocking enqueue; Blocking waits on the
+        // event here, Pipelined threads it downstream. `self.src` is valid for the
+        // whole `sync` — no keep-alive callback needed. In-place → home threads.
+        let guard = crate::eager::LentGuard::new(buf, home);
+        let event = crate::mapped::svm_write_enqueue(guard.value(), ec, self.src.as_slice(), &raw)?;
         match mode {
             ExecMode::Blocking => {
                 event.wait().map_err(Error::OpenCl)?;
+                let (buf, home) = guard.disarm();
                 self.out.put_home(buf, Deps::new(), home);
             }
             ExecMode::Pipelined => {
+                let (buf, home) = guard.disarm();
                 self.out.put_home(buf, single_dep(event), home);
             }
         }

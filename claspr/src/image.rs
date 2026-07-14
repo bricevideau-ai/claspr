@@ -788,17 +788,35 @@ impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
             });
         }
         // In-place: the written image is the lent image → home threads through.
-        let (mut img, deps, home) = self.img.resolve_home(ec)?;
+        // Guard across the fallible enqueue so a failure rehomes the lent image
+        // rather than stranding its origin cell in `Lent`.
+        let (img, deps, home) = self.img.resolve_home(ec)?;
         let raw = deps_to_wait_list(&deps);
         let data = self.data.as_ptr() as *const std::ffi::c_void;
+        let mut guard = crate::eager::LentGuard::new(img, home);
         match mode {
             ExecMode::Blocking => {
-                write_image_enqueue(img.image_mut(), ec, self.region, data, true, &raw)?;
+                write_image_enqueue(
+                    guard.value_mut().image_mut(),
+                    ec,
+                    self.region,
+                    data,
+                    true,
+                    &raw,
+                )?;
+                let (img, home) = guard.disarm();
                 self.out.put_home(img, Deps::new(), home);
             }
             ExecMode::Pipelined => {
-                let event =
-                    write_image_enqueue(img.image_mut(), ec, self.region, data, false, &raw)?;
+                let event = write_image_enqueue(
+                    guard.value_mut().image_mut(),
+                    ec,
+                    self.region,
+                    data,
+                    false,
+                    &raw,
+                )?;
+                let (img, home) = guard.disarm();
                 self.out.put_home(img, single_dep(event), home);
             }
         }
@@ -891,18 +909,36 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
                 });
             }
         }
-        // In-place: the read image is handed back unchanged → home threads.
+        // In-place: the read image is handed back unchanged → home threads. Guard
+        // across the fallible read so a failure rehomes rather than strands.
         let (img, deps, home) = self.img.resolve_home(ec)?;
         let raw = deps_to_wait_list(&deps);
         let mut dst_guard = self.dst.lock().unwrap();
         let dst = dst_guard.as_mut_ptr() as *mut std::ffi::c_void;
+        let img_guard = crate::eager::LentGuard::new(img, home);
         match mode {
             ExecMode::Blocking => {
-                read_image_enqueue(img.image_ref(), ec, self.region, dst, true, &raw)?;
+                read_image_enqueue(
+                    img_guard.value().image_ref(),
+                    ec,
+                    self.region,
+                    dst,
+                    true,
+                    &raw,
+                )?;
+                let (img, home) = img_guard.disarm();
                 self.out.put_home(img, Deps::new(), home);
             }
             ExecMode::Pipelined => {
-                let event = read_image_enqueue(img.image_ref(), ec, self.region, dst, false, &raw)?;
+                let event = read_image_enqueue(
+                    img_guard.value().image_ref(),
+                    ec,
+                    self.region,
+                    dst,
+                    false,
+                    &raw,
+                )?;
+                let (img, home) = img_guard.disarm();
                 self.out.put_home(img, single_dep(event), home);
             }
         }
@@ -988,7 +1024,7 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         // In-place on both sides (image copy preserves type) → each home threads
         // to its own element pipe.
         let (src, src_deps, src_home) = self.src.resolve_home(ec)?;
-        let (mut dst, dst_deps, dst_home) = self.dst.resolve_home(ec)?;
+        let (dst, dst_deps, dst_home) = self.dst.resolve_home(ec)?;
         // Region: from the build-time value (concrete `copy_to`) or derived at execute
         // from the lent src (pipe-fed `eager_image_copy`, no concrete src at build).
         let region = self.region.unwrap_or_else(|| src.enqueue_region());
@@ -1047,10 +1083,23 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         let mut merged = src_deps.clone();
         merged.extend(dst_deps.iter().cloned());
         let raw = deps_to_wait_list(&merged);
+        // Guard BOTH lent images across the fallible enqueue: a failure rehomes each
+        // to its origin cell rather than stranding either. (The CB arms above already
+        // deposited + returned, so this only covers the Off/per-op path.)
+        let src_guard = crate::eager::LentGuard::new(src, src_home);
+        let mut dst_guard = crate::eager::LentGuard::new(dst, dst_home);
         // Copy has no native CL_BLOCKING flag — always enqueue non-blocking; a
         // blocking terminal waits on the event via the carried deps.
-        let event = copy_image_enqueue(src.image_ref(), dst.image_mut(), ec, region, &raw)?;
+        let event = copy_image_enqueue(
+            src_guard.value().image_ref(),
+            dst_guard.value_mut().image_mut(),
+            ec,
+            region,
+            &raw,
+        )?;
         let dep = single_dep(event);
+        let (src, src_home) = src_guard.disarm();
+        let (dst, dst_home) = dst_guard.disarm();
         self.src_pipe.put_home(src, dep.clone(), src_home);
         self.dst_pipe.put_home(dst, dep, dst_home);
         Ok(())
@@ -1207,7 +1256,7 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         use opencl3::memory::ClMem;
         // In-place: the filled image is the lent image → home threads through.
-        let (mut img, deps, home) = self.img.resolve_home(ec)?;
+        let (img, deps, home) = self.img.resolve_home(ec)?;
         let pattern = self.pattern;
 
         // ── CB-mode fork (design v2) — image fill via clCommandFillImageKHR. An
@@ -1249,15 +1298,19 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
         }
 
         let raw = deps_to_wait_list(&deps);
-        // Fill has no native CL_BLOCKING flag — always enqueue non-blocking; a
-        // blocking terminal waits on the event via the carried deps.
+        // Guard the lent image across the fallible enqueue (CB arms above already
+        // deposited + returned, so this covers the Off/per-op path). Fill has no
+        // native CL_BLOCKING flag — always enqueue non-blocking; a blocking terminal
+        // waits on the event via the carried deps.
+        let mut guard = crate::eager::LentGuard::new(img, home);
         let event = fill_image_enqueue(
-            img.image_mut(),
+            guard.value_mut().image_mut(),
             ec,
             self.region,
             pattern.as_ptr() as *const std::ffi::c_void,
             &raw,
         )?;
+        let (img, home) = guard.disarm();
         self.out.put_home(img, single_dep(event), home);
         Ok(())
     }

@@ -1687,14 +1687,31 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                                 ::std::boxed::Box::new(move |info| (cb)(info));
                             shim
                         });
-                    let event = ::claspr::LaunchOp::new(
+                    let __claspr_launch = ::claspr::LaunchOp::new(
                         ec,
                         &self.kernel,
                         __claspr_spec,
                         #op_launch_args_tuple,
                     )
                     .with_state(raw_deps, profile_cb)
-                    .submit()?;
+                    .submit();
+                    // Stranding guard (review finding #1): the launch only BORROWS the
+                    // lent buffers (the `LaunchOp` — and its borrows — is dropped when
+                    // `.submit()` returns), so on failure we still own each by value
+                    // and RETURN it to its origin cell via `rehome_consumed` before
+                    // propagating the error. Without this a failed enqueue (bad args,
+                    // out-of-resources, terminated queue) would drop the lent buffers,
+                    // stranding every origin cell in `Lent` and permanently poisoning
+                    // the graph. Same contract as the hand-written leaves' `LentGuard`.
+                    let event = match __claspr_launch {
+                        ::core::result::Result::Ok(ev) => ev,
+                        ::core::result::Result::Err(__claspr_e) => {
+                            #(
+                                ::claspr::rehome_consumed(#output_names, #output_homes);
+                            )*
+                            return ::core::result::Result::Err(__claspr_e);
+                        }
+                    };
                     // ONE enqueue → one completion event. Wrap once, then clone
                     // the `Dep` (Arc<Event>) onto EACH element pipe so whichever
                     // element(s) flow downstream carry the wait-list, and the

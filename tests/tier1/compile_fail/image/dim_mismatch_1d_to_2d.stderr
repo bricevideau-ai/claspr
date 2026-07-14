@@ -5,13 +5,13 @@ error[E0277]: the trait bound `Image1D<WriteOnly, R32Uint>: KernelImage2DWriteAr
    |                     ^^^^^^^^^^^^ the trait `KernelImage2DWriteArg<Uint>` is not implemented for `Image1D<WriteOnly, R32Uint>`
    |
 help: the following other types implement trait `KernelImage2DWriteArg<SF>`
-  --> claspr/src/image.rs:1922:8
+  --> claspr/src/image.rs:1975:8
    |
    = note: `Image2D<WriteOnly, F>`
-  ::: claspr/src/image.rs:1924:8
+  ::: claspr/src/image.rs:1977:8
    |
    = note: `Image2D<ReadWrite, F>`
-  ::: claspr/src/image.rs:1967:1
+  ::: claspr/src/image.rs:2020:1
    |
    = note: in this macro invocation
 note: required by a bound in `claspr_test_image_kernels::dim2_uint::Kernels::fill_pattern`

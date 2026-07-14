@@ -441,6 +441,139 @@ pub fn rehome_consumed<T>(buf: T, home: Option<BoxedHome<T>>) {
     // else: homeless → `buf` drops here, releasing it.
 }
 
+/// RAII guard over a buffer lent out of its origin cell by
+/// [`resolve_home`](Input::resolve_home), for the window between the lend and the
+/// deposit ([`put_home`](Pipe::put_home) / [`rehome_consumed`]).
+///
+/// `resolve_home` moves a buffer OUT of its cell (`Bound`/`Concrete → Lent`); the
+/// op then runs a **fallible** enqueue and only deposits the buffer back on
+/// success. If the enqueue (or a blocking `wait`) errors via `?`, the raw
+/// `(value, home)` tuple would just drop — and since neither the bare tuple nor a
+/// `BoxedHome` has a rehome-on-drop, the origin cell stays permanently `Lent`:
+/// the graph is silently poisoned (a later run reports "busy"/`SlotUnbound`
+/// forever) instead of failing cleanly and staying retryable. This hits the
+/// hottest path — every kernel launch and every fill/copy/download `execute`.
+///
+/// `LentGuard` closes that window: it owns the lent `(value, home)` and, on drop,
+/// rehomes the value to its cell — EXACTLY like [`PipePayload`]'s drop and a
+/// [`Checkout`] drop (re-arm `Bound`, no-op for a concrete `Cell`). The success
+/// path calls [`disarm`](Self::disarm) to reclaim `(value, home)` for the deposit,
+/// which defuses the guard so it does nothing on drop. A minted/homeless lend
+/// (`home == None`) simply releases on drop, unchanged.
+pub(crate) struct LentGuard<T> {
+    value: Option<T>,
+    home: Option<BoxedHome<T>>,
+}
+
+impl<T> LentGuard<T> {
+    /// Arm a guard over a freshly-lent `(value, home)`.
+    pub(crate) fn new(value: T, home: Option<BoxedHome<T>>) -> Self {
+        Self {
+            value: Some(value),
+            home,
+        }
+    }
+
+    /// Borrow the lent value mutably for the enqueue (which may fail — if it does,
+    /// the guard is still armed and rehomes on the `?` unwind).
+    pub(crate) fn value_mut(&mut self) -> &mut T {
+        self.value
+            .as_mut()
+            .expect("LentGuard value already disarmed")
+    }
+
+    /// Borrow the lent value immutably (read-only enqueues, e.g. image/read).
+    pub(crate) fn value(&self) -> &T {
+        self.value
+            .as_ref()
+            .expect("LentGuard value already disarmed")
+    }
+
+    /// Success path: defuse the guard and reclaim `(value, home)` for the deposit
+    /// ([`Pipe::put_home`] / [`rehome_consumed`]). After this the guard's drop is a
+    /// no-op — the deposit now owns the rehome obligation.
+    pub(crate) fn disarm(mut self) -> (T, Option<BoxedHome<T>>) {
+        let value = self.value.take().expect("LentGuard disarmed twice");
+        let home = self.home.take();
+        (value, home)
+    }
+}
+
+impl<T> Drop for LentGuard<T> {
+    fn drop(&mut self) {
+        // Armed at drop ⇒ the enqueue failed (or an early return skipped `disarm`):
+        // return the lent buffer to its origin cell so the graph is left unchanged
+        // and re-runnable, rather than stranded in `Lent`. Mirrors `PipePayload`
+        // and `Checkout` drop. `disarm` clears `value`, making this a no-op.
+        if let (Some(value), Some(home)) = (self.value.take(), self.home.take()) {
+            home.rehome(value);
+        }
+        // else: disarmed (deposited) or homeless (nothing to return).
+    }
+}
+
+#[cfg(test)]
+mod lent_guard_tests {
+    use super::*;
+
+    // Model a lend: empty the cell into a guard homed on that same cell (what
+    // `resolve_home` does for a concrete `Cell`).
+    fn lend(cell: &Cell<u32>) -> LentGuard<u32> {
+        let value = cell.lock().unwrap().take().expect("cell was empty");
+        let home: BoxedHome<u32> = Box::new(Arc::clone(cell));
+        LentGuard::new(value, Some(home))
+    }
+
+    // Dropping an ARMED guard (the enqueue-failed path) must return the value to
+    // its origin cell — the anti-stranding property. Without the guard's Drop the
+    // cell would stay empty ("Lent" forever).
+    #[test]
+    fn armed_drop_rehomes_to_origin_cell() {
+        let cell: Cell<u32> = Arc::new(Mutex::new(Some(99)));
+        {
+            let _guard = lend(&cell);
+            assert!(
+                cell.lock().unwrap().is_none(),
+                "lent: cell empty during run"
+            );
+            // guard dropped here WITHOUT disarm → simulates a failed enqueue
+        }
+        assert_eq!(
+            *cell.lock().unwrap(),
+            Some(99),
+            "armed guard drop must rehome the lent value"
+        );
+    }
+
+    // `disarm` (the success path) hands the value back to the caller and defuses
+    // the guard, so its later drop is a no-op — the deposit owns the rehome now.
+    #[test]
+    fn disarm_defuses_and_returns_value() {
+        let cell: Cell<u32> = Arc::new(Mutex::new(Some(7)));
+        let (value, home) = {
+            let guard = lend(&cell);
+            guard.disarm()
+        };
+        assert_eq!(value, 7, "disarm returns the lent value");
+        assert!(
+            cell.lock().unwrap().is_none(),
+            "disarmed guard must NOT rehome (deposit owns it now)"
+        );
+        // The caller's deposit would normally re-fill via `home`; do it explicitly
+        // to confirm the home still points at the origin cell.
+        home.expect("concrete cell has a home").rehome(value);
+        assert_eq!(*cell.lock().unwrap(), Some(7));
+    }
+
+    // A homeless lend (minted buffer, `home == None`) just releases on drop —
+    // no panic, nothing to rehome.
+    #[test]
+    fn homeless_guard_drop_is_noop() {
+        let guard = LentGuard::new(42u32, None);
+        drop(guard); // must not panic
+    }
+}
+
 /// Identity rehome: an output returns to a cell of its own type (the in-place
 /// case — fill/scale/kernel-buffer-arg/copy's same-typed sides), putting the value
 /// back into the cell so the next replay reuses the same buffer.

@@ -5,13 +5,13 @@ error[E0277]: the trait bound `Image2D<WriteOnly, R32Float>: KernelImage2DReadAr
    |                     ^^^^^^^^^^^^^^ the trait `KernelImage2DReadArg<claspr::format::Float>` is not implemented for `Image2D<WriteOnly, R32Float>`
    |
 help: the following other types implement trait `KernelImage2DReadArg<SF>`
-  --> claspr/src/image.rs:1921:8
+  --> claspr/src/image.rs:1974:8
    |
    = note: `Image2D<ReadOnly, F>`
-  ::: claspr/src/image.rs:1923:8
+  ::: claspr/src/image.rs:1976:8
    |
    = note: `Image2D<ReadWrite, F>`
-  ::: claspr/src/image.rs:1967:1
+  ::: claspr/src/image.rs:2020:1
    |
    = note: in this macro invocation
 note: required by a bound in `claspr_test_image_kernels::dim2_float::Kernels::copy_to_buffer`
