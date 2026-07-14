@@ -173,6 +173,46 @@ references the macro crate, so no re-bless (confirmed). Remaining top hotspots a
 proc-macro (`parse_image_tokens` cog 32, `read_image_access_attr` cog 17) + the isolated
 `apply_value_bind` (cog 22). NOT yet FF'd to main.
 
+### ✅ READY-TO-FF 2026-07-14 — quality-review fixes (branch `fix-review-findings-20260714`)
+
+Actioned ALL findings from the full-codebase quality review (the branch
+`code-quality-review-20260714` recorded them as unactioned; **this branch resolves
+them and SUPERSEDES that entry** — fold/drop the review branch once this lands). 10
+commits, each verified against the code before fixing, behavior-preserving in
+compiled paths, with a test where deterministically possible. Full tier1+tier2
+green on 3 ICDs; gray-scott bit-identical.
+
+- **High #1 — lent-buffer stranding on enqueue failure.** `resolve_home` lent a
+  buffer with no RAII guard → a failed enqueue stranded the origin cell in `Lent`
+  (graph silently poisoned) on every kernel launch / fill / copy / download. Added
+  `LentGuard` (rehome-on-drop, `disarm` on success) at every borrow-path execute
+  site + the macro kernel launch. CopyTo2's CONSUMING copy path needed its own
+  shape (the `Uninit→Init` transition takes buffers by value): added a copy-only
+  `CopyRun` trait returning `Err((error, output))` so CopyTo2 rehomes the recovered
+  buffers — leaving the shared `DeviceEnqueue`/host-view ops untouched. (Chasing
+  this surfaced that FillDeviceUninit does the same transition inline+borrowed, so
+  CopyTo2's consuming-run-with-a-held-home was the real inconsistency.)
+- **High #2 — CopyTo2 CB-replay dropped external deps** (LendOnly arm skipped
+  `cb_collect_external`) → producer race. Fixed to match sibling leaves.
+- **High #3 — image length/dim mismatches** panicked (`assert_eq!`) or truncated
+  (`min`) instead of erroring. Unified on `Err(LengthMismatch)`, checked in
+  `check_ready` so the ops stay Tier-2-composable (the read side had returned
+  `Result` at construction → not usable mid-graph; now a bare `DeviceOp`).
+- **High #4 — `CbBuilder` pointer-arith methods** were safe `pub fn` doing
+  unchecked `.add()`. They were `pub` only incidentally (macro reachability); made
+  them `pub(crate)` (macro emits only `set_mem_arg`/`note_slot`). No bounds-check
+  plumbing (MemRef carries no length; internal callers trusted).
+- **Medium:** M1 dedup CompileBuilder/HostBuilder via a `spirv_build_config_methods!`
+  macro (inherent, not a trait — no consumer `use`, no private-type leak); M2 emit
+  `rerun-if-changed` for the seeded kernel `Cargo.lock`; M3 fix `write_from`'s
+  stale "panics" doc; M4 reject generic/return/async/unsafe kernel sigs at the
+  macro boundary (+ compile_fail fixtures); M5 (`Image1DBufferView::view_of`) was
+  already fixed by #3.
+- **Low:** L1 host-view Drop paths `record_err()` on a failed wait (was `let _ =`);
+  L2 `read_image_access_attr` recognizes raw string literals (parse via
+  `syn::LitStr`); L3 added `#[test]`s to image-pipeline + two-device (were
+  print-only).
+
 ---
 
 ## Deferred
