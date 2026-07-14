@@ -480,20 +480,6 @@ pub(crate) fn cb_should_open_span<O: DeviceOp>(op: &O, ec: &ExecutionContext<'_>
         && op.cbable_weight() >= 2
 }
 
-/// The **span-close decision** for an [`AndThen`] running INSIDE a command buffer.
-/// If `next` cannot continue the maximal seam-free span (a host seam / transfer —
-/// [`cb_spine_head_addable`](DeviceOp::cb_spine_head_addable) is false) and we are in
-/// `Build`/`LendOnly`, this SEALS + ENQUEUES the span CB via [`cb_close_span`] and
-/// [`cb_restamp`](DeviceOp::cb_restamp)s its completion event onto `source`'s output
-/// pipes — `source` is the last span node before the seam, and its pipes are exactly
-/// what `next` (the seam) is about to read. Returns `true` iff the span closed here
-/// (the caller must then run `next` in [`Off`](CbWalk::Off)); `false` to continue the
-/// span (run `next` in the same Build/LendOnly `ec`).
-///
-/// Idempotent across ancestor `AndThen`s: once a deeper close sealed the builder, a
-/// higher `AndThen` whose `next` also can't continue re-enters here, gets `None` from
-/// [`cb_close_span`] (already finalized), skips the restamp, and still runs its `next`
-/// in `Off` — so no post-seam op joins the dead builder.
 /// Whether this walk position's span has already CLOSED (its latch is set — see
 /// [`CbWalk::Build`]`::closed`). Once closed, all remaining work under the same
 /// boundary frame must run in [`Off`](CbWalk::Off): a deeper close already sealed +
@@ -509,6 +495,20 @@ pub(crate) fn cb_span_closed(ec: &ExecutionContext<'_>) -> bool {
     }
 }
 
+/// The **span-close decision** for an [`AndThen`] running INSIDE a command buffer.
+/// If `next` cannot continue the maximal seam-free span (a host seam / transfer —
+/// [`cb_spine_head_addable`](DeviceOp::cb_spine_head_addable) is false) and we are in
+/// `Build`/`LendOnly`, this SEALS + ENQUEUES the span CB via [`cb_close_span`] and
+/// [`cb_restamp`](DeviceOp::cb_restamp)s its completion event onto `source`'s output
+/// pipes — `source` is the last span node before the seam, and its pipes are exactly
+/// what `next` (the seam) is about to read. Returns `true` iff the span closed here
+/// (the caller must then run `next` in [`Off`](CbWalk::Off)); `false` to continue the
+/// span (run `next` in the same Build/LendOnly `ec`).
+///
+/// Idempotent across ancestor `AndThen`s: once a deeper close sealed the builder, a
+/// higher `AndThen` whose `next` also can't continue re-enters here, gets `None` from
+/// [`cb_close_span`] (already finalized), skips the restamp, and still runs its `next`
+/// in `Off` — so no post-seam op joins the dead builder.
 pub(crate) fn cb_close_before_seam<S, U>(
     source: &S,
     next: &U,

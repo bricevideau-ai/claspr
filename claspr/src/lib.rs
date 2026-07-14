@@ -100,8 +100,8 @@ pub mod transfer;
 
 pub use access::{
     DeviceScratch, FillStrategy, Fillable, Frozen, HostAccess, HostReadOnly, HostReadable,
-    HostUploadable, HostWritable, KernelAccess, KernelReadable, KernelWritable, MemMode, ReadOnly,
-    ReadWrite, RuntimeFillable, UploadReseed, WriteOnly,
+    HostWritable, KernelAccess, KernelReadable, KernelWritable, MemMode, ReadOnly, ReadWrite,
+    UploadReseed, WriteOnly,
 };
 pub use buffer::{
     Buffer, DeviceMapMutOp, DeviceMapOp, DeviceMapReadPending, DeviceMapWritePending,
@@ -125,8 +125,8 @@ pub use image::{
 };
 pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, KernelPointerArg, KernelScalarRefArg,
-    KernelScalarRefMutArg, KernelSliceArg, KernelSliceReadArg, KernelSliceReadWriteArg, LaunchSpec,
-    LocalBuffer, ScalarArg, ScalarRefArg, profiling_duration,
+    KernelScalarRefMutArg, KernelSliceReadArg, KernelSliceReadWriteArg, LaunchSpec, LocalBuffer,
+    ScalarArg, ScalarRefArg, profiling_duration,
 };
 pub use op::{
     LaunchOp, ProfileCb, ProfilingInfo, assert_same_context, complete_user_event,

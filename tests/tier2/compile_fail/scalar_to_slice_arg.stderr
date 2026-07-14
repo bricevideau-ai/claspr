@@ -5,14 +5,14 @@ error[E0277]: the trait bound `Scalar<DeviceSlice<u32>>: KernelSliceReadWriteArg
    |                     ^^^^^^^^^ the trait `KernelSliceReadWriteArg<u32>` is not implemented for `Scalar<DeviceSlice<u32>>`
    |
 help: the following other types implement trait `KernelSliceReadWriteArg<T>`
-  --> claspr/src/launch.rs:320:0
-  ::: claspr/src/launch.rs:323:50
+  --> claspr/src/launch.rs:314:0
+  ::: claspr/src/launch.rs:317:50
    |
    = note: `DeviceSlice<T, M>`
-  ::: claspr/src/launch.rs:359:57
+  ::: claspr/src/launch.rs:353:57
    |
    = note: `MappedSlice<T, M>`
-  ::: claspr/src/launch.rs:395:54
+  ::: claspr/src/launch.rs:389:54
    |
    = note: `USMSlice<T, M>`
 note: required by a bound in `claspr_test_kernels::kernels::Kernels::scale_u32`

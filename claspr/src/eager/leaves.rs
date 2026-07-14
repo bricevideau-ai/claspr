@@ -1164,7 +1164,7 @@ pub fn write_device_uninit<T, M, S>(
 ) -> WriteDeviceUninit<T, M>
 where
     T: Send + Sync + 'static,
-    M: MemMode + HostUploadable + HostWritable + Send + 'static,
+    M: MemMode + HostWritable + Send + 'static,
     S: Into<UploadSource<T>>,
 {
     WriteDeviceUninit {
@@ -1177,7 +1177,7 @@ where
 impl<T, M> DeviceOp for WriteDeviceUninit<T, M>
 where
     T: Send + Sync + 'static,
-    M: MemMode + HostUploadable + HostWritable + Send + 'static,
+    M: MemMode + HostWritable + Send + 'static,
 {
     type Output = DeviceSlice<T, M>;
 

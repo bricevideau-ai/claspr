@@ -305,31 +305,15 @@ impl HostReadable for Frozen {}
 // DeviceScratch: host-no-access — neither readable nor writable from
 // the host. Don't impl either trait.
 
-// ── Bridge traits (deferral-safe aliases for Tier 1/Tier 2 bounds) ──
+// ── Fillable: the fill-strategy DISPATCH trait ──
 //
-// `RuntimeFillable` / `HostUploadable` are super-traits that both
-// Tier 1 ops and Tier 2 (eager-graph) ops reference in their
-// `where` clauses. The blanket impls today alias to `HostWritable`;
-// future bound changes are one-line edits to the impl, propagating
-// to both tiers without two-place coordination.
+// `Fillable` is a *dispatch* trait: each marker picks a strategy
+// (Runtime or DeviceKernel) for how `.fill()` should execute. The
+// user sees one `.fill()` method; the dispatch is opaque.
 //
-// `Fillable` is different — it's a *dispatch* trait. Each marker
-// picks a strategy (Runtime or DeviceKernel) for how `.fill()`
-// should execute. The user sees one `.fill()` method; the dispatch
-// is opaque.
-
-/// Markers eligible for ops that need host-side writability through
-/// the runtime — `Upload`, `MappedSliceUpload`, `*::write`, the
-/// runtime fast-path of fill. Today: aliases `HostWritable`. Future
-/// relaxations are one-line edits to the blanket impl.
-pub trait RuntimeFillable: MemMode + HostWritable {}
-impl<M: MemMode + HostWritable> RuntimeFillable for M {}
-
-/// Markers eligible for host→device alloc+write composites (Upload,
-/// MappedSliceUpload). Same gate as `RuntimeFillable` today; kept
-/// separate so the two concepts can diverge later.
-pub trait HostUploadable: MemMode + HostWritable {}
-impl<M: MemMode + HostWritable> HostUploadable for M {}
+// (Host-write eligibility itself is just `HostWritable` — the earlier
+// `RuntimeFillable` / `HostUploadable` alias traits were speculative
+// super-traits that never diverged from `HostWritable`, so they're gone.)
 
 /// Strategy enum returned by [`Fillable::FILL_STRATEGY`] —
 /// `.fill()`'s runtime dispatches on this to pick the right path.

@@ -85,10 +85,10 @@ impl<T: KernelArg + ?Sized> KernelArg for &mut T {
     }
 }
 
-// ── KernelSliceArg ────────────────────────────────────────────────────
+// ── Kernel slice-arg traits ─────────────────────────────────────────────
 
-/// Sealing module — keeps `KernelSliceArg` impls in-crate so we can
-/// change the trait or its bounds without breaking external callers.
+/// Sealing module — keeps the `KernelSlice{Read,ReadWrite}Arg` impls in-crate so we
+/// can change the traits or their bounds without breaking external callers.
 mod kernel_slice_arg_sealed {
     pub trait Sealed {}
 }
@@ -181,12 +181,6 @@ impl<D: KernelPointerArg + ?Sized> KernelArg for ScalarRefArg<'_, D> {
 /// for read/write access) so users with one bound can rely on the
 /// other.
 pub trait KernelSliceReadWriteArg<T>: KernelSliceReadArg<T> {}
-
-/// Legacy alias for [`KernelSliceReadWriteArg<T>`] — preserved so
-/// proc-macro-emitted bounds keep compiling while we migrate the
-/// macro to pick Read vs ReadWrite based on slice mutability.
-pub trait KernelSliceArg<T>: KernelSliceReadWriteArg<T> {}
-impl<T, X: KernelSliceReadWriteArg<T>> KernelSliceArg<T> for X {}
 
 // ── KernelScalarRefArg — the scalar-by-reference kernel-arg bound ────
 //

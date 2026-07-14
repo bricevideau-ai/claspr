@@ -460,8 +460,9 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     //
     // Slices get one fresh generic type parameter each
     // (`__claspr_D0`, `__claspr_D1`, …) bounded
-    // `: ::claspr::KernelSliceArg<elem>`. This lets the same emitted
-    // method accept `DeviceSlice<T>`, `MappedSlice<T>`, or
+    // `: ::claspr::KernelSliceReadArg<elem>` (`&[T]`) or
+    // `: ::claspr::KernelSliceReadWriteArg<elem>` (`&mut [T]`). This lets the same
+    // emitted method accept `DeviceSlice<T>`, `MappedSlice<T>`, or
     // `USMSlice<T>` interchangeably while keeping the flow-through
     // Output typed precisely.
     //

@@ -164,9 +164,8 @@ use crate::host_view::{
 use crate::image::ImageHostTransfer;
 use crate::transfer::UploadSource;
 use crate::{
-    Buffer, Context, DeviceSlice, DeviceSliceUninit, Error, Fillable, HostReadable, HostUploadable,
-    HostWritable, MappedSlice, MappedSliceUninit, MemMode, ReadWrite, Result, USMSlice,
-    USMSliceUninit,
+    Buffer, Context, DeviceSlice, DeviceSliceUninit, Error, Fillable, HostReadable, HostWritable,
+    MappedSlice, MappedSliceUninit, MemMode, ReadWrite, Result, USMSlice, USMSliceUninit,
 };
 use std::any::{Any, TypeId};
 use std::marker::PhantomData;
@@ -1496,8 +1495,13 @@ pub trait DeviceOp: Send {
     /// `None` case is never reached through them.
     fn output_pipe(&self) -> Option<Pipe<Self::Output>>;
 
-    /// The downstream-facing [`Handle`](Self::Handle). Default: the output pipe
-    /// (so a downstream closure gets `Pipe<Output>`). Combinators override.
+    /// The downstream-facing [`Handle`](Self::Handle) — what a downstream `and_then`
+    /// closure receives. A single-output op returns its output pipe (`self.out.clone()`
+    /// — i.e. `self.output_pipe().unwrap()`); a multi-output combinator returns its
+    /// per-element tuple. **No default body**: the single-output form isn't expressible
+    /// generically (the trait can't construct `Self::Handle` without a `From<Pipe<
+    /// Output>>` bound that would then break generic callers on tuple-`Handle` ops), so
+    /// every op writes it explicitly — one line for a leaf.
     fn handle(&self) -> Self::Handle;
 
     /// Run the op for ONE run: **lend** inputs (take from their cells / upstream
@@ -2744,25 +2748,23 @@ impl<T: DeviceOp> DeviceOpExt for T {}
 /// UNTOUCHED. This is stronger than the old "sever every source up front, THEN
 /// `?`-chained fold", which could sever all Checkouts and then error.
 ///
-/// **One residual, `bind_all` only.** The value-dependent
-/// [`SlotConflict`](Error::SlotConflict) of a `Set` onto an already-`Bound`
-/// (different) slot cannot be pre-caught (the value is inside an unsevered
-/// `Checkout`); it fires in phase 2 after phase 1 may have severed OTHER sources.
-/// It is a set-once misuse case. `mutate_all` has no `SlotConflict` leg, so it is
-/// FULLY all-or-nothing. Order does not matter for *success*: every element binds
-/// its own tag independently. Implemented for tuples of arity 1..=8 (mirroring
-/// [`KernelArgs`](crate::KernelArgs)). See the `bind_all_body!` macro for the three
+/// `mutate_all` has no `SlotConflict` leg (mutate overwrites), so it is FULLY
+/// all-or-nothing. Order does not matter for *success*: every element binds its own
+/// tag independently. Implemented for tuples of arity 1..=8 (mirroring
+/// [`KernelArgs`](crate::KernelArgs)). See the `mutate_all_body!` macro for the three
 /// phases (probe → sever → fold).
+///
+/// (The set-once tuple path — [`call`](DeviceOpExt::call) — does NOT route through
+/// here; it folds each element via [`CallArg`], see `CallArgs` below. This trait is
+/// the `mutate_call` driver only.)
 pub trait BindAll {
-    /// Fold each element through [`bind`](DeviceOpExt::bind) (set-once).
-    fn bind_all<Op: DeviceOp>(self, g: &Op) -> Result<()>;
     /// Fold each element through [`mutate_bind`](DeviceOpExt::mutate_bind) (set/change).
     fn mutate_all<Op: DeviceOp>(self, g: &Op) -> Result<()>;
 }
 
-/// The shared three-phase body of [`BindAll::bind_all`] / [`BindAll::mutate_all`],
-/// parameterised on the [`BindMode`]. Splitting it out keeps the two verbs a single
-/// source of truth for the all-or-nothing sequence.
+/// The three-phase body of [`BindAll::mutate_all`] (the `mutate_call` driver). Since
+/// mutate overwrites, there is no `SlotConflict` residual — this path is FULLY
+/// all-or-nothing.
 ///
 /// - **PHASE 0 — probe (read-only, severs NOTHING).** First gather the
 ///   `severable_cells` set: the slot-cell id every `Checkout`-sourced element will
@@ -2776,27 +2778,16 @@ pub trait BindAll {
 ///   source, THEN the fold errors" hole. (A crossed swap's `Lent` targets are in
 ///   `severable_cells`, so the probe passes them; see [`SlotBinder::probe_lent`].)
 ///
-///   The ONE residual the probe cannot pre-catch is a `Set` (bind) onto an already-
-///   `Bound`-DIFFERENT slot ([`SlotConflict`](Error::SlotConflict)): the conflicting
-///   value lives inside an unsevered `Checkout` and the probe never severs to read
-///   it. Such a conflict still fires in phase 2 — after phase 1 may have severed
-///   OTHER elements' sources. This is a misuse case (`bind` is set-once; re-binding
-///   an already-bound slot to a different buffer is the error), and it never affects
-///   the motivating paths (the crossed swap uses `mutate`, absent-tag / checked-out
-///   are fully covered). `mutate` has no `SlotConflict` leg, so `mutate_call` is
-///   fully all-or-nothing.
-///
 /// - **PHASE 1 — sever all sources (`into_value`).** With the probe having proved
 ///   every element bindable, resolve each source: a `Checkout` severs its home
 ///   HERE (`Lent → Severed`), before any fold. This is what makes the crossed swap
 ///   `mutate_call((In(out_co), Out(in_co)))` work — both source slots are `Severed`
 ///   BEFORE either target is rebound, so neither rebind hits a still-`Lent` slot.
 ///
-/// - **PHASE 2 — fold each resolved value.** `?` keeps first-error-stops semantics;
-///   with phase 0 already vetted, the only error phase 2 can now surface is the
-///   documented `Set`/`SlotConflict` residual.
-macro_rules! bind_all_body {
-    ($g:ident, $mode:expr, $($name:ident),+) => {{
+/// - **PHASE 2 — fold each resolved value.** With phase 0 already vetting every
+///   element and mutate having no conflict leg, phase 2 cannot surface a new error.
+macro_rules! mutate_all_body {
+    ($g:ident, $($name:ident),+) => {{
         // PHASE 0a — the crossed-swap recogniser: which slot cells phase 1 will
         // sever (Checkout sources contribute their home cell id; raw values `None`).
         // Read-only — `source_cell_id` borrows, never consumes.
@@ -2804,17 +2795,16 @@ macro_rules! bind_all_body {
             [ $( $name.source_cell_id() ),+ ].into_iter().flatten().collect();
         // PHASE 0b — probe EVERY element (read-only). Any failure returns here
         // having severed / mutated NOTHING (the all-or-nothing guarantee).
-        $( $g.probe_bind::<$name>($mode, &severable)?; )+
+        $( $g.probe_bind::<$name>(BindMode::Mutate, &severable)?; )+
         // PHASE 1 — sever all Checkout sources first (see macro doc).
         $( let $name = $name.into_value(); )+
-        // PHASE 2 — fold each resolved value; `?` stops at the first (now only the
-        // residual Set/SlotConflict) error.
-        $( $g.fold_bind::<$name>($name, $mode)?; )+
+        // PHASE 2 — fold each resolved value (mutate has no conflict → cannot error).
+        $( $g.fold_bind::<$name>($name, BindMode::Mutate)?; )+
     }};
 }
 
 /// Implement [`BindAll`] for one tuple arity. Each element is a `Tag` whose `Value`
-/// is `SlotEq` (the buffer-handle equality the set-once leg needs).
+/// is `SlotEq` (buffer-handle equality) + `SlotValue`.
 macro_rules! impl_bind_all_tuple {
     ($($name:ident),+ $(,)?) => {
         impl<$($name),+> BindAll for ($($name,)+)
@@ -2822,15 +2812,9 @@ macro_rules! impl_bind_all_tuple {
             $( $name: Tag, $name::Value: SlotEq + SlotValue, )+
         {
             #[allow(non_snake_case)]
-            fn bind_all<Op: DeviceOp>(self, g: &Op) -> Result<()> {
-                let ($($name,)+) = self;
-                bind_all_body!(g, BindMode::Set, $($name),+);
-                Ok(())
-            }
-            #[allow(non_snake_case)]
             fn mutate_all<Op: DeviceOp>(self, g: &Op) -> Result<()> {
                 let ($($name,)+) = self;
-                bind_all_body!(g, BindMode::Mutate, $($name),+);
+                mutate_all_body!(g, $($name),+);
                 Ok(())
             }
         }
@@ -3631,7 +3615,7 @@ impl<T, M: MemMode> Pipe<DeviceSliceUninit<T, M>> {
     pub fn write<S>(self, src: S) -> WriteDeviceUninit<T, M>
     where
         T: Send + Sync + 'static,
-        M: HostUploadable + HostWritable + Send + 'static,
+        M: HostWritable + Send + 'static,
         S: Into<UploadSource<T>>,
     {
         write_device_uninit(self, src)
