@@ -1905,11 +1905,7 @@ pub trait DeviceOp: Send {
     /// Default: clear own cache if it intersects; combinators override to recurse.
     fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
         if let Some(cache) = self.cb_cache() {
-            let mut guard = cache.lock().unwrap();
-            let stale = guard.as_ref().is_some_and(|cb| cb.depends_on_any(mutated));
-            if stale {
-                *guard = None;
-            }
+            cb_cache_invalidate(cache, mutated);
         }
     }
 
@@ -1922,10 +1918,8 @@ pub trait DeviceOp: Send {
     /// push own id if homed; combinators override to recurse into children.
     #[doc(hidden)]
     fn collect_cb_ids(&self, out: &mut Vec<usize>) {
-        if let Some(cache) = self.cb_cache()
-            && let Some(arc) = cache.lock().unwrap().as_ref()
-        {
-            out.push(std::sync::Arc::as_ptr(arc) as usize);
+        if let Some(cache) = self.cb_cache() {
+            cb_cache_collect_id(cache, out);
         }
     }
 

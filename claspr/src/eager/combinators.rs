@@ -309,23 +309,15 @@ where
     }
 
     fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
-        // Clear this chain's own homed CB iff it depends on a mutated slot, then
-        // recurse into both children (a CB homed in either sub-position is checked
-        // against `mutated` at its own node).
-        {
-            let mut g = self.cb_cache.lock().unwrap();
-            if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
-                *g = None;
-            }
-        }
+        // Own CB, then recurse into both children (a CB homed in either sub-position
+        // is checked against `mutated` at its own node).
+        cb_cache_invalidate(&self.cb_cache, mutated);
         self.source.invalidate_cbs(mutated);
         self.next.invalidate_cbs(mutated);
     }
 
     fn collect_cb_ids(&self, out: &mut Vec<usize>) {
-        if let Some(arc) = self.cb_cache.lock().unwrap().as_ref() {
-            out.push(std::sync::Arc::as_ptr(arc) as usize);
-        }
+        cb_cache_collect_id(&self.cb_cache, out);
         self.source.collect_cb_ids(out);
         self.next.collect_cb_ids(out);
     }
@@ -821,19 +813,12 @@ where
     }
 
     fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
-        {
-            let mut g = self.cb_cache.lock().unwrap();
-            if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
-                *g = None;
-            }
-        }
+        cb_cache_invalidate(&self.cb_cache, mutated);
         self.source.invalidate_cbs(mutated);
     }
 
     fn collect_cb_ids(&self, out: &mut Vec<usize>) {
-        if let Some(arc) = self.cb_cache.lock().unwrap().as_ref() {
-            out.push(std::sync::Arc::as_ptr(arc) as usize);
-        }
+        cb_cache_collect_id(&self.cb_cache, out);
         self.source.collect_cb_ids(out);
     }
 
@@ -1044,19 +1029,12 @@ where
     }
 
     fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
-        {
-            let mut g = self.cb_cache.lock().unwrap();
-            if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
-                *g = None;
-            }
-        }
+        cb_cache_invalidate(&self.cb_cache, mutated);
         self.source.invalidate_cbs(mutated);
     }
 
     fn collect_cb_ids(&self, out: &mut Vec<usize>) {
-        if let Some(arc) = self.cb_cache.lock().unwrap().as_ref() {
-            out.push(std::sync::Arc::as_ptr(arc) as usize);
-        }
+        cb_cache_collect_id(&self.cb_cache, out);
         self.source.collect_cb_ids(out);
     }
 
@@ -1371,19 +1349,12 @@ macro_rules! impl_eager_bundle {
             }
 
             fn invalidate_cbs(&self, mutated: &::std::collections::BTreeSet<usize>) {
-                {
-                    let mut g = self.cb_cache.lock().unwrap();
-                    if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
-                        *g = None;
-                    }
-                }
+                $crate::eager::cb_cache_invalidate(&self.cb_cache, mutated);
                 $(self.$field.invalidate_cbs(mutated);)+
             }
 
             fn collect_cb_ids(&self, out: &mut ::std::vec::Vec<usize>) {
-                if let Some(arc) = self.cb_cache.lock().unwrap().as_ref() {
-                    out.push(::std::sync::Arc::as_ptr(arc) as usize);
-                }
+                $crate::eager::cb_cache_collect_id(&self.cb_cache, out);
                 $(self.$field.collect_cb_ids(out);)+
             }
         }
@@ -1670,21 +1641,14 @@ where
     }
 
     fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
-        {
-            let mut g = self.cb_cache.lock().unwrap();
-            if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
-                *g = None;
-            }
-        }
+        cb_cache_invalidate(&self.cb_cache, mutated);
         for op in &self.ops {
             op.invalidate_cbs(mutated);
         }
     }
 
     fn collect_cb_ids(&self, out: &mut Vec<usize>) {
-        if let Some(arc) = self.cb_cache.lock().unwrap().as_ref() {
-            out.push(std::sync::Arc::as_ptr(arc) as usize);
-        }
+        cb_cache_collect_id(&self.cb_cache, out);
         for op in &self.ops {
             op.collect_cb_ids(out);
         }

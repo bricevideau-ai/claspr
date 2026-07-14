@@ -38,6 +38,28 @@ pub fn new_cb_cache() -> CbCache {
     Arc::new(Mutex::new(None))
 }
 
+/// Clear this node's OWN homed CB iff it baked a buffer/scalar traceable to a mutated
+/// slot (`captured_slots ∩ mutated ≠ ∅`). The own-cache half of
+/// [`invalidate_cbs`](DeviceOp::invalidate_cbs); each CB-homing combinator calls this
+/// on its `cb_cache` field then recurses into its own children (the recursion shape —
+/// `source`/`next`, a field list, or `self.ops` — is the part that legitimately varies
+/// per combinator, so it stays explicit at the call site).
+pub fn cb_cache_invalidate(cache: &CbCache, mutated: &std::collections::BTreeSet<usize>) {
+    let mut g = cache.lock().unwrap();
+    if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
+        *g = None;
+    }
+}
+
+/// Push this node's OWN homed [`FinalizedCb`](crate::record::FinalizedCb) identity
+/// (`Arc::as_ptr`) into `out`, if it currently holds one. The own-cache half of
+/// [`collect_cb_ids`](DeviceOp::collect_cb_ids); the caller recurses into its children.
+pub fn cb_cache_collect_id(cache: &CbCache, out: &mut Vec<usize>) {
+    if let Some(arc) = cache.lock().unwrap().as_ref() {
+        out.push(Arc::as_ptr(arc) as usize);
+    }
+}
+
 // ── CB-mode fork helpers (design v2, CB-as-EXECUTION-MODE) ───────────────────
 //
 // These are the shared primitives the per-node fork uses so every CB-capable op's
