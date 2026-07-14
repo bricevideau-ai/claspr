@@ -338,6 +338,21 @@ where
 ///
 /// This is what makes host-seam graphs segment into sub-tree CBs: the seam feeds
 /// its device source through here in `Off`, so the source span becomes its own CB.
+/// Whether `child` should be run as ONE command buffer at THIS boundary — the shared
+/// eligibility gate of [`cb_exec_child`] / [`cb_gather_child`]. True iff we are in
+/// [`Off`](CbWalk::Off) (not already inside a CB), the child homes a CB, its whole
+/// subtree is CB-eligible ([`cb_graph_eligible`]), and it holds `>= 2` commands.
+///
+/// The `>= 2` cutoff: a single-command span runs per-op — a CB holding one command is
+/// pure create/finalize/enqueue overhead with no batching benefit. Exact here (the
+/// boundaried span IS the whole child subtree).
+fn cb_should_open_boundary<O: DeviceOp>(child: &O, ec: &ExecutionContext<'_>) -> bool {
+    matches!(ec.cb(), CbWalk::Off)
+        && child.cb_cache().is_some()
+        && cb_graph_eligible(child, ec)
+        && child.cbable_weight() >= 2
+}
+
 pub(crate) fn cb_exec_child<O: DeviceOp>(
     child: &O,
     ec: &ExecutionContext<'_>,
@@ -348,14 +363,7 @@ pub(crate) fn cb_exec_child<O: DeviceOp>(
         // (it opens its own fresh boundary if eligible). Never add to a sealed CB.
         return cb_exec_child(child, &ec.with_cb(CbWalk::Off), mode);
     }
-    if matches!(ec.cb(), CbWalk::Off)
-        && child.cb_cache().is_some()
-        && cb_graph_eligible(child, ec)
-        // >= 2: a single-command span runs per-op — a CB holding one command is pure
-        // create/finalize/enqueue overhead with no batching benefit. Exact here (the
-        // boundaried span IS the whole child subtree).
-        && child.cbable_weight() >= 2
-    {
+    if cb_should_open_boundary(child, ec) {
         cb_boundary_execute(child, ec, mode)
     } else {
         child.execute(ec, mode)
@@ -383,12 +391,7 @@ where
         // `Off` (opens its own fresh boundary if eligible).
         return cb_gather_child(child, &ec.with_cb(CbWalk::Off), mode);
     }
-    if matches!(ec.cb(), CbWalk::Off)
-        && child.cb_cache().is_some()
-        && cb_graph_eligible(child, ec)
-        // >= 2: single-command span runs per-op (see cb_exec_child). Exact here.
-        && child.cbable_weight() >= 2
-    {
+    if cb_should_open_boundary(child, ec) {
         cb_boundary_gather(child, ec, mode)
     } else {
         child.gather_checkouts(ec, mode)
