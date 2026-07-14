@@ -956,10 +956,7 @@ impl<'a, T, M: MemMode + HostReadable> MapOp<'a, T, M> {
     /// cross-queue chain ordering before then.
     pub fn submit_on<L: Launcher>(self, launcher: &L) -> Result<MappedReadPending<'a, T, M>> {
         let (guard, event) = MappedReadGuard::enqueue_map(self.owner, launcher, false)?;
-        Ok(MappedReadPending {
-            guard: Some(guard),
-            event,
-        })
+        Ok(crate::map_primitive::MapPending::new(guard, event))
     }
 }
 
@@ -997,88 +994,28 @@ impl<'a, T, M: MemMode + HostWritable + HostReadable> MapMutOp<'a, T, M> {
     /// returns a [`MappedWritePending`] carrying the map event.
     pub fn submit_on<L: Launcher>(self, launcher: &L) -> Result<MappedWritePending<'a, T, M>> {
         let (guard, event) = MappedWriteGuard::enqueue_map(self.owner, launcher, false)?;
-        Ok(MappedWritePending {
-            guard: Some(guard),
-            event,
-        })
+        Ok(crate::map_primitive::MapPending::new(guard, event))
     }
 }
 
 // ── Map pendings (non-blocking submit results) ─────────────────────
 
-/// Result of [`MapOp::submit`] — a non-blocking SVM read map in
-/// flight. The map enqueue has returned; the bytes are NOT
-/// spec-valid for host reads until the map event completes.
+/// Result of [`MapOp::submit`] — a non-blocking SVM read map in flight. The map
+/// enqueue has returned; the bytes are NOT spec-valid for host reads until the map
+/// event completes. A [`MapPending`](crate::map_primitive::MapPending) over a
+/// [`MappedReadGuard`]: [`wait`](crate::map_primitive::MapPending::wait) blocks on the
+/// event and yields the guard; [`event`](crate::map_primitive::MapPending::event)
+/// borrows the map event for cross-queue chaining first.
 ///
-/// Consume via [`wait`](Self::wait) to block on the event and get
-/// the [`MappedReadGuard`]; use [`event`](Self::event) before that
-/// if you need to thread the map event into a cross-queue chain.
-pub struct MappedReadPending<'a, T, M: MemMode> {
-    guard: Option<MappedReadGuard<'a, T, M>>,
-    event: Event,
-}
+/// (No explicit `Drop`: if the pending is dropped without `wait`, the guard inside
+/// `MapPending`'s `Option` drops — enqueuing the unmap on the same in-order queue, its
+/// event registered on `last_use` so SVMFree waits on it.)
+pub type MappedReadPending<'a, T, M> = crate::map_primitive::MapPending<MappedReadGuard<'a, T, M>>;
 
-impl<'a, T, M: MemMode> MappedReadPending<'a, T, M> {
-    /// Borrow the map [`Event`] — for `.after(&evt)` chaining on a
-    /// dependent enqueue without blocking the host. Calling this
-    /// does not consume the pending; the guard is still produced by
-    /// [`wait`](Self::wait).
-    pub fn event(&self) -> &Event {
-        &self.event
-    }
-
-    /// Block on the map event and return the [`MappedReadGuard`].
-    /// After this returns Ok, the guard's `Deref<Target=[T]>` is
-    /// safe to read.
-    pub fn wait(mut self) -> Result<MappedReadGuard<'a, T, M>> {
-        self.event.wait()?;
-        Ok(self
-            .guard
-            .take()
-            .expect("MappedReadPending::wait called twice"))
-    }
-}
-
-impl<T, M: MemMode> Drop for MappedReadPending<'_, T, M> {
-    fn drop(&mut self) {
-        // If the user dropped the pending without calling .wait(),
-        // the embedded guard still drops below — which enqueues the
-        // unmap. That's correct: the map enqueued, the unmap follows
-        // on the same queue (in-order semantics on that queue
-        // serialise them), and the unmap event is registered on
-        // last_use so SVMFree waits on it.
-    }
-}
-
-/// Result of [`MapMutOp::submit`] — a non-blocking SVM read+write
-/// map in flight. Same shape as [`MappedReadPending`] but the
-/// resulting guard is [`MappedWriteGuard`] (DerefMut to `&mut [T]`).
-pub struct MappedWritePending<'a, T, M: MemMode> {
-    guard: Option<MappedWriteGuard<'a, T, M>>,
-    event: Event,
-}
-
-impl<'a, T, M: MemMode> MappedWritePending<'a, T, M> {
-    /// See [`MappedReadPending::event`].
-    pub fn event(&self) -> &Event {
-        &self.event
-    }
-
-    /// See [`MappedReadPending::wait`].
-    pub fn wait(mut self) -> Result<MappedWriteGuard<'a, T, M>> {
-        self.event.wait()?;
-        Ok(self
-            .guard
-            .take()
-            .expect("MappedWritePending::wait called twice"))
-    }
-}
-
-impl<T, M: MemMode> Drop for MappedWritePending<'_, T, M> {
-    fn drop(&mut self) {
-        // See MappedReadPending::drop.
-    }
-}
+/// Result of [`MapMutOp::submit`] — the read/write twin of [`MappedReadPending`],
+/// yielding a [`MappedWriteGuard`] (`DerefMut` to `&mut [T]`).
+pub type MappedWritePending<'a, T, M> =
+    crate::map_primitive::MapPending<MappedWriteGuard<'a, T, M>>;
 
 // ── Map guards ──────────────────────────────────────────────────────
 

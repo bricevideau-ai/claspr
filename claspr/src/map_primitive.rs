@@ -43,6 +43,44 @@ use opencl3::types::{
 use std::ffi::c_void;
 use std::ptr;
 
+/// A non-blocking map in flight: a map guard `G` whose backing map is still
+/// enqueued, plus the map `Event`. Returned by every `*::submit` map op — the four
+/// families (`cl_mem` read/write, SVM read/write) differ only in the guard type `G`,
+/// so they are all type aliases of this one shape (see `DeviceMapReadPending`,
+/// `MappedWritePending`, …). `event()` borrows the map event for cross-queue chain
+/// ordering without consuming; `wait()` blocks then yields the guard.
+///
+/// The guard is held in an `Option` so `wait` can move it out; if the pending is
+/// dropped WITHOUT `wait`, the `Option<G>`'s own drop glue drops the guard (which
+/// enqueues the unmap on the same in-order queue) — so no explicit `Drop` is needed.
+pub struct MapPending<G> {
+    guard: Option<G>,
+    event: Event,
+}
+
+impl<G> MapPending<G> {
+    /// Wrap a freshly-enqueued map guard + its event.
+    pub fn new(guard: G, event: Event) -> Self {
+        MapPending {
+            guard: Some(guard),
+            event,
+        }
+    }
+
+    /// Borrow the map [`Event`] for `.after(&evt)` cross-queue chaining, without
+    /// consuming the pending (`wait` still yields the guard).
+    pub fn event(&self) -> &Event {
+        &self.event
+    }
+
+    /// Block on the map event, then return the guard. After `Ok`, the guard's
+    /// `Deref` target is safe to access.
+    pub fn wait(mut self) -> Result<G> {
+        self.event.wait()?;
+        Ok(self.guard.take().expect("MapPending::wait called twice"))
+    }
+}
+
 fn cl_to_err(code: cl_int) -> Error {
     Error::OpenCl(ClError(code))
 }

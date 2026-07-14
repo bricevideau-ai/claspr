@@ -1116,10 +1116,7 @@ impl<'a, T, M: MemMode + HostReadable> DeviceMapOp<'a, T, M> {
     /// into a cross-queue chain first.
     pub fn submit_on<L: Launcher>(self, launcher: &L) -> Result<DeviceMapReadPending<'a, T, M>> {
         let (guard, event) = DeviceMappedReadGuard::enqueue_map(self.owner, launcher, false)?;
-        Ok(DeviceMapReadPending {
-            guard: Some(guard),
-            event,
-        })
+        Ok(crate::map_primitive::MapPending::new(guard, event))
     }
 }
 
@@ -1158,60 +1155,23 @@ impl<'a, T, M: MemMode + HostWritable + HostReadable> DeviceMapMutOp<'a, T, M> {
     /// Non-blocking terminal with an explicit launcher.
     pub fn submit_on<L: Launcher>(self, launcher: &L) -> Result<DeviceMapWritePending<'a, T, M>> {
         let (guard, event) = DeviceMappedWriteGuard::enqueue_map(self.owner, launcher, false)?;
-        Ok(DeviceMapWritePending {
-            guard: Some(guard),
-            event,
-        })
+        Ok(crate::map_primitive::MapPending::new(guard, event))
     }
 }
 
-/// Result of [`DeviceMapOp::submit`] — a non-blocking
-/// `clEnqueueMapBuffer` in flight. The pointer was set synchronously
-/// inside the call but the bytes are NOT spec-valid for host reads
-/// until the map event completes.
-pub struct DeviceMapReadPending<'a, T, M: MemMode> {
-    guard: Option<DeviceMappedReadGuard<'a, T, M>>,
-    event: Event,
-}
+/// Result of [`DeviceMapOp::submit`] — a non-blocking `clEnqueueMapBuffer` in
+/// flight. The pointer was set synchronously inside the call but the bytes are NOT
+/// spec-valid for host reads until the map event completes. A
+/// [`MapPending`](crate::map_primitive::MapPending) over a [`DeviceMappedReadGuard`]:
+/// `event()` borrows the map event for cross-queue chaining, `wait()` yields the
+/// guard (`Deref<Target = [T]>`).
+pub type DeviceMapReadPending<'a, T, M> =
+    crate::map_primitive::MapPending<DeviceMappedReadGuard<'a, T, M>>;
 
-impl<'a, T, M: MemMode> DeviceMapReadPending<'a, T, M> {
-    /// Borrow the map [`Event`] for cross-queue chain ordering before
-    /// consuming the pending.
-    pub fn event(&self) -> &Event {
-        &self.event
-    }
-
-    /// Block on the map event and return the
-    /// [`DeviceMappedReadGuard`]. After Ok return the guard's
-    /// `Deref<Target = [T]>` is safe to read.
-    pub fn wait(mut self) -> Result<DeviceMappedReadGuard<'a, T, M>> {
-        self.event.wait()?;
-        Ok(self
-            .guard
-            .take()
-            .expect("DeviceMapReadPending::wait called twice"))
-    }
-}
-
-/// Result of [`DeviceMapMutOp::submit`] — same shape as
-/// [`DeviceMapReadPending`] but yields a [`DeviceMappedWriteGuard`].
-pub struct DeviceMapWritePending<'a, T, M: MemMode> {
-    guard: Option<DeviceMappedWriteGuard<'a, T, M>>,
-    event: Event,
-}
-
-impl<'a, T, M: MemMode> DeviceMapWritePending<'a, T, M> {
-    pub fn event(&self) -> &Event {
-        &self.event
-    }
-    pub fn wait(mut self) -> Result<DeviceMappedWriteGuard<'a, T, M>> {
-        self.event.wait()?;
-        Ok(self
-            .guard
-            .take()
-            .expect("DeviceMapWritePending::wait called twice"))
-    }
-}
+/// Result of [`DeviceMapMutOp::submit`] — the read/write twin of
+/// [`DeviceMapReadPending`], yielding a [`DeviceMappedWriteGuard`].
+pub type DeviceMapWritePending<'a, T, M> =
+    crate::map_primitive::MapPending<DeviceMappedWriteGuard<'a, T, M>>;
 
 /// RAII guard for a `cl_mem` read map. Drop issues
 /// `clEnqueueUnmapMemObject` and discards the unmap event (OpenCL
