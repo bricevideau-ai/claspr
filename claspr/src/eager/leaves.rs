@@ -2101,362 +2101,157 @@ where
 // map/unmap primitive that survives in `host_view.rs`). None of these has a
 // native blocking enqueue (the map/unmap is always non-blocking `false`), so
 // `mode` is ignored.
+//
+// Each acquire/release leaf is the same shape — resolve the input, delegate its
+// one map/unmap enqueue to the host-view builder's `run(ec, deps)`, deposit — so
+// two stampers emit them. `impl_acquire_view!` (input is a buffer, output a view,
+// forwards `bind_slots` since the buffer may be a `slot!()`); `impl_release_view!`
+// (input is a view — never a slot — output the buffer back). Bounds vary per family
+// (device vs SVM) so they pass as a trailing `where` fragment, like
+// `impl_alloc_uninit!`.
 
-// ── Leaf: acquire a read/write DeviceSlice host view ────────────────────────
+/// Stamp an acquire-host-view leaf (buffer → view, via `$delegate`). `$tb` / `$mb`
+/// are the full `T` / `M` bound fragments (they differ device vs SVM, read vs rw).
+macro_rules! impl_acquire_view {
+    ($Op:ident, $ctor:ident, $In:ty, $Out:ty, $delegate:ident, $label:literal,
+     T: {$($tb:tt)+}, M: {$($mb:tt)+}) => {
+        #[doc = concat!("Graph leaf: acquire a host view via `", stringify!($delegate),
+            "`. Build via [`", stringify!($ctor), "`].")]
+        pub struct $Op<T, M: MemMode> {
+            buf: Input<$In>,
+            out: Pipe<$Out>,
+        }
 
-/// Acquire a read/write host view of an upstream `DeviceSlice` via a
-/// non-blocking `clEnqueueMapBuffer`. Output is the owned
-/// [`DeviceSliceHostView`]. No native blocking enqueue — `mode` ignored.
-/// Delegates to the `AcquireDeviceSliceOp` body via `acquire_host_view`.
-pub struct AcquireDeviceView<T, M: MemMode> {
-    buf: Input<DeviceSlice<T, M>>,
-    out: Pipe<DeviceSliceHostView<T, M, MapReadWrite>>,
+        #[doc = concat!("Build an eager `", stringify!($Op), "` leaf.")]
+        pub fn $ctor<T, M>(buf: impl Into<Input<$In>>) -> $Op<T, M>
+        where
+            T: $($tb)+,
+            M: $($mb)+,
+        {
+            $Op { buf: buf.into(), out: Pipe::new() }
+        }
+
+        impl<T, M> DeviceOp for $Op<T, M>
+        where
+            T: $($tb)+,
+            M: $($mb)+,
+        {
+            type Output = $Out;
+            fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
+                Some(self.out.clone())
+            }
+            fn handle(&self) -> Self::Handle {
+                self.out.clone()
+            }
+            fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+                // Delegate the one map enqueue (always non-blocking — `mode` ignored).
+                let (buf, deps) = self.buf.resolve(ec)?;
+                let (view, out_deps) = buf.$delegate().run(ec, deps)?;
+                self.out.put(view, out_deps);
+                Ok(())
+            }
+            fn check_ready(&self) -> Result<()> {
+                self.buf.check_ready()
+            }
+            fn bind_slots(&self, binder: &mut SlotBinder) {
+                // The viewed buffer may be a `slot!()` operand (concrete/pipe: no-op).
+                self.buf.try_bind_slot(binder);
+            }
+            fn describe(&self, out: &mut Vec<String>) {
+                out.push($label.into());
+            }
+        }
+    };
 }
 
-/// Build an eager acquire-read/write-view leaf over an upstream `DeviceSlice`.
-pub fn acquire_device_view<T, M>(
-    buf: impl Into<Input<DeviceSlice<T, M>>>,
-) -> AcquireDeviceView<T, M>
-where
-    T: Send + 'static,
-    M: MemMode + HostWritable + HostReadable,
-{
-    AcquireDeviceView {
-        buf: buf.into(),
-        out: Pipe::new(),
-    }
+/// Stamp a release-host-view leaf (view → buffer, via `release_to_device`). A view
+/// input is never a slot operand, so no `bind_slots`. Generic over the view's
+/// map-access mode `A`.
+macro_rules! impl_release_view {
+    ($Op:ident, $ctor:ident, $View:ty, $Out:ty, $label:literal, M: {$($mb:tt)+}) => {
+        #[doc = concat!("Graph leaf: release a host view back to its buffer. Build via [`",
+            stringify!($ctor), "`].")]
+        pub struct $Op<T, M: MemMode, A: MapAccess> {
+            view: Input<$View>,
+            out: Pipe<$Out>,
+        }
+
+        #[doc = concat!("Build an eager `", stringify!($Op), "` leaf.")]
+        pub fn $ctor<T, M, A>(view: impl Into<Input<$View>>) -> $Op<T, M, A>
+        where
+            T: Send + 'static,
+            M: $($mb)+,
+            A: MapAccess,
+        {
+            $Op { view: view.into(), out: Pipe::new() }
+        }
+
+        impl<T, M, A> DeviceOp for $Op<T, M, A>
+        where
+            T: Send + 'static,
+            M: $($mb)+,
+            A: MapAccess,
+        {
+            type Output = $Out;
+            fn output_pipe(&self) -> Option<Pipe<$Out>> {
+                Some(self.out.clone())
+            }
+            fn handle(&self) -> Self::Handle {
+                self.out.clone()
+            }
+            fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+                let (view, deps) = self.view.resolve(ec)?;
+                let (buf, out_deps) = view.release_to_device().run(ec, deps)?;
+                self.out.put(buf, out_deps);
+                Ok(())
+            }
+            fn check_ready(&self) -> Result<()> {
+                self.view.check_ready()
+            }
+            fn describe(&self, out: &mut Vec<String>) {
+                out.push($label.into());
+            }
+        }
+    };
 }
 
-impl<T, M> DeviceOp for AcquireDeviceView<T, M>
-where
-    T: Send + 'static,
-    M: MemMode + HostWritable + HostReadable,
-{
-    type Output = DeviceSliceHostView<T, M, MapReadWrite>;
+impl_acquire_view!(
+    AcquireDeviceView, acquire_device_view,
+    DeviceSlice<T, M>, DeviceSliceHostView<T, M, MapReadWrite>,
+    acquire_host_view, "acquire_device_view",
+    T: {Send + 'static}, M: {MemMode + HostWritable + HostReadable}
+);
+impl_acquire_view!(
+    AcquireDeviceViewRead, acquire_device_view_read,
+    DeviceSlice<T, M>, DeviceSliceHostView<T, M, MapReadOnly>,
+    acquire_host_view_read, "acquire_device_view_read",
+    T: {Send + 'static}, M: {MemMode + HostReadable}
+);
+impl_release_view!(
+    ReleaseDeviceView, release_device_view,
+    DeviceSliceHostView<T, M, A>, DeviceSlice<T, M>,
+    "release_device_view", M: {MemMode}
+);
 
-    fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
-        Some(self.out.clone())
-    }
-
-    fn handle(&self) -> Self::Handle {
-        self.out.clone()
-    }
-
-    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve(ec)?;
-        // Delegate to the old op's verbatim map body (map/unmap is always
-        // non-blocking — mode ignored).
-        let (view, out_deps) = buf.acquire_host_view().run(ec, deps)?;
-        self.out.put(view, out_deps);
-        Ok(())
-    }
-
-    fn check_ready(&self) -> Result<()> {
-        self.buf.check_ready()
-    }
-
-    fn bind_slots(&self, binder: &mut SlotBinder) {
-        // The viewed buffer may be a `slot!()` operand (concrete/pipe: no-op).
-        self.buf.try_bind_slot(binder);
-    }
-
-    fn describe(&self, out: &mut Vec<String>) {
-        out.push("acquire_device_view".into());
-    }
-}
-
-// ── Leaf: acquire a read-only DeviceSlice host view ─────────────────────────
-
-/// Acquire a read-only host view of an upstream `DeviceSlice`
-/// (`clEnqueueMapBuffer(CL_MAP_READ)`). Output is the owned
-/// [`DeviceSliceHostView`]. No native blocking enqueue — `mode` ignored.
-pub struct AcquireDeviceViewRead<T, M: MemMode> {
-    buf: Input<DeviceSlice<T, M>>,
-    out: Pipe<DeviceSliceHostView<T, M, MapReadOnly>>,
-}
-
-/// Build an eager acquire-read-only-view leaf over an upstream `DeviceSlice`.
-pub fn acquire_device_view_read<T, M>(
-    buf: impl Into<Input<DeviceSlice<T, M>>>,
-) -> AcquireDeviceViewRead<T, M>
-where
-    T: Send + 'static,
-    M: MemMode + HostReadable,
-{
-    AcquireDeviceViewRead {
-        buf: buf.into(),
-        out: Pipe::new(),
-    }
-}
-
-impl<T, M> DeviceOp for AcquireDeviceViewRead<T, M>
-where
-    T: Send + 'static,
-    M: MemMode + HostReadable,
-{
-    type Output = DeviceSliceHostView<T, M, MapReadOnly>;
-
-    fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
-        Some(self.out.clone())
-    }
-
-    fn handle(&self) -> Self::Handle {
-        self.out.clone()
-    }
-
-    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve(ec)?;
-        let (view, out_deps) = buf.acquire_host_view_read().run(ec, deps)?;
-        self.out.put(view, out_deps);
-        Ok(())
-    }
-
-    fn check_ready(&self) -> Result<()> {
-        self.buf.check_ready()
-    }
-
-    fn bind_slots(&self, binder: &mut SlotBinder) {
-        // The viewed buffer may be a `slot!()` operand (concrete/pipe: no-op).
-        self.buf.try_bind_slot(binder);
-    }
-
-    fn describe(&self, out: &mut Vec<String>) {
-        out.push("acquire_device_view_read".into());
-    }
-}
-
-// ── Leaf: release a DeviceSlice host view back to the device ─────────────────
-
-/// Enqueue `clEnqueueUnmapMemObject` for an upstream
-/// [`DeviceSliceHostView`] and yield the [`DeviceSlice`] back. No native
-/// blocking enqueue — `mode` ignored. Generic over the view's map-access mode.
-pub struct ReleaseDeviceView<T, M: MemMode, A: MapAccess> {
-    view: Input<DeviceSliceHostView<T, M, A>>,
-    out: Pipe<DeviceSlice<T, M>>,
-}
-
-/// Build an eager release-view leaf over an upstream `DeviceSliceHostView`.
-pub fn release_device_view<T, M, A>(
-    view: impl Into<Input<DeviceSliceHostView<T, M, A>>>,
-) -> ReleaseDeviceView<T, M, A>
-where
-    T: Send + 'static,
-    M: MemMode,
-    A: MapAccess,
-{
-    ReleaseDeviceView {
-        view: view.into(),
-        out: Pipe::new(),
-    }
-}
-
-impl<T, M, A> DeviceOp for ReleaseDeviceView<T, M, A>
-where
-    T: Send + 'static,
-    M: MemMode,
-    A: MapAccess,
-{
-    type Output = DeviceSlice<T, M>;
-
-    fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
-        Some(self.out.clone())
-    }
-
-    fn handle(&self) -> Self::Handle {
-        self.out.clone()
-    }
-
-    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (view, deps) = self.view.resolve(ec)?;
-        let (buf, out_deps) = view.release_to_device().run(ec, deps)?;
-        self.out.put(buf, out_deps);
-        Ok(())
-    }
-
-    fn check_ready(&self) -> Result<()> {
-        self.view.check_ready()
-    }
-
-    fn describe(&self, out: &mut Vec<String>) {
-        out.push("release_device_view".into());
-    }
-}
-
-// ── Leaf: acquire a read/write MappedSlice (SVM) host view ──────────────────
-
-/// Acquire a read/write SVM host view of an upstream `MappedSlice` via a
-/// non-blocking `clEnqueueSVMMap`. No native blocking enqueue — `mode` ignored.
-pub struct AcquireMappedView<T, M: MemMode> {
-    buf: Input<MappedSlice<T, M>>,
-    out: Pipe<MappedSliceHostView<T, M, MapReadWrite>>,
-}
-
-/// Build an eager acquire-read/write-SVM-view leaf over a `MappedSlice`.
-pub fn acquire_mapped_view<T, M>(
-    buf: impl Into<Input<MappedSlice<T, M>>>,
-) -> AcquireMappedView<T, M>
-where
-    T: Send + Sync + 'static,
-    M: MemMode + HostWritable + HostReadable,
-{
-    AcquireMappedView {
-        buf: buf.into(),
-        out: Pipe::new(),
-    }
-}
-
-impl<T, M> DeviceOp for AcquireMappedView<T, M>
-where
-    T: Send + Sync + 'static,
-    M: MemMode + HostWritable + HostReadable,
-{
-    type Output = MappedSliceHostView<T, M, MapReadWrite>;
-
-    fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
-        Some(self.out.clone())
-    }
-
-    fn handle(&self) -> Self::Handle {
-        self.out.clone()
-    }
-
-    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve(ec)?;
-        let (view, out_deps) = buf.acquire_host_view().run(ec, deps)?;
-        self.out.put(view, out_deps);
-        Ok(())
-    }
-
-    fn check_ready(&self) -> Result<()> {
-        self.buf.check_ready()
-    }
-
-    fn bind_slots(&self, binder: &mut SlotBinder) {
-        // The viewed buffer may be a `slot!()` operand (concrete/pipe: no-op).
-        self.buf.try_bind_slot(binder);
-    }
-
-    fn describe(&self, out: &mut Vec<String>) {
-        out.push("acquire_mapped_view".into());
-    }
-}
-
-// ── Leaf: acquire a read-only MappedSlice (SVM) host view ───────────────────
-
-/// Acquire a read-only SVM host view of an upstream `MappedSlice`
-/// (`clEnqueueSVMMap(CL_MAP_READ)`). No native blocking enqueue — `mode`
-/// ignored.
-pub struct AcquireMappedViewRead<T, M: MemMode> {
-    buf: Input<MappedSlice<T, M>>,
-    out: Pipe<MappedSliceHostView<T, M, MapReadOnly>>,
-}
-
-/// Build an eager acquire-read-only-SVM-view leaf over a `MappedSlice`.
-pub fn acquire_mapped_view_read<T, M>(
-    buf: impl Into<Input<MappedSlice<T, M>>>,
-) -> AcquireMappedViewRead<T, M>
-where
-    T: Send + Sync + 'static,
-    M: MemMode + HostReadable,
-{
-    AcquireMappedViewRead {
-        buf: buf.into(),
-        out: Pipe::new(),
-    }
-}
-
-impl<T, M> DeviceOp for AcquireMappedViewRead<T, M>
-where
-    T: Send + Sync + 'static,
-    M: MemMode + HostReadable,
-{
-    type Output = MappedSliceHostView<T, M, MapReadOnly>;
-
-    fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
-        Some(self.out.clone())
-    }
-
-    fn handle(&self) -> Self::Handle {
-        self.out.clone()
-    }
-
-    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (buf, deps) = self.buf.resolve(ec)?;
-        let (view, out_deps) = buf.acquire_host_view_read().run(ec, deps)?;
-        self.out.put(view, out_deps);
-        Ok(())
-    }
-
-    fn check_ready(&self) -> Result<()> {
-        self.buf.check_ready()
-    }
-
-    fn bind_slots(&self, binder: &mut SlotBinder) {
-        // The viewed buffer may be a `slot!()` operand (concrete/pipe: no-op).
-        self.buf.try_bind_slot(binder);
-    }
-
-    fn describe(&self, out: &mut Vec<String>) {
-        out.push("acquire_mapped_view_read".into());
-    }
-}
-
-// ── Leaf: release a MappedSlice (SVM) host view back to the device ───────────
-
-/// Enqueue `clEnqueueSVMUnmap` for an upstream [`MappedSliceHostView`] and
-/// yield the [`MappedSlice`] back. No native blocking enqueue — `mode` ignored.
-/// Generic over the view's map-access mode.
-pub struct ReleaseMappedView<T, M: MemMode, A: MapAccess> {
-    view: Input<MappedSliceHostView<T, M, A>>,
-    out: Pipe<MappedSlice<T, M>>,
-}
-
-/// Build an eager release-SVM-view leaf over an upstream `MappedSliceHostView`.
-pub fn release_mapped_view<T, M, A>(
-    view: impl Into<Input<MappedSliceHostView<T, M, A>>>,
-) -> ReleaseMappedView<T, M, A>
-where
-    T: Send + 'static,
-    M: MemMode,
-    A: MapAccess,
-{
-    ReleaseMappedView {
-        view: view.into(),
-        out: Pipe::new(),
-    }
-}
-
-impl<T, M, A> DeviceOp for ReleaseMappedView<T, M, A>
-where
-    T: Send + 'static,
-    M: MemMode,
-    A: MapAccess,
-{
-    type Output = MappedSlice<T, M>;
-
-    fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
-        Some(self.out.clone())
-    }
-
-    fn handle(&self) -> Self::Handle {
-        self.out.clone()
-    }
-
-    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
-        let (view, deps) = self.view.resolve(ec)?;
-        let (buf, out_deps) = view.release_to_device().run(ec, deps)?;
-        self.out.put(buf, out_deps);
-        Ok(())
-    }
-
-    fn check_ready(&self) -> Result<()> {
-        self.view.check_ready()
-    }
-
-    fn describe(&self, out: &mut Vec<String>) {
-        out.push("release_mapped_view".into());
-    }
-}
+// The SVM (MappedSlice) acquire/release family — same stampers as the DeviceSlice
+// family above; the acquire bounds carry the extra `Sync` the SVM path needs.
+impl_acquire_view!(
+    AcquireMappedView, acquire_mapped_view,
+    MappedSlice<T, M>, MappedSliceHostView<T, M, MapReadWrite>,
+    acquire_host_view, "acquire_mapped_view",
+    T: {Send + Sync + 'static}, M: {MemMode + HostWritable + HostReadable}
+);
+impl_acquire_view!(
+    AcquireMappedViewRead, acquire_mapped_view_read,
+    MappedSlice<T, M>, MappedSliceHostView<T, M, MapReadOnly>,
+    acquire_host_view_read, "acquire_mapped_view_read",
+    T: {Send + Sync + 'static}, M: {MemMode + HostReadable}
+);
+impl_release_view!(
+    ReleaseMappedView, release_mapped_view,
+    MappedSliceHostView<T, M, A>, MappedSlice<T, M>,
+    "release_mapped_view", M: {MemMode}
+);
 
 // ── Multi-output leaf: copy_to (src, dst) → (src, dst) ──────────────────────
 //
