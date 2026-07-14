@@ -2479,15 +2479,15 @@ impl<T: Send + 'static, M: MemMode + Send + 'static> CopyHome<USMSlice<T, M>>
 pub struct CopyTo2<Src, Dst>
 where
     Src: CopyTo<Dst>,
-    <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
+    <Src::Op as crate::copy::CopyRun>::Output: CopyOutputs,
 {
     src: Input<Src>,
     dst: Input<Dst>,
     // One element pipe per copy output (move-once storage), mirroring the
     // macro-emitted multi-output kernel. The output tuple is reconstructed from
     // both in `into_output`.
-    src_pipe: Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src>,
-    dst_pipe: Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
+    src_pipe: Pipe<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Src>,
+    dst_pipe: Pipe<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Dst>,
     /// Design-v2 CB home: a copy records `clCommandCopyBufferKHR` (cl_mem↔cl_mem) or
     /// `clCommandSVMMemcpyKHR` (SVM↔SVM) where the extension provides it; a mixed
     /// cl_mem/SVM pair or absent PFN falls back to software.
@@ -2588,7 +2588,7 @@ impl_copy_operand_uninit!(USMSliceUninit);
 pub fn eager_copy_to<Src, Dst, S, D>(src: S, dst: D) -> CopyTo2<Src, Dst>
 where
     Src: CopyTo<Dst>,
-    <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
+    <Src::Op as crate::copy::CopyRun>::Output: CopyOutputs,
     S: CopyOperand<Src>,
     D: CopyOperand<Dst>,
 {
@@ -2610,26 +2610,26 @@ where
     Src: CopyTo<Dst> + Send + crate::record::RecordableBuffer + 'static,
     Dst: Send + crate::record::RecordableBuffer + 'static,
     Src::Op: Send,
-    <Src::Op as crate::eager::DeviceEnqueue>::Output: CopyOutputs,
+    <Src::Op as crate::copy::CopyRun>::Output: CopyOutputs,
     // Each input cell knows how to rehome its (possibly retyped) output: src is
     // identity (never retyped), dst is identity or the Uninit→Init downgrade.
-    Src: CopyHome<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src>,
-    Dst: CopyHome<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
+    Src: CopyHome<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Src>,
+    Dst: CopyHome<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Dst>,
 {
     type Output = (
-        <<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src,
-        <<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst,
+        <<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Src,
+        <<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Dst,
     );
     // Two element pipes, like the multi-output kernel: the downstream closure
     // gets `(pa, pb)` and selects either buffer.
     type Handle = (
-        Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src>,
-        Pipe<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
+        Pipe<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Src>,
+        Pipe<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Dst>,
     );
     // Per-output Checkouts: each side independently readable / into_inner'd.
     type Checkouts = (
-        Checkout<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Src>,
-        Checkout<<<Src::Op as crate::eager::DeviceEnqueue>::Output as CopyOutputs>::Dst>,
+        Checkout<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Src>,
+        Checkout<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Dst>,
     );
 
     fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
@@ -2735,7 +2735,20 @@ where
         // buffer-use registration. ONE enqueue → its returned Deps hold one
         // completion event.
         let op = src.copy_to(dst);
-        let (out, out_deps) = op.run(ec, deps)?;
+        // Use the copy-specific `run_recover` (not the plain `DeviceEnqueue::run`):
+        // a copy CONSUMES its buffers, and we hold their return homes, so on failure
+        // we rehome the recovered buffers to their origin cells — a failed copy
+        // leaves the graph re-runnable, the same anti-stranding invariant the
+        // borrow-path leaves get from `LentGuard` (review finding #1).
+        let (out, out_deps) = match crate::copy::CopyRun::run_recover(op, ec, deps) {
+            Ok(pair) => pair,
+            Err((e, recovered)) => {
+                let (out_src, out_dst) = recovered.into_parts();
+                rehome_consumed(out_src, src_home);
+                rehome_consumed(out_dst, dst_home);
+                return Err(e);
+            }
+        };
         let (out_src, out_dst) = out.into_parts();
         // Clone the completion Dep onto BOTH element pipes so whichever side
         // flows downstream carries the wait-list (and the terminal reconstruct

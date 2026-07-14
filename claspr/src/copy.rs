@@ -82,8 +82,56 @@ use std::ffi::c_void;
 /// ([`CopyTo2`](crate::eager::CopyTo2)) drives it. See the module rustdoc for
 /// the supported pairs.
 pub trait CopyTo<Dst>: Sized {
-    type Op: DeviceEnqueue;
+    type Op: CopyRun;
     fn copy_to(self, dst: Dst) -> Self::Op;
+}
+
+/// The copy ops' fallible enqueue with BUFFER RECOVERY on error — the
+/// copy-specific superset of [`DeviceEnqueue::run`]. A copy CONSUMES its buffers
+/// (the `Uninit → Init` `assume_init` is by-value), and `CopyTo2` holds their
+/// return homes, so a failed copy that just dropped the buffers would strand the
+/// origin cells in `Lent` (review finding #1). This method does the by-value
+/// transition FIRST, then the enqueue, so on failure it hands the recovered,
+/// OUTPUT-typed buffers back — `Err((error, output))` — for `CopyTo2` to rehome.
+///
+/// It lives on its own trait (not on [`DeviceEnqueue`]) so ONLY the copy ops that
+/// hold homes pay for recovery; the host-view acquire/release ops (the other
+/// `DeviceEnqueue` impls) resolve homeless and keep the plain `run`. The blanket
+/// `DeviceEnqueue::run` below delegates here and discards the recovered buffers,
+/// so the non-recovering callers are unchanged.
+pub trait CopyRun: Send + Sized {
+    /// Copy output — the `(src, dst)` pair, dst possibly retyped `Uninit → Init`.
+    type Output: Send;
+    /// See the trait docs. `Ok((output, deps))` or `Err((error, output))`.
+    fn run_recover(
+        self,
+        ec: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> std::result::Result<(Self::Output, Deps), (crate::Error, Self::Output)>;
+    /// CB twin — identical to [`DeviceEnqueue::record_cb`]; copy overrides it.
+    #[allow(clippy::type_complexity)]
+    fn record_cb_recover(
+        self,
+        builder: Option<&crate::record::CbBuilder>,
+        waits: &crate::exec_ctx::SyncPoints,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)>;
+}
+
+// Every `CopyRun` op is also a plain `DeviceEnqueue` (so it still composes in the
+// host-view/copy call sites that want the simple contract): `run` delegates to
+// `run_recover` and drops the recovered buffers on error; `record_cb` forwards.
+impl<O: CopyRun> DeviceEnqueue for O {
+    type Output = <O as CopyRun>::Output;
+    fn run(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+        self.run_recover(ec, deps).map_err(|(e, _buffers)| e)
+    }
+    fn record_cb(
+        self,
+        builder: Option<&crate::record::CbBuilder>,
+        waits: &crate::exec_ctx::SyncPoints,
+    ) -> Option<(Self::Output, Option<crate::cl_sync_point_khr>)> {
+        self.record_cb_recover(builder, waits)
+    }
 }
 
 /// Shared op-state container — one struct, many [`DeviceEnqueue`]
@@ -120,7 +168,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceEnqueue for CopyToOp<DeviceSlice<T, M1>, DeviceSlice<T, M2>>
+impl<T, M1, M2> CopyRun for CopyToOp<DeviceSlice<T, M1>, DeviceSlice<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -128,14 +176,20 @@ where
 {
     type Output = (DeviceSlice<T, M1>, DeviceSlice<T, M2>);
 
-    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run_recover(
+        mut self,
+        ec: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> std::result::Result<(Self::Output, Deps), (crate::Error, Self::Output)> {
         let (src, mut dst) = self.take();
         let raw = deps_to_wait_list(&deps);
-        let event = crate::buffer::copy_buffer_enqueue(&src, &mut dst, ec, &raw)?;
-        Ok(((src, dst), single_dep(event)))
+        match crate::buffer::copy_buffer_enqueue(&src, &mut dst, ec, &raw) {
+            Ok(event) => Ok(((src, dst), single_dep(event))),
+            Err(e) => Err((e, (src, dst))),
+        }
     }
 
-    fn record_cb(
+    fn record_cb_recover(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
         waits: &crate::exec_ctx::SyncPoints,
@@ -160,7 +214,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceEnqueue for CopyToOp<DeviceSlice<T, M1>, DeviceSliceUninit<T, M2>>
+impl<T, M1, M2> CopyRun for CopyToOp<DeviceSlice<T, M1>, DeviceSliceUninit<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -169,7 +223,11 @@ where
     // dst transitions Uninit → Init because the copy writes every byte.
     type Output = (DeviceSlice<T, M1>, DeviceSlice<T, M2>);
 
-    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run_recover(
+        mut self,
+        ec: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> std::result::Result<(Self::Output, Deps), (crate::Error, Self::Output)> {
         let (src, uninit_dst) = self.take();
         // SAFETY: the copy_to enqueue below writes every byte of dst
         // before the chain's downstream stages observe the buffer
@@ -177,11 +235,13 @@ where
         // observe uninit bytes.
         let mut dst = unsafe { uninit_dst.assume_init() };
         let raw = deps_to_wait_list(&deps);
-        let event = crate::buffer::copy_buffer_enqueue(&src, &mut dst, ec, &raw)?;
-        Ok(((src, dst), single_dep(event)))
+        match crate::buffer::copy_buffer_enqueue(&src, &mut dst, ec, &raw) {
+            Ok(event) => Ok(((src, dst), single_dep(event))),
+            Err(e) => Err((e, (src, dst))),
+        }
     }
 
-    fn record_cb(
+    fn record_cb_recover(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
         waits: &crate::exec_ctx::SyncPoints,
@@ -210,7 +270,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceEnqueue for CopyToOp<MappedSlice<T, M1>, MappedSlice<T, M2>>
+impl<T, M1, M2> CopyRun for CopyToOp<MappedSlice<T, M1>, MappedSlice<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -218,14 +278,20 @@ where
 {
     type Output = (MappedSlice<T, M1>, MappedSlice<T, M2>);
 
-    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run_recover(
+        mut self,
+        ec: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> std::result::Result<(Self::Output, Deps), (crate::Error, Self::Output)> {
         let (src, dst) = self.take();
         let raw = deps_to_wait_list(&deps);
-        let event = crate::mapped::svm_copy_enqueue(&src, &dst, ec, &raw)?;
-        Ok(((src, dst), single_dep(event)))
+        match crate::mapped::svm_copy_enqueue(&src, &dst, ec, &raw) {
+            Ok(event) => Ok(((src, dst), single_dep(event))),
+            Err(e) => Err((e, (src, dst))),
+        }
     }
 
-    fn record_cb(
+    fn record_cb_recover(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
         waits: &crate::exec_ctx::SyncPoints,
@@ -250,7 +316,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceEnqueue for CopyToOp<MappedSlice<T, M1>, MappedSliceUninit<T, M2>>
+impl<T, M1, M2> CopyRun for CopyToOp<MappedSlice<T, M1>, MappedSliceUninit<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -258,16 +324,22 @@ where
 {
     type Output = (MappedSlice<T, M1>, MappedSlice<T, M2>);
 
-    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run_recover(
+        mut self,
+        ec: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> std::result::Result<(Self::Output, Deps), (crate::Error, Self::Output)> {
         let (src, uninit_dst) = self.take();
         // SAFETY: copy_to below writes every byte of dst.
         let dst = unsafe { uninit_dst.assume_init() };
         let raw = deps_to_wait_list(&deps);
-        let event = crate::mapped::svm_copy_enqueue(&src, &dst, ec, &raw)?;
-        Ok(((src, dst), single_dep(event)))
+        match crate::mapped::svm_copy_enqueue(&src, &dst, ec, &raw) {
+            Ok(event) => Ok(((src, dst), single_dep(event))),
+            Err(e) => Err((e, (src, dst))),
+        }
     }
 
-    fn record_cb(
+    fn record_cb_recover(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
         waits: &crate::exec_ctx::SyncPoints,
@@ -331,6 +403,73 @@ fn cross_type_byte_count<T>(len: usize) -> usize {
     len * std::mem::size_of::<T>()
 }
 
+/// SVM-backed slices that record an in-flight event so their `Drop` is
+/// queue-ordered after a copy touching them. Both kinds have the same inherent
+/// `register_use` + `ptr` + `len`; this trait lets [`svm_memcpy_copy`] drive them
+/// generically (the six cross-type SVM copy bodies were byte-identical apart from
+/// operand types).
+trait SvmCopyOperand {
+    fn register_use(&self, event: std::sync::Arc<Event>);
+    fn svm_ptr(&self) -> *mut c_void;
+    fn elem_len(&self) -> usize;
+}
+
+impl<T, M: MemMode> SvmCopyOperand for MappedSlice<T, M> {
+    fn register_use(&self, event: std::sync::Arc<Event>) {
+        MappedSlice::register_use(self, event);
+    }
+    fn svm_ptr(&self) -> *mut c_void {
+        self.ptr() as *mut c_void
+    }
+    fn elem_len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<T, M: MemMode> SvmCopyOperand for USMSlice<T, M> {
+    fn register_use(&self, event: std::sync::Arc<Event>) {
+        USMSlice::register_use(self, event);
+    }
+    fn svm_ptr(&self) -> *mut c_void {
+        self.ptr() as *mut c_void
+    }
+    fn elem_len(&self) -> usize {
+        self.len()
+    }
+}
+
+/// The one cross-type SVM copy body, factored out of the six `(Mapped|USM) →
+/// (Mapped|USM)` `run_recover` impls that were byte-identical apart from operand
+/// types. Length-checks, issues the memcpy, then retains + registers the event on
+/// both operands. On ANY failure returns the error WITHOUT registering anything —
+/// the caller still owns `src`/`dst` intact to hand back for rehoming.
+fn svm_memcpy_copy<S: SvmCopyOperand, D: SvmCopyOperand, T>(
+    ec: &ExecutionContext<'_>,
+    src: &S,
+    dst: &D,
+    deps: &Deps,
+) -> Result<Event> {
+    if src.elem_len() != dst.elem_len() {
+        return Err(crate::Error::LengthMismatch {
+            src: src.elem_len(),
+            dst: dst.elem_len(),
+        });
+    }
+    let size = cross_type_byte_count::<T>(src.elem_len());
+    let raw = deps_to_wait_list(deps);
+    // SAFETY: both pointers are live SVM/host pointers in ec's context on a
+    // fine-grain-system device (USMSlice's construction guarantees it); `size` fits
+    // both (checked equal above). CL_NON_BLOCKING — event-side wait chain.
+    let event = unsafe { svm_memcpy_async(ec, dst.svm_ptr(), src.svm_ptr(), size, &raw)? };
+    // Register only after a successful enqueue (nothing to unwind on the error
+    // path — the buffers are handed back unregistered).
+    let src_arc = unsafe { retain_for_register(&event)? };
+    let dst_arc = unsafe { retain_for_register(&event)? };
+    src.register_use(src_arc);
+    dst.register_use(dst_arc);
+    Ok(event)
+}
+
 // (MappedSlice, USMSlice)
 
 impl<T, M1, M2> CopyTo<USMSlice<T, M2>> for MappedSlice<T, M1>
@@ -345,7 +484,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceEnqueue for CopyToOp<MappedSlice<T, M1>, USMSlice<T, M2>>
+impl<T, M1, M2> CopyRun for CopyToOp<MappedSlice<T, M1>, USMSlice<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -353,39 +492,19 @@ where
 {
     type Output = (MappedSlice<T, M1>, USMSlice<T, M2>);
 
-    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run_recover(
+        mut self,
+        ec: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> std::result::Result<(Self::Output, Deps), (crate::Error, Self::Output)> {
         let (src, dst) = self.take();
-        if src.len() != dst.len() {
-            return Err(crate::Error::LengthMismatch {
-                src: src.len(),
-                dst: dst.len(),
-            });
+        match svm_memcpy_copy::<_, _, T>(ec, &src, &dst, &deps) {
+            Ok(event) => Ok(((src, dst), single_dep(event))),
+            Err(e) => Err((e, (src, dst))),
         }
-        let size = cross_type_byte_count::<T>(src.len());
-        let raw_deps = deps_to_wait_list(&deps);
-        // SAFETY: src.ptr() is a live SVM allocation in ec's context;
-        // dst.ptr() is a live host pointer (USMSlice requires
-        // fine-grain-system SVM, where host pointers are valid SVM
-        // arguments to clEnqueueSVMMemcpy).
-        let event = unsafe {
-            svm_memcpy_async(
-                ec,
-                dst.ptr() as *mut c_void,
-                src.ptr() as *const c_void,
-                size,
-                &raw_deps,
-            )?
-        };
-        // Register on both buffers' in-flight lists so Drop is
-        // queue-ordered after this copy.
-        let src_arc = unsafe { retain_for_register(&event)? };
-        let dst_arc = unsafe { retain_for_register(&event)? };
-        src.register_use(src_arc);
-        dst.register_use(dst_arc);
-        Ok(((src, dst), single_dep(event)))
     }
 
-    fn record_cb(
+    fn record_cb_recover(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
         waits: &crate::exec_ctx::SyncPoints,
@@ -410,7 +529,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceEnqueue for CopyToOp<MappedSlice<T, M1>, USMSliceUninit<T, M2>>
+impl<T, M1, M2> CopyRun for CopyToOp<MappedSlice<T, M1>, USMSliceUninit<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -418,36 +537,22 @@ where
 {
     type Output = (MappedSlice<T, M1>, USMSlice<T, M2>);
 
-    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run_recover(
+        mut self,
+        ec: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> std::result::Result<(Self::Output, Deps), (crate::Error, Self::Output)> {
         let (src, uninit_dst) = self.take();
-        if src.len() != uninit_dst.len() {
-            return Err(crate::Error::LengthMismatch {
-                src: src.len(),
-                dst: uninit_dst.len(),
-            });
-        }
-        // SAFETY: the SVM memcpy below writes every byte of dst.
+        // SAFETY: the SVM memcpy writes every byte of dst before any downstream
+        // stage observes it (they gate on the returned event).
         let dst = unsafe { uninit_dst.assume_init() };
-        let size = cross_type_byte_count::<T>(src.len());
-        let raw_deps = deps_to_wait_list(&deps);
-        // SAFETY: same as the Init variant above.
-        let event = unsafe {
-            svm_memcpy_async(
-                ec,
-                dst.ptr() as *mut c_void,
-                src.ptr() as *const c_void,
-                size,
-                &raw_deps,
-            )?
-        };
-        let src_arc = unsafe { retain_for_register(&event)? };
-        let dst_arc = unsafe { retain_for_register(&event)? };
-        src.register_use(src_arc);
-        dst.register_use(dst_arc);
-        Ok(((src, dst), single_dep(event)))
+        match svm_memcpy_copy::<_, _, T>(ec, &src, &dst, &deps) {
+            Ok(event) => Ok(((src, dst), single_dep(event))),
+            Err(e) => Err((e, (src, dst))),
+        }
     }
 
-    fn record_cb(
+    fn record_cb_recover(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
         waits: &crate::exec_ctx::SyncPoints,
@@ -474,7 +579,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceEnqueue for CopyToOp<USMSlice<T, M1>, MappedSlice<T, M2>>
+impl<T, M1, M2> CopyRun for CopyToOp<USMSlice<T, M1>, MappedSlice<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -482,33 +587,19 @@ where
 {
     type Output = (USMSlice<T, M1>, MappedSlice<T, M2>);
 
-    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run_recover(
+        mut self,
+        ec: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> std::result::Result<(Self::Output, Deps), (crate::Error, Self::Output)> {
         let (src, dst) = self.take();
-        if src.len() != dst.len() {
-            return Err(crate::Error::LengthMismatch {
-                src: src.len(),
-                dst: dst.len(),
-            });
+        match svm_memcpy_copy::<_, _, T>(ec, &src, &dst, &deps) {
+            Ok(event) => Ok(((src, dst), single_dep(event))),
+            Err(e) => Err((e, (src, dst))),
         }
-        let size = cross_type_byte_count::<T>(src.len());
-        let raw_deps = deps_to_wait_list(&deps);
-        let event = unsafe {
-            svm_memcpy_async(
-                ec,
-                dst.ptr() as *mut c_void,
-                src.ptr() as *const c_void,
-                size,
-                &raw_deps,
-            )?
-        };
-        let src_arc = unsafe { retain_for_register(&event)? };
-        let dst_arc = unsafe { retain_for_register(&event)? };
-        src.register_use(src_arc);
-        dst.register_use(dst_arc);
-        Ok(((src, dst), single_dep(event)))
     }
 
-    fn record_cb(
+    fn record_cb_recover(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
         waits: &crate::exec_ctx::SyncPoints,
@@ -533,7 +624,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceEnqueue for CopyToOp<USMSlice<T, M1>, MappedSliceUninit<T, M2>>
+impl<T, M1, M2> CopyRun for CopyToOp<USMSlice<T, M1>, MappedSliceUninit<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -541,35 +632,22 @@ where
 {
     type Output = (USMSlice<T, M1>, MappedSlice<T, M2>);
 
-    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run_recover(
+        mut self,
+        ec: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> std::result::Result<(Self::Output, Deps), (crate::Error, Self::Output)> {
         let (src, uninit_dst) = self.take();
-        if src.len() != uninit_dst.len() {
-            return Err(crate::Error::LengthMismatch {
-                src: src.len(),
-                dst: uninit_dst.len(),
-            });
-        }
-        // SAFETY: the SVM memcpy below writes every byte of dst.
+        // SAFETY: the SVM memcpy writes every byte of dst before any downstream
+        // stage observes it (they gate on the returned event).
         let dst = unsafe { uninit_dst.assume_init() };
-        let size = cross_type_byte_count::<T>(src.len());
-        let raw_deps = deps_to_wait_list(&deps);
-        let event = unsafe {
-            svm_memcpy_async(
-                ec,
-                dst.ptr() as *mut c_void,
-                src.ptr() as *const c_void,
-                size,
-                &raw_deps,
-            )?
-        };
-        let src_arc = unsafe { retain_for_register(&event)? };
-        let dst_arc = unsafe { retain_for_register(&event)? };
-        src.register_use(src_arc);
-        dst.register_use(dst_arc);
-        Ok(((src, dst), single_dep(event)))
+        match svm_memcpy_copy::<_, _, T>(ec, &src, &dst, &deps) {
+            Ok(event) => Ok(((src, dst), single_dep(event))),
+            Err(e) => Err((e, (src, dst))),
+        }
     }
 
-    fn record_cb(
+    fn record_cb_recover(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
         waits: &crate::exec_ctx::SyncPoints,
@@ -596,7 +674,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceEnqueue for CopyToOp<USMSlice<T, M1>, USMSlice<T, M2>>
+impl<T, M1, M2> CopyRun for CopyToOp<USMSlice<T, M1>, USMSlice<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -604,33 +682,19 @@ where
 {
     type Output = (USMSlice<T, M1>, USMSlice<T, M2>);
 
-    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run_recover(
+        mut self,
+        ec: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> std::result::Result<(Self::Output, Deps), (crate::Error, Self::Output)> {
         let (src, dst) = self.take();
-        if src.len() != dst.len() {
-            return Err(crate::Error::LengthMismatch {
-                src: src.len(),
-                dst: dst.len(),
-            });
+        match svm_memcpy_copy::<_, _, T>(ec, &src, &dst, &deps) {
+            Ok(event) => Ok(((src, dst), single_dep(event))),
+            Err(e) => Err((e, (src, dst))),
         }
-        let size = cross_type_byte_count::<T>(src.len());
-        let raw_deps = deps_to_wait_list(&deps);
-        let event = unsafe {
-            svm_memcpy_async(
-                ec,
-                dst.ptr() as *mut c_void,
-                src.ptr() as *const c_void,
-                size,
-                &raw_deps,
-            )?
-        };
-        let src_arc = unsafe { retain_for_register(&event)? };
-        let dst_arc = unsafe { retain_for_register(&event)? };
-        src.register_use(src_arc);
-        dst.register_use(dst_arc);
-        Ok(((src, dst), single_dep(event)))
     }
 
-    fn record_cb(
+    fn record_cb_recover(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
         waits: &crate::exec_ctx::SyncPoints,
@@ -655,7 +719,7 @@ where
     }
 }
 
-impl<T, M1, M2> DeviceEnqueue for CopyToOp<USMSlice<T, M1>, USMSliceUninit<T, M2>>
+impl<T, M1, M2> CopyRun for CopyToOp<USMSlice<T, M1>, USMSliceUninit<T, M2>>
 where
     T: Send + 'static,
     M1: MemMode + Send + 'static,
@@ -663,35 +727,22 @@ where
 {
     type Output = (USMSlice<T, M1>, USMSlice<T, M2>);
 
-    fn run(mut self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)> {
+    fn run_recover(
+        mut self,
+        ec: &ExecutionContext<'_>,
+        deps: Deps,
+    ) -> std::result::Result<(Self::Output, Deps), (crate::Error, Self::Output)> {
         let (src, uninit_dst) = self.take();
-        if src.len() != uninit_dst.len() {
-            return Err(crate::Error::LengthMismatch {
-                src: src.len(),
-                dst: uninit_dst.len(),
-            });
-        }
-        // SAFETY: the SVM memcpy below writes every byte of dst.
+        // SAFETY: the SVM memcpy writes every byte of dst before any downstream
+        // stage observes it (they gate on the returned event).
         let dst = unsafe { uninit_dst.assume_init() };
-        let size = cross_type_byte_count::<T>(src.len());
-        let raw_deps = deps_to_wait_list(&deps);
-        let event = unsafe {
-            svm_memcpy_async(
-                ec,
-                dst.ptr() as *mut c_void,
-                src.ptr() as *const c_void,
-                size,
-                &raw_deps,
-            )?
-        };
-        let src_arc = unsafe { retain_for_register(&event)? };
-        let dst_arc = unsafe { retain_for_register(&event)? };
-        src.register_use(src_arc);
-        dst.register_use(dst_arc);
-        Ok(((src, dst), single_dep(event)))
+        match svm_memcpy_copy::<_, _, T>(ec, &src, &dst, &deps) {
+            Ok(event) => Ok(((src, dst), single_dep(event))),
+            Err(e) => Err((e, (src, dst))),
+        }
     }
 
-    fn record_cb(
+    fn record_cb_recover(
         mut self,
         builder: Option<&crate::record::CbBuilder>,
         waits: &crate::exec_ctx::SyncPoints,

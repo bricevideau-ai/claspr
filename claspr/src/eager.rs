@@ -319,6 +319,16 @@ pub trait DeviceEnqueue: Send + Sized {
     /// The host value the enqueue produces.
     type Output: Send;
     /// Enqueue against `ec` with `deps` as the wait-list; return `(value, Deps)`.
+    ///
+    /// This op CONSUMES its buffers (unlike the borrow-path leaves): the delegated
+    /// primitives do a by-value type transition — copy's `Uninit → Init`
+    /// (`assume_init`) and host-view `DeviceSlice ↔ HostView`. On failure the
+    /// buffers drop here. Callers that hold no return home (the host-view
+    /// acquire/release leaves resolve homeless — the view carries the buffer
+    /// forward) are unaffected. `CopyTo2`, which DOES hold homes, must NOT use
+    /// this method on its fallible path — it calls the copy-specific
+    /// `CopyRun::run_recover`, which hands the
+    /// buffers back on error so they can be rehomed (anti-stranding, review #1).
     fn run(self, ec: &ExecutionContext<'_>, deps: Deps) -> Result<(Self::Output, Deps)>;
 
     /// CB twin of [`run`](Self::run) for the copy leaf: perform the same type

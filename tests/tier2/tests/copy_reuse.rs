@@ -129,3 +129,38 @@ fn usm_copy_uninit_dst_is_reusable() {
         );
     }
 }
+
+/// Anti-stranding on a FAILED copy (review finding #1): a length-mismatched copy
+/// errors at `sync`, but must NOT leave its lent src/dst cells stranded in `Lent`
+/// — the copy op's `run_recover` hands the buffers back and `CopyTo2` rehomes them
+/// to its own Input cells. Proof: a SECOND `sync` of the same graph returns the
+/// SAME `LengthMismatch` error again. If the first failure had stranded either
+/// buffer (cell emptied, no Checkout to re-arm), the re-sync would instead fail
+/// with a "graph busy" / `SlotUnbound`-class error before ever reaching the copy's
+/// length check.
+#[test]
+fn failed_copy_does_not_strand_operands() {
+    let Some(ctx) = ctx() else { return };
+
+    let data: Vec<u32> = (0..N as u32).collect();
+    let src = DeviceSlice::<u32>::from_slice(&ctx, &data).expect("src alloc");
+    // Deliberately-too-small dst → the copy's length check fails at enqueue.
+    let small_dst = DeviceSlice::<u32>::alloc_zero(&ctx, N / 2).expect("small dst alloc");
+
+    let g = eager_copy_to(src, small_dst);
+
+    let err1 = g.sync(&ctx).expect_err("mismatched-size copy must error");
+    assert!(
+        matches!(err1, claspr::Error::LengthMismatch { .. }),
+        "run 1: expected LengthMismatch, got {err1:?}"
+    );
+    // Re-run: must reach the copy again and produce the SAME length error — proving
+    // both operands were rehomed (not stranded `Lent`) by the failed first attempt.
+    let err2 = g
+        .sync(&ctx)
+        .expect_err("re-sync after a failed copy must reach the copy again, not report busy");
+    assert!(
+        matches!(err2, claspr::Error::LengthMismatch { .. }),
+        "run 2: operands must have been rehomed → same LengthMismatch, got {err2:?}"
+    );
+}
