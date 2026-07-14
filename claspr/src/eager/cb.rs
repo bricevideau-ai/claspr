@@ -237,13 +237,7 @@ where
     let closed = std::sync::atomic::AtomicBool::new(false);
 
     // Is there a valid cached CB for this queue? (Replay fast-path.)
-    let cached: Option<Arc<crate::record::FinalizedCb>> = {
-        let guard = cache.lock().unwrap();
-        match guard.as_ref() {
-            Some(cb) if cb.queue() == queue => Some(Arc::clone(cb)),
-            _ => None,
-        }
-    };
+    let cached = cb_lookup_cached(cache, queue);
 
     if let Some(cb) = cached {
         // REPLAY: re-walk lend-only (materialize buffers + build Checkouts), then
@@ -351,6 +345,21 @@ fn cb_should_open_boundary<O: DeviceOp>(child: &O, ec: &ExecutionContext<'_>) ->
         && child.cb_cache().is_some()
         && cb_graph_eligible(child, ec)
         && child.cbable_weight() >= 2
+}
+
+/// The replay fast-path lookup shared by both boundary functions
+/// ([`cb_boundary_execute`] / [`cb_boundary_gather`]): a still-valid cached
+/// [`FinalizedCb`] for THIS queue, or `None` (build a fresh one). A CB is queue-bound
+/// — a cache homed against a different queue is stale and must be rebuilt.
+fn cb_lookup_cached(
+    cache: &CbCache,
+    queue: opencl3::types::cl_command_queue,
+) -> Option<Arc<crate::record::FinalizedCb>> {
+    let guard = cache.lock().unwrap();
+    match guard.as_ref() {
+        Some(cb) if cb.queue() == queue => Some(Arc::clone(cb)),
+        _ => None,
+    }
 }
 
 pub(crate) fn cb_exec_child<O: DeviceOp>(
@@ -594,13 +603,7 @@ where
     let closed = std::sync::atomic::AtomicBool::new(false);
 
     // Replay fast-path: a valid cached CB for this queue.
-    let cached: Option<Arc<crate::record::FinalizedCb>> = {
-        let guard = cache.lock().unwrap();
-        match guard.as_ref() {
-            Some(cb) if cb.queue() == queue => Some(Arc::clone(cb)),
-            _ => None,
-        }
-    };
+    let cached = cb_lookup_cached(cache, queue);
 
     if let Some(cb) = cached {
         let build_ec = ec.with_cb(CbWalk::LendOnly {
