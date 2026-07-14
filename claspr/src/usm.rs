@@ -454,8 +454,8 @@ impl<T: Copy, M: MemMode> USMSliceUninit<T, M> {
     }
 
     /// Memcpy `src` into the uninitialised slots and transition to
-    /// [`USMSlice<T, M>`]. Length mismatch panics. Synchronous
-    /// host operation.
+    /// [`USMSlice<T, M>`]. Returns [`Error::LengthMismatch`] if `src.len()`
+    /// differs from the slice length. Synchronous host operation.
     pub fn write_from(self, src: &[T]) -> Result<USMSlice<T, M>> {
         let mut data = self.data;
         if src.len() != data.len() {

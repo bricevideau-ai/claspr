@@ -887,6 +887,10 @@ fn seed_lockfile_from_host(src_dir: &Path, crate_dir: &Path) {
         let candidate = probe.join("Cargo.lock");
         if candidate.exists() {
             let _ = std::fs::copy(&candidate, crate_dir.join("Cargo.lock"));
+            // Re-seed when the host lock changes: a `cargo update` in the host
+            // workspace rewrites this file, and without a rerun trigger the
+            // sub-crate keeps its now-stale copied lock across rebuilds.
+            println!("cargo:rerun-if-changed={}", candidate.display());
             return;
         }
         if !probe.pop() {
