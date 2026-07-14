@@ -47,10 +47,16 @@ use crate::{
     Result, USMSlice, USMSliceUninit,
 };
 
-/// Shared CB-record helper for the copy ops: record a `min(src,dst)`-byte copy of
-/// `src → dst` (both `RecordableBuffer`, so cl_mem or SVM) into `builder` and return
-/// its sync point. `None` when the builder lacks the command / the pair is ineligible
-/// (a mixed cl_mem/SVM copy) — `CbBuilder::copy_buffer` marks itself ineligible then.
+/// Shared CB-record helper for the copy ops: record a copy of `src → dst` (both
+/// `RecordableBuffer`, so cl_mem or SVM) into `builder` and return its sync point.
+/// `None` when the builder lacks the command / the pair is ineligible (a mixed
+/// cl_mem/SVM copy) — `CbBuilder::copy_buffer` marks itself ineligible then — OR
+/// when the two operands differ in byte length: rather than silently truncating to
+/// `min(src, dst)` (which the CB path used to do, dropping data where the per-op
+/// path returns `LengthMismatch`), mark the builder ineligible and return `None` so
+/// the boundary discards the CB and re-runs on the per-op path — whose
+/// `copy_buffer_enqueue` surfaces the real `Err(LengthMismatch)`. This keeps the
+/// CB-accelerated and per-op copies behaviourally identical on a size mismatch.
 fn record_copy_cmd<S: RecordableBuffer, D: RecordableBuffer>(
     builder: &crate::record::CbBuilder,
     src: &S,
@@ -59,8 +65,12 @@ fn record_copy_cmd<S: RecordableBuffer, D: RecordableBuffer>(
 ) -> Option<crate::cl_sync_point_khr> {
     let sh = src.record_handle();
     let dh = dst.record_handle();
-    let size = sh.byte_len.min(dh.byte_len);
-    builder.copy_buffer(sh.mem, dh.mem, 0, 0, size, waits)
+    if sh.byte_len != dh.byte_len {
+        // Defer to the per-op path (which errors) instead of truncating.
+        builder.mark_ineligible();
+        return None;
+    }
+    builder.copy_buffer(sh.mem, dh.mem, 0, 0, sh.byte_len, waits)
 }
 use opencl3::event::{Event, retain_event};
 use opencl3::types::{CL_NON_BLOCKING, cl_event};

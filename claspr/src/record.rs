@@ -224,8 +224,11 @@ impl CbBuilder {
     }
 
     /// Mark the build as ineligible (an SVM command or a failed add) so the homing
-    /// node discards it and falls back to per-op execute.
-    fn mark_ineligible(&self) {
+    /// node discards it and falls back to per-op execute. `pub(crate)` so the copy
+    /// ops (`copy.rs`) can force the per-op fallback on a size mismatch — routing
+    /// the error through the per-op path that already returns `LengthMismatch`,
+    /// instead of the CB path silently truncating.
+    pub(crate) fn mark_ineligible(&self) {
         *self.eligible.lock().unwrap() = false;
     }
 

@@ -255,7 +255,7 @@ macro_rules! impl_image_verbs {
             /// [`ImageRead`] graph node — pick a terminal (`.wait()`
             /// blocking, `.submit()` non-blocking, or
             /// `.wait_on`/`.submit_on`).
-            pub fn read<'a>(self, dst: &'a mut [F::Pixel]) -> Result<ImageRead<'a, Self, F::Pixel>>
+            pub fn read<'a>(self, dst: &'a mut [F::Pixel]) -> ImageRead<'a, Self, F::Pixel>
             where
                 Self: ImageEnqueue,
                 F::Pixel: Send,
@@ -267,7 +267,7 @@ macro_rules! impl_image_verbs {
 
             /// Same as [`read`](Self::read) but raw bytes — caller-supplied
             /// `&mut [u8]` of `pixel_count * size_of::<F::Pixel>()` bytes.
-            pub fn read_bytes<'a>(self, dst: &'a mut [u8]) -> Result<ImageRead<'a, Self, u8>>
+            pub fn read_bytes<'a>(self, dst: &'a mut [u8]) -> ImageRead<'a, Self, u8>
             where
                 Self: ImageEnqueue,
             {
@@ -753,6 +753,16 @@ pub struct ImageWrite<'a, I: ImageEnqueue, E> {
     img: Input<I>,
     region: [usize; 3],
     data: &'a [E],
+    /// The element count `data` MUST have (pixels for `write`, bytes for
+    /// `write_bytes`), computed from the image's extent at construction. Checked
+    /// in [`check_ready`](DeviceOp::check_ready) — the atomicity pre-pass — so a
+    /// mismatch surfaces as `Err(LengthMismatch)` at the terminal BEFORE any
+    /// buffer is lent or command enqueued. Kept out of the constructor (which
+    /// stays infallible) so a bare `.and_then(|img| img.write(data))` still
+    /// composes in a Tier 2 graph — an `and_then` closure returns `U: DeviceOp`,
+    /// not `Result<U>`, so a fallible constructor would force a `.unwrap()` panic
+    /// back into the mid-graph path.
+    expected_len: usize,
     out: Pipe<I>,
 }
 
@@ -768,6 +778,15 @@ impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // Length backstop BEFORE lending the image (a direct `execute` that skips
+        // the `check_ready` pre-pass must not lend then fail): a mismatched source
+        // is a caller error, surfaced as `Err(LengthMismatch)`, not a panic.
+        if self.data.len() != self.expected_len {
+            return Err(Error::LengthMismatch {
+                src: self.expected_len,
+                dst: self.data.len(),
+            });
+        }
         // In-place: the written image is the lent image → home threads through.
         let (mut img, deps, home) = self.img.resolve_home(ec)?;
         let raw = deps_to_wait_list(&deps);
@@ -788,8 +807,18 @@ impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
 
     /// Atomicity pre-pass mirror of the slice ops: read-only readiness of the
     /// lent image cell, so a busy/unsatisfiable image op is caught before any
-    /// earlier lending op enqueues (see [`Input::check_ready`]).
+    /// earlier lending op enqueues (see [`Input::check_ready`]). Also validates the
+    /// source length here — a mismatch is a caller error and must abort the whole
+    /// graph BEFORE anything is lent/enqueued, at the Tier-2-safe point (the check
+    /// can't live in the constructor without breaking `and_then` composition; see
+    /// the `expected_len` field docs).
     fn check_ready(&self) -> Result<()> {
+        if self.data.len() != self.expected_len {
+            return Err(Error::LengthMismatch {
+                src: self.expected_len,
+                dst: self.data.len(),
+            });
+        }
         self.img.check_ready()
     }
 
@@ -827,6 +856,14 @@ pub struct ImageRead<'a, I: ImageEnqueue, E> {
     region: [usize; 3],
     // Behind a `Mutex` so `execute(&self)` can take the `&mut [E]` it reads into.
     dst: std::sync::Mutex<&'a mut [E]>,
+    /// The element count `dst` MUST have (pixels for `read`, bytes for
+    /// `read_bytes`). Checked in [`check_ready`](DeviceOp::check_ready) rather than
+    /// at construction — same Tier-2 reasoning as [`ImageWrite::expected_len`]: an
+    /// `and_then` closure returns `U: DeviceOp`, not `Result<U>`, so a fallible
+    /// constructor would bar `.and_then(|img| img.read(dst))` from composing (it
+    /// previously returned `Result<ImageRead>`, so the caller-supplied-dst read was
+    /// Tier-1-only — the mid-graph read-back path is the composable `image_download`).
+    expected_len: usize,
     out: Pipe<I>,
 }
 
@@ -842,6 +879,18 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // Length backstop BEFORE lending (a direct `execute` skipping the
+        // `check_ready` pre-pass must not lend then fail): a mismatched dst is a
+        // caller error → `Err(LengthMismatch)`, not a panic and not a truncated read.
+        {
+            let dst_len = self.dst.lock().unwrap().len();
+            if dst_len != self.expected_len {
+                return Err(Error::LengthMismatch {
+                    src: self.expected_len,
+                    dst: dst_len,
+                });
+            }
+        }
         // In-place: the read image is handed back unchanged → home threads.
         let (img, deps, home) = self.img.resolve_home(ec)?;
         let raw = deps_to_wait_list(&deps);
@@ -862,8 +911,18 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
 
     /// Atomicity pre-pass mirror of the slice ops: read-only readiness of the
     /// lent image cell, so a busy/unsatisfiable image op is caught before any
-    /// earlier lending op enqueues (see [`Input::check_ready`]).
+    /// earlier lending op enqueues (see [`Input::check_ready`]). Also validates the
+    /// dst length here (moved off the constructor for Tier-2 composability — see
+    /// the `expected_len` field docs), so a mismatch aborts the graph
+    /// before anything is lent/enqueued.
     fn check_ready(&self) -> Result<()> {
+        let dst_len = self.dst.lock().unwrap().len();
+        if dst_len != self.expected_len {
+            return Err(Error::LengthMismatch {
+                src: self.expected_len,
+                dst: dst_len,
+            });
+        }
         self.img.check_ready()
     }
 
@@ -1040,9 +1099,25 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
     /// Atomicity pre-pass mirror of the slice ops: read-only readiness of BOTH
     /// lent image cells (src then dst), so a busy/unsatisfiable operand is caught
     /// before any earlier lending op enqueues (see [`Input::check_ready`]).
+    ///
+    /// Also validates that src and dst have the SAME extent when BOTH are concrete
+    /// — an image→image copy across mismatched dims was previously an unchecked
+    /// bare-driver error (`CL_INVALID_...`). When either operand is pipe-fed the
+    /// dims aren't known until execute, so the check is skipped there (the driver
+    /// still guards that case, unchanged).
     fn check_ready(&self) -> Result<()> {
         self.src.check_ready()?;
-        self.dst.check_ready()
+        self.dst.check_ready()?;
+        if let (Some(src_region), Some(dst_region)) = (
+            self.src.with_concrete(|s| s.enqueue_region()),
+            self.dst.with_concrete(|d| d.enqueue_region()),
+        ) && src_region != dst_region
+        {
+            return Err(Error::InvalidArgument(
+                "image copy_to: source and destination image dimensions differ",
+            ));
+        }
+        Ok(())
     }
 
     fn bind_slots(&self, binder: &mut crate::SlotBinder) {
@@ -1364,24 +1439,23 @@ where
 // constructors below. Centralising the "build an op" step keeps
 // per-image-type methods to a single line each.
 
+// The `_type_name` args are retained for signature parity with the read helpers
+// (and future diagnostics); the length check now lives in `ImageWrite::check_ready`
+// as `Err(LengthMismatch)` rather than a constructor panic — see the field docs on
+// `ImageWrite::expected_len` for why the constructor stays infallible (Tier 2
+// `and_then` composition).
 fn image_write_op<'a, I: ImageEnqueue, T>(
     image: I,
     region: [usize; 3],
     pixels: &'a [T],
     expected_pixel_count: usize,
-    type_name: &'static str,
+    _type_name: &'static str,
 ) -> ImageWrite<'a, I, T> {
-    assert_eq!(
-        pixels.len(),
-        expected_pixel_count,
-        "{type_name}::write: pixel count {} ≠ expected {}",
-        pixels.len(),
-        expected_pixel_count,
-    );
     ImageWrite {
         img: image.into(),
         region,
         data: pixels,
+        expected_len: expected_pixel_count,
         out: Pipe::new(),
     }
 }
@@ -1391,42 +1465,34 @@ fn image_write_bytes_op<'a, I: ImageEnqueue>(
     region: [usize; 3],
     bytes: &'a [u8],
     expected_bytes: usize,
-    type_name: &'static str,
+    _type_name: &'static str,
 ) -> ImageWrite<'a, I, u8> {
-    assert_eq!(
-        bytes.len(),
-        expected_bytes,
-        "{type_name}::write_bytes: buffer length {} ≠ expected {}",
-        bytes.len(),
-        expected_bytes,
-    );
     ImageWrite {
         img: image.into(),
         region,
         data: bytes,
+        expected_len: expected_bytes,
         out: Pipe::new(),
     }
 }
 
+// Infallible constructors (mirror the write helpers): the dst-length check moved
+// to `ImageRead::check_ready` so `.read()`/`.read_bytes()` return a bare
+// `DeviceOp` and compose in a Tier 2 `and_then`. See `ImageRead::expected_len`.
 fn image_read_op<'a, I: ImageEnqueue, T>(
     image: I,
     region: [usize; 3],
     dst: &'a mut [T],
     expected_pixel_count: usize,
     _type_name: &'static str,
-) -> Result<ImageRead<'a, I, T>> {
-    if dst.len() != expected_pixel_count {
-        return Err(Error::LengthMismatch {
-            src: expected_pixel_count,
-            dst: dst.len(),
-        });
-    }
-    Ok(ImageRead {
+) -> ImageRead<'a, I, T> {
+    ImageRead {
         img: image.into(),
         region,
         dst: std::sync::Mutex::new(dst),
+        expected_len: expected_pixel_count,
         out: Pipe::new(),
-    })
+    }
 }
 
 fn image_read_bytes_op<'a, I: ImageEnqueue>(
@@ -1435,19 +1501,14 @@ fn image_read_bytes_op<'a, I: ImageEnqueue>(
     dst: &'a mut [u8],
     expected_bytes: usize,
     _type_name: &'static str,
-) -> Result<ImageRead<'a, I, u8>> {
-    if dst.len() != expected_bytes {
-        return Err(Error::LengthMismatch {
-            src: expected_bytes,
-            dst: dst.len(),
-        });
-    }
-    Ok(ImageRead {
+) -> ImageRead<'a, I, u8> {
+    ImageRead {
         img: image.into(),
         region,
         dst: std::sync::Mutex::new(dst),
+        expected_len: expected_bytes,
         out: Pipe::new(),
-    })
+    }
 }
 
 fn image_copy_op<Src: ImageEnqueue, Dst: ImageEnqueue>(
@@ -2279,15 +2340,15 @@ impl<'a, M: MemMode, F: format::Format> Image1DBufferView<'a, M, F> {
     pub fn view_of<T>(slice: &'a DeviceSlice<T, M>) -> Result<Self> {
         let pixel_bytes = std::mem::size_of::<F::Pixel>();
         let byte_len = slice.len() * std::mem::size_of::<T>();
-        assert_eq!(
-            byte_len % pixel_bytes,
-            0,
-            "Image1DBufferView::view_of: slice byte length {} is not a multiple of pixel size {} \
-             (format = {})",
-            byte_len,
-            pixel_bytes,
-            std::any::type_name::<F>(),
-        );
+        // A partial trailing pixel is a caller error, not a panic — this fn already
+        // returns `Result` and its doc promises "Errors if …" (the former
+        // `assert_eq!` contradicted that contract).
+        if !byte_len.is_multiple_of(pixel_bytes) {
+            return Err(Error::InvalidArgument(
+                "Image1DBufferView::view_of: slice byte length is not a whole multiple \
+                 of the format's pixel size (partial trailing pixel)",
+            ));
+        }
         let width = byte_len / pixel_bytes;
         let format = cl_image_format {
             image_channel_order: F::CHANNEL_ORDER,

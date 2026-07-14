@@ -111,13 +111,14 @@ fn image2d_read_into_caller_dst() {
     let img = img.write(&pixels).wait().expect("write");
 
     let mut got = vec![0u32; (W as usize) * (H as usize)];
-    img.read(&mut got).expect("read op").wait().expect("wait");
+    img.read(&mut got).wait().expect("wait");
     assert_eq!(got, pixels);
 }
 
-/// `image.read(&mut dst)` returns `Error::LengthMismatch` when
-/// dst's length doesn't match the image's pixel count — same
-/// shape as `buf.read`'s length check.
+/// `image.read(&mut dst)` surfaces `Error::LengthMismatch` when dst's length
+/// doesn't match the image's pixel count. The check moved off the constructor
+/// (now infallible, so the op is Tier-2-composable) to the terminal — so the
+/// error appears at `.wait()`, not at `.read()`.
 #[test]
 fn image2d_read_length_mismatch_errors() {
     let Some(ctx) = ctx() else { return };
@@ -127,7 +128,7 @@ fn image2d_read_length_mismatch_errors() {
     let img = Image2D::<ReadOnly, R32Uint>::alloc(&ctx, W, H).expect("alloc");
 
     let mut wrong_size = vec![0u32; 8]; // expected 16
-    let err = match img.read(&mut wrong_size) {
+    let err = match img.read(&mut wrong_size).wait() {
         Ok(_) => panic!("expected LengthMismatch, got Ok"),
         Err(e) => e,
     };
@@ -171,7 +172,7 @@ fn image2d_read_submit_returns_event() {
 
     let mut got = vec![0u32; (W as usize) * (H as usize)];
     {
-        let op = img.read(&mut got).expect("read op");
+        let op = img.read(&mut got);
         // Non-blocking submit returns the (rebindable) image plus the read event.
         let (_img, event) = op.submit().expect("submit read");
         event.wait().expect("wait read");
