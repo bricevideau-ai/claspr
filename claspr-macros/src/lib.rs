@@ -1199,45 +1199,56 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
         ::claspr::ScalarInput::check_ready(&self.spec)?;
     };
 
-    // Output type / expression — bare for a single slice, tuple for
-    // many, `()` for none. Same convention on both terminals
-    // (`wait`/`submit`) and the `DeviceOperation::Output`.
-    let (output_ty, output_expr) = match output_names.len() {
-        0 => (quote! { () }, quote! { () }),
+    // The output ARITY drives four fragments the same way — zero / one / many
+    // outputs. Computed in one `match output_names.len()` so the trichotomy is
+    // stated once (each arm still spells its own tokens verbatim):
+    //   output_ty / output_expr — bare for a single slice, tuple for many, `()`
+    //     for none; the convention on both terminals (`wait`/`submit`) and
+    //     `DeviceOperation::Output`.
+    //   single_output_home — the lone output's home (for the single-output
+    //     `execute` to thread onto the output pipe); `None` for zero or many
+    //     (multi threads per-element homes instead). `output_homes.len()` always
+    //     equals `output_names.len()` (both pushed only by resource arms), so it
+    //     keys off the same arity.
+    //   wait_into_output — the `wait()` terminal turning `Checkouts` back into the
+    //     bare `#output_ty` by severing each `Checkout` via `into_inner`.
+    let (output_ty, output_expr, single_output_home, wait_into_output): (
+        TokenStream2,
+        TokenStream2,
+        TokenStream2,
+        TokenStream2,
+    ) = match output_names.len() {
+        0 => (
+            quote! { () },
+            quote! { () },
+            quote! { ::core::option::Option::None },
+            quote! { { let _ = __claspr_checkouts; () } },
+        ),
         1 => {
             let n = &output_names[0];
             let t = &output_types[0];
-            (quote! { #t }, quote! { #n })
+            (
+                quote! { #t },
+                quote! { #n },
+                output_homes[0].clone(),
+                quote! { ::claspr::Checkout::into_inner(__claspr_checkouts) },
+            )
         }
-        _ => (
-            quote! { ( #(#output_types),* ) },
-            quote! { ( #(#output_names),* ) },
-        ),
-    };
-
-    // Single-output home expression: the lone buffer/image output's home (for a
-    // zero-output kernel there is nothing to return → `None`). Used by the
-    // single-output `execute` to thread the home onto the output pipe.
-    let single_output_home: TokenStream2 = match output_homes.len() {
-        1 => output_homes[0].clone(),
-        _ => quote! { ::core::option::Option::None },
-    };
-
-    // `wait()` terminal: turn the `Checkouts` (single `Checkout` or a per-output
-    // tuple) back into the bare `#output_ty` by severing each via `into_inner`.
-    let wait_into_output: TokenStream2 = match output_names.len() {
-        0 => quote! { { let _ = __claspr_checkouts; () } },
-        1 => quote! { ::claspr::Checkout::into_inner(__claspr_checkouts) },
         _ => {
             let co_idents: Vec<syn::Ident> = (0..output_names.len())
                 .map(|i| quote::format_ident!("__claspr_wco{}", i))
                 .collect();
-            quote! {
-                {
-                    let ( #(#co_idents),* ) = __claspr_checkouts;
-                    ( #( ::claspr::Checkout::into_inner(#co_idents) ),* )
-                }
-            }
+            (
+                quote! { ( #(#output_types),* ) },
+                quote! { ( #(#output_names),* ) },
+                quote! { ::core::option::Option::None },
+                quote! {
+                    {
+                        let ( #(#co_idents),* ) = __claspr_checkouts;
+                        ( #( ::claspr::Checkout::into_inner(#co_idents) ),* )
+                    }
+                },
+            )
         }
     };
 
