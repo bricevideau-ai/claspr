@@ -310,10 +310,7 @@ impl HostReadable for Frozen {}
 // `Fillable` is a *dispatch* trait: each marker picks a strategy
 // (Runtime or DeviceKernel) for how `.fill()` should execute. The
 // user sees one `.fill()` method; the dispatch is opaque.
-//
-// (Host-write eligibility itself is just `HostWritable` — the earlier
-// `RuntimeFillable` / `HostUploadable` alias traits were speculative
-// super-traits that never diverged from `HostWritable`, so they're gone.)
+// (Plain host-write eligibility is just `HostWritable`.)
 
 /// Strategy enum returned by [`Fillable::FILL_STRATEGY`] —
 /// `.fill()`'s runtime dispatches on this to pick the right path.

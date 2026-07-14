@@ -1,25 +1,15 @@
 //! [`CopyTo`] — single polymorphic copy verb whose behavior is
 //! picked by the runtime based on the source + destination types.
 //!
-//! ## Motivation
+//! One polymorphic verb instead of a per-(src, dst)-pair free-function table (which
+//! would scale along `src type × dst type × init-state`): every supported (src, dst)
+//! pair gets a trait impl that knows the right OpenCL primitive to enqueue. User
+//! writes `src.copy_to(dst).and_then(...)` regardless of the buffer kinds. The op's
+//! Output type encodes the post-copy state — an `Uninit` dst comes back fully
+//! initialised because the copy wrote every byte (no `unsafe { assume_init() }` at
+//! the call site).
 //!
-//! Earlier the library exposed `device_slice_copy(src, dst)` and
-//! `mapped_slice_copy(src, dst)` as separate free functions, each
-//! type-locked to one (src, dst) pair. Adding cross-type copies
-//! (e.g. `MappedSlice → USMSlice` via SVM memcpy) or Uninit-dst
-//! variants (`copy_to(uninit_dst)` that transitions Uninit → Init
-//! safely without an `unsafe { assume_init() }` at the call site)
-//! meant scaling that verb table along the cross-product of
-//! `src type × dst type × init-state`. Bad shape.
-//!
-//! [`CopyTo`] collapses the verb set: every supported (src, dst)
-//! pair gets a trait impl that knows the right OpenCL primitive to
-//! enqueue. User writes `src.copy_to(dst).and_then(...)` regardless
-//! of the buffer kinds. The op's Output type encodes the post-copy
-//! state — an `Uninit` dst comes back fully initialised because the
-//! copy wrote every byte.
-//!
-//! ## Supported pairs (today)
+//! ## Supported pairs
 //!
 //! | Source | Destination | Primitive |
 //! |---|---|---|
@@ -36,7 +26,7 @@
 //!
 //! **Cross-type DeviceSlice↔SVM** is not yet implemented (would
 //! need `clEnqueueReadBuffer` / `clEnqueueWriteBuffer` with an SVM
-//! pointer as the host arg). Add when needed.
+//! pointer as the host arg).
 //!
 //! ## Synchronicity
 //!

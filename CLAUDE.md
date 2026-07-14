@@ -66,28 +66,27 @@ A claspr kernel can be packaged as its own library crate (`pub mod gpu`, build.r
 - **Pure kernel library** (mandelbrot-kernel, sobel-kernel today): exposes only typed launch handles. spirv-std imports inside the library's device module are cfg-gated to `target_arch = "spirv"` so consumers don't pay for spirv-std as a transitive dep. Helpers can't reference device-only types directly (the library's host build won't have those types in scope).
 - **Mixed kernel + host library** (raymarch is binary-shaped today; could be a library): exposes typed launch handles AND host-callable helpers (e.g., `pixel_color` for validation). Needs spirv-std as a *regular* host dep so types like `cl::Float3` are in scope on both sides. Cost: consumers pull spirv-std transitively. Benefit: full host parity.
 
-## Tier 2: the reusable device-operation graph (`claspr/src/eager.rs`)
+## Tier 2: the reusable device-operation graph (`eager.rs` + `eager/`)
 
-Every op implements the one `DeviceOp` trait, so it runs standalone (`.wait()`) or composes into an **eager, closure-free** graph via `.and_then` / `bundle!` / `fan_out`, with terminals `.sync(&ctx)` (blocking) / `.run(&ctx)` (Future). Builders run at *construction* over a build-time `Handle`, so the graph is a nested struct you can `describe()` without executing (unlike cuda-oxide's lazy-closure model — same vocabulary, different mental model).
+Every op implements the one `DeviceOp` trait, so it runs standalone (`.wait()`) or
+composes into an **eager, closure-free** graph via `.and_then` / `bundle!` / `fan_out`,
+with terminals `.sync(&ctx)` / `.run(&ctx)`. Typed slots (`slots!` / `slot!`) make a
+graph reusable: build once, re-bind, replay. **The full model — the closed 4-verb
+`bind`/`call`/`mutate_bind`/`mutate_call` set, the 5-state `SlotState`, the home
+invariant, the unified `Tag(value)`/`Tag(pipe)` constructor — lives in `ARCHITECTURE.md`
+and the `eager.rs` module `//!` docs; this file does not restate it.**
 
-**Typed slots** make a graph *reusable* — build once, re-bind and replay:
-
-- `slots!{ Tag: Type, ... }` declares tag types; `slot!(Tag)` is an unbound hole usable anywhere a concrete buffer/scalar/`LaunchSpec` goes. A tag is generic over its binding *source*: `Tag<S = Value>(pub S)`.
-- **Bind verbs — a CLOSED 4-verb set (2×2):**
-  - **Set-once `bind` (one tag) / `call` (a tuple)** are **CONSUMING + INFALLIBLE** (`bind(self, arg) -> Self`, `call(self, args) -> Self`). They return the owned graph, so a fully-bound graph is usable both as the bare composed `U` *inside* an `and_then` closure AND as a one-shot at the terminal. Bind errors are **DEFERRED** — recorded at the call site and surfaced at `sync` (via `check_ready`, with nothing enqueued) — and **STICKY / POISON**: an errored graph re-reports on every `sync`; recover only by REBUILDING. Used for currying too: partial-bind the invariants now (the returned graph), the rest later.
-  - **Reuse-loop `mutate_bind` (one tag) / `mutate_call` (a tuple)** are FLUENT `&self -> Result` with EAGER errors at the call site; they never poison the graph. These are the set / change verbs for a built graph you replay in a loop. A tuple is all-or-nothing via a phase-0 probe before any sever.
-  - The matrix is CLOSED: there is **no `mutate_call_move`** — mutate is `&self`, and compose already builds a fresh graph, so set-once is the only composing mode.
-- **`SlotState` is 5-state:** `Unbound` → `Bound` → `Lent` (checked out) → `Severed` (value taken via `Checkout::into_inner`, only `mutate_bind` re-arms) — plus `FedByPipe(Pipe<T>)`, a slot wired to an upstream pipe.
-- **Home invariant:** a lent buffer always rehomes to its cell on `Checkout`/payload drop (never destroyed), so `cl_mem` handles stay stable across replays — the prerequisite for command-buffer caching (the next layer, tracked in `NOTES.md`). `sync`/`wait_on` are atomic: a read-only `check_ready` pre-pass validates every input cell before any enqueue.
-- **Unified tag constructor:** `Tag(value)` binds by value; `Tag(pipe)` wires the slot to an upstream pipe (`FedByPipe`). One constructor, two sources — there is **no separate `feed` verb** (a fluent `DeviceOpExt::feed::<Tg>` method exists internally but the tuple surface is just `Tag(pipe)`). The `slots!` macro emits three per-tag *concrete-source* `CallArg` impls (`$val`, `Checkout<$val>` value-bind; `Pipe<V>` pipe-feed gated on `V: RecordableBuffer`) — deliberately **not** an `impl<Tg: Tag> CallArg for Tg` blanket, which breaks cross-crate coherence for scalar-valued tags. Scalars (`f32`, `LaunchSpec`) stay value-only by construction: `F(pipe)` finds no `CallArg` and fails to compile (guarded by `tests/tier2/compile_fail/scalar_slot_fed_pipe.rs`).
-
-The `examples/gray-scott` flagship exercises the whole story: `run_swap` (set-once `bind` chain to fill every slot once, `mutate_call`/`mutate_bind` mid-run reconfigure) and `run_immutable` (a curried two-closure meta-kernel — `get_meta_kernel` builds the DAG with all slots open + a `bundle4` output trim, `curried_kernel` set-once-`call`s the invariants, then two set-once `call`s compose the unrolled pair with the crossed rotation fed by name), proven bit-identical by `swap_and_immutable_agree_bit_for_bit`. `examples/cg` (matrix-free Conjugate Gradient) is the *self-closing single-graph* pattern — the whole CG iteration is one `and_then` chain that feeds its own next iteration, device-resident scalars (`&f32`/`&mut f32` args) keep α/β on-device, and the loop is just `sync` + a len-1 residual readback.
-
-**Authoring host code against a graph** (the lend/rehome/reclaim lifecycle, reading via `Checkout` deref+`map`, `into_inner`-vs-`drop`, the build-once-`sync`-in-a-loop replay idiom, what `sync` returns, and device scalars) is documented as a **usage guide in the `claspr/src/eager.rs` module `//!` docs** ("Writing reusable-graph host code") — read that before writing a new graph-using example. gray-scott + cg are its worked examples.
+**Before writing a graph-using example, read the "Writing reusable-graph host code"
+usage guide in the `eager.rs` module `//!` docs** (the lend/rehome/reclaim lifecycle,
+`Checkout` deref+`map`, `into_inner`-vs-`drop`, the build-once-`sync`-in-a-loop replay
+idiom, device scalars). Its worked examples: `examples/gray-scott` (reusable graph —
+`run_swap` mutable-replay vs `run_immutable` curried compose, proven bit-identical) and
+`examples/cg` (matrix-free CG as a self-closing single-graph loop with device-resident
+α/β scalars).
 
 ## Key files
 
-- `claspr/src/eager.rs` — the entire Tier 2 graph engine: `DeviceOp`/`DeviceOpExt`, all combinators, and the slot machinery (`SlotState`, `SlotBinder`, `Checkout`, `IntoBound`, `CallArg`/`CallArgs`, the closed 4-verb `bind`/`call`/`mutate_bind`/`mutate_call` set). Largest and most active surface for graph work.
+- `claspr/src/eager.rs` + `eager/` — the Tier 2 graph engine, split by concern: `eager.rs` holds the core (`DeviceOp`/`DeviceOpExt`, the edge/home model, terminals, the closed 4-verb `bind`/`call`/`mutate_bind`/`mutate_call` set), and the submodules hold `combinators.rs` (AndThen/Bundle/FanOut/…), `leaves.rs` (fill/copy/transfer leaf ops), `slots.rs` (`SlotState`/`SlotBinder`), `cb.rs` (command-buffer recording). See `ARCHITECTURE.md` for the "to change X, read Y" map. Most active surface for graph work.
 - `claspr/src/tier2_macros.rs` — the `slots!` / `slot!` macros, including the per-tag `Tag`, `IntoBound`, and `CallArg` impls (value + `Checkout` + `Pipe` sources) each tag emits.
 - `claspr-build/src/lib.rs` — both `compile()` (separate kernel crate) and `compile_from_host()` (single-source extraction) live here. The translation logic (`translate_and_inline`, `resolve_module_file`, `is_claspr_kernel_attr`, `is_claspr_device_attr`) is the most-likely-to-change surface as new kernel patterns surface; multi-file resolution rules also live there.
 - `claspr-macros/src/lib.rs` — `#[kernel]` + `#[device]`. The kernel signature → host wrapper translation lives in `classify_param`, `classify_image_param`, `slice_element_ty` (plus `parse_image_tokens`/`read_image_access_attr` for images). The device-on-mod injection (include! + `kernels()` fn) lives in the `device` proc-macro body.

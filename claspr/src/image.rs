@@ -66,10 +66,8 @@ use std::ptr;
 
 // ── Access markers (re-exported from the shared access module) ─────
 //
-// Image2D used to define its own sealed `ImageAccess` trait + a private
-// `ReadOnly` / `WriteOnly` / `ReadWrite` set of markers. Those are now
-// the cross-cutting [`crate::access`] markers; this re-export keeps the
-// existing `claspr::image::*` import paths and proc-macro-emitted
+// The image access markers are the cross-cutting [`crate::access`] markers; this
+// re-export keeps the `claspr::image::*` import paths and proc-macro-emitted
 // `::claspr::ReadOnly` references working.
 
 pub use crate::access::{ReadOnly, ReadWrite, WriteOnly};
@@ -459,10 +457,9 @@ fn alloc_image<A: KernelAccess, F: format::Format>(
 
 // ── Raw enqueue helpers — the fold seam for the eager image ops ──────
 //
-// Each helper is the `clEnqueue*Image` body the matching Tier-1 image builder
-// used to own, lifted out so the eager image graph nodes (`ImageWrite` /
-// `ImageRead` / `ImageCopy` / `ImageFill` in this file) can enqueue directly
-// against an `Image` without round-tripping through a borrow-based builder.
+// Each helper is a `clEnqueue*Image` body the eager image graph nodes
+// (`ImageWrite` / `ImageRead` / `ImageCopy` / `ImageFill` in this file) enqueue
+// directly against an `Image`.
 // `blocking` selects `CL_BLOCKING` vs `CL_NON_BLOCKING` (only `write`/`read`
 // have a native blocking flag; copy/fill have none — the caller waits on the
 // returned event for their blocking terminal). `deps` is the already-collected

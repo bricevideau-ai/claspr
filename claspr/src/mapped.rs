@@ -585,11 +585,10 @@ impl<T, M: MemMode> Buffer<T> for MappedSlice<T, M> {
 
 // ── Raw SVM enqueue helpers — the fold seam for the eager SVM ops ────
 //
-// Each helper is the `clEnqueueSVM*` body the matching Tier-1 builder
-// used to own, lifted out so the eager graph nodes (`FillMapped` /
-// `WriteMapped` in `eager.rs`, plus the `CopyTo` family in `copy.rs`)
-// can enqueue directly against a `MappedSlice` without round-tripping
-// through a borrow-based builder. Each does the enqueue, retains the
+// Each helper is a `clEnqueueSVM*` body the eager graph nodes
+// (`FillMapped` / `WriteMapped` in `eager.rs`, plus the `CopyTo`
+// family in `copy.rs`) enqueue directly against a `MappedSlice`. Each
+// does the enqueue, retains the
 // event, and registers it on the buffer(s)' last-use list so Drop's
 // `clEnqueueSVMFree` queue-orders after every recorded use. `deps` is
 // the already-collected `cl_event` wait-list (the eager op flattens

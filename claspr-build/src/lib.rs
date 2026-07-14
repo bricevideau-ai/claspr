@@ -154,8 +154,8 @@ pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync + 'stati
 /// Deferred-construction settings for [`SpirvBuilder`].
 ///
 /// Both [`CompileBuilder`] and [`HostBuilder`] embed one and apply it
-/// to a fresh [`SpirvBuilder`] at terminal-call time. Call order
-/// doesn't matter — `target_env` no longer rebuilds anything mid-chain.
+/// to a fresh [`SpirvBuilder`] at terminal-call time, so call order
+/// doesn't matter.
 struct SpirvBuilderSettings {
     target_env: String,
     capabilities: Vec<Capability>,

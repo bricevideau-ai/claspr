@@ -411,16 +411,6 @@ impl<
 // owned DeviceSlice first, then `.arc()` once writes are done to
 // hand the buffer out for read sharing.
 //
-// Historical note: pre-`f80202c` (the Read/Write trait split), the
-// catch-all `KernelSliceArg<T>` for `Arc<DeviceSlice>` was added in
-// `480bcba` ("true diamond sharing") explicitly for read-only fan-
-// out. The split commit mechanically gave Arc both Read and
-// ReadWrite variants, preserving the bug-of-omission — every
-// existing use of Arc in tests + examples + the combinator spike
-// is read-only. The Write impl was reachable but never exercised;
-// removing it restores the original design intent and the borrow
-// checker's single-writer story.
-//
 // `T: Sync` is needed because `Arc<DeviceSlice<T, M>>: Send` requires
 // `DeviceSlice<T, M>: Send + Sync` which propagates `T: Sync`.
 impl<T: Send + Sync + 'static, M: crate::access::MemMode> kernel_slice_arg_sealed::Sealed

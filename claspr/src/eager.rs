@@ -23,10 +23,9 @@
 //! `Pipe(Pipe<T>)` (produced upstream). One type, two states: this is the edge
 //! that unifies concrete args, intermediate values, and (later) slots.
 //!
-//! This module IS the Tier 2 device-graph layer. The former closure-based
-//! `DeviceOperation` layer it replaced has been removed; the only residue is the
-//! tiny [`DeviceEnqueue`] contract a few primitive leaves (host-view map/unmap,
-//! the polymorphic `copy_to` family) delegate their raw enqueue body to.
+//! This module IS the Tier 2 device-graph layer. [`DeviceEnqueue`] is the minimal
+//! enqueue contract a few primitive leaves (host-view map/unmap, the polymorphic
+//! `copy_to` family) delegate their raw enqueue body to.
 //!
 //! # Writing reusable-graph host code
 //!
@@ -264,8 +263,7 @@ pub fn wrap_event(event: crate::Event) -> Dep {
 }
 
 /// A single-element [`Deps`] set from one freshly-produced event — the common
-/// "this op enqueued one command, here is its completion event" result. Replaces
-/// the old `single_dep(event)` now that [`Deps`] is a set.
+/// "this op enqueued one command, here is its completion event" result.
 pub fn single_dep(event: crate::Event) -> Deps {
     let mut d = Deps::new();
     d.insert(wrap_event(event));
@@ -279,9 +277,8 @@ pub fn single_dep(event: crate::Event) -> Deps {
 // they reach into private fields and own per-family `clEnqueue*` bodies. Rather
 // than duplicate those bodies, the eager wrapper holds the buffer/view and
 // delegates to a small op type whose only job is one non-blocking enqueue
-// returning `(Output, Deps)`. This trait is that contract — the residue of the
-// old `DeviceOperation` trait, pared down to the single `run` method the eager
-// graph actually needs (no terminals, no combinators, no blanket).
+// returning `(Output, Deps)`. This trait is that contract — a single `run` method,
+// no terminals, no combinators, no blanket.
 
 /// One non-blocking enqueue: take the upstream `deps` as the wait-list, enqueue,
 /// and return the produced value plus the events the enqueue created. Implemented
@@ -414,8 +411,8 @@ pub fn rehome_consumed<T>(buf: T, home: Option<BoxedHome<T>>) {
 }
 
 /// Identity rehome: an output returns to a cell of its own type (the in-place
-/// case — fill/scale/kernel-buffer-arg/copy's same-typed sides). This is the
-/// behaviour the old `Option<Cell<T>>` home had, now expressed through the trait.
+/// case — fill/scale/kernel-buffer-arg/copy's same-typed sides), putting the value
+/// back into the cell so the next replay reuses the same buffer.
 impl<T: Send> Rehome<T> for Cell<T> {
     fn rehome(self: Box<Self>, value: T) {
         *self.lock().unwrap() = Some(value);
@@ -994,13 +991,6 @@ impl<T> Input<T> {
         }
     }
 
-    // NOTE: `Input::resolve_on(&launcher)` — which built a transient
-    // `ExecutionContext` so an image kernel's args could resolve outside an
-    // `execute(&self)` — was removed when image kernels became reusable
-    // `DeviceOp`s. Image args now lend through `resolve_home` from inside
-    // `execute` exactly like slice args, so the standalone launcher-resolve seam
-    // (the last piece of the image one-shot fork) has no remaining caller.
-
     /// If this input is a [`Concrete`](Input::Concrete) head, return its lending
     /// [`Cell`] so a run's `Checkout` can deposit the (possibly transformed-in-place /
     /// Uninit→Init-downgraded) value back into it on drop, re-arming the graph. A
@@ -1040,8 +1030,8 @@ impl<T> Input<T> {
     ///   the `Uninit → Init` downgrade re-wrap).
     /// - [`Slot`](Input::Slot): `T`'s [`CopyHome::copy_slot_home`] (a four-state
     ///   [`SlotHome`] — re-arms `Lent → Bound`, severs on `into_inner`). This is the
-    ///   wiring of the formerly-dead [`slot_home`](Self::slot_home), now generalised
-    ///   through `CopyHome` so it threads even when the copy retypes the output.
+    ///   wiring of [`slot_home`](Self::slot_home) through `CopyHome`, so it threads
+    ///   even when the copy retypes the output.
     /// - [`Pipe`](Input::Pipe): `None` — the upstream producer owns the value's
     ///   provenance; a copy doesn't re-mint it.
     ///
@@ -1895,14 +1885,6 @@ pub trait DeviceOp: Send {
     /// (one extra user event + a deferred terminal wait), so it is paid **only
     /// when this returns `true`**; pure device graphs keep the zero-overhead
     /// fast path. Validated in `scratch/start_threaded.c` (NEO 40/40, 0 hung).
-    ///
-    /// NOTE: the former execute-time `and_then_with_context` combinator built its
-    /// downstream op at execute (invisible here), leaving any host seam nested in
-    /// its closure un-gated — the one documented gap. That combinator is gone:
-    /// its sole use (device-by-index routing) is now structural via
-    /// [`on_device_at`](DeviceOpExt::on_device_at) /
-    /// [`transfer_to_device_at`], so the whole graph is
-    /// build-time inspectable and the gap is CLOSED.
     fn contains_host_seam(&self) -> bool {
         false
     }
@@ -3398,17 +3380,15 @@ impl_checkout_split_tuple!(
 /// stay individually consumable **downstream** (a `Pipe` per branch, not one
 /// `Pipe<tuple>`) AND re-home across replays.
 ///
-/// [`CheckoutSplit`] completed #212 only at the **terminal** (`gather_checkouts`
-/// reassembles a `Checkouts` tuple). A seam nested MID-graph (the source of a
-/// downstream [`and_then`](DeviceOpExt::and_then)) runs via `execute`, whose old
-/// path collapsed a bundle source to `home == None` (no re-home) and exposed a
-/// single `Pipe<S::Output>` (`= Pipe<tuple>`, so the written α/−α couldn't be
-/// routed to separate downstream kernels). `SeamScatter` closes that: it is
-/// implemented on the SAME `Checkout<O>` + tuple structure `CheckoutSplit` uses
-/// (so it is arity- and nesting-general), and mirrors what a `bundle!`'s `execute`
-/// does for kernel branches — scatter each branch into its own element pipe with
-/// its own home. A single-output source keeps `Handle = Pipe<O>` (byte-identical
-/// to the pre-#212 default), so only the multi-output mid-graph case changes.
+/// A seam nested MID-graph (the source of a downstream
+/// [`and_then`](DeviceOpExt::and_then)) runs via `execute`, and for a multi-output
+/// source must expose each branch as its OWN element `Pipe` (not one
+/// `Pipe<tuple>`) so the written branches route to separate downstream kernels AND
+/// each re-homes across replays. `SeamScatter` provides that: implemented on the
+/// SAME `Checkout<O>` + tuple structure as [`CheckoutSplit`] (so it is arity- and
+/// nesting-general), it scatters each branch into its own element pipe with its own
+/// home — mirroring what a `bundle!`'s `execute` does. A single-output source keeps
+/// `Handle = Pipe<O>` (the trait default); only the multi-output case scatters.
 pub trait SeamScatter: CheckoutSplit {
     /// The pipe-shaped downstream handle: `Pipe<O>` for a single-output source, a
     /// tuple of these for a bundle / multi-output source (mirrors
@@ -3421,12 +3401,10 @@ pub trait SeamScatter: CheckoutSplit {
     fn empty_handle() -> Self::Handle;
     /// The seam's [`output_pipe`](DeviceOp::output_pipe) view — an optional single
     /// `Pipe<Value>`. For a **single-output** source this is `Some` of the storage
-    /// pipe (so [`AndThen`]'s orphaned-source-deps threading behaves EXACTLY as it
-    /// did pre-#212 when a downstream closure discards the seam's output —
-    /// byte-identity of the single-output mid-graph path). For a **multi-output**
-    /// source, storage is the per-branch element pipes and there is no single
-    /// storage pipe, so this returns `None` (the same convention a `bundle!` /
-    /// [`CopyTo2`] `output_pipe` use).
+    /// pipe (so [`AndThen`]'s orphaned-source-deps threading works when a downstream
+    /// closure discards the seam's output). For a **multi-output** source, storage is
+    /// the per-branch element pipes with no single storage pipe, so this returns
+    /// `None` (the same convention `bundle!` / [`CopyTo2`] `output_pipe` use).
     fn output_pipe_view(handle: &Self::Handle) -> Option<Pipe<Self::Value>>;
     /// Scatter the seam-mutated `value` + per-branch `homes` into `handle`'s
     /// element pipes, cloning `deps` (the seam's unmap + `proceed` gate) onto each
@@ -3441,7 +3419,7 @@ pub trait SeamScatter: CheckoutSplit {
     fn reconstruct(handle: &Self::Handle) -> Result<(Self::Value, Deps)>;
     /// Like [`reconstruct`](Self::reconstruct) but also yield the collapsed
     /// return home — the `collect_home` path. A single-output source preserves its
-    /// one home (the #211 nested-in-`and_then` re-arm); a multi-output source
+    /// one home (the nested-in-`and_then` re-arm); a multi-output source
     /// returns `None` (N per-branch homes can't ride one slot — the same boundary
     /// [`collect_home`](DeviceOp::collect_home) documents; the multi-home re-arm
     /// rides the Checkout path instead).
@@ -3792,7 +3770,6 @@ impl<T, M: MemMode> Pipe<USMSliceUninit<T, M>> {
 // the eager model (NOTES → "EXECUTE-TIME CLOSURE NODES"). Unlike eager
 // `and_then` (its builder runs at BUILD with a `Pipe` handle), the host-seam
 // nodes below run their closure at EXECUTE because it needs the mapped host
-// data, which does not exist at build. (Device-by-index routing used to live
-// here too via `and_then_with_context`; it is now structural — see
-// [`OnDevice`] / [`TransferToDevice`] + `DeviceTarget` below.)
+// data, which does not exist at build. (Device-by-index routing is structural —
+// see [`OnDevice`] / [`TransferToDevice`] + `DeviceTarget` below.)
 // ════════════════════════════════════════════════════════════════════════

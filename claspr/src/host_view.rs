@@ -99,11 +99,9 @@ pub use map_access::{MapAccess, MapReadOnly, MapReadWrite};
 
 // ── HostReadableExt / HostWritableExt ──────────────────────────────
 //
-// Two traits, split per host-access direction. Used to be one trait
-// (`HostAccessibleExt`) with both methods on it, but that prevented
-// per-marker gating — `Frozen` should expose `acquire_host_view_read`
-// but not `acquire_host_view` (the mut version), which is unrepresent-
-// able with a single trait that requires both methods.
+// Two traits, split per host-access direction, so `Frozen` can expose
+// `acquire_host_view_read` without `acquire_host_view` (the mut version) — a
+// single trait requiring both methods couldn't gate per marker.
 
 /// Adds [`acquire_host_view_read`](Self::acquire_host_view_read) to
 /// buffer types whose marker permits host reads

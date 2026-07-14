@@ -874,13 +874,11 @@ pub(crate) fn fill_via_kernel_buffer<T: Copy, L: Launcher + ?Sized>(
 
 // ── Raw enqueue helpers — the fold seam for the eager buffer ops ──────
 //
-// Each helper is the `clEnqueue*` body the matching Tier-1 builder used to own
-// (in its `wait_on`/`submit_on`/`into_event`), lifted out so the eager graph
-// nodes (`Fill`/`Download`/`ReadInto`/`WriteDevice`/`TransferToDevice` in
-// `eager.rs`) can enqueue directly against a `DeviceSlice` without round-tripping
-// through a borrow-based builder. `blocking` selects `CL_BLOCKING` vs
+// Each helper is a `clEnqueue*` body the eager graph nodes
+// (`Fill`/`Download`/`ReadInto`/`WriteDevice`/`TransferToDevice` in `eager.rs`)
+// enqueue directly against a `DeviceSlice`. `blocking` selects `CL_BLOCKING` vs
 // `CL_NON_BLOCKING` so the eager op's `ExecMode::Blocking` terminal path keeps
-// the native no-event blocking enqueue the builder's `wait_on` had. `deps` is the
+// the native no-event blocking enqueue. `deps` is the
 // already-collected `cl_event` wait-list (the eager op flattens its `Deps` to
 // raw handles, held alive across the call).
 
