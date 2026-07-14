@@ -449,7 +449,6 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<AttrArgs> {
 }
 
 fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
-    let vis = &func.vis;
     let name = &func.sig.ident;
 
     // Per-host-param accumulators. The single emitted method takes
@@ -1044,6 +1043,94 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
             ),
         ));
     }
+
+    // Producer/consumer seam: the loop above only WROTE the accumulators; the
+    // emission below only READS them (no `?`, no early return — pure token
+    // assembly). Hand the whole collected set to `emit_kernel_launch` by move so
+    // this function keeps only the fallible parse/classify half. `KernelParts` is
+    // a passive carrier (no methods) — the emission still reads each field by name.
+    let parts = KernelParts {
+        host_names,
+        op_field_init,
+        input_resolve_eager,
+        scalar_resolve_eager,
+        input_deps_idents,
+        input_bind_slots,
+        input_check_ready,
+        bind_slot_pat_names,
+        dump_pat_names,
+        dump_in_cell_stmts,
+        method_params,
+        arg_types,
+        op_arg_pass,
+        output_names,
+        output_types,
+        output_homes,
+        output_origins,
+        cb_arg_stmts,
+        method_only_generics,
+        generics,
+    };
+    Ok(emit_kernel_launch(func, args, parts))
+}
+
+/// Passive carrier for the 20 per-parameter accumulators the `#[kernel]` param
+/// loop collects, handed from [`expand_kernel`] to [`emit_kernel_launch`] across
+/// the producer/consumer seam. A dumb struct — no methods; the emission reads each
+/// field by name exactly as it read the former locals.
+struct KernelParts {
+    host_names: Vec<TokenStream2>,
+    op_field_init: Vec<TokenStream2>,
+    input_resolve_eager: Vec<TokenStream2>,
+    scalar_resolve_eager: Vec<TokenStream2>,
+    input_deps_idents: Vec<TokenStream2>,
+    input_bind_slots: Vec<TokenStream2>,
+    input_check_ready: Vec<TokenStream2>,
+    bind_slot_pat_names: Vec<TokenStream2>,
+    dump_pat_names: Vec<TokenStream2>,
+    dump_in_cell_stmts: Vec<TokenStream2>,
+    method_params: Vec<TokenStream2>,
+    arg_types: Vec<TokenStream2>,
+    op_arg_pass: Vec<TokenStream2>,
+    output_names: Vec<TokenStream2>,
+    output_types: Vec<TokenStream2>,
+    output_homes: Vec<TokenStream2>,
+    output_origins: Vec<TokenStream2>,
+    cb_arg_stmts: Vec<TokenStream2>,
+    method_only_generics: Vec<(TokenStream2, TokenStream2)>,
+    generics: Vec<(TokenStream2, TokenStream2)>,
+}
+
+/// Consumer half of `#[kernel]` codegen: derive the emitted shape from the
+/// collected [`KernelParts`] and assemble the final `TokenStream`. Split out of
+/// [`expand_kernel`] at the producer/consumer seam — infallible, pure token
+/// assembly (no `?`, no early return). Destructure `parts` up front so the body
+/// reads the accumulators as bare names, exactly as it did when they were locals.
+fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> TokenStream2 {
+    let vis = &func.vis;
+    let name = &func.sig.ident;
+    let KernelParts {
+        host_names,
+        op_field_init,
+        input_resolve_eager,
+        scalar_resolve_eager,
+        input_deps_idents,
+        input_bind_slots,
+        input_check_ready,
+        bind_slot_pat_names,
+        dump_pat_names,
+        dump_in_cell_stmts,
+        method_params,
+        arg_types,
+        op_arg_pass,
+        output_names,
+        output_types,
+        output_homes,
+        output_origins,
+        cb_arg_stmts,
+        method_only_generics,
+        generics,
+    } = parts;
 
     // Generic parameter forms used in `impl<...>` / `Op<...>` / fn
     // signature positions. Three flavours:
@@ -1963,7 +2050,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `#[allow(clippy::too_many_arguments)]` — the wrapper's arg count
     // is determined by the kernel's declared signature, not user
     // choice, so a per-call `#[allow]` would burden every user.
-    Ok(quote! {
+    quote! {
         impl #kernels_path {
             #[allow(clippy::too_many_arguments)]
             #vis fn #name #method_gen_decl (
@@ -2098,7 +2185,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
             // scatter-in-`execute` + reconstruct-in-`into_output` (see above).
             #eager_impl
         }
-    })
+    }
 }
 
 /// Tuples with a single element need a trailing comma in Rust. Helper
