@@ -568,6 +568,84 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // when slices and images interleave in the kernel signature.
     let mut arg_gen_idx = 0usize;
 
+    // Shared token fragments for the three RESOURCE arms (Slice / ScalarRef /
+    // Image). These three arms differ only in their trait bounds, their
+    // `ToInput`/`ToInputImage` conversion, the launch-tuple wrapper, and the
+    // CB-mode handle+setter — every other emitted fragment is byte-identical
+    // across all three. Extracting the identical fragments as named closures
+    // keeps each in ONE place: an agent reads each arm as "what's DIFFERENT
+    // here", and a fix to the subtle bits (the CB precise-invalidation origin
+    // capture, the fan-out bind guard) can't land in only one of three copies.
+    // Pure token producers — no accumulator capture — so the generated code is
+    // unchanged.
+    //
+    // Eager path: capture the upstream pipe cell id + the slot ORIGINS this
+    // arg's buffer traces to (precise per-slot CB-invalidation substrate: the
+    // arg's own slot cell if it is a slot, else the origins its upstream pipe
+    // carries), then lend the buffer via `resolve_home`. `#cbcell` is captured
+    // BEFORE `resolve_home` shadows `#pname` (the CB-mode sync-point lookup
+    // needs it).
+    let res_resolve_eager = |pname: &TokenStream2,
+                             cbcell: &proc_macro2::Ident,
+                             origin: &proc_macro2::Ident,
+                             deps: &proc_macro2::Ident,
+                             home: &proc_macro2::Ident|
+     -> TokenStream2 {
+        quote! {
+            let #cbcell = ::claspr::Input::pipe_cell_id(#pname);
+            let #origin: ::std::collections::BTreeSet<usize> =
+                match ::claspr::Input::slot_cell_id(#pname) {
+                    ::core::option::Option::Some(__s) => {
+                        let mut __o = ::std::collections::BTreeSet::new();
+                        __o.insert(__s);
+                        __o
+                    }
+                    ::core::option::Option::None => {
+                        ::claspr::ExecutionContext::cb_reach_of(ec, #cbcell)
+                    }
+                };
+            let (#pname, #deps, #home) =
+                ::claspr::Input::resolve_home(#pname, ec)?;
+        }
+    };
+    // `bind_slots`: offer the binder to this arg's `Input` cell. A move-only
+    // binder stops once consumed; a fan-out binder (e.g. a shared `Arc`) visits
+    // EVERY site so one bind fills all matching slots.
+    let res_bind_slots = |pname: &TokenStream2| -> TokenStream2 {
+        quote! {
+            if ::claspr::SlotBinder::is_fanout(binder)
+                || !::claspr::SlotBinder::is_consumed(binder)
+            {
+                ::claspr::Input::try_bind_slot(#pname, binder);
+            }
+        }
+    };
+    // `check_ready`: this buffer arg is lent at execute, so its `Input` cell
+    // must be satisfiable BEFORE any work is enqueued.
+    let res_check_ready = |pname: &TokenStream2| -> TokenStream2 {
+        quote! { ::claspr::Input::check_ready(#pname)?; }
+    };
+    // Read-only dump: a resource arg is an `Input` — a shared producer edge
+    // lands here if it is pipe-fed.
+    let res_dump_in_cell = |pname: &TokenStream2| -> TokenStream2 {
+        quote! {
+            if let ::core::option::Option::Some(__c) =
+                ::claspr::Input::pipe_cell_id(#pname)
+            {
+                __claspr_in_cells.push(__c);
+            }
+        }
+    };
+    // CB-mode precise-invalidation: this command bakes a buffer traceable to
+    // `#origin`; note each origin on the CB so a `mutate_*` of any clears it.
+    let note_origins = |origin: &proc_macro2::Ident| -> TokenStream2 {
+        quote! {
+            for __s in &#origin {
+                ::claspr::record::CbBuilder::note_slot(__claspr_cb_builder, *__s);
+            }
+        }
+    };
+
     for input in &func.sig.inputs {
         let FnArg::Typed(pt) = input else {
             return Err(syn::Error::new(
@@ -617,75 +695,34 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // output pipe so the run's `Checkout` re-arms its concrete cell.
                 let cbcell_ident = quote::format_ident!("__claspr_cbcell{}", arg_gen_idx - 1);
                 let origin_ident = quote::format_ident!("__claspr_origin{}", arg_gen_idx - 1);
-                input_resolve_eager.push(quote! {
-                    // Capture the upstream pipe cell id BEFORE `resolve_home` shadows
-                    // `#pname` (needed by the CB-mode sync-point lookup).
-                    let #cbcell_ident = ::claspr::Input::pipe_cell_id(#pname);
-                    // Capture the slot ORIGINS this arg's buffer traces to (precise
-                    // per-slot CB invalidation substrate): the arg's own slot cell if
-                    // it is a slot, else the origins its upstream pipe carries.
-                    let #origin_ident: ::std::collections::BTreeSet<usize> =
-                        match ::claspr::Input::slot_cell_id(#pname) {
-                            ::core::option::Option::Some(__s) => {
-                                let mut __o = ::std::collections::BTreeSet::new();
-                                __o.insert(__s);
-                                __o
-                            }
-                            ::core::option::Option::None => {
-                                ::claspr::ExecutionContext::cb_reach_of(ec, #cbcell_ident)
-                            }
-                        };
-                    let (#pname, #deps_ident, #home_ident) =
-                        ::claspr::Input::resolve_home(#pname, ec)?;
-                });
+                input_resolve_eager.push(res_resolve_eager(
+                    &pname,
+                    &cbcell_ident,
+                    &origin_ident,
+                    &deps_ident,
+                    &home_ident,
+                ));
                 input_deps_idents.push(quote! { #deps_ident });
-                // `bind_slots`: `#pname` destructures to `&Input<__D>`; offer the
-                // binder to it. A move-only binder stops once consumed; a fan-out
-                // binder (e.g. a shared `Arc<DeviceSlice>`) visits EVERY site so one
-                // bind fills all matching slots.
-                input_bind_slots.push(quote! {
-                    if ::claspr::SlotBinder::is_fanout(binder)
-                        || !::claspr::SlotBinder::is_consumed(binder)
-                    {
-                        ::claspr::Input::try_bind_slot(#pname, binder);
-                    }
-                });
-                // `check_ready`: read-only mirror of `input_resolve_eager` — this
-                // buffer arg is lent at execute, so its `Input` cell must be
-                // satisfiable BEFORE any work is enqueued.
-                input_check_ready.push(quote! {
-                    ::claspr::Input::check_ready(#pname)?;
-                });
+                input_bind_slots.push(res_bind_slots(&pname));
+                input_check_ready.push(res_check_ready(&pname));
                 bind_slot_pat_names.push(quote! { #pname });
                 op_arg_pass.push(quote! { &#pname });
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
                 output_homes.push(quote! { #home_ident });
                 output_origins.push(quote! { #origin_ident });
-                // Read-only dump: a slice arg is a RESOURCE `Input` — a shared
-                // producer edge lands here if it is pipe-fed.
                 dump_pat_names.push(quote! { #pname });
-                dump_in_cell_stmts.push(quote! {
-                    if let ::core::option::Option::Some(__c) =
-                        ::claspr::Input::pipe_cell_id(#pname)
-                    {
-                        __claspr_in_cells.push(__c);
-                    }
-                });
+                dump_in_cell_stmts.push(res_dump_in_cell(&pname));
 
                 // CB-mode: set this slice's (cl_mem, len) arg pair from the LENT
                 // local's handle, gather its upstream producer's sync points, and
                 // remember the handle for the output-pipe registration.
+                let note_origins_tt = note_origins(&origin_ident);
                 cb_arg_stmts.push(quote! {
                     {
                         let __claspr_h = ::claspr::KernelSliceReadArg::record_handle(&#pname)?;
                         __claspr_cb_waits.extend(__claspr_cb_ec.sp_lookup(#cbcell_ident));
-                        // Precise-invalidation: this command bakes a buffer traceable
-                        // to origins `#origin_ident` — note them on the CB so a mutate
-                        // of any clears it.
-                        for __s in &#origin_ident {
-                            ::claspr::record::CbBuilder::note_slot(__claspr_cb_builder, *__s);
-                        }
+                        #note_origins_tt
                         unsafe {
                             __claspr_cb_builder.set_buffer_arg(
                                 __claspr_cb_kernel,
@@ -750,33 +787,16 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // Output threading / lend / rehome: IDENTICAL to Slice.
                 let cbcell_ident = quote::format_ident!("__claspr_cbcell{}", arg_gen_idx - 1);
                 let origin_ident = quote::format_ident!("__claspr_origin{}", arg_gen_idx - 1);
-                input_resolve_eager.push(quote! {
-                    let #cbcell_ident = ::claspr::Input::pipe_cell_id(#pname);
-                    let #origin_ident: ::std::collections::BTreeSet<usize> =
-                        match ::claspr::Input::slot_cell_id(#pname) {
-                            ::core::option::Option::Some(__s) => {
-                                let mut __o = ::std::collections::BTreeSet::new();
-                                __o.insert(__s);
-                                __o
-                            }
-                            ::core::option::Option::None => {
-                                ::claspr::ExecutionContext::cb_reach_of(ec, #cbcell_ident)
-                            }
-                        };
-                    let (#pname, #deps_ident, #home_ident) =
-                        ::claspr::Input::resolve_home(#pname, ec)?;
-                });
+                input_resolve_eager.push(res_resolve_eager(
+                    &pname,
+                    &cbcell_ident,
+                    &origin_ident,
+                    &deps_ident,
+                    &home_ident,
+                ));
                 input_deps_idents.push(quote! { #deps_ident });
-                input_bind_slots.push(quote! {
-                    if ::claspr::SlotBinder::is_fanout(binder)
-                        || !::claspr::SlotBinder::is_consumed(binder)
-                    {
-                        ::claspr::Input::try_bind_slot(#pname, binder);
-                    }
-                });
-                input_check_ready.push(quote! {
-                    ::claspr::Input::check_ready(#pname)?;
-                });
+                input_bind_slots.push(res_bind_slots(&pname));
+                input_check_ready.push(res_check_ready(&pname));
                 bind_slot_pat_names.push(quote! { #pname });
                 // The ONLY difference from Slice in the EAGER path: wrap the
                 // resolved buffer in `ScalarRefArg` so the launch tuple sets a
@@ -786,26 +806,17 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 output_types.push(gid_tt);
                 output_homes.push(quote! { #home_ident });
                 output_origins.push(quote! { #origin_ident });
-                // Read-only dump: a scalar-ref (device-scalar) arg is a RESOURCE
-                // `Input` too — its pipe-fed edge is a shared producer edge.
                 dump_pat_names.push(quote! { #pname });
-                dump_in_cell_stmts.push(quote! {
-                    if let ::core::option::Option::Some(__c) =
-                        ::claspr::Input::pipe_cell_id(#pname)
-                    {
-                        __claspr_in_cells.push(__c);
-                    }
-                });
+                dump_in_cell_stmts.push(res_dump_in_cell(&pname));
 
                 // CB-mode: set ONLY the pointer arg (advance by 1), gather upstream
                 // sync points, remember the handle for output-pipe registration.
+                let note_origins_tt = note_origins(&origin_ident);
                 cb_arg_stmts.push(quote! {
                     {
                         let __claspr_h = ::claspr::KernelScalarRefArg::record_handle(&#pname)?;
                         __claspr_cb_waits.extend(__claspr_cb_ec.sp_lookup(#cbcell_ident));
-                        for __s in &#origin_ident {
-                            ::claspr::record::CbBuilder::note_slot(__claspr_cb_builder, *__s);
-                        }
+                        #note_origins_tt
                         unsafe {
                             __claspr_cb_builder.set_mem_arg(
                                 __claspr_cb_kernel,
@@ -875,57 +886,24 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // replays), exactly like an in-place slice kernel arg.
                 let cbcell_ident = quote::format_ident!("__claspr_cbcell{}", arg_gen_idx - 1);
                 let origin_ident = quote::format_ident!("__claspr_origin{}", arg_gen_idx - 1);
-                input_resolve_eager.push(quote! {
-                    // Capture the upstream pipe cell id BEFORE `resolve_home` shadows
-                    // `#pname` (needed by the CB-mode sync-point lookup), same as slices.
-                    let #cbcell_ident = ::claspr::Input::pipe_cell_id(#pname);
-                    let #origin_ident: ::std::collections::BTreeSet<usize> =
-                        match ::claspr::Input::slot_cell_id(#pname) {
-                            ::core::option::Option::Some(__s) => {
-                                let mut __o = ::std::collections::BTreeSet::new();
-                                __o.insert(__s);
-                                __o
-                            }
-                            ::core::option::Option::None => {
-                                ::claspr::ExecutionContext::cb_reach_of(ec, #cbcell_ident)
-                            }
-                        };
-                    let (#pname, #deps_ident, #home_ident) =
-                        ::claspr::Input::resolve_home(#pname, ec)?;
-                });
+                input_resolve_eager.push(res_resolve_eager(
+                    &pname,
+                    &cbcell_ident,
+                    &origin_ident,
+                    &deps_ident,
+                    &home_ident,
+                ));
                 input_deps_idents.push(quote! { #deps_ident });
-                // `bind_slots`: an image arg is a real slot position too — offer the
-                // binder so a matching unbound `slot!(Tag)` (Tag::Value = image)
-                // takes the value, just like a slice arg. Fan-out-aware: visit every
-                // site for a clone-able binder, stop once consumed for a move-only.
-                input_bind_slots.push(quote! {
-                    if ::claspr::SlotBinder::is_fanout(binder)
-                        || !::claspr::SlotBinder::is_consumed(binder)
-                    {
-                        ::claspr::Input::try_bind_slot(#pname, binder);
-                    }
-                });
-                // `check_ready`: an image arg is lent at execute exactly like a
-                // slice arg → read-only validate its `Input` cell up front.
-                input_check_ready.push(quote! {
-                    ::claspr::Input::check_ready(#pname)?;
-                });
+                input_bind_slots.push(res_bind_slots(&pname));
+                input_check_ready.push(res_check_ready(&pname));
                 bind_slot_pat_names.push(quote! { #pname });
                 op_arg_pass.push(quote! { &#pname });
                 output_names.push(pname.clone());
                 output_types.push(gid_tt);
                 output_homes.push(quote! { #home_ident });
                 output_origins.push(quote! { #origin_ident });
-                // Read-only dump: an image arg is a RESOURCE `Input` — pipe-fed
-                // images contribute a shared producer edge, like slices.
                 dump_pat_names.push(quote! { #pname });
-                dump_in_cell_stmts.push(quote! {
-                    if let ::core::option::Option::Some(__c) =
-                        ::claspr::Input::pipe_cell_id(#pname)
-                    {
-                        __claspr_in_cells.push(__c);
-                    }
-                });
+                dump_in_cell_stmts.push(res_dump_in_cell(&pname));
 
                 // CB-mode: an image is a SINGLE `cl_mem` arg (unlike a slice's
                 // pointer+length pair), so it uses `set_mem_arg` (1 slot), and its
@@ -933,14 +911,13 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // `BufHandle` directly — no `?`). Otherwise identical to the slice
                 // block: gather the upstream sync points, set the arg, remember the
                 // handle for the output-pipe registration.
+                let note_origins_tt = note_origins(&origin_ident);
                 cb_arg_stmts.push(quote! {
                     {
                         let __claspr_h =
                             ::claspr::record::RecordableBuffer::record_handle(&#pname);
                         __claspr_cb_waits.extend(__claspr_cb_ec.sp_lookup(#cbcell_ident));
-                        for __s in &#origin_ident {
-                            ::claspr::record::CbBuilder::note_slot(__claspr_cb_builder, *__s);
-                        }
+                        #note_origins_tt
                         unsafe {
                             __claspr_cb_builder.set_mem_arg(
                                 __claspr_cb_kernel,
