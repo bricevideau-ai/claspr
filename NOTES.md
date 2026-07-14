@@ -113,6 +113,39 @@ intel_legacy); `clippy --workspace --all-targets --release -D warnings` + `doc -
 Earlier commits already FF'd to main
 (`17f575e`); commits since (leaves/combinators/R4) awaiting the 3-ICD run.
 
+### ✅ READY-TO-FF 2026-07-14 — abstraction round 2 (branch `abstract-patterns-round2-20260714`)
+
+Same cost-of-entry goal: collapse repeated patterns so an agent reads intent, not
+N near-copies. 8 commits on top of `4da2117` (arity 8→16) + `e50d79b` (SyncPoints
+alias). Each behavior-preserving, each individually green (per-commit compile_fail
+re-checked with fresh rlib — the golden-shift trap bit twice mid-round and was
+folded back into the causing commit each time). **Net −743 lines, 22 files.**
+
+- **impl_image_verbs!** (image.rs, −420): the 8 transfer verbs (read/read_bytes/
+  read_alloc/read_bytes_alloc/write/write_bytes/copy_to/fill) × 6 families → 1
+  macro + 6 rows. `pixel_count` now `region.iter().product()` (the enqueue region
+  IS the extent) — the 6 dimension formulas fold into one. Biggest win.
+- **kernel resource-arm dedup** (claspr-macros): the Slice/ScalarRef/Image `#[kernel]`
+  arms shared 5 byte-identical fragments incl. the fresh CB precise-invalidation
+  origin capture (3 verbatim copies = the drift hazard) → token-producing closures,
+  one copy each. Arms stay separate (18 shared accumulators block a full merge).
+- **capabilities! table** (access.rs): 29 scattered impls across 4 trait sections →
+  a 6-row truth table (kernel:/host:/reseed:/fill: columns). The row IS the model.
+- **impl_acquire_view!/impl_release_view!** (leaves.rs, −205): the 6 host-view
+  acquire/release leaves. Brace-bound-fragment syntax `T:{..},M:{..}` dodges arm
+  ambiguity.
+- **impl_kernel_image_arg_matrix!** (image.rs, −83): 36 `KernelImage*Arg` access
+  impls → 6 rows (complements R4's trait-decl macro from round 1).
+- smaller: **SlotBinder::provide** (dedup the take/clone+downcast between the 5-state
+  Input + 2-state ScalarInput slot paths); **value_pattern_bytes** + unified
+  **fill_via_kernel** (buffer/SVM fill share one launch path, arg 0 via closure).
+
+VERIFIED (tip `a50af0f`): full workspace release build clean; **tier1+tier2 green on
+all 3 ICDs** (pocl/rusticl/intel_legacy); fmt/clippy `-D warnings`/doc/fixtures-fmt
+clean; image-pipeline + collatz run clean; gray-scott run_swap vs run_immutable
+BIT-IDENTICAL (exercises mutate + CB precise-invalidation through the shared origin
+capture). NOT yet FF'd to main.
+
 ---
 
 ## Deferred
