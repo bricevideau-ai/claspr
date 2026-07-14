@@ -1954,25 +1954,46 @@ kernel_image_arg_traits! {
         "Host arg for a kernel `&Image!(2D-array, ...)` parameter the kernel declared read_write.",
 }
 
-// ── Sealed marker impls (one per (Image<dim>D, A, F) combo) ────────
+// ── Sealed marker impls + per-(dim, access) arg impls ──────────────
 //
-// `kernel_image_arg_sealed::Sealed` is required by every
-// `KernelImage<dim>D*Arg` trait. We blanket-impl it on every
-// concrete `Image<dim>D<A, F>` regardless of access marker, since
-// the access-specific gating happens on the per-access trait
-// impls below.
+// `kernel_image_arg_sealed::Sealed` is required by every `KernelImage<dim>D*Arg`
+// trait; it is blanket-impl'd on every concrete `Image<dim>D<A, F>` regardless of
+// access marker (access-specific gating is on the per-access impls). Each access
+// marker then impls one or more trait variants, parameterised on `F::SampledFamily`
+// so the proc-macro's `<F: format::Format<SampledFamily = K>>` wrapper bound picks
+// the right impl per kernel `type=` keyword.
+//
+// Compatibility partial order (per OpenCL `clSetKernelArg` rules), emitted by
+// `impl_kernel_image_arg_matrix!` for EVERY dim:
+//   - `ReadOnly`  host image → satisfies `Read` kernel arg only
+//   - `WriteOnly` host image → satisfies `Write` kernel arg only
+//   - `ReadWrite` host image → satisfies all three (`Read`, `Write`, `ReadWrite`) —
+//     the host promises the cl_mem can bind to any kernel access qualifier; the
+//     runtime only forbids writing CL_MEM_READ_ONLY / reading CL_MEM_WRITE_ONLY,
+//     neither of which fires when ReadWrite is the host flag.
+//
+// This lets a single `Image2D<ReadWrite, F>` flow through a pipeline mixing
+// write-only producers and read-only consumers without intermediate cl_mem retypes.
 
-impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
-    kernel_image_arg_sealed::Sealed for Image1D<A, F>
-{
-}
-impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
-    kernel_image_arg_sealed::Sealed for Image2D<A, F>
-{
-}
-impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
-    kernel_image_arg_sealed::Sealed for Image3D<A, F>
-{
+/// Emit, for one image family, the `Sealed` impl + the fixed 5-impl access matrix
+/// wiring its markers to the `$read`/`$write`/`$readwrite` arg traits. The twin of
+/// `kernel_image_arg_traits!` (which DEFINES the traits); this WIRES the impls, so
+/// the compatibility partial order above lives in ONE place, not 6 copies.
+macro_rules! impl_kernel_image_arg_matrix {
+    ($fam:ident, $read:ident, $write:ident, $readwrite:ident) => {
+        impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
+            kernel_image_arg_sealed::Sealed for $fam<A, F>
+        {
+        }
+        impl<F: format::Format + Send + 'static> $read<F::SampledFamily> for $fam<ReadOnly, F> {}
+        impl<F: format::Format + Send + 'static> $write<F::SampledFamily> for $fam<WriteOnly, F> {}
+        impl<F: format::Format + Send + 'static> $read<F::SampledFamily> for $fam<ReadWrite, F> {}
+        impl<F: format::Format + Send + 'static> $write<F::SampledFamily> for $fam<ReadWrite, F> {}
+        impl<F: format::Format + Send + 'static> $readwrite<F::SampledFamily>
+            for $fam<ReadWrite, F>
+        {
+        }
+    };
 }
 
 // ── Per-(dim, access) impls ──────────────────────────────────────
@@ -1998,71 +2019,26 @@ impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
 // read-only consumer kernels — the common image-pipeline case —
 // without intermediate retype operations on the cl_mem.
 
-// Image1D
-impl<F: format::Format + Send + 'static> KernelImage1DReadArg<F::SampledFamily>
-    for Image1D<ReadOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage1DWriteArg<F::SampledFamily>
-    for Image1D<WriteOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage1DReadArg<F::SampledFamily>
-    for Image1D<ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage1DWriteArg<F::SampledFamily>
-    for Image1D<ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage1DReadWriteArg<F::SampledFamily>
-    for Image1D<ReadWrite, F>
-{
-}
+impl_kernel_image_arg_matrix!(
+    Image1D,
+    KernelImage1DReadArg,
+    KernelImage1DWriteArg,
+    KernelImage1DReadWriteArg
+);
 
-// Image2D
-impl<F: format::Format + Send + 'static> KernelImage2DReadArg<F::SampledFamily>
-    for Image2D<ReadOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage2DWriteArg<F::SampledFamily>
-    for Image2D<WriteOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage2DReadArg<F::SampledFamily>
-    for Image2D<ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage2DWriteArg<F::SampledFamily>
-    for Image2D<ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage2DReadWriteArg<F::SampledFamily>
-    for Image2D<ReadWrite, F>
-{
-}
+impl_kernel_image_arg_matrix!(
+    Image2D,
+    KernelImage2DReadArg,
+    KernelImage2DWriteArg,
+    KernelImage2DReadWriteArg
+);
 
-// Image3D
-impl<F: format::Format + Send + 'static> KernelImage3DReadArg<F::SampledFamily>
-    for Image3D<ReadOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage3DWriteArg<F::SampledFamily>
-    for Image3D<WriteOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage3DReadArg<F::SampledFamily>
-    for Image3D<ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage3DWriteArg<F::SampledFamily>
-    for Image3D<ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage3DReadWriteArg<F::SampledFamily>
-    for Image3D<ReadWrite, F>
-{
-}
+impl_kernel_image_arg_matrix!(
+    Image3D,
+    KernelImage3DReadArg,
+    KernelImage3DWriteArg,
+    KernelImage3DReadWriteArg
+);
 
 // ── Image1DArray ─────────────────────────────────────────────────
 //
@@ -2229,31 +2205,12 @@ impl<A: KernelAccess, F: format::Format> KernelArg for Image1DArray<A, F> {
     }
 }
 
-impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
-    kernel_image_arg_sealed::Sealed for Image1DArray<A, F>
-{
-}
-
-impl<F: format::Format + Send + 'static> KernelImage1DArrayReadArg<F::SampledFamily>
-    for Image1DArray<ReadOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage1DArrayWriteArg<F::SampledFamily>
-    for Image1DArray<WriteOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage1DArrayReadArg<F::SampledFamily>
-    for Image1DArray<ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage1DArrayWriteArg<F::SampledFamily>
-    for Image1DArray<ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage1DArrayReadWriteArg<F::SampledFamily>
-    for Image1DArray<ReadWrite, F>
-{
-}
+impl_kernel_image_arg_matrix!(
+    Image1DArray,
+    KernelImage1DArrayReadArg,
+    KernelImage1DArrayWriteArg,
+    KernelImage1DArrayReadWriteArg
+);
 
 // ── Image2DArray ─────────────────────────────────────────────────
 //
@@ -2441,31 +2398,12 @@ impl<A: KernelAccess, F: format::Format> KernelArg for Image2DArray<A, F> {
     }
 }
 
-impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
-    kernel_image_arg_sealed::Sealed for Image2DArray<A, F>
-{
-}
-
-impl<F: format::Format + Send + 'static> KernelImage2DArrayReadArg<F::SampledFamily>
-    for Image2DArray<ReadOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage2DArrayWriteArg<F::SampledFamily>
-    for Image2DArray<WriteOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage2DArrayReadArg<F::SampledFamily>
-    for Image2DArray<ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage2DArrayWriteArg<F::SampledFamily>
-    for Image2DArray<ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImage2DArrayReadWriteArg<F::SampledFamily>
-    for Image2DArray<ReadWrite, F>
-{
-}
+impl_kernel_image_arg_matrix!(
+    Image2DArray,
+    KernelImage2DArrayReadArg,
+    KernelImage2DArrayWriteArg,
+    KernelImage2DArrayReadWriteArg
+);
 
 // ── Image1DBuffer ─────────────────────────────────────────────────
 //
@@ -2683,33 +2621,12 @@ impl<A: KernelAccess, F: format::Format> KernelArg for Image1DBuffer<A, F> {
     }
 }
 
-impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
-    kernel_image_arg_sealed::Sealed for Image1DBuffer<A, F>
-{
-}
-
-// Per-access impls for Image1DBuffer — same partial order as
-// the dim-1/2/3 wrappers above.
-impl<F: format::Format + Send + 'static> KernelImageBufferReadArg<F::SampledFamily>
-    for Image1DBuffer<ReadOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
-    for Image1DBuffer<WriteOnly, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImageBufferReadArg<F::SampledFamily>
-    for Image1DBuffer<ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImageBufferWriteArg<F::SampledFamily>
-    for Image1DBuffer<ReadWrite, F>
-{
-}
-impl<F: format::Format + Send + 'static> KernelImageBufferReadWriteArg<F::SampledFamily>
-    for Image1DBuffer<ReadWrite, F>
-{
-}
+impl_kernel_image_arg_matrix!(
+    Image1DBuffer,
+    KernelImageBufferReadArg,
+    KernelImageBufferWriteArg,
+    KernelImageBufferReadWriteArg
+);
 
 // ── Image1DBufferView ─────────────────────────────────────────────
 //
