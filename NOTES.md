@@ -37,6 +37,49 @@ below.
   cascade `+ CommandBufferOp` bounds through ~7 CB helpers + every combinator (~53
   impl splits, ~60 call sites) with ZERO object-safety benefit (no `dyn DeviceOp`
   anywhere). The "CB is a skippable layer" goal is met by the module split instead.
+- **Type-state slots for Tier 2** (graph type carries the unbound-tag set) —
+  DECLINED (2026-07-15, not enough benefit for the churn). Design: `type Slots`
+  (HList set) per op; `bind`/`call` type-transition `Graph<Remaining>` →
+  `Graph<Remaining∖Tg>`; terminals gate on `Slots=HNil`; `Bound`(static) vs
+  `Ready`(dynamic, stays runtime `check_ready`); `mutate_*` on `Graph<Bound>`.
+  The prize: forgotten-bind / double-bind / typo'd-tag become COMPILE errors, so
+  the whole deferred-error apparatus (`DeferredErrors` sink + `peek_deferred`
+  poison + rebuild-recovery, `eager/slots.rs`) is DELETED, not maintained.
+  Size/`LengthMismatch` stays a runtime terminal `Result` (raised at execute,
+  never in the sink); readiness (lent/severed/pipe) stays runtime.
+  **Why the residual ergonomics don't pay off — the shared-slot wall:**
+  auto-dedup of a tag reused at N sites needs type-level type-equality →
+  associated-type specialization's `default type` won't normalize (min_spec
+  rejects outright; full spec compiles but can't be named downstream) — HARD wall
+  on the pinned nightly, empirically reconfirmed. Consequences:
+    - `bind(Grid(arr))` filling ALL Grid sites at once needs `RemoveAll` = same
+      wall; NOT buildable. A macro can't rescue it (the occurrence count lives in
+      the resolved type, invisible to a syntactic macro).
+    - `g.bind::<rank>(...)` (one specific occurrence via explicit index) IS
+      buildable — escape hatch only.
+    - Fill-all + clone-by-multiplicity are MUTUALLY EXCLUSIVE (fill-all needs the
+      tag once in the type; multiplicity-clone needs it N times).
+  Three wall-free shapes, each with a real cost, none compelling now:
+    - **Multiset + clone/move** (no marker; multiplicity = "consumed N times",
+      clone/move falls out of ownership for free) — but repeated-tag removal is
+      order-sensitive (head-pinned; inferred-index is `E0283`-ambiguous on
+      repeats) and no fill-all.
+    - **Dedup-by-declaration** (graph names its distinct slot set in its type —
+      reusable graphs already do via `impl Graph<Slots=Slots![..]>`) — gives
+      fill-all + order-free + single-move (runtime `TypeId` map fans one bind to
+      all sites, no cloning) — but weaker typo-catching and a dedup annotation is
+      still needed at cross-graph `bundle!` joins.
+    - **`Reuse` marker at reuse sites** — REJECTED by Brice: a per-site
+      annotation fights graph reusability.
+  Scope if ever revived: ~36 `DeviceOp` impls gain `type Slots` (default `HNil`);
+  ~9 composing combinators `Append` children's sets; close the latent
+  `bind_slots` gaps (FanOut/Arced/ArcSplit/OnDevice/Profiled/DeviceDynOp — several
+  don't walk slots at runtime today); `DeviceDynOp` erasure can't carry static
+  `Slots` (stored graphs fall back to runtime). Verified feasible: distinct-tags
+  type-state (18/18 old spike, re-greened today) and shared-via-explicit-Reuse
+  (spiked green today, no unstable features). **REVISIT TRIGGER: if the
+  deferred-error machinery grows further (more sink/poison cases), the trade tips
+  — full type-state then deletes it wholesale; revisit dedup-by-declaration.**
 
 ---
 
