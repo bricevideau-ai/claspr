@@ -123,6 +123,12 @@ trigger:** a user wants one of those.
 
 ## Concerns
 
+- **Intel NEO (legacy) crashes on malformed SPIR-V** — a valid-header module with a
+  scrambled instruction stream SIGSEGVs inside the driver's IL frontend, and a
+  half-truncated module is silently ACCEPTED (no validation). `tier1/errors.rs`
+  gates its corrupted-module case off Intel devices with a loud SKIP. Driver
+  defect; legacy NEO is effectively frozen so an upstream report is low-value —
+  recorded here so nobody re-diagnoses the SEGV.
 - **PoCL device-init race (upstream-report candidate)** — concurrent first-touch
   `clGetDeviceIDs` on PoCL 8.0-pre transiently returns ZERO devices to threads that
   race another thread's first call (recovers ~100s of ms later; rusticl unaffected;

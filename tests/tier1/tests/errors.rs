@@ -30,9 +30,19 @@ fn build_program_rejects_garbage_bytes() {
 /// stream must also fail (the runtime's IL parser or its compiler
 /// rejects it) — this is the closest analogue to a truncated or
 /// bit-rotted .spv file in the wild.
+///
+/// Skipped on Intel NEO: its IL frontend doesn't survive malformed
+/// module bodies — a scrambled instruction stream SIGSEGVs inside the
+/// driver (and a half-truncated module is silently ACCEPTED, so
+/// there's no corruption shape it rejects cleanly). Driver defect,
+/// not a claspr one; PoCL and rusticl both reject properly.
 #[test]
 fn build_program_rejects_corrupted_module() {
     let Some(ctx) = ctx() else { return };
+    if ctx.device().vendor().unwrap_or_default().contains("Intel") {
+        eprintln!("SKIP: Intel NEO crashes on malformed SPIR-V module bodies");
+        return;
+    }
     let mut bytes = claspr_test_kernels::kernels::SPV_BYTES.to_vec();
     assert!(bytes.len() > 64, "test kernel module unexpectedly small");
     // Keep the 20-byte header (magic/version/generator/bound/schema)
