@@ -71,9 +71,25 @@ struct PlatformInner {
 unsafe impl Send for PlatformInner {}
 unsafe impl Sync for PlatformInner {}
 
+/// Serializes platform *and* device enumeration process-wide.
+///
+/// A runtime's lazy first-touch initialization is not necessarily
+/// thread-safe against concurrent enumeration: PoCL (observed on
+/// 8.0-pre) transiently reports **zero devices** to threads whose
+/// `clGetDeviceIDs` lands while another thread's first call is still
+/// mid-initialization (they recover ~hundreds of ms later). With both
+/// enumeration entry points behind one lock, the winning thread's
+/// first call completes the runtime's init before anyone else asks.
+/// Enumeration is rare and cheap, so the mutex costs nothing once the
+/// runtime is warm.
+static CL_ENUM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Platform {
     /// Every OpenCL platform reachable from the loader.
+    ///
+    /// Serialized via [`CL_ENUM_LOCK`] (see there).
     pub fn all() -> Result<Vec<Platform>> {
+        let _guard = crate::util::lock_unpoisoned(&CL_ENUM_LOCK);
         let cl3_platforms = get_platforms()?;
         let mut out = Vec::with_capacity(cl3_platforms.len());
         for p in cl3_platforms {
@@ -95,7 +111,12 @@ impl Platform {
     }
 
     /// Devices on this platform of the given type.
+    ///
+    /// Serialized via [`CL_ENUM_LOCK`] (see there) — PoCL's device
+    /// init races concurrent `clGetDeviceIDs`, transiently reporting
+    /// zero devices.
     pub fn devices_of_type(&self, kind: DeviceType) -> Result<Vec<Device>> {
+        let _guard = crate::util::lock_unpoisoned(&CL_ENUM_LOCK);
         let cl3 = Cl3Platform::new(self.inner.id);
         let ids = cl3.get_devices(kind.as_cl_type())?;
         Ok(ids
