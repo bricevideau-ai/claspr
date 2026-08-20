@@ -77,10 +77,13 @@ use syn::{
 /// See the crate-level docs for the rough shape; behaviour follows
 /// these rules when walking the stub's parameters:
 ///
-/// - A parameter with a `#[spirv(<builtin>)]` attribute (anything except
-///   `cross_workgroup` or no attribute) is **dropped** — these are
-///   SPIR-V built-in inputs filled in by the OpenCL runtime, not
-///   host-side arguments.
+/// - A parameter with a `#[spirv(<known-builtin>)]` attribute (one of
+///   `KNOWN_BUILTINS` in this crate, e.g. `global_invocation_id`,
+///   `workgroup_id`, `subgroup_id`) is **dropped** — these are SPIR-V
+///   built-in inputs filled in by the OpenCL runtime, not host-side
+///   arguments. An unrecognised qualifier (a typo, a Vulkan-style
+///   `uniform`/`binding`, or a builtin not yet in the list) is a
+///   compile error pointing at the attribute.
 /// - A parameter `#[spirv(cross_workgroup)] name: &mut [T]` or `&[T]`
 ///   is **translated** to a generic arg bounded by
 ///   `KernelSliceRead[Write]Arg<T>` (accepts `DeviceSlice`/`MappedSlice`/
@@ -166,6 +169,22 @@ pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse to decide between the fn form and the mod form.
     let parsed: syn::Result<syn::Item> = syn::parse2(item_ts.clone());
     if let Ok(syn::Item::Mod(mut item_mod)) = parsed {
+        // `#[claspr::device] mod gpu;` (no inline body) can't work: the
+        // macro has nowhere to inject the include! + `kernels()` items,
+        // and the build script has no body to lift into the kernel
+        // crate — historically both sides silently did nothing. Error
+        // here, where the fix is visible.
+        if item_mod.content.is_none() {
+            return syn::Error::new(
+                item_mod.ident.span(),
+                "claspr::device: a device module needs an inline body \
+                 (`mod gpu { ... }`), not a file module (`mod gpu;`). To split \
+                 device code across files, put `mod foo;` declarations *inside* \
+                 the inline body (requires `#![feature(proc_macro_hygiene)]`).",
+            )
+            .to_compile_error()
+            .into();
+        }
         if let Some((_, items)) = &mut item_mod.content {
             // Append the include and the convenience `kernels()` fn
             // *inside* the user's module body. Filename matches the
@@ -180,15 +199,52 @@ pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let include_item: syn::Item = syn::parse_quote! {
                 include!(concat!(env!("OUT_DIR"), #mod_filename));
             };
+            // Collect the `#[claspr::kernel]` fn names declared directly
+            // in the module body. The build-generated `ENTRY_POINTS`
+            // comes from what rust-gpu *compiled*; the typed launchers
+            // come from what the host source *declares* — nothing else
+            // cross-checks the two, so a stale OUT_DIR or a renamed
+            // kernel would otherwise surface as a raw
+            // CL_INVALID_KERNEL_NAME panic at first launch. (Kernels in
+            // nested `mod foo;` file modules aren't visible here; they
+            // keep the launch-time check only.)
+            let launcher_names: Vec<String> = items
+                .iter()
+                .filter_map(|it| match it {
+                    syn::Item::Fn(f) if f.attrs.iter().any(is_claspr_kernel_attr) => {
+                        Some(f.sig.ident.to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
             let kernels_fn: syn::Item = syn::parse_quote! {
                 /// Build the program from the embedded SPIR-V and look up every entry point.
                 ///
                 /// Thin wrapper around `Kernels::load_from(ctx, SPV_BYTES)` —
                 /// the same `load_from` that any `claspr::kernels!`-generated
-                /// `Kernels` exposes — so `#[claspr::device]` consumes the
-                /// public abstraction rather than its own one-off path.
+                /// `Kernels` exposes — plus a cross-check that every typed
+                /// launcher declared in this module has a matching entry
+                /// point in the compiled SPIR-V, so host/kernel drift is a
+                /// constructor `Err`, not a first-launch panic.
                 pub fn kernels(ctx: &::claspr::Context) -> ::claspr::Result<Kernels> {
-                    Kernels::load_from(ctx, SPV_BYTES)
+                    const __CLASPR_LAUNCHER_ENTRY_POINTS: &[&str] = &[
+                        #( #launcher_names ),*
+                    ];
+                    let k = Kernels::load_from(ctx, SPV_BYTES)?;
+                    for name in __CLASPR_LAUNCHER_ENTRY_POINTS {
+                        if ::claspr::Kernel::create(&k.__claspr_program, name).is_err() {
+                            return ::core::result::Result::Err(::claspr::Error::Build {
+                                log: ::std::format!(
+                                    "host launcher `{name}` has no matching entry point in the \
+                                     compiled SPIR-V (available: {ENTRY_POINTS:?}). The host \
+                                     wrapper and the kernel build are out of sync — stale \
+                                     OUT_DIR (try a clean build), a renamed kernel, or an \
+                                     entry point the kernel compiler dropped."
+                                ),
+                            });
+                        }
+                    }
+                    ::core::result::Result::Ok(k)
                 }
             };
             items.push(include_item);
@@ -397,11 +453,20 @@ fn expand_kernels(input: KernelsMacroInput) -> syn::Result<TokenStream2> {
                 /// if the runtime is out of resources — `bind` /
                 /// `load_from` validated every entry point's
                 /// existence, so the only remaining failure mode is
-                /// OOM. Used internally by the typed launchers;
-                /// exposed for the rare untyped-launch case.
+                /// OOM (the message still lists the known entry
+                /// points, for raw-name callers passing a name outside
+                /// `ENTRY_POINTS`). Used internally by the typed
+                /// launchers; exposed for the rare untyped-launch case.
                 pub fn kernel(&self, name: &str) -> ::claspr::Kernel {
-                    ::claspr::Kernel::create(&self.__claspr_program, name)
-                        .unwrap_or_else(|e| panic!("clCreateKernel({name:?}) failed: {e:?}"))
+                    ::claspr::Kernel::create(&self.__claspr_program, name).unwrap_or_else(
+                        |e| {
+                            ::std::panic!(
+                                "clCreateKernel({name:?}) failed: {e:?} (entry points in \
+                                 this program: {:?})",
+                                Self::ENTRY_POINTS
+                            )
+                        },
+                    )
                 }
 
                 /// The kernel entry-point names this `Kernels` view
@@ -2348,15 +2413,15 @@ enum ParamRole {
 
 fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
     let attr = find_spirv_attr(&pt.attrs);
-    let kind = attr.as_ref().map(spirv_attr_kind);
+    let kind = match &attr {
+        Some(a) => Some(spirv_attr_kind(a)?),
+        None => None,
+    };
 
-    // Anything tagged with a SPIR-V builtin name (global_invocation_id,
-    // workgroup_id, local_invocation_id, …) is a runtime-filled input,
-    // not a host kernel argument. The complete list lives in
-    // `spirv-std::spirv` — rather than enumerate every keyword, we
-    // treat everything except `cross_workgroup` as a builtin. This
-    // matches the rust-gpu convention where `cross_workgroup` is the
-    // *only* attribute that names a host-supplied buffer.
+    // A known SPIR-V builtin qualifier (global_invocation_id,
+    // workgroup_id, …) marks a runtime-filled input, not a host kernel
+    // argument — drop the parameter from the launch wrapper. Unknown
+    // qualifiers already errored in `spirv_attr_kind`.
     if matches!(kind, Some(SpirvKind::Builtin)) {
         return Ok(ParamRole::Builtin);
     }
@@ -2399,6 +2464,19 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
             family: info.family,
             access_segment: info.access_segment,
         });
+    }
+    // Reference-typed params that reach this point are mistakes, not
+    // scalars: every host-supplied buffer shape (`&[T]`, `&mut [T]`,
+    // `&T`, `&mut T`) needs `#[spirv(cross_workgroup)]`, and images
+    // were recognised above. Passing one through as a "scalar" would
+    // produce a launcher whose trait bounds fail far from the typo.
+    if matches!(&*pt.ty, Type::Reference(_) | Type::Slice(_)) {
+        return Err(syn::Error::new(
+            pt.ty.span(),
+            "claspr::kernel: reference-typed parameter without an address-space qualifier — \
+             did you forget `#[spirv(cross_workgroup)]`? (`&[T]` / `&mut [T]` slices and \
+             `&T` / `&mut T` scalar-by-reference params must all carry it)",
+        ));
     }
     let t = &pt.ty;
     Ok(ParamRole::Scalar {
@@ -2454,6 +2532,23 @@ fn find_spirv_attr(attrs: &[Attribute]) -> Option<Attribute> {
     attrs.iter().find(|a| a.path().is_ident("spirv")).cloned()
 }
 
+/// True for `#[claspr::kernel]` / `#[kernel]` (same matching rules as
+/// claspr-build's `is_claspr_kernel_attr` — keep the two in sync).
+/// Used by the `device` macro to inventory the module's launcher names.
+fn is_claspr_kernel_attr(attr: &Attribute) -> bool {
+    let segs: Vec<String> = attr
+        .path()
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    match segs.as_slice() {
+        [single] => single == "kernel",
+        [first, second] => first == "claspr" && second == "kernel",
+        _ => false,
+    }
+}
+
 enum SpirvKind {
     /// `#[spirv(cross_workgroup)]` — host-supplied buffer; translate type.
     CrossWorkgroup,
@@ -2463,31 +2558,82 @@ enum SpirvKind {
     /// addition to the Image! tokens) when picking the host-side
     /// trait-bound variant.
     ImageAccess,
-    /// Anything else (`#[spirv(global_invocation_id)]`, `workgroup`, …)
-    /// — drop from host signature.
+    /// A known SPIR-V builtin input qualifier (one of [`KNOWN_BUILTINS`])
+    /// — drop the parameter from the host signature.
     Builtin,
 }
 
-fn spirv_attr_kind(attr: &Attribute) -> SpirvKind {
-    // We want to know whether the inner meta starts with `cross_workgroup`,
-    // `image_access`, or something else. Use the parse_args-as-token-stream
-    // path so we don't have to enumerate every spirv attribute syn might
-    // know about.
-    let tokens = attr.meta.require_list().ok().map(|l| l.tokens.clone());
-    let Some(tokens) = tokens else {
-        return SpirvKind::Builtin;
-    };
-    let first_ident = tokens
+/// SPIR-V parameter qualifiers `claspr::kernel` recognises as
+/// runtime-filled builtins (and therefore drops from the host launch
+/// wrapper). Add to this list when supporting a new builtin — the
+/// lookup is by exact ident, so a typo or rename surfaces as a compile
+/// error from `spirv_attr_kind` rather than silently slipping through
+/// and desyncing the host signature from what was written.
+const KNOWN_BUILTINS: &[&str] = &[
+    "global_invocation_id",
+    "local_invocation_id",
+    "local_invocation_index",
+    "workgroup_id",
+    "num_workgroups",
+    "num_subgroups",
+    "subgroup_id",
+    "subgroup_size",
+    "subgroup_local_invocation_id",
+    "subgroup_max_size",
+    // `workgroup` declares workgroup-local memory; the parameter is
+    // dropped and the host sizes the allocation explicitly.
+    "workgroup",
+];
+
+/// Classify a `#[spirv(...)]` parameter attribute: `cross_workgroup`
+/// (host-supplied buffer), `image_access` (kernel-side access
+/// override, param stays in the host signature), or a runtime-filled
+/// builtin from [`KNOWN_BUILTINS`]. Anything else surfaces as a
+/// compile error pointing at the attribute rather than getting
+/// silently dropped from the launch wrapper.
+///
+/// Detection keys on the first identifier inside the attribute's
+/// argument list — the common shape for SPIR-V parameter qualifiers.
+/// Vulkan-style attributes leading with `uniform`, `descriptor_set`,
+/// `binding`, … aren't supported by the OpenCL kernel target and
+/// (correctly) error here.
+fn spirv_attr_kind(attr: &Attribute) -> syn::Result<SpirvKind> {
+    let list = attr.meta.require_list().map_err(|_| {
+        syn::Error::new(
+            attr.span(),
+            "claspr::kernel: `#[spirv]` must have an argument list, e.g. \
+             `#[spirv(global_invocation_id)]` or `#[spirv(cross_workgroup)]`",
+        )
+    })?;
+    let first_ident = list
+        .tokens
+        .clone()
         .into_iter()
         .find_map(|tt| match tt {
             proc_macro2::TokenTree::Ident(i) => Some(i.to_string()),
             _ => None,
         })
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            syn::Error::new(
+                attr.span(),
+                "claspr::kernel: `#[spirv(...)]` must name a SPIR-V parameter qualifier \
+                 (e.g. `cross_workgroup`, `global_invocation_id`)",
+            )
+        })?;
+
     match first_ident.as_str() {
-        "cross_workgroup" => SpirvKind::CrossWorkgroup,
-        "image_access" => SpirvKind::ImageAccess,
-        _ => SpirvKind::Builtin,
+        "cross_workgroup" => Ok(SpirvKind::CrossWorkgroup),
+        "image_access" => Ok(SpirvKind::ImageAccess),
+        b if KNOWN_BUILTINS.contains(&b) => Ok(SpirvKind::Builtin),
+        other => Err(syn::Error::new(
+            attr.span(),
+            format!(
+                "claspr::kernel: unrecognised SPIR-V parameter qualifier `{other}`. \
+                 If this is a new SPIR-V builtin input, add it to KNOWN_BUILTINS in \
+                 claspr-macros. Vulkan-style attributes (uniform, descriptor_set, \
+                 binding, …) are not supported by the OpenCL kernel target."
+            ),
+        )),
     }
 }
 
@@ -2539,6 +2685,8 @@ struct ImageInfo {
 ///   - (no `type=`) → `Uint` default (matches rust-gpu's behaviour
 ///     when neither `type=` nor `format=` is set; the user should
 ///     really write `type=u32` explicitly, but we don't fail here)
+///   - any other `type=` value → compile error (a typo'd sampled type
+///     must not silently launch as `Uint`)
 ///
 /// Dim derivation from the leading `Image!(<dim>, ...)` ident:
 ///   - `1D` → 1; `2D` → 2; `3D` → 3
@@ -2625,10 +2773,25 @@ fn classify_image_param(pt: &PatType) -> syn::Result<Option<ImageInfo>> {
         Some("i32") | Some("i64") | Some("i8") | Some("i16") => {
             quote! { ::claspr::image::format::Sint }
         }
-        // `u32`/`u8`/`u16`/`u64` + the no-`type=` catch-all map to
-        // `Uint`, matching the existing default that pairs with
-        // rust-gpu's `Image!(...)` when no `type=` is given.
-        _ => quote! { ::claspr::image::format::Uint },
+        Some("u32") | Some("u64") | Some("u8") | Some("u16") => {
+            quote! { ::claspr::image::format::Uint }
+        }
+        // No `type=` keeps the `Uint` default, matching rust-gpu's
+        // behaviour when neither `type=` nor `format=` is given.
+        None => quote! { ::claspr::image::format::Uint },
+        // An unrecognised `type=` must not silently fall back to Uint —
+        // a typo'd sampled type would launch with the wrong family and
+        // fail (or misread) at runtime instead of here.
+        Some(other) => {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "claspr::kernel: unsupported Image! sampled type `type={other}`. \
+                     Supported: u8/u16/u32/u64 (Uint), i8/i16/i32/i64 (Sint), \
+                     f32/f64 (Float)"
+                ),
+            ));
+        }
     };
 
     // Access derivation. The override (if present) wins over the

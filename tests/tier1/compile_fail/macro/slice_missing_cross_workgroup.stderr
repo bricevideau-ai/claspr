@@ -1,0 +1,8 @@
+error: claspr::kernel: reference-typed parameter without an address-space qualifier — did you forget `#[spirv(cross_workgroup)]`? (`&[T]` / `&mut [T]` slices and `&T` / `&mut T` scalar-by-reference params must all carry it)
+  --> compile_fail/macro/slice_missing_cross_workgroup.rs:13:19
+   |
+13 |             data: &mut [u32],
+   |                   ^^^^^^^^^^
+
+error: aborting due to 1 previous error
+

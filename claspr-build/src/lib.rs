@@ -136,7 +136,6 @@
 //! [kernels-macro]: https://docs.rs/claspr/latest/claspr/macro.kernels.html
 //! [claspr]: https://github.com/bricevideau-ai/claspr
 
-use quote::ToTokens;
 use spirv_builder::{CompileResult, SpirvBuilder};
 use std::error::Error;
 use std::fmt::Write as _;
@@ -507,15 +506,23 @@ fn generate_module_source(
         Self::load_from(ctx, SPV_BYTES)
     }
 
-    /// Get a fresh `cl_kernel` handle for `name`. Panics if the
-    /// runtime is out of resources — the constructor validated every
-    /// entry point's existence, so the only remaining failure mode
-    /// is OOM. Used internally by proc-macro-emitted launch methods;
-    /// exposed for the rare case where you need a raw kernel by name
+    /// Get a fresh `cl_kernel` handle for `name`. Panics on failure:
+    /// the constructor validated every name in `ENTRY_POINTS`, so this
+    /// only fires on resource exhaustion — or on a host-launcher /
+    /// compiled-SPIR-V mismatch the constructor couldn't see (a kernel
+    /// in a nested file module, or a raw-name call). The panic message
+    /// lists the entry points that do exist to make that diagnosable.
+    /// Used internally by proc-macro-emitted launch methods; exposed
+    /// for the rare case where you need a raw kernel by name
     /// (e.g. `ctx.launch(&kernels.kernel("foo"), ...)`).
     pub fn kernel(&self, name: &str) -> ::claspr::Kernel {
-        ::claspr::Kernel::create(&self.__claspr_program, name)
-            .unwrap_or_else(|e| panic!("clCreateKernel({name:?}) failed: {e:?}"))
+        ::claspr::Kernel::create(&self.__claspr_program, name).unwrap_or_else(|e| {
+            panic!(
+                "clCreateKernel({name:?}) failed: {e:?} (entry points in this program: \
+                 {ENTRY_POINTS:?}; if {name:?} is missing there, the host launcher and the \
+                 compiled SPIR-V are out of sync — stale OUT_DIR or a renamed kernel)"
+            )
+        })
     }
 }
 "#,
@@ -669,11 +676,21 @@ impl HostBuilder {
             .parent()
             .ok_or("source file has no parent directory")?;
         let device_mod_dir = src_dir.join(&mod_name);
-        let raw_items = device_mod
-            .content
-            .as_ref()
-            .map(|(_, items)| items.clone())
-            .unwrap_or_default();
+        // `#[claspr::device] mod gpu;` (no inline body) has nothing to
+        // lift — historically this silently produced an empty kernel
+        // crate with no entry points. The proc-macro rejects it too;
+        // error here as well so a stale host build can't mask it.
+        let Some((_, items)) = device_mod.content.as_ref() else {
+            return Err(format!(
+                "device module `{mod_name}` in {} has no inline body \
+                 (`mod {mod_name};`). Give it an inline body \
+                 (`mod {mod_name} {{ ... }}`); split across files with `mod foo;` \
+                 declarations *inside* the body.",
+                self.src_file.display()
+            )
+            .into());
+        };
+        let raw_items = items.clone();
         let lifted_items = translate_and_inline(raw_items, &device_mod_dir)?;
         let lifted_file = syn::File {
             shebang: None,
@@ -698,8 +715,22 @@ impl HostBuilder {
         // reshuffle on rust-gpu in 2026-05).
         seed_lockfile_from_host(src_dir, &crate_dir);
 
-        // Compile via spirv-builder.
-        let result: CompileResult = self.settings.apply_to(&crate_dir).build()?;
+        // Compile via spirv-builder. Name the module on failure —
+        // with several device modules in one host source, "which one
+        // broke" is otherwise invisible in the build output.
+        let result: CompileResult = self
+            .settings
+            .apply_to(&crate_dir)
+            .build()
+            .map_err(|e| format!("kernel build failed for device module `{mod_name}`: {e}"))?;
+        if result.entry_points.is_empty() {
+            return Err(format!(
+                "device module `{mod_name}` produced no kernel entry points — \
+                 does it (or a file module it pulls in) contain at least one \
+                 `#[claspr::kernel]` fn?"
+            )
+            .into());
+        }
         let spv_path = result.module.unwrap_single().to_path_buf();
 
         // Emit the Kernels module to OUT_DIR/<mod_name>.rs — this
@@ -911,10 +942,14 @@ fn write_generated_lib_rs(crate_dir: &Path, file: &syn::File) -> Result<()> {
     s.push_str("#![cfg_attr(target_arch = \"spirv\", no_std)]\n");
     s.push_str("#![allow(unused_imports)]\n\n");
     s.push_str("use spirv_std::spirv;\n\n");
-    for item in &file.items {
-        s.push_str(&item.to_token_stream().to_string());
-        s.push_str("\n\n");
-    }
+    // Pretty-print rather than dumping raw token streams: rustc errors
+    // from the kernel build point into this file, and "line 4, column
+    // 8213" of token soup is undebuggable.
+    s.push_str(&prettyplease::unparse(&syn::File {
+        shebang: None,
+        attrs: vec![],
+        items: file.items.clone(),
+    }));
     std::fs::write(crate_dir.join("src/lib.rs"), s)?;
     Ok(())
 }

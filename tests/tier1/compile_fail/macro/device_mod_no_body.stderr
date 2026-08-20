@@ -1,0 +1,8 @@
+error: claspr::device: a device module needs an inline body (`mod gpu { ... }`), not a file module (`mod gpu;`). To split device code across files, put `mod foo;` declarations *inside* the inline body (requires `#![feature(proc_macro_hygiene)]`).
+  --> compile_fail/macro/device_mod_no_body.rs:10:5
+   |
+10 | mod gpu;
+   |     ^^^
+
+error: aborting due to 1 previous error
+

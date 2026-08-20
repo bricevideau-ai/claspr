@@ -1,0 +1,8 @@
+error: claspr::kernel: unrecognised SPIR-V parameter qualifier `global_invocation_idx`. If this is a new SPIR-V builtin input, add it to KNOWN_BUILTINS in claspr-macros. Vulkan-style attributes (uniform, descriptor_set, binding, …) are not supported by the OpenCL kernel target.
+  --> compile_fail/macro/unknown_spirv_qualifier.rs:13:13
+   |
+13 |             #[spirv(global_invocation_idx)] _id: spirv_std::glam::USizeVec3,
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+
