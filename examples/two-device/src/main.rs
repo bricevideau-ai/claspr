@@ -33,13 +33,22 @@ fn pick_devices() -> claspr::Result<Option<DeviceConfig>> {
     if all.is_empty() {
         return Ok(None);
     }
-    if all.len() >= 2 {
-        println!(
-            "two-device: using two physical devices ({}, {})",
-            all[0].name()?,
-            all[1].name()?,
-        );
-        return Ok(Some(DeviceConfig::Two([all[0].clone(), all[1].clone()])));
+    // Two physical devices must come from ONE platform: an OpenCL
+    // context can't span platforms (clCreateContext rejects the pair
+    // with CL_INVALID_DEVICE). With several ICDs installed,
+    // `Device::all()` happily returns a cross-platform mix, so pick
+    // per-platform instead of taking the first two overall.
+    for platform in claspr::Platform::all()? {
+        let devs = platform.devices()?;
+        if devs.len() >= 2 {
+            println!(
+                "two-device: using two physical devices ({}, {}) on platform {}",
+                devs[0].name()?,
+                devs[1].name()?,
+                platform.name(),
+            );
+            return Ok(Some(DeviceConfig::Two([devs[0].clone(), devs[1].clone()])));
+        }
     }
     // Try sub-device partitioning. `partition_equally`'s argument
     // is "compute units per sub-device" — for exactly 2 sub-devices
