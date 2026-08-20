@@ -201,8 +201,21 @@ impl<'l, A: KernelArgs> IntoFuture for LaunchOp<'l, A> {
     type IntoFuture = LaunchFuture;
 
     fn into_future(self) -> LaunchFuture {
+        let queue = self.queue;
         match self.into_event() {
-            Ok(event) => LaunchFuture::Running(EventFuture::new(event)),
+            Ok(event) => {
+                // Flush before parking on the callback: registering a
+                // CL_COMPLETE callback does NOT submit the command, and
+                // a lazy runtime (rusticl) never executes an unflushed
+                // enqueue — the future would deadlock. Same reasoning
+                // as the tier2 run() terminal's
+                // flush_all_outoforder_queues; pocl flushes eagerly so
+                // this is a no-op there.
+                if let Err(e) = queue.flush() {
+                    return LaunchFuture::Errored(Some(e.into()));
+                }
+                LaunchFuture::Running(EventFuture::new(event))
+            }
             Err(e) => LaunchFuture::Errored(Some(e)),
         }
     }

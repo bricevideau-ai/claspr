@@ -101,7 +101,9 @@ pub type ProfileCb = Box<dyn FnOnce(Result<ProfilingInfo>) + Send + 'static>;
 /// Modifiers — [`after`](Self::after), [`profiled`](Self::profiled) —
 /// chain by-value; combine them in any order before the terminal.
 pub struct LaunchOp<'l, A: KernelArgs> {
-    queue: &'l CommandQueue,
+    /// `pub(crate)` so `IntoFuture` (future.rs) can flush this queue
+    /// after `into_event` — see the deadlock note there.
+    pub(crate) queue: &'l CommandQueue,
     kernel: &'l Kernel,
     spec: LaunchSpec,
     args: A,
