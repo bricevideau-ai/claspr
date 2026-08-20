@@ -123,19 +123,15 @@ trigger:** a user wants one of those.
 
 ## Concerns
 
-- **Upload reseed-failure strands the graph with a misleading diagnosis** (from the
-  2026-08-20 adversarial review; PRE-EXISTING, not introduced by the fix branch) —
-  if a replay's `write_buffer_enqueue` fails in `Upload::execute`
-  (`eager/leaves.rs` ~318-331), the taken buffer is dropped instead of rehomed, so
-  every later run reports "already lent … graph busy" instead of the real dead-graph
-  cause. Same shape in `ScalarUpload` (~424) and a third copy (~1854). Low urgency
-  (needs an enqueue failure mid-replay); fix = rehome-on-error before returning.
 - **Intel NEO (legacy) crashes on malformed SPIR-V** — a valid-header module with a
   scrambled instruction stream SIGSEGVs inside the driver's IL frontend, and a
   half-truncated module is silently ACCEPTED (no validation). `tier1/errors.rs`
   gates its corrupted-module case off Intel devices with a loud SKIP. Driver
   defect; legacy NEO is effectively frozen so an upstream report is low-value —
-  recorded here so nobody re-diagnoses the SEGV.
+  recorded here so nobody re-diagnoses the SEGV. Same laxness family: it does
+  not enforce `CL_INVALID_CONTEXT` on cross-context enqueues (the write just
+  succeeds), so `eager_cross_context.rs`'s reseed-failure tests behavior-gate
+  themselves (loud SKIP when the replay unexpectedly succeeds).
 - **PoCL device-init race (upstream-report candidate)** — concurrent first-touch
   `clGetDeviceIDs` on PoCL 8.0-pre transiently returns ZERO devices to threads that
   race another thread's first call (recovers ~100s of ms later; rusticl unaffected;

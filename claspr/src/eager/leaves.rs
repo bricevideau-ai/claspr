@@ -318,14 +318,21 @@ where
             (Some(mut buf), _) => {
                 if M::RESEED_ON_REPLAY {
                     // Synchronous host write back into the SAME buffer (stable
-                    // handle). No upstream deps — upload is a chain head.
-                    crate::buffer::write_buffer_enqueue(
+                    // handle). No upstream deps — upload is a chain head. A
+                    // failed enqueue must REHOME before surfacing: the buffer
+                    // was already taken, and dropping it leaves cell-empty +
+                    // seeded, which every later run misdiagnoses as "already
+                    // lent" — the graph would be stranded by a transient error.
+                    if let Err(e) = crate::buffer::write_buffer_enqueue(
                         &mut buf,
                         ec,
                         self.src.as_slice(),
                         true,
                         &[],
-                    )?;
+                    ) {
+                        *lock_unpoisoned(&self.buf) = Some(buf);
+                        return Err(e);
+                    }
                 }
                 buf
             }
@@ -423,13 +430,19 @@ where
             }
             (Some(mut buf), _) => {
                 if M::RESEED_ON_REPLAY {
-                    crate::buffer::write_buffer_enqueue(
+                    // A failed reseed must rehome before surfacing (same
+                    // rationale as `Upload`: a drop strands the graph as
+                    // "already lent").
+                    if let Err(e) = crate::buffer::write_buffer_enqueue(
                         &mut buf.inner,
                         ec,
                         std::slice::from_ref(&self.value),
                         true,
                         &[],
-                    )?;
+                    ) {
+                        *lock_unpoisoned(&self.buf) = Some(buf);
+                        return Err(e);
+                    }
                 }
                 buf
             }
@@ -1870,8 +1883,13 @@ where
                 if M::RESEED_ON_REPLAY {
                     // Plain host copy back into the SAME allocation (stable pointer),
                     // after draining in-flight kernel-use events. No SVM map/memcpy —
-                    // USM is host memory.
-                    buf.reseed_sync(self.src.as_slice())?;
+                    // USM is host memory. A failed reseed must rehome before
+                    // surfacing (same rationale as `Upload`: a drop strands the
+                    // graph as "already lent").
+                    if let Err(e) = buf.reseed_sync(self.src.as_slice()) {
+                        *lock_unpoisoned(&self.buf) = Some(buf);
+                        return Err(e);
+                    }
                 }
                 buf
             }
