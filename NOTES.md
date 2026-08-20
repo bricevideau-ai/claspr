@@ -123,9 +123,11 @@ trigger:** a user wants one of those.
 
 ## Concerns
 
-- **Image format dispatch in the proc-macro** — the macro emits `&Image2DRgba8` for every
-  `&Image!(...)` param; the runtime (`Image2D<A, F>`) is generic over format. Gap is in
-  the macro's dispatch only. (README Limitations.)
+- **Image dispatch is family-level, not format-level** — the macro derives
+  dim/arrayed/family/access from `Image!(...)` and bounds the launcher generic, but the
+  concrete channel format isn't part of the bound (Kernel-target SPIR-V carries only the
+  sampled type; `format=` is Shader-only), so channel-format mismatches surface at
+  runtime. Near the ceiling of what's statically checkable. (README Limitations.)
 - **Cross-device + Arc-split test coverage is thin** — `cross_device` ~2 tests,
   `arc_split` sparse. Works as documented; harden when cross-device gets more usage.
 - **Library-crate transitive spirv-std dependency** — pure kernel libs cfg-gate spirv-std

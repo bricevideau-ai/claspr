@@ -25,7 +25,7 @@ mod gpu {
 
     #[claspr::kernel]
     pub fn collatz_kernel(
-        #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+        #[spirv(global_invocation_id)] _id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] data: &mut [u32],
     ) {
         let i = _id.x;
@@ -63,7 +63,7 @@ fn main() {
 
 That's the whole thing. The kernel function lives once, in the `#[claspr::device] mod`. claspr-build extracts the module's body into a generated kernel sub-crate compiled by rust-gpu; for each device module `<name>` it finds, output is written to `OUT_DIR/<name>.rs`. `#[claspr::device]` on the matching host module injects an `include!()` of that file *inside* the module (so `Kernels` ends up scoped to `gpu::Kernels`) plus a `pub fn kernels(&ctx) -> Result<Kernels>` convenience wrapper; the `#[claspr::kernel]` proc-macro emits a typed launch method on `Kernels` for each function. The host can also call `gpu::collatz(...)` for validation — same source, two consumers. Multiple `#[claspr::device]` modules in the same file each map to their own `OUT_DIR/<name>.rs` and own `Kernels` — no collisions.
 
-The typed launcher (`kernels.collatz_kernel(...)`) takes the slice arg by value and returns it from `.wait(...)`, so you can keep using the buffer after the launch without unsafe-borrowing across the device/host boundary. The slice param is generic over `KernelSliceArg<T>` — `DeviceSlice<T>`, `MappedSlice<T>` (coarse-grain SVM), and `USMSlice<T>` (fine-grain-system SVM over a host `Vec<T>`) all flow through the same call.
+The typed launcher (`kernels.collatz_kernel(...)`) takes the slice arg by value and returns it from `.wait()`, so you can keep using the buffer after the launch without unsafe-borrowing across the device/host boundary. The slice param is generic over `KernelSliceReadArg<T>` / `KernelSliceReadWriteArg<T>` (picked from the kernel's `&[T]` vs `&mut [T]`) — `DeviceSlice<T>`, `MappedSlice<T>` (coarse-grain SVM), and `USMSlice<T>` (fine-grain-system SVM over a host `Vec<T>`) all flow through the same call.
 
 ## Other modes: pre-compiled and external SPIR-V
 
@@ -95,7 +95,7 @@ mod generated { include!(concat!(env!("OUT_DIR"), "/kernels.rs")); }
 claspr::kernels! {
     pub mod gpu {
         fn fill_u32(
-            #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+            #[spirv(global_invocation_id)] _id: spirv_std::glam::USizeVec3,
             #[spirv(cross_workgroup)] data: &mut [u32],
             value: u32,
         );
@@ -120,7 +120,7 @@ skip `claspr-build` entirely. Declare the typed surface with
 claspr::kernels! {
     pub mod gpu {
         fn fill_u32(
-            #[spirv(global_invocation_id)] _id: ::glam::USizeVec3,
+            #[spirv(global_invocation_id)] _id: spirv_std::glam::USizeVec3,
             #[spirv(cross_workgroup)] data: &mut [u32],
             value: u32,
         );
@@ -131,7 +131,7 @@ let bytes = std::fs::read("kernels.spv")?;          // or clang, or HTTP fetch
 let kernels = gpu::Kernels::load_from(&ctx, &bytes)?;
 // Or, if you want to share the built program across surfaces:
 let program = ctx.build_program(&bytes)?;
-let kernels = gpu::Kernels::bind(program)?;
+let kernels = gpu::Kernels::bind(&ctx, program)?;
 ```
 
 The trade-off vs single-source: `kernels!` signatures live in the
@@ -176,8 +176,8 @@ let g = kernels
     .call((Factor(2),));           // curry the invariant once
 
 for x in inputs {                  // one graph, many runs
-    let out = g.mutate_call((Buf(upload_x),))  // reuse-loop: re-bind by name
-               .sync(&ctx)?;
+    let out = g.mutate_call((Buf(upload_x),))? // reuse-loop: re-bind by name
+        .sync(&ctx)?;
 }
 ```
 
@@ -217,6 +217,8 @@ bit-identical.
 | `examples/batch-inference/` | Device-graph fan-out: N independent batches in parallel via `fan_out`, sharing model weights through one `Arc<DeviceSlice>` (uploaded once, read-only in every branch). |
 | `examples/two-device/` | Multi-device API: `Context::for_devices()`, `Queue::on_device()`, cross-queue buffer `copy_to`, plus a sub-device partition fallback so it does something useful even on single-physical-device boxes. No kernel code. |
 | `examples/gray-scott/` | Reusable-graph flagship: a Gray-Scott reaction-diffusion solver built two ways over typed slots — `run_swap` (mutable-swap replay via `mutate_call`) and `run_immutable` (a curried bind-by-name meta-kernel composed with set-once `call`). An inline `#[test]` proves the two are bit-identical. Writes a `.ppm` of the final V field. |
+| `examples/cg/` | Matrix-free conjugate-gradient solver as a self-closing single-graph loop with device-resident α/β scalars — the worked example for keeping an iterative solver's control scalars on-device. |
+| `examples/spv-introspect/` | SPIR-V introspection helper: dumps a compiled kernel's entry points and argument metadata — handy when debugging host/kernel signature drift. |
 
 ## Running the examples
 
@@ -237,8 +239,14 @@ cargo run -p batch-inference-example
 # Reusable-graph flagship: reaction-diffusion, two graph shapes, bit-identical
 cargo run -p gray-scott-example
 
+# Matrix-free CG solver, device-resident scalars
+cargo run -p cg-example
+
 # Multi-device walk
 cargo run -p two-device-example
+
+# SPIR-V entry-point / kernel-arg introspection
+cargo run -p spv-introspect-example
 ```
 
 All need an OpenCL runtime. With pocl installed under `~/.local`:
@@ -257,16 +265,16 @@ On macOS, the system OpenCL framework is picked up automatically (no `OCL_ICD_VE
 
 1. **Runtime crate (`claspr`)** — generalises the `OclContext` / `DeviceSlice` / `KernelArg` / image-and-ppm helper patterns from [rust-gpu-opencl-samples](https://github.com/bricevideau-ai/rust-gpu-opencl-samples) into a reusable library. Launch surface with two entry points: the lower-level `LaunchOp::new(...)` builder and the proc-macro-emitted `kernels.foo(...)` typed launchers. Host-only, no rust-gpu deps. Every op implements the one `DeviceOp` trait, so the same operation runs standalone (`.wait()`) or composes into an eager, closure-free device-operation graph (`.and_then` / `bundle!` / `fan_out`, terminals `.sync(&ctx)` / `.run(&ctx)`).
 2. **Build-script codegen (`claspr-build`)** — turns a host source file into a generated kernel crate + a `Kernels` struct with one field per entry point. Two flavours: `compile()` for the kernel-crate-as-separate-folder workflow, and `compile_from_host()` for the in-host source extraction that single-source mode uses (with multi-file support via `mod foo;` declarations following rustc's standard file-resolution rules).
-3. **Proc-macro frontend (`claspr-macros`)** — `#[claspr::kernel]` emits an `impl Kernels { fn name(...) -> Op<...> }` typed launch method whose signature mirrors the kernel's (each `#[spirv(cross_workgroup)] &mut [T]` becomes a generic `D: KernelSliceArg<T>` slot, builtin-tagged params dropped, image params translated to `Image2D<A, F>`). The emitted Op implements the one `DeviceOp` trait, so it exposes the standalone terminals (`.wait(&launcher)` / `.submit(&launcher)`) and composes into device-operation graphs alike. `#[claspr::device]` marks individual fns or whole modules; on a module, also injects an `include!()` of the build-script-generated `Kernels` and a `pub fn kernels(&ctx)` convenience wrapper.
+3. **Proc-macro frontend (`claspr-macros`)** — `#[claspr::kernel]` emits an `impl Kernels { fn name(...) -> Op<...> }` typed launch method whose signature mirrors the kernel's (each `#[spirv(cross_workgroup)] &mut [T]` becomes a generic `D: KernelSliceReadWriteArg<T>` slot, builtin-tagged params dropped, image params translated to generics bounded by the matching `KernelImage<dim><Access>Arg<family>` trait). The emitted Op implements the one `DeviceOp` trait, so it exposes the standalone terminals (`.wait()` / `.submit()`) and composes into device-operation graphs alike. `#[claspr::device]` marks individual fns or whole modules; on a module, also injects an `include!()` of the build-script-generated `Kernels` and a `pub fn kernels(&ctx)` convenience wrapper.
 
 ## Limitations
 
 - **rust-gpu fork pinned**: depends on `bricevideau-ai/rust-gpu` branch `opencl-kernel-support` (kernel target + everything that goes with it; not yet upstreamed). The generated kernel sub-crate's `Cargo.toml` hardcodes the same branch — should eventually inherit from the host workspace.
-- **Image format hardcoded to RGBA8 in the proc-macro**: any `&Image!(...)` param maps to `Image2D<_, R8G8B8A8Uint>`. The runtime side (`claspr::Image2D<A, F>`) is fully generic — only the macro's dispatch is the gap.
+- **Image dispatch is family-level, not format-level**: the proc-macro derives dimensionality (1D/2D/3D/buffer, arrayed), sampled-type family (`type=` → Uint/Sint/Float), and access (`&`/`&mut` + `image_access`) from the `Image!(...)` param and bounds the launcher generic accordingly — but the concrete channel format (`Rgba8` vs `R32Uint`, …) is not part of the bound. Any host image of the right dim/family/access flows through; a channel-format mismatch surfaces at runtime, not compile time. (Kernel-target SPIR-V carries only the sampled type — `format=` is Shader-only — so this is close to the ceiling of what the macro *can* check.)
 - **Filter is opt-in by attribute**: items not marked `#[claspr::kernel]` / `#[claspr::device]` are dropped from the kernel crate. Auto-call-graph extraction (kernel-side helpers picked up automatically from the kernel body's references) is on the eventual TODO.
 - **Multi-file device modules need `#![feature(proc_macro_hygiene)]`** at the user's crate root — `mod foo;` (file modules) inside a proc-macro's input is gated on nightly (rust-lang/rust#54727). Single-file modules don't need the feature gate. Can't be auto-injected (crate-level inner attrs only live at the crate root).
 - **Limited kernel patterns covered through single source**: collatz (slice + scalar args), raymarch (image kernel + many helpers), mandelbrot + sobel (image generator + image filter, library-crate form), the small linear / relu pipelines in `async-pipeline` and `batch-inference`. fp64 / vector / subgroup ops / sampler-based image reads / custom struct args have not yet been ported through the single-source path — coverage on those lives in rust-gpu's upstream difftest suite.
-- **Build-script error messages are still terse** — fine for normal flow, blunt when something genuinely goes wrong.
+- **Build-script error messages are serviceable but not polished** — kernel-build failures name the offending device module and the generated kernel crate is pretty-printed (so rustc line numbers are usable), but deeper spirv-builder failures still surface as raw tool output.
 
 ## Prior art and inspiration
 
