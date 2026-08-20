@@ -123,6 +123,13 @@ trigger:** a user wants one of those.
 
 ## Concerns
 
+- **Upload reseed-failure strands the graph with a misleading diagnosis** (from the
+  2026-08-20 adversarial review; PRE-EXISTING, not introduced by the fix branch) —
+  if a replay's `write_buffer_enqueue` fails in `Upload::execute`
+  (`eager/leaves.rs` ~318-331), the taken buffer is dropped instead of rehomed, so
+  every later run reports "already lent … graph busy" instead of the real dead-graph
+  cause. Same shape in `ScalarUpload` (~424) and a third copy (~1854). Low urgency
+  (needs an enqueue failure mid-replay); fix = rehome-on-error before returning.
 - **Intel NEO (legacy) crashes on malformed SPIR-V** — a valid-header module with a
   scrambled instruction stream SIGSEGVs inside the driver's IL frontend, and a
   half-truncated module is silently ACCEPTED (no validation). `tier1/errors.rs`

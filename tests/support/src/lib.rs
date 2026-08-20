@@ -113,7 +113,9 @@ pub fn ctx_with_svm() -> Option<Context> {
 ///    `CLASPR_REQUIRE_DEVICE` (the variable asserts a device exists, not
 ///    two) — but *zero* devices still panics through [`ctx`] when it's set.
 pub fn ctx_two_devices() -> Option<(Context, Device, Device)> {
-    // 1. Real multi-device: any platform with ≥2 devices.
+    // 1. Real multi-device: any platform with ≥2 devices. A context-build
+    // failure on one platform must not silently abort discovery — say so
+    // loudly and try the next platform (then the sub-device stage).
     if let Ok(platforms) = Platform::all() {
         for p in platforms {
             if let Ok(devs) = p.devices()
@@ -121,11 +123,19 @@ pub fn ctx_two_devices() -> Option<(Context, Device, Device)> {
             {
                 let dev_a = devs[0].clone();
                 let dev_b = devs[1].clone();
-                let ctx = Context::builder()
+                match Context::builder()
                     .devices(&[dev_a.clone(), dev_b.clone()])
                     .build()
-                    .ok()?;
-                return Some((ctx, dev_a, dev_b));
+                {
+                    Ok(ctx) => return Some((ctx, dev_a, dev_b)),
+                    Err(e) => {
+                        eprintln!(
+                            "SKIP candidate: two-device context build failed on platform {} \
+                             ({e}); trying next",
+                            p.name()
+                        );
+                    }
+                }
             }
         }
     }
@@ -150,11 +160,15 @@ pub fn ctx_two_devices() -> Option<(Context, Device, Device)> {
             }
             let dev_a = subs[0].clone();
             let dev_b = subs[1].clone();
-            let ctx = Context::builder()
+            match Context::builder()
                 .devices(&[dev_a.clone(), dev_b.clone()])
                 .build()
-                .ok()?;
-            return Some((ctx, dev_a, dev_b));
+            {
+                Ok(ctx) => return Some((ctx, dev_a, dev_b)),
+                Err(e) => {
+                    eprintln!("SKIP candidate: sub-device context build failed ({e}); trying next");
+                }
+            }
         }
     }
     // 3. Skip — but a machine with NO device at all must still trip

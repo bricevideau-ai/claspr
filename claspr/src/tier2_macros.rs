@@ -298,7 +298,7 @@ macro_rules! device_scalar_zero {
 /// impl<S> ::claspr::Tag for Buf<S>
 /// where S: ::claspr::IntoBound<DeviceSlice<u32>> + 'static {
 ///     type Value = DeviceSlice<u32>;
-///     type Key   = Buf<::claspr::KeyMarker>;   // stable matching identity
+///     type Key   = Buf<::claspr::eager::KeyMarker>;   // stable matching identity
 ///     fn into_value(self) -> DeviceSlice<u32> { self.0.into_bound() }
 ///     fn source_cell_id(&self) -> Option<usize> { self.0.source_cell_id() }
 /// }

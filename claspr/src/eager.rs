@@ -441,7 +441,7 @@ pub type BoxedHome<Out> = Box<dyn Rehome<Out>>;
 /// origin cell, which simply drops (releasing its `cl_mem`).
 ///
 /// `pub` + `#[doc(hidden)]`: the `#[kernel]` proc-macro emits
-/// `::claspr::rehome_consumed(...)` inside the *user's* crate for multi-output
+/// `::claspr::eager::rehome_consumed(...)` inside the *user's* crate for multi-output
 /// kernels' `reclaim_undelivered`, so it must be reachable cross-crate. Not part
 /// of the stable surface.
 #[doc(hidden)]

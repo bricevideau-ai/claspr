@@ -54,10 +54,10 @@
 //! ```ignore
 //! use claspr::{download, upload, DeviceOpExt};
 //!
-//! let result: Vec<u32> = upload!(initial_data)
+//! let result: Vec<u32> = upload(initial_data)
 //!     .and_then(|buf| kernels.fill_u32([N], buf, 5))
 //!     .and_then(|buf| kernels.scale_u32([N], buf, 3))
-//!     .and_then(|buf| download!(buf))
+//!     .and_then(download)
 //!     .sync(&ctx)?;
 //! ```
 //!
@@ -211,7 +211,21 @@ pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let launcher_names: Vec<String> = items
                 .iter()
                 .filter_map(|it| match it {
-                    syn::Item::Fn(f) if f.attrs.iter().any(is_claspr_kernel_attr) => {
+                    // Skip cfg-gated kernels: this macro sees items
+                    // BEFORE cfg-stripping, so a `#[cfg(feature =
+                    // "...")]` kernel's name would be baked into the
+                    // check even when the cfg is off — and the
+                    // generated kernel sub-crate never has the host's
+                    // features, so the entry point is legitimately
+                    // absent from the SPV. Gated kernels keep the
+                    // launch-time check only, same as file-module
+                    // kernels.
+                    syn::Item::Fn(f)
+                        if f.attrs.iter().any(is_claspr_kernel_attr)
+                            && !f.attrs.iter().any(|a| {
+                                a.path().is_ident("cfg") || a.path().is_ident("cfg_attr")
+                            }) =>
+                    {
                         Some(f.sig.ident.to_string())
                     }
                     _ => None,
@@ -2579,7 +2593,20 @@ const KNOWN_BUILTINS: &[&str] = &[
     "subgroup_id",
     "subgroup_size",
     "subgroup_local_invocation_id",
-    "subgroup_max_size",
+    // The Kernel-execution-model builtins backing OpenCL's
+    // get_work_dim() / get_global_size() / get_enqueued_local_size() /
+    // get_global_offset() / get_global_linear_id() — all wired in
+    // rust-gpu's builtin table (symbols.rs), so the host wrapper must
+    // drop them like any other runtime-filled input.
+    "work_dim",
+    "global_size",
+    "enqueued_workgroup_size",
+    "global_offset",
+    "global_linear_id",
+    // NOT listed: `subgroup_max_size` / `num_enqueued_subgroups` —
+    // commented out in rust-gpu's table today, so a kernel using them
+    // fails there anyway; add here in lockstep when rust-gpu wires
+    // them.
     // `workgroup` declares workgroup-local memory; the parameter is
     // dropped and the host sizes the allocation explicitly.
     "workgroup",
