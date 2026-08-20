@@ -88,11 +88,10 @@ pub mod kernels {
         data[gid.x] = lid.x as u32;
     }
 
-    /// Write `global_invocation_id().x` into the global slot — used by
-    /// runtime tests to verify `global_offset` took effect. With
-    /// `global_size=[N]` and `global_offset=[K]`,
-    /// `global_invocation_id().x` ranges over `K..K+N` and writes land
-    /// at the same indices.
+    /// Write `global_invocation_id().x` into the global slot — an
+    /// identity probe used by the slot-generalization tests (and the
+    /// natural probe for a global-offset launch option, if
+    /// `LaunchSpec` ever grows one; it has no offset support today).
     #[claspr::kernel]
     pub fn global_id_u32(
         #[spirv(global_invocation_id)] gid: spirv_std::glam::USizeVec3,

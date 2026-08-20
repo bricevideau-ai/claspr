@@ -217,10 +217,7 @@ impl Device {
     /// First device of any type. Convenience for trivial single-device
     /// setups; for anything multi-device, use [`find`](Self::find).
     pub fn any() -> Result<Device> {
-        Self::all()?
-            .into_iter()
-            .next()
-            .ok_or(Error::NoDevices)
+        Self::all()?.into_iter().next().ok_or(Error::NoDevices)
     }
 
     /// First GPU device on any platform.

@@ -164,7 +164,14 @@ mod tests {
             return;
         };
         let k = generated::Kernels::load(&ctx).expect("legacy Kernels::load");
-        // Untyped escape-hatch: get a raw `cl_kernel` by name.
-        let _raw = k.kernel("fill_u32");
+        // Untyped escape-hatch: get a raw `cl_kernel` by name, and
+        // assert it's actually the kernel we asked for (a bare `let _`
+        // here would pass even if the escape hatch handed back
+        // garbage).
+        let raw = k.kernel("fill_u32");
+        assert_eq!(
+            raw.function_name().expect("CL_KERNEL_FUNCTION_NAME"),
+            "fill_u32"
+        );
     }
 }

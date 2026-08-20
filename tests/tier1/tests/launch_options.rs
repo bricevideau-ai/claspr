@@ -1,4 +1,6 @@
-//! Kernel launch options — local work-size and global offset.
+//! Kernel launch options — local work-size. (Global offset is not a
+//! `LaunchSpec` feature today; if it grows one, `global_id_u32` in
+//! the test-kernels crate is the natural probe.)
 
 use claspr::{Context, DeviceSlice};
 use claspr_test_kernels::kernels;

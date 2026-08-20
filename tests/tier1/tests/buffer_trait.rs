@@ -67,11 +67,15 @@ fn buffer_is_empty_matches_zero_len_alloc() {
     let Some(ctx) = ctx() else { return };
     // Zero-length allocations on every tier where they're legal.
     // OpenCL accepts size=0 for clCreateBuffer in practice (returns
-    // a valid mem object); some drivers reject it. Use this test as
-    // a soft check — skip the assertion if alloc errors.
-    if let Ok(b) = DeviceSlice::<u32>::alloc_zero(&ctx, 0) {
-        assert_eq!(b.len(), 0);
-        assert!(b.is_empty());
+    // a valid mem object); some drivers reject it — that's a
+    // legitimate skip, but it must be LOUD so an all-green run can't
+    // silently mean "asserted nothing".
+    match DeviceSlice::<u32>::alloc_zero(&ctx, 0) {
+        Ok(b) => {
+            assert_eq!(b.len(), 0);
+            assert!(b.is_empty());
+        }
+        Err(e) => eprintln!("SKIP: driver rejects zero-length clCreateBuffer ({e})"),
     }
 }
 

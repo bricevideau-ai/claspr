@@ -19,6 +19,9 @@ claspr-test-image-kernels = { path = "../image-kernels" }
 
 [dev-dependencies]
 ui_test = "0.30"
+# For block_on / noop_waker in the Tier-1 async-surface tests
+# (async_event.rs) — same crate claspr's `async-events` feature uses.
+futures = "0.3"
 
 # `ui_test` requires harness = false so its `fn main()` actually runs
 # instead of cargo test looking for `#[test]`s. The test crate `image_compile_fail`
