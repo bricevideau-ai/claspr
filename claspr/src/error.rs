@@ -26,6 +26,12 @@ pub enum Error {
     LengthMismatch { src: usize, dst: usize },
     /// The selected device or runtime doesn't support a requested feature.
     NotSupported(&'static str),
+    /// No OpenCL device was found on any platform — usually an
+    /// environment problem (no ICD installed, or `OCL_ICD_VENDORS`
+    /// pointing at the wrong directory), not a claspr one. The most
+    /// common first-run failure, so it gets its own variant with the
+    /// remedy in the message instead of a generic "not supported".
+    NoDevices,
     /// SVM (shared virtual memory) was requested but not available on this device.
     SvmNotAvailable,
     /// A [`LaunchOp::profiled`](crate::op::LaunchOp::profiled) closure was
@@ -106,6 +112,11 @@ impl fmt::Display for Error {
                 write!(f, "length mismatch: src has {src} elements, dst has {dst}")
             }
             Error::NotSupported(what) => write!(f, "not supported on this device: {what}"),
+            Error::NoDevices => f.write_str(
+                "no OpenCL devices found on any platform — is an OpenCL runtime (ICD) \
+                 installed? Check `clinfo`; if you select a runtime via OCL_ICD_VENDORS, \
+                 make sure it points at a directory containing .icd files",
+            ),
             Error::SvmNotAvailable => {
                 f.write_str("SVM (shared virtual memory) not available on this device")
             }
