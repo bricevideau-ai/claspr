@@ -306,6 +306,12 @@ impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadabl
 {
     fn set_pointer_only(&self, exec: &mut ExecuteKernel<'_>) {
         // Pointer only — no trailing length (scalar-ref shape).
+        // SAFETY: `buffer` is a live cl_mem owned by this slice; the
+        // launch Op holds the arg by value, and cl_mem release is
+        // refcounted past in-flight commands, so the handle outlives
+        // the launch. Arg-index order matches the kernel signature by
+        // construction (macro-emitted `set` calls run in declaration
+        // order).
         unsafe {
             exec.set_arg(&*self.buffer);
         }
@@ -342,6 +348,10 @@ impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadabl
 {
     fn set_pointer_only(&self, exec: &mut ExecuteKernel<'_>) {
         // SVM pointer only — no trailing length (scalar-ref shape).
+        // SAFETY: `ptr()` is a live SVM allocation owned by this
+        // slice; the launch Op holds the arg by value and
+        // `register_completion` pins the allocation past the launch's
+        // completion event, so the pointer outlives the kernel run.
         unsafe {
             exec.set_arg_svm(self.ptr());
         }
@@ -378,6 +388,9 @@ impl<T: Send + 'static, M: crate::access::MemMode + crate::access::KernelReadabl
 {
     fn set_pointer_only(&self, exec: &mut ExecuteKernel<'_>) {
         // SVM pointer only — no trailing length (scalar-ref shape).
+        // SAFETY: as for MappedSlice above — live SVM pointer, owned
+        // by the arg the Op holds, pinned past completion via
+        // `register_completion`.
         unsafe {
             exec.set_arg_svm(self.ptr());
         }
@@ -443,6 +456,11 @@ impl<T: Send + Sync + 'static, M: crate::access::MemMode + crate::access::Kernel
 impl<T, M: crate::access::MemMode> KernelArg for DeviceSlice<T, M> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         let len: usize = self.len;
+        // SAFETY: live cl_mem owned by this slice (refcounted past
+        // in-flight commands); `len` is passed by value. The
+        // (pointer, length) pair matches rust-gpu's slice-param ABI,
+        // and arg-index order matches the kernel signature by
+        // construction.
         unsafe {
             exec.set_arg(&*self.buffer).set_arg(&len);
         }
@@ -561,6 +579,8 @@ impl LocalBuffer {
 
 impl KernelArg for LocalBuffer {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
+        // SAFETY: passes only a size — the runtime allocates the
+        // workgroup-local memory itself; no host pointer is involved.
         unsafe {
             exec.set_arg_local_buffer(self.size_bytes);
         }

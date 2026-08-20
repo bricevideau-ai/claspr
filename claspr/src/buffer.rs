@@ -1225,6 +1225,10 @@ pub struct DeviceMappedWriteGuard<'a, T, M: MemMode> {
     released: bool,
 }
 
+// SAFETY: same argument as DeviceMappedReadGuard above — host_ptr is a
+// mapped pointer accessed serially via Deref/DerefMut/Drop on whichever
+// thread owns the guard; the buffer's Send-ness is inherited through
+// the (here exclusive) borrow.
 unsafe impl<T: Send, M: MemMode> Send for DeviceMappedWriteGuard<'_, T, M> {}
 
 impl<'a, T, M: MemMode> DeviceMappedWriteGuard<'a, T, M> {

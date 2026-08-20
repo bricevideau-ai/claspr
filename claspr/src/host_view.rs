@@ -45,7 +45,7 @@
 //! (no writeback on unmap).
 
 use crate::access::{HostReadable, HostWritable, MemMode};
-use crate::eager::{Deps, DeviceEnqueue, deps_as_events, deps_to_wait_list, single_dep};
+use crate::eager::{Deps, DeviceEnqueue, deps_to_wait_list, single_dep};
 use crate::exec_ctx::ExecutionContext;
 use crate::map_primitive;
 use crate::mappable::Mappable;
@@ -769,11 +769,4 @@ where
         unsafe { mapped_slice(handle.ptr, handle.len) }
     }
     fn mark_unmap_not_done(_handle: &mut Self::MapHandle) {}
-}
-
-// Suppress the unused import warning for `deps_as_events` — kept
-// available for future variants that need it.
-#[allow(dead_code)]
-fn _unused_deps_as_events_keepalive(d: &Deps) -> impl Iterator<Item = &Event> {
-    deps_as_events(d)
 }
