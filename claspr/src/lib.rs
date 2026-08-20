@@ -166,19 +166,22 @@ pub use transfer::UploadSource;
 
 #[cfg(feature = "async-events")]
 pub use eager::DeviceChainFuture;
+// Root policy: USER surface only. A docs.rs visitor should meet verbs
+// and types they call, not the engine's plumbing. Everything the graph
+// engine itself needs (dep/event conversion helpers, edge tables, the
+// slot-equality machinery, the numbered `bundleN` fns behind the
+// `bundle!` macro) stays reachable at `claspr::eager::…` but is NOT
+// re-exported here.
 pub use eager::{
     AndThenHost, ArcSplit, BindAll, BindMode, Cell, Checkout, CopyTo2, Dep, Deps, DeviceDynOp,
     DeviceEnqueue, DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt, Download, ExecMode,
     FanOut, Fill, FillMapped, FromCheckout, GraphNode, ImageDownloadEager, ImageUploadEager, Input,
-    IntoBound, KeyMarker, OnDevice, Pipe, ReadInto, ScalarInput, ScalarSlotCell, ScalarSlotState,
-    ScalarUpload, ScalarZero, SlotBinder, SlotCell, SlotEq, SlotHandle, SlotState, SlotValue, Tag,
-    ToInput, TransferToDevice, Upload, WriteDevice, WriteMapped, arc_split, arced, bundle2,
-    bundle3, bundle4, bundle5, bundle6, bundle7, bundle8, bundle9, bundle10, bundle11, bundle12,
-    bundle13, bundle14, bundle15, bundle16, deps_as_events, deps_into_single_event,
-    deps_to_wait_list, eager_copy_to, fan_out, fill_mapped, forward, graph_edge_table,
-    image_download, image_upload, lift, read_into, rehome_consumed, scalar_value, scalar_value_as,
-    scalar_zero, scalar_zero_as, single_dep, transfer_to_device, transfer_to_device_at, value,
-    wrap_event, write, write_mapped,
+    IntoBound, OnDevice, Pipe, ReadInto, ScalarInput, ScalarSlotCell, ScalarSlotState,
+    ScalarUpload, ScalarZero, SlotBinder, SlotCell, SlotHandle, SlotState, SlotValue, Tag, ToInput,
+    TransferToDevice, Upload, WriteDevice, WriteMapped, arc_split, arced, download, eager_copy_to,
+    fan_out, fill, fill_mapped, forward, image_download, image_upload, lift, read_into,
+    scalar_value, scalar_value_as, scalar_zero, scalar_zero_as, transfer_to_device,
+    transfer_to_device_at, upload, value, write, write_mapped,
 };
 
 // Stage-3 proc-macro frontend.
@@ -227,18 +230,25 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
 
     // ── High-frequency Tier 2 constructors ──
+    // `download` / `upload` are intentionally absent here: the crate-root
+    // re-import below brings in both the macro and the root-re-exported fn
+    // of those names, and naming them twice in the value namespace is E0252.
     pub use crate::eager::{
         alloc_zero, arc_split, arced, bundle2, bundle3, bundle4, bundle5, bundle6, bundle7,
         bundle8, bundle9, bundle10, bundle11, bundle12, bundle13, bundle14, bundle15, bundle16,
-        download, fan_out, fill, forward, lift, transfer_to_device, transfer_to_device_at, upload,
-        upload_as, value, write,
+        fan_out, fill, forward, lift, transfer_to_device, transfer_to_device_at, upload_as, value,
+        write,
     };
 
     // ── Chain-entry macros (re-exported from the crate root, where
     // `#[macro_export]` places them) ──
+    //
+    // The legacy `upload!` / `download!` macros are gone — they were
+    // thin aliases of the `upload` / `download` fns (imported above)
+    // and had no remaining users.
     pub use crate::{
         bundle, device_slice, device_slice_alloc_uninit, device_slice_alloc_zero,
-        device_slice_filled, device_slice_from_slice, download, slot, slots, upload,
+        device_slice_filled, device_slice_from_slice, slot, slots,
     };
 
     // ── Typed-slot tags + multi-fill ──

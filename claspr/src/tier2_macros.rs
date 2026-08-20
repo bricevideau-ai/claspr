@@ -18,10 +18,10 @@
 #[macro_export]
 macro_rules! device_slice_alloc_zero {
     ($t:ty, $n:expr) => {
-        $crate::alloc_zero::<$t>($n)
+        $crate::eager::alloc_zero::<$t>($n)
     };
     ($t:ty, $n:expr; $m:expr) => {
-        $crate::alloc_zero_as::<$t, _>($n, $m)
+        $crate::eager::alloc_zero_as::<$t, _>($n, $m)
     };
 }
 
@@ -31,10 +31,10 @@ macro_rules! device_slice_alloc_zero {
 #[macro_export]
 macro_rules! device_slice_alloc_uninit {
     ($t:ty, $n:expr) => {
-        $crate::device_alloc_uninit::<$t>($n)
+        $crate::eager::device_alloc_uninit::<$t>($n)
     };
     ($t:ty, $n:expr; $m:expr) => {
-        $crate::device_alloc_uninit_as::<$t, _>($n, $m)
+        $crate::eager::device_alloc_uninit_as::<$t, _>($n, $m)
     };
 }
 
@@ -43,14 +43,15 @@ macro_rules! device_slice_alloc_uninit {
 #[macro_export]
 macro_rules! device_slice_filled {
     ($v:expr, $n:expr) => {
-        $crate::DeviceOpExt::and_then($crate::device_alloc_uninit::<_>($n), move |u| {
-            $crate::fill_device_uninit(u, $v)
+        $crate::DeviceOpExt::and_then($crate::eager::device_alloc_uninit::<_>($n), move |u| {
+            $crate::eager::fill_device_uninit(u, $v)
         })
     };
     ($v:expr, $n:expr; $m:expr) => {
-        $crate::DeviceOpExt::and_then($crate::device_alloc_uninit_as::<_, _>($n, $m), move |u| {
-            $crate::fill_device_uninit(u, $v)
-        })
+        $crate::DeviceOpExt::and_then(
+            $crate::eager::device_alloc_uninit_as::<_, _>($n, $m),
+            move |u| $crate::eager::fill_device_uninit(u, $v),
+        )
     };
 }
 
@@ -60,31 +61,10 @@ macro_rules! device_slice_filled {
 #[macro_export]
 macro_rules! device_slice_from_slice {
     ($data:expr) => {
-        $crate::upload::<_, _>($data)
+        $crate::eager::upload::<_, _>($data)
     };
     ($data:expr; $m:expr) => {
-        $crate::upload_as::<_, _, _>($data, $m)
-    };
-}
-
-/// Lazy host-to-device upload (`from_slice` create + copy). `upload!(src)` /
-/// `upload!(src; M)`. `src` must be `Vec<T>` / `Box<[T]>` / `Arc<[T]>`.
-#[macro_export]
-macro_rules! upload {
-    ($src:expr) => {
-        $crate::upload::<_, _>($src)
-    };
-    ($src:expr; $m:expr) => {
-        $crate::upload_as::<_, _, _>($src, $m)
-    };
-}
-
-/// Lazy non-blocking device-to-host read. `download!(buf)`. Marker inferred from
-/// the input buffer; bound `M: HostReadable`.
-#[macro_export]
-macro_rules! download {
-    ($buf:expr) => {
-        $crate::download($buf)
+        $crate::eager::upload_as::<_, _, _>($data, $m)
     };
 }
 
@@ -93,14 +73,15 @@ macro_rules! download {
 #[macro_export]
 macro_rules! mapped_slice_alloc_zero {
     ($t:ty, $n:expr) => {
-        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit::<$t>($n), |u| {
-            $crate::fill_mapped_uninit(u, <$t as ::core::default::Default>::default())
+        $crate::DeviceOpExt::and_then($crate::eager::mapped_alloc_uninit::<$t>($n), |u| {
+            $crate::eager::fill_mapped_uninit(u, <$t as ::core::default::Default>::default())
         })
     };
     ($t:ty, $n:expr; $m:expr) => {
-        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit_as::<$t, _>($n, $m), |u| {
-            $crate::fill_mapped_uninit(u, <$t as ::core::default::Default>::default())
-        })
+        $crate::DeviceOpExt::and_then(
+            $crate::eager::mapped_alloc_uninit_as::<$t, _>($n, $m),
+            |u| $crate::eager::fill_mapped_uninit(u, <$t as ::core::default::Default>::default()),
+        )
     };
 }
 
@@ -108,10 +89,10 @@ macro_rules! mapped_slice_alloc_zero {
 #[macro_export]
 macro_rules! mapped_slice_alloc_uninit {
     ($t:ty, $n:expr) => {
-        $crate::mapped_alloc_uninit::<$t>($n)
+        $crate::eager::mapped_alloc_uninit::<$t>($n)
     };
     ($t:ty, $n:expr; $m:expr) => {
-        $crate::mapped_alloc_uninit_as::<$t, _>($n, $m)
+        $crate::eager::mapped_alloc_uninit_as::<$t, _>($n, $m)
     };
 }
 
@@ -119,14 +100,15 @@ macro_rules! mapped_slice_alloc_uninit {
 #[macro_export]
 macro_rules! mapped_slice_filled {
     ($v:expr, $n:expr) => {
-        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit::<_>($n), move |u| {
-            $crate::fill_mapped_uninit(u, $v)
+        $crate::DeviceOpExt::and_then($crate::eager::mapped_alloc_uninit::<_>($n), move |u| {
+            $crate::eager::fill_mapped_uninit(u, $v)
         })
     };
     ($v:expr, $n:expr; $m:expr) => {
-        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit_as::<_, _>($n, $m), move |u| {
-            $crate::fill_mapped_uninit(u, $v)
-        })
+        $crate::DeviceOpExt::and_then(
+            $crate::eager::mapped_alloc_uninit_as::<_, _>($n, $m),
+            move |u| $crate::eager::fill_mapped_uninit(u, $v),
+        )
     };
 }
 
@@ -136,16 +118,17 @@ macro_rules! mapped_slice_from_slice {
     ($data:expr) => {{
         let data = $data;
         let n = data.len();
-        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit::<_>(n), move |u| {
-            $crate::write_mapped_uninit(u, data)
+        $crate::DeviceOpExt::and_then($crate::eager::mapped_alloc_uninit::<_>(n), move |u| {
+            $crate::eager::write_mapped_uninit(u, data)
         })
     }};
     ($data:expr; $m:expr) => {{
         let data = $data;
         let n = data.len();
-        $crate::DeviceOpExt::and_then($crate::mapped_alloc_uninit_as::<_, _>(n, $m), move |u| {
-            $crate::write_mapped_uninit(u, data)
-        })
+        $crate::DeviceOpExt::and_then(
+            $crate::eager::mapped_alloc_uninit_as::<_, _>(n, $m),
+            move |u| $crate::eager::write_mapped_uninit(u, data),
+        )
     }};
 }
 
@@ -164,10 +147,10 @@ macro_rules! mapped_slice_upload {
 #[macro_export]
 macro_rules! usm_slice_alloc_uninit {
     ($t:ty, $n:expr) => {
-        $crate::usm_alloc_uninit::<$t>($n)
+        $crate::eager::usm_alloc_uninit::<$t>($n)
     };
     ($t:ty, $n:expr; $m:expr) => {
-        $crate::usm_alloc_uninit_as::<$t, _>($n, $m)
+        $crate::eager::usm_alloc_uninit_as::<$t, _>($n, $m)
     };
 }
 
@@ -175,13 +158,13 @@ macro_rules! usm_slice_alloc_uninit {
 #[macro_export]
 macro_rules! usm_slice_alloc_zero {
     ($t:ty, $n:expr) => {
-        $crate::DeviceOpExt::and_then($crate::usm_alloc_uninit::<$t>($n), |u| {
-            $crate::fill_usm_uninit(u, <$t as ::core::default::Default>::default())
+        $crate::DeviceOpExt::and_then($crate::eager::usm_alloc_uninit::<$t>($n), |u| {
+            $crate::eager::fill_usm_uninit(u, <$t as ::core::default::Default>::default())
         })
     };
     ($t:ty, $n:expr; $m:expr) => {
-        $crate::DeviceOpExt::and_then($crate::usm_alloc_uninit_as::<$t, _>($n, $m), |u| {
-            $crate::fill_usm_uninit(u, <$t as ::core::default::Default>::default())
+        $crate::DeviceOpExt::and_then($crate::eager::usm_alloc_uninit_as::<$t, _>($n, $m), |u| {
+            $crate::eager::fill_usm_uninit(u, <$t as ::core::default::Default>::default())
         })
     };
 }
@@ -208,7 +191,7 @@ macro_rules! device_slice {
         $crate::device_slice_filled!($value, $count)
     };
     [$($v:expr),* $(,)?] => {
-        $crate::upload!(::std::vec![$($v),*])
+        $crate::eager::upload!(::std::vec![$($v),*])
     };
 }
 
@@ -275,10 +258,10 @@ macro_rules! usm_slice {
 #[macro_export]
 macro_rules! device_scalar_alloc {
     ($v:expr) => {
-        $crate::scalar_value($v)
+        $crate::eager::scalar_value($v)
     };
     ($v:expr; $m:expr) => {
-        $crate::scalar_value_as($v, $m)
+        $crate::eager::scalar_value_as($v, $m)
     };
 }
 
@@ -291,10 +274,10 @@ macro_rules! device_scalar_alloc {
 #[macro_export]
 macro_rules! device_scalar_zero {
     ($t:ty) => {
-        $crate::scalar_zero::<$t>()
+        $crate::eager::scalar_zero::<$t>()
     };
     ($t:ty; $m:expr) => {
-        $crate::scalar_zero_as::<$t, _>($m)
+        $crate::eager::scalar_zero_as::<$t, _>($m)
     };
 }
 
@@ -363,7 +346,7 @@ macro_rules! slots {
                 // `Checkout`-built binding (`$name<Checkout<Value>>`) matches a
                 // `slot!($name)` (`$name<Value>`). `KeyMarker` is a shared ZST used
                 // ONLY for TypeId matching (the display name is `NAME`, above).
-                type Key = $name<$crate::KeyMarker>;
+                type Key = $name<$crate::eager::KeyMarker>;
                 fn into_value(self) -> $val {
                     $crate::IntoBound::into_bound(self.0)
                 }
@@ -395,7 +378,7 @@ macro_rules! slots {
             // Value-bind, raw-value source (`$name(v)` => `$name<$val>`).
             impl $crate::eager::CallArg for $name<$val>
             where
-                $val: $crate::SlotEq + $crate::SlotValue,
+                $val: $crate::eager::SlotEq + $crate::SlotValue,
             {
                 fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
                     // Infallible but RECORD-don't-drop: a bind error is recorded into
@@ -409,7 +392,7 @@ macro_rules! slots {
             // — the sever-and-adopt bind.
             impl $crate::eager::CallArg for $name<$crate::Checkout<$val>>
             where
-                $val: $crate::SlotEq + $crate::SlotValue + ::core::marker::Send,
+                $val: $crate::eager::SlotEq + $crate::SlotValue + ::core::marker::Send,
             {
                 fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
                     // Infallible but RECORD-don't-drop (see the raw-value arm): the

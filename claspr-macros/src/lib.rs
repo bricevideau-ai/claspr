@@ -1823,7 +1823,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                         ::core::result::Result::Ok(ev) => ev,
                         ::core::result::Result::Err(__claspr_e) => {
                             #(
-                                ::claspr::rehome_consumed(#output_names, #output_homes);
+                                ::claspr::eager::rehome_consumed(#output_names, #output_homes);
                             )*
                             return ::core::result::Result::Err(__claspr_e);
                         }
@@ -1832,7 +1832,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     // the `Dep` (Arc<Event>) onto EACH element pipe so whichever
                     // element(s) flow downstream carry the wait-list, and the
                     // terminal reconstruct gathers from all.
-                    let __claspr_dep = ::claspr::wrap_event(event);
+                    let __claspr_dep = ::claspr::eager::wrap_event(event);
                     #(
                         self.#op_pipe_fields.put_home(
                             #output_names,
@@ -1954,7 +1954,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                         if let ::core::option::Option::Some((__v, _d, __h)) =
                             self.#op_pipe_fields.take_home()
                         {
-                            ::claspr::rehome_consumed(__v, __h);
+                            ::claspr::eager::rehome_consumed(__v, __h);
                         }
                     )*
                 }
@@ -2064,7 +2064,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     // `Checkout` drop).
                     self.__claspr_out.put_home(
                         #output_expr,
-                        ::claspr::single_dep(event),
+                        ::claspr::eager::single_dep(event),
                         #single_output_home,
                     );
                     ::core::result::Result::Ok(())
