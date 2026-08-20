@@ -433,15 +433,6 @@ impl<A: KernelAccess, F: format::Format> Image2D<A, F> {
     }
 }
 
-impl<A: KernelAccess, F: format::Format> KernelArg for Image2D<A, F> {
-    fn set(&self, exec: &mut ExecuteKernel<'_>) {
-        let cl_mem_handle = self.image.get();
-        unsafe {
-            exec.set_arg(&cl_mem_handle);
-        }
-    }
-}
-
 // ── Internal: shared alloc + read helpers ──────────────────────────
 //
 // The per-dim wrappers below all funnel through these two functions.
@@ -1736,15 +1727,6 @@ impl<A: KernelAccess, F: format::Format> Image1D<A, F> {
     }
 }
 
-impl<A: KernelAccess, F: format::Format> KernelArg for Image1D<A, F> {
-    fn set(&self, exec: &mut ExecuteKernel<'_>) {
-        let cl_mem_handle = self.image.get();
-        unsafe {
-            exec.set_arg(&cl_mem_handle);
-        }
-    }
-}
-
 // ── Image3D ─────────────────────────────────────────────────────────
 
 /// A 3D image with compile-time access mode and storage format.
@@ -1804,15 +1786,6 @@ impl<A: KernelAccess, F: format::Format> Image3D<A, F> {
     /// Borrow the underlying opencl3 [`Image`].
     pub fn image(&self) -> &Image {
         &self.image
-    }
-}
-
-impl<A: KernelAccess, F: format::Format> KernelArg for Image3D<A, F> {
-    fn set(&self, exec: &mut ExecuteKernel<'_>) {
-        let cl_mem_handle = self.image.get();
-        unsafe {
-            exec.set_arg(&cl_mem_handle);
-        }
     }
 }
 
@@ -1962,12 +1935,26 @@ kernel_image_arg_traits! {
 // This lets a single `Image2D<ReadWrite, F>` flow through a pipeline mixing
 // write-only producers and read-only consumers without intermediate cl_mem retypes.
 
-/// Emit, for one image family, the `Sealed` impl + the fixed 5-impl access matrix
-/// wiring its markers to the `$read`/`$write`/`$readwrite` arg traits. The twin of
+/// Emit, for one image family, the `KernelArg` impl + the `Sealed` impl + the
+/// fixed 5-impl access matrix wiring its markers to the
+/// `$read`/`$write`/`$readwrite` arg traits. The twin of
 /// `kernel_image_arg_traits!` (which DEFINES the traits); this WIRES the impls, so
-/// the compatibility partial order above lives in ONE place, not 6 copies.
+/// the compatibility partial order above — and the one arg-setting body every
+/// owned image family shares — lives in ONE place, not 6 copies.
 macro_rules! impl_kernel_image_arg_matrix {
     ($fam:ident, $read:ident, $write:ident, $readwrite:ident) => {
+        impl<A: KernelAccess, F: format::Format> KernelArg for $fam<A, F> {
+            fn set(&self, exec: &mut ExecuteKernel<'_>) {
+                let cl_mem_handle = self.image.get();
+                // SAFETY: `image` is a live cl_mem image owned by this
+                // wrapper; release is refcounted past in-flight commands,
+                // so the handle outlives the launch. Arg-index order
+                // matches the kernel signature by construction.
+                unsafe {
+                    exec.set_arg(&cl_mem_handle);
+                }
+            }
+        }
         impl<A: KernelAccess + Send + 'static, F: format::Format + Send + 'static>
             kernel_image_arg_sealed::Sealed for $fam<A, F>
         {
@@ -2089,15 +2076,6 @@ impl<A: KernelAccess, F: format::Format> Image1DArray<A, F> {
     }
 }
 
-impl<A: KernelAccess, F: format::Format> KernelArg for Image1DArray<A, F> {
-    fn set(&self, exec: &mut ExecuteKernel<'_>) {
-        let cl_mem_handle = self.image.get();
-        unsafe {
-            exec.set_arg(&cl_mem_handle);
-        }
-    }
-}
-
 impl_kernel_image_arg_matrix!(
     Image1DArray,
     KernelImage1DArrayReadArg,
@@ -2171,15 +2149,6 @@ impl<A: KernelAccess, F: format::Format> Image2DArray<A, F> {
     /// Borrow the underlying opencl3 [`Image`].
     pub fn image(&self) -> &Image {
         &self.image
-    }
-}
-
-impl<A: KernelAccess, F: format::Format> KernelArg for Image2DArray<A, F> {
-    fn set(&self, exec: &mut ExecuteKernel<'_>) {
-        let cl_mem_handle = self.image.get();
-        unsafe {
-            exec.set_arg(&cl_mem_handle);
-        }
     }
 }
 
@@ -2304,15 +2273,6 @@ impl<A: KernelAccess, F: format::Format> Image1DBuffer<A, F> {
     /// Borrow the underlying opencl3 [`Image`].
     pub fn image(&self) -> &Image {
         &self.image
-    }
-}
-
-impl<A: KernelAccess, F: format::Format> KernelArg for Image1DBuffer<A, F> {
-    fn set(&self, exec: &mut ExecuteKernel<'_>) {
-        let cl_mem_handle = self.image.get();
-        unsafe {
-            exec.set_arg(&cl_mem_handle);
-        }
     }
 }
 
@@ -2460,6 +2420,10 @@ impl<'a, M: MemMode, F: format::Format> Image1DBufferView<'a, M, F> {
 impl<M: MemMode, F: format::Format> KernelArg for Image1DBufferView<'_, M, F> {
     fn set(&self, exec: &mut ExecuteKernel<'_>) {
         let cl_mem_handle = self.image.get();
+        // SAFETY: same contract as the owned families (see
+        // `impl_kernel_image_arg_matrix!`); the view additionally
+        // borrows the backing `DeviceSlice`, so the buffer it wraps is
+        // alive for the launch by construction.
         unsafe {
             exec.set_arg(&cl_mem_handle);
         }

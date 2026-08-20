@@ -227,9 +227,17 @@ where
 {
     use crate::Launcher;
     let queue = ec.cl_queue().get();
-    let cache = op
-        .cb_cache()
-        .expect("cb_boundary_gather: boundary node must carry a cb_cache");
+    let Some(cache) = op.cb_cache() else {
+        // Every route here (cb_should_open_boundary / cb_should_open_span /
+        // the sync-terminal eligibility check) requires
+        // `cb_cache().is_some()` before picking the boundary path, so this
+        // is unreachable in-tree. `cb_addable() == true` with the default
+        // `cb_cache() == None` is a legal combination for an external
+        // `DeviceOp` impl though — fall back to the plain per-op walk
+        // instead of panicking if a future caller forgets the guard.
+        debug_assert!(false, "cb_boundary_gather on an op without a cb_cache");
+        return op.gather_checkouts(ec, mode);
+    };
 
     // The EXTERNAL cl_event accumulator for THIS command buffer, on this frame.
     let ext: Mutex<Deps> = Mutex::new(Deps::new());
@@ -596,9 +604,12 @@ where
 {
     use crate::Launcher;
     let queue = ec.cl_queue().get();
-    let cache = op
-        .cb_cache()
-        .expect("cb_boundary_execute: boundary node must carry a cb_cache");
+    let Some(cache) = op.cb_cache() else {
+        // Same reasoning as cb_boundary_gather: unreachable via the guarded
+        // routes; degrade to the per-op walk rather than panicking.
+        debug_assert!(false, "cb_boundary_execute on an op without a cb_cache");
+        return op.execute(ec, mode);
+    };
     let ext: Mutex<Deps> = Mutex::new(Deps::new());
     let closed = std::sync::atomic::AtomicBool::new(false);
 
