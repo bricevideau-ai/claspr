@@ -177,7 +177,7 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
     /// Allocate a device buffer of `len` elements, leaving the bytes
     /// uninitialised. Returns a [`DeviceSliceUninit<T, M>`] wrapper
     /// instead of a bare `DeviceSlice` — the type-state blocks host
-    /// reads (`.read()` / `download!`) at compile time so unintended
+    /// reads (`.read()` / `download`) at compile time so unintended
     /// uninit-byte observation is a type error rather than UB.
     ///
     /// Transition to an initialised [`DeviceSlice<T, M>`] via one of

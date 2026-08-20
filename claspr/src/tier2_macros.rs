@@ -132,7 +132,7 @@ macro_rules! mapped_slice_from_slice {
     }};
 }
 
-/// SVM analog of `upload!` — alloc + SVM write of a host slice.
+/// SVM analog of `device_slice_from_slice!` via upload — alloc + SVM write of a host slice.
 #[macro_export]
 macro_rules! mapped_slice_upload {
     ($src:expr) => {
@@ -176,7 +176,7 @@ macro_rules! usm_slice_alloc_zero {
 /// - `device_slice![value; count]` — alloc + on-device `clEnqueueFillBuffer`.
 ///   No host allocation. Expands to [`device_slice_filled!`].
 /// - `device_slice![a, b, c]` — upload a host literal (alloc + write). Expands
-///   to [`upload!`].
+///   to the [`upload`](crate::eager::upload) leaf.
 ///
 /// The two arms have radically different bandwidth profiles even though they
 /// look almost identical; choose intentionally.
@@ -191,7 +191,7 @@ macro_rules! device_slice {
         $crate::device_slice_filled!($value, $count)
     };
     [$($v:expr),* $(,)?] => {
-        $crate::eager::upload!(::std::vec![$($v),*])
+        $crate::eager::upload(::std::vec![$($v),*])
     };
 }
 
@@ -227,17 +227,17 @@ macro_rules! mapped_slice {
 macro_rules! usm_slice {
     // `usm_slice![v; N]` — wrap host vec![v; N].
     [$value:expr; $count:expr] => {
-        $crate::usm_slice::<_>(::std::vec![$value; $count])
+        $crate::eager::usm_slice(::std::vec![$value; $count])
     };
     // `usm_slice!(host_vec)` — wrap an existing Vec, default marker. Put this
     // BEFORE the bracket-list arm so single-expr paren calls don't get wrapped
     // in another Vec.
     ($vec:expr) => {
-        $crate::usm_slice::<_>($vec)
+        $crate::eager::usm_slice($vec)
     };
     // `usm_slice![a, b, c]` — wrap a host vec literal.
     [$($v:expr),* $(,)?] => {
-        $crate::usm_slice::<_>(::std::vec![$($v),*])
+        $crate::eager::usm_slice(::std::vec![$($v),*])
     };
 }
 
