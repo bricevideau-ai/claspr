@@ -21,22 +21,11 @@
 //! Skips on devices without SVM. Guard preserved verbatim.
 
 use claspr::eager::{DeviceOpExt, fill_mapped_uninit, mapped_alloc_uninit};
-use claspr::{Buffer, Context, MappedSlice, SvmLevel};
+use claspr::{Buffer, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
+use claspr_test_support::{ctx, ctx_with_svm};
 
 const N: usize = 64;
-
-fn ctx_with_svm() -> Option<Context> {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return None;
-    };
-    if ctx.svm_capability() == SvmLevel::None {
-        eprintln!("SKIP: device has no SVM");
-        return None;
-    }
-    Some(ctx)
-}
 
 /// svm_fill_copy.rs::tier1_svm_fill_writes_pattern — eager move-out form: `fill`
 /// consumes the buffer and rebinds it out.
@@ -213,10 +202,7 @@ fn macro_mapped_slice_literal_arm() {
 /// eagerly — faithful to the old lazy `mapped_slice_filled!` op's "at execute".
 #[test]
 fn tier2_mapped_slice_filled_surfaces_svm_not_available() {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
+    let Some(ctx) = ctx() else { return };
     if ctx.svm_capability() != SvmLevel::None {
         eprintln!("SKIP: device supports SVM, can't test no-SVM path here");
         return;

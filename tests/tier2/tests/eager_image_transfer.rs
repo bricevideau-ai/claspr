@@ -12,29 +12,14 @@
 
 use claspr::eager::{DeviceOpExt, image_download, image_upload};
 use claspr::{
-    Context, Image1D, Image1DArray, Image2D, Image2DArray, Image3D, ReadWrite,
-    image::format::R32Uint,
+    Image1D, Image1DArray, Image2D, Image2DArray, Image3D, ReadWrite, image::format::R32Uint,
 };
-
-fn ctx() -> Option<Context> {
-    let ctx = match Context::any() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: no OpenCL device ({e})");
-            return None;
-        }
-    };
-    if !ctx.device().cl3().image_support().unwrap_or(false) {
-        eprintln!("SKIP: device has no image support");
-        return None;
-    }
-    Some(ctx)
-}
+use claspr_test_support::ctx_with_images;
 
 /// `Image2D` round-trip — upload → download. Confirms the `(u32, u32)` Dims path.
 #[test]
 fn image2d_round_trip() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 8;
     const H: u32 = 4;
     let pixels: Vec<u32> = (0..(W * H)).map(|i| 0xCAFE_0000 | i).collect();
@@ -50,7 +35,7 @@ fn image2d_round_trip() {
 /// `Image1D` round-trip — confirms the `u32` Dims path (no tuple wrap).
 #[test]
 fn image1d_round_trip() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 16;
     let pixels: Vec<u32> = (0..W).map(|i| i * 13 + 5).collect();
 
@@ -65,7 +50,7 @@ fn image1d_round_trip() {
 /// `Image3D` round-trip — confirms the `(u32, u32, u32)` Dims path.
 #[test]
 fn image3d_round_trip() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 4;
     const H: u32 = 3;
     const D: u32 = 2;
@@ -83,7 +68,7 @@ fn image3d_round_trip() {
 /// array variant; layers laid out contiguously.
 #[test]
 fn image1d_array_round_trip() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 6;
     const LAYERS: u32 = 3;
     let pixels: Vec<u32> = (0..(W * LAYERS)).map(|i| 0xA000 + i).collect();
@@ -100,7 +85,7 @@ fn image1d_array_round_trip() {
 /// 2D-array variant.
 #[test]
 fn image2d_array_round_trip() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 4;
     const H: u32 = 3;
     const LAYERS: u32 = 2;

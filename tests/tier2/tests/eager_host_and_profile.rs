@@ -7,29 +7,20 @@
 //!   `value(v).and_then(|x| upload!(x))` → `upload(v)`
 //!   `.and_then_host(|view|…)`           → same method on `DeviceOpExt`
 
+use claspr::DeviceSlice;
 use claspr::eager::{DeviceOpExt, upload, value};
-use claspr::{Context, Device, DeviceSlice};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx_profiling;
 use std::sync::{Arc, Mutex};
 
 const N: usize = 128;
-
-fn ctx(profiling: bool) -> Option<Context> {
-    let dev = Device::any().ok()?;
-    Context::builder()
-        .device(&dev)
-        .profiling(profiling)
-        .build()
-        .ok()
-}
 
 // ── and_then_host ────────────────────────────────────────────────────
 
 #[test]
 fn and_then_host_sum_between_device_stages() {
-    let Some(ctx) = ctx(false) else {
-        eprintln!("SKIP: no OpenCL device");
+    let Some(ctx) = ctx_profiling(false) else {
         return;
     };
 
@@ -53,8 +44,7 @@ fn and_then_host_sum_between_device_stages() {
 
 #[test]
 fn and_then_host_error_propagates() {
-    let Some(ctx) = ctx(false) else {
-        eprintln!("SKIP: no OpenCL device");
+    let Some(ctx) = ctx_profiling(false) else {
         return;
     };
     // Closure returns Err → the eager host seam surfaces the original Rust
@@ -83,8 +73,7 @@ slots! { Buf: DeviceSlice<u32> }
 /// makes the slot-bound buffer flow into the seam.
 #[test]
 fn and_then_host_replays_and_reruns_each_sync() {
-    let Some(ctx) = ctx(false) else {
-        eprintln!("SKIP: no OpenCL device");
+    let Some(ctx) = ctx_profiling(false) else {
         return;
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
@@ -130,8 +119,7 @@ fn and_then_host_replays_and_reruns_each_sync() {
 /// on every replay (and that captures are shared by borrow, not move-consumed).
 #[test]
 fn and_then_host_loop_reruns_closure_every_iteration() {
-    let Some(ctx) = ctx(false) else {
-        eprintln!("SKIP: no OpenCL device");
+    let Some(ctx) = ctx_profiling(false) else {
         return;
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");

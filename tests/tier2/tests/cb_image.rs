@@ -15,39 +15,13 @@
 
 use claspr::eager::{DeviceOp, DeviceOpExt};
 use claspr::image::format::R32Float;
-use claspr::{Context, DeviceSlice, Image2D, ReadWrite};
+use claspr::{DeviceSlice, Image2D, ReadWrite};
 use claspr_test_image_kernels::dim2_float;
+use claspr_test_support::{ctx_with_images, homed_cb};
 
 const W: u32 = 8;
 const H: u32 = 8;
 const N: usize = (W * H) as usize;
-
-/// Skip on no device or no image support. (The old rusticl/llvmpipe rust-gpu
-/// image-kernel SEGV — reference_rusticl_llvmpipe_image2d_segv, 2026-05-14 — is FIXED
-/// as of Mesa 26.1.4 / LLVM 21: verified 2026-07-12 that raymarch, tier1
-/// image_dispatch, and these tests all run clean on llvmpipe, 5/5 no SEGV. llvmpipe's
-/// rusticl advertises no command-buffer commands, so image ops fall back to per-op
-/// there via the null-PFN path — still exercises the image kernels, just not the CB.)
-fn ctx() -> Option<Context> {
-    let c = match Context::any() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: no OpenCL device ({e})");
-            return None;
-        }
-    };
-    if !c.device().cl3().image_support().unwrap_or(false) {
-        eprintln!("SKIP: device has no image support");
-        return None;
-    }
-    Some(c)
-}
-
-fn homed_cb<O: DeviceOp>(g: &O) -> bool {
-    g.cb_cache()
-        .map(|c| c.lock().unwrap().is_some())
-        .unwrap_or(false)
-}
 
 /// A two-image-kernel chain — `fill_pattern` (write image) then `copy_to_buffer`
 /// (read image -> out buffer) — is a weight-2 all-device span: ONE command buffer,
@@ -55,7 +29,7 @@ fn homed_cb<O: DeviceOp>(g: &O) -> bool {
 /// kernel-written pattern each run.
 #[test]
 fn image_kernel_chain_runs_as_command_buffer() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let ks = dim2_float::kernels(&ctx).expect("load image kernels");
 
     let img = Image2D::<ReadWrite, R32Float>::alloc(&ctx, W, H).expect("alloc image");
@@ -99,7 +73,7 @@ fn image_kernel_chain_runs_as_command_buffer() {
 /// is the pipe-fed graph copy (the concrete `copy_to` can't chain off `and_then`).
 #[test]
 fn image_fill_then_copy_runs_as_command_buffer() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     use claspr::eager_image_copy;
     use claspr::image::format::R32G32B32A32Uint;
     let pattern: [u32; 4] = [11, 22, 33, 44];
@@ -139,7 +113,7 @@ fn image_fill_then_copy_runs_as_command_buffer() {
 /// span: `clCommandFillImageKHR` + `clCommandNDRangeKernelKHR` in ONE command buffer.
 #[test]
 fn image_fill_then_kernel_runs_as_command_buffer() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let ks = dim2_float::kernels(&ctx).expect("load image kernels");
     let fill_x: f32 = 7.0;
 

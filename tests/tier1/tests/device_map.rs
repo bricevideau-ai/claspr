@@ -6,20 +6,11 @@
 //! Parallels `svm.rs` for the SVM (`MappedSlice`) side. Tests both
 //! halves so they don't drift apart.
 
-use claspr::{Context, Device, DeviceSlice, InOrder, Queue, ReadOnly};
+use claspr::{Device, DeviceSlice, InOrder, Queue, ReadOnly};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 256;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 #[test]
 fn map_mut_then_map_round_trip() {

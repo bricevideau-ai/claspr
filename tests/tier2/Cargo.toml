@@ -13,12 +13,14 @@ path = "src/lib.rs"
 [dependencies]
 claspr = { path = "../../claspr" }
 claspr-test-kernels = { path = "../kernels" }
+# Shared test helpers (ctx()/skip discipline, seeded/handle_of) +
+# the ui_test harness plumbing behind the `ui-test` feature.
+claspr-test-support = { path = "../support", features = ["ui-test"] }
 
 [dev-dependencies]
 # Just for `block_on` in the async-terminal tests — no need for tokio's
 # full machinery.
 futures = { version = "0.3", default-features = false, features = ["executor", "std"] }
-ui_test = "0.30"
 # Write-only IMAGE kernel for the home-invariant no-seed scenario (scenario 4).
 claspr-test-image-kernels = { path = "../image-kernels" }
 

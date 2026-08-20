@@ -11,21 +11,11 @@
 //! (`fan_out`) compositions run end-to-end through the eager graph. Same N,
 //! same fill values, same assertions as `bundle.rs`.
 
-use claspr::Context;
 use claspr::eager::{DeviceOpExt, bundle2, bundle3, download, fan_out, upload, value};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 128;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 #[test]
 fn bundle2_pure_values() {

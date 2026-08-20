@@ -11,21 +11,11 @@
 //! Pins the same contract: if a future refactor let a `cl_mem` leak across
 //! context boundaries, `CL_INVALID_CONTEXT` would surface here.
 
-use claspr::Context;
 use claspr::eager::{DeviceOpExt, download, upload};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// cross_context.rs::vec_round_trips_between_two_contexts — chain 1 on ctx_a
 /// (fill 7 → download), then chain 2 on ctx_b (re-upload that Vec → scale 6 →

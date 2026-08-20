@@ -6,18 +6,9 @@
 use claspr::eager::eager_copy_to;
 use claspr::prelude::*;
 use claspr_test_kernels::kernels;
+use claspr_test_support::{ctx, ctx_two_devices};
 
 const N: usize = 256;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// The graph is a closure-free struct: `description()` lists nodes with no
 /// Context and no execution.
@@ -480,49 +471,9 @@ fn eager_and_then_host_error_propagates() {
 /// runners skip it — there is no second queue to route to.
 #[test]
 fn eager_on_device() {
-    use claspr::device::Platform;
-
-    // Discover a two-device context: real multi-device → sub-device partition →
-    // skip. Mirrors tests/tier2/tests/on_device.rs.
-    fn ctx_two_devices() -> Option<Context> {
-        if let Ok(platforms) = Platform::all() {
-            for p in platforms {
-                if let Ok(devs) = p.devices()
-                    && devs.len() >= 2
-                {
-                    return Context::builder()
-                        .devices(&[devs[0].clone(), devs[1].clone()])
-                        .build()
-                        .ok();
-                }
-            }
-        }
-        if let Ok(devs) = Device::all() {
-            for parent in devs {
-                if parent.partition_max_sub_devices().unwrap_or(0) < 2 {
-                    continue;
-                }
-                let cu = parent.max_compute_units().unwrap_or(0);
-                if cu < 2 {
-                    continue;
-                }
-                let Ok(subs) = parent.partition_equally(cu / 2) else {
-                    continue;
-                };
-                if subs.len() < 2 {
-                    continue;
-                }
-                return Context::builder()
-                    .devices(&[subs[0].clone(), subs[1].clone()])
-                    .build()
-                    .ok();
-            }
-        }
-        eprintln!("SKIP: no two-device context for eager_on_device");
-        None
-    }
-
-    let Some(ctx) = ctx_two_devices() else { return };
+    let Some((ctx, _, _)) = ctx_two_devices() else {
+        return;
+    };
 
     // Two fill stages, each routed to a distinct device from the context, then
     // download. Device identity resolved by index at execute (portable idiom).

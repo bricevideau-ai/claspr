@@ -6,17 +6,8 @@
 //! and no test ever fed malformed SPIR-V to `build_program` /
 //! `load_from`. These pin the actual failure paths.
 
-use claspr::{Context, Error};
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
+use claspr::Error;
+use claspr_test_support::ctx;
 
 /// Bytes that aren't SPIR-V at all (wrong magic) must fail at
 /// `clCreateProgramWithIL` (`Error::OpenCl`) or, on runtimes that

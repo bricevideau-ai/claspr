@@ -6,11 +6,11 @@
 //! platform that advertises the extension (introspected via the root's cb_cache),
 //! and (b) it produces the right results across replays (build then replay).
 
-use claspr::Context;
 use claspr::DeviceSlice;
 use claspr::eager::{DeviceOp, DeviceOpExt, fill};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
+use claspr_test_support::{ctx, homed_cb};
 
 // A scalar (by-value) scale factor slot — `mutate_bind(Factor(v))` changes it.
 slots! {
@@ -18,23 +18,6 @@ slots! {
 }
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
-
-/// Whether the graph's root homed a real finalized command buffer after a sync.
-fn homed_cb<O: DeviceOp>(g: &O) -> bool {
-    g.cb_cache()
-        .map(|c| c.lock().unwrap().is_some())
-        .unwrap_or(false)
-}
 
 /// Stable identity (the `Arc` pointer) of the root's homed `FinalizedCb`, or 0 if
 /// none. Two syncs returning the SAME non-zero id prove create-once + replay (the

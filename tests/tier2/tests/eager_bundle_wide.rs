@@ -23,39 +23,8 @@
 
 use claspr::bundle;
 use claspr::eager::{DeviceOpExt, alloc_zero, bundle2, download, eager_copy_to, upload, value};
-use claspr::{Context, DeviceSlice, MemRef, RecordableBuffer};
 use claspr_test_kernels::kernels;
-
-const N: usize = 64;
-
-/// Stable identity of a buffer's backing memory (raw `cl_mem`/SVM ptr as `usize`)
-/// for `==` across replays. Reads via public `RecordableBuffer::record_handle()`;
-/// works on a `DeviceSlice` and (via `Deref`) on a `Checkout<DeviceSlice>`.
-fn handle_of<B: RecordableBuffer>(b: &B) -> usize {
-    match b.record_handle().mem {
-        MemRef::Buffer(m) => m as usize,
-        MemRef::Svm(p) => p as usize,
-    }
-}
-
-/// Allocate + fill a `DeviceSlice<u32>` of `N` elements with `v`.
-fn seeded(ctx: &Context, v: u32) -> DeviceSlice<u32> {
-    DeviceSlice::<u32>::alloc_zero(ctx, N)
-        .expect("alloc")
-        .fill(v)
-        .wait()
-        .expect("seed")
-}
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
+use claspr_test_support::{N, ctx, handle_of, seeded};
 
 /// Flat 8-way bundle via the variadic macro — proves arity 8 + the macro's
 /// 8-argument arm both exist and reconstruct the tuple in order.

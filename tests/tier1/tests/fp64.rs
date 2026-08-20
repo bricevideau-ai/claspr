@@ -19,14 +19,12 @@
 
 use claspr::{Context, DeviceSlice};
 use claspr_test_kernels::kernels_f64 as kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 256;
 
 fn ctx_with_f64() -> Option<Context> {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return None;
-    };
+    let ctx = ctx()?;
     // `CL_DEVICE_DOUBLE_FP_CONFIG` returns a bit-field of rounding
     // modes the device supports for f64. Non-zero = some level of
     // f64 support; zero = none. (opencl3's `double_fp_config()` may

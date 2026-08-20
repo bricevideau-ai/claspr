@@ -54,7 +54,8 @@ claspr::kernels! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claspr::{Context, DeviceSlice};
+    use claspr::DeviceSlice;
+    use claspr_test_support::ctx;
 
     /// Embedded-bytes flow — `SPV_BYTES` is `include_bytes!`-ed
     /// into the binary by the build-script-generated file.
@@ -62,10 +63,7 @@ mod tests {
     /// embedded use case.
     #[test]
     fn embedded_spv_round_trip() {
-        let Ok(ctx) = Context::any() else {
-            eprintln!("SKIP: no OpenCL device");
-            return;
-        };
+        let Some(ctx) = ctx() else { return };
         let kernels = gpu::Kernels::load_from(&ctx, generated::SPV_BYTES).expect("load kernels");
 
         let buf = DeviceSlice::<u32>::alloc_zero(&ctx, 64).expect("alloc");
@@ -90,10 +88,7 @@ mod tests {
     /// shape the explicit-compile path was designed to support.
     #[test]
     fn runtime_supplied_bytes_round_trip() {
-        let Ok(ctx) = Context::any() else {
-            eprintln!("SKIP: no OpenCL device");
-            return;
-        };
+        let Some(ctx) = ctx() else { return };
         let bytes: Vec<u8> = generated::SPV_BYTES.to_vec();
         let kernels = gpu::Kernels::load_from(&ctx, &bytes).expect("load kernels");
 
@@ -117,10 +112,7 @@ mod tests {
     /// or share it across multiple typed surfaces.
     #[test]
     fn bind_with_prebuilt_program() {
-        let Ok(ctx) = Context::any() else {
-            eprintln!("SKIP: no OpenCL device");
-            return;
-        };
+        let Some(ctx) = ctx() else { return };
         let program = ctx
             .build_program(generated::SPV_BYTES)
             .expect("build program");
@@ -159,10 +151,7 @@ mod tests {
     /// `load_from(ctx, SPV_BYTES)` it ends up calling.
     #[test]
     fn legacy_generated_kernels_load_works() {
-        let Ok(ctx) = Context::any() else {
-            eprintln!("SKIP: no OpenCL device");
-            return;
-        };
+        let Some(ctx) = ctx() else { return };
         let k = generated::Kernels::load(&ctx).expect("legacy Kernels::load");
         // Untyped escape-hatch: get a raw `cl_kernel` by name, and
         // assert it's actually the kernel we asked for (a bare `let _`

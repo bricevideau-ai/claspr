@@ -15,22 +15,12 @@
 //!   `download!(buf)`    → `download`
 //!   `.and_then_host(f)` → `.and_then_host(f)` (DeviceSlice View is `&mut [u32]`)
 
-use claspr::Context;
 use claspr::eager::{DeviceDynOp, DeviceOpExt, download, upload, value};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 use std::sync::{Arc, Mutex};
 
 const N: usize = 32;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// conditional.rs::dyn_op_lets_if_arms_have_different_concrete_types — the core
 /// reason `DeviceDynOp` exists. Two arms produce different concrete op types

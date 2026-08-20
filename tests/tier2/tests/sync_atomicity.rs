@@ -38,54 +38,14 @@
 
 use claspr::eager::{DeviceOpExt, bundle2};
 use claspr::image::format::R32Uint;
-use claspr::record::{MemRef, RecordableBuffer};
-use claspr::{Context, DeviceSlice, Error, Image2D, InOrder, Queue, WriteOnly};
+use claspr::{DeviceSlice, Error, Image2D, InOrder, Queue, WriteOnly};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
-
-const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
+use claspr_test_support::{N, ctx, handle_of, seeded};
 
 slots! {
     Late: DeviceSlice<u32>,
     Missing: DeviceSlice<u32>,
-}
-
-/// Allocate + fill a `DeviceSlice<u32>` of `N` elements with `v`.
-fn seeded(ctx: &Context, v: u32) -> DeviceSlice<u32> {
-    DeviceSlice::<u32>::alloc_zero(ctx, N)
-        .expect("alloc")
-        .fill(v)
-        .wait()
-        .expect("seed")
-}
-
-/// The raw buffer-identity pointer behind a `DeviceSlice` — for asserting the
-/// SAME `cl_mem` survived a failed-then-retried `sync` (it was never lent away).
-fn handle_of(buf: &DeviceSlice<u32>) -> usize {
-    match buf.record_handle().mem {
-        MemRef::Buffer(mem) => mem as usize,
-        MemRef::Svm(p) => p as usize,
-    }
-}
-
-/// Image twin of [`handle_of`] — the `cl_mem` behind an image (images implement
-/// `RecordableBuffer`), for asserting the SAME image survived a failed-then-
-/// retried `sync`.
-fn img_handle_of(img: &Image2D<WriteOnly, R32Uint>) -> usize {
-    match img.record_handle().mem {
-        MemRef::Buffer(mem) => mem as usize,
-        MemRef::Svm(p) => p as usize,
-    }
 }
 
 /// (1) An UNBOUND slot in a LATER node makes `sync` error WITHOUT touching the
@@ -286,7 +246,7 @@ fn busy_image_cell_caught_by_check_ready_and_recovers() {
     const W: u32 = 8;
     const H: u32 = 4;
     let img = Image2D::<WriteOnly, R32Uint>::alloc(&ctx, W, H).expect("alloc image");
-    let img_handle = img_handle_of(&img);
+    let img_handle = handle_of(&img);
 
     // In-place `image.fill`, NO download: the run's Checkout HOLDS the image, so
     // its concrete `Input` cell is left empty/lent — the busy state the override
@@ -296,7 +256,7 @@ fn busy_image_cell_caught_by_check_ready_and_recovers() {
     // Run 1: the image fills and is checked out (its cell is now empty/lent).
     let co1 = g.sync(&ctx).expect("run 1: ready image op must sync");
     assert_eq!(
-        img_handle_of(&co1),
+        handle_of(&*co1),
         img_handle,
         "run 1 must lend the SAME cl_mem"
     );
@@ -324,7 +284,7 @@ fn busy_image_cell_caught_by_check_ready_and_recovers() {
         .sync(&ctx)
         .expect("recovered sync — the image cell must re-arm after the live Checkout drops");
     assert_eq!(
-        img_handle_of(&co3),
+        handle_of(&*co3),
         img_handle,
         "image must re-arm to the SAME cl_mem across the failed attempt"
     );

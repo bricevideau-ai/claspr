@@ -11,22 +11,12 @@
 //! is reproduced byte-for-byte: it uses no Tier-2 op, only the Tier-1 fill verb,
 //! so the eager port is identical (it is the runtime primitive both layers call).
 
-use claspr::Context;
 use claspr::DeviceSlice;
 use claspr::eager::{DeviceOpExt, alloc_zero, download, fill, upload};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// fill.rs::tier1_fill_writes_value_to_every_element — Tier 1 FillOp directly.
 #[test]

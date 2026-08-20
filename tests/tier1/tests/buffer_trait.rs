@@ -8,19 +8,10 @@
 //! committing to a tier is exactly the use case the trait exists
 //! for; this file proves that use case compiles and runs.
 
-use claspr::{Buffer, Context, DeviceSlice, MappedSlice, SvmLevel, USMSlice};
+use claspr::{Buffer, DeviceSlice, MappedSlice, SvmLevel, USMSlice};
+use claspr_test_support::ctx;
 
 const N: usize = 128;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// The polymorphic accessor — the documented use case for `Buffer<T>`.
 /// `B` only needs to expose `len`/`is_empty`/`ctx`; we deliberately

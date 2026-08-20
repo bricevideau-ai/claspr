@@ -2,18 +2,9 @@
 //! `LaunchSpec` feature today; if it grows one, `global_id_u32` in
 //! the test-kernels crate is the natural probe.)
 
-use claspr::{Context, DeviceSlice};
+use claspr::DeviceSlice;
 use claspr_test_kernels::kernels;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
+use claspr_test_support::ctx;
 
 #[test]
 fn tuple_form_sets_local_size_via_local_invocation_id() {

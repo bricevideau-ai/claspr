@@ -7,35 +7,17 @@
 //! portable to avoid spirv-builder / pocl gotchas that would mask
 //! runtime-side bugs we're actually trying to surface.
 
+use claspr::DeviceSlice;
 use claspr::eager::DeviceOpExt;
-use claspr::{Context, Device, DeviceSlice};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx_profiling;
 use std::sync::{Arc, Mutex};
 
 const N: usize = 1024;
 
-/// Convenience: build a single-device context with profiling on/off.
-/// Returns `None` (with an eprintln SKIP) if there's no OpenCL device.
-fn ctx(profiling: bool) -> Option<Context> {
-    let dev = match Device::any() {
-        Ok(d) => d,
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            return None;
-        }
-    };
-    Some(
-        Context::builder()
-            .device(&dev)
-            .profiling(profiling)
-            .build()
-            .expect("build context"),
-    )
-}
-
 #[test]
 fn errors_when_queue_lacks_profiling() {
-    let Some(ctx) = ctx(false) else {
+    let Some(ctx) = ctx_profiling(false) else {
         return;
     };
     assert!(!ctx.profiling());
@@ -59,7 +41,7 @@ fn errors_when_queue_lacks_profiling() {
 
 #[test]
 fn delivers_monotonic_timestamps_when_enabled() {
-    let Some(ctx) = ctx(true) else {
+    let Some(ctx) = ctx_profiling(true) else {
         return;
     };
     assert!(ctx.profiling());
@@ -100,7 +82,7 @@ fn delivers_monotonic_timestamps_when_enabled() {
 /// enqueue and returns a re-homing `Checkout`.)
 #[test]
 fn inherent_profiled_replays_and_refires_callback_each_sync() {
-    let Some(ctx) = ctx(true) else {
+    let Some(ctx) = ctx_profiling(true) else {
         return;
     };
     assert!(ctx.profiling());
@@ -153,7 +135,7 @@ fn fill_then_download_round_trip() {
     // Sanity for the test-kernel library itself: fill_u32 + download
     // gives back the expected pattern. Catches regressions in the
     // tests/kernels crate before they look like LaunchOp bugs.
-    let Some(ctx) = ctx(false) else {
+    let Some(ctx) = ctx_profiling(false) else {
         return;
     };
     let kernels = kernels::kernels(&ctx).expect("load kernels");

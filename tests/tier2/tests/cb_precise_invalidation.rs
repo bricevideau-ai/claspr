@@ -32,21 +32,11 @@ use claspr::image::format::R32G32B32A32Uint;
 use claspr::{Context, DeviceSlice, Image2D, ReadWrite, eager_image_copy};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
+use claspr_test_support::{N, ctx, seeded};
 
-const N: usize = 64;
 // Image dims for the image-slot reach test (W*H == N so the pixel count matches).
 const W: u32 = 8;
 const H: u32 = 8;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(e) => {
-            eprintln!("SKIP: no OpenCL device ({e})");
-            None
-        }
-    }
-}
 
 // Two independent scalar factor slots (one per device region / branch) + a buffer
 // slot for the cross-seam reach test.
@@ -68,15 +58,6 @@ fn cb_ids<O: DeviceOp>(g: &O) -> std::collections::BTreeSet<usize> {
 /// regions WITHOUT changing the data (so the arithmetic stays easy to predict).
 fn noop_seam(_v: &mut [u32]) -> claspr::Result<()> {
     Ok(())
-}
-
-/// Seed a fresh `DeviceSlice<u32>` of `N` elements to `v`.
-fn seeded(ctx: &Context, v: u32) -> DeviceSlice<u32> {
-    DeviceSlice::<u32>::alloc_zero(ctx, N)
-        .expect("alloc")
-        .fill(v)
-        .wait()
-        .expect("seed")
 }
 
 type RgbaImg = Image2D<ReadWrite, R32G32B32A32Uint>;

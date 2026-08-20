@@ -17,8 +17,9 @@
 //! by-value handle hands it the `Arc`, which derefs to the value). This mirrors
 //! old `arc.split::<3>()` → 3 `Arc::clone`s exactly.
 
+use claspr::Error;
 use claspr::eager::{DeviceOpExt, bundle2, bundle3, value};
-use claspr::{Context, Error};
+use claspr_test_support::ctx;
 use std::sync::Arc;
 
 /// arc_split.rs::arc_split_into_three_branches_share_value — one shared
@@ -27,10 +28,7 @@ use std::sync::Arc;
 /// branch; the by-value handle hands each closure the `Arc` to reduce.
 #[test]
 fn arc_split_into_three_branches_share_value() {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
+    let Some(ctx) = ctx() else { return };
 
     let shared = Arc::new(vec![1u32, 2, 3, 4]);
     let (sum, product, len) = bundle3(
@@ -51,10 +49,7 @@ fn arc_split_into_three_branches_share_value() {
 /// shared value; branch B ignores it and aborts via `and_then_host`.
 #[test]
 fn arc_split_propagates_branch_error() {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
+    let Some(ctx) = ctx() else { return };
 
     let shared = Arc::new(vec![1u32, 2, 3]);
     let chain = bundle2(
@@ -83,10 +78,7 @@ fn arc_split_propagates_branch_error() {
 /// non-numeric value (`Arc<String>`) reduced via `.len()`.
 #[test]
 fn arc_split_single_does_not_panic() {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
+    let Some(ctx) = ctx() else { return };
     let shared = Arc::new("only-input".to_string());
     let chain = value(shared).and_then(|s| value(s.len()));
     assert_eq!(*chain.sync(&ctx).expect("single branch"), 10);

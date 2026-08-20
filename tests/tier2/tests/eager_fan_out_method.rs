@@ -3,18 +3,8 @@
 //!
 //! Mirrors the old `fan_out.rs` `vec_method_form_matches_free_fn` shape.
 
-use claspr::Context;
 use claspr::eager::{DeviceFanOutExt, DeviceOpExt, fan_out, value};
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
+use claspr_test_support::ctx;
 
 #[test]
 fn vec_method_form_matches_free_fn() {

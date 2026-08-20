@@ -24,30 +24,10 @@
 //! test kernels — NOT gray-scott.
 
 use claspr::eager::{DeviceOpExt, Pipe, download, upload};
-use claspr::{Context, DeviceSlice, Error};
+use claspr::{DeviceSlice, Error};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
-
-const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
-
-/// Allocate + fill a `DeviceSlice<u32>` of `N` elements with `v`.
-fn seeded(ctx: &Context, v: u32) -> DeviceSlice<u32> {
-    DeviceSlice::<u32>::alloc_zero(ctx, N)
-        .expect("alloc")
-        .fill(v)
-        .wait()
-        .expect("seed")
-}
+use claspr_test_support::{N, ctx, seeded};
 
 // Tags for the slot positions used below.
 slots! {

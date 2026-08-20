@@ -1,0 +1,20 @@
+[package]
+name = "claspr-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Shared helpers for claspr's integration-test crates (device discovery, skip discipline, seeding, ui_test harness plumbing)"
+
+[dependencies]
+claspr = { path = "../../claspr" }
+# Only the ui_test-harness module needs ui_test; plain test crates that
+# just want `ctx()` & friends don't pull it in.
+ui_test = { version = "0.30", optional = true }
+
+[features]
+ui-test = ["dep:ui_test"]
+
+[lints]
+workspace = true

@@ -11,22 +11,8 @@
 //! (the atomicity pre-pass) + an `execute` backstop.
 
 use claspr::image::format::R32Uint;
-use claspr::{Context, Error, Image2D, ReadWrite};
-
-fn ctx() -> Option<Context> {
-    let ctx = match Context::any() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: no OpenCL device ({e})");
-            return None;
-        }
-    };
-    if !ctx.device().cl3().image_support().unwrap_or(false) {
-        eprintln!("SKIP: device has no image support");
-        return None;
-    }
-    Some(ctx)
-}
+use claspr::{Error, Image2D, ReadWrite};
+use claspr_test_support::ctx_with_images;
 
 const W: u32 = 8;
 const H: u32 = 4; // 32 pixels
@@ -35,7 +21,7 @@ const H: u32 = 4; // 32 pixels
 /// instead of panicking. (Was an `assert_eq!` in `image_write_op`.)
 #[test]
 fn write_wrong_pixel_count_errors_not_panics() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let wrong = vec![0u32; (W * H) as usize - 1]; // one short
 
@@ -53,7 +39,7 @@ fn write_wrong_pixel_count_errors_not_panics() {
 /// `write_bytes` with the wrong byte count returns `Err(LengthMismatch)`.
 #[test]
 fn write_bytes_wrong_len_errors_not_panics() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let expected_bytes = (W * H) as usize * std::mem::size_of::<u32>();
     let wrong = vec![0u8; expected_bytes + 4]; // one pixel too many
@@ -72,7 +58,7 @@ fn write_bytes_wrong_len_errors_not_panics() {
 /// (Previously a construction-time `Result`; now surfaces via `check_ready`.)
 #[test]
 fn read_wrong_dst_len_errors() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let mut too_big = vec![0u32; (W * H) as usize + 5];
 
@@ -94,7 +80,7 @@ fn read_wrong_dst_len_errors() {
 /// still returned `Result`, this file would not compile.
 #[test]
 fn matching_lengths_round_trip_and_ops_are_bare_device_ops() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let pixels: Vec<u32> = (0..(W * H)).map(|i| 0xF00D_0000 | i).collect();
     let img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
 
@@ -114,7 +100,7 @@ fn matching_lengths_round_trip_and_ops_are_bare_device_ops() {
 /// driver `CL_INVALID_*` at enqueue.
 #[test]
 fn copy_to_mismatched_dims_errors_client_side() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let src = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc src");
     let dst = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W * 2, H).expect("alloc dst");
 

@@ -8,33 +8,12 @@
 //! correct, just not CB-accelerated. So these tests assert RESULTS unconditionally
 //! and only note whether a CB was homed.
 
+use claspr::MappedSlice;
 use claspr::eager::{DeviceOp, DeviceOpExt};
-use claspr::{Context, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
+use claspr_test_support::{ctx_with_svm, homed_cb};
 
 const N: usize = 64;
-
-/// Skip on no device or no SVM.
-fn ctx() -> Option<Context> {
-    let c = match Context::any() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: no OpenCL device ({e})");
-            return None;
-        }
-    };
-    if c.svm_capability() == SvmLevel::None {
-        eprintln!("SKIP: device has no SVM");
-        return None;
-    }
-    Some(c)
-}
-
-fn homed_cb<O: DeviceOp>(g: &O) -> bool {
-    g.cb_cache()
-        .map(|c| c.lock().unwrap().is_some())
-        .unwrap_or(false)
-}
 
 /// An SVM `fill` then a kernel over the same SVM buffer is a weight-2 all-device
 /// span: `clCommandSVMMemFillKHR` + `clCommandNDRangeKernelKHR` in ONE command
@@ -42,7 +21,7 @@ fn homed_cb<O: DeviceOp>(g: &O) -> bool {
 /// fill sets 2, the kernel scales ×5 → every element 10, idempotent across replays.
 #[test]
 fn svm_fill_then_kernel_runs_as_command_buffer() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_svm() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
     let buf = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc svm");
 
@@ -77,7 +56,7 @@ fn svm_fill_then_kernel_runs_as_command_buffer() {
 #[test]
 fn svm_fill_then_copy_runs_as_command_buffer() {
     use claspr::eager_copy_to;
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_svm() else { return };
     let src = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc src");
     let dst = MappedSlice::<u32>::alloc_zero(&ctx, N).expect("alloc dst");
 

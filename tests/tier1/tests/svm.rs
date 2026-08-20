@@ -8,25 +8,12 @@
 //! behind the cross-queue work via the event wait-list instead of
 //! deadlocking or freeing while the unmap is still in flight.
 
-use claspr::{
-    Context, Device, DeviceOpExt, InOrder, Launcher, MappedSlice, OutOfOrder, Queue, SvmLevel,
-};
+use claspr::{Device, DeviceOpExt, InOrder, Launcher, MappedSlice, OutOfOrder, Queue};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx_with_svm;
 use std::sync::Arc;
 
 const N: usize = 256;
-
-fn ctx_with_svm() -> Option<Context> {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return None;
-    };
-    if ctx.svm_capability() == SvmLevel::None {
-        eprintln!("SKIP: device has no SVM");
-        return None;
-    }
-    Some(ctx)
-}
 
 #[test]
 fn map_mut_then_map_round_trip() {

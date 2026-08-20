@@ -15,25 +15,16 @@
 //! propagates the closure's exact `Error` variant (no `OpenCl(-1)` cascade),
 //! and short-circuits before the downstream `and_then_host` builds/executes.
 
+use claspr::Error;
 use claspr::eager::{DeviceOpExt, upload, value};
-use claspr::{Context, Error};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
 const N: usize = 32;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 #[test]
 fn and_then_host_error_stops_chain_immediately() {

@@ -14,28 +14,11 @@
 //! carries all their `&mut T` write-back views across the replay loop.
 
 use claspr::eager::{DeviceOpExt, bundle2, bundle3};
-use claspr::{Context, DeviceScalar, DeviceSlice, MemRef, RecordableBuffer};
+use claspr::{DeviceScalar, DeviceSlice};
 use claspr_test_kernels::kernels;
+use claspr_test_support::{ctx, handle_of};
 
 const N: usize = 64;
-
-/// Stable identity of a buffer's backing memory for `==` across replays.
-fn handle_of<B: RecordableBuffer>(b: &B) -> usize {
-    match b.record_handle().mem {
-        MemRef::Buffer(m) => m as usize,
-        MemRef::Svm(p) => p as usize,
-    }
-}
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 // ── lift as a LONE branch: a lifted buffer head → host seam, replayed ─────
 //

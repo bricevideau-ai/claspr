@@ -27,23 +27,13 @@
 //! 1:1 to `diamond_arc.rs` (which ended each branch `add_u32(...).and_then(|(_,_,
 //! out)| value(out))`); no extra kernel.
 
-use claspr::Context;
 use claspr::eager::{
     DeviceOpExt, alloc_zero, arc_split, arced, bundle2, bundle3, download, forward, upload,
 };
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// diamond_arc.rs::diamond_shares_single_cl_mem_via_arc_device_slice.
 ///

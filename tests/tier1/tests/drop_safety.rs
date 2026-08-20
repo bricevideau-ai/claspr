@@ -14,20 +14,11 @@
 //! sticky error on the context. We force every drop, then poke the
 //! context for errors and finish the queue.
 
-use claspr::{Context, DeviceSlice, Launcher, MappedSlice, SvmLevel, USMSlice};
+use claspr::{DeviceSlice, Launcher, MappedSlice, SvmLevel, USMSlice};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 4096;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 #[test]
 fn device_slice_drop_while_kernel_in_flight() {

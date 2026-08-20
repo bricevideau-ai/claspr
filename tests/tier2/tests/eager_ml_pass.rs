@@ -9,23 +9,13 @@
 //!
 //! Same N, same scale factors, same assertions as `ml_pass.rs`.
 
-use claspr::Context;
 use claspr::bundle;
 use claspr::eager::{DeviceOpExt, bundle3, download, upload, value};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 use std::sync::{Arc, Mutex};
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 #[test]
 fn forward_pass_threads_buffer_through_three_stages() {

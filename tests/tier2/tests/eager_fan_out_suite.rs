@@ -10,21 +10,11 @@
 //!
 //! Same N, same values, same assertions as `fan_out.rs`.
 
-use claspr::Context;
 use claspr::eager::{DeviceOpExt, download, fan_out, upload, value};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 #[test]
 fn fan_out_preserves_input_order() {

@@ -23,22 +23,12 @@
 //! bundle branch handles to pipes, or drops `Pipe: DeviceOp`, one or more of
 //! these stops compiling — which is the point.
 
-use claspr::Context;
 use claspr::bundle;
 use claspr::eager::{DeviceOpExt, bundle2, download, upload, value};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 32;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// REQUIREMENT 1 + 3: a bundle mixing a kernel-output PIPE and a `value` SCALAR;
 /// the downstream closure destructures `(Pipe<DeviceSlice>, u32)`. The kernel

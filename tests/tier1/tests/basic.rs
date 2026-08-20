@@ -5,20 +5,11 @@
 //! the right data for the simplest pipeline shape — what every
 //! claspr user starts with.
 
-use claspr::{Context, DeviceSlice};
+use claspr::DeviceSlice;
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 1024;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 #[test]
 fn fill_kernel_writes_value_to_every_element() {

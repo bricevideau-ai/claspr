@@ -15,8 +15,9 @@
 //! assertions: if a drop fired the underlying release eagerly, the
 //! runtime would either hang, crash, or surface a sticky error").
 
-use claspr::{Context, MappedSlice, OutOfOrder, Queue, SvmLevel};
+use claspr::{MappedSlice, OutOfOrder, Queue};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx_with_svm;
 
 const N: usize = 256;
 /// At least 1000 per REVIEW.md item #5. `fill_u32` is one
@@ -24,18 +25,6 @@ const N: usize = 256;
 /// in well under a second while still fully exercising the Vec
 /// accumulation surface.
 const LAUNCHES: u32 = 1024;
-
-fn ctx_with_svm() -> Option<Context> {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return None;
-    };
-    if ctx.svm_capability() == SvmLevel::None {
-        eprintln!("SKIP: device has no SVM");
-        return None;
-    }
-    Some(ctx)
-}
 
 #[test]
 fn thousand_ooo_launches_on_one_sharedbuffer_drop_safely() {

@@ -11,24 +11,13 @@ use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::task::Poll;
 
-use claspr::{
-    Context, DeviceSlice, EventFutureExt, LaunchOp, complete_user_event, create_user_event,
-};
+use claspr::{DeviceSlice, EventFutureExt, LaunchOp, complete_user_event, create_user_event};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 use futures::executor::block_on;
 use futures::task::noop_waker;
 
 const N: usize = 1024;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// Drive `EventFuture` through a genuine Pending → callback-wake →
 /// Ready cycle using a user event completed from another thread.

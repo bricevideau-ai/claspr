@@ -15,23 +15,13 @@
 //! identical. The host-value chain (`value(x).and_then(|n| value(n+1))`) ports
 //! 1:1 thanks to `value`'s by-value handle.
 
-use claspr::Context;
 use claspr::eager::{DeviceOpExt, alloc_zero, bundle3, download, upload, value};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 use std::sync::Arc;
 
 const N: usize = 256;
 const FILL_VALUE: u32 = 0xfeed_cafe;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// chain.rs::linear_chain_upload_kernel_download — upload → fill_u32 → download.
 #[test]

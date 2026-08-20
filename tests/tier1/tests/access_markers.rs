@@ -9,22 +9,11 @@
 //! module — easier to keep in sync with the marker definitions than
 //! separate trybuild fixtures.
 
-use claspr::{
-    Context, DeviceScratch, DeviceSlice, DeviceSliceUninit, Frozen, HostReadOnly, ReadOnly,
-};
+use claspr::{DeviceScratch, DeviceSlice, DeviceSliceUninit, Frozen, HostReadOnly, ReadOnly};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 32;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 #[test]
 fn readwrite_default_marker_exercises_full_surface() {

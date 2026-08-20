@@ -31,41 +31,10 @@ use claspr::eager::{
     DeviceOpExt, bundle2, download, eager_copy_to, fan_out, fill, upload, upload_as,
 };
 use claspr::image::format::R32Uint;
-use claspr::{Context, DeviceSlice, Error, Image2D, MemRef, ReadOnly, RecordableBuffer, WriteOnly};
+use claspr::{DeviceSlice, Error, Image2D, ReadOnly, WriteOnly};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
-
-const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
-
-/// The stable identity of a buffer's backing memory: the raw `cl_mem` (or SVM)
-/// pointer as a `usize`, for `==` identity comparison across runs. Reads through
-/// the public `RecordableBuffer::record_handle()` — works on a bare
-/// `DeviceSlice` and (via `Deref`) on a live `Checkout<DeviceSlice>`.
-fn handle_of<B: RecordableBuffer>(b: &B) -> usize {
-    match b.record_handle().mem {
-        MemRef::Buffer(m) => m as usize,
-        MemRef::Svm(p) => p as usize,
-    }
-}
-
-/// Allocate + fill a `DeviceSlice<u32>` of `N` elements with `v`.
-fn seeded(ctx: &Context, v: u32) -> DeviceSlice<u32> {
-    DeviceSlice::<u32>::alloc_zero(ctx, N)
-        .expect("alloc")
-        .fill(v)
-        .wait()
-        .expect("seed")
-}
+use claspr_test_support::{N, ctx, handle_of, seeded};
 
 // Slot tags for the slot-positioned scenarios.
 slots! {

@@ -104,8 +104,15 @@ jobs:
         # integration test suites, and the small async-pipeline /
         # batch-inference examples' inline tests. Tests that need an
         # OpenCL device skip gracefully if none is present, but with
-        # rusticl installed above they actually execute. `--release`
-        # matches the build step above so artifacts are reused —
-        # release also surfaces a handful of kernel-codegen issues
-        # that don't appear in debug.
+        # rusticl installed above they actually execute.
+        # CLASPR_REQUIRE_DEVICE turns the no-device skip into a
+        # panic (see claspr-test-support): this job installed an ICD,
+        # so a broken/undiscoverable ICD must FAIL the suite instead
+        # of silently skipping every device test and reporting green.
+        # Feature skips (no image support, no SVM, <2 devices) still
+        # skip. `--release` matches the build step above so artifacts
+        # are reused — release also surfaces a handful of
+        # kernel-codegen issues that don't appear in debug.
         run: cargo test --workspace --release --target $TARGET
+        env:
+          CLASPR_REQUIRE_DEVICE: 1

@@ -8,20 +8,10 @@
 //! These tests fail to COMPILE if the inherent `Pipe<...>` methods are missing,
 //! and fail to PASS if they don't delegate to the right enqueue.
 
-use claspr::Context;
 use claspr::eager::{DeviceOpExt, alloc_zero, device_alloc_uninit, download, upload};
+use claspr_test_support::ctx;
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// `device_alloc_uninit(n).and_then(|u| u.write(data))` — the piped uninit
 /// buffer's `.write` verb transitions it to init by uploading host data.

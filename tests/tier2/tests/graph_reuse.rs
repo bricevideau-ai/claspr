@@ -18,23 +18,13 @@
 //!    re-arms EVERY same-typed concrete cell, which the old single-guard /
 //!    type-match heuristic could not.
 
-use claspr::Context;
 use claspr::DeviceSlice;
 use claspr::Error;
 use claspr::eager::{DeviceOpExt, download, upload};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// Property 1: a mint-and-consume graph is **idempotent** — `sync`'d twice it
 /// gives the same result both runs (the `upload` op re-seeds its buffer each

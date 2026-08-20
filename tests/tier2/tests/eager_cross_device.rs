@@ -18,62 +18,11 @@
 //! Skips when only one device is available (no real multi-device platform AND no
 //! sub-device partition support). Guard copied verbatim from cross_device.rs.
 
-use claspr::device::Platform;
 use claspr::eager::{DeviceOpExt, download, upload};
-use claspr::{Context, Device};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx_two_devices;
 
 const N: usize = 64;
-
-/// Three-stage discovery: real multi-device → sub-device partition → skip.
-fn ctx_two_devices() -> Option<(Context, Device, Device)> {
-    if let Ok(platforms) = Platform::all() {
-        for p in platforms {
-            if let Ok(devs) = p.devices()
-                && devs.len() >= 2
-            {
-                let dev_a = devs[0].clone();
-                let dev_b = devs[1].clone();
-                let ctx = Context::builder()
-                    .devices(&[dev_a.clone(), dev_b.clone()])
-                    .build()
-                    .ok()?;
-                return Some((ctx, dev_a, dev_b));
-            }
-        }
-    }
-    if let Ok(devs) = Device::all() {
-        for parent in devs {
-            if parent.partition_max_sub_devices().unwrap_or(0) < 2 {
-                continue;
-            }
-            let cu = parent.max_compute_units().unwrap_or(0);
-            if cu < 2 {
-                continue;
-            }
-            // partition_equally takes CUs-per-sub-device, not number of
-            // sub-devices — see its rustdoc. cu/2 yields 2 sub-devices.
-            let Ok(subs) = parent.partition_equally(cu / 2) else {
-                continue;
-            };
-            if subs.len() < 2 {
-                continue;
-            }
-            let dev_a = subs[0].clone();
-            let dev_b = subs[1].clone();
-            let ctx = Context::builder()
-                .devices(&[dev_a.clone(), dev_b.clone()])
-                .build()
-                .ok()?;
-            return Some((ctx, dev_a, dev_b));
-        }
-    }
-    eprintln!(
-        "SKIP: no platform with ≥2 devices and no partitionable device \
-         (CL_DEVICE_PARTITION_EQUALLY with max_sub_devices ≥ 2)",
-    );
-    None
-}
 
 /// cross_device.rs::pipeline_spans_two_devices_via_mapped_slice — stage 1
 /// (fill 3) on device 0, stage 2 (scale 4) on device 1, then download. 3×4 = 12.

@@ -16,20 +16,11 @@
 //!   `download!(buf)`                      → `download`
 
 use claspr::eager::{DeviceOpExt, alloc_zero_as, download, fill, upload_as};
-use claspr::{Context, DeviceSlice, Frozen, HostReadOnly, ReadOnly};
+use claspr::{DeviceSlice, Frozen, HostReadOnly, ReadOnly};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 32;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// marker_aware::from_slice_with_frozen_marker_round_trips — `upload` uses
 /// `from_slice` (no Fillable bound), so the Frozen marker round-trips.

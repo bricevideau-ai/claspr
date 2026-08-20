@@ -23,60 +23,21 @@
 //! Skips when only one device is available (no real multi-device platform AND no
 //! sub-device partition). Guard copied verbatim from on_device.rs.
 
-use claspr::device::Platform;
+use claspr::Error;
 use claspr::eager::{DeviceOpExt, bundle2, download, upload};
-use claspr::{Context, Device, Error};
 use claspr_test_kernels::kernels;
+use claspr_test_support::{ctx, ctx_two_devices};
 
 const N: usize = 64;
-
-/// Three-stage discovery: real multi-device → sub-device partition → skip.
-fn ctx_two_devices() -> Option<Context> {
-    if let Ok(platforms) = Platform::all() {
-        for p in platforms {
-            if let Ok(devs) = p.devices()
-                && devs.len() >= 2
-            {
-                let ctx = Context::builder()
-                    .devices(&[devs[0].clone(), devs[1].clone()])
-                    .build()
-                    .ok()?;
-                return Some(ctx);
-            }
-        }
-    }
-    if let Ok(devs) = Device::all() {
-        for parent in devs {
-            if parent.partition_max_sub_devices().unwrap_or(0) < 2 {
-                continue;
-            }
-            let cu = parent.max_compute_units().unwrap_or(0);
-            if cu < 2 {
-                continue;
-            }
-            let Ok(subs) = parent.partition_equally(cu / 2) else {
-                continue;
-            };
-            if subs.len() < 2 {
-                continue;
-            }
-            let ctx = Context::builder()
-                .devices(&[subs[0].clone(), subs[1].clone()])
-                .build()
-                .ok()?;
-            return Some(ctx);
-        }
-    }
-    eprintln!("SKIP: no two-device context available (real or sub-device)");
-    None
-}
 
 /// on_device.rs::on_device_routes_chain_to_devices_from_context — two scale
 /// stages, one per device, plus a final download. Device identity resolved by
 /// index at execute each stage. 1 × 3 × 4 = 12.
 #[test]
 fn on_device_routes_chain_to_devices_from_context() {
-    let Some(ctx) = ctx_two_devices() else { return };
+    let Some((ctx, _, _)) = ctx_two_devices() else {
+        return;
+    };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
@@ -97,7 +58,9 @@ fn on_device_routes_chain_to_devices_from_context() {
 /// host-error slot.
 #[test]
 fn on_device_preserves_host_error_slot_across_routing() {
-    let Some(ctx) = ctx_two_devices() else { return };
+    let Some((ctx, _, _)) = ctx_two_devices() else {
+        return;
+    };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
@@ -124,7 +87,9 @@ fn on_device_preserves_host_error_slot_across_routing() {
 /// produced. Smoke test for "multi-device branches don't hang".
 #[test]
 fn on_device_bundle_runs_branches_on_distinct_devices() {
-    let Some(ctx) = ctx_two_devices() else { return };
+    let Some((ctx, _, _)) = ctx_two_devices() else {
+        return;
+    };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
@@ -159,7 +124,7 @@ fn on_device_bundle_runs_branches_on_distinct_devices() {
 /// `1`s and yield `5` on a racy driver.
 #[test]
 fn and_then_pipe_dep_same_device_raw() {
-    let Ok(ctx) = Context::any() else { return };
+    let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 

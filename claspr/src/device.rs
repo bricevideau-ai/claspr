@@ -87,7 +87,7 @@ static CL_ENUM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 impl Platform {
     /// Every OpenCL platform reachable from the loader.
     ///
-    /// Serialized via [`CL_ENUM_LOCK`] (see there).
+    /// Serialized via `CL_ENUM_LOCK` (see its comment above).
     pub fn all() -> Result<Vec<Platform>> {
         let _guard = crate::util::lock_unpoisoned(&CL_ENUM_LOCK);
         let cl3_platforms = get_platforms()?;
@@ -112,9 +112,9 @@ impl Platform {
 
     /// Devices on this platform of the given type.
     ///
-    /// Serialized via [`CL_ENUM_LOCK`] (see there) — PoCL's device
-    /// init races concurrent `clGetDeviceIDs`, transiently reporting
-    /// zero devices.
+    /// Serialized via `CL_ENUM_LOCK` (see its comment above) — PoCL's
+    /// device init races concurrent `clGetDeviceIDs`, transiently
+    /// reporting zero devices.
     pub fn devices_of_type(&self, kind: DeviceType) -> Result<Vec<Device>> {
         let _guard = crate::util::lock_unpoisoned(&CL_ENUM_LOCK);
         let cl3 = Cl3Platform::new(self.inner.id);

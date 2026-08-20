@@ -13,21 +13,11 @@
 //!                                semantics as the Tier-1 `.wait()`).
 //! Both test fns port 1:1 — same N, values, assertions.
 
-use claspr::Context;
 use claspr::eager::{DeviceOpExt, download, upload};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 128;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 #[test]
 fn split_chain_with_host_decision_between() {

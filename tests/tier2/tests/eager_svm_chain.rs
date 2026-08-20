@@ -11,22 +11,11 @@
 //!
 //! Skips on devices without SVM. Guard preserved verbatim.
 
-use claspr::{Context, MappedSlice, SvmLevel};
+use claspr::MappedSlice;
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx_with_svm;
 
 const N: usize = 256;
-
-fn ctx_with_svm() -> Option<Context> {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return None;
-    };
-    if ctx.svm_capability() == SvmLevel::None {
-        eprintln!("SKIP: device has no SVM");
-        return None;
-    }
-    Some(ctx)
-}
 
 /// svm_chain.rs::mapped_slice_threads_through_typed_launchers — Tier-1
 /// fill(6) → scale(7) via submit/after/wait, sum readback. 6 * 7 * N.

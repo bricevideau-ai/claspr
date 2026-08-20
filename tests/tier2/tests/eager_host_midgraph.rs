@@ -18,28 +18,11 @@
 //! single-output regression guard so neither pre-existing path regresses.
 
 use claspr::eager::{DeviceOpExt, bundle2, download, forward};
-use claspr::{Context, DeviceScalar, DeviceSlice, MemRef, RecordableBuffer};
+use claspr::{DeviceScalar, DeviceSlice};
 use claspr_test_kernels::kernels;
+use claspr_test_support::{ctx, handle_of};
 
 const N: usize = 64;
-
-/// Stable identity of a buffer's backing memory for `==` across replays.
-fn handle_of<B: RecordableBuffer>(b: &B) -> usize {
-    match b.record_handle().mem {
-        MemRef::Buffer(m) => m as usize,
-        MemRef::Svm(p) => p as usize,
-    }
-}
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 // ── THE core case: mid-graph bundle-fed seam, written branches → SEPARATE
 //    downstream kernels, replayed ─────────────────────────────────────────────

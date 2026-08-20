@@ -37,21 +37,10 @@
 //!     (`bind` after sever surfaces `SlotSevered` at sync; `mutate_bind` re-arms).
 
 use claspr::eager::{DeviceOpExt, download};
-use claspr::{Context, DeviceSlice, Error};
+use claspr::{DeviceSlice, Error};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
-
-const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
+use claspr_test_support::{N, ctx, handle_of, seeded};
 
 // Tags for the slots used below. Each carries one fixed buffer type (compile-time);
 // the tag type is the runtime identity key.
@@ -76,15 +65,6 @@ fn bind_err<G>(r: claspr::Result<&G>, msg: &str) -> Error {
         Ok(_) => panic!("{msg}"),
         Err(e) => e,
     }
-}
-
-/// Allocate + fill a `DeviceSlice<u32>` of `N` elements with `v`.
-fn seeded(ctx: &Context, v: u32) -> DeviceSlice<u32> {
-    DeviceSlice::<u32>::alloc_zero(ctx, N)
-        .expect("alloc")
-        .fill(v)
-        .wait()
-        .expect("seed")
 }
 
 /// (a) `slot!(Buf)` in a kernel arg position; `g.bind(Buf(b))?.sync()` runs the
@@ -229,16 +209,7 @@ fn bind_same_buffer_is_idempotent() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    use claspr::{MemRef, RecordableBuffer};
     use std::sync::Arc;
-
-    /// Raw `cl_mem`/SVM pointer as a `usize`, for `==` identity across the run.
-    fn handle_of<B: RecordableBuffer>(b: &B) -> usize {
-        match b.record_handle().mem {
-            MemRef::Buffer(m) => m as usize,
-            MemRef::Svm(p) => p as usize,
-        }
-    }
 
     // out = sharedA + b. `a` is a read-only arg (accepts `Arc<DeviceSlice>`).
     let shared = Arc::new(seeded(&ctx, 2));

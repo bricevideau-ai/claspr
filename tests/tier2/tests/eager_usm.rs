@@ -23,26 +23,14 @@
 use claspr::eager::{
     DeviceOpExt, bundle2, fill_usm_uninit, usm_alloc_uninit, usm_slice, usm_slice_as,
 };
-use claspr::{Buffer, Context, Frozen, MemRef, RecordableBuffer, SvmLevel, USMSliceUninit};
+use claspr::{Buffer, Context, Frozen, SvmLevel, USMSliceUninit};
 use claspr_test_kernels::kernels;
+use claspr_test_support::{ctx, handle_of};
 
 const N: usize = 64;
 
-/// Stable identity of a USM slice's backing SVM pointer (as `usize`) for `==`
-/// across replays. Works on a `USMSlice` and (via `Deref`/`Checkout`) on a
-/// `Checkout<USMSlice>`.
-fn svm_ptr_of<B: RecordableBuffer>(b: &B) -> usize {
-    match b.record_handle().mem {
-        MemRef::Svm(p) => p as usize,
-        MemRef::Buffer(m) => m as usize,
-    }
-}
-
 fn ctx_with_fine_system() -> Option<Context> {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return None;
-    };
+    let ctx = ctx()?;
     if ctx.svm_capability() != SvmLevel::FineSystem {
         eprintln!(
             "SKIP: device reports {:?}, USMSlice needs FineSystem",
@@ -57,10 +45,7 @@ fn ctx_with_fine_system() -> Option<Context> {
 /// Reproduced verbatim.
 #[test]
 fn usm_slice_capability_gate() {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
+    let Some(ctx) = ctx() else { return };
     match ctx.svm_capability() {
         SvmLevel::FineSystem => {
             let s = claspr::USMSlice::<u32>::new(&ctx, vec![1u32, 2, 3])
@@ -252,14 +237,14 @@ fn usm_slice_rw_stable_pointer_and_reseed_after_mutation() {
 
     // Run 1: 10 × 3 = 30.
     let co1 = g.sync(&ctx).expect("run 1");
-    let ptr1 = svm_ptr_of(&*co1);
+    let ptr1 = handle_of(&*co1);
     assert!(co1.iter().all(|&v| v == 30), "run1 got {}", co1[0]);
     drop(co1); // re-home the USM slice (reseed happens on next execute)
 
     // Run 2 (replay over the SAME SVM pointer): the buffer was reseeded to 10, so
     // 10 × 3 = 30 again — NOT 30 × 3 = 90 (would be compounding without reseed).
     let co2 = g.sync(&ctx).expect("run 2 (replay)");
-    let ptr2 = svm_ptr_of(&*co2);
+    let ptr2 = handle_of(&*co2);
     assert_eq!(ptr1, ptr2, "USM pointer must be stable across replays");
     assert!(
         co2.iter().all(|&v| v == 30),
@@ -333,15 +318,15 @@ fn usm_slice_as_bundle_branch_replays() {
 
     // Run 1: a = 2×5 = 10, b = 3×6 = 18.
     let (a1, b1) = g.sync(&ctx).expect("run 1");
-    let (pa1, pb1) = (svm_ptr_of(&*a1), svm_ptr_of(&*b1));
+    let (pa1, pb1) = (handle_of(&*a1), handle_of(&*b1));
     assert!(a1.iter().all(|&v| v == 10), "run1 a got {}", a1[0]);
     assert!(b1.iter().all(|&v| v == 18), "run1 b got {}", b1[0]);
     drop((a1, b1)); // both branches re-home
 
     // Run 2 (replay, same pointers, idempotent reseed): 10 and 18 again.
     let (a2, b2) = g.sync(&ctx).expect("run 2 (replay)");
-    assert_eq!(svm_ptr_of(&*a2), pa1, "branch a pointer stable");
-    assert_eq!(svm_ptr_of(&*b2), pb1, "branch b pointer stable");
+    assert_eq!(handle_of(&*a2), pa1, "branch a pointer stable");
+    assert_eq!(handle_of(&*b2), pb1, "branch b pointer stable");
     assert!(a2.iter().all(|&v| v == 10), "run2 a got {}", a2[0]);
     assert!(b2.iter().all(|&v| v == 18), "run2 b got {}", b2[0]);
     drop((a2, b2));

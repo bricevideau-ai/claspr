@@ -17,21 +17,10 @@
 //! Each test asserts real device behavior (skips silently with no OpenCL device).
 
 use claspr::eager::{DeviceOpExt, download, write};
-use claspr::{Context, DeviceSlice, Error, LaunchSpec};
+use claspr::{DeviceSlice, Error, LaunchSpec};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
-
-const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
+use claspr_test_support::{N, ctx, handle_of, seeded};
 
 slots! {
     // Scalar slots (Tag::Value is the scalar type — Copy, value-equality).
@@ -57,26 +46,6 @@ slots! {
     // the Checkout is bound INTO.
     Src: DeviceSlice<u32>,
     Dst: DeviceSlice<u32>,
-}
-
-/// The stable identity of a buffer's backing memory (raw `cl_mem`/SVM pointer as a
-/// `usize`), for `==` across runs. Reads through `RecordableBuffer::record_handle()`
-/// — works on a bare `DeviceSlice` and (via `Deref`) on a live `Checkout`.
-fn handle_of<B: claspr::RecordableBuffer>(b: &B) -> usize {
-    use claspr::MemRef;
-    match b.record_handle().mem {
-        MemRef::Buffer(m) => m as usize,
-        MemRef::Svm(p) => p as usize,
-    }
-}
-
-/// Allocate + fill a `DeviceSlice<u32>` of `N` elements with `v`.
-fn seeded(ctx: &Context, v: u32) -> DeviceSlice<u32> {
-    DeviceSlice::<u32>::alloc_zero(ctx, N)
-        .expect("alloc")
-        .fill(v)
-        .wait()
-        .expect("seed")
 }
 
 // ── (A) SCALAR-arg slots ────────────────────────────────────────────────────

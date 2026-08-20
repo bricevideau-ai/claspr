@@ -11,31 +11,17 @@
 //! kernel-side state).
 
 use claspr::{
-    Context, Image2D, ReadOnly, ReadWrite, WriteOnly,
+    Image2D, ReadOnly, ReadWrite, WriteOnly,
     image::format::{R32Float, R32G32B32A32Uint, R32Uint},
 };
-
-fn ctx() -> Option<Context> {
-    let ctx = match Context::any() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: no OpenCL device ({e})");
-            return None;
-        }
-    };
-    if !ctx.device().cl3().image_support().unwrap_or(false) {
-        eprintln!("SKIP: device has no image support");
-        return None;
-    }
-    Some(ctx)
-}
+use claspr_test_support::ctx_with_images;
 
 /// `image.copy_to(&mut dst)` propagates pixels through
 /// `clEnqueueCopyImage`. Writes a known pattern into src, copies,
 /// reads dst, confirms equality.
 #[test]
 fn image2d_copy_to_propagates_pixels() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 8;
     const H: u32 = 4;
 
@@ -58,7 +44,7 @@ fn image2d_copy_to_propagates_pixels() {
 /// truncates `[T; 4]` to fewer channels.
 #[test]
 fn image2d_fill_writes_pattern_to_every_pixel() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 4;
     const H: u32 = 2;
     let pattern: [u32; 4] = [10, 20, 30, 40];
@@ -80,7 +66,7 @@ fn image2d_fill_writes_pattern_to_every_pixel() {
 /// `SampledTypeFamily` (`Float`).
 #[test]
 fn image2d_fill_float_format_round_trips() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 6;
     const H: u32 = 3;
     let pattern: [f32; 4] = [1.5, 2.5, 3.5, 4.5];
@@ -102,7 +88,7 @@ fn image2d_fill_float_format_round_trips() {
 /// non-allocating shape is functional and length-checked.
 #[test]
 fn image2d_read_into_caller_dst() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 8;
     const H: u32 = 4;
 
@@ -121,7 +107,7 @@ fn image2d_read_into_caller_dst() {
 /// error appears at `.wait()`, not at `.read()`.
 #[test]
 fn image2d_read_length_mismatch_errors() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 4;
     const H: u32 = 4;
 
@@ -144,7 +130,7 @@ fn image2d_read_length_mismatch_errors() {
 /// `pixels` outlives the event).
 #[test]
 fn image2d_write_submit_returns_event() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 4;
     const H: u32 = 4;
 
@@ -162,7 +148,7 @@ fn image2d_write_submit_returns_event() {
 /// download path, caller waits on the event before reading the dst.
 #[test]
 fn image2d_read_submit_returns_event() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 4;
     const H: u32 = 4;
 
@@ -185,7 +171,7 @@ fn image2d_read_submit_returns_event() {
 /// loaders.
 #[test]
 fn image2d_write_bytes_and_read_bytes_round_trip() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 4;
     const H: u32 = 2;
     let pixel_bytes = std::mem::size_of::<u32>();
@@ -205,7 +191,7 @@ fn image2d_write_bytes_and_read_bytes_round_trip() {
 /// correctly (the eager-graph replacement for the old `.after(&event)` modifier).
 #[test]
 fn image2d_write_after_event() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 4;
     const H: u32 = 4;
 
@@ -231,7 +217,7 @@ fn image2d_write_after_event() {
 /// host-side write or read paths.
 #[test]
 fn image2d_write_only_marker_still_writes() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     const W: u32 = 4;
     const H: u32 = 4;
 

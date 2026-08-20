@@ -2,20 +2,11 @@
 //! via `CL_MEM_COPY_HOST_PTR` at construction. Verifies the kernel
 //! can read it and the bytes match what we baked in.
 
-use claspr::{Context, DeviceSlice, Frozen};
+use claspr::{DeviceSlice, Frozen};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 32;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 #[test]
 fn frozen_from_slice_round_trip_via_read() {

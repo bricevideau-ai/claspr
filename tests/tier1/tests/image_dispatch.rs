@@ -24,28 +24,14 @@
 //! the device doesn't advertise image support.
 
 use claspr::{
-    Context, DeviceSlice, Image1D, Image1DArray, Image1DBuffer, Image1DBufferView, Image2DArray,
-    Image3D, ReadOnly, ReadWrite, WriteOnly,
+    DeviceSlice, Image1D, Image1DArray, Image1DBuffer, Image1DBufferView, Image2DArray, Image3D,
+    ReadOnly, ReadWrite, WriteOnly,
     image::format::{R8G8B8A8Uint, R32Float, R32G32B32A32Uint, R32Sint, R32Uint},
 };
+use claspr_test_support::ctx_with_images;
 
 const W: u32 = 16;
 const H: u32 = 8;
-
-fn ctx() -> Option<Context> {
-    let ctx = match Context::any() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: no OpenCL device ({e})");
-            return None;
-        }
-    };
-    if !ctx.device().cl3().image_support().unwrap_or(false) {
-        eprintln!("SKIP: device has no image support");
-        return None;
-    }
-    Some(ctx)
-}
 
 /// Write-only 2D Uint image, default `R8G8B8A8Uint` format
 /// (this is what the examples already exercise — included here
@@ -53,7 +39,7 @@ fn ctx() -> Option<Context> {
 /// against the existing-success path on this machine).
 #[test]
 fn fill_pattern_rgba8_uint() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim2_uint::kernels(&ctx).unwrap();
     let img = claspr::Image2D::<WriteOnly, R8G8B8A8Uint>::alloc(&ctx, W, H).unwrap();
     let img = kernels
@@ -74,7 +60,7 @@ fn fill_pattern_rgba8_uint() {
 /// other than RGBA8.
 #[test]
 fn fill_pattern_r32_uint() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim2_uint::kernels(&ctx).unwrap();
     let img = claspr::Image2D::<WriteOnly, R32Uint>::alloc(&ctx, W, H).unwrap();
     let img = kernels
@@ -101,7 +87,7 @@ fn fill_pattern_r32_uint() {
 /// the wider channel layout.
 #[test]
 fn fill_pattern_rgba32_uint() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim2_uint::kernels(&ctx).unwrap();
     let img = claspr::Image2D::<WriteOnly, R32G32B32A32Uint>::alloc(&ctx, W, H).unwrap();
     let img = kernels
@@ -124,7 +110,7 @@ fn fill_pattern_rgba32_uint() {
 /// Float family.
 #[test]
 fn fill_pattern_r32_float() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim2_float::kernels(&ctx).unwrap();
     let img = claspr::Image2D::<WriteOnly, R32Float>::alloc(&ctx, W, H).unwrap();
     let img = kernels
@@ -146,7 +132,7 @@ fn fill_pattern_r32_float() {
 /// family.
 #[test]
 fn fill_pattern_r32_sint() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim2_sint::kernels(&ctx).unwrap();
     let img = claspr::Image2D::<WriteOnly, R32Sint>::alloc(&ctx, W, H).unwrap();
     let img = kernels
@@ -170,7 +156,7 @@ fn fill_pattern_r32_sint() {
 /// the host `upload` API at the same time.
 #[test]
 fn read_only_float_image_to_buffer() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim2_float::kernels(&ctx).unwrap();
 
     let img = claspr::Image2D::<ReadOnly, R32Float>::alloc(&ctx, W, H).unwrap();
@@ -200,7 +186,7 @@ fn read_only_float_image_to_buffer() {
 /// family + `&Image` read path.
 #[test]
 fn read_only_sint_image_to_buffer() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim2_sint::kernels(&ctx).unwrap();
 
     let img = claspr::Image2D::<ReadOnly, R32Sint>::alloc(&ctx, W, H).unwrap();
@@ -231,7 +217,7 @@ fn read_only_sint_image_to_buffer() {
 /// spirv-val rejects the module).
 #[test]
 fn dim1_fill_pattern_r32_uint() {
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim1_uint::kernels(&ctx).unwrap();
     let img = Image1D::<WriteOnly, R32Uint>::alloc(&ctx, W).unwrap();
     let img = kernels.fill_pattern([W as usize], img, W).wait().unwrap();
@@ -251,7 +237,7 @@ fn dim1_fill_pattern_r32_uint() {
 #[test]
 fn dim3_fill_pattern_r32_uint() {
     const D: u32 = 4;
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim3_uint::kernels(&ctx).unwrap();
     let img = Image3D::<WriteOnly, R32Uint>::alloc(&ctx, W, H, D).unwrap();
     let img = kernels
@@ -279,7 +265,7 @@ fn dim3_fill_pattern_r32_uint() {
 #[test]
 fn dim_buffer_fill_pattern_r32_uint() {
     const N: u32 = 64;
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim_buffer_uint::kernels(&ctx).unwrap();
     let img = Image1DBuffer::<WriteOnly, R32Uint>::alloc(&ctx, N).unwrap();
     let img = kernels.fill_pattern([N as usize], img, N).wait().unwrap();
@@ -309,7 +295,7 @@ fn dim_buffer_fill_pattern_r32_uint() {
 #[test]
 fn dim_buffer_owned_read_to_slice() {
     const N: u32 = 64;
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim_buffer_uint::kernels(&ctx).unwrap();
 
     // Seed an owned image-buffer with the same pattern the old view test used.
@@ -344,7 +330,7 @@ fn dim_buffer_owned_read_to_slice() {
 #[test]
 fn dim_buffer_view_width_derived_from_slice_bytes() {
     const N: u32 = 16;
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let zeros = vec![0u32; N as usize];
     let slice = DeviceSlice::<u32>::from_slice(&ctx, &zeros).unwrap();
     let view = Image1DBufferView::<ReadWrite, R32Uint>::view_of(&slice).unwrap();
@@ -359,7 +345,7 @@ fn dim_buffer_view_width_derived_from_slice_bytes() {
 #[test]
 fn dim_buffer_read_to_slice() {
     const N: u32 = 64;
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim_buffer_uint::kernels(&ctx).unwrap();
 
     let img = Image1DBuffer::<ReadOnly, R32Uint>::alloc(&ctx, N).unwrap();
@@ -390,7 +376,7 @@ fn dim_buffer_read_to_slice() {
 fn dim1_array_fill_pattern_r32_uint() {
     const WIDTH: u32 = 16;
     const LAYERS: u32 = 4;
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim1_array_uint::kernels(&ctx).unwrap();
     let img = Image1DArray::<WriteOnly, R32Uint>::alloc(&ctx, WIDTH, LAYERS).unwrap();
     // 2D launch grid: (width, array_size). The kernel uses id.y
@@ -419,7 +405,7 @@ fn dim2_array_fill_pattern_r32_uint() {
     const LW: u32 = 8;
     const LH: u32 = 4;
     const LAYERS: u32 = 3;
-    let Some(ctx) = ctx() else { return };
+    let Some(ctx) = ctx_with_images() else { return };
     let kernels = claspr_test_image_kernels::dim2_array_uint::kernels(&ctx).unwrap();
     let img = Image2DArray::<WriteOnly, R32Uint>::alloc(&ctx, LW, LH, LAYERS).unwrap();
     let img = kernels

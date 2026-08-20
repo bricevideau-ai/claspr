@@ -205,7 +205,7 @@ pub use opencl3::types::cl_event;
 /// access markers ([`ReadWrite`]/[`ReadOnly`]/[`WriteOnly`]/[`Frozen`]), the
 /// high-frequency Tier 2 constructors (`upload`/`download`/`fill`/`alloc_zero`/
 /// `value`/`lift`/`bundle2..16`/`fan_out`/`arc_split`/…), the chain-entry
-/// macros (`bundle!`/`upload!`/`download!`/`device_slice!`/…), and the core
+/// macros (`bundle!`/`device_slice!`/`mapped_slice!`/…), and the core
 /// types ([`Context`]/[`DeviceSlice`]/[`Device`]/[`Result`]/[`Error`]) into
 /// scope — so callers can invoke the trait methods without hand-listing every
 /// extension trait.
@@ -230,14 +230,11 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
 
     // ── High-frequency Tier 2 constructors ──
-    // `download` / `upload` are intentionally absent here: the crate-root
-    // re-import below brings in both the macro and the root-re-exported fn
-    // of those names, and naming them twice in the value namespace is E0252.
     pub use crate::eager::{
         alloc_zero, arc_split, arced, bundle2, bundle3, bundle4, bundle5, bundle6, bundle7,
         bundle8, bundle9, bundle10, bundle11, bundle12, bundle13, bundle14, bundle15, bundle16,
-        fan_out, fill, forward, lift, transfer_to_device, transfer_to_device_at, upload_as, value,
-        write,
+        download, fan_out, fill, forward, lift, transfer_to_device, transfer_to_device_at, upload,
+        upload_as, value, write,
     };
 
     // ── Chain-entry macros (re-exported from the crate root, where

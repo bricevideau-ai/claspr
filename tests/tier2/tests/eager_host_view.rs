@@ -23,6 +23,7 @@ use claspr::eager::{
 use claspr::prelude::*;
 use claspr::{MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 64;
 
@@ -30,10 +31,7 @@ const N: usize = 64;
 
 #[test]
 fn acquire_host_edit_release_round_trip() {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
+    let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     // upload all-3s → scale by 2 (all 6s) → host view (edit [0]=999)
@@ -61,10 +59,7 @@ fn acquire_host_edit_release_round_trip() {
 
 #[test]
 fn acquire_immediately_release_is_a_round_trip() {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
+    let Some(ctx) = ctx() else { return };
 
     let result = upload(vec![42u32; N])
         .and_then(acquire_device_view)
@@ -78,10 +73,7 @@ fn acquire_immediately_release_is_a_round_trip() {
 
 #[test]
 fn acquire_host_view_read_inspects_without_writeback() {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
+    let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let sum_cell = std::sync::Arc::new(std::sync::Mutex::new(0u32));
@@ -110,10 +102,7 @@ fn acquire_host_view_read_inspects_without_writeback() {
 
 #[test]
 fn acquire_host_view_read_just_inspect_and_drop() {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
+    let Some(ctx) = ctx() else { return };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
 
     let first_cell = std::sync::Arc::new(std::sync::Mutex::new(0u32));
@@ -137,10 +126,7 @@ fn acquire_host_view_read_just_inspect_and_drop() {
 
 #[test]
 fn mapped_slice_acquire_release_round_trip() {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
+    let Some(ctx) = ctx() else { return };
     if ctx.svm_capability() == SvmLevel::None {
         eprintln!("SKIP: no SVM support on this device");
         return;
@@ -171,10 +157,7 @@ fn mapped_slice_acquire_release_round_trip() {
 
 #[test]
 fn mapped_slice_acquire_release_read_only() {
-    let Ok(ctx) = Context::any() else {
-        eprintln!("SKIP: no OpenCL device");
-        return;
-    };
+    let Some(ctx) = ctx() else { return };
     if ctx.svm_capability() == SvmLevel::None {
         eprintln!("SKIP: no SVM support on this device");
         return;

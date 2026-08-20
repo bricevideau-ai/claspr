@@ -22,29 +22,11 @@
 use claspr::eager::{
     DeviceOpExt, alloc_zero, bundle2, download, eager_copy_to, fill, upload, write,
 };
-use claspr::{Buffer, Context, DeviceSlice, Error, MappedSlice, SvmLevel};
+use claspr::{Buffer, DeviceSlice, Error, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
+use claspr_test_support::{ctx, ctx_with_svm};
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
-
-fn ctx_with_svm() -> Option<Context> {
-    let c = ctx()?;
-    if c.svm_capability() == SvmLevel::None {
-        eprintln!("SKIP: device has no SVM");
-        return None;
-    }
-    Some(c)
-}
 
 // ── device_slice_fill ──────────────────────────────────────────────
 

@@ -6,19 +6,10 @@
 
 use claspr::{Context, Device, DeviceOpExt, DeviceSlice, InOrder, Queue};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 use std::panic;
 
 const N: usize = 512;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 #[test]
 fn after_event_orders_launch_on_second_queue() {

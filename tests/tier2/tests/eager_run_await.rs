@@ -19,22 +19,13 @@
 //!   chain error via `with_context`      → `.and_then_host(|_| Err(..))` (the
 //!     eager host seam surfaces the closure's exact `Error` variant).
 
+use claspr::Error;
 use claspr::eager::{DeviceOpExt, download, upload, value};
-use claspr::{Context, Error};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 use futures::executor::block_on;
 
 const N: usize = 256;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// run_await.rs::await_simple_chain — upload → fill kernel → download via `.await`.
 #[test]

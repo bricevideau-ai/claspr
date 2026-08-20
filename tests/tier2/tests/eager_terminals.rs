@@ -7,18 +7,9 @@
 use claspr::prelude::*;
 use claspr::{InOrder, Queue};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// `wait_on(&queue)` runs a graph to completion on an explicit queue and yields
 /// the Output directly — same result as `sync(&ctx)`, but caller-chosen queue.

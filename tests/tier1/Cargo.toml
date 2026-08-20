@@ -16,9 +16,11 @@ path = "src/lib.rs"
 claspr = { path = "../../claspr" }
 claspr-test-kernels = { path = "../kernels" }
 claspr-test-image-kernels = { path = "../image-kernels" }
+# Shared test helpers (ctx()/skip discipline, two-device discovery) +
+# the ui_test harness plumbing behind the `ui-test` feature.
+claspr-test-support = { path = "../support", features = ["ui-test"] }
 
 [dev-dependencies]
-ui_test = "0.30"
 # For block_on / noop_waker in the Tier-1 async-surface tests
 # (async_event.rs) — same crate claspr's `async-events` feature uses.
 futures = "0.3"

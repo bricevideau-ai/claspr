@@ -15,19 +15,10 @@ use claspr::eager::{DeviceOpExt, download, upload};
 use claspr::{Context, DeviceSlice, Error};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 use std::sync::{Arc, Mutex};
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 #[test]
 fn closure_receives_running_context() {

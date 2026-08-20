@@ -123,6 +123,17 @@ trigger:** a user wants one of those.
 
 ## Concerns
 
+- **PoCL device-init race (upstream-report candidate)** — concurrent first-touch
+  `clGetDeviceIDs` on PoCL 8.0-pre transiently returns ZERO devices to threads that
+  race another thread's first call (recovers ~100s of ms later; rusticl unaffected;
+  reproduced 100% with 8 threads pre-fix). claspr works around it by serializing
+  platform+device enumeration behind `CL_ENUM_LOCK` (`device.rs`), pinned by
+  `tier1/concurrent_enumeration.rs` (threads-first, so the process's first
+  enumeration is the concurrent one). Worth a minimized C repro + pocl issue —
+  same lazy-init path our arg-info PR (#2166) territory. Surfaced only when test
+  skips became loud (`CLASPR_REQUIRE_DEVICE`): the two access_frozen victims had
+  been silently "passing" as skips.
+
 - **Image dispatch is family-level, not format-level** — the macro derives
   dim/arrayed/family/access from `Image!(...)` and bounds the launcher generic, but the
   concrete channel format isn't part of the bound (Kernel-target SPIR-V carries only the

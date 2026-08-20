@@ -13,6 +13,10 @@ path = "src/lib.rs"
 [dependencies]
 claspr = { path = "../../claspr" }
 
+[dev-dependencies]
+# Shared test helpers — ctx() and the SKIP/CLASPR_REQUIRE_DEVICE discipline.
+claspr-test-support = { path = "../support" }
+
 [build-dependencies]
 claspr-build = { path = "../../claspr-build" }
 

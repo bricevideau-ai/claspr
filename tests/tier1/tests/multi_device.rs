@@ -16,67 +16,11 @@
 //! partition fallback makes the tests actually fire on common dev
 //! environments.
 
-use claspr::device::Platform;
-use claspr::{Context, Device, DeviceOpExt, DeviceSlice, InOrder, Queue};
+use claspr::{DeviceOpExt, DeviceSlice, InOrder, Queue};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx_two_devices;
 
 const N: usize = 256;
-
-/// Returns `Some((ctx, dev_a, dev_b))` for a 2-device context built
-/// from either real multi-device discovery or sub-device partitioning.
-/// Returns `None` (with a SKIP printed) when neither is available.
-fn ctx_two_devices() -> Option<(Context, Device, Device)> {
-    // 1. Real multi-device: any platform with ≥2 devices.
-    if let Ok(platforms) = Platform::all() {
-        for p in platforms {
-            if let Ok(devs) = p.devices()
-                && devs.len() >= 2
-            {
-                let dev_a = devs[0].clone();
-                let dev_b = devs[1].clone();
-                let ctx = Context::builder()
-                    .devices(&[dev_a.clone(), dev_b.clone()])
-                    .build()
-                    .ok()?;
-                return Some((ctx, dev_a, dev_b));
-            }
-        }
-    }
-    // 2. Sub-devices: any device with PARTITION_EQUALLY + ≥ 2 CUs.
-    // `partition_equally`'s arg is *CUs per sub-device*, not number of
-    // sub-devices — `parent.partition_equally(cu / 2)` on a CU-count
-    // ≥ 2 parent yields exactly 2 sub-devices.
-    if let Ok(devs) = Device::all() {
-        for parent in devs {
-            if parent.partition_max_sub_devices().unwrap_or(0) < 2 {
-                continue;
-            }
-            let cu = parent.max_compute_units().unwrap_or(0);
-            if cu < 2 {
-                continue;
-            }
-            let Ok(subs) = parent.partition_equally(cu / 2) else {
-                continue;
-            };
-            if subs.len() < 2 {
-                continue;
-            }
-            let dev_a = subs[0].clone();
-            let dev_b = subs[1].clone();
-            let ctx = Context::builder()
-                .devices(&[dev_a.clone(), dev_b.clone()])
-                .build()
-                .ok()?;
-            return Some((ctx, dev_a, dev_b));
-        }
-    }
-    // 3. Skip.
-    eprintln!(
-        "SKIP: no platform with ≥2 devices and no partitionable device \
-         (CL_DEVICE_PARTITION_EQUALLY with max_sub_devices ≥ 2)",
-    );
-    None
-}
 
 #[test]
 fn context_builder_accepts_two_devices() {

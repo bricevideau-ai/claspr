@@ -16,19 +16,10 @@
 //!   re-wraps it as `DeviceSliceUninit` before storing.
 
 use claspr::eager::{DeviceOpExt, eager_copy_to};
-use claspr::{Context, DeviceSlice, MappedSlice, SvmLevel, USMSlice};
+use claspr::{DeviceSlice, MappedSlice, SvmLevel, USMSlice};
+use claspr_test_support::ctx;
 
 const N: usize = 16;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// Concrete `DeviceSlice` src + dst: `eager_copy_to` run twice (Checkouts
 /// dropped between). Both buffers must return to their cells (identity rehome

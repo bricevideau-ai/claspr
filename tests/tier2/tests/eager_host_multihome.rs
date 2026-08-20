@@ -23,39 +23,9 @@
 //! regression guard for #211.
 
 use claspr::eager::{DeviceOpExt, acquire_mapped_view, bundle2, bundle3, release_mapped_view};
-use claspr::{Context, DeviceScalar, DeviceSlice, MappedSlice, MemRef, RecordableBuffer, SvmLevel};
+use claspr::{DeviceScalar, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
-
-const N: usize = 64;
-
-/// Stable identity of a buffer's backing memory (raw `cl_mem`/SVM ptr as `usize`)
-/// for `==` across replays. Works on a `DeviceSlice`/`DeviceScalar`/`MappedSlice`
-/// and (via `Deref`) on a `Checkout` of any of them.
-fn handle_of<B: RecordableBuffer>(b: &B) -> usize {
-    match b.record_handle().mem {
-        MemRef::Buffer(m) => m as usize,
-        MemRef::Svm(p) => p as usize,
-    }
-}
-
-/// Allocate + fill a `DeviceSlice<u32>` of `N` elements with `v`.
-fn seeded(ctx: &Context, v: u32) -> DeviceSlice<u32> {
-    DeviceSlice::<u32>::alloc_zero(ctx, N)
-        .expect("alloc")
-        .fill(v)
-        .wait()
-        .expect("seed")
-}
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
+use claspr_test_support::{N, ctx, handle_of, seeded};
 
 // ── #211 regression guard: single-output-fed seam still replays ──────────
 //

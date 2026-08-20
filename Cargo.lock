@@ -327,6 +327,7 @@ version = "0.0.0"
 dependencies = [
  "claspr",
  "claspr-build",
+ "claspr-test-support",
 ]
 
 [[package]]
@@ -355,14 +356,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "claspr-test-support"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+ "ui_test",
+]
+
+[[package]]
 name = "claspr-tier1-tests"
 version = "0.0.0"
 dependencies = [
  "claspr",
  "claspr-test-image-kernels",
  "claspr-test-kernels",
+ "claspr-test-support",
  "futures",
- "ui_test",
 ]
 
 [[package]]
@@ -372,8 +381,8 @@ dependencies = [
  "claspr",
  "claspr-test-image-kernels",
  "claspr-test-kernels",
+ "claspr-test-support",
  "futures",
- "ui_test",
 ]
 
 [[package]]

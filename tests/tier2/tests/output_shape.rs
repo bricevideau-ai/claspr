@@ -6,18 +6,9 @@
 //! or `Checkouts` (or an `OutputShape` impl drifts), `require_canonical` below stops
 //! compiling — a compile-time guard, exercised at runtime here on a leaf and a tuple.
 
+use claspr::DeviceSlice;
 use claspr::eager::{DeviceOp, DeviceOpExt, OutputShape, bundle2, fill};
-use claspr::{Context, DeviceSlice};
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(e) => {
-            eprintln!("SKIP: no OpenCL device ({e})");
-            None
-        }
-    }
-}
+use claspr_test_support::ctx;
 
 /// Compile-time proof that `O`'s `Handle`/`Checkouts` ARE the `OutputShape` of its
 /// `Output`. Passing a real op through it type-checks ONLY if the invariant holds.

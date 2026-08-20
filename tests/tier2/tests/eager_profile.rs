@@ -7,25 +7,15 @@
 //!   `.profiled(cb)`                     → `DeviceProfileExt::profiled`
 
 use claspr::eager::{DeviceOpExt, DeviceProfileExt, upload, value};
-use claspr::{Context, Device};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx_profiling;
 use std::sync::{Arc, Mutex};
 
 const N: usize = 128;
 
-fn ctx(profiling: bool) -> Option<Context> {
-    let dev = Device::any().ok()?;
-    Context::builder()
-        .device(&dev)
-        .profiling(profiling)
-        .build()
-        .ok()
-}
-
 #[test]
 fn profile_chain_fires_callback_when_profiling_on() {
-    let Some(ctx) = ctx(true) else {
-        eprintln!("SKIP: no OpenCL device");
+    let Some(ctx) = ctx_profiling(true) else {
         return;
     };
     assert!(ctx.profiling());
@@ -66,8 +56,7 @@ fn profile_chain_fires_callback_when_profiling_on() {
 /// rehomes it, so the graph replays over stable handles.
 #[test]
 fn profile_combinator_replays_and_refires_callback_each_sync() {
-    let Some(ctx) = ctx(true) else {
-        eprintln!("SKIP: no OpenCL device");
+    let Some(ctx) = ctx_profiling(true) else {
         return;
     };
     assert!(ctx.profiling());
@@ -116,8 +105,7 @@ fn profile_combinator_replays_and_refires_callback_each_sync() {
 
 #[test]
 fn profile_chain_errors_when_profiling_off() {
-    let Some(ctx) = ctx(false) else {
-        eprintln!("SKIP: no OpenCL device");
+    let Some(ctx) = ctx_profiling(false) else {
         return;
     };
     assert!(!ctx.profiling());

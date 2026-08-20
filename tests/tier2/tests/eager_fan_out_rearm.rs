@@ -12,29 +12,12 @@
 //! multi-output-branch fan-out re-arms, and fan-out composes as a chain head and
 //! mid-graph.)
 
+use claspr::DeviceSlice;
 use claspr::eager::{DeviceOpExt, download, fan_out, forward, upload};
-use claspr::{Context, DeviceSlice, MemRef, RecordableBuffer};
 use claspr_test_kernels::kernels;
+use claspr_test_support::{ctx, handle_of};
 
 const N: usize = 64;
-
-/// Stable identity of a buffer's backing `cl_mem`/SVM ptr for `==` across replays.
-fn handle_of<B: RecordableBuffer>(b: &B) -> usize {
-    match b.record_handle().mem {
-        MemRef::Buffer(m) => m as usize,
-        MemRef::Svm(p) => p as usize,
-    }
-}
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// REGRESSION: fan-out over MINTED buffers (`upload` per branch) still works and
 /// replays. Minted branches carry `home == None` (nothing to return), so the

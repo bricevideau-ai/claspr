@@ -10,22 +10,13 @@
 //! through: kernel arg, `slot!(Tag)`, `Pipe`, `Checkout`, plus a
 //! host-seam-write-then-kernel-read replay path.
 
+use claspr::DeviceScalar;
 use claspr::eager::{DeviceOpExt, bundle2, download, forward, upload};
-use claspr::{Context, DeviceScalar};
 use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 /// `&u32` read scalar-ref: a `DeviceScalar<u32>` bound to `factor`
 /// scales every element of `data`. Proves the pointer-only arg is set

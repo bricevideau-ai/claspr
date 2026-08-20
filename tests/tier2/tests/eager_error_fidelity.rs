@@ -15,19 +15,10 @@
 //! Both terminals (`sync` + `run`) prefer the stashed variant over the
 //! `OpenCl(-1)` cascade.
 
+use claspr::Error;
 use claspr::eager::{DeviceOpExt, bundle2, value};
-use claspr::{Context, Error};
+use claspr_test_support::ctx;
 use futures::executor::block_on;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 // A panic inside an `and_then_host` closure is caught by the eager host seam
 // (`run_host_seam`'s `catch_unwind`) and surfaced as `Error::HostPanic(msg)`

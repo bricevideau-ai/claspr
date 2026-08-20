@@ -20,20 +20,11 @@ use claspr::eager::{
     DeviceOpExt, alloc_zero, bundle3, device_alloc_uninit, download, fill_device_uninit,
     fill_mapped_uninit, mapped_alloc_uninit, upload, write_device_uninit,
 };
-use claspr::{Buffer, Context, Error, MappedSlice, SvmLevel};
+use claspr::{Buffer, Error, MappedSlice, SvmLevel};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx;
 
 const N: usize = 64;
-
-fn ctx() -> Option<Context> {
-    match Context::any() {
-        Ok(c) => Some(c),
-        Err(_) => {
-            eprintln!("SKIP: no OpenCL device");
-            None
-        }
-    }
-}
 
 // ── alloc-op shape tests ───────────────────────────────────────────
 

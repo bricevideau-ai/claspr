@@ -24,55 +24,11 @@
 //! migration; there is no single-device no-op fallback (migrating to the device a
 //! buffer already lives on wouldn't test cross-device movement).
 
-use claspr::device::Platform;
 use claspr::eager::{DeviceOpExt, download, transfer_to_device_at, upload};
-use claspr::{Context, Device};
 use claspr_test_kernels::kernels;
+use claspr_test_support::ctx_two_devices;
 
 const N: usize = 64;
-
-/// Build a genuine two-device context: prefer a real two-device platform, then a
-/// sub-device partition. Returns `None` (test skips) when no two-device context
-/// is available — mirrors `transfer_to_device.rs::ctx_two_devices`.
-fn ctx_two_devices() -> Option<Context> {
-    if let Ok(platforms) = Platform::all() {
-        for p in platforms {
-            if let Ok(devs) = p.devices()
-                && devs.len() >= 2
-                && let Ok(ctx) = Context::builder()
-                    .devices(&[devs[0].clone(), devs[1].clone()])
-                    .build()
-            {
-                return Some(ctx);
-            }
-        }
-    }
-    if let Ok(devs) = Device::all() {
-        for parent in devs {
-            if parent.partition_max_sub_devices().unwrap_or(0) < 2 {
-                continue;
-            }
-            let cu = parent.max_compute_units().unwrap_or(0);
-            if cu < 2 {
-                continue;
-            }
-            let Ok(subs) = parent.partition_equally(cu / 2) else {
-                continue;
-            };
-            if subs.len() < 2 {
-                continue;
-            }
-            if let Ok(ctx) = Context::builder()
-                .devices(&[subs[0].clone(), subs[1].clone()])
-                .build()
-            {
-                return Some(ctx);
-            }
-        }
-    }
-    eprintln!("SKIP: no two-device context available (real or sub-device)");
-    None
-}
 
 /// transfer_to_device.rs::transfer_to_device_completes_in_chain —
 /// upload → transfer to dev[1] → kernel.on_device(dev[1]) → download. The
@@ -80,7 +36,9 @@ fn ctx_two_devices() -> Option<Context> {
 /// explicit `.wait()`, without hang, and the result matches.
 #[test]
 fn transfer_to_device_completes_in_chain() {
-    let Some(ctx) = ctx_two_devices() else { return };
+    let Some((ctx, _, _)) = ctx_two_devices() else {
+        return;
+    };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
@@ -100,7 +58,9 @@ fn transfer_to_device_completes_in_chain() {
 /// transfer → download). Regression test for the cross-device pipeline.
 #[test]
 fn transfer_then_on_device_matches_scenario_14_shape() {
-    let Some(ctx) = ctx_two_devices() else { return };
+    let Some((ctx, _, _)) = ctx_two_devices() else {
+        return;
+    };
     let kernels = kernels::kernels(&ctx).expect("load kernels");
     let kernels_ref = &kernels;
 
