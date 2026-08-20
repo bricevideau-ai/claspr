@@ -20,6 +20,7 @@
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::queue::{InOrder, Launcher, OutOfOrder, Queue};
+use crate::util::lock_unpoisoned;
 use opencl3::command_queue::CommandQueue;
 use opencl3::device::{
     CL_DEVICE_SVM_ATOMICS, CL_DEVICE_SVM_COARSE_GRAIN_BUFFER, CL_DEVICE_SVM_FINE_GRAIN_BUFFER,
@@ -178,13 +179,10 @@ impl Drop for ContextInner {
                     self.error_state.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            // The mutex is poisoned only if a panic struck mid-lock;
-            // recover the inner value either way so teardown still
-            // releases the handle.
-            let guard = match slot.out_of_order.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            // `lock_unpoisoned` recovers the inner value even if a
+            // panic struck mid-lock, so teardown still releases the
+            // handle.
+            let guard = lock_unpoisoned(&slot.out_of_order);
             if let Some(q) = guard.as_ref() {
                 // SAFETY: as above.
                 let res = unsafe { opencl3::command_queue::release_command_queue(q.get()) };
@@ -306,10 +304,7 @@ impl Context {
     /// the [`profiling`](Self::profiling) setting from the builder.
     pub fn default_outoforder_queue(&self, device: &Device) -> Result<Arc<Queue<OutOfOrder>>> {
         let idx = self.device_index(device)?;
-        let mut slot = self.inner.queues[idx]
-            .out_of_order
-            .lock()
-            .expect("DeviceQueues out_of_order mutex poisoned");
+        let mut slot = lock_unpoisoned(&self.inner.queues[idx].out_of_order);
         // The CACHE is the raw handle (no strong-`ctx` wrapper — caching
         // a wrapper here would reintroduce the Arc cycle). Each call
         // builds a fresh on-demand `Arc<Queue>` over the SAME cached raw
@@ -350,10 +345,7 @@ impl Context {
         let Ok(idx) = self.device_index(device) else {
             return;
         };
-        let mut slot = self.inner.queues[idx]
-            .out_of_order
-            .lock()
-            .expect("DeviceQueues out_of_order mutex poisoned");
+        let mut slot = lock_unpoisoned(&self.inner.queues[idx].out_of_order);
         // The cached handle is `ManuallyDrop`, so dropping the Option
         // alone would leak it — release this slot's ref explicitly. Any
         // outstanding on-demand `Arc<Queue>` wrapper still holds its own
@@ -387,10 +379,7 @@ impl Context {
     /// event-wait responsibility).
     pub fn flush_all_outoforder_queues(&self) -> Result<()> {
         for slot in &self.inner.queues {
-            let guard = slot
-                .out_of_order
-                .lock()
-                .expect("DeviceQueues out_of_order mutex poisoned");
+            let guard = lock_unpoisoned(&slot.out_of_order);
             if let Some(q) = guard.as_ref() {
                 q.flush()?;
             }
@@ -413,10 +402,7 @@ impl Context {
     /// Synchronous: blocks until every cached OOO queue has drained.
     pub fn finish_all_outoforder_queues(&self) -> Result<()> {
         for slot in &self.inner.queues {
-            let guard = slot
-                .out_of_order
-                .lock()
-                .expect("DeviceQueues out_of_order mutex poisoned");
+            let guard = lock_unpoisoned(&slot.out_of_order);
             if let Some(q) = guard.as_ref() {
                 q.finish()?;
             }

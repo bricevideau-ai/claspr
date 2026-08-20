@@ -26,6 +26,7 @@
 //! falls back to the per-op `execute` path — same results, no CB acceleration.
 use crate::error::{Error, Result};
 use crate::exec_ctx::{SyncPoints, sync_points_to_wait_list};
+use crate::util::lock_unpoisoned;
 use opencl3::types::{cl_command_queue, cl_event, cl_kernel, cl_mem, cl_uint};
 use std::ffi::{CStr, c_void};
 use std::ptr;
@@ -229,12 +230,12 @@ impl CbBuilder {
     /// the error through the per-op path that already returns `LengthMismatch`,
     /// instead of the CB path silently truncating.
     pub(crate) fn mark_ineligible(&self) {
-        *self.eligible.lock().unwrap() = false;
+        *lock_unpoisoned(&self.eligible) = false;
     }
 
     /// Bump the recorded-command counter (called on each successful `clCommand*KHR`).
     fn count(&self) {
-        *self.recorded.lock().unwrap() += 1;
+        *lock_unpoisoned(&self.recorded) += 1;
     }
 
     /// Note that this CB baked in a buffer/scalar traceable to slot cell `id`
@@ -242,13 +243,13 @@ impl CbBuilder {
     /// pipes. Drives precise per-slot invalidation: mutating a slot clears exactly
     /// the CBs whose `captured_slots` contains it. Cheap idempotent set insert.
     pub fn note_slot(&self, id: usize) {
-        self.slots.lock().unwrap().insert(id);
+        lock_unpoisoned(&self.slots).insert(id);
     }
 
     /// How many `clCommand*KHR` commands have been recorded. Zero → the boundary
     /// discards the CB (empty-CB guard).
     pub fn recorded(&self) -> usize {
-        *self.recorded.lock().unwrap()
+        *lock_unpoisoned(&self.recorded)
     }
 
     /// Whether [`finalize`](Self::finalize) has already sealed this builder. The
@@ -257,7 +258,7 @@ impl CbBuilder {
     /// eligible → the close never fired (a span with no interior seam) → the opener
     /// finalizes + enqueues at return itself.
     pub fn is_finalized(&self) -> bool {
-        *self.finalized.lock().unwrap()
+        *lock_unpoisoned(&self.finalized)
     }
 
     /// Add a buffer fill to the CB. A `cl_mem` buffer records via
@@ -627,7 +628,7 @@ impl CbBuilder {
             self.mark_ineligible();
             return None;
         }
-        self.kernels.lock().unwrap().push(kernel);
+        lock_unpoisoned(&self.kernels).push(kernel);
         // Materialize the set into the contiguous slice the C call needs. The
         // wait-list is a SET (wait for all markers; order irrelevant) — carrying it
         // as a `BTreeSet` up to here means a consumer reading two pipes of one
@@ -669,7 +670,7 @@ impl CbBuilder {
     /// add). A `false` here means the homing node must discard the builder and fall
     /// back to the per-op execute path.
     pub fn is_eligible(&self) -> bool {
-        *self.eligible.lock().unwrap()
+        *lock_unpoisoned(&self.eligible)
     }
 
     /// Finalize the live CB into a replayable [`FinalizedCb`] — **interior-mutable +
@@ -690,7 +691,7 @@ impl CbBuilder {
     pub fn finalize(&self) -> Option<FinalizedCb> {
         // Idempotency + eligibility gate. Hold the `finalized` lock across the whole
         // seal so two racing closers can't both hand off the same handle.
-        let mut done = self.finalized.lock().unwrap();
+        let mut done = lock_unpoisoned(&self.finalized);
         if *done || !self.is_eligible() {
             return None;
         }
@@ -704,8 +705,8 @@ impl CbBuilder {
         // Hand off the CB handle (Copy) + retained kernels to the FinalizedCb. Mark
         // sealed BEFORE releasing the lock so `Drop` (and any later `finalize`) skips
         // the handle we just gave away.
-        let kernels = std::mem::take(&mut *self.kernels.lock().unwrap());
-        let captured_slots = std::mem::take(&mut *self.slots.lock().unwrap());
+        let kernels = std::mem::take(&mut *lock_unpoisoned(&self.kernels));
+        let captured_slots = std::mem::take(&mut *lock_unpoisoned(&self.slots));
         *done = true;
         Some(FinalizedCb {
             cb: self.cb,
@@ -724,10 +725,10 @@ impl Drop for CbBuilder {
         // `FinalizedCb`, which now owns them → release NOTHING here. Only the DISCARD
         // path (never finalized: ineligible / empty-CB guard / finalize failure)
         // reaches the releases below.
-        if *self.finalized.lock().unwrap() {
+        if *lock_unpoisoned(&self.finalized) {
             return;
         }
-        for k in self.kernels.lock().unwrap().drain(..) {
+        for k in lock_unpoisoned(&self.kernels).drain(..) {
             let _ = unsafe { cl3::kernel::release_kernel(k) };
         }
         if let Some(release) = self.ext.release {

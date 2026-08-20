@@ -155,7 +155,7 @@ pub type DeferredErrors = Arc<Mutex<Vec<Error>>>;
 /// variant (never produced here) is reported as an internal-inconsistency
 /// [`Error::NotSupported`] rather than silently dropped.
 pub(crate) fn peek_deferred(sink: &Mutex<Vec<Error>>) -> Option<Error> {
-    sink.lock().unwrap().first().map(|e| match e {
+    lock_unpoisoned(sink).first().map(|e| match e {
         Error::SlotConflict(n) => Error::SlotConflict(n),
         Error::SlotNoSuchTag(n) => Error::SlotNoSuchTag(n),
         Error::SlotCheckedOut(n) => Error::SlotCheckedOut(n),
@@ -953,7 +953,7 @@ impl SlotBinder {
             Ok(()) => None,
         };
         if let (Some(err), Some(sink)) = (err, &self.captured_sink) {
-            sink.lock().unwrap().push(err);
+            lock_unpoisoned(sink).push(err);
         }
     }
 }
@@ -1009,7 +1009,7 @@ impl<V: Clone> ScalarInput<V> {
     pub fn read(&self) -> Result<V> {
         match self {
             ScalarInput::Concrete(v) => Ok(v.clone()),
-            ScalarInput::Slot { name, cell, .. } => match &*cell.lock().unwrap() {
+            ScalarInput::Slot { name, cell, .. } => match &*lock_unpoisoned(cell) {
                 ScalarSlotState::Bound(v) => Ok(v.clone()),
                 ScalarSlotState::Unbound => Err(Error::SlotUnbound(name)),
             },
@@ -1043,7 +1043,7 @@ impl<V: Clone> ScalarInput<V> {
             } => {
                 // State-first, then drain the deferred-error sink (see
                 // `Input::check_ready` for the ordering rationale).
-                match &*cell.lock().unwrap() {
+                match &*lock_unpoisoned(cell) {
                     ScalarSlotState::Bound(_) => {}
                     ScalarSlotState::Unbound => return Err(Error::SlotUnbound(name)),
                 }
@@ -1128,7 +1128,7 @@ impl<V: Send + 'static> ScalarInput<V> {
         // The shared take-or-clone-and-downcast step (see `SlotBinder::provide`).
         let provide = |binder: &mut SlotBinder| -> Option<V> { binder.provide::<V>(fanout) };
 
-        let mut guard = cell.lock().unwrap();
+        let mut guard = lock_unpoisoned(cell);
         match &*guard {
             ScalarSlotState::Unbound => {
                 if let Some(new) = provide(binder) {

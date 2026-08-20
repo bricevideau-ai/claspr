@@ -1992,7 +1992,7 @@ where
         // Stash the rich Rust error first (first-writer-wins — a concurrent
         // failing worker in the same bundle/fan-out may already have written).
         if let Some(err) = rust_err {
-            let mut slot = worker_host_error.lock().unwrap();
+            let mut slot = lock_unpoisoned(&worker_host_error);
             if slot.is_none() {
                 *slot = Some(err);
             }
@@ -2469,7 +2469,7 @@ pub enum DeviceChainFuture<T> {
 fn join_chain_workers(
     workers: &std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
 ) {
-    let handles: Vec<std::thread::JoinHandle<()>> = std::mem::take(&mut *workers.lock().unwrap());
+    let handles: Vec<std::thread::JoinHandle<()>> = std::mem::take(&mut *lock_unpoisoned(workers));
     for h in handles {
         let _ = h.join();
     }
@@ -2506,7 +2506,7 @@ impl<T: Unpin> std::future::Future for DeviceChainFuture<T> {
                     // Marker done → all device work (and the seam's signals) are
                     // settled; join workers before returning.
                     join_chain_workers(workers);
-                    Poll::Ready(Err(host_error.lock().unwrap().take().unwrap_or(e)))
+                    Poll::Ready(Err(lock_unpoisoned(host_error).take().unwrap_or(e)))
                 }
                 // Even on a "successful" marker, a host worker may have stashed
                 // an error the marker did NOT propagate: pocl's
@@ -2516,7 +2516,7 @@ impl<T: Unpin> std::future::Future for DeviceChainFuture<T> {
                 // failure signal. (Same handling as the old `ChainFuture`.)
                 Poll::Ready(Ok(())) => {
                     join_chain_workers(workers);
-                    if let Some(rust_err) = host_error.lock().unwrap().take() {
+                    if let Some(rust_err) = lock_unpoisoned(host_error).take() {
                         return Poll::Ready(Err(rust_err));
                     }
                     Poll::Ready(Ok(output
@@ -2612,7 +2612,7 @@ where
             drop(queue);
             context.invalidate_default_outoforder_queue(&device);
             return DeviceChainFuture::Errored(Some(
-                host_error.lock().unwrap().take().unwrap_or(e),
+                lock_unpoisoned(&host_error).take().unwrap_or(e),
             ));
         }
     };

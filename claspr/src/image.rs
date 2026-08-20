@@ -54,6 +54,7 @@ use crate::error::Error;
 use crate::exec_ctx::ExecutionContext;
 use crate::launch::KernelArg;
 use crate::queue::Launcher;
+use crate::util::lock_unpoisoned;
 use opencl3::event::Event;
 use opencl3::kernel::ExecuteKernel;
 use opencl3::memory::{
@@ -901,7 +902,7 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
         // `check_ready` pre-pass must not lend then fail): a mismatched dst is a
         // caller error → `Err(LengthMismatch)`, not a panic and not a truncated read.
         {
-            let dst_len = self.dst.lock().unwrap().len();
+            let dst_len = lock_unpoisoned(&self.dst).len();
             if dst_len != self.expected_len {
                 return Err(Error::LengthMismatch {
                     src: self.expected_len,
@@ -913,7 +914,7 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
         // across the fallible read so a failure rehomes rather than strands.
         let (img, deps, home) = self.img.resolve_home(ec)?;
         let raw = deps_to_wait_list(&deps);
-        let mut dst_guard = self.dst.lock().unwrap();
+        let mut dst_guard = lock_unpoisoned(&self.dst);
         let dst = dst_guard.as_mut_ptr() as *mut std::ffi::c_void;
         let img_guard = crate::eager::LentGuard::new(img, home);
         match mode {
@@ -952,7 +953,7 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
     /// the `expected_len` field docs), so a mismatch aborts the graph
     /// before anything is lent/enqueued.
     fn check_ready(&self) -> Result<()> {
-        let dst_len = self.dst.lock().unwrap().len();
+        let dst_len = lock_unpoisoned(&self.dst).len();
         if dst_len != self.expected_len {
             return Err(Error::LengthMismatch {
                 src: self.expected_len,

@@ -20,6 +20,7 @@
 //! [`CommandQueue`]: opencl3::command_queue::CommandQueue
 //! [`Launcher`]: crate::Launcher
 
+use crate::util::lock_unpoisoned;
 use crate::{CommandQueue, Context, Device, Error, Launcher};
 use opencl_sys::cl_sync_point_khr;
 use std::collections::{BTreeSet, HashMap};
@@ -323,10 +324,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// pipe) yields no markers.
     pub fn sp_lookup(&self, cell_id: Option<usize>) -> SyncPoints {
         match cell_id {
-            Some(id) => self
-                .sp_edges
-                .lock()
-                .unwrap()
+            Some(id) => lock_unpoisoned(&self.sp_edges)
                 .get(&id)
                 .cloned()
                 .unwrap_or_default(),
@@ -337,7 +335,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// Register a producer's output command sync point(s) under its output pipe's
     /// `cell_id`, so a CB-internal consumer resolves them via [`sp_lookup`](Self::sp_lookup).
     pub fn sp_register(&self, cell_id: usize, sps: SyncPoints) {
-        self.sp_edges.lock().unwrap().insert(cell_id, sps);
+        lock_unpoisoned(&self.sp_edges).insert(cell_id, sps);
     }
 
     /// The slot origins reachable to the buffer in `cell_id` (a pipe / output cell),
@@ -345,10 +343,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// concrete buffer, or a producer that hasn't run). `None` cell → empty.
     pub fn cb_reach_of(&self, cell_id: Option<usize>) -> BTreeSet<usize> {
         match cell_id {
-            Some(id) => self
-                .cb_reach
-                .lock()
-                .unwrap()
+            Some(id) => lock_unpoisoned(&self.cb_reach)
                 .get(&id)
                 .cloned()
                 .unwrap_or_default(),
@@ -361,7 +356,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// each output pipe cell with its input args' origins; a passthrough forwards its
     /// source's. Downstream leaves read this via [`cb_reach_of`](Self::cb_reach_of).
     pub fn cb_reach_extend(&self, out_cell: usize, slots: impl IntoIterator<Item = usize>) {
-        let mut m = self.cb_reach.lock().unwrap();
+        let mut m = lock_unpoisoned(&self.cb_reach);
         m.entry(out_cell).or_default().extend(slots);
     }
 
@@ -397,7 +392,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// resolve with Err, so the original Rust variant surfaces instead
     /// of the `Error::OpenCl(-1)` cascade from the user-event signal.
     pub(crate) fn take_host_error(&self) -> Option<Error> {
-        self.host_error.lock().unwrap().take()
+        lock_unpoisoned(&self.host_error).take()
     }
 
     /// Install the start gate (raw `cl_event`). Called by a terminal BEFORE it
@@ -420,7 +415,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// device wait). [`run_host_seam`](crate::run_host_seam) calls this instead
     /// of detaching its worker.
     pub(crate) fn push_worker(&self, h: JoinHandle<()>) {
-        self.workers.lock().unwrap().push(h);
+        lock_unpoisoned(&self.workers).push(h);
     }
 
     /// Drain and join every host-seam worker. Called by the terminal AFTER the
@@ -428,7 +423,7 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// (signalling its user events, then dropping its retained queue) complete
     /// before the caller can drop the [`Context`].
     pub(crate) fn join_workers(&self) {
-        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.workers.lock().unwrap());
+        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *lock_unpoisoned(&self.workers));
         for h in handles {
             // A worker panic is already surfaced as a `HostPanic` in the
             // host-error slot (the seam catches it); ignore the join error here.

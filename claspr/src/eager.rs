@@ -162,6 +162,7 @@ use crate::host_view::{
 };
 use crate::image::ImageHostTransfer;
 use crate::transfer::UploadSource;
+use crate::util::lock_unpoisoned;
 use crate::{
     Buffer, Context, DeviceSlice, DeviceSliceUninit, Error, Fillable, HostReadable, HostWritable,
     MappedSlice, MappedSliceUninit, MemMode, ReadWrite, Result, USMSlice, USMSliceUninit,
@@ -529,7 +530,7 @@ mod lent_guard_tests {
     // Model a lend: empty the cell into a guard homed on that same cell (what
     // `resolve_home` does for a concrete `Cell`).
     fn lend(cell: &Cell<u32>) -> LentGuard<u32> {
-        let value = cell.lock().unwrap().take().expect("cell was empty");
+        let value = lock_unpoisoned(cell).take().expect("cell was empty");
         let home: BoxedHome<u32> = Box::new(Arc::clone(cell));
         LentGuard::new(value, Some(home))
     }
@@ -543,13 +544,13 @@ mod lent_guard_tests {
         {
             let _guard = lend(&cell);
             assert!(
-                cell.lock().unwrap().is_none(),
+                lock_unpoisoned(&cell).is_none(),
                 "lent: cell empty during run"
             );
             // guard dropped here WITHOUT disarm → simulates a failed enqueue
         }
         assert_eq!(
-            *cell.lock().unwrap(),
+            *lock_unpoisoned(&cell),
             Some(99),
             "armed guard drop must rehome the lent value"
         );
@@ -566,13 +567,13 @@ mod lent_guard_tests {
         };
         assert_eq!(value, 7, "disarm returns the lent value");
         assert!(
-            cell.lock().unwrap().is_none(),
+            lock_unpoisoned(&cell).is_none(),
             "disarmed guard must NOT rehome (deposit owns it now)"
         );
         // The caller's deposit would normally re-fill via `home`; do it explicitly
         // to confirm the home still points at the origin cell.
         home.expect("concrete cell has a home").rehome(value);
-        assert_eq!(*cell.lock().unwrap(), Some(7));
+        assert_eq!(*lock_unpoisoned(&cell), Some(7));
     }
 
     // A homeless lend (minted buffer, `home == None`) just releases on drop —
@@ -589,7 +590,7 @@ mod lent_guard_tests {
 /// back into the cell so the next replay reuses the same buffer.
 impl<T: Send> Rehome<T> for Cell<T> {
     fn rehome(self: Box<Self>, value: T) {
-        *self.lock().unwrap() = Some(value);
+        *lock_unpoisoned(&self) = Some(value);
     }
     // `sever` keeps the default no-op: a concrete cell stays empty after
     // `into_inner`, which already reads correctly (re-allocate / busy next run).
@@ -632,13 +633,13 @@ impl<T: Send> Rehome<T> for SlotHome<T> {
         // Re-arm: the lent buffer (possibly transformed in place, or consumed into
         // a host Vec by a download whose home channel still carries it back) comes
         // back to its slot with a STABLE handle.
-        *self.cell.lock().unwrap() = SlotState::Bound(value);
+        *lock_unpoisoned(&self.cell) = SlotState::Bound(value);
     }
     fn sever(self: Box<Self>) {
         // The caller kept the value (`into_inner`); the slot is empty but NOT
         // virgin — it lands in `Severed`, so a set-once `bind` rejects it
         // (`Error::SlotSevered`) and only `mutate_bind` may re-arm it.
-        *self.cell.lock().unwrap() = SlotState::Severed;
+        *lock_unpoisoned(&self.cell) = SlotState::Severed;
     }
     fn home_cell_id(&self) -> Option<usize> {
         // The identity of THIS slot's cell — matched by the `call`/`mutate_call`
@@ -755,7 +756,7 @@ impl<T> Pipe<T> {
         // prior value having been drained (it shouldn't happen on the live paths,
         // but the invariant holds regardless). The freshly stored payload arms the
         // new (value, home) pair for the next drain or its own drop.
-        *self.cell.lock().unwrap() = Some(PipePayload {
+        *lock_unpoisoned(&self.cell) = Some(PipePayload {
             value: Some(v),
             deps,
             home,
@@ -778,7 +779,7 @@ impl<T> Pipe<T> {
         // a no-op (both now `None`). The home is MOVED to the caller — the payload
         // no longer owns it, so its `Drop` won't re-fire the rehome (single owner,
         // `BoxedHome: !Clone`). `deps` is `Default`, swapped out cheaply.
-        self.cell.lock().unwrap().take().map(|mut p| {
+        lock_unpoisoned(&self.cell).take().map(|mut p| {
             let value = p
                 .value
                 .take()
@@ -950,7 +951,7 @@ impl<T> Input<T> {
     where
         T: Send + 'static,
     {
-        let v = cell.lock().unwrap().take().ok_or(empty_err)?;
+        let v = lock_unpoisoned(cell).take().ok_or(empty_err)?;
         // The home is this very cell: the lent buffer (possibly transformed
         // in place) is returned here on `Checkout` drop, re-arming `g`. An
         // in-place op's output type equals the cell type → identity rehome
@@ -985,7 +986,7 @@ impl<T> Input<T> {
         // — no start gate is threaded here (the upstream producer already gated its
         // own enqueue, and its events flow onward as the drained `Deps`).
         {
-            let guard = cell.lock().unwrap();
+            let guard = lock_unpoisoned(cell);
             if let SlotState::FedByPipe(pipe) = &*guard {
                 let pipe = pipe.clone();
                 drop(guard);
@@ -998,7 +999,7 @@ impl<T> Input<T> {
         // `Bound(v) → Lent`, take `v`; anything else (Unbound / Severed / already
         // Lent) is the "nothing to lend" error.
         let v = {
-            let mut guard = cell.lock().unwrap();
+            let mut guard = lock_unpoisoned(cell);
             match std::mem::replace(&mut *guard, SlotState::Lent) {
                 SlotState::Bound(v) => v,
                 // Restore the prior state before erroring (we tentatively wrote
@@ -1115,7 +1116,7 @@ impl<T> Input<T> {
     pub fn check_ready(&self) -> Result<()> {
         match self {
             Input::Concrete(cell) => {
-                if cell.lock().unwrap().is_some() {
+                if lock_unpoisoned(cell).is_some() {
                     Ok(())
                 } else {
                     // Same condition + message `lend_from_cell`'s `empty_err`
@@ -1146,7 +1147,7 @@ impl<T> Input<T> {
             Input::Slot {
                 name, cell, sink, ..
             } => {
-                match &*cell.lock().unwrap() {
+                match &*lock_unpoisoned(cell) {
                     SlotState::Bound(_) | SlotState::FedByPipe(_) => {}
                     SlotState::Unbound | SlotState::Severed | SlotState::Lent => {
                         return Err(Error::SlotUnbound(name));
@@ -1275,11 +1276,11 @@ impl<T> Input<T> {
     /// helpers, which only need to inspect the buffer's handle/byte-len.
     pub fn with_concrete<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
         match self {
-            Input::Concrete(cell) => cell.lock().unwrap().as_ref().map(f),
+            Input::Concrete(cell) => lock_unpoisoned(cell).as_ref().map(f),
             // A slot is readable by-ref only while `Bound`; every empty state
             // (`Unbound`/`Severed`/`Lent`) maps to `None` (the same "no concrete
             // value to inspect" the empty concrete cell gives).
-            Input::Slot { cell, .. } => match &*cell.lock().unwrap() {
+            Input::Slot { cell, .. } => match &*lock_unpoisoned(cell) {
                 SlotState::Bound(v) => Some(f(v)),
                 // `FedByPipe` has no concrete value to inspect (deferred) — like
                 // `Pipe`.
@@ -1308,7 +1309,7 @@ impl<T> Input<T> {
             // already drains this same pipe in `resolve_home`; this exposes the same
             // edge to the record path. A non-`FedByPipe` slot (Unbound/Bound/Lent/
             // Severed) has no upstream pipe → `None`, like a concrete cell.
-            Input::Slot { cell, .. } => match &*cell.lock().unwrap() {
+            Input::Slot { cell, .. } => match &*lock_unpoisoned(cell) {
                 SlotState::FedByPipe(pipe) => Some(pipe.cell_id()),
                 _ => None,
             },
@@ -1424,7 +1425,7 @@ impl<T> Input<T> {
     /// catch a genuine `SlotConflict`; that is the documented residual.
     fn probe_bind(binder: &mut SlotBinder, cell: &SlotCell<T>, name: &'static str) {
         let cell_id = Arc::as_ptr(cell) as usize;
-        match &*cell.lock().unwrap() {
+        match &*lock_unpoisoned(cell) {
             // Both verbs fill a virgin / re-arm a bound cell → OK. `Set` on `Bound`
             // is the value-dependent residual (treated OK here). A `FedByPipe` cell
             // is treated like `Bound`: a value bind over it would overwrite (Mutate)
@@ -1464,7 +1465,7 @@ impl<T> Input<T> {
         if let Some(boxed) = &binder.feed_pipe
             && let Some(pipe) = boxed.downcast_ref::<Pipe<T>>()
         {
-            *cell.lock().unwrap() = SlotState::FedByPipe(pipe.clone());
+            *lock_unpoisoned(cell) = SlotState::FedByPipe(pipe.clone());
         }
     }
 
@@ -1484,7 +1485,7 @@ impl<T> Input<T> {
         // pinned `T == Tag::Value`).
         let provide = |binder: &mut SlotBinder| -> Option<T> { binder.provide::<T>(fanout) };
 
-        let mut guard = cell.lock().unwrap();
+        let mut guard = lock_unpoisoned(cell);
         match &*guard {
             // Virgin — never bound. Both verbs fill it (a `bind` is the slot's first
             // declaration).

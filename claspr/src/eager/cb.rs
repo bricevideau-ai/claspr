@@ -45,7 +45,7 @@ pub fn new_cb_cache() -> CbCache {
 /// `source`/`next`, a field list, or `self.ops` — is the part that legitimately varies
 /// per combinator, so it stays explicit at the call site).
 pub fn cb_cache_invalidate(cache: &CbCache, mutated: &std::collections::BTreeSet<usize>) {
-    let mut g = cache.lock().unwrap();
+    let mut g = lock_unpoisoned(cache);
     if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
         *g = None;
     }
@@ -55,7 +55,7 @@ pub fn cb_cache_invalidate(cache: &CbCache, mutated: &std::collections::BTreeSet
 /// (`Arc::as_ptr`) into `out`, if it currently holds one. The own-cache half of
 /// [`collect_cb_ids`](DeviceOp::collect_cb_ids); the caller recurses into its children.
 pub fn cb_cache_collect_id(cache: &CbCache, out: &mut Vec<usize>) {
-    if let Some(arc) = cache.lock().unwrap().as_ref() {
+    if let Some(arc) = lock_unpoisoned(cache).as_ref() {
         out.push(Arc::as_ptr(arc) as usize);
     }
 }
@@ -78,7 +78,7 @@ pub use crate::exec_ctx::CbWalk;
 /// sync points), so this is a no-op for internal edges. Idempotent + cheap.
 pub fn cb_collect_external(ext: &Mutex<Deps>, deps: &Deps) {
     if !deps.is_empty() {
-        ext.lock().unwrap().extend(deps.iter().cloned());
+        lock_unpoisoned(ext).extend(deps.iter().cloned());
     }
 }
 
@@ -311,7 +311,7 @@ where
     };
     let finalized = Arc::new(finalized);
     // HOME the CB in the boundary node's OWN cache (drops with the graph).
-    *cache.lock().unwrap() = Some(Arc::clone(&finalized));
+    *lock_unpoisoned(cache) = Some(Arc::clone(&finalized));
 
     let waits = drain_ext(&ext);
     let event = finalized.enqueue(&waits)?;
@@ -355,7 +355,7 @@ fn cb_lookup_cached(
     cache: &CbCache,
     queue: opencl3::types::cl_command_queue,
 ) -> Option<Arc<crate::record::FinalizedCb>> {
-    let guard = cache.lock().unwrap();
+    let guard = lock_unpoisoned(cache);
     match guard.as_ref() {
         Some(cb) if cb.queue() == queue => Some(Arc::clone(cb)),
         _ => None,
@@ -457,7 +457,7 @@ pub(crate) fn cb_close_span(ec: &ExecutionContext<'_>) -> Result<Option<Dep>> {
     // REPLAY: enqueue the cached span CB (read from the head's cache).
     if !is_build {
         let cached: Option<Arc<crate::record::FinalizedCb>> = {
-            let g = cache.lock().unwrap();
+            let g = lock_unpoisoned(cache);
             g.as_ref().filter(|cb| cb.queue() == queue).map(Arc::clone)
         };
         let Some(cb) = cached else {
@@ -486,7 +486,7 @@ pub(crate) fn cb_close_span(ec: &ExecutionContext<'_>) -> Result<Option<Dep>> {
         return Ok(None);
     };
     let finalized = Arc::new(finalized);
-    *cache.lock().unwrap() = Some(Arc::clone(&finalized));
+    *lock_unpoisoned(cache) = Some(Arc::clone(&finalized));
     let waits = drain_ext(ext);
     let event = finalized.enqueue(&waits)?;
     Ok(Some(wrap_event(event)))
@@ -495,7 +495,7 @@ pub(crate) fn cb_close_span(ec: &ExecutionContext<'_>) -> Result<Option<Dep>> {
 /// Drain a CB's external dep accumulator into a raw `cl_event` wait-list for
 /// `clEnqueueCommandBufferKHR`.
 fn drain_ext(ext: &Mutex<Deps>) -> Vec<crate::cl_event> {
-    deps_to_wait_list(&ext.lock().unwrap())
+    deps_to_wait_list(&lock_unpoisoned(ext))
 }
 
 /// Whether `op` (an [`AndThen`]) should OPEN a maximal seam-free span here (design
@@ -659,7 +659,7 @@ where
         // entry leaf that crossed into this would-be CB) need stamping on top, so a
         // downstream consumer waits on the real upstream work. `ext` is usually empty
         // for a pure-passthrough span (nothing resolved a cross-boundary input).
-        let evs: Deps = std::mem::take(&mut ext.lock().unwrap());
+        let evs: Deps = std::mem::take(&mut lock_unpoisoned(&ext));
         if !evs.is_empty() {
             op.cb_restamp(&evs);
         }
@@ -671,7 +671,7 @@ where
         return op.execute(ec, mode);
     };
     let finalized = Arc::new(finalized);
-    *cache.lock().unwrap() = Some(Arc::clone(&finalized));
+    *lock_unpoisoned(cache) = Some(Arc::clone(&finalized));
     let waits = drain_ext(&ext);
     let event = finalized.enqueue(&waits)?;
     op.cb_restamp(&single_dep(event));

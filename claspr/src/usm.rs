@@ -34,6 +34,7 @@ use crate::buffer::Buffer;
 use crate::context::{Context, SvmLevel};
 use crate::error::{Error, Result};
 use crate::launch::KernelArg;
+use crate::util::lock_unpoisoned;
 use opencl3::event::{Event, retain_event};
 use opencl3::kernel::ExecuteKernel;
 use std::fmt;
@@ -125,10 +126,7 @@ impl<T, M: MemMode> USMSlice<T, M> {
     /// include this USMSlice. Public so hand-rolled SVM use
     /// (manual `clSetKernelArgSVMPointer`) can stay Drop-safe.
     pub fn register_use(&self, event: Arc<Event>) {
-        self.in_flight
-            .lock()
-            .expect("in_flight mutex poisoned")
-            .push(event);
+        lock_unpoisoned(&self.in_flight).push(event);
     }
 
     /// Raw SVM pointer (the wrapped Vec's allocation). Same escape
@@ -161,7 +159,7 @@ impl<T: Copy, M: MemMode> USMSlice<T, M> {
         // prior run's kernel may still be reading this SVM region. This is
         // the same host-side wait `Drop` performs, but here we KEEP the
         // buffer alive and re-arm it. Errors bump the sticky context flag.
-        let events = std::mem::take(&mut *self.in_flight.lock().expect("in_flight mutex poisoned"));
+        let events = std::mem::take(&mut *lock_unpoisoned(&self.in_flight));
         for ev in &events {
             ev.wait().map_err(Error::OpenCl)?;
         }
@@ -571,7 +569,7 @@ impl<T, M: MemMode> Drop for USMSlice<T, M> {
         // OpenCL command to enqueue — Rust's Vec free runs
         // immediately and unconditionally on the host. The only way
         // to avoid a race is a synchronous wait.
-        let events = std::mem::take(&mut *self.in_flight.lock().expect("in_flight mutex poisoned"));
+        let events = std::mem::take(&mut *lock_unpoisoned(&self.in_flight));
         for ev in &events {
             // Wait errors here can't be propagated — bump the
             // sticky counter so test post-conditions catch them.

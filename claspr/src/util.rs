@@ -108,3 +108,19 @@ pub unsafe fn mapped_slice_mut<'a, T>(ptr: *mut T, len: usize) -> &'a mut [T] {
     // SAFETY: caller's contract; see fn doc.
     unsafe { slice::from_raw_parts_mut(ptr, len) }
 }
+
+// ── Mutex helpers ───────────────────────────────────────────────────
+
+/// Lock a `Mutex`, ignoring poisoning.
+///
+/// claspr's mutexes guard plain bookkeeping state (event lists, queue
+/// maps, graph edges) that stays coherent even if a panic unwound
+/// through a critical section — each critical section fully completes
+/// its invariant before releasing. Propagating the poison would turn
+/// one user panic (e.g. inside an `and_then_host` closure) into a
+/// process-wide "every subsequent op panics", and inside `Drop` impls
+/// into a panic-during-unwind abort.
+#[doc(hidden)]
+pub fn lock_unpoisoned<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}

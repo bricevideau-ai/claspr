@@ -300,8 +300,8 @@ where
         // The buffer is allocated ONCE and lives in `self.buf` across runs; its home
         // is that very cell, so a run's Checkout / PipePayload drop returns the SAME
         // `cl_mem` here. Three cases, decided by the cell + the `seeded` flag:
-        let mut seeded = self.seeded.lock().unwrap();
-        let lent = self.buf.lock().unwrap().take();
+        let mut seeded = lock_unpoisoned(&self.seeded);
+        let lent = lock_unpoisoned(&self.buf).take();
         let buf = match (lent, *seeded) {
             // First run: never seeded → alloc + seed via from_slice
             // (CL_MEM_COPY_HOST_PTR, synchronous create, no in-flight event).
@@ -413,8 +413,8 @@ where
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
         // Same three-case stable-handle logic as `Upload`, over a length-1 scalar.
-        let mut seeded = self.seeded.lock().unwrap();
-        let lent = self.buf.lock().unwrap().take();
+        let mut seeded = lock_unpoisoned(&self.seeded);
+        let lent = lock_unpoisoned(&self.buf).take();
         let buf = match (lent, *seeded) {
             (None, false) => {
                 let buf = DeviceScalar::<T, M>::new(ec.context(), self.value)?;
@@ -677,7 +677,7 @@ where
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
         let (buf, deps, home) = self.buf.resolve_home(ec)?;
         let raw = deps_to_wait_list(&deps);
-        let mut dst = self.dst.lock().unwrap();
+        let mut dst = lock_unpoisoned(&self.dst);
         // In-place: the buffer is read and handed back unchanged → home threads.
         // Guard across the fallible read so a failure rehomes rather than strands.
         let guard = crate::eager::LentGuard::new(buf, home);
@@ -1851,8 +1851,8 @@ where
         // SAME SVM allocation here. Three cases, decided by the cell + `seeded` flag
         // — the exact shape `Upload::execute` uses (USMSlice::new is the synchronous
         // host-create analog of DeviceSlice::from_slice; reseed is a host copy).
-        let mut seeded = self.seeded.lock().unwrap();
-        let lent = self.buf.lock().unwrap().take();
+        let mut seeded = lock_unpoisoned(&self.seeded);
+        let lent = lock_unpoisoned(&self.buf).take();
         let buf = match (lent, *seeded) {
             // First run: never seeded → move the host source into a fresh USMSlice
             // (pure host code — USM IS the host allocation, no enqueue/event).
@@ -2390,7 +2390,7 @@ struct DowngradeRehome<U, Init> {
 
 impl<U: Send, Init: Send> Rehome<Init> for DowngradeRehome<U, Init> {
     fn rehome(self: Box<Self>, value: Init) {
-        *self.cell.lock().unwrap() = Some((self.wrap)(value));
+        *lock_unpoisoned(&self.cell) = Some((self.wrap)(value));
     }
 }
 

@@ -44,6 +44,7 @@ use crate::error::{Error, Result};
 use crate::launch::KernelArg;
 use crate::map_primitive;
 use crate::queue::Launcher;
+use crate::util::lock_unpoisoned;
 use opencl3::event::{Event, retain_event};
 use opencl3::kernel::ExecuteKernel;
 use opencl3::memory::{CL_MAP_READ, CL_MAP_WRITE, svm_alloc};
@@ -394,10 +395,7 @@ impl<T, M: MemMode> MappedSlice<T, M> {
     /// hand-rolled SVM use (raw `ctx.launch`, manual `clSetKernelArgSVMPointer`)
     /// can keep Drop safe.
     pub fn register_use(&self, event: Arc<Event>) {
-        self.last_use
-            .lock()
-            .expect("last_use mutex poisoned")
-            .push(event);
+        lock_unpoisoned(&self.last_use).push(event);
     }
 
     /// Begin a host read map of this buffer. Returns a lazy [`MapOp`]
@@ -783,8 +781,7 @@ impl<T, M: MemMode> Drop for MappedSlice<T, M> {
         // every kernel launch) and the host-view release path's unmap.
         let queue = self.ctx.raw_default_queue();
         let svm_ptr = self.ptr as *const std::ffi::c_void;
-        let events: Vec<Arc<Event>> =
-            std::mem::take(&mut *self.last_use.lock().expect("last_use mutex poisoned"));
+        let events: Vec<Arc<Event>> = std::mem::take(&mut *lock_unpoisoned(&self.last_use));
         let wait_list: Vec<cl_event> = events.iter().map(|e| e.get()).collect();
         // SAFETY: ptr was returned by svm_alloc on this context; we
         // queue exactly one free for it. Every wait-list event is
