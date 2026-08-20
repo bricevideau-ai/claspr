@@ -205,10 +205,22 @@ impl ExternRlibs {
 fn find_newest_rlib(deps_dir: &Path, crate_name: &str) -> Result<PathBuf> {
     // Same dir can hold multiple rlibs for one crate when cargo's dep-graph
     // metadata hash differs across builds (test deps vs bin deps, feature
-    // flips, etc). We want the freshest one — mtime ordering matches what
-    // cargo just wrote for this run.
+    // flips, per-package `cargo test -p …` invocations, etc). Picking the
+    // globally newest is WRONG when a later, unrelated invocation rebuilt a
+    // different variant of a dep: the fixtures then mix rlibs from two
+    // builds and rustc reports "multiple different versions of crate X".
+    // The rlibs consistent with each other are the ones from the SAME
+    // cargo invocation that built THIS harness binary — so prefer the
+    // newest rlib not newer than the harness binary itself, and only fall
+    // back to the globally newest when everything postdates it (e.g. a
+    // `cargo build` refreshed rlibs without relinking the test).
+    let exe_mtime = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.metadata().ok())
+        .and_then(|m| m.modified().ok());
     let prefix = format!("lib{crate_name}-");
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut best_coeval: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(deps_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -221,10 +233,26 @@ fn find_newest_rlib(deps_dir: &Path, crate_name: &str) -> Result<PathBuf> {
         }
         let mtime = entry.metadata()?.modified()?;
         if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
-            best = Some((mtime, path));
+            best = Some((mtime, path.clone()));
+        }
+        // "Coeval": produced no later than the harness binary (plus a
+        // small slack for filesystem timestamp granularity).
+        //
+        // KNOWN LIMIT: mtime heuristics cannot fully identify the set
+        // one cargo invocation built — mixed `cargo test -p …` runs
+        // leave differently-feature-unified variants side by side, and
+        // an unchanged unit keeps its old mtime even in the current
+        // run. If fixtures fail with rustc's "multiple different
+        // versions of crate `claspr`", that's this: run
+        // `cargo clean -p claspr` and re-run the suite through one
+        // workspace-level invocation.
+        if exe_mtime.is_some_and(|e| mtime <= e + std::time::Duration::from_secs(2))
+            && best_coeval.as_ref().is_none_or(|(t, _)| mtime > *t)
+        {
+            best_coeval = Some((mtime, path));
         }
     }
-    best.map(|(_, p)| p).ok_or_else(|| {
+    best_coeval.or(best).map(|(_, p)| p).ok_or_else(|| {
         eyre!(
             "no `{prefix}*.rlib` in {deps_dir:?} — was `{crate_name}` built by the parent \
              `cargo test` invocation before this test ran?"
