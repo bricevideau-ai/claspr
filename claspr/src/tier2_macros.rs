@@ -321,6 +321,65 @@ macro_rules! device_scalar_zero {
 /// construction** — `g.bind(Buf(b))` — no `Fn`/`fn_traits`.
 #[macro_export]
 macro_rules! slots {
+    // ── GENERIC-VALUE arm: `Tag<R>: <value type using R>` ────────────────────
+    //
+    // Declares tags whose carried value is generic over a type parameter, so a
+    // width-generic driver (`fn run<R>`) can use ONE module-level declaration
+    // instead of stamping a `slots!` block per width (the miniweather /
+    // `instantiate` case: `slots! { Dt<R>: R }` then `slot!(Dt<f64>)` /
+    // `Dt(0.5f32)`). Each instantiation is an independent slot identity (`Key =
+    // Tag<R>` itself), so an `f64`-stamped graph and an `f32`-stamped graph can
+    // never cross-match the "same" tag.
+    //
+    // IDENTITY SOURCE ONLY, by design: the concrete arm's `Checkout` and `Pipe`
+    // sources are buffer mechanisms (sever-and-adopt, pipe-feed) whose
+    // per-source impls would overlap an open generic parameter in coherence
+    // terms. With one source, the source dimension disappears: the tag is
+    // generic over the VALUE parameter directly (`Dt<f64>`, `GBuf<u32>`), not
+    // over a binding source. Mixing generic and concrete entries in one
+    // invocation is not supported — use two `slots!` blocks.
+    ( $( $name:ident < $R:ident > : $val:ty ),+ $(,)? ) => {
+        $(
+            #[doc = concat!("Reusable-graph slot tag, GENERIC over `", stringify!($R), "`, carrying a `", stringify!($val), "`.")]
+            #[doc = ""]
+            #[doc = "Build a hole with [`slot!`](crate::slot)`(Tag<Concrete>)`; bind with"]
+            #[doc = "plain construction `Tag(value)` (raw values only — no `Checkout`"]
+            #[doc = "or `Pipe` sources on generic tags)."]
+            pub struct $name<$R>(pub $val);
+
+            impl<$R: 'static> $crate::Tag for $name<$R>
+            where
+                $val: $crate::eager::SlotEq + $crate::SlotValue,
+            {
+                const NAME: &'static str = stringify!($name);
+                type Value = $val;
+                // With the identity source there is no source dimension to erase,
+                // so the tag type itself is the matching identity — distinct per
+                // tag ident AND per instantiated `R` (unlike the concrete arm's
+                // source-erasing `KeyMarker`).
+                type Key = $name<$R>;
+                fn into_value(self) -> $val {
+                    self.0
+                }
+                fn source_cell_id(&self) -> ::core::option::Option<usize> {
+                    // Identity source only — never a `Checkout`.
+                    ::core::option::Option::None
+                }
+            }
+
+            // Value-bind, raw-value source — the only `CallArg` surface for a
+            // generic tag (see the arm header).
+            impl<$R: 'static> $crate::eager::CallArg for $name<$R>
+            where
+                $val: $crate::eager::SlotEq + $crate::SlotValue,
+            {
+                fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
+                    // Infallible but RECORD-don't-drop, same as the concrete arm.
+                    $crate::DeviceOpExt::bind_deferred(g, self);
+                }
+            }
+        )+
+    };
     // Trailing comma + at least one entry.
     ( $( $name:ident : $val:ty ),+ $(,)? ) => {
         $(

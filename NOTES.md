@@ -159,10 +159,13 @@ first, designing the trait second):
 - the launcher methods themselves (8 here, each with per-arg
   `KernelSliceRead[Write]Arg<Real>` generics and a complex concrete return type —
   RPITIT or associated types needed to hide it);
-- `slots!` declarations with `Real`-typed values (18 dt/hyperviscosity slots) —
-  the known `slots!` generic-value-type gap is THE biggest blocker: the slots
-  module is stamped inside `make_runner!` solely because tag value types are
-  concrete;
+- ~~`slots!` declarations with `Real`-typed values~~ SOLVED 2026-08-21: the
+  generic-value `slots!` arm (`Tag<R>: <value>`) landed — miniweather's 18
+  slots are now ONE module-level declaration and `make_runner!` no longer
+  stamps a slots block. Generic tags are identity-source only (no
+  `Checkout`/`Pipe` — buffer mechanisms scalars never use), which is what
+  dissolves the coherence overlaps; each instantiation is its own slot
+  identity (`Key = Tag<R>`). Engine tests: `tier2/tests/generic_slots.rs`;
 - `DeviceSlice::<Real>` allocations + the host f64→Real cast at the boundary
   (a `Real: num-ish` bound or claspr-provided `FromF64` shim);
 - scalar `as Real` casts at bind sites (`dz as Real`, hv coefficients).
@@ -178,7 +181,7 @@ a generic layer for IN-KERNEL vector math. But the HOST-ABI half stays concrete:
 a generic struct can't express the element-dependent `repr(align(N))` the cl::*
 types carry, so vector-typed KERNEL PARAMETERS (buffers of vectors) keep needing
 the aligned concrete types → per-stamp alias families remain the right bridge for
-signatures, generic cl vectors the right tool inside kernel bodies; (3) `slots!` generic value type (~15 lines).
+signatures, generic cl vectors the right tool inside kernel bodies; (3) ~~`slots!` generic value type~~ DONE 2026-08-21 (generic-value `slots!` arm; see the trait-requirements list above).
 Limitation to document if it bites: the extra stamp-module level shifts `super::`
 paths in the body by one.
 

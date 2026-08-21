@@ -699,6 +699,22 @@ fn output_fields(state: &[f64], init: &Init, nx: usize, nz: usize) -> Vec<f64> {
     out
 }
 
+// The dt-dependent scalar slots, declared ONCE for every width via the
+// generic-value `slots!` arm (`Tag<R>: R`) — each width instantiation is an
+// independent slot identity (`KeyFor<R>`), so the f64 and f32 graphs can
+// never cross-match. The graph is one DOUBLE step (x-first step, then
+// z-first step); directions and launch extents are literals, so these
+// scalars — per-step RK stage dts and hyperviscosity per (step, half,
+// stage) — are the only slots, re-bound at most twice per run.
+slots! {
+    Dt1A<R>: R, Dt1B<R>: R, Dt1C<R>: R,
+    Dt2A<R>: R, Dt2B<R>: R, Dt2C<R>: R,
+    H1A1<R>: R, H1A2<R>: R, H1A3<R>: R, // step 1, x half
+    H1B1<R>: R, H1B2<R>: R, H1B3<R>: R, // step 1, z half
+    H2A1<R>: R, H2A2<R>: R, H2A3<R>: R, // step 2, z half
+    H2B1<R>: R, H2B2<R>: R, H2B3<R>: R, // step 2, x half
+}
+
 // ── Tier-2 driver, instantiated per precision ────────────────────────────────
 
 macro_rules! make_runner {
@@ -706,20 +722,6 @@ macro_rules! make_runner {
         mod $runner {
             use super::*;
 
-            slots! {
-                // The graph is one DOUBLE step (x-first step, then z-first
-                // step), so directions and launch extents are literals — the
-                // only slots are the dt-dependent scalars, and they change at
-                // most twice per run (final clamp, odd-count no-op tail).
-                // Per-step RK stage dts:
-                Dt1A: $ty, Dt1B: $ty, Dt1C: $ty,
-                Dt2A: $ty, Dt2B: $ty, Dt2C: $ty,
-                // hyperviscosity per (step, half, RK stage):
-                H1A1: $ty, H1A2: $ty, H1A3: $ty, // step 1, x half
-                H1B1: $ty, H1B2: $ty, H1B3: $ty, // step 1, z half
-                H2A1: $ty, H2A2: $ty, H2A3: $ty, // step 2, z half
-                H2B1: $ty, H2B2: $ty, H2B3: $ty, // step 2, x half
-            }
 
             /// Run the case on the device; returns (initial, final) state as
             /// f64 (initial = after the precision round-trip, i.e. exactly
@@ -823,14 +825,14 @@ macro_rules! make_runner {
                                 nxu,
                                 nzu,
                                 $d,
-                                slot!($hv1),
+                                slot!($hv1<$ty>),
                             )
                         })
                         .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
                             ks.tend_s(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
                         })
                         .and_then(move |(s, t, fx, td)| {
-                            ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dta))
+                            ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dta<$ty>))
                         })
                         .and_then(move |(s, t, fx, td)| {
                             ks.halo_t(
@@ -863,14 +865,14 @@ macro_rules! make_runner {
                                 nxu,
                                 nzu,
                                 $d,
-                                slot!($hv2),
+                                slot!($hv2<$ty>),
                             )
                         })
                         .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
                             ks.tend_t(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
                         })
                         .and_then(move |(s, t, fx, td)| {
-                            ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dtb))
+                            ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dtb<$ty>))
                         })
                         .and_then(move |(s, t, fx, td)| {
                             ks.halo_t(
@@ -903,14 +905,14 @@ macro_rules! make_runner {
                                 nxu,
                                 nzu,
                                 $d,
-                                slot!($hv3),
+                                slot!($hv3<$ty>),
                             )
                         })
                         .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
                             ks.tend_t(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
                         })
                         .and_then(move |(s, t, fx, td)| {
-                            ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!($dtc))
+                            ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!($dtc<$ty>))
                         })
                     };
                 }
@@ -948,14 +950,14 @@ macro_rules! make_runner {
                             nxu,
                             nzu,
                             0u32,
-                            slot!(H1A1),
+                            slot!(H1A1<$ty>),
                         )
                     })
                     .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
                         ks.tend_s(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
                     })
                     .and_then(move |(s, t, fx, td)| {
-                        ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!(Dt1A))
+                        ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!(Dt1A<$ty>))
                     })
                     .and_then(move |(s, t, fx, td)| {
                         ks.halo_t(
@@ -988,14 +990,14 @@ macro_rules! make_runner {
                             nxu,
                             nzu,
                             0u32,
-                            slot!(H1A2),
+                            slot!(H1A2<$ty>),
                         )
                     })
                     .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
                         ks.tend_t(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
                     })
                     .and_then(move |(s, t, fx, td)| {
-                        ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!(Dt1B))
+                        ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!(Dt1B<$ty>))
                     })
                     .and_then(move |(s, t, fx, td)| {
                         ks.halo_t(
@@ -1028,14 +1030,14 @@ macro_rules! make_runner {
                             nxu,
                             nzu,
                             0u32,
-                            slot!(H1A3),
+                            slot!(H1A3<$ty>),
                         )
                     })
                     .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
                         ks.tend_t(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
                     })
                     .and_then(move |(s, t, fx, td)| {
-                        ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!(Dt1C))
+                        ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!(Dt1C<$ty>))
                     });
                 let g1 = half!(g0, gh_z, gf_z, 1u32, H1B1, H1B2, H1B3, Dt1A, Dt1B, Dt1C);
                 let g2 = half!(g1, gh_z, gf_z, 1u32, H2A1, H2A2, H2A3, Dt2A, Dt2B, Dt2C);
