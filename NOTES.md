@@ -177,10 +177,11 @@ hit on the way, worth a guard in claspr-build: `write_to`'s generated file
 `include_bytes!`-es the .spv at its BUILD location, so two `compile()` calls on the same
 kernel crate share a target dir + product name and the second silently overwrites the
 first — both host includes then embed the same (last-written) module. Symptom: the "f32"
-blob failed Intel with "Double type is not supported". Fix: distinct
-`target_dir_path` per invocation; claspr-build could either hash the feature set into
-the default target dir or copy the .spv next to the generated .rs (content-addressed)
-so two write_to outputs can never alias.
+blob failed Intel with "Double type is not supported". FIXED 2026-08-21 (`ce11135`):
+both generation paths now freeze a copy of the .spv beside the generated .rs and embed
+that (`freeze_spv_beside`); regression-tested by a dual-feature compile of the
+explicit-compile kernel crate whose tests assert the embedded blobs differ and behave
+differently on device. The user-facing `target_dir_path` workaround is no longer needed.
 
 On declaration drift in explicit mode (`kernels!` block vs the actual blob): today only
 entry-point NAMES are validated at bind; arg mismatches surface at first launch. A
