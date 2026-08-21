@@ -185,13 +185,31 @@ impl ExternRlibs {
             host_deps_dir = Some(workspace_target.join(profile).join("deps"));
         }
 
-        let externs = crates
-            .iter()
-            .map(|&name| {
-                let rlib = find_newest_rlib(&deps_dir, name)?;
-                Ok::<_, ui_test::color_eyre::Report>((name.to_string(), rlib))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Prefer the authoritative answer: ask cargo which rlibs the
+        // CURRENT dep graph resolves to. Every mtime heuristic over
+        // `deps/` (newest, coeval-with-harness, …) has a failure mode
+        // where it pairs rlibs from two different build epochs — seen
+        // in practice right after a large dependency bump, where the
+        // fixtures then observe two copies of `claspr` and fail with
+        // type-identity errors ("expected claspr::context::Context,
+        // found claspr::Context"). The heuristic remains as a fallback
+        // for environments where invoking cargo is not possible.
+        let release = deps_dir
+            .ancestors()
+            .nth(1)
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("release");
+        let externs = match discover_via_cargo(crates, release) {
+            Some(found) => found,
+            None => crates
+                .iter()
+                .map(|&name| {
+                    let rlib = find_newest_rlib(&deps_dir, name)?;
+                    Ok::<_, ui_test::color_eyre::Report>((name.to_string(), rlib))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
 
         Ok(Self {
             externs,
@@ -200,6 +218,71 @@ impl ExternRlibs {
             host_deps_dir,
         })
     }
+}
+
+/// Resolve rlib paths by running a no-op `cargo build` of the requested
+/// packages with `--message-format=json` and reading the emitted
+/// `compiler-artifact` messages. Sub-second when the artifacts are fresh
+/// (the usual case: the parent `cargo test` just built them), and it
+/// blocks on cargo's build lock instead of racing a concurrent build.
+///
+/// Returns `None` on any failure so the caller can fall back to the
+/// mtime heuristic — this is a best-effort upgrade, not a hard gate.
+fn discover_via_cargo(crates: &[&str], release: bool) -> Option<Vec<(String, PathBuf)>> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut cmd = std::process::Command::new(cargo);
+    cmd.current_dir(env!("CARGO_MANIFEST_DIR"))
+        .arg("build")
+        .arg("--message-format=json-render-diagnostics");
+    if release {
+        cmd.arg("--release");
+    }
+    for name in crates {
+        cmd.args(["-p", &name.replace('_', "-")]);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(out.stdout).ok()?;
+
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    for &name in crates {
+        let underscored = name.replace('-', "_");
+        // Match this crate's `compiler-artifact` line and pull the .rlib
+        // out of its `filenames` array. Field order within the message is
+        // stable enough for this narrow extraction; any mismatch simply
+        // falls back to the heuristic.
+        let rlib = stdout.lines().rev().find_map(|line| {
+            if !line.contains("\"compiler-artifact\"") {
+                return None;
+            }
+            let target_name = format!("\"name\":\"{}\"", name.replace('_', "-"));
+            let target_name_us = format!("\"name\":\"{underscored}\"");
+            if !line.contains(&target_name) && !line.contains(&target_name_us) {
+                return None;
+            }
+            // `-p`-selected packages report the unhashed top-level copy
+            // (`target/<profile>/libX.rlib`) — exactly what we want:
+            // cargo keeps it pointed at the current graph's artifact,
+            // so hash ambiguity can't creep in.
+            let want = format!("lib{underscored}");
+            line.split('"')
+                .find(|part| {
+                    part.ends_with(".rlib")
+                        && std::path::Path::new(part)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| {
+                                n.strip_prefix(&want)
+                                    .is_some_and(|rest| rest == ".rlib" || rest.starts_with('-'))
+                            })
+                })
+                .map(PathBuf::from)
+        })?;
+        found.push((name.to_string(), rlib));
+    }
+    Some(found)
 }
 
 fn find_newest_rlib(deps_dir: &Path, crate_name: &str) -> Result<PathBuf> {
