@@ -112,6 +112,110 @@ build re-resolves against the floating ref. Fix: walk up from `OUT_DIR` to the h
 `Cargo.lock`, extract the pinned revs, write them into the generated TOML (fallback to
 today's refs). Glam is no longer in the generated TOML (spirv-std re-exports it).
 
+### Graph mutation invalidates the recorded CB wholesale → two-tier dirtiness + mutable dispatch
+
+From the miniWeather claspr port (2026-08-20, `argonne-demo/miniweather-claspr`; cliloader
+host-timing traces on local PoCL). A replayed Tier-2 graph whose scalar slots are
+`mutate_*`-ed between syncs re-records its command buffer EVERY replay: 30-step run =
+30x `clCreateCommandBufferKHR` + 720x `clCommandNDRangeKernelKHR` (24 dispatches
+re-recorded/step) + 16,020x `clSetKernelArg`, each CB enqueued once then released
+(~30% of wall on a 100x50 grid). Control run with zero mutation confirms the cache
+itself is correct: 1 CB, recorded once, replayed 30x, 534 arg-sets. Two fixes, in order:
+
+- **(a) Two-tier invalidation + `cl_khr_command_buffer_mutable_dispatch`.** Local PoCL
+  advertises it (rusticl/llvmpipe and Intel legacy have no CB ext at all, so plain-enqueue
+  fallback is unaffected). A by-value scalar rebind — and a LaunchSpec rebind, via
+  `CL_MUTABLE_DISPATCH_GLOBAL_SIZE_KHR` — is `clUpdateMutableCommandsKHR` on the existing
+  CB; only structural dirt (buffer identity, graph shape) should force re-record. Record
+  with `CL_COMMAND_BUFFER_MUTABLE_KHR` only when the graph has scalar/extent slots, so
+  fully-literal graphs pay nothing.
+- **(b) Small keyed CB cache as the no-ext fallback.** LRU of ~2-4 finalized CBs keyed by
+  the record-relevant binding state. Covers the dominant ALTERNATING pattern: step-parity
+  slots (miniWeather's x-first/z-first), ping-pong buffer swaps (gray-scott re-records
+  every step today for exactly this reason).
+
+App-side workaround that motivated this: restructuring miniWeather's graph to one
+DOUBLE timestep (directions/extents as literals, dt scalars mutated ≤2x/run) got
+1 CB per whole 600-step run. That shouldn't be necessary for scalars.
+
+### Generic device-module instantiation — `#[claspr::device(instantiate(Real = [f64, f32]))]`
+
+From the miniWeather port (2026-08-20): a precision-generic app must duplicate its device
+module per width today — 297 of the port's 1,005 code lines were a textual f64→f32 copy,
+because kernels can't be generic and the proc-macro/build scan can't see macro-generated
+modules. Proposed feature: one module written against a placeholder type (`Real`,
+unsuffixed float literals), stamped N times.
+
+Why it fits THIS architecture unusually well: `compile_from_host` already owns the module
+body as text/AST and already walks every param type (`classify_param`) to emit the typed
+launchers — stamping N sub-crates (prepend `type Real = X;`) and substituting `Real → X`
+in the emitted `Kernels` signatures is mechanical. The proc-macro side emits N
+`include!`s/constructors instead of one.
+
+Constraints that make per-width stamping the CORRECT shape (not a workaround):
+- SPIR-V entry points cannot be generic — per-width modules are forced by the target.
+- Both widths in one SPIR-V module is a portability non-starter: the module would declare
+  `Float64` → clBuildProgram fails on non-fp64 devices; rusticl/iris SEGV (see NOTES
+  history). One module per instantiation is what drivers require.
+- Capability handling already works: `.with_f64()` + auto-declare-on-use leaves the f32
+  stamp's SPIR-V clean (miniWeather's f32 module ran on Intel legacy + rusticl).
+
+The real design surface is the HOST side: N stamped `Kernels` structs with identical
+method shapes still force users into a per-type macro for their driver. Full win = also
+emit a generated trait per device module (all signatures known at generation time;
+`trait GpuKernels<Real>` impl'd by every stamp) so users write one
+`fn run<R, K: GpuKernels<R>>`. `slots!` needs a small extension (generic value type) or
+stays user-instantiated (~15 lines, acceptable).
+
+Workaround available TODAY (validated in the miniWeather port): explicit-compile mode —
+one raw kernel crate with `#[cfg(feature = "f64")] pub type Real = f64;`, build.rs runs
+`claspr_build::compile(..)` twice with `.with(|sb| sb.shader_crate_features...)`, host
+declares the two surfaces via a user macro wrapping `claspr::kernels!`. Collapses the
+duplication to signature declarations; the `instantiate` feature would erase those too.
+DONE in the port 2026-08-20 (1,005 → ~700 code lines, bit-identical on 3 ICDs). One trap
+hit on the way, worth a guard in claspr-build: `write_to`'s generated file
+`include_bytes!`-es the .spv at its BUILD location, so two `compile()` calls on the same
+kernel crate share a target dir + product name and the second silently overwrites the
+first — both host includes then embed the same (last-written) module. Symptom: the "f32"
+blob failed Intel with "Double type is not supported". Fix: distinct
+`target_dir_path` per invocation; claspr-build could either hash the feature set into
+the default target dir or copy the .spv next to the generated .rs (content-addressed)
+so two write_to outputs can never alias.
+
+On declaration drift in explicit mode (`kernels!` block vs the actual blob): today only
+entry-point NAMES are validated at bind; arg mismatches surface at first launch. A
+bind-time `CL_KERNEL_NUM_ARGS` count check (core `clGetKernelInfo`, safe everywhere)
+would catch added/removed params deterministically at startup. Do NOT build name/type
+verification on `clGetKernelArgInfo` for SPIR-V programs for now — the arg-info
+semantics for SPIR-V are in flux at the OpenCL WG (Brice, 2026-08); revisit when the
+WG lands a resolution.
+
+### Tier-2 papercuts from the same port (small, independent)
+
+- **`Checkout::read_into(&self, &mut [T])`.** The only compile error in an 1,100-line
+  first build: `(*co).read(...)` moves the slice out of the checkout (E0507). The
+  documented `(*co).map().wait()?` + copy works but is discoverable only from the
+  eager.rs module docs. A borrowing read on `Checkout` (or `read` on `&DeviceSlice`)
+  closes it.
+- **Re-record churn (minor, moot if (a)/(b) land).** Each re-record does per-command
+  `clRetainKernel` + full `clSetKernelArg` sweeps (720 retains / 534 arg-sets per
+  24-dispatch record); per-site arg caching would shrink it, but it's noise once the
+  CB stops being re-recorded.
+- **Doc pointer, not a bug:** `Arc<DeviceSlice<T, M>>: KernelSliceReadArg` (launch.rs)
+  is the answer to "read-only buffer used at N graph sites" — the port initially threaded
+  5 hydrostatic arrays through all 24 dispatches as pipes ("caravan" signatures) for want
+  of finding it. Worth a line in the eager.rs docs next to the fan-out discussion
+  (slots fan out Copy values; Arc fans out read-only buffers). Applying it shrank the
+  port's caravan 9→4 buffers and its kernels by 52 pass-through params, bit-identical
+  on all 3 ICDs.
+- **Arc args come back in the output tuple.** The typed launcher returns Arc buffer args
+  like any other buffer arg, so an `and_then` chain over Arc-heavy kernels destructures
+  and drops them at every transition (`|(s, t, fx, td, _hd, _hdt)| …`) — the next site
+  binds a fresh clone anyway. Harmless but noisy at 48 dispatches. Options: an
+  Arc-of-read-only variant that is NOT threaded into the output tuple (it has no home to
+  rehome — the clone is the ownership story), or just show the destructure-and-drop
+  idiom in the fan-out docs so chain authors know it's expected.
+
 ### Tier 1 scoped launcher (`ctx.scope(|s| {...})`)
 
 Sketched but resolved differently (ops carry ctx + no-arg `.wait()`/`.submit()`, commit
