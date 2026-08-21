@@ -133,16 +133,11 @@ checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
 
 [[package]]
 name = "bitflags"
-version = "1.3.2"
+version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
-
-[[package]]
-name = "bitflags"
-version = "2.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 dependencies = [
+ "bytemuck",
  "serde_core",
 ]
 
@@ -180,7 +175,7 @@ checksum = "f9abbd1bc6865053c427f7198e6af43bfdedc55ab791faed4fbd361d789575ff"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -318,7 +313,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "spirv-builder",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -336,7 +331,7 @@ version = "0.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -502,7 +497,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustc_version",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -513,7 +508,7 @@ checksum = "1ac70aa55017e108007fbaf5aa0f54b021c98f92ff8af59d42eda9da96e3dd4f"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -536,7 +531,7 @@ checksum = "0fbbb781877580993a8707ec48672673ec7b81eeba04cfd2310bd28c08e47c8f"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -703,7 +698,7 @@ checksum = "e835b70203e41293343137df5c0664546da5745f82ec9b84d40be8336958447b"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -766,9 +761,9 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "glam"
-version = "0.33.1"
+version = "0.33.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "898f5a568a84989b6c0f8caa50a93074b97dbdc58fc6d9543157bb4562758933"
+checksum = "c426daf70099baff33fac0ba85151c42424861c56828cef9ba02dacb78eb6b26"
 dependencies = [
  "libm",
 ]
@@ -1107,7 +1102,7 @@ checksum = "0dd91265cc2454558f659b3b4b9640f0ddb8cc6521277f166b8a8c181c898079"
 dependencies = [
  "arrayvec",
  "bit-set",
- "bitflags 2.13.0",
+ "bitflags",
  "cfg-if",
  "cfg_aliases",
  "codespan-reporting",
@@ -1119,7 +1114,7 @@ dependencies = [
  "num-traits",
  "once_cell",
  "petgraph",
- "rustc-hash",
+ "rustc-hash 1.1.0",
  "spirv",
  "thiserror 2.0.18",
 ]
@@ -1273,7 +1268,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1283,6 +1278,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "profiling"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
+dependencies = [
+ "profiling-procmacros",
+]
+
+[[package]]
+name = "profiling-procmacros"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
+dependencies = [
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1350,8 +1364,35 @@ version = "0.13.0+sdk-1.4.341.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "091dca2e1d6fd3098417b5ec88e77e80d1ba5945750943419dc976858082c296"
 dependencies = [
- "rustc-hash",
+ "rustc-hash 1.1.0",
  "spirv",
+]
+
+[[package]]
+name = "rspirv2"
+version = "0.1.0+sdk-1.4.357"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "538bb4bcd995e28a520c42c73d5a1900c3b9714054a6f916807ab26f0e07a40c"
+dependencies = [
+ "bitflags",
+ "bytemuck",
+ "profiling",
+ "rspirv2-types",
+ "smallvec",
+]
+
+[[package]]
+name = "rspirv2-types"
+version = "0.1.0+sdk-1.4.357"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e32dd16a2eba8ae3e9fabd45bf0587e29310ba4d64e4e93eabd33650b18a8e4"
+dependencies = [
+ "anstyle",
+ "bitflags",
+ "bytemuck",
+ "profiling",
+ "rustc-hash 2.1.3",
+ "smallvec",
 ]
 
 [[package]]
@@ -1367,9 +1408,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
+
+[[package]]
 name = "rustc_codegen_spirv"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#1d39b29dab0af5dde831b0d202a9b67fd013388f"
+source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#5ac2ab98c79b979e506739d70289fcb4e7caa377"
 dependencies = [
  "ahash",
  "ar",
@@ -1384,6 +1431,7 @@ dependencies = [
  "object 0.37.3",
  "regex",
  "rspirv",
+ "rspirv2",
  "rustc-demangle",
  "rustc_codegen_spirv-types",
  "rustix",
@@ -1402,7 +1450,7 @@ dependencies = [
 [[package]]
 name = "rustc_codegen_spirv-types"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#1d39b29dab0af5dde831b0d202a9b67fd013388f"
+source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#5ac2ab98c79b979e506739d70289fcb4e7caa377"
 dependencies = [
  "rspirv",
  "semver",
@@ -1439,7 +1487,7 @@ version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -1529,7 +1577,7 @@ checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1624,7 +1672,7 @@ dependencies = [
  "itertools 0.10.5",
  "lazy_static",
  "longest-increasing-subsequence",
- "rustc-hash",
+ "rustc-hash 1.1.0",
  "serde",
  "serde_json",
  "smallvec",
@@ -1636,14 +1684,14 @@ version = "0.4.0+sdk-1.4.341.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
  "serde",
 ]
 
 [[package]]
 name = "spirv-builder"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#1d39b29dab0af5dde831b0d202a9b67fd013388f"
+source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#5ac2ab98c79b979e506739d70289fcb4e7caa377"
 dependencies = [
  "cargo_metadata 0.21.0",
  "log",
@@ -1660,9 +1708,9 @@ dependencies = [
 [[package]]
 name = "spirv-std"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#1d39b29dab0af5dde831b0d202a9b67fd013388f"
+source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#5ac2ab98c79b979e506739d70289fcb4e7caa377"
 dependencies = [
- "bitflags 1.3.2",
+ "bitflags",
  "glam",
  "libm",
  "num-traits",
@@ -1673,18 +1721,18 @@ dependencies = [
 [[package]]
 name = "spirv-std-macros"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#1d39b29dab0af5dde831b0d202a9b67fd013388f"
+source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#5ac2ab98c79b979e506739d70289fcb4e7caa377"
 dependencies = [
  "proc-macro2",
  "quote",
  "spirv-std-types",
- "syn",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "spirv-std-types"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#1d39b29dab0af5dde831b0d202a9b67fd013388f"
+source = "git+https://github.com/bricevideau-ai/rust-gpu.git?branch=opencl-kernel-support#5ac2ab98c79b979e506739d70289fcb4e7caa377"
 
 [[package]]
 name = "spirv-tools"
@@ -1743,7 +1791,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1758,6 +1806,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "synstructure"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1765,7 +1824,7 @@ checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1794,7 +1853,7 @@ checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1805,7 +1864,7 @@ checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -1899,7 +1958,7 @@ checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2120,7 +2179,7 @@ dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
  "wasm-bindgen-shared",
 ]
 
@@ -2139,7 +2198,7 @@ version = "0.236.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a9b1e81f3eb254cf7404a82cee6926a4a3ccc5aad80cc3d43608a070c67aa1d7"
 dependencies = [
- "bitflags 2.13.0",
+ "bitflags",
 ]
 
 [[package]]
@@ -2229,7 +2288,7 @@ checksum = "de844c262c8848816172cef550288e7dc6c7b7814b4ee56b3e1553f275f1858e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
  "synstructure",
 ]
 
@@ -2250,7 +2309,7 @@ checksum = "1ae7f38b72ec2a254e2b87ef277cf2cd4fb97cbebf944faa6f33354da0867930"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2270,7 +2329,7 @@ checksum = "11532158c46691caf0f2593ea8358fed6bbf68a0315e80aae9bd41fbade684a1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
  "synstructure",
 ]
 
@@ -2304,7 +2363,7 @@ checksum = "625dc425cab0dca6dc3c3319506e6593dcb08a9f387ea3b284dbd52a92c40555"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.117",
 ]
 
 [[package]]
