@@ -1,0 +1,8 @@
+error: claspr::device: duplicate instantiate type `f32`
+ --> compile_fail/macro/device_instantiate_duplicate.rs:4:43
+  |
+4 | #[claspr::device(instantiate(Real = [f32, f32]))]
+  |                                           ^^^
+
+error: aborting due to 1 previous error
+

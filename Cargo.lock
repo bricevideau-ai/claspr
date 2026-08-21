@@ -343,6 +343,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "claspr-test-instantiate"
+version = "0.0.0"
+dependencies = [
+ "claspr",
+ "claspr-build",
+ "claspr-test-support",
+]
+
+[[package]]
 name = "claspr-test-kernels"
 version = "0.0.0"
 dependencies = [

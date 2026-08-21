@@ -1,0 +1,23 @@
+[package]
+name = "claspr-test-instantiate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "End-to-end coverage for #[claspr::device(instantiate(...))] — one device module stamped per scalar width"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+claspr = { path = "../../claspr" }
+
+[dev-dependencies]
+claspr-test-support = { path = "../support" }
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true

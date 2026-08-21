@@ -1,0 +1,10 @@
+error: claspr::device: `instantiate(...)` is only supported on device modules (`#[claspr::device(instantiate(...))] mod gpu { ... }`)
+ --> compile_fail/macro/device_instantiate_on_fn.rs:4:1
+  |
+4 | #[claspr::device(instantiate(Real = [f32]))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `claspr::device` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: aborting due to 1 previous error
+

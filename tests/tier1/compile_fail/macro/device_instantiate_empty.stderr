@@ -1,0 +1,8 @@
+error: claspr::device: `instantiate` needs at least one type (`instantiate(Real = [f64, f32])`)
+ --> compile_fail/macro/device_instantiate_empty.rs:4:30
+  |
+4 | #[claspr::device(instantiate(Real = []))]
+  |                              ^^^^
+
+error: aborting due to 1 previous error
+

@@ -716,15 +716,64 @@ impl HostBuilder {
         };
         let raw_items = items.clone();
         let lifted_items = translate_and_inline(raw_items, &device_mod_dir)?;
+
+        match parse_instantiate_spec(&device_mod.attrs)
+            .map_err(|e| format!("device module `{mod_name}`: {e}"))?
+        {
+            None => self.compile_one_stamp(&mod_name, None, lifted_items, src_dir, out_dir),
+            Some((placeholder, types)) => {
+                // One stamp per listed type: same lifted body, with
+                // `pub type <Placeholder> = <ty>;` prepended so the
+                // kernel code's placeholder resolves — mirroring the
+                // alias the `#[claspr::device]` proc-macro injects into
+                // each host-side stamp module. No substitution anywhere.
+                for ty in &types {
+                    self.compile_one_stamp(
+                        &mod_name,
+                        Some((placeholder.as_str(), ty.as_str())),
+                        lifted_items.clone(),
+                        src_dir,
+                        out_dir,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Build one kernel sub-crate: a plain device module (`stamp` =
+    /// `None`) or one instantiation stamp (`stamp` = the placeholder
+    /// ident and the concrete type it aliases in this stamp).
+    fn compile_one_stamp(
+        &self,
+        mod_name: &str,
+        stamp: Option<(&str, &str)>,
+        mut lifted_items: Vec<syn::Item>,
+        src_dir: &Path,
+        out_dir: &Path,
+    ) -> Result<()> {
+        let unit_name = match stamp {
+            None => mod_name.to_string(),
+            Some((_, ty)) => format!("{mod_name}__{ty}"),
+        };
+        if let Some((placeholder, ty)) = stamp {
+            let placeholder: syn::Ident = syn::parse_str(placeholder)?;
+            let ty: syn::Type = syn::parse_str(ty)?;
+            let alias: syn::Item = syn::parse_quote! {
+                #[allow(dead_code)]
+                pub type #placeholder = #ty;
+            };
+            lifted_items.insert(0, alias);
+        }
         let lifted_file = syn::File {
             shebang: None,
             attrs: vec![],
             items: lifted_items,
         };
 
-        // Materialise per-module kernel sub-crate. Distinct dir per
-        // module so multiple modules don't clobber each other.
-        let crate_dir = out_dir.join(format!("claspr_kernel_{mod_name}"));
+        // Materialise per-unit kernel sub-crate. Distinct dir per
+        // module (and per stamp) so builds don't clobber each other.
+        let crate_dir = out_dir.join(format!("claspr_kernel_{unit_name}"));
         std::fs::create_dir_all(crate_dir.join("src"))?;
         write_generated_cargo_toml(&crate_dir)?;
         write_generated_lib_rs(&crate_dir, &lifted_file)?;
@@ -739,17 +788,21 @@ impl HostBuilder {
         // reshuffle on rust-gpu in 2026-05).
         seed_lockfile_from_host(src_dir, &crate_dir);
 
-        // Compile via spirv-builder. Name the module on failure —
-        // with several device modules in one host source, "which one
-        // broke" is otherwise invisible in the build output.
-        let result: CompileResult = self
-            .settings
-            .apply_to(&crate_dir)
+        // Compile via spirv-builder. Name the unit on failure — with
+        // several device modules (or stamps) in one host source,
+        // "which one broke" is otherwise invisible in the build
+        // output. An f64 stamp gets the `Float64` capability
+        // automatically; other stamps stay portable.
+        let mut sb = self.settings.apply_to(&crate_dir);
+        if matches!(stamp, Some((_, "f64"))) {
+            sb = sb.capability(Capability::Float64);
+        }
+        let result: CompileResult = sb
             .build()
-            .map_err(|e| format!("kernel build failed for device module `{mod_name}`: {e}"))?;
+            .map_err(|e| format!("kernel build failed for device module `{unit_name}`: {e}"))?;
         if result.entry_points.is_empty() {
             return Err(format!(
-                "device module `{mod_name}` produced no kernel entry points — \
+                "device module `{unit_name}` produced no kernel entry points — \
                  does it (or a file module it pulls in) contain at least one \
                  `#[claspr::kernel]` fn?"
             )
@@ -757,9 +810,10 @@ impl HostBuilder {
         }
         let spv_path = result.module.unwrap_single().to_path_buf();
 
-        // Emit the Kernels module to OUT_DIR/<mod_name>.rs — this
-        // is what `#[claspr::device] mod <name>` includes!() from.
-        let module_out_path = out_dir.join(format!("{mod_name}.rs"));
+        // Emit the Kernels module to OUT_DIR/<unit>.rs — this is what
+        // `#[claspr::device] mod <name>` (or its stamp sub-module)
+        // includes!() from.
+        let module_out_path = out_dir.join(format!("{unit_name}.rs"));
         let spv_path = freeze_spv_beside(&spv_path, &module_out_path)?;
         let generated = generate_module_source(&spv_path, &result.entry_points, &crate_dir)?;
         std::fs::write(&module_out_path, generated)?;
@@ -845,6 +899,56 @@ fn has_any_claspr_marker(attrs: &[syn::Attribute]) -> bool {
     attrs
         .iter()
         .any(|a| is_claspr_kernel_attr(a) || is_claspr_device_attr(a))
+}
+
+/// Parse `instantiate(<Placeholder> = [<ty>, ...])` out of a
+/// `#[claspr::device(...)]` attribute, mirroring the grammar the
+/// `claspr::device` proc-macro accepts (keep the two in sync). Returns
+/// `Ok(None)` for a bare `#[claspr::device]`.
+fn parse_instantiate_spec(attrs: &[syn::Attribute]) -> Result<Option<(String, Vec<String>)>> {
+    use syn::parse::Parser as _;
+    for attr in attrs {
+        if !is_claspr_device_attr(attr) {
+            continue;
+        }
+        let syn::Meta::List(list) = &attr.meta else {
+            return Ok(None);
+        };
+        let parsed = (|input: syn::parse::ParseStream<'_>| -> syn::Result<(String, Vec<String>)> {
+            let key: syn::Ident = input.parse()?;
+            if key != "instantiate" {
+                return Err(syn::Error::new(
+                    key.span(),
+                    format!(
+                        "unknown claspr::device argument `{key}` — the only supported \
+                         argument is `instantiate(<Placeholder> = [<ty>, ...])`"
+                    ),
+                ));
+            }
+            let inner;
+            syn::parenthesized!(inner in input);
+            let placeholder: syn::Ident = inner.parse()?;
+            inner.parse::<syn::Token![=]>()?;
+            let tys;
+            syn::bracketed!(tys in inner);
+            let tys: syn::punctuated::Punctuated<syn::Ident, syn::Token![,]> =
+                tys.parse_terminated(<syn::Ident as syn::parse::Parse>::parse, syn::Token![,])?;
+            if tys.is_empty() {
+                return Err(syn::Error::new(
+                    placeholder.span(),
+                    "`instantiate` needs at least one type",
+                ));
+            }
+            Ok((
+                placeholder.to_string(),
+                tys.into_iter().map(|t| t.to_string()).collect(),
+            ))
+        })
+        .parse2(list.tokens.clone())
+        .map_err(|e| format!("invalid `instantiate` arguments: {e}"))?;
+        return Ok(Some(parsed));
+    }
+    Ok(None)
 }
 
 fn has_any_claspr_device_attr(attrs: &[syn::Attribute]) -> bool {

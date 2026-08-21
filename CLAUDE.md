@@ -33,7 +33,10 @@ examples/gray-scott/          reusable-graph flagship — reaction-diffusion
 examples/spv-introspect/      SPIR-V introspection helper demo.
 
 tests/kernels, tests/image-kernels, tests/explicit-compile,
-tests/tier1, tests/tier2   integration-test crates (also workspace members).
+tests/instantiate, tests/tier1, tests/tier2
+                           integration-test crates (also workspace members).
+                           tests/instantiate is the single-source showcase
+                           for #[claspr::device(instantiate(...))].
 ```
 
 ## How the single-source pipeline fits together
@@ -44,6 +47,18 @@ User writes one source file (e.g. `examples/collatz/src/main.rs`). It contains:
 - **`#[claspr::device] mod gpu { ... }`** — the device side, in a single tagged module. Inside (user-written): kernel-only `use` statements (cfg-gated to `target_arch = "spirv"` if the host doesn't depend on those crates), `const`s, helper `fn`s, optional `mod foo;` declarations to split the module across files, and one or more `#[claspr::kernel]` entry points (defaults to `kernels = Kernels` — the relative-path `Kernels` resolves to the one the macro injects below). Inside (macro-injected, at the end of the module body): `include!(concat!(env!("OUT_DIR"), "/<modname>.rs"))` (brings `Kernels` + `SPV_BYTES` + `ENTRY_POINTS` + `Kernels::{bind,load_from,load}` in) and a `pub fn kernels(ctx) -> Result<Kernels>` convenience wrapper (which calls `Kernels::load_from(ctx, SPV_BYTES)`).
 - The user does *not* need to import `spirv` from spirv-std — `claspr-build`'s preamble injects `use spirv_std::spirv;` because every translated `#[claspr::kernel]` becomes `#[spirv(kernel)]` and the `spirv` proc-macro must be in scope. Anything else (`Image`, `cl::*`, `opencl_std`, `num_traits::Float`, …) the user imports themselves.
 - Calling code reads `let kernels = gpu::kernels(&ctx)?;` then `kernels.collatz_kernel([N], buf, ...).wait()?` (the typed launcher carries the context; no `&ctx` argument, and a terminal like `.wait()` / `.submit()` runs it). Multiple `#[claspr::device]` modules in the same file each scope their own `Kernels`/`kernels()` — no collisions.
+- **`#[claspr::device(instantiate(Real = [f64, f32]))]`** stamps the module once
+  per listed scalar type: the body is written against the placeholder (`Real`),
+  each stamp becomes a nested host sub-module named after its type (`gpu::f64`,
+  `gpu::f32`) with its own independently compiled SPIR-V + `Kernels` + launchers
+  + `kernels()`. Both sides inject `pub type Real = <ty>;` (claspr-build into the
+  stamped kernel crate, the device macro into each host stamp module) — nothing
+  is textually substituted. The f64 stamp gets `Capability::Float64`
+  automatically; other stamps build without fp64 permission so accidental
+  widening errors out. Kernel sub-crates/outputs are named `<mod>__<ty>`.
+  Showcase + tests: `tests/instantiate`. Not yet done: generated trait unifying
+  the stamps (generic host drivers), per-stamp vector-family aliases, `slots!`
+  generic value types.
 - The build script writes one `OUT_DIR/<modname>.rs` per device module it finds — the macro's injected include matches the module ident, so module name is the only piece of coupling between the build-script side and the host source. Top-level `#[claspr::kernel]` / `#[claspr::device]` items outside any module are rejected: organise kernel code into a module so the per-module file naming has something to key off.
 
 Two compilation paths run on the same source:

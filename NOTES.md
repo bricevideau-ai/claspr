@@ -140,6 +140,21 @@ DOUBLE timestep (directions/extents as literals, dt scalars mutated ≤2x/run) g
 
 ### Generic device-module instantiation — `#[claspr::device(instantiate(Real = [f64, f32]))]`
 
+**MVP LANDED 2026-08-21** (`tests/instantiate` is the showcase): attribute grammar
+(claspr-macros + mirrored claspr-build parser — keep in sync), per-stamp kernel
+sub-crates + host stamp sub-modules (`gpu::f64` / `gpu::f32`), alias injection on
+both sides (no substitution), auto-`Float64` for f64 stamps only (verified by a
+capability-walk test: f32 stamp SPIR-V is Float64-free), 4/4 tests green on 3 ICDs.
+Remaining, in order of value: (1) the generated `trait` unifying stamp surfaces so
+drivers are written once (`fn run<R, K: GpuKernels<R>>`) — the showcase's
+`axpb_round_trip!` macro marks exactly what it erases; (2) per-stamp vector-family
+aliases (`RealVec3` → `DVec3`/`Vec3`, `Real4` → `cl::Double4`/`Float4`) — near-term
+bridge needing no rust-gpu changes; longer-term, test whether generic
+`#[spirv(vector)]` structs already monomorphize correctly in rust-gpu codegen
+(Brice: vector library may need work); (3) `slots!` generic value type (~15 lines).
+Limitation to document if it bites: the extra stamp-module level shifts `super::`
+paths in the body by one.
+
 From the miniWeather port (2026-08-20): a precision-generic app must duplicate its device
 module per width today — 297 of the port's 1,005 code lines were a textual f64→f32 copy,
 because kernels can't be generic and the proc-macro/build scan can't see macro-generated

@@ -163,8 +163,55 @@ pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `#[claspr::kernel]` or `#[claspr::device]` are host-only —
 /// `claspr-build` skips them when generating the kernel crate, so
 /// things like `use claspr::*` and `fn main()` work normally.
+///
+/// # Instantiation: one module, several scalar widths
+///
+/// `#[claspr::device(instantiate(Real = [f64, f32]))]` stamps the
+/// module once per listed type. Write the body against the placeholder
+/// (`Real`); each stamp becomes a nested sub-module named after its
+/// type (`gpu::f64`, `gpu::f32`), holding a complete, independently
+/// compiled surface: its own SPIR-V module, `Kernels` struct, typed
+/// launchers, and `kernels()` constructor. Both sides resolve the
+/// placeholder through an injected `pub type Real = <ty>;` — no
+/// signature is ever textually substituted.
+///
+/// Each stamp is its own SPIR-V module by design: SPIR-V entry points
+/// cannot be generic, and one module carrying both widths would
+/// declare `Float64` and fail to load on devices without fp64. The
+/// `f64` stamp gets the `Float64` capability automatically; every
+/// other stamp builds without it, so accidental widening in shared
+/// code is a build error rather than a portability regression.
+///
+/// ```ignore
+/// #[claspr::device(instantiate(Real = [f64, f32]))]
+/// mod gpu {
+///     #[claspr::kernel]
+///     pub fn axpb(
+///         #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
+///         #[spirv(cross_workgroup)] a: &[Real],
+///         #[spirv(cross_workgroup)] out: &mut [Real],
+///         factor: Real,
+///         offset: Real,
+///     ) { let i = id.x; out[i] = a[i] * factor + offset; }
+/// }
+///
+/// // host code — one surface per stamp:
+/// let k64 = gpu::f64::kernels(&ctx)?;
+/// let k32 = gpu::f32::kernels(&ctx)?;
+/// ```
+///
+/// Current limitations: the placeholder must be a plain scalar type
+/// ident; vector families (`Vec3` vs `DVec3`, `cl::Float4` vs
+/// `cl::Double4`) are not yet aliased per stamp; and the extra module
+/// level shifts `super::` paths in the body by one. A generated
+/// `trait` unifying the stamps' surfaces (so drivers can be written
+/// once, generically) is planned — see `NOTES.md`.
 #[proc_macro_attribute]
-pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn device(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let instantiate = match syn::parse::<DeviceArgs>(attr) {
+        Ok(args) => args.instantiate,
+        Err(e) => return e.to_compile_error().into(),
+    };
     let item_ts: TokenStream2 = item.into();
     // Parse to decide between the fn form and the mod form.
     let parsed: syn::Result<syn::Item> = syn::parse2(item_ts.clone());
@@ -184,6 +231,9 @@ pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
             )
             .to_compile_error()
             .into();
+        }
+        if let Some(spec) = instantiate {
+            return expand_instantiated_device_module(item_mod, &spec);
         }
         if let Some((_, items)) = &mut item_mod.content {
             // Append the include and the convenience `kernels()` fn
@@ -231,36 +281,7 @@ pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => None,
                 })
                 .collect();
-            let kernels_fn: syn::Item = syn::parse_quote! {
-                /// Build the program from the embedded SPIR-V and look up every entry point.
-                ///
-                /// Thin wrapper around `Kernels::load_from(ctx, SPV_BYTES)` —
-                /// the same `load_from` that any `claspr::kernels!`-generated
-                /// `Kernels` exposes — plus a cross-check that every typed
-                /// launcher declared in this module has a matching entry
-                /// point in the compiled SPIR-V, so host/kernel drift is a
-                /// constructor `Err`, not a first-launch panic.
-                pub fn kernels(ctx: &::claspr::Context) -> ::claspr::Result<Kernels> {
-                    const __CLASPR_LAUNCHER_ENTRY_POINTS: &[&str] = &[
-                        #( #launcher_names ),*
-                    ];
-                    let k = Kernels::load_from(ctx, SPV_BYTES)?;
-                    for name in __CLASPR_LAUNCHER_ENTRY_POINTS {
-                        if ::claspr::Kernel::create(&k.__claspr_program, name).is_err() {
-                            return ::core::result::Result::Err(::claspr::Error::Build {
-                                log: ::std::format!(
-                                    "host launcher `{name}` has no matching entry point in the \
-                                     compiled SPIR-V (available: {ENTRY_POINTS:?}). The host \
-                                     wrapper and the kernel build are out of sync — stale \
-                                     OUT_DIR (try a clean build), a renamed kernel, or an \
-                                     entry point the kernel compiler dropped."
-                                ),
-                            });
-                        }
-                    }
-                    ::core::result::Result::Ok(k)
-                }
-            };
+            let kernels_fn = device_kernels_ctor(&launcher_names);
             items.push(include_item);
             items.push(kernels_fn);
         }
@@ -269,6 +290,15 @@ pub fn device(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #[allow(dead_code, unused_imports)]
             #body
         }
+        .into();
+    }
+    if instantiate.is_some() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "claspr::device: `instantiate(...)` is only supported on device \
+             modules (`#[claspr::device(instantiate(...))] mod gpu { ... }`)",
+        )
+        .to_compile_error()
         .into();
     }
     // Function form (or anything else): same `#[allow(...)]` wrap as
@@ -2560,6 +2590,196 @@ fn is_claspr_kernel_attr(attr: &Attribute) -> bool {
         [single] => single == "kernel",
         [first, second] => first == "claspr" && second == "kernel",
         _ => false,
+    }
+}
+
+/// Parsed `#[claspr::device(...)]` arguments. Empty args = plain device
+/// module (the common case). The only recognised key today is
+/// `instantiate(<Placeholder> = [<ty>, ...])`.
+struct DeviceArgs {
+    instantiate: Option<InstantiateSpec>,
+}
+
+/// `instantiate(Real = [f64, f32])` — stamp the device module once per
+/// listed type, with `pub type <Placeholder> = <ty>;` injected into each
+/// stamp (kernel-crate side by claspr-build, host side by this macro).
+struct InstantiateSpec {
+    placeholder: syn::Ident,
+    types: Vec<syn::Ident>,
+}
+
+impl syn::parse::Parse for DeviceArgs {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        if input.is_empty() {
+            return Ok(Self { instantiate: None });
+        }
+        let key: syn::Ident = input.parse()?;
+        if key != "instantiate" {
+            return Err(syn::Error::new(
+                key.span(),
+                format!(
+                    "claspr::device: unknown argument `{key}` — the only \
+                     supported argument is `instantiate(<Placeholder> = [<ty>, ...])`"
+                ),
+            ));
+        }
+        let inner;
+        syn::parenthesized!(inner in input);
+        let placeholder: syn::Ident = inner.parse()?;
+        inner.parse::<syn::Token![=]>()?;
+        let list;
+        syn::bracketed!(list in inner);
+        let types: syn::punctuated::Punctuated<syn::Ident, syn::Token![,]> =
+            list.parse_terminated(syn::Ident::parse, syn::Token![,])?;
+        let types: Vec<syn::Ident> = types.into_iter().collect();
+        if types.is_empty() {
+            return Err(syn::Error::new(
+                placeholder.span(),
+                "claspr::device: `instantiate` needs at least one type \
+                 (`instantiate(Real = [f64, f32])`)",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for ty in &types {
+            if !seen.insert(ty.to_string()) {
+                return Err(syn::Error::new(
+                    ty.span(),
+                    format!("claspr::device: duplicate instantiate type `{ty}`"),
+                ));
+            }
+        }
+        if !inner.is_empty() {
+            return Err(syn::Error::new(
+                inner.span(),
+                "claspr::device: unexpected tokens after the instantiate type list",
+            ));
+        }
+        if !input.is_empty() {
+            return Err(syn::Error::new(
+                input.span(),
+                "claspr::device: unexpected tokens after `instantiate(...)`",
+            ));
+        }
+        Ok(Self {
+            instantiate: Some(InstantiateSpec { placeholder, types }),
+        })
+    }
+}
+
+/// Expand `#[claspr::device(instantiate(Real = [f64, f32]))] mod gpu`:
+/// the module body is stamped once per listed type into a nested
+/// sub-module named after the type (`gpu::f64`, `gpu::f32`), each stamp
+/// getting `pub type Real = <ty>;` prepended plus its own generated-file
+/// include and `kernels()` constructor. `#[claspr::kernel]` attrs inside
+/// the copied bodies expand per-stamp, so every launcher is typed against
+/// that stamp's `Real` with no substitution anywhere.
+///
+/// Limitation: the extra module level means `super::` paths in the user's
+/// body resolve one level deeper than in a plain device module.
+fn expand_instantiated_device_module(
+    mut item_mod: syn::ItemMod,
+    spec: &InstantiateSpec,
+) -> TokenStream {
+    let mod_name = item_mod.ident.to_string();
+    let Some((brace, original_items)) = item_mod.content.take() else {
+        unreachable!("no-body modules are rejected before instantiate expansion");
+    };
+
+    // Same launcher inventory as the single-module path: names of
+    // ungated `#[claspr::kernel]` fns, checked against the compiled
+    // entry points in each stamp's `kernels()` constructor.
+    let launcher_names: Vec<String> = original_items
+        .iter()
+        .filter_map(|it| match it {
+            syn::Item::Fn(f)
+                if f.attrs.iter().any(is_claspr_kernel_attr)
+                    && !f
+                        .attrs
+                        .iter()
+                        .any(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr")) =>
+            {
+                Some(f.sig.ident.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+
+    let placeholder = &spec.placeholder;
+    let stamp_mods: Vec<syn::Item> = spec
+        .types
+        .iter()
+        .map(|ty| {
+            let mut items = original_items.clone();
+            let alias_doc = format!(
+                "Instantiation alias: `{placeholder}` = `{ty}` in this stamp \
+                 of device module `{mod_name}`."
+            );
+            let alias: syn::Item = syn::parse_quote! {
+                #[doc = #alias_doc]
+                #[allow(dead_code)]
+                pub type #placeholder = #ty;
+            };
+            items.insert(0, alias);
+
+            let stamp_filename = format!("/{mod_name}__{ty}.rs");
+            let include_item: syn::Item = syn::parse_quote! {
+                include!(concat!(env!("OUT_DIR"), #stamp_filename));
+            };
+            let kernels_fn = device_kernels_ctor(&launcher_names);
+            items.push(include_item);
+            items.push(kernels_fn);
+
+            syn::parse_quote! {
+                pub mod #ty {
+                    #(#items)*
+                }
+            }
+        })
+        .collect();
+
+    item_mod.content = Some((brace, stamp_mods));
+    let body = quote! { #item_mod };
+    quote! {
+        #[allow(dead_code, unused_imports)]
+        #body
+    }
+    .into()
+}
+
+/// The `kernels()` constructor appended to every device-module scope
+/// (plain modules and each instantiate stamp): `Kernels::load_from` on the
+/// embedded SPIR-V plus a constructor-time cross-check that every typed
+/// launcher has a matching compiled entry point.
+fn device_kernels_ctor(launcher_names: &[String]) -> syn::Item {
+    syn::parse_quote! {
+        /// Build the program from the embedded SPIR-V and look up every entry point.
+        ///
+        /// Thin wrapper around `Kernels::load_from(ctx, SPV_BYTES)` —
+        /// the same `load_from` that any `claspr::kernels!`-generated
+        /// `Kernels` exposes — plus a cross-check that every typed
+        /// launcher declared in this module has a matching entry
+        /// point in the compiled SPIR-V, so host/kernel drift is a
+        /// constructor `Err`, not a first-launch panic.
+        pub fn kernels(ctx: &::claspr::Context) -> ::claspr::Result<Kernels> {
+            const __CLASPR_LAUNCHER_ENTRY_POINTS: &[&str] = &[
+                #( #launcher_names ),*
+            ];
+            let k = Kernels::load_from(ctx, SPV_BYTES)?;
+            for name in __CLASPR_LAUNCHER_ENTRY_POINTS {
+                if ::claspr::Kernel::create(&k.__claspr_program, name).is_err() {
+                    return ::core::result::Result::Err(::claspr::Error::Build {
+                        log: ::std::format!(
+                            "host launcher `{name}` has no matching entry point in the \
+                             compiled SPIR-V (available: {ENTRY_POINTS:?}). The host \
+                             wrapper and the kernel build are out of sync — stale \
+                             OUT_DIR (try a clean build), a renamed kernel, or an \
+                             entry point the kernel compiler dropped."
+                        ),
+                    });
+                }
+            }
+            ::core::result::Result::Ok(k)
+        }
     }
 }
 

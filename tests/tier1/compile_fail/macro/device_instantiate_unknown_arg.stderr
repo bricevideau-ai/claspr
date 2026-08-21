@@ -1,0 +1,8 @@
+error: claspr::device: unknown argument `frobnicate` — the only supported argument is `instantiate(<Placeholder> = [<ty>, ...])`
+ --> compile_fail/macro/device_instantiate_unknown_arg.rs:4:18
+  |
+4 | #[claspr::device(frobnicate = 3)]
+  |                  ^^^^^^^^^^
+
+error: aborting due to 1 previous error
+
