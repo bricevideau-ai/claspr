@@ -170,10 +170,15 @@ first, designing the trait second):
 Remaining, in order of value: (1) the generated `trait` unifying stamp surfaces so
 drivers are written once (`fn run<R, K: GpuKernels<R>>`) — the showcase's
 `axpb_round_trip!` macro marks exactly what it erases; (2) per-stamp vector-family
-aliases (`RealVec3` → `DVec3`/`Vec3`, `Real4` → `cl::Double4`/`Float4`) — near-term
-bridge needing no rust-gpu changes; longer-term, test whether generic
-`#[spirv(vector)]` structs already monomorphize correctly in rust-gpu codegen
-(Brice: vector library may need work); (3) `slots!` generic value type (~15 lines).
+aliases (`RealVec3` → `DVec3`/`Vec3`, `Real4` → `cl::Double4`/`Float4`) — PROBE
+ANSWERED 2026-08-21 (rust-gpu `91323ce1b02`, pinned compiletest): generic
+`#[rust_gpu::vector]` structs DO monomorphize into valid OpTypeVector at
+f32/f64/u32 with per-element capability validation — so `spirv_std::cl` can grow
+a generic layer for IN-KERNEL vector math. But the HOST-ABI half stays concrete:
+a generic struct can't express the element-dependent `repr(align(N))` the cl::*
+types carry, so vector-typed KERNEL PARAMETERS (buffers of vectors) keep needing
+the aligned concrete types → per-stamp alias families remain the right bridge for
+signatures, generic cl vectors the right tool inside kernel bodies; (3) `slots!` generic value type (~15 lines).
 Limitation to document if it bites: the extra stamp-module level shifts `super::`
 paths in the body by one.
 
