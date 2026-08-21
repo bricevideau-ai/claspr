@@ -35,6 +35,73 @@ pub mod gpu {
 }
 
 #[cfg(test)]
+mod tests_generic_driver {
+    use super::*;
+    use claspr::eager::DeviceOpExt;
+    use claspr::{Context, DeviceSlice};
+    use claspr_test_support::ctx;
+
+    const N: usize = 64;
+
+    /// THE trait payoff: ONE driver, written once, generic over the width —
+    /// no macro, no per-width copies. Runs the axpb kernel through the
+    /// generated `gpu::Kernels<Real>` trait via Tier-2 verbs (the opaque
+    /// `DeviceOp` returns don't expose the Tier-1 inherent terminals).
+    fn axpb_generic<Real, K>(ctx: &Context, factor: Real, offset: Real) -> Vec<Real>
+    where
+        K: gpu::Kernels<Real>,
+        Real: Copy + Default + Send + Sync + 'static + From<u8>,
+        // Scalars convert into kernel-arg positions via per-type `From` impls
+        // (kept non-blanket for coherence with the `slot!` conversion), so a
+        // width-generic driver states the conversion as a bound — satisfied
+        // by every scalar width.
+        claspr::ScalarInput<Real>: From<Real>,
+    {
+        let kernels = K::kernels(ctx).expect("load stamp via trait");
+        let input: Vec<Real> = (0..N).map(|i| Real::from((i % 100) as u8)).collect();
+        let a = DeviceSlice::<Real>::from_vec(ctx, input).expect("alloc a");
+        let out = DeviceSlice::<Real>::from_vec(ctx, vec![Real::default(); N]).expect("alloc out");
+
+        let g = kernels.axpb([N], a, out, factor, offset);
+        let (_a, co) = g.sync(ctx).expect("sync");
+        let view = co.map().wait().expect("readback");
+        view.to_vec()
+    }
+
+    #[test]
+    fn one_generic_driver_runs_both_widths() {
+        let Some(ctx) = ctx() else { return };
+        let got32 = axpb_generic::<f32, gpu::f32::Kernels>(&ctx, 2.0, 0.5);
+        assert!(
+            got32
+                .iter()
+                .enumerate()
+                .all(|(i, &x)| x == ((i % 100) as f32) * 2.0 + 0.5),
+            "f32 stamp through the generic driver",
+        );
+
+        let has_f64 = ctx
+            .device()
+            .cl3()
+            .double_fp_config()
+            .map(|v| v != 0)
+            .unwrap_or(false);
+        if !has_f64 {
+            eprintln!("SKIP: device has no Float64 capability (f64 leg)");
+            return;
+        }
+        let got64 = axpb_generic::<f64, gpu::f64::Kernels>(&ctx, 2.0, 0.5);
+        assert!(
+            got64
+                .iter()
+                .enumerate()
+                .all(|(i, &x)| x == ((i % 100) as f64) * 2.0 + 0.5),
+            "f64 stamp through the SAME generic driver",
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use claspr::{Context, DeviceSlice};

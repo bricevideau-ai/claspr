@@ -60,9 +60,13 @@ User writes one source file (e.g. `examples/collatz/src/main.rs`). It contains:
   is textually substituted. The f64 stamp gets `Capability::Float64`
   automatically; other stamps build without fp64 permission so accidental
   widening errors out. Kernel sub-crates/outputs are named `<mod>__<ty>`.
-  Showcase + tests: `tests/instantiate`. Not yet done: generated trait unifying
-  the stamps (generic host drivers), per-stamp vector-family aliases, `slots!`
-  generic value types.
+  The macro ALSO emits `pub trait Kernels<Real>` in the module (impl'd by every
+  stamp; launcher methods return pinned opaque `impl DeviceOp`s) so host drivers
+  are written ONCE: `fn run<Real, K: gpu::Kernels<Real>>` — see
+  `examples/miniweather` for the full-scale form and `tests/instantiate` for the
+  minimal one. Generic slot tags (`slots! { Tag<R>: R }`) pair with it. Not yet
+  done: per-stamp vector-family aliases; image-param kernels are excluded from
+  the generated trait (stamp modules still expose them).
 - The build script writes one `OUT_DIR/<modname>.rs` per device module it finds — the macro's injected include matches the module ident, so module name is the only piece of coupling between the build-script side and the host source. Top-level `#[claspr::kernel]` / `#[claspr::device]` items outside any module are rejected: organise kernel code into a module so the per-module file naming has something to key off.
 
 Two compilation paths run on the same source:

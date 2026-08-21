@@ -2705,6 +2705,73 @@ fn expand_instantiated_device_module(
         .collect();
 
     let placeholder = &spec.placeholder;
+
+    // The width-generic trait surface. Its generic parameter is the
+    // PLACEHOLDER IDENT ITSELF, and each stamp's impl is emitted INSIDE the
+    // stamp module (where `Real` is already aliased to the stamp's concrete
+    // type) — so the trait declaration and every impl reuse the exact same
+    // signature tokens with zero substitution, the same trick the stamps and
+    // the kernel crates use.
+    let kernel_fns: Vec<&syn::ItemFn> = original_items
+        .iter()
+        .filter_map(|it| match it {
+            syn::Item::Fn(f)
+                if f.attrs.iter().any(is_claspr_kernel_attr)
+                    && !f
+                        .attrs
+                        .iter()
+                        .any(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr")) =>
+            {
+                Some(f)
+            }
+            _ => None,
+        })
+        .collect();
+    let (trait_method_decls, trait_method_impls, trait_skipped) =
+        match instantiate_trait_methods(&kernel_fns) {
+            Ok(v) => v,
+            Err(e) => return e.to_compile_error().into(),
+        };
+    let trait_doc = format!(
+        "Width-generic surface over every `{mod_name}` stamp: one `impl` per \
+         instantiated type, so a driver written as `fn run<{placeholder}, K: \
+         {mod_name}::Kernels<{placeholder}>>` runs at every width. Launcher \
+         methods return opaque [`DeviceOp`](claspr::DeviceOp)s with `Output` / \
+         `Handle` / `Checkouts` pinned, so Tier-2 graph building (`and_then` / \
+         `bind` / `sync` / `mutate_call`) type-checks exactly as with the \
+         concrete launchers; the Tier-1 inherent terminals (`.wait()` / \
+         `.submit()`) are not visible through the trait — use \
+         [`DeviceOpExt`](claspr::eager::DeviceOpExt) verbs in generic code.{}",
+        if trait_skipped.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Kernels NOT covered by the trait (image parameters are not \
+                 yet supported in trait generation; call them via the stamp \
+                 modules): {}.",
+                trait_skipped.join(", ")
+            )
+        }
+    );
+    let trait_item: syn::Item = syn::parse_quote! {
+        #[doc = #trait_doc]
+        pub trait Kernels<#placeholder>: ::core::marker::Sized {
+            /// Load the stamp's embedded SPIR-V and cross-check every typed
+            /// launcher against the compiled entry points — the trait form of
+            /// the per-stamp `kernels()` constructor.
+            fn kernels(ctx: &::claspr::Context) -> ::claspr::Result<Self>;
+            #(#trait_method_decls)*
+        }
+    };
+    let stamp_trait_impl: syn::Item = syn::parse_quote! {
+        impl super::Kernels<#placeholder> for Kernels {
+            fn kernels(ctx: &::claspr::Context) -> ::claspr::Result<Self> {
+                kernels(ctx)
+            }
+            #(#trait_method_impls)*
+        }
+    };
+
     let stamp_mods: Vec<syn::Item> = spec
         .types
         .iter()
@@ -2728,6 +2795,7 @@ fn expand_instantiated_device_module(
             let kernels_fn = device_kernels_ctor(&launcher_names);
             items.push(include_item);
             items.push(kernels_fn);
+            items.push(stamp_trait_impl.clone());
 
             syn::parse_quote! {
                 pub mod #ty {
@@ -2737,13 +2805,130 @@ fn expand_instantiated_device_module(
         })
         .collect();
 
-    item_mod.content = Some((brace, stamp_mods));
+    let mut module_items = stamp_mods;
+    module_items.push(trait_item);
+    item_mod.content = Some((brace, module_items));
     let body = quote! { #item_mod };
     quote! {
         #[allow(dead_code, unused_imports)]
         #body
     }
     .into()
+}
+
+/// Build the width-generic trait's launcher-method surface for an
+/// instantiated device module: one bodyless declaration + one delegating impl
+/// item per `#[claspr::kernel]` fn, both spelled with the SAME tokens (the
+/// placeholder ident resolves to the trait's generic parameter in the
+/// declaration and to the stamp's `Real` alias in the impls). Returns
+/// `(decls, impls, skipped_kernel_names)` — kernels with image parameters (or
+/// with no buffer output at all) are skipped and listed in the trait docs.
+///
+/// Signatures mirror `expand_kernel`'s emitted launchers exactly (per-arg
+/// `D`/`S` generic pairs for slices and scalar-refs, `Into<ScalarInput<_>>`
+/// for scalars, `Into<ScalarInput<LaunchSpec>>` for the grid); the return type
+/// is an opaque `impl DeviceOp` with `Output`/`Handle`/`Checkouts` pinned to
+/// the same types the concrete Op advertises, so graph building through the
+/// trait type-checks identically.
+fn instantiate_trait_methods(
+    kernel_fns: &[&ItemFn],
+) -> syn::Result<(Vec<TokenStream2>, Vec<TokenStream2>, Vec<String>)> {
+    let mut decls = Vec::new();
+    let mut impls = Vec::new();
+    let mut skipped = Vec::new();
+    'fns: for func in kernel_fns {
+        let name = &func.sig.ident;
+        let mut gens: Vec<TokenStream2> = Vec::new();
+        let mut params: Vec<TokenStream2> = Vec::new();
+        let mut arg_names: Vec<TokenStream2> = Vec::new();
+        let mut outs: Vec<TokenStream2> = Vec::new();
+        let mut idx = 0usize;
+        for arg in &func.sig.inputs {
+            let syn::FnArg::Typed(pt) = arg else { continue };
+            match classify_param(pt)? {
+                ParamRole::Builtin => {}
+                ParamRole::Slice {
+                    name: pname,
+                    elem,
+                    mutable,
+                }
+                | ParamRole::ScalarRef {
+                    name: pname,
+                    elem,
+                    mutable,
+                } => {
+                    let d = quote::format_ident!("__claspr_TD{idx}");
+                    let s = quote::format_ident!("__claspr_TS{idx}");
+                    let bound = if mutable {
+                        quote! { ::claspr::KernelSliceReadWriteArg<#elem> }
+                    } else {
+                        quote! { ::claspr::KernelSliceReadArg<#elem> }
+                    };
+                    gens.push(quote! { #d: #bound });
+                    gens.push(quote! { #s: ::claspr::ToInput<#elem, Buf = #d> });
+                    params.push(quote! { #pname: #s });
+                    arg_names.push(pname);
+                    outs.push(quote! { #d });
+                    idx += 1;
+                }
+                ParamRole::Scalar { name: pname, ty } => {
+                    let ss = quote::format_ident!("__claspr_TSS{idx}");
+                    gens.push(quote! { #ss: ::core::convert::Into<::claspr::ScalarInput<#ty>> });
+                    params.push(quote! { #pname: #ss });
+                    arg_names.push(pname);
+                    idx += 1;
+                }
+                ParamRole::Image { .. } => {
+                    skipped.push(name.to_string());
+                    continue 'fns;
+                }
+            }
+        }
+        if outs.is_empty() {
+            // No buffer output — nothing to pin `Output` to; the concrete
+            // launcher shape differs. Callers use the stamp modules.
+            skipped.push(name.to_string());
+            continue;
+        }
+        let ret = if outs.len() == 1 {
+            let d = &outs[0];
+            quote! {
+                impl ::claspr::DeviceOp<
+                    Output = #d,
+                    Handle = ::claspr::Pipe<#d>,
+                    Checkouts = ::claspr::Checkout<#d>,
+                >
+            }
+        } else {
+            quote! {
+                impl ::claspr::DeviceOp<
+                    Output = ( #(#outs),* ),
+                    Handle = ( #(::claspr::Pipe<#outs>),* ),
+                    Checkouts = ( #(::claspr::Checkout<#outs>),* ),
+                >
+            }
+        };
+        let doc = format!("Width-generic form of the `{name}` launcher.");
+        let sig = quote! {
+            fn #name< #(#gens),* >(
+                &self,
+                grid: impl ::core::convert::Into<::claspr::ScalarInput<::claspr::LaunchSpec>>,
+                #(#params),*
+            ) -> #ret
+        };
+        decls.push(quote! {
+            #[doc = #doc]
+            #[allow(clippy::too_many_arguments)]
+            #sig;
+        });
+        impls.push(quote! {
+            #[allow(clippy::too_many_arguments)]
+            #sig {
+                Kernels::#name(self, grid, #(#arg_names),*)
+            }
+        });
+    }
+    Ok((decls, impls, skipped))
 }
 
 /// The `kernels()` constructor appended to every device-module scope

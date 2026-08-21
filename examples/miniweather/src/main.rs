@@ -9,9 +9,10 @@
 //! written ONCE against the placeholder `Real` and stamped per width by
 //! `#[claspr::device(instantiate(Real = [f64, f32]))]` — no per-width kernel
 //! copies, no separate kernel crate, no hand-stamped signature lists. The
-//! per-width HOST driver still goes through `make_runner!`; that macro is
-//! precisely the boilerplate the planned generated `GpuKernels<Real>` trait
-//! will erase (see claspr NOTES.md).
+//! HOST driver is width-generic too: ONE `fn run<Real, K: gpu::Kernels<Real>>`
+//! drives both stamps through the generated `gpu::Kernels<Real>` trait (the
+//! only per-width text left in this file is the two-line dispatch in `main`
+//! and the `Width` cast helper).
 //!
 //! The whole timestep (6 semi-steps x 4 kernels = 24 dispatches) is ONE
 //! Tier-2 eager graph, built once and replayed with `sync` every DOUBLE
@@ -717,212 +718,101 @@ slots! {
 
 // ── Tier-2 driver, instantiated per precision ────────────────────────────────
 
-macro_rules! make_runner {
-    ($runner:ident, $stamp:path, $ty:ty) => {
-        mod $runner {
-            use super::*;
+/// The example's numeric-width bound: host-boundary casts for a
+/// width-generic driver (claspr itself stays numeric-agnostic).
+trait Width:
+    Copy + Default + Send + Sync + 'static + claspr::SlotValue + claspr::eager::SlotEq
+{
+    fn of(v: f64) -> Self;
+    fn to_f64(self) -> f64;
+}
+impl Width for f64 {
+    fn of(v: f64) -> Self {
+        v
+    }
+    fn to_f64(self) -> f64 {
+        self
+    }
+}
+impl Width for f32 {
+    fn of(v: f64) -> Self {
+        v as f32
+    }
+    fn to_f64(self) -> f64 {
+        self as f64
+    }
+}
 
+/// Run the case on the device; returns (initial, final) state as
+/// f64 (initial = after the precision round-trip, i.e. exactly
+/// what the device evolved from).
+fn run<Real, K>(ctx: &Context, cfg: &Config, init: &Init) -> claspr::Result<(Vec<f64>, Vec<f64>)>
+where
+    K: gpu::Kernels<Real>,
+    Real: Width,
+    claspr::ScalarInput<Real>: From<Real>,
+{
+    let (nx, nz) = (cfg.nx, cfg.nz);
+    let dx = XLEN / nx as f64;
+    let dzf = ZLEN / nz as f64;
+    let nxp = nx + 2 * HS;
+    let state_len = 4 * (nz + 2 * HS) * nxp;
 
-            /// Run the case on the device; returns (initial, final) state as
-            /// f64 (initial = after the precision round-trip, i.e. exactly
-            /// what the device evolved from).
-            pub fn run(
-                ctx: &Context,
-                cfg: &Config,
-                init: &Init,
-            ) -> claspr::Result<(Vec<f64>, Vec<f64>)> {
-                let (nx, nz) = (cfg.nx, cfg.nz);
-                let dx = XLEN / nx as f64;
-                let dzf = ZLEN / nz as f64;
-                let nxp = nx + 2 * HS;
-                let state_len = 4 * (nz + 2 * HS) * nxp;
+    let cast = |v: &[f64]| -> Vec<Real> { v.iter().map(|&x| Real::of(x)).collect() };
+    let state_h = cast(&init.state);
+    let state0: Vec<f64> = state_h.iter().map(|&x| x.to_f64()).collect();
 
-                let cast = |v: &[f64]| -> Vec<$ty> { v.iter().map(|&x| x as $ty).collect() };
-                let state_h = cast(&init.state);
-                let state0: Vec<f64> = state_h.iter().map(|&x| x as f64).collect();
+    let ks = K::kernels(ctx)?;
+    let s = DeviceSlice::<Real>::from_vec(ctx, state_h.clone())?;
+    let t = DeviceSlice::<Real>::from_vec(ctx, state_h)?;
+    let fx = DeviceSlice::<Real>::alloc_zero(ctx, 4 * (nz + 1) * (nx + 1))?;
+    let td = DeviceSlice::<Real>::alloc_zero(ctx, 4 * nz * nx)?;
+    // Read-only hydrostatic arrays: Arc-shared, one clone bound as
+    // a literal at every dispatch site that reads them (the Arc
+    // fan-out pattern; no pipe threading, no slots).
+    let hd = std::sync::Arc::new(DeviceSlice::<Real>::from_vec(ctx, cast(&init.hy_d))?);
+    let hdt = std::sync::Arc::new(DeviceSlice::<Real>::from_vec(ctx, cast(&init.hy_dt))?);
+    let hdi = std::sync::Arc::new(DeviceSlice::<Real>::from_vec(ctx, cast(&init.hy_di))?);
+    let hdti = std::sync::Arc::new(DeviceSlice::<Real>::from_vec(ctx, cast(&init.hy_dti))?);
+    let hpi = std::sync::Arc::new(DeviceSlice::<Real>::from_vec(ctx, cast(&init.hy_pi))?);
+    let (hd, hdt, hdi, hdti, hpi) = (&hd, &hdt, &hdi, &hdti, &hpi);
 
-                use $stamp as stamp;
-                let ks = stamp::kernels(ctx)?;
-                let s = DeviceSlice::<$ty>::from_vec(ctx, state_h.clone())?;
-                let t = DeviceSlice::<$ty>::from_vec(ctx, state_h)?;
-                let fx = DeviceSlice::<$ty>::alloc_zero(ctx, 4 * (nz + 1) * (nx + 1))?;
-                let td = DeviceSlice::<$ty>::alloc_zero(ctx, 4 * nz * nx)?;
-                // Read-only hydrostatic arrays: Arc-shared, one clone bound as
-                // a literal at every dispatch site that reads them (the Arc
-                // fan-out pattern; no pipe threading, no slots).
-                let hd = std::sync::Arc::new(DeviceSlice::<$ty>::from_vec(ctx, cast(&init.hy_d))?);
-                let hdt =
-                    std::sync::Arc::new(DeviceSlice::<$ty>::from_vec(ctx, cast(&init.hy_dt))?);
-                let hdi =
-                    std::sync::Arc::new(DeviceSlice::<$ty>::from_vec(ctx, cast(&init.hy_di))?);
-                let hdti =
-                    std::sync::Arc::new(DeviceSlice::<$ty>::from_vec(ctx, cast(&init.hy_dti))?);
-                let hpi =
-                    std::sync::Arc::new(DeviceSlice::<$ty>::from_vec(ctx, cast(&init.hy_pi))?);
-                let (hd, hdt, hdi, hdti, hpi) = (&hd, &hdt, &hdi, &hdti, &hpi);
+    let nxu = nx as u32;
+    let nzu = nz as u32;
+    let inj = if cfg.case == Case::Injection {
+        1u32
+    } else {
+        0u32
+    };
+    let dz_t = Real::of(dzf);
+    let dx_t = Real::of(dx);
+    let gt = LaunchSpec::from([nx * nz]);
+    let ks = &ks;
 
-                let nxu = nx as u32;
-                let nzu = nz as u32;
-                let inj = if cfg.case == Case::Injection {
-                    1u32
-                } else {
-                    0u32
-                };
-                let dz_t = dzf as $ty;
-                let dx_t = dx as $ty;
-                let gt = LaunchSpec::from([nx * nz]);
-                let ks = &ks;
+    // One graph = one DOUBLE timestep: step 1 is x-first (halves
+    // x, z), step 2 is z-first (halves z, x). Directions and
+    // launch extents are literals, so a steady-state replay
+    // mutates nothing and the recorded command buffer is reused.
+    let gh_x = LaunchSpec::from([nz]);
+    let gh_z = LaunchSpec::from([nxp]);
+    let gf_x = LaunchSpec::from([(nx + 1) * nz]);
+    let gf_z = LaunchSpec::from([nx * (nz + 1)]);
 
-                // One graph = one DOUBLE timestep: step 1 is x-first (halves
-                // x, z), step 2 is z-first (halves z, x). Directions and
-                // launch extents are literals, so a steady-state replay
-                // mutates nothing and the recorded command buffer is reused.
-                let gh_x = LaunchSpec::from([nz]);
-                let gh_z = LaunchSpec::from([nxp]);
-                let gf_x = LaunchSpec::from([(nx + 1) * nz]);
-                let gf_z = LaunchSpec::from([nx * (nz + 1)]);
-
-                // Twelve dispatches of one half-step (3 RK stages x 4 kernels),
-                // Twelve dispatches of one half-step (3 RK stages x 4 kernels),
-                // appended to an existing chain. The four mutable buffers ride
-                // the pipes; the hy arrays enter as Arc clones per site. Free
-                // identifiers (ks, gt, hd, ...) resolve at the expansion site.
-                // rustfmt oscillates on the parameter continuation line of a
-                // macro_rules! nested this deep (adds indentation every pass)
-                // — freeze it.
-                #[rustfmt::skip]
-                macro_rules! half {
-                    ($g:expr, $gh:expr, $gf:expr, $d:expr, $hv1:ident, $hv2:ident, $hv3:ident,
-                                             $dta:ident, $dtb:ident, $dtc:ident) => {
-                        $g.and_then(move |(s, t, fx, td)| {
-                            ks.halo_s(
-                                $gh,
-                                s,
-                                t,
-                                fx,
-                                td,
-                                hd.clone(),
-                                hdt.clone(),
-                                nxu,
-                                nzu,
-                                $d,
-                                inj,
-                                dz_t,
-                            )
-                        })
-                        .and_then(move |(s, t, fx, td, _hd, _hdt)| {
-                            ks.flux_s(
-                                $gf,
-                                s,
-                                t,
-                                fx,
-                                td,
-                                hd.clone(),
-                                hdt.clone(),
-                                hdi.clone(),
-                                hdti.clone(),
-                                hpi.clone(),
-                                nxu,
-                                nzu,
-                                $d,
-                                slot!($hv1<$ty>),
-                            )
-                        })
-                        .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
-                            ks.tend_s(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
-                        })
-                        .and_then(move |(s, t, fx, td)| {
-                            ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dta<$ty>))
-                        })
-                        .and_then(move |(s, t, fx, td)| {
-                            ks.halo_t(
-                                $gh,
-                                s,
-                                t,
-                                fx,
-                                td,
-                                hd.clone(),
-                                hdt.clone(),
-                                nxu,
-                                nzu,
-                                $d,
-                                inj,
-                                dz_t,
-                            )
-                        })
-                        .and_then(move |(s, t, fx, td, _hd, _hdt)| {
-                            ks.flux_t(
-                                $gf,
-                                s,
-                                t,
-                                fx,
-                                td,
-                                hd.clone(),
-                                hdt.clone(),
-                                hdi.clone(),
-                                hdti.clone(),
-                                hpi.clone(),
-                                nxu,
-                                nzu,
-                                $d,
-                                slot!($hv2<$ty>),
-                            )
-                        })
-                        .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
-                            ks.tend_t(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
-                        })
-                        .and_then(move |(s, t, fx, td)| {
-                            ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dtb<$ty>))
-                        })
-                        .and_then(move |(s, t, fx, td)| {
-                            ks.halo_t(
-                                $gh,
-                                s,
-                                t,
-                                fx,
-                                td,
-                                hd.clone(),
-                                hdt.clone(),
-                                nxu,
-                                nzu,
-                                $d,
-                                inj,
-                                dz_t,
-                            )
-                        })
-                        .and_then(move |(s, t, fx, td, _hd, _hdt)| {
-                            ks.flux_t(
-                                $gf,
-                                s,
-                                t,
-                                fx,
-                                td,
-                                hd.clone(),
-                                hdt.clone(),
-                                hdi.clone(),
-                                hdti.clone(),
-                                hpi.clone(),
-                                nxu,
-                                nzu,
-                                $d,
-                                slot!($hv3<$ty>),
-                            )
-                        })
-                        .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
-                            ks.tend_t(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
-                        })
-                        .and_then(move |(s, t, fx, td)| {
-                            ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!($dtc<$ty>))
-                        })
-                    };
-                }
-
-                // Seed dispatch takes the owned buffers; every later half is
-                // uniform. Step 1 = x-first (x half via seed+rest, then z),
-                // step 2 = z-first (z, then x).
-                let g0 = ks
-                    .halo_s(
-                        gh_x,
+    // Twelve dispatches of one half-step (3 RK stages x 4 kernels),
+    // Twelve dispatches of one half-step (3 RK stages x 4 kernels),
+    // appended to an existing chain. The four mutable buffers ride
+    // the pipes; the hy arrays enter as Arc clones per site. Free
+    // identifiers (ks, gt, hd, ...) resolve at the expansion site.
+    // rustfmt oscillates on the parameter continuation line of a
+    // macro_rules! nested this deep (adds indentation every pass)
+    // — freeze it.
+    #[rustfmt::skip]
+        macro_rules! half {
+            ($g:expr, $gh:expr, $gf:expr, $d:expr, $hv1:ident, $hv2:ident, $hv3:ident,
+                                     $dta:ident, $dtb:ident, $dtc:ident) => {
+                $g.and_then(move |(s, t, fx, td)| {
+                    ks.halo_s(
+                        $gh,
                         s,
                         t,
                         fx,
@@ -931,224 +821,338 @@ macro_rules! make_runner {
                         hdt.clone(),
                         nxu,
                         nzu,
-                        0u32,
+                        $d,
                         inj,
                         dz_t,
                     )
-                    .and_then(move |(s, t, fx, td, _hd, _hdt)| {
-                        ks.flux_s(
-                            gf_x,
-                            s,
-                            t,
-                            fx,
-                            td,
-                            hd.clone(),
-                            hdt.clone(),
-                            hdi.clone(),
-                            hdti.clone(),
-                            hpi.clone(),
-                            nxu,
-                            nzu,
-                            0u32,
-                            slot!(H1A1<$ty>),
-                        )
-                    })
-                    .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
-                        ks.tend_s(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
-                    })
-                    .and_then(move |(s, t, fx, td)| {
-                        ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!(Dt1A<$ty>))
-                    })
-                    .and_then(move |(s, t, fx, td)| {
-                        ks.halo_t(
-                            gh_x,
-                            s,
-                            t,
-                            fx,
-                            td,
-                            hd.clone(),
-                            hdt.clone(),
-                            nxu,
-                            nzu,
-                            0u32,
-                            inj,
-                            dz_t,
-                        )
-                    })
-                    .and_then(move |(s, t, fx, td, _hd, _hdt)| {
-                        ks.flux_t(
-                            gf_x,
-                            s,
-                            t,
-                            fx,
-                            td,
-                            hd.clone(),
-                            hdt.clone(),
-                            hdi.clone(),
-                            hdti.clone(),
-                            hpi.clone(),
-                            nxu,
-                            nzu,
-                            0u32,
-                            slot!(H1A2<$ty>),
-                        )
-                    })
-                    .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
-                        ks.tend_t(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
-                    })
-                    .and_then(move |(s, t, fx, td)| {
-                        ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!(Dt1B<$ty>))
-                    })
-                    .and_then(move |(s, t, fx, td)| {
-                        ks.halo_t(
-                            gh_x,
-                            s,
-                            t,
-                            fx,
-                            td,
-                            hd.clone(),
-                            hdt.clone(),
-                            nxu,
-                            nzu,
-                            0u32,
-                            inj,
-                            dz_t,
-                        )
-                    })
-                    .and_then(move |(s, t, fx, td, _hd, _hdt)| {
-                        ks.flux_t(
-                            gf_x,
-                            s,
-                            t,
-                            fx,
-                            td,
-                            hd.clone(),
-                            hdt.clone(),
-                            hdi.clone(),
-                            hdti.clone(),
-                            hpi.clone(),
-                            nxu,
-                            nzu,
-                            0u32,
-                            slot!(H1A3<$ty>),
-                        )
-                    })
-                    .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
-                        ks.tend_t(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
-                    })
-                    .and_then(move |(s, t, fx, td)| {
-                        ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!(Dt1C<$ty>))
-                    });
-                let g1 = half!(g0, gh_z, gf_z, 1u32, H1B1, H1B2, H1B3, Dt1A, Dt1B, Dt1C);
-                let g2 = half!(g1, gh_z, gf_z, 1u32, H2A1, H2A2, H2A3, Dt2A, Dt2B, Dt2C);
-                let g = half!(g2, gh_x, gf_x, 0u32, H2B1, H2B2, H2B3, Dt2A, Dt2B, Dt2C);
-
-                // hv(d, stage, dt) with the dt = 0 no-op convention
-                let hv = |d: f64, q: f64, dt: f64| -> $ty {
-                    if dt == 0.0 {
-                        0.0 as $ty
-                    } else {
-                        (-HV_BETA * d / (16.0 * (dt / q))) as $ty
-                    }
-                };
-
-                let dt0 = dx.min(dzf) / MAX_SPEED * CFL;
-                let bind_all = |dt1: f64, dt2: f64| {
-                    (
-                        Dt1A((dt1 / 3.0) as $ty),
-                        Dt1B((dt1 / 2.0) as $ty),
-                        Dt1C(dt1 as $ty),
-                        Dt2A((dt2 / 3.0) as $ty),
-                        Dt2B((dt2 / 2.0) as $ty),
-                        Dt2C(dt2 as $ty),
-                        H1A1(hv(dx, 3.0, dt1)),
-                        H1A2(hv(dx, 2.0, dt1)),
-                        H1A3(hv(dx, 1.0, dt1)),
-                        H1B1(hv(dzf, 3.0, dt1)),
-                        H1B2(hv(dzf, 2.0, dt1)),
-                        H1B3(hv(dzf, 1.0, dt1)),
-                        H2A1(hv(dzf, 3.0, dt2)),
-                        H2A2(hv(dzf, 2.0, dt2)),
-                        H2A3(hv(dzf, 1.0, dt2)),
-                        H2B1(hv(dx, 3.0, dt2)),
-                        H2B2(hv(dx, 2.0, dt2)),
-                        H2B3(hv(dx, 1.0, dt2)),
+                })
+                .and_then(move |(s, t, fx, td, _hd, _hdt)| {
+                    ks.flux_s(
+                        $gf,
+                        s,
+                        t,
+                        fx,
+                        td,
+                        hd.clone(),
+                        hdt.clone(),
+                        hdi.clone(),
+                        hdti.clone(),
+                        hpi.clone(),
+                        nxu,
+                        nzu,
+                        $d,
+                        slot!($hv1<Real>),
                     )
-                };
-                let b = bind_all(dt0, dt0);
-                let g = g
-                    .bind(b.0)
-                    .bind(b.1)
-                    .bind(b.2)
-                    .bind(b.3)
-                    .bind(b.4)
-                    .bind(b.5)
-                    .bind(b.6)
-                    .bind(b.7)
-                    .bind(b.8)
-                    .bind(b.9)
-                    .bind(b.10)
-                    .bind(b.11)
-                    .bind(b.12)
-                    .bind(b.13)
-                    .bind(b.14)
-                    .bind(b.15)
-                    .bind(b.16)
-                    .bind(b.17);
+                })
+                .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
+                    ks.tend_s(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
+                })
+                .and_then(move |(s, t, fx, td)| {
+                    ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dta<Real>))
+                })
+                .and_then(move |(s, t, fx, td)| {
+                    ks.halo_t(
+                        $gh,
+                        s,
+                        t,
+                        fx,
+                        td,
+                        hd.clone(),
+                        hdt.clone(),
+                        nxu,
+                        nzu,
+                        $d,
+                        inj,
+                        dz_t,
+                    )
+                })
+                .and_then(move |(s, t, fx, td, _hd, _hdt)| {
+                    ks.flux_t(
+                        $gf,
+                        s,
+                        t,
+                        fx,
+                        td,
+                        hd.clone(),
+                        hdt.clone(),
+                        hdi.clone(),
+                        hdti.clone(),
+                        hpi.clone(),
+                        nxu,
+                        nzu,
+                        $d,
+                        slot!($hv2<Real>),
+                    )
+                })
+                .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
+                    ks.tend_t(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
+                })
+                .and_then(move |(s, t, fx, td)| {
+                    ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dtb<Real>))
+                })
+                .and_then(move |(s, t, fx, td)| {
+                    ks.halo_t(
+                        $gh,
+                        s,
+                        t,
+                        fx,
+                        td,
+                        hd.clone(),
+                        hdt.clone(),
+                        nxu,
+                        nzu,
+                        $d,
+                        inj,
+                        dz_t,
+                    )
+                })
+                .and_then(move |(s, t, fx, td, _hd, _hdt)| {
+                    ks.flux_t(
+                        $gf,
+                        s,
+                        t,
+                        fx,
+                        td,
+                        hd.clone(),
+                        hdt.clone(),
+                        hdi.clone(),
+                        hdti.clone(),
+                        hpi.clone(),
+                        nxu,
+                        nzu,
+                        $d,
+                        slot!($hv3<Real>),
+                    )
+                })
+                .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
+                    ks.tend_t(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
+                })
+                .and_then(move |(s, t, fx, td)| {
+                    ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!($dtc<Real>))
+                })
+            };
+        }
 
-                let mut etime = 0.0f64;
-                let mut dt = dt0;
-                let mut bound = (dt0, dt0);
-                let mut final_state = vec![<$ty>::default(); state_len];
-                let mut nstep = 0u64;
-                while etime < cfg.sim_time {
-                    // derive this pair's two step dts with the Fortran's exact
-                    // clamp arithmetic; dt2 = 0 means "no-op second step"
-                    if etime + dt > cfg.sim_time {
-                        dt = cfg.sim_time - etime;
-                    }
-                    let dt1 = dt;
-                    let e1 = etime + dt1;
-                    let dt2 = if e1 < cfg.sim_time {
-                        if e1 + dt > cfg.sim_time {
-                            cfg.sim_time - e1
-                        } else {
-                            dt
-                        }
-                    } else {
-                        0.0
-                    };
-                    if (dt1, dt2) != bound {
-                        let b = bind_all(dt1, dt2);
-                        g.mutate_call((b.0, b.1, b.2, b.3))?;
-                        g.mutate_call((b.4, b.5, b.6, b.7))?;
-                        g.mutate_call((b.8, b.9, b.10, b.11))?;
-                        g.mutate_call((b.12, b.13, b.14, b.15))?;
-                        g.mutate_call((b.16, b.17))?;
-                        bound = (dt1, dt2);
-                    }
-                    if dt2 != 0.0 {
-                        dt = dt2; // the Fortran dt variable persists across steps
-                    }
-                    let co = g.sync(ctx)?;
-                    etime = e1 + dt2;
-                    nstep += if dt2 != 0.0 { 2 } else { 1 };
-                    if etime >= cfg.sim_time {
-                        let (cs, _ct, _cfx, _ctd) = co;
-                        let view = (*cs).map().wait()?;
-                        final_state.copy_from_slice(&view);
-                    }
-                }
-                eprintln!("steps: {nstep}");
-                let final_f64: Vec<f64> = final_state.iter().map(|&x| x as f64).collect();
-                Ok((state0, final_f64))
-            }
+    // Seed dispatch takes the owned buffers; every later half is
+    // uniform. Step 1 = x-first (x half via seed+rest, then z),
+    // step 2 = z-first (z, then x).
+    let g0 = ks
+        .halo_s(
+            gh_x,
+            s,
+            t,
+            fx,
+            td,
+            hd.clone(),
+            hdt.clone(),
+            nxu,
+            nzu,
+            0u32,
+            inj,
+            dz_t,
+        )
+        .and_then(move |(s, t, fx, td, _hd, _hdt)| {
+            ks.flux_s(
+                gf_x,
+                s,
+                t,
+                fx,
+                td,
+                hd.clone(),
+                hdt.clone(),
+                hdi.clone(),
+                hdti.clone(),
+                hpi.clone(),
+                nxu,
+                nzu,
+                0u32,
+                slot!(H1A1<Real>),
+            )
+        })
+        .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
+            ks.tend_s(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
+        })
+        .and_then(move |(s, t, fx, td)| ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!(Dt1A<Real>)))
+        .and_then(move |(s, t, fx, td)| {
+            ks.halo_t(
+                gh_x,
+                s,
+                t,
+                fx,
+                td,
+                hd.clone(),
+                hdt.clone(),
+                nxu,
+                nzu,
+                0u32,
+                inj,
+                dz_t,
+            )
+        })
+        .and_then(move |(s, t, fx, td, _hd, _hdt)| {
+            ks.flux_t(
+                gf_x,
+                s,
+                t,
+                fx,
+                td,
+                hd.clone(),
+                hdt.clone(),
+                hdi.clone(),
+                hdti.clone(),
+                hpi.clone(),
+                nxu,
+                nzu,
+                0u32,
+                slot!(H1A2<Real>),
+            )
+        })
+        .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
+            ks.tend_t(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
+        })
+        .and_then(move |(s, t, fx, td)| ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!(Dt1B<Real>)))
+        .and_then(move |(s, t, fx, td)| {
+            ks.halo_t(
+                gh_x,
+                s,
+                t,
+                fx,
+                td,
+                hd.clone(),
+                hdt.clone(),
+                nxu,
+                nzu,
+                0u32,
+                inj,
+                dz_t,
+            )
+        })
+        .and_then(move |(s, t, fx, td, _hd, _hdt)| {
+            ks.flux_t(
+                gf_x,
+                s,
+                t,
+                fx,
+                td,
+                hd.clone(),
+                hdt.clone(),
+                hdi.clone(),
+                hdti.clone(),
+                hpi.clone(),
+                nxu,
+                nzu,
+                0u32,
+                slot!(H1A3<Real>),
+            )
+        })
+        .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
+            ks.tend_t(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
+        })
+        .and_then(move |(s, t, fx, td)| ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!(Dt1C<Real>)));
+    let g1 = half!(g0, gh_z, gf_z, 1u32, H1B1, H1B2, H1B3, Dt1A, Dt1B, Dt1C);
+    let g2 = half!(g1, gh_z, gf_z, 1u32, H2A1, H2A2, H2A3, Dt2A, Dt2B, Dt2C);
+    let g = half!(g2, gh_x, gf_x, 0u32, H2B1, H2B2, H2B3, Dt2A, Dt2B, Dt2C);
+
+    // hv(d, stage, dt) with the dt = 0 no-op convention
+    let hv = |d: f64, q: f64, dt: f64| -> Real {
+        if dt == 0.0 {
+            Real::of(0.0)
+        } else {
+            Real::of(-HV_BETA * d / (16.0 * (dt / q)))
         }
     };
-}
 
-make_runner!(runner_f64, super::gpu::f64, f64);
-make_runner!(runner_f32, super::gpu::f32, f32);
+    let dt0 = dx.min(dzf) / MAX_SPEED * CFL;
+    let bind_all = |dt1: f64, dt2: f64| {
+        (
+            Dt1A(Real::of(dt1 / 3.0)),
+            Dt1B(Real::of(dt1 / 2.0)),
+            Dt1C(Real::of(dt1)),
+            Dt2A(Real::of(dt2 / 3.0)),
+            Dt2B(Real::of(dt2 / 2.0)),
+            Dt2C(Real::of(dt2)),
+            H1A1(hv(dx, 3.0, dt1)),
+            H1A2(hv(dx, 2.0, dt1)),
+            H1A3(hv(dx, 1.0, dt1)),
+            H1B1(hv(dzf, 3.0, dt1)),
+            H1B2(hv(dzf, 2.0, dt1)),
+            H1B3(hv(dzf, 1.0, dt1)),
+            H2A1(hv(dzf, 3.0, dt2)),
+            H2A2(hv(dzf, 2.0, dt2)),
+            H2A3(hv(dzf, 1.0, dt2)),
+            H2B1(hv(dx, 3.0, dt2)),
+            H2B2(hv(dx, 2.0, dt2)),
+            H2B3(hv(dx, 1.0, dt2)),
+        )
+    };
+    let b = bind_all(dt0, dt0);
+    let g = g
+        .bind(b.0)
+        .bind(b.1)
+        .bind(b.2)
+        .bind(b.3)
+        .bind(b.4)
+        .bind(b.5)
+        .bind(b.6)
+        .bind(b.7)
+        .bind(b.8)
+        .bind(b.9)
+        .bind(b.10)
+        .bind(b.11)
+        .bind(b.12)
+        .bind(b.13)
+        .bind(b.14)
+        .bind(b.15)
+        .bind(b.16)
+        .bind(b.17);
+
+    let mut etime = 0.0f64;
+    let mut dt = dt0;
+    let mut bound = (dt0, dt0);
+    let mut final_state = vec![Real::default(); state_len];
+    let mut nstep = 0u64;
+    while etime < cfg.sim_time {
+        // derive this pair's two step dts with the Fortran's exact
+        // clamp arithmetic; dt2 = 0 means "no-op second step"
+        if etime + dt > cfg.sim_time {
+            dt = cfg.sim_time - etime;
+        }
+        let dt1 = dt;
+        let e1 = etime + dt1;
+        let dt2 = if e1 < cfg.sim_time {
+            if e1 + dt > cfg.sim_time {
+                cfg.sim_time - e1
+            } else {
+                dt
+            }
+        } else {
+            0.0
+        };
+        if (dt1, dt2) != bound {
+            let b = bind_all(dt1, dt2);
+            g.mutate_call((b.0, b.1, b.2, b.3))?;
+            g.mutate_call((b.4, b.5, b.6, b.7))?;
+            g.mutate_call((b.8, b.9, b.10, b.11))?;
+            g.mutate_call((b.12, b.13, b.14, b.15))?;
+            g.mutate_call((b.16, b.17))?;
+            bound = (dt1, dt2);
+        }
+        if dt2 != 0.0 {
+            dt = dt2; // the Fortran dt variable persists across steps
+        }
+        let co = g.sync(ctx)?;
+        etime = e1 + dt2;
+        nstep += if dt2 != 0.0 { 2 } else { 1 };
+        if etime >= cfg.sim_time {
+            let (cs, _ct, _cfx, _ctd) = co;
+            let view = (*cs).map().wait()?;
+            final_state.copy_from_slice(&view);
+        }
+    }
+    eprintln!("steps: {nstep}");
+    let final_f64: Vec<f64> = final_state.iter().map(|&x| x.to_f64()).collect();
+    Ok((state0, final_f64))
+}
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -1227,9 +1231,9 @@ fn main() -> claspr::Result<()> {
     let init = initialize(&cfg);
     let t0 = std::time::Instant::now();
     let (state0, state1) = if use_f64 {
-        runner_f64::run(&ctx, &cfg, &init)?
+        run::<f64, gpu::f64::Kernels>(&ctx, &cfg, &init)?
     } else {
-        runner_f32::run(&ctx, &cfg, &init)?
+        run::<f32, gpu::f32::Kernels>(&ctx, &cfg, &init)?
     };
     eprintln!("device loop: {:.3}s", t0.elapsed().as_secs_f64());
 
@@ -1290,7 +1294,7 @@ mod tests {
         }
         let cfg = test_cfg();
         let init = initialize(&cfg);
-        let (s0, s1) = runner_f64::run(&ctx, &cfg, &init).expect("run f64");
+        let (s0, s1) = run::<f64, gpu::f64::Kernels>(&ctx, &cfg, &init).expect("run f64");
         let (m0, e0) = reductions(&s0, &init, cfg.nx, cfg.nz);
         let (m1, e1) = reductions(&s1, &init, cfg.nx, cfg.nz);
         let dm = ((m1 - m0) / m0).abs();
@@ -1310,7 +1314,7 @@ mod tests {
         };
         let cfg = test_cfg();
         let init = initialize(&cfg);
-        let (s0, s1) = runner_f32::run(&ctx, &cfg, &init).expect("run f32");
+        let (s0, s1) = run::<f32, gpu::f32::Kernels>(&ctx, &cfg, &init).expect("run f32");
         let (m0, e0) = reductions(&s0, &init, cfg.nx, cfg.nz);
         let (m1, e1) = reductions(&s1, &init, cfg.nx, cfg.nz);
         let dm = ((m1 - m0) / m0).abs();
@@ -1334,8 +1338,8 @@ mod tests {
         }
         let cfg = test_cfg();
         let init = initialize(&cfg);
-        let (_, s64) = runner_f64::run(&ctx, &cfg, &init).expect("run f64");
-        let (_, s32) = runner_f32::run(&ctx, &cfg, &init).expect("run f32");
+        let (_, s64) = run::<f64, gpu::f64::Kernels>(&ctx, &cfg, &init).expect("run f64");
+        let (_, s32) = run::<f32, gpu::f32::Kernels>(&ctx, &cfg, &init).expect("run f32");
         let f64_fields = output_fields(&s64, &init, cfg.nx, cfg.nz);
         let f32_fields = output_fields(&s32, &init, cfg.nx, cfg.nz);
         let max_diff = f64_fields

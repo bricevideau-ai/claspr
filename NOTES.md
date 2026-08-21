@@ -170,7 +170,25 @@ first, designing the trait second):
   (a `Real: num-ish` bound or claspr-provided `FromF64` shim);
 - scalar `as Real` casts at bind sites (`dz as Real`, hv coefficients).
 
-Remaining, in order of value: (1) the generated `trait` unifying stamp surfaces so
+**GpuKernels<Real> trait: DONE 2026-08-21** (same-day prototype, merged). The
+device macro now also emits `pub trait Kernels<Real>` in the instantiated module
+plus one impl per stamp — the impls live INSIDE the stamp modules where `Real`
+is aliased, so trait decl and impls share identical signature tokens (the
+no-substitution trick, third use). Launcher methods return opaque
+`impl DeviceOp<Output=…, Handle=…, Checkouts=…>` (all three pinned → and_then /
+bind / sync / mutate_call type-check exactly as with concrete launchers).
+Proven: miniweather's `make_runner!` macro is DELETED — one
+`fn run<Real: Width, K: gpu::Kernels<Real>>` drives the full 24-dispatch replay
+graph at both widths, output BIT-IDENTICAL. Caller-side bounds a generic driver
+states: `ScalarInput<Real>: From<Real>` (scalar From impls are deliberately
+per-type) + `SlotValue + SlotEq` if the driver declares generic slots + its own
+numeric casts (miniweather's 8-line `Width` trait). Limitations: Tier-1 inherent
+terminals (`.wait()`/`.submit()`) aren't visible through the opaque returns
+(generic code uses DeviceOpExt verbs); kernels with image params (or no buffer
+output) are skipped from the trait and listed in its docs — call those via the
+stamp modules; revisit when an image-using instantiated module exists.
+
+Historical (what the trait needed, kept for context): (1) the generated `trait` unifying stamp surfaces so
 drivers are written once (`fn run<R, K: GpuKernels<R>>`) — the showcase's
 `axpb_round_trip!` macro marks exactly what it erases; (2) per-stamp vector-family
 aliases (`RealVec3` → `DVec3`/`Vec3`, `Real4` → `cl::Double4`/`Float4`) — PROBE
