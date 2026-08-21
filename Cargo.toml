@@ -15,6 +15,7 @@ members = [
     "examples/batch-inference",
     "examples/cg",
     "examples/spv-introspect",
+    "examples/miniweather",
     "tests/instantiate",
     "tests/kernels",
     "tests/image-kernels",

@@ -145,6 +145,28 @@ DOUBLE timestep (directions/extents as literals, dt scalars mutated ≤2x/run) g
 sub-crates + host stamp sub-modules (`gpu::f64` / `gpu::f32`), alias injection on
 both sides (no substitution), auto-`Float64` for f64 stamps only (verified by a
 capability-walk test: f32 stamp SPIR-V is Float64-free), 4/4 tests green on 3 ICDs.
+miniWeather REWORKED onto instantiate 2026-08-21 (`examples/miniweather`, single
+900-line file): deletes the separate kernel crate, the dual-compile build.rs, and
+the 110-line hand-stamped `claspr::kernels!` signature macro; output fields
+BIT-IDENTICAL to the explicit-compile port at both widths on PoCL; self-validating
+(mass/energy drift + cross-width agreement) on 3 ICDs.
+
+**`GpuKernels<Real>` trait requirements — the width leaks the rework left behind**
+(everything `make_runner!` still parameterizes; gathered per the plan of porting
+first, designing the trait second):
+- the per-stamp constructor (`stamp::kernels(ctx)`) — the trait needs an
+  associated ctor, and the stamp must be nameable generically;
+- the launcher methods themselves (8 here, each with per-arg
+  `KernelSliceRead[Write]Arg<Real>` generics and a complex concrete return type —
+  RPITIT or associated types needed to hide it);
+- `slots!` declarations with `Real`-typed values (18 dt/hyperviscosity slots) —
+  the known `slots!` generic-value-type gap is THE biggest blocker: the slots
+  module is stamped inside `make_runner!` solely because tag value types are
+  concrete;
+- `DeviceSlice::<Real>` allocations + the host f64→Real cast at the boundary
+  (a `Real: num-ish` bound or claspr-provided `FromF64` shim);
+- scalar `as Real` casts at bind sites (`dz as Real`, hv coefficients).
+
 Remaining, in order of value: (1) the generated `trait` unifying stamp surfaces so
 drivers are written once (`fn run<R, K: GpuKernels<R>>`) — the showcase's
 `axpb_round_trip!` macro marks exactly what it erases; (2) per-stamp vector-family

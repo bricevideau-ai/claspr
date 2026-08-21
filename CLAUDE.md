@@ -31,6 +31,10 @@ examples/gray-scott/          reusable-graph flagship — reaction-diffusion
                               (run_swap mutable-replay vs run_immutable
                               curried compose, proven bit-identical).
 examples/spv-introspect/      SPIR-V introspection helper demo.
+examples/miniweather/         instantiate flagship — miniWeather in ONE file
+                              at two precisions (device module stamped
+                              f64/f32; 24-dispatch Tier-2 replay graph;
+                              self-validating conservation tests).
 
 tests/kernels, tests/image-kernels, tests/explicit-compile,
 tests/instantiate, tests/tier1, tests/tier2

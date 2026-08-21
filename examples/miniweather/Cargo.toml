@@ -1,0 +1,25 @@
+[package]
+name = "miniweather-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "miniWeather in one Rust file at two precisions — the #[claspr::device(instantiate(...))] flagship"
+
+[[bin]]
+name = "miniweather"
+path = "src/main.rs"
+
+[dependencies]
+claspr = { path = "../../claspr" }
+# spirv-std host arms provide opencl_std::* (ocl::pow in the flux kernel
+# helper) on the CPU too, so the device module's helpers stay host-visible
+# without cfg-gating.
+spirv-std.workspace = true
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true
