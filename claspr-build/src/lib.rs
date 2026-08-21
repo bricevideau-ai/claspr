@@ -366,11 +366,12 @@ impl CompileBuilder {
         let result: CompileResult = self.settings.apply_to(&self.crate_path).build()?;
         let spv_path = result.module.unwrap_single().to_path_buf();
 
-        let generated = generate_module_source(&spv_path, &result.entry_points, &self.crate_path)?;
-
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let spv_path = freeze_spv_beside(&spv_path, out_path)?;
+        let generated = generate_module_source(&spv_path, &result.entry_points, &self.crate_path)?;
+
         let mut file = std::fs::File::create(out_path)?;
         file.write_all(generated.as_bytes())?;
         Ok(())
@@ -380,6 +381,29 @@ impl CompileBuilder {
 fn emit_rerun_if_changed(crate_path: &Path) {
     println!("cargo:rerun-if-changed={}/Cargo.toml", crate_path.display());
     println!("cargo:rerun-if-changed={}/src", crate_path.display());
+}
+
+/// Copy the freshly-built SPIR-V module next to the generated `.rs` file and
+/// return the frozen path for `include_bytes!` to reference.
+///
+/// The build product under spirv-builder's target dir is shared by every
+/// compile of the same kernel crate — including compiles with different
+/// feature sets or settings. Embedding that path directly means two
+/// `compile()` invocations silently alias: the second build overwrites the
+/// `.spv`, and *both* generated files embed whichever blob was written last
+/// (host-side `include_bytes!` reads at host-compile time, well after both
+/// builds ran). Freezing a copy beside each generated file makes every
+/// output self-contained and immune to later rebuilds of the kernel crate.
+fn freeze_spv_beside(spv_build_path: &Path, generated_rs_path: &Path) -> Result<PathBuf> {
+    let dest = generated_rs_path.with_extension("spv");
+    std::fs::copy(spv_build_path, &dest).map_err(|e| {
+        format!(
+            "failed to copy SPIR-V module {} to {}: {e}",
+            spv_build_path.display(),
+            dest.display()
+        )
+    })?;
+    Ok(dest)
 }
 
 fn generate_module_source(
@@ -736,6 +760,7 @@ impl HostBuilder {
         // Emit the Kernels module to OUT_DIR/<mod_name>.rs — this
         // is what `#[claspr::device] mod <name>` includes!() from.
         let module_out_path = out_dir.join(format!("{mod_name}.rs"));
+        let spv_path = freeze_spv_beside(&spv_path, &module_out_path)?;
         let generated = generate_module_source(&spv_path, &result.entry_points, &crate_dir)?;
         std::fs::write(&module_out_path, generated)?;
         Ok(())

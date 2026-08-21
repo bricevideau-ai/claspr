@@ -37,6 +37,15 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/kernels.rs"));
 }
 
+// Same kernel crate compiled a second time with the `alt` feature.
+// Exists to prove two `write_to` outputs of one kernel crate embed
+// *distinct* SPIR-V (each generated file freezes its own `.spv` copy
+// beside itself; embedding spirv-builder's shared build product would
+// alias both to the last-written variant).
+mod generated_alt {
+    include!(concat!(env!("OUT_DIR"), "/kernels_alt.rs"));
+}
+
 // Single-kernel surface declared near the call site. Same shape
 // `#[claspr::kernel]` would emit, but the SPIR-V binding is
 // deferred to runtime: `gpu::Kernels::load_from(&ctx, &bytes)`
@@ -149,6 +158,48 @@ mod tests {
     /// `#[claspr::device]`-emitted `pub fn kernels(ctx)` shim
     /// (rewritten in this same change) consumes the same
     /// `load_from(ctx, SPV_BYTES)` it ends up calling.
+    /// Two compiles of one kernel crate must embed different blobs.
+    /// Device-free: this is the aliasing regression assertion itself —
+    /// before `freeze_spv_beside`, both generated files `include_bytes!`-ed
+    /// spirv-builder's shared product path and this failed.
+    #[test]
+    fn compile_variants_embed_distinct_spv() {
+        assert_ne!(
+            generated::SPV_BYTES,
+            generated_alt::SPV_BYTES,
+            "base and `alt`-feature compiles embedded the same SPIR-V blob — \
+             the generated files are aliasing one build product",
+        );
+        assert_eq!(generated::ENTRY_POINTS, generated_alt::ENTRY_POINTS);
+    }
+
+    /// And the two variants must *behave* differently on device: the alt
+    /// kernel biases the fill by 1000. Catches subtler aliasing where the
+    /// blobs differ but the wrong one was frozen for a variant.
+    #[test]
+    fn compile_variants_run_distinct_kernels() {
+        let Some(ctx) = ctx() else { return };
+
+        let base = gpu::Kernels::load_from(&ctx, generated::SPV_BYTES).expect("load base");
+        let buf = DeviceSlice::<u32>::alloc_zero(&ctx, 4).expect("alloc");
+        let buf = base
+            .fill_u32([4usize], buf, 5u32)
+            .wait()
+            .expect("base launch");
+        let mut got = vec![0u32; 4];
+        let buf = buf.read(&mut got).wait().expect("base readback");
+        assert_eq!(got, vec![5u32; 4], "base variant fills with the raw value");
+
+        let alt = gpu::Kernels::load_from(&ctx, generated_alt::SPV_BYTES).expect("load alt");
+        let buf = alt
+            .fill_u32([4usize], buf, 5u32)
+            .wait()
+            .expect("alt launch");
+        let mut got = vec![0u32; 4];
+        buf.read(&mut got).wait().expect("alt readback");
+        assert_eq!(got, vec![1005u32; 4], "alt variant biases the fill by 1000");
+    }
+
     #[test]
     fn legacy_generated_kernels_load_works() {
         let Some(ctx) = ctx() else { return };

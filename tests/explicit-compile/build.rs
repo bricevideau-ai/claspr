@@ -20,4 +20,17 @@ fn main() {
         .opencl12()
         .write_to(&out_path)
         .expect("compile explicit-compile-test kernels to SPIR-V");
+
+    // Second compile of the SAME kernel crate with a different feature
+    // set. spirv-builder reuses one build location per kernel crate, so
+    // this overwrites the first build's `.spv` — the generated files must
+    // each embed a frozen copy or both would silently alias to this
+    // (last-written) variant. `alias_regression` in src/lib.rs asserts
+    // the two blobs differ.
+    let alt_out_path = out_path.with_file_name("kernels_alt.rs");
+    claspr_build::compile(&kernel_crate)
+        .opencl12()
+        .with(|sb| sb.shader_crate_features(["alt".to_string()]))
+        .write_to(&alt_out_path)
+        .expect("compile explicit-compile-test kernels (alt feature) to SPIR-V");
 }
