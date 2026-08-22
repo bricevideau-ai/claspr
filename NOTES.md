@@ -24,7 +24,12 @@ below.
   DSL + opaque expansion errors (a cost-of-entry COST) to save ~15 lines at exactly
   one site that `OutputShape` already made readable. **REVISIT TRIGGER: 3+ generic-fn
   subgraph authors accumulate.**
-- **Leaf memory-family unification** (`leaf_fill!`/`leaf_write!`) — DECLINED. The
+- **Leaf memory-family unification** (`leaf_fill!`/`leaf_write!`) — DECLINED.
+  **RE-CONFIRMED 2026-08-21 by measurement**: `leaves.rs` is 19 `DeviceOp` impls;
+  18 of them average ~55 lines with 5–11 members, i.e. genuinely irreducible
+  per-op work, and they really do differ across verb × memory-family ×
+  init-state. A 5-axis muncher would read worse than ten honest structs. What the
+  measurement DID surface as open (see Deferred, below). The
   fill/write families vary on ~5 axes (input/output type, in-place-`put_home` vs
   uninit-`put`, cl_mem vs SVM handle + enqueue fn, CB-recordable vs host); a macro
   would trade skimmable duplication for a fiddly muncher — a net loss for the
@@ -33,13 +38,14 @@ below.
 - **Concrete-head terminal boilerplate** (the ~6 `wait`/`submit` pairs) — DECLINED.
   They carry useful per-op doc comments (each op's Tier-1 spelling); a macro would
   drop those or need doc-passthrough (negating the win).
-- **`scalar_slot_fed_pipe` golden pins an `eager.rs` line number** (small, open).
-  Its `.stderr` carries `note: required by a bound in DeviceOpExt::call --> claspr/src/eager.rs:NNNN`,
-  so ANY edit above that bound in `eager.rs` fails the golden and needs a re-bless
-  (twice in the 2026-08-21 session alone: the `Homed` extraction and the `DeviceOp`
-  doc tiering, both purely cosmetic). Fix: a normalize-stderr-style filter blanking
-  the line number in that one note (rust-gpu's compiletests do this for `OpLine`).
-  Left alone so far to keep unrelated diffs out of the harness.
+- **`scalar_slot_fed_pipe` golden pinned an `eager.rs` line number** — FIXED
+  2026-08-21 (`f8bcc8b`). A `stderr_filter` in `tests/support/src/ui.rs` now
+  rewrites `<claspr path>.rs:N:C` to `:LL:CC` in compile-fail goldens; the file
+  stays (real signal: which claspr item imposed the bound), only the volatile
+  position is blanked. It had cost three spurious re-blesses in one session and
+  was latent in five more goldens (launch.rs, buffer.rs, host_view.rs). NB the
+  regex spells classes out (`[a-zA-Z0-9_]`, not `\w`) — ui_test's regex build
+  has unicode-perl off.
 - **`DeviceOp` trait split** (`CommandBufferOp` supertrait) — DECLINED (R1). Would
   cascade `+ CommandBufferOp` bounds through ~7 CB helpers + every combinator (~53
   impl splits, ~60 call sites) with ZERO object-safety benefit (no `dyn DeviceOp`
@@ -122,6 +128,26 @@ lap is). Size derivation: grid-shaped is free (derive from LaunchSpec); non-grid
 need an author-declared closure `alloc(slot!(Grid), |g| …)` (start here — no new IR) or a
 reified `SizeExpr` (only when inspection/serialization/CB-cache-key forces it). The
 `#[auto]` write-only producer output dissolves gray-scott's two-sets aliasing + threading.
+
+### `leaves.rs` orientation + `CopyTo2` (measured 2026-08-21, not started)
+
+Two findings from measuring `eager/leaves.rs` (2,906L, ~1,942 code, 19 `DeviceOp`
+impls) while looking for refactors worth doing:
+
+- **Doc density is 11%**, vs 44% in `eager.rs`. This is the file agents WRITE in
+  (19 of the engine's 33 op impls) and the least explained. The type names encode a
+  verb × memory-family × init-state matrix (`Fill`/`FillDeviceUninit`/
+  `FillMappedUninit`/`FillUsmUninit`/`FillMapped`, `WriteDevice`/`WriteDeviceUninit`/
+  `WriteMapped`/`WriteMappedUninit`/`WriteUsmUninit`, …) that a newcomer must infer by
+  pattern-matching. A ~30-line module `//!` header stating the axes, which
+  combinations exist and why some don't, and the member set a new leaf needs, would do
+  for `leaves.rs` what the tier table did for `DeviceOp` (`821cf94`) at the same cost
+  and risk. NOT a refactor — the impls themselves are fine (see the re-confirmed
+  leaf-unification DECLINE above).
+- **`CopyTo2<Src, Dst>` is an outlier**: 270L / 17 members, ~5x the file's median and
+  ~10% of it. Probably the src × dst family cross-product plus CB recording. Worth
+  measuring ON ITS OWN before deciding whether it is irreducible or genuinely tangled;
+  everything else in the file is 26–99L.
 
 ### Inherit generated kernel deps from host workspace
 
