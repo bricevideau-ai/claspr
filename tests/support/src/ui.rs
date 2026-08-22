@@ -123,6 +123,19 @@ fn make_config(
 
     config.bless_command = Some(bless_command.into());
 
+    // Blank the line:column in `note: required by a bound in ...` frames that
+    // point INTO claspr's own sources. Those notes cite e.g.
+    // `claspr/src/eager.rs:2703:4`, so ANY edit above the cited item — even a
+    // comment — shifts the number and fails an otherwise-unchanged golden. It
+    // cost three spurious re-blesses in one 2026-08-21 session (a struct
+    // extraction, a doc-tiering pass, and a method move, none of which touched
+    // behaviour). The FILE stays in the golden (it is real signal: which claspr
+    // item imposed the bound); only the volatile position is normalised.
+    config.stderr_filter(
+        r"(claspr(?:-[a-zA-Z0-9_]+)?[/\\][a-zA-Z0-9_/\\.-]+\.rs):[0-9]+:[0-9]+",
+        "$1:LL:CC",
+    );
+
     config
 }
 

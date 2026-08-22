@@ -5,7 +5,7 @@ error[E0277]: the trait bound `DeviceSlice<u32>: KernelScalarRefArg<u32>` is not
    |                     ^^^^^^^^^^^^^^^^ the trait `KernelScalarRefArg<u32>` is not implemented for `DeviceSlice<u32>`
    |
 help: the trait `KernelScalarRefArg<T>` is implemented for `Scalar<B>`
-  --> claspr/src/launch.rs:252:0
+  --> claspr/src/launch.rs:LL:CC
 note: required by a bound in `claspr_test_kernels::kernels::Kernels::scale_by_ref_u32`
   --> tests/kernels/src/lib.rs:106:4
    = note: this error originates in the attribute macro `claspr::kernel` (in Nightly builds, run with -Z macro-backtrace for more info)
