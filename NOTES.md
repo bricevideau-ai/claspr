@@ -33,10 +33,30 @@ below.
 - **Concrete-head terminal boilerplate** (the ~6 `wait`/`submit` pairs) — DECLINED.
   They carry useful per-op doc comments (each op's Tier-1 spelling); a macro would
   drop those or need doc-passthrough (negating the win).
+- **`scalar_slot_fed_pipe` golden pins an `eager.rs` line number** (small, open).
+  Its `.stderr` carries `note: required by a bound in DeviceOpExt::call --> claspr/src/eager.rs:NNNN`,
+  so ANY edit above that bound in `eager.rs` fails the golden and needs a re-bless
+  (twice in the 2026-08-21 session alone: the `Homed` extraction and the `DeviceOp`
+  doc tiering, both purely cosmetic). Fix: a normalize-stderr-style filter blanking
+  the line number in that one note (rust-gpu's compiletests do this for `OpLine`).
+  Left alone so far to keep unrelated diffs out of the harness.
 - **`DeviceOp` trait split** (`CommandBufferOp` supertrait) — DECLINED (R1). Would
   cascade `+ CommandBufferOp` bounds through ~7 CB helpers + every combinator (~53
   impl splits, ~60 call sites) with ZERO object-safety benefit (no `dyn DeviceOp`
   anywhere). The "CB is a skippable layer" goal is met by the module split instead.
+  **RE-CONFIRMED 2026-08-21 on a different axis** (attempt 2 asked about AGENT CONTEXT
+  cost, not impl cost — a fair re-open, and it still declines): measured across the 33
+  in-tree impls, **45% override at least one `cb_*` member** (`cb_addable` 14,
+  `cb_cache` 11, `cbable_weight` 11). CB is therefore NOT a severable minority layer —
+  a supertrait would relocate the members without removing the thinking, and nearly
+  half the ops would implement both traits. What the measurements DID justify was the
+  documentation fix that landed instead (`7d240ac`): the trait is 24 members but the
+  median impl overrides **7**, and nothing marked the tiers. The trait's rustdoc now
+  carries a measured tier table (1 core / 2 multi-output / 3 slots / 4 CB /
+  5 introspection), in-body banners mirror it, and the deepest CB internals are
+  `#[doc(hidden)]`. **REVISIT TRIGGER: if CB participation drops well below ~45% (the
+  tier-4 defaults become the overwhelming norm), the severable-layer premise becomes
+  true and the split is worth re-pricing.**
 - **Type-state slots for Tier 2** (graph type carries the unbound-tag set) —
   DECLINED (2026-07-15, not enough benefit for the churn). Design: `type Slots`
   (HList set) per op; `bind`/`call` type-transition `Graph<Remaining>` →

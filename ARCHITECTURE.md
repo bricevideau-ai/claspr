@@ -46,12 +46,19 @@ Read these five first; they are the "mandatory core" every graph task touches:
 2. **The home invariant** — a lent buffer ALWAYS rehomes to its origin cell on
    `Checkout`/payload drop, so `cl_mem` handles stay stable across replays. This is what
    makes a graph reusable AND what lets a command buffer bake a stable handle.
-3. **`DeviceOp` trait** — the one node contract. Required: `Output` + `execute` +
-   `output_pipe` + `describe`. Everything else is defaulted: the gather machinery
-   (`collect`/`gather_checkouts`/`into_output`), slots (`bind_slots`/`check_ready`),
-   introspection (`describe`/`dump_graph`), and the **command-buffer capability**
-   (`cb_addable`/`cbable_weight`/`cb_cache`/`invalidate_cbs`/`cb_restamp`/…). You can
-   ignore the `cb_*` methods unless you're touching CB — they default to "not CB-able".
+3. **`DeviceOp` trait** — the one node contract, 24 members but NOT 24 decisions:
+   measured across the 33 in-tree impls the median op overrides **7**. The trait's
+   own rustdoc carries the authoritative tier table (read it before adding an op);
+   in short — **tier 1, always**: `Output` + `output_pipe` + `handle` + `execute` +
+   `describe` (all 33 impls define exactly these five); **tier 2, multi-output only**
+   (`Handle`/`Checkouts`/`collect`/`collect_home`/`into_output`/`gather_checkouts`,
+   6 impls); **tier 3, if you hold `Input`s** (`bind_slots`/`check_ready`/
+   `reclaim_undelivered`); **tier 4, CB participation** (`cb_addable`/`cbable_weight`/
+   `cb_cache`/`invalidate_cbs`/`collect_cb_ids`/`cb_restamp`/`cb_spine_head_addable`
+   — 45% of impls; the defaults say "not recordable", which is always CORRECT, just
+   not CB-accelerated); **tier 5, introspection** (`node_label`/`dump_graph`/
+   `contains_host_seam` — combinators recurse, leaves rarely). Skip tier 4 entirely
+   unless your op enqueues recordable commands.
    `DeviceOpExt` (blanket-impl'd) holds the user verbs: `and_then`/`bundle`/`fan_out`/
    `bind`/`call`/`mutate_bind`/`sync`/`run`.
 4. **Slots (reuse)** — `slot!(Tag)` is an unbound hole; `SlotState` is 5-state

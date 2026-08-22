@@ -1759,10 +1759,35 @@ pub fn graph_edge_table(nodes: &[GraphNode]) -> Vec<(usize, Vec<usize>)> {
 /// [`.submit_on()`](DeviceOpExt::submit_on), or the concrete-head `.wait()` —
 /// is called. Dropping a built op silently discards all the work it describes,
 /// so the trait is `#[must_use]`.
+///
+/// # Implementing a new op — what you actually need
+///
+/// The trait has 24 members, but they are NOT 24 decisions. Measured across the
+/// 33 in-tree impls, the median op overrides **7**. They fall in five tiers, in
+/// declaration order below:
+///
+/// | Tier | Members | When you write them |
+/// |------|---------|---------------------|
+/// | **1. Core contract** | [`Output`](Self::Output), [`output_pipe`](Self::output_pipe), [`handle`](Self::handle), [`execute`](Self::execute), [`describe`](Self::describe) | ALWAYS — every one of the 33 impls defines these five. |
+/// | **2. Output shape** | [`Handle`](Self::Handle), [`Checkouts`](Self::Checkouts), [`collect`](Self::collect), [`collect_home`](Self::collect_home), [`into_output`](Self::into_output), [`gather_checkouts`](Self::gather_checkouts) | Only for MULTI-OUTPUT ops (6 impls). Single-output ops take the defaults, which build one [`Pipe`]/[`Checkout`] from `Output`. |
+/// | **3. Slots & readiness** | [`bind_slots`](Self::bind_slots), [`check_ready`](Self::check_ready), [`reclaim_undelivered`](Self::reclaim_undelivered) | If your op holds [`Input`]s that can be slots: forward to each input. Leaves with concrete-only args take the defaults. |
+/// | **4. Command-buffer participation** | [`cb_addable`](Self::cb_addable), [`cbable_weight`](Self::cbable_weight), [`cb_cache`](Self::cb_cache), [`invalidate_cbs`](Self::invalidate_cbs), [`collect_cb_ids`](Self::collect_cb_ids), [`cb_restamp`](Self::cb_restamp), [`cb_spine_head_addable`](Self::cb_spine_head_addable) | Only if your op enqueues commands a `cl_khr_command_buffer` can RECORD (45% of impls). The defaults say "not recordable", which is always CORRECT — never unsound, just slower (the op runs per-enqueue instead of being baked into a replayed CB). |
+/// | **5. Introspection** | [`node_label`](Self::node_label), [`dump_graph`](Self::dump_graph), [`contains_host_seam`](Self::contains_host_seam) | Combinators that nest children override these to recurse; leaves almost never do. |
+///
+/// So: a new **leaf** op is tier 1 + usually `check_ready`/`bind_slots` — about
+/// six members. A new **combinator** additionally recurses tiers 3–5 into its
+/// children. Reach for tier 4 only when the op is CB-recordable, and note the
+/// defaults are the safe answer, not a stub to fill in.
 #[must_use = "device ops do nothing until a terminal like .sync()/.wait()/.run() is called"]
 pub trait DeviceOp: Send {
+    // ── Tier 1: core contract — every one of the 33 in-tree impls defines
+    // these five (Output / output_pipe / handle / execute / describe) ─────
+
     /// What this op produces at run time.
     type Output: Send;
+
+    // ── Tier 2: output shape — MULTI-OUTPUT ops only. The defaults build one
+    // Pipe/Checkout from `Output`, which is right for every single-output op ─
 
     /// The **build-time, downstream-facing handle** — what a downstream
     /// `and_then` closure receives. Defaults to a single [`Pipe<Output>`]
@@ -1999,6 +2024,9 @@ pub trait DeviceOp: Send {
         });
     }
 
+    // ── Tier 3: slots & readiness — ops holding `Input`s forward to each; a
+    // leaf with concrete-only args takes the defaults ─────────────────────
+
     /// Fold one [`SlotBinder`] into this op's [`slot!`](crate::slot) cells —
     /// the per-op half of [`bind`](DeviceOpExt::bind)`(Tag(value))`.
     ///
@@ -2124,6 +2152,12 @@ pub trait DeviceOp: Send {
         false
     }
 
+    // ── Tier 4: command-buffer participation — ONLY for ops whose commands a
+    // `cl_khr_command_buffer` can record (45% of impls). Every default here
+    // says "not recordable", which is always CORRECT: never unsound, just
+    // per-enqueue rather than baked into a replayed CB. Skip the tier unless
+    // your op enqueues recordable commands. ───────────────────────────────
+
     /// Whether this WHOLE (sub)graph can be added to a command buffer as-is
     /// (design v2 eligibility): every node is a device command (`fill`, `copy`,
     /// kernel), a structural passthrough (`forward`/`lift`/`arced`/`Pipe`), or a
@@ -2236,6 +2270,7 @@ pub trait DeviceOp: Send {
     /// Default: the single [`output_pipe`](Self::output_pipe). Multi-output ops
     /// (kernels, bundles, `CopyTo2`, `FanOut`) override to stamp each element pipe —
     /// mirroring [`reclaim_undelivered`](Self::reclaim_undelivered)'s traversal.
+    #[doc(hidden)]
     fn cb_restamp(&self, evs: &Deps) {
         if let Some(pipe) = self.output_pipe()
             && let Some((v, _deps, home)) = pipe.take_home()
@@ -2259,6 +2294,7 @@ pub trait DeviceOp: Send {
     /// at the `bundle4.and_then(seam)` level whose `next` is the seam. This is the
     /// stop rule that batches CG's `[xpby, spmv, dot]` (+ the 0-command `bundle4`
     /// passthrough) into ONE CB.
+    #[doc(hidden)]
     fn cb_spine_head_addable(&self) -> bool {
         self.cb_addable()
     }
