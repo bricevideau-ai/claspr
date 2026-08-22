@@ -433,6 +433,89 @@ pub trait Rehome<Out>: Send {
 /// `Input` / `Checkout` signatures stay readable.
 pub type BoxedHome<Out> = Box<dyn Rehome<Out>>;
 
+/// A value paired with its OPTIONAL **rehome obligation** — the single carrier of
+/// the reusable-graph invariant *"homeless is never legitimate"*.
+///
+/// Three places hold a produced-but-not-yet-delivered value: a [`PipePayload`]
+/// (mid-graph, in a pipe cell), a [`LentGuard`] (lent for a fallible enqueue), and
+/// a [`Checkout`] (handed to the user at a terminal). All three obey the SAME
+/// rule, and it lives here exactly once:
+///
+/// - **drop while still holding both** ⇒ the value was produced and never handed
+///   onward, so it is [`rehome`](Rehome::rehome)d to its origin cell (re-arming the
+///   graph) rather than released;
+/// - **[`take`](Self::take)** moves the pair out intact (the obligation is
+///   RELOCATED to the new owner), leaving a husk whose drop is a no-op;
+/// - **[`sever`](Self::sever)** fires [`Rehome::sever`] instead — the caller keeps
+///   the value ([`Checkout::into_inner`]), so a slot lands in
+///   [`Severed`](SlotState::Severed), not back in `Bound`.
+///
+/// Because [`BoxedHome`] is not `Clone`, the obligation exists in exactly one
+/// place at a time, so it fires exactly once — enforced structurally, not by
+/// discipline. Both fields are `Option` so every exit can drain in place.
+pub(crate) struct Homed<T> {
+    value: Option<T>,
+    home: Option<BoxedHome<T>>,
+}
+
+impl<T> Homed<T> {
+    /// Pair a value with its (possibly absent) rehome obligation.
+    pub(crate) fn new(value: T, home: Option<BoxedHome<T>>) -> Self {
+        Self {
+            value: Some(value),
+            home,
+        }
+    }
+
+    /// Borrow the value; `None` once drained by [`take`](Self::take) /
+    /// [`sever`](Self::sever).
+    pub(crate) fn value(&self) -> Option<&T> {
+        self.value.as_ref()
+    }
+
+    /// Mutably borrow the value (the in-flight enqueue path).
+    pub(crate) fn value_mut(&mut self) -> Option<&mut T> {
+        self.value.as_mut()
+    }
+
+    /// Move `(value, home)` out intact, RELOCATING the obligation to the caller.
+    /// The drained husk's drop is a no-op — the new owner fires the rehome.
+    /// `None` if already drained.
+    pub(crate) fn take(&mut self) -> Option<(T, Option<BoxedHome<T>>)> {
+        let value = self.value.take()?;
+        Some((value, self.home.take()))
+    }
+
+    /// Take the value and fire [`Rehome::sever`] instead of rehoming: the caller
+    /// KEEPS the value, so a slot cell lands in `Severed` rather than re-armed.
+    /// `None` if already drained.
+    pub(crate) fn sever(&mut self) -> Option<T> {
+        let value = self.value.take()?;
+        if let Some(home) = self.home.take() {
+            home.sever();
+        }
+        Some(value)
+    }
+
+    /// The identity of the cell this obligation would act on, or `None` when
+    /// homeless / already drained.
+    pub(crate) fn home_cell_id(&self) -> Option<usize> {
+        self.home.as_ref().and_then(|h| h.home_cell_id())
+    }
+}
+
+impl<T> Drop for Homed<T> {
+    /// THE enforcement point of "homeless is never legitimate": still holding both
+    /// a value and its obligation at drop means the value was never delivered —
+    /// return it to its origin cell so the graph stays re-runnable. A drained husk
+    /// (`take`/`sever`) or a homeless value is a no-op.
+    fn drop(&mut self) {
+        if let (Some(value), Some(home)) = (self.value.take(), self.home.take()) {
+            home.rehome(value);
+        }
+    }
+}
+
 /// Return a buffer CONSUMED by an op (read into a host `Vec`, never carried onward
 /// in a pipe) to its home, or release it if homeless. The general
 /// [`PipePayload`] drop handles values that flow THROUGH a pipe; a consuming op
@@ -472,31 +555,32 @@ pub fn rehome_consumed<T>(buf: T, home: Option<BoxedHome<T>>) {
 /// which defuses the guard so it does nothing on drop. A minted/homeless lend
 /// (`home == None`) simply releases on drop, unchanged.
 pub(crate) struct LentGuard<T> {
-    value: Option<T>,
-    home: Option<BoxedHome<T>>,
+    /// The lent value + its rehome obligation. [`Homed`]'s drop IS the
+    /// anti-stranding behaviour described above; `disarm` drains it so the
+    /// success path's deposit owns the obligation instead.
+    homed: Homed<T>,
 }
 
 impl<T> LentGuard<T> {
     /// Arm a guard over a freshly-lent `(value, home)`.
     pub(crate) fn new(value: T, home: Option<BoxedHome<T>>) -> Self {
         Self {
-            value: Some(value),
-            home,
+            homed: Homed::new(value, home),
         }
     }
 
     /// Borrow the lent value mutably for the enqueue (which may fail — if it does,
     /// the guard is still armed and rehomes on the `?` unwind).
     pub(crate) fn value_mut(&mut self) -> &mut T {
-        self.value
-            .as_mut()
+        self.homed
+            .value_mut()
             .expect("LentGuard value already disarmed")
     }
 
     /// Borrow the lent value immutably (read-only enqueues, e.g. image/read).
     pub(crate) fn value(&self) -> &T {
-        self.value
-            .as_ref()
+        self.homed
+            .value()
             .expect("LentGuard value already disarmed")
     }
 
@@ -504,22 +588,7 @@ impl<T> LentGuard<T> {
     /// ([`Pipe::put_home`] / [`rehome_consumed`]). After this the guard's drop is a
     /// no-op — the deposit now owns the rehome obligation.
     pub(crate) fn disarm(mut self) -> (T, Option<BoxedHome<T>>) {
-        let value = self.value.take().expect("LentGuard disarmed twice");
-        let home = self.home.take();
-        (value, home)
-    }
-}
-
-impl<T> Drop for LentGuard<T> {
-    fn drop(&mut self) {
-        // Armed at drop ⇒ the enqueue failed (or an early return skipped `disarm`):
-        // return the lent buffer to its origin cell so the graph is left unchanged
-        // and re-runnable, rather than stranded in `Lent`. Mirrors `PipePayload`
-        // and `Checkout` drop. `disarm` clears `value`, making this a no-op.
-        if let (Some(value), Some(home)) = (self.value.take(), self.home.take()) {
-            home.rehome(value);
-        }
-        // else: disarmed (deposited) or homeless (nothing to return).
+        self.homed.take().expect("LentGuard disarmed twice")
     }
 }
 
@@ -698,24 +767,12 @@ pub struct Pipe<T> {
 /// [`BoxedHome`] is not `Clone`, the home lives in exactly one place at a time,
 /// so the rehome fires from exactly one drop — never double.
 struct PipePayload<T> {
-    value: Option<T>,
+    /// The in-flight value + its rehome obligation. [`Homed`]'s drop is the
+    /// invariant's catch-all described above: a payload still holding both when it
+    /// drops was never delivered downstream, so its value goes home instead of
+    /// being released. A drained payload (`take_home`) drops as a no-op.
+    homed: Homed<T>,
     deps: Deps,
-    home: Option<BoxedHome<T>>,
-}
-
-impl<T> Drop for PipePayload<T> {
-    fn drop(&mut self) {
-        // The invariant's catch-all: a value produced mid-graph but never
-        // delivered (no downstream `take_home`, no terminal `Checkout`) and still
-        // carrying a home must be RETURNED to its origin cell, not released. If the
-        // home was already moved out (forwarded downstream / into a Checkout), this
-        // is a no-op — the new owner now owns the rehome obligation.
-        if let (Some(value), Some(home)) = (self.value.take(), self.home.take()) {
-            home.rehome(value);
-        }
-        // else: a homeless payload (minted, nothing to return) or one whose value
-        // and/or home were already drained — nothing to rehome.
-    }
 }
 
 impl<T> Clone for Pipe<T> {
@@ -757,9 +814,8 @@ impl<T> Pipe<T> {
         // but the invariant holds regardless). The freshly stored payload arms the
         // new (value, home) pair for the next drain or its own drop.
         *lock_unpoisoned(&self.cell) = Some(PipePayload {
-            value: Some(v),
+            homed: Homed::new(v, home),
             deps,
-            home,
         });
     }
     /// Move out the value + its events (the downstream wait-list), **dropping the
@@ -780,11 +836,11 @@ impl<T> Pipe<T> {
         // no longer owns it, so its `Drop` won't re-fire the rehome (single owner,
         // `BoxedHome: !Clone`). `deps` is `Default`, swapped out cheaply.
         lock_unpoisoned(&self.cell).take().map(|mut p| {
-            let value = p
-                .value
+            let (value, home) = p
+                .homed
                 .take()
                 .expect("PipePayload drained twice — internal bug");
-            (value, std::mem::take(&mut p.deps), p.home.take())
+            (value, std::mem::take(&mut p.deps), home)
         })
     }
 
@@ -3167,14 +3223,16 @@ impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
 /// correctly, which the old single-guard / type-match design could not.
 #[must_use = "a Checkout holds the graph's output; reading it requires keeping it alive"]
 pub struct Checkout<O> {
-    // `Option` so `into_inner`/drop can move the output out.
-    value: Option<O>,
-    // How this output is returned to its origin cell on drop (re-arming `g`).
-    // `None` for a minted/transformed/consumed output (nothing to return).
-    // Learned from the output pipe's home channel — no matching, no `Any`. A
-    // type-erased rehome (not a bare `Cell<O>`) so the origin cell may hold a
-    // weaker type than `O` (the copy's Uninit→Init downgrade).
-    home: Option<BoxedHome<O>>,
+    /// The output + how it returns to its origin cell on drop (re-arming `g`).
+    /// The obligation is `None` for a minted/transformed/consumed output, and is
+    /// learned from the output pipe's home channel — no type matching, no `Any`;
+    /// it is type-erased (not a bare `Cell<O>`) so the origin cell may hold a
+    /// weaker type than `O` (the copy's Uninit→Init downgrade).
+    ///
+    /// [`Homed`] carries the rehome-on-drop rule shared with [`PipePayload`] and
+    /// [`LentGuard`]; `into_inner` takes its `sever` exit instead — the one place
+    /// in the engine that severs.
+    homed: Homed<O>,
 }
 
 impl<O: Send> Checkout<O> {
@@ -3188,8 +3246,7 @@ impl<O: Send> Checkout<O> {
     #[doc(hidden)]
     pub fn new(value: O, home: Option<BoxedHome<O>>) -> Self {
         Checkout {
-            value: Some(value),
-            home,
+            homed: Homed::new(value, home),
         }
     }
 
@@ -3210,20 +3267,17 @@ impl<O: Send> Checkout<O> {
     /// Checkout that phase 1 will sever" (a crossed swap) versus "held by an external
     /// live Checkout" (a real [`Error::SlotCheckedOut`]).
     pub(crate) fn home_cell_id(&self) -> Option<usize> {
-        self.home.as_ref().and_then(|h| h.home_cell_id())
+        self.homed.home_cell_id()
     }
 
     pub fn into_inner(mut self) -> O {
-        // Sever the home (does NOT deposit the value): a concrete cell stays
-        // empty (no-op), a SLOT cell transitions `Lent → Severed` so a later
-        // set-once `bind` sees a severed (not virgin, not stuck-`Lent`) slot and
-        // rejects it (`Error::SlotSevered`); `mutate_bind` re-arms it. Then take
-        // the value out for the caller.
-        if let Some(home) = self.home.take() {
-            home.sever();
-        }
-        self.value
-            .take()
+        // Sever (does NOT deposit the value): a concrete cell stays empty (no-op),
+        // a SLOT cell transitions `Lent → Severed` so a later set-once `bind` sees
+        // a severed (not virgin, not stuck-`Lent`) slot and rejects it
+        // (`Error::SlotSevered`); `mutate_bind` re-arms it. Draining here also
+        // defuses the drop.
+        self.homed
+            .sever()
             .expect("Checkout::into_inner after value already taken — internal bug")
     }
 
@@ -3243,31 +3297,12 @@ impl<O: Send> Checkout<O> {
     /// (it never reaches `home.rehome` / never fires `sever`). The single home now
     /// lives in the caller's pipe (`BoxedHome: !Clone`), so it fires exactly once.
     pub(crate) fn into_value_and_home(mut self) -> (O, Option<BoxedHome<O>>) {
-        let value = self
-            .value
+        self.homed
             .take()
-            .expect("Checkout::into_value_and_home after value already taken — internal bug");
-        let home = self.home.take();
-        (value, home)
-        // `self` drops here: both `value` and `home` are now `None`, so the
-        // `Drop` impl's `let Some(value) = self.value.take() else { return }`
-        // short-circuits — no rehome, no sever. The home was MOVED, not fired.
-    }
-}
-
-impl<O> Drop for Checkout<O> {
-    fn drop(&mut self) {
-        // Return the output to its home cell, re-arming `g`. The home is the
-        // EXACT cell the value flowed from (concrete head → through every in-place
-        // stage), carried by the pipe — no type-matching, no ambiguity. A
-        // minted/transformed/consumed output has `home == None`: nothing to return.
-        let Some(value) = self.value.take() else {
-            return; // already taken by into_inner
-        };
-        if let Some(home) = self.home.take() {
-            home.rehome(value);
-        }
-        // else: `value` drops here — nothing re-armed.
+            .expect("Checkout::into_value_and_home after value already taken — internal bug")
+        // `self` drops here over a DRAINED `Homed` (both halves taken), so its
+        // `Drop` short-circuits — no rehome, no sever. The obligation was MOVED
+        // to the caller, not fired.
     }
 }
 
@@ -3728,16 +3763,16 @@ impl_seam_scatter_tuple!(
 impl<O> std::ops::Deref for Checkout<O> {
     type Target = O;
     fn deref(&self) -> &O {
-        self.value
-            .as_ref()
+        self.homed
+            .value()
             .expect("Checkout dereferenced after into_inner — internal bug")
     }
 }
 
 impl<O> std::ops::DerefMut for Checkout<O> {
     fn deref_mut(&mut self) -> &mut O {
-        self.value
-            .as_mut()
+        self.homed
+            .value_mut()
             .expect("Checkout dereferenced after into_inner — internal bug")
     }
 }
