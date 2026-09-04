@@ -48,16 +48,19 @@ fn n() -> usize {
 }
 /// Replay count per workload. Large enough that a per-replay re-record is obvious
 /// against a one-off record, small enough to stay quick on a CPU ICD.
-/// Replays per workload, overridable via `CB_BENCH_ITERS`. Capped well below ~1000
-/// on purpose: sustained replay of one cached CB hits a PRE-EXISTING pocl bug
-/// (`CL_INVALID_OPERATION` at a random iteration — see the `cb_replay_limit`
-/// example), which has nothing to do with what this bench measures but would
-/// otherwise abort the longer workloads at random.
+/// Replays per workload, overridable via `CB_BENCH_ITERS`.
+///
+/// This used to be capped near 400 because sustained replay of one cached CB hit
+/// a pocl race (`CL_INVALID_OPERATION` at a random iteration — the
+/// `cb_replay_limit` example). Fixed upstream-ready in pocl
+/// ("Command-buffers: retire the submission before publishing CL_COMPLETE"), and
+/// 5000 replays run clean against a pocl carrying it. An OLDER pocl will still
+/// abort the longer workloads at random — that is the runtime, not this bench.
 fn iters() -> usize {
     std::env::var("CB_BENCH_ITERS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(400)
+        .unwrap_or(2000)
 }
 /// Dispatch count for the `-deep` workload — matched to the miniWeather trace in
 /// `NOTES.md` (24 dispatches re-recorded per step). Re-record cost scales with

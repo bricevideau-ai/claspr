@@ -453,8 +453,20 @@ Verified on a clean reconfigure+build of rebased pocl: full `ctest` 317/341, wit
 unrelated, pre-existing on LLVM 20 + aarch64). CB tests 3/3. The new regression test
 fails without the fix and passes with it.
 
-Remaining: send it upstream. `cb_bench` can have its 400-iteration cap lifted once a
-fixed pocl is installed.
+**Rolled out 2026-09-04**: pocl 8.0-pre (rebased fix branch) installed to `~/.local`,
+PR opened as pocl/pocl#2306. `cb_bench`'s iteration cap lifted 400 -> 2000; 5000
+replays run clean. Backup of the previous install at
+`~/.local/pocl-backup-20260904-1552/`.
+
+Build-trap caught during the rollout, now in auto-memory: a CLEAN pocl reconfigure
+picks up the unversioned `/usr/lib/.../libLLVMSPIRVLib.so`, which apt repoints at the
+newest LLVM (22) regardless of `WITH_LLVM_CONFIG` (20). Two LLVM majors in one
+address space -> SIGSEGV in `llvm::FixedVectorType::get` on the first SPIR-V
+translation, and 24 pocl ctest failures that look like upstream regressions. Always
+configure with `-DLLVM_SPIRV_LIB=/usr/lib/aarch64-linux-gnu/libLLVMSPIRVLib.so.20.1`
+and `-DHOST_LLVM_SPIRV=/usr/bin/llvm-spirv-20`; verify with
+`ldd build/lib/CL/libpocl.so | grep -i llvm` showing ONE major. With the pins:
+pocl ctest 341/341.
 
 ---
 
