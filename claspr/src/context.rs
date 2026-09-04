@@ -77,6 +77,16 @@ struct ContextInner {
     /// release failure can't propagate it; they bump this instead so
     /// callers who care can audit via [`Context::error_count`].
     error_state: AtomicU32,
+    /// `devices[0]`'s extension set, parsed once.
+    ///
+    /// A device's extension list is IMMUTABLE, but
+    /// [`device_has_extension`](Context::device_has_extension) used to re-query
+    /// `CL_DEVICE_EXTENSIONS` on every call — a driver round-trip, a `String`
+    /// allocation and a whitespace split, just to compare one token. The CB gate asks
+    /// twice per `sync` ([`cb_graph_eligible`] and the boundary/bundle guards), so a
+    /// replay loop was paying it on every iteration; an API trace of a steady-state
+    /// replay shows two `clGetDeviceInfo` calls per enqueue. Cached here instead.
+    device_extensions: OnceLock<std::collections::HashSet<String>>,
     /// Lazily-built program holding the built-in fill kernels (see
     /// [`crate::fill_kernel`]). Built on first device-fill use via
     /// [`Context::fill_program`]; cached for the context's lifetime.
@@ -514,11 +524,16 @@ impl Context {
     /// string (space-delimited), so a substring like `cl_khr_command_buffer`
     /// does not match the longer `cl_khr_command_buffer_mutable_dispatch`.
     fn device_has_extension(&self, ext: &str) -> bool {
-        self.inner.devices[0]
-            .cl3()
-            .extensions()
-            .map(|s| s.split_whitespace().any(|tok| tok == ext))
-            .unwrap_or(false)
+        self.inner
+            .device_extensions
+            .get_or_init(|| {
+                self.inner.devices[0]
+                    .cl3()
+                    .extensions()
+                    .map(|s| s.split_whitespace().map(str::to_owned).collect())
+                    .unwrap_or_default()
+            })
+            .contains(ext)
     }
 
     // ── Sticky-error counter ───────────────────────────────────────
@@ -682,6 +697,7 @@ impl ContextBuilder {
                 profiling: self.profiling,
                 queues,
                 error_state: AtomicU32::new(0),
+                device_extensions: OnceLock::new(),
                 fill_program: OnceLock::new(),
             }),
         };

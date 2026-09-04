@@ -89,7 +89,7 @@ fn erased_segments_lift_the_chain_length_ceiling() {
 
 /// A slot INSIDE an erased segment binds, re-binds, and invalidates the command
 /// buffer it was recorded into — the erased op forwards `bind_slots`,
-/// `invalidate_cbs` and the CB cache to the op it wraps.
+/// `apply_binding_delta` and the CB cache to the op it wraps.
 #[test]
 fn erased_segment_forwards_slots_and_command_buffers() {
     let Some(ctx) = ctx() else { return };
@@ -201,7 +201,7 @@ fn assert_static_parity<P: DeviceOp, E: DeviceOp>(plain: &P, erased: &E) {
 }
 
 /// A CB-recordable kernel chain with a slot: `bind_slots`, `check_ready` (unbound
-/// → error on both), the CB members, and `invalidate_cbs` via `mutate_bind`.
+/// → error on both), the CB members, and `apply_binding_delta` via `mutate_bind`.
 #[test]
 fn parity_slot_kernel_chain() {
     let Some(ctx) = ctx() else { return };
@@ -228,7 +228,7 @@ fn parity_slot_kernel_chain() {
         assert_eq!(
             homed_cb(&plain),
             homed_cb(&erased),
-            "invalidate_cbs after bind"
+            "apply_binding_delta after bind"
         );
         let p = plain
             .sync(&ctx)

@@ -1509,7 +1509,7 @@ pub fn graph_edge_table(nodes: &[GraphNode]) -> Vec<(usize, Vec<usize>)> {
 /// | **1. Core contract** | [`Output`](Self::Output), [`output_pipe`](Self::output_pipe), [`handle`](Self::handle), [`execute`](Self::execute), [`describe`](Self::describe) | ALWAYS — every one of the 33 impls defines these five. |
 /// | **2. Output shape** | [`Shape`](Self::Shape), [`collect`](Self::collect), [`collect_home`](Self::collect_home), [`into_output`](Self::into_output), [`gather_checkouts`](Self::gather_checkouts) | Only for MULTI-OUTPUT ops (6 impls). Single-output ops take the defaults, which build one [`Pipe`]/[`Checkout`] from `Output`. |
 /// | **3. Slots & readiness** | [`bind_slots`](Self::bind_slots), [`check_ready`](Self::check_ready), [`reclaim_undelivered`](Self::reclaim_undelivered) | If your op holds [`Input`]s that can be slots: forward to each input. Leaves with concrete-only args take the defaults. |
-/// | **4. Command-buffer participation** | [`cb_addable`](Self::cb_addable), [`cbable_weight`](Self::cbable_weight), [`cb_cache`](Self::cb_cache), [`invalidate_cbs`](Self::invalidate_cbs), [`collect_cb_ids`](Self::collect_cb_ids), [`cb_restamp`](Self::cb_restamp), [`cb_spine_head_addable`](Self::cb_spine_head_addable) | Only if your op enqueues commands a `cl_khr_command_buffer` can RECORD (45% of impls). The defaults say "not recordable", which is always CORRECT — never unsound, just slower (the op runs per-enqueue instead of being baked into a replayed CB). |
+/// | **4. Command-buffer participation** | [`cb_addable`](Self::cb_addable), [`cbable_weight`](Self::cbable_weight), [`cb_cache`](Self::cb_cache), [`apply_binding_delta`](Self::apply_binding_delta), [`collect_cb_ids`](Self::collect_cb_ids), [`cb_restamp`](Self::cb_restamp), [`cb_spine_head_addable`](Self::cb_spine_head_addable) | Only if your op enqueues commands a `cl_khr_command_buffer` can RECORD (45% of impls). The defaults say "not recordable", which is always CORRECT — never unsound, just slower (the op runs per-enqueue instead of being baked into a replayed CB). |
 /// | **5. Introspection** | [`node_label`](Self::node_label), [`dump_graph`](Self::dump_graph), [`contains_host_seam`](Self::contains_host_seam) | Combinators that nest children override these to recurse; leaves almost never do. |
 ///
 /// So: a new **leaf** op is tier 1 + usually `check_ready`/`bind_slots` — about
@@ -1954,7 +1954,7 @@ pub trait DeviceOp: Send {
     /// macro kernel `Op`) override to return `Some(&self.cb_cache)`.
     ///
     /// The per-node algorithm reads/writes THIS to "home a CB in yourself" and to
-    /// take the replay fast-path. [`invalidate_cbs`](Self::invalidate_cbs) clears
+    /// take the replay fast-path. [`apply_binding_delta`](Self::apply_binding_delta) clears
     /// it on mutation.
     fn cb_cache(&self) -> Option<&CbCache> {
         None
@@ -1975,16 +1975,16 @@ pub trait DeviceOp: Send {
     /// clears nothing.
     ///
     /// Default: clear own cache if it intersects; combinators override to recurse.
-    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
+    fn apply_binding_delta(&self, delta: &BindingDelta, rotate: bool) {
         if let Some(cache) = self.cb_cache() {
-            cb_cache_invalidate(cache, mutated);
+            cb_cache_apply(cache, delta, rotate);
         }
     }
 
     /// **Collect the stable identities of every homed [`FinalizedCb`] in this
     /// (sub)graph**, appending `(Arc::as_ptr as usize)` for each node that currently
     /// holds a CB. Test/introspection hook (`#[doc(hidden)]`): it walks the SAME
-    /// node set [`invalidate_cbs`](Self::invalidate_cbs) does, so a test can assert
+    /// node set [`apply_binding_delta`](Self::apply_binding_delta) does, so a test can assert
     /// that a `mutate_bind` cleared exactly the interior CBs it should (a region-A
     /// CB's id disappears / changes while region-B's id is untouched). Default:
     /// push own id if homed; combinators override to recurse into children.
@@ -2192,6 +2192,8 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             next,
             cb_cache: new_cb_cache(),
             cbable_weight,
+            cb_addable_memo: PredMemo::new(),
+            seam_memo: PredMemo::new(),
         }
     }
 
@@ -2423,17 +2425,21 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             // latter would leak the internal `<KeyMarker>` suffix into the message.
             return Err(Error::SlotNoSuchTag(Tg::NAME));
         }
-        // CB-mode (design v2): a MUTATE re-bound a slot, so any homed command buffer
-        // that captured that slot's buffer/args is stale. PRECISE per-slot: clear only
-        // the CBs whose `captured_slots` include a cell just re-bound (the binder
-        // recorded them in `matched_cells`), covering FedByPipe-across-seam via the
-        // CbReach substrate. Set-once `bind` runs at build BEFORE any CB exists, so it
-        // needs no invalidation.
-        if matches!(mode, BindMode::Mutate) {
-            let mutated: std::collections::BTreeSet<usize> =
-                binder.matched_cells().iter().copied().collect();
-            self.invalidate_cbs(&mutated);
-        }
+        // CB-mode: broadcast what just got bound, and to WHAT, so every CB-homing
+        // node can update its keyed cache (`CbLru`). Both verbs broadcast, but only
+        // `Mutate` rotates:
+        //
+        // - `Set` runs at build, before any CB exists, so there is nothing to rotate
+        //   — but it MUST still be recorded, because it establishes the binding state
+        //   the first recorded CB gets filed under. Skip it and that CB's key is
+        //   empty, no later state can ever match it, and the cache never hits.
+        // - `Mutate` rotates: park the current CB under the state it was recorded in
+        //   and promote whichever parked CB matches the new state (see `CbLru::apply`).
+        //   This is what turns miniWeather's per-step re-record into two records total.
+        //
+        // The delta covers exactly the cells this fold matched, carrying the digest of
+        // the value now in them (`None` for an unkeyable pipe-feed → hard clear).
+        self.apply_binding_delta(&binder.binding_delta(), matches!(mode, BindMode::Mutate));
         Ok(self)
     }
 
@@ -2577,6 +2583,11 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         let mut binder = SlotBinder::new::<Tg>(tag.into_value(), BindMode::Set);
         binder.mark_deferred();
         self.bind_slots(&mut binder);
+        // Seed the keyed CB cache with this initial binding (no rotation — a
+        // set-once bind runs at build, before any CB exists). Skipping it would leave
+        // the first recorded CB filed under an incomplete key, which nothing could
+        // ever match. See `fold_bind` for the same call on the fluent path.
+        self.apply_binding_delta(&binder.binding_delta(), false);
         binder.record_deferred(Tg::NAME);
     }
 

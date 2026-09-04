@@ -27,7 +27,7 @@ fn homed_cb_id<O: DeviceOp>(g: &O) -> usize {
         .and_then(|c| {
             c.lock()
                 .unwrap()
-                .as_ref()
+                .current()
                 .map(|arc| std::sync::Arc::as_ptr(arc) as usize)
         })
         .unwrap_or(0)

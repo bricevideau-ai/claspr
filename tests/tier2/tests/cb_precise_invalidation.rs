@@ -19,7 +19,7 @@
 //!   region 2's CB would silently replay the OLD buffer);
 //! - **combinator recursion** — a CB homed UNDER a `bundle` branch (below an interior
 //!   seam) is still reached by the mutate walk (the recursion the bundle/seam
-//!   `invalidate_cbs`/`collect_cb_ids` overrides close).
+//!   `apply_binding_delta`/`collect_cb_ids` overrides close).
 //!
 //! Each device region is a NESTED chain of ≥2 device commands so it homes its OWN
 //! command buffer (a single post-seam op is weight-1 and runs per-op, homing no CB).

@@ -29,33 +29,247 @@ use super::*;
 /// THIS field. It drops with the graph (the `FinalizedCb`'s RAII release), so the
 /// cache needs no global table and cannot ABA. [`mutate_bind`](DeviceOpExt::mutate_bind)
 /// clears the caches of the CB-homing nodes a mutated slot reaches (via the
-/// recursive [`invalidate_cbs`](DeviceOp::invalidate_cbs) walk).
-pub type CbCache = Arc<Mutex<Option<Arc<crate::record::FinalizedCb>>>>;
+/// recursive [`apply_binding_delta`](DeviceOp::apply_binding_delta) walk).
+pub type CbCache = Arc<Mutex<CbLru>>;
+
+/// How many *parked* command buffers a node keeps besides its current one.
+///
+/// Sized for the pattern that motivates the cache: a graph whose bindings CYCLE
+/// with a small period — miniWeather's x-first/z-first step parity, gray-scott's
+/// two-buffer ping-pong. Both are period 2, so 4 leaves headroom for a 3- or
+/// 4-phase cycle without letting a graph whose scalars take arbitrarily many values
+/// pin an unbounded number of `cl_command_buffer_khr` handles (each one holds
+/// retained kernels alive until it drops).
+pub const CB_LRU_CAP: usize = 4;
+
+/// The **binding state of a set of slot cells**: cell id → digest of the value bound
+/// there, or `None` where the value is unkeyable (a pipe-feed / probe — see
+/// [`SlotBinder::value_digest`](crate::eager::SlotBinder)).
+///
+/// Used two ways: as the DELTA a `mutate_bind` broadcasts, and (with the `None`s
+/// dropped) as the KEY a recorded command buffer is filed under.
+pub type BindingDelta = std::collections::BTreeMap<usize, Option<u64>>;
+
+/// A recorded command buffer's cache key: the digests of the slot cells it baked.
+/// Total (no `None`s) — a CB whose bindings include an unkeyable cell is never
+/// parked, because there would be no way to recognise its state again.
+pub type CbKey = std::collections::BTreeMap<usize, u64>;
+
+/// A CB-homing node's **small keyed cache of finalized command buffers**.
+///
+/// Replaces the single `Option<Arc<FinalizedCb>>` that made a `mutate_bind` throw
+/// away a perfectly good CB. The problem it solves (`NOTES.md`, "Graph mutation
+/// invalidates the recorded CB wholesale"): rebinding one scalar is the SMALLEST
+/// possible change and used to force a full re-record — 24 `clCommandNDRangeKernelKHR`
+/// per step in the miniWeather port. Bindings in real replay loops cycle, so the CB
+/// for the state you are returning to was usually recorded minutes ago and thrown out.
+///
+/// ## How a state is recognised
+///
+/// `bound` tracks what the graph's slots are bound to RIGHT NOW,
+/// updated by every `bind` and `mutate_bind` (set-once binds too — otherwise the
+/// first recorded CB would be filed under an empty key and nothing would ever match
+/// it). When a CB is recorded it is filed under `bound` restricted to the cells it
+/// actually baked; when a mutate arrives, `bound` is updated and any parked CB whose
+/// key still agrees with it is promoted back to [`current`](Self::current).
+///
+/// Note the digests come from the BINDER, not from the recording walk — the value is
+/// already in hand at `mutate_bind` time, so recording needs no extra bookkeeping and
+/// the replay hot path is untouched.
+#[derive(Default)]
+pub struct CbLru {
+    /// The CB matching the CURRENT binding state, if one is recorded. This is what
+    /// the boundary replays; `None` means the next `sync` records a fresh one.
+    current: Option<Arc<crate::record::FinalizedCb>>,
+    /// Previously recorded CBs for OTHER binding states, most-recently-parked first.
+    /// Capped at [`CB_LRU_CAP`]; the oldest is dropped (releasing its handle) on
+    /// overflow.
+    parked: std::collections::VecDeque<Arc<crate::record::FinalizedCb>>,
+    /// What every slot cell this node has ever seen bound is bound to now. A
+    /// superset of any single CB's key (it spans the whole graph's binds, not just
+    /// this node's captured set), which is exactly what lets a key be checked as
+    /// "every cell I baked still agrees".
+    bound: BindingDelta,
+    /// How many CBs THIS node has installed over its life. The process-wide
+    /// [`cb_records_total`](crate::record::cb_records_total) is the right instrument
+    /// for a single-threaded bench but useless in a parallel test binary, where every
+    /// test would count every other test's records; this is per-graph and immune to
+    /// that. Never reset — take a delta.
+    records: u64,
+}
 
 /// A fresh, empty [`CbCache`] — every CB-capable node initializes its field with
 /// this at build time.
 pub fn new_cb_cache() -> CbCache {
-    Arc::new(Mutex::new(None))
+    Arc::new(Mutex::new(CbLru::default()))
+}
+
+impl CbLru {
+    /// The CB for the current binding state, if recorded. `#[doc(hidden)] pub` so
+    /// the integration suites can introspect the cache (`homed_cb`, and the
+    /// `FinalizedCb` Arc identity the precise-invalidation tests assert on).
+    #[doc(hidden)]
+    pub fn current(&self) -> Option<&Arc<crate::record::FinalizedCb>> {
+        self.current.as_ref()
+    }
+
+    /// Install a freshly finalized CB as `current`, filing it under the binding state
+    /// it was recorded in (`bound` restricted to the slots it actually baked).
+    pub(crate) fn install(&mut self, cb: Arc<crate::record::FinalizedCb>) {
+        cb.set_key(self.key_for(&cb));
+        self.current = Some(cb);
+        self.records += 1;
+    }
+
+    /// How many CBs this node has installed — see [`records`](Self::records).
+    #[doc(hidden)]
+    pub fn records(&self) -> u64 {
+        self.records
+    }
+
+    /// The key `cb` should be filed under: this node's current bindings, restricted
+    /// to the slot cells `cb` baked, with unkeyable cells dropped. An entry the
+    /// recording captured but that we have no digest for makes the CB UNKEYABLE —
+    /// signalled by returning `None`, so it is never parked.
+    fn key_for(&self, cb: &crate::record::FinalizedCb) -> Option<CbKey> {
+        let mut key = CbKey::new();
+        for &cell in cb.captured_slots() {
+            match self.bound.get(&cell) {
+                Some(Some(d)) => {
+                    key.insert(cell, *d);
+                }
+                // Captured but unkeyable (pipe-fed) or never seen bound: we cannot
+                // recognise this state again, so refuse to key the CB at all.
+                Some(None) => return None,
+                None => return None,
+            }
+        }
+        Some(key)
+    }
+
+    /// Whether `cb`'s recorded key still agrees with the current bindings.
+    fn matches_now(&self, cb: &crate::record::FinalizedCb) -> bool {
+        cb.key()
+            .is_some_and(|k| k.iter().all(|(c, d)| self.bound.get(c) == Some(&Some(*d))))
+    }
+
+    /// **Apply a binding delta** — the whole point of the cache.
+    ///
+    /// Folds `delta` into [`bound`](Self::bound), then decides what happens to the
+    /// CBs this node holds. `rotate` is false for a set-once `bind` (which runs at
+    /// build, before any CB exists — it only needs to seed `bound`) and true for a
+    /// `mutate_bind`.
+    ///
+    /// Three outcomes, in the order they are tested:
+    ///
+    /// 1. **untouched** — the delta hits no slot this node's CB baked. Nothing moves.
+    /// 2. **rotate** — the touched cells are all keyable, so `current` is parked
+    ///    under the key it was recorded with, and whichever parked CB now agrees with
+    ///    `bound` (if any) is promoted. A period-2 alternation settles here: park A,
+    ///    record B, park B, find A.
+    /// 3. **hard clear** — an unkeyable cell was touched, so no key can be trusted;
+    ///    drop `current` AND every parked CB (they all share the assumption that just
+    ///    became unverifiable). This is exactly the old wholesale behaviour, now the
+    ///    fallback rather than the rule.
+    pub(crate) fn apply(&mut self, delta: &BindingDelta, rotate: bool) {
+        for (&cell, &digest) in delta {
+            self.bound.insert(cell, digest);
+        }
+        if !rotate {
+            return;
+        }
+        // Does this delta touch anything the CBs here actually baked?
+        let touches =
+            |cb: &crate::record::FinalizedCb| delta.keys().any(|c| cb.captured_slots().contains(c));
+        let hit_current = self.current.as_deref().is_some_and(touches);
+        let hit_parked = self.parked.iter().any(|cb| touches(cb));
+        if !hit_current && !hit_parked {
+            return; // (1) untouched
+        }
+        // (3) hard clear: an unkeyable rebind poisons every key at this node.
+        if delta.values().any(|d| d.is_none()) {
+            self.current = None;
+            self.parked.clear();
+            return;
+        }
+        // (2) rotate.
+        // A CB with no key was never recognisable, so parking it would pin a handle
+        // nothing can ever match — let it drop and release instead.
+        if let Some(cur) = self.current.take()
+            && cur.key().is_some()
+        {
+            self.parked.push_front(cur);
+            self.parked.truncate(CB_LRU_CAP);
+        }
+        if let Some(i) = self.parked.iter().position(|cb| self.matches_now(cb)) {
+            self.current = self.parked.remove(i);
+        }
+    }
+
+    /// Drop every CB held here (used when the queue changes out from under us).
+    pub(crate) fn clear(&mut self) {
+        self.current = None;
+        self.parked.clear();
+    }
+
+    /// How many CBs this node is holding (current + parked) — test hook for
+    /// asserting the cap is real.
+    #[doc(hidden)]
+    pub fn len(&self) -> usize {
+        self.current.is_some() as usize + self.parked.len()
+    }
+
+    /// Whether this node holds no CB at all.
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+// ── PredMemo: write-once memo for the static subtree predicates ──────────────
+
+/// A **write-once memo for a subtree predicate** that is static under `mutate`.
+///
+/// [`cb_addable`](DeviceOp::cb_addable) and
+/// [`contains_host_seam`](DeviceOp::contains_host_seam) recurse the WHOLE subtree on
+/// every call, and `wait_on` calls both once per `sync` — so a replay loop re-walks
+/// the graph twice per iteration to recompute two answers that cannot change. Worse,
+/// in `Off` mode the recursion re-runs at each node it descends through, which is
+/// what makes a left-deep spine or a seam-heavy graph O(n²) per sync.
+///
+/// Both predicates are static for exactly the reason
+/// [`cbable_weight`](DeviceOp::cbable_weight) is (see its doc): topology and per-node
+/// record-ability are fixed at build, and a `mutate_bind` changes a dependency EDGE,
+/// never a node's type or arity. `cbable_weight` banks that as a plain field because
+/// its value is known at construction; these two are cheaper to fill lazily on first
+/// use, which also keeps every constructor signature unchanged.
+///
+/// Only the BRANCHING combinators (`AndThen`, `Bundle*`, `FanOut`) need one — the
+/// single-delegate wrappers (`Arced`, `ArcSplit`, `OnDevice`, `Profiled`) just forward
+/// to their source, so they become O(1) as soon as the branch below them is memoized.
+pub(crate) type PredMemo = std::sync::OnceLock<bool>;
+
+/// Read `memo`, computing it with `f` on first use. The whole point is that `f` is
+/// the O(subtree) recursion and runs at most once per node per graph.
+pub(crate) fn pred_memo(memo: &PredMemo, f: impl FnOnce() -> bool) -> bool {
+    *memo.get_or_init(f)
 }
 
 /// Clear this node's OWN homed CB iff it baked a buffer/scalar traceable to a mutated
 /// slot (`captured_slots ∩ mutated ≠ ∅`). The own-cache half of
-/// [`invalidate_cbs`](DeviceOp::invalidate_cbs); each CB-homing combinator calls this
+/// [`apply_binding_delta`](DeviceOp::apply_binding_delta); each CB-homing combinator calls this
 /// on its `cb_cache` field then recurses into its own children (the recursion shape —
 /// `source`/`next`, a field list, or `self.ops` — is the part that legitimately varies
 /// per combinator, so it stays explicit at the call site).
-pub fn cb_cache_invalidate(cache: &CbCache, mutated: &std::collections::BTreeSet<usize>) {
-    let mut g = lock_unpoisoned(cache);
-    if g.as_ref().is_some_and(|cb| cb.depends_on_any(mutated)) {
-        *g = None;
-    }
+pub fn cb_cache_apply(cache: &CbCache, delta: &BindingDelta, rotate: bool) {
+    lock_unpoisoned(cache).apply(delta, rotate);
 }
 
 /// Push this node's OWN homed [`FinalizedCb`](crate::record::FinalizedCb) identity
 /// (`Arc::as_ptr`) into `out`, if it currently holds one. The own-cache half of
 /// [`collect_cb_ids`](DeviceOp::collect_cb_ids); the caller recurses into its children.
 pub fn cb_cache_collect_id(cache: &CbCache, out: &mut Vec<usize>) {
-    if let Some(arc) = lock_unpoisoned(cache).as_ref() {
+    if let Some(arc) = lock_unpoisoned(cache).current() {
         out.push(Arc::as_ptr(arc) as usize);
     }
 }
@@ -319,7 +533,7 @@ where
     };
     let finalized = Arc::new(finalized);
     // HOME the CB in the boundary node's OWN cache (drops with the graph).
-    *lock_unpoisoned(cache) = Some(Arc::clone(&finalized));
+    lock_unpoisoned(cache).install(Arc::clone(&finalized));
 
     let waits = drain_ext(&ext);
     let event = finalized.enqueue(&waits)?;
@@ -363,10 +577,17 @@ fn cb_lookup_cached(
     cache: &CbCache,
     queue: opencl3::types::cl_command_queue,
 ) -> Option<Arc<crate::record::FinalizedCb>> {
-    let guard = lock_unpoisoned(cache);
-    match guard.as_ref() {
+    let mut guard = lock_unpoisoned(cache);
+    match guard.current() {
         Some(cb) if cb.queue() == queue => Some(Arc::clone(cb)),
-        _ => None,
+        // A cache built against a DIFFERENT queue is stale wholesale — the parked
+        // entries were recorded on that queue too, so drop the lot rather than
+        // leaving handles that can never match.
+        Some(_) => {
+            guard.clear();
+            None
+        }
+        None => None,
     }
 }
 
@@ -466,7 +687,7 @@ pub(crate) fn cb_close_span(ec: &ExecutionContext<'_>) -> Result<Option<Dep>> {
     if !is_build {
         let cached: Option<Arc<crate::record::FinalizedCb>> = {
             let g = lock_unpoisoned(cache);
-            g.as_ref().filter(|cb| cb.queue() == queue).map(Arc::clone)
+            g.current().filter(|cb| cb.queue() == queue).map(Arc::clone)
         };
         let Some(cb) = cached else {
             // Shouldn't happen (replay implies a homed CB), but stay safe: no CB to
@@ -494,7 +715,7 @@ pub(crate) fn cb_close_span(ec: &ExecutionContext<'_>) -> Result<Option<Dep>> {
         return Ok(None);
     };
     let finalized = Arc::new(finalized);
-    *lock_unpoisoned(cache) = Some(Arc::clone(&finalized));
+    lock_unpoisoned(cache).install(Arc::clone(&finalized));
     let waits = drain_ext(ext);
     let event = finalized.enqueue(&waits)?;
     Ok(Some(wrap_event(event)))
@@ -682,7 +903,7 @@ where
         return op.execute(ec, mode);
     };
     let finalized = Arc::new(finalized);
-    *lock_unpoisoned(cache) = Some(Arc::clone(&finalized));
+    lock_unpoisoned(cache).install(Arc::clone(&finalized));
     let waits = drain_ext(&ext);
     let event = finalized.enqueue(&waits)?;
     op.cb_restamp(&single_dep(event));

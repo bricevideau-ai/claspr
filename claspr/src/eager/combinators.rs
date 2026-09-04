@@ -67,6 +67,10 @@ pub struct AndThen<S, U> {
     /// Precomputed `source.cbable_weight() + next.cbable_weight()` (static under
     /// mutate — see [`DeviceOp::cbable_weight`]). Set once by [`and_then`].
     pub(crate) cbable_weight: usize,
+    /// Memo for [`cb_addable`](DeviceOp::cb_addable) — see [`PredMemo`].
+    pub(crate) cb_addable_memo: PredMemo,
+    /// Memo for [`contains_host_seam`](DeviceOp::contains_host_seam) — see [`PredMemo`].
+    pub(crate) seam_memo: PredMemo,
 }
 
 impl<S, U> DeviceOp for AndThen<S, U>
@@ -273,8 +277,11 @@ where
     fn contains_host_seam(&self) -> bool {
         // `next` is the downstream op built eagerly inside the `and_then` closure
         // at construction (a real owned field, not a deferred closure), so a host
-        // seam built in the closure IS visible here.
-        self.source.contains_host_seam() || self.next.contains_host_seam()
+        // seam built in the closure IS visible here. Memoized: static under mutate,
+        // and `wait_on` asks once per sync.
+        pred_memo(&self.seam_memo, || {
+            self.source.contains_host_seam() || self.next.contains_host_seam()
+        })
     }
 
     fn cb_cache(&self) -> Option<&CbCache> {
@@ -284,7 +291,11 @@ where
     fn cb_addable(&self) -> bool {
         // A chain is CB-addable iff BOTH halves are (a transfer / host seam in
         // either disqualifies the whole subtree — coarse whole-graph gating).
-        self.source.cb_addable() && self.next.cb_addable()
+        // Memoized: this is the recursion that made an Off-mode walk over a
+        // left-deep spine O(n²) — every level re-walked its whole subtree.
+        pred_memo(&self.cb_addable_memo, || {
+            self.source.cb_addable() && self.next.cb_addable()
+        })
     }
 
     fn cbable_weight(&self) -> usize {
@@ -311,12 +322,12 @@ where
         self.next.cb_restamp(evs);
     }
 
-    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
+    fn apply_binding_delta(&self, delta: &BindingDelta, rotate: bool) {
         // Own CB, then recurse into both children (a CB homed in either sub-position
         // is checked against `mutated` at its own node).
-        cb_cache_invalidate(&self.cb_cache, mutated);
-        self.source.invalidate_cbs(mutated);
-        self.next.invalidate_cbs(mutated);
+        cb_cache_apply(&self.cb_cache, delta, rotate);
+        self.source.apply_binding_delta(delta, rotate);
+        self.next.apply_binding_delta(delta, rotate);
     }
 
     fn collect_cb_ids(&self, out: &mut Vec<usize>) {
@@ -647,7 +658,7 @@ trait ErasedDeviceOp<S: OpShape>: Send {
     fn cb_addable_erased(&self) -> bool;
     fn cbable_weight_erased(&self) -> usize;
     fn cb_cache_erased(&self) -> Option<&CbCache>;
-    fn invalidate_cbs_erased(&self, mutated: &std::collections::BTreeSet<usize>);
+    fn apply_binding_delta_erased(&self, delta: &BindingDelta, rotate: bool);
     fn collect_cb_ids_erased(&self, out: &mut Vec<usize>);
     fn cb_restamp_erased(&self, evs: &Deps);
     fn cb_spine_head_addable_erased(&self) -> bool;
@@ -722,8 +733,8 @@ where
     fn cb_cache_erased(&self) -> Option<&CbCache> {
         self.cb_cache()
     }
-    fn invalidate_cbs_erased(&self, mutated: &std::collections::BTreeSet<usize>) {
-        self.invalidate_cbs(mutated);
+    fn apply_binding_delta_erased(&self, delta: &BindingDelta, rotate: bool) {
+        self.apply_binding_delta(delta, rotate);
     }
     fn collect_cb_ids_erased(&self, out: &mut Vec<usize>) {
         self.collect_cb_ids(out);
@@ -889,8 +900,8 @@ where
         self.inner.cb_cache_erased()
     }
 
-    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
-        self.inner.invalidate_cbs_erased(mutated);
+    fn apply_binding_delta(&self, delta: &BindingDelta, rotate: bool) {
+        self.inner.apply_binding_delta_erased(delta, rotate);
     }
 
     fn collect_cb_ids(&self, out: &mut Vec<usize>) {
@@ -980,9 +991,9 @@ where
         Some(&self.cb_cache)
     }
 
-    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
-        cb_cache_invalidate(&self.cb_cache, mutated);
-        self.source.invalidate_cbs(mutated);
+    fn apply_binding_delta(&self, delta: &BindingDelta, rotate: bool) {
+        cb_cache_apply(&self.cb_cache, delta, rotate);
+        self.source.apply_binding_delta(delta, rotate);
     }
 
     fn collect_cb_ids(&self, out: &mut Vec<usize>) {
@@ -1190,9 +1201,9 @@ where
         Some(&self.cb_cache)
     }
 
-    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
-        cb_cache_invalidate(&self.cb_cache, mutated);
-        self.source.invalidate_cbs(mutated);
+    fn apply_binding_delta(&self, delta: &BindingDelta, rotate: bool) {
+        cb_cache_apply(&self.cb_cache, delta, rotate);
+        self.source.apply_binding_delta(delta, rotate);
     }
 
     fn collect_cb_ids(&self, out: &mut Vec<usize>) {
@@ -1278,6 +1289,10 @@ macro_rules! impl_eager_bundle {
             /// Precomputed sum of the branches' [`cbable_weight`](DeviceOp::cbable_weight)
             /// (static under mutate). Set once by the constructor.
             cbable_weight: usize,
+            /// Memo for [`cb_addable`](DeviceOp::cb_addable) — see [`PredMemo`].
+            cb_addable_memo: PredMemo,
+            /// Memo for [`contains_host_seam`](DeviceOp::contains_host_seam).
+            seam_memo: PredMemo,
         }
 
         #[doc = concat!("Construct an eager [`", stringify!($name),
@@ -1285,7 +1300,13 @@ macro_rules! impl_eager_bundle {
         #[allow(clippy::too_many_arguments)]
         pub fn $ctor<$($ty: DeviceOp),+>($($field: $ty),+) -> $name<$($ty),+> {
             let cbable_weight = 0 $(+ $field.cbable_weight())+;
-            $name { $($field,)+ cb_cache: new_cb_cache(), cbable_weight }
+            $name {
+                $($field,)+
+                cb_cache: new_cb_cache(),
+                cbable_weight,
+                cb_addable_memo: PredMemo::new(),
+                seam_memo: PredMemo::new(),
+            }
         }
 
         impl<$($ty: DeviceOp),+> DeviceOp for $name<$($ty),+>
@@ -1481,13 +1502,18 @@ macro_rules! impl_eager_bundle {
 
             fn contains_host_seam(&self) -> bool {
                 // OR every branch: a host seam in any one of them must gate.
-                false $(|| self.$field.contains_host_seam())+
+                // Memoized (static under mutate — see `PredMemo`).
+                pred_memo(&self.seam_memo, || {
+                    false $(|| self.$field.contains_host_seam())+
+                })
             }
 
             fn cb_addable(&self) -> bool {
                 // AND every branch: the whole bundle is CB-addable iff every branch
                 // is (a transfer / host seam in any branch disqualifies it).
-                true $(&& self.$field.cb_addable())+
+                pred_memo(&self.cb_addable_memo, || {
+                    true $(&& self.$field.cb_addable())+
+                })
             }
 
             fn cbable_weight(&self) -> usize {
@@ -1509,9 +1535,9 @@ macro_rules! impl_eager_bundle {
                 Some(&self.cb_cache)
             }
 
-            fn invalidate_cbs(&self, mutated: &::std::collections::BTreeSet<usize>) {
-                $crate::eager::cb_cache_invalidate(&self.cb_cache, mutated);
-                $(self.$field.invalidate_cbs(mutated);)+
+            fn apply_binding_delta(&self, delta: &$crate::eager::BindingDelta, rotate: bool) {
+                $crate::eager::cb_cache_apply(&self.cb_cache, delta, rotate);
+                $(self.$field.apply_binding_delta(delta, rotate);)+
             }
 
             fn collect_cb_ids(&self, out: &mut ::std::vec::Vec<usize>) {
@@ -1633,6 +1659,13 @@ pub struct FanOut<U: DeviceOp> {
     /// Design-v2 CB home: no command of its own, but its N branches record through
     /// here when they're all CB-addable.
     cb_cache: CbCache,
+    /// Precomputed sum of the branches' [`cbable_weight`](DeviceOp::cbable_weight),
+    /// matching the bundles (static under mutate). Was re-summed per call.
+    cbable_weight: usize,
+    /// Memo for [`cb_addable`](DeviceOp::cb_addable) — see [`PredMemo`].
+    cb_addable_memo: PredMemo,
+    /// Memo for [`contains_host_seam`](DeviceOp::contains_host_seam).
+    seam_memo: PredMemo,
 }
 
 /// Build a fan-out: `f` is called now for each input, producing the branch ops.
@@ -1642,10 +1675,14 @@ where
     U: DeviceOp,
 {
     let ops: Vec<U> = inputs.into_iter().map(&mut f).collect();
+    let cbable_weight = ops.iter().map(|op| op.cbable_weight()).sum();
     FanOut {
         ops,
         out: Pipe::new(),
         cb_cache: new_cb_cache(),
+        cbable_weight,
+        cb_addable_memo: PredMemo::new(),
+        seam_memo: PredMemo::new(),
     }
 }
 
@@ -1801,10 +1838,10 @@ where
         Some(&self.cb_cache)
     }
 
-    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
-        cb_cache_invalidate(&self.cb_cache, mutated);
+    fn apply_binding_delta(&self, delta: &BindingDelta, rotate: bool) {
+        cb_cache_apply(&self.cb_cache, delta, rotate);
         for op in &self.ops {
-            op.invalidate_cbs(mutated);
+            op.apply_binding_delta(delta, rotate);
         }
     }
 
@@ -1818,12 +1855,15 @@ where
     fn cb_addable(&self) -> bool {
         // No command of its own — CB-addable iff EVERY branch is (mirrors bundle).
         // Empty fan-out records nothing → not addable (cbable_weight 0 gates it too).
-        !self.ops.is_empty() && self.ops.iter().all(|op| op.cb_addable())
+        pred_memo(&self.cb_addable_memo, || {
+            !self.ops.is_empty() && self.ops.iter().all(|op| op.cb_addable())
+        })
     }
 
     fn cbable_weight(&self) -> usize {
-        // Sum of the branches' weights.
-        self.ops.iter().map(|op| op.cbable_weight()).sum()
+        // Precomputed sum of the branches' weights, like the bundles (static under
+        // mutate — see [`DeviceOp::cbable_weight`]).
+        self.cbable_weight
     }
 
     fn cb_restamp(&self, evs: &Deps) {
@@ -1833,12 +1873,42 @@ where
         }
     }
 
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        // Recurse into EVERY branch — a `slot!(Tag)` inside a fan-out branch must be
+        // reachable by `g.bind(Tag(v))` / `g.mutate_bind(..)`, exactly as it is inside
+        // a bundle branch. Without this override `FanOut` inherited the no-op default
+        // (`eager.rs`, `DeviceOp::bind_slots`), so the walk never reached `self.ops`
+        // and every such bind failed `SlotNoSuchTag` — the tag looked absent from a
+        // graph that plainly contains it.
+        //
+        // Fan-out discipline mirrors `AndThen`/bundle: a move-only binder stops once
+        // its single value has landed (one `bind` → one cell); a clone-able binder
+        // (scalar / launch / `Arc`) never consumes, so one `bind` fills EVERY matching
+        // cell across all branches. The early return is an optimization — a consumed
+        // move-only binder already no-ops at the next branch on its own `value`
+        // guard — but it keeps the traversal cost proportional to the work done.
+        for op in &self.ops {
+            op.bind_slots(binder);
+            if !binder.is_fanout() && binder.is_consumed() {
+                return;
+            }
+        }
+    }
+
     fn describe(&self, out: &mut Vec<String>) {
-        out.push(format!("fan_out[{}]", self.ops.len()));
+        // Recurse into the branches like the bundles do — a bare `fan_out[N]` hides
+        // whatever the branches are, which is the whole content of the node.
+        out.push(format!("fan_out[{}]{{", self.ops.len()));
+        for op in &self.ops {
+            op.describe(out);
+        }
+        out.push("}".into());
     }
 
     fn contains_host_seam(&self) -> bool {
-        self.ops.iter().any(|op| op.contains_host_seam())
+        pred_memo(&self.seam_memo, || {
+            self.ops.iter().any(|op| op.contains_host_seam())
+        })
     }
 }
 
@@ -2442,11 +2512,11 @@ where
         self.source.bind_slots(binder);
     }
 
-    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
+    fn apply_binding_delta(&self, delta: &BindingDelta, rotate: bool) {
         // A seam has no cb_cache of its OWN, but its source (a pre-seam device
         // region) homes CBs — recurse so a mutated slot upstream of the seam clears
         // the region-1 CB. Without this, the default (own-cache-only) would miss it.
-        self.source.invalidate_cbs(mutated);
+        self.source.apply_binding_delta(delta, rotate);
     }
 
     fn collect_cb_ids(&self, out: &mut Vec<usize>) {

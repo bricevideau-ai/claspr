@@ -54,7 +54,7 @@ Read these five first; they are the "mandatory core" every graph task touches:
    (`Shape`/`collect`/`collect_home`/`into_output`/`gather_checkouts`,
    6 impls); **tier 3, if you hold `Input`s** (`bind_slots`/`check_ready`/
    `reclaim_undelivered`); **tier 4, CB participation** (`cb_addable`/`cbable_weight`/
-   `cb_cache`/`invalidate_cbs`/`collect_cb_ids`/`cb_restamp`/`cb_spine_head_addable`
+   `cb_cache`/`apply_binding_delta`/`collect_cb_ids`/`cb_restamp`/`cb_spine_head_addable`
    — 45% of impls; the defaults say "not recordable", which is always CORRECT, just
    not CB-accelerated); **tier 5, introspection** (`node_label`/`dump_graph`/
    `contains_host_seam` — combinators recurse, leaves rarely). Skip tier 4 entirely

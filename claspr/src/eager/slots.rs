@@ -223,6 +223,31 @@ pub trait SlotEq {
     /// `true` iff `self` and `other` are the same underlying buffer object
     /// (handle / pointer identity).
     fn slot_eq(&self, other: &Self) -> bool;
+
+    /// A 64-bit **digest of this binding's identity**, with the contract
+    /// `slot_eq(a, b) => slot_digest(a) == slot_digest(b)` (the converse only up to
+    /// hash collision).
+    ///
+    /// This is what makes the keyed command-buffer cache possible: a `FinalizedCb`
+    /// records the digest of every slot it baked, so a `mutate_bind` can ask "is
+    /// there already a recorded CB for the state we are now in?" instead of throwing
+    /// the CB away. Digests, not values, because the cache is type-erased (cells are
+    /// bare `usize` ids) and because a move-only buffer cannot be copied into a key.
+    ///
+    /// It lives on `SlotEq` rather than in a trait of its own so the two can never
+    /// drift: any type that can answer "same binding?" must answer it the same way
+    /// twice, and every `Tg::Value: SlotEq` bound in the crate already carries it.
+    fn slot_digest(&self) -> u64;
+}
+
+/// Hash `x` to the `u64` a [`SlotEq::slot_digest`] impl returns. `DefaultHasher`
+/// is deterministic within a process (which is all a per-graph cache key needs) and
+/// keeps every impl hashing the same way.
+pub fn slot_digest_of(x: impl std::hash::Hash) -> u64 {
+    use std::hash::{DefaultHasher, Hasher};
+    let mut h = DefaultHasher::new();
+    x.hash(&mut h);
+    h.finish()
 }
 
 /// Implement [`SlotEq`] for a buffer family by comparing its
@@ -244,6 +269,16 @@ macro_rules! impl_slot_eq {
                     _ => false,
                 }
             }
+
+            fn slot_digest(&self) -> u64 {
+                use crate::record::{MemRef, RecordableBuffer};
+                // Tag the class so a `cl_mem` and an SVM pointer with the same
+                // numeric value can never collide — `slot_eq` calls them different.
+                match self.record_handle().mem {
+                    MemRef::Buffer(m) => $crate::eager::slot_digest_of((0u8, m as usize)),
+                    MemRef::Svm(p) => $crate::eager::slot_digest_of((1u8, p as usize)),
+                }
+            }
         }
     };
 }
@@ -258,6 +293,10 @@ impl<B: SlotEq> SlotEq for Scalar<B> {
     fn slot_eq(&self, other: &Self) -> bool {
         self.inner.slot_eq(other.as_buffer())
     }
+
+    fn slot_digest(&self) -> u64 {
+        self.inner.slot_digest()
+    }
 }
 
 // A shared (read-only fan-out) `Arc<DeviceSlice>` slot compares its inner buffer.
@@ -267,6 +306,11 @@ where
 {
     fn slot_eq(&self, other: &Self) -> bool {
         (**self).slot_eq(&**other)
+    }
+
+    // The Arc is a sharing wrapper — identity is the inner buffer's, not the Arc's.
+    fn slot_digest(&self) -> u64 {
+        (**self).slot_digest()
     }
 }
 
@@ -289,6 +333,10 @@ macro_rules! impl_slot_eq_scalar {
                 fn slot_eq(&self, other: &Self) -> bool {
                     self == other
                 }
+
+                fn slot_digest(&self) -> u64 {
+                    slot_digest_of(self)
+                }
             }
         )*
     };
@@ -301,10 +349,19 @@ impl SlotEq for f32 {
     fn slot_eq(&self, other: &Self) -> bool {
         self.to_bits() == other.to_bits()
     }
+
+    // Bitwise, to match `slot_eq` exactly (NaN and -0.0 included).
+    fn slot_digest(&self) -> u64 {
+        slot_digest_of(self.to_bits())
+    }
 }
 impl SlotEq for f64 {
     fn slot_eq(&self, other: &Self) -> bool {
         self.to_bits() == other.to_bits()
+    }
+
+    fn slot_digest(&self) -> u64 {
+        slot_digest_of(self.to_bits())
     }
 }
 
@@ -317,6 +374,11 @@ impl SlotEq for crate::LaunchSpec {
         self.dims() == other.dims()
             && self.global() == other.global()
             && self.local() == other.local()
+    }
+
+    // Exactly the three fields `slot_eq` compares, in the same order.
+    fn slot_digest(&self) -> u64 {
+        slot_digest_of((self.dims(), self.global(), self.local()))
     }
 }
 
@@ -646,8 +708,21 @@ pub struct SlotBinder {
     /// to clear exactly the CBs whose `captured_slots` intersect the re-bound cells.
     /// Populated in [`try_bind_slot`](Input::try_bind_slot) alongside `matched`
     /// (both probe and real passes — harmless in probe, but only the real Mutate pass
-    /// feeds `invalidate_cbs`).
+    /// feeds `apply_binding_delta`).
     pub(crate) matched_cells: Vec<usize>,
+    /// **The digest of the value being bound** ([`SlotEq::slot_digest`]), or `None`
+    /// for a binder that carries no value (a [`probe`](Self::probe) dry run, or a
+    /// [`feed`](Self::feed) pipe install).
+    ///
+    /// Computed in [`new`](Self::new) BEFORE the value is boxed, because a move-only
+    /// buffer binder has its value `take`n out during the walk — by the time
+    /// `fold_bind` wants the digest, `value` is `None`. One binder carries one value,
+    /// which fans out to every cell in [`matched_cells`](Self::matched_cells), so
+    /// this single digest is the digest of ALL of them.
+    ///
+    /// `None` here means "unkeyable": the keyed CB cache cannot tell two such
+    /// bindings apart, so a mutate carrying it falls back to a hard clear.
+    pub(crate) value_digest: Option<u64>,
     /// **Probe (read-only) mode.** When `true`, [`try_bind_slot`](Input::try_bind_slot)
     /// does NOT fill / take / replace any cell — it only INSPECTS state and records
     /// [`matched`](Self::matched) + [`outcome`](Self::outcome), so the whole
@@ -711,6 +786,9 @@ impl SlotBinder {
     where
         Tg::Value: SlotEq + SlotValue,
     {
+        // BEFORE the move into the box: a move-only buffer's value is taken out
+        // during the walk, so this is the only point where it is reachable.
+        let digest = value.slot_digest();
         SlotBinder {
             id: TypeId::of::<Tg::Key>(),
             mode,
@@ -737,6 +815,7 @@ impl SlotBinder {
             outcome: Ok(()),
             matched: 0,
             matched_cells: ::std::vec::Vec::new(),
+            value_digest: Some(digest),
             probe: false,
             severable_cells: Vec::new(),
             feed_pipe: None,
@@ -765,6 +844,8 @@ impl SlotBinder {
             outcome: Ok(()),
             matched: 0,
             matched_cells: ::std::vec::Vec::new(),
+            // A pipe-fed slot has no value to digest → unkeyable → hard clear.
+            value_digest: None,
             probe: false,
             severable_cells: Vec::new(),
             feed_pipe: Some(Box::new(pipe)),
@@ -795,6 +876,7 @@ impl SlotBinder {
             outcome: Ok(()),
             matched: 0,
             matched_cells: ::std::vec::Vec::new(),
+            value_digest: None,
             probe: true,
             severable_cells,
             feed_pipe: None,
@@ -923,9 +1005,23 @@ impl SlotBinder {
     }
 
     /// The slot cell ids this bind matched — the input to precise per-slot CB
-    /// invalidation (`fold_bind` passes these to `invalidate_cbs` on a `Mutate`).
+    /// invalidation (`fold_bind` passes these to `apply_binding_delta` on a `Mutate`).
     pub fn matched_cells(&self) -> &[usize] {
         &self.matched_cells
+    }
+
+    /// The **binding delta this fold represents**: every cell it matched, mapped to
+    /// the digest of the value it now holds. `None` digest (probe / pipe-feed) yields
+    /// an entry with no digest, which the CB cache reads as "unkeyable → hard clear".
+    ///
+    /// This is what replaces the bare cell set that precise invalidation used to
+    /// pass: knowing WHICH cells changed only lets you throw CBs away, knowing what
+    /// they changed TO lets you go find the one you already recorded.
+    pub(crate) fn binding_delta(&self) -> crate::eager::BindingDelta {
+        self.matched_cells
+            .iter()
+            .map(|&c| (c, self.value_digest))
+            .collect()
     }
 
     /// Mark this binder as belonging to the INFALLIBLE, consuming

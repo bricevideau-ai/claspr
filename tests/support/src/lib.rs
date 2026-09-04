@@ -203,9 +203,28 @@ pub fn handle_of<B: RecordableBuffer>(b: &B) -> usize {
 }
 
 /// Whether the graph's root homed a real finalized command buffer
-/// after a sync.
+/// after a sync — i.e. its keyed cache has a CB for the CURRENT binding state.
 pub fn homed_cb<O: DeviceOp>(g: &O) -> bool {
     g.cb_cache()
-        .map(|c| c.lock().unwrap().is_some())
+        .map(|c| c.lock().unwrap().current().is_some())
         .unwrap_or(false)
+}
+
+/// How many command buffers the graph's ROOT node has recorded over its life.
+///
+/// Prefer this over the process-wide `claspr::record::cb_records_total()` in tests:
+/// cargo runs test fns in parallel, so a global delta picks up every other test's
+/// records too (and fails maddeningly only under `--test-threads>1`). Take a delta
+/// around the region under test.
+pub fn cb_records_of<O: DeviceOp>(g: &O) -> u64 {
+    g.cb_cache()
+        .map(|c| c.lock().unwrap().records())
+        .unwrap_or(0)
+}
+
+/// How many command buffers the graph's root is holding — the one matching the
+/// current bindings plus any PARKED for other states (see `CbLru`). Lets a test
+/// assert the keyed cache's occupancy and its cap.
+pub fn homed_cb_count<O: DeviceOp>(g: &O) -> usize {
+    g.cb_cache().map(|c| c.lock().unwrap().len()).unwrap_or(0)
 }

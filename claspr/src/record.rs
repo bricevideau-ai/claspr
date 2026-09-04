@@ -198,6 +198,26 @@ pub struct CbBuilder {
 unsafe impl Send for CbBuilder {}
 unsafe impl Sync for CbBuilder {}
 
+/// Process-wide count of command buffers actually CREATED
+/// (`clCreateCommandBufferKHR`) — the record-churn metric. A replayed graph
+/// should create ONE per distinct binding state and then leave this flat; a
+/// graph that re-records every `sync` makes it climb linearly with the loop.
+///
+/// Test/bench hook (`#[doc(hidden)]`), in the same spirit as
+/// [`collect_cb_ids`](crate::DeviceOp::collect_cb_ids): it lets a test ASSERT the
+/// keyed-cache hit rate instead of inferring it from wall-clock. Relaxed ordering
+/// — this is a diagnostic counter, not a synchronization point, and it rides a
+/// driver call that dwarfs it.
+static CB_CREATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read [`CB_CREATES`] — total command buffers created since process start.
+/// Take a delta around the region you care about; see `cb_records_total` usage in
+/// `tests/tier2/tests/cb_keyed_cache.rs`.
+#[doc(hidden)]
+pub fn cb_records_total() -> u64 {
+    CB_CREATES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl CbBuilder {
     /// Create a fresh live command buffer over `queue` (single-queue CB). Returns
     /// `None` if the extension's lifecycle isn't reachable for `platform`.
@@ -212,6 +232,7 @@ impl CbBuilder {
         if err != opencl_sys::CL_SUCCESS || cb.is_null() {
             return None;
         }
+        CB_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(CbBuilder {
             cb,
             queue,
@@ -715,6 +736,8 @@ impl CbBuilder {
             release,
             kernels,
             captured_slots,
+            // Stamped by `CbLru::install`, which knows the binding digests.
+            key: Mutex::new(None),
         })
     }
 }
@@ -757,6 +780,16 @@ pub struct FinalizedCb {
     /// Slot cell ids this CB baked a buffer/scalar from (directly or transitively
     /// through pipes). Precise invalidation clears this CB iff a mutated slot is here.
     captured_slots: std::collections::BTreeSet<usize>,
+    /// **The binding state this CB was recorded in** — the digest of every slot in
+    /// [`captured_slots`](Self::captured_slots) at record time, filed by
+    /// [`CbLru::install`](crate::eager::CbLru). `None` means unkeyable (some captured
+    /// slot had no digest — a pipe-fed cell), so the CB can be replayed while it is
+    /// current but never parked and recognised later.
+    ///
+    /// Interior-mutable because the key is known to the CACHE, not to the recording
+    /// walk: the digests come from the binder that set the values, so `finalize`
+    /// produces the CB and `install` stamps its key a moment later.
+    key: Mutex<Option<crate::eager::CbKey>>,
 }
 
 // SAFETY: as `RecordedCb` — opaque handles + plain fn pointers.
@@ -774,6 +807,23 @@ impl FinalizedCb {
     /// transitively through pipes) — i.e. a mutate of one of those slots stales it.
     pub fn depends_on_any(&self, mutated: &std::collections::BTreeSet<usize>) -> bool {
         !self.captured_slots.is_disjoint(mutated)
+    }
+
+    /// The slot cells this CB baked — see [`captured_slots`](Self::captured_slots).
+    pub fn captured_slots(&self) -> &std::collections::BTreeSet<usize> {
+        &self.captured_slots
+    }
+
+    /// The binding state this CB was recorded in, or `None` if unkeyable. See
+    /// [`key`](Self::key).
+    pub fn key(&self) -> Option<crate::eager::CbKey> {
+        lock_unpoisoned(&self.key).clone()
+    }
+
+    /// Stamp this CB's cache key. Called once by
+    /// [`CbLru::install`](crate::eager::CbLru) right after `finalize`.
+    pub fn set_key(&self, key: Option<crate::eager::CbKey>) {
+        *lock_unpoisoned(&self.key) = key;
     }
 
     /// Enqueue the whole CB on its queue with `wait` as the EXTERNAL `cl_event`

@@ -2529,6 +2529,13 @@ macro_rules! impl_image_slot {
                 // Owned images are `cl_mem`-backed; identity is handle equality.
                 self.image.get() == other.image.get()
             }
+
+            fn slot_digest(&self) -> u64 {
+                // Same handle `slot_eq` compares. Tagged distinctly from the buffer
+                // families' `MemRef::Buffer` so an image and a buffer sharing a
+                // numeric handle value can never key the same.
+                crate::eager::slot_digest_of((2u8, self.image.get() as usize))
+            }
         }
 
         impl<A, F> crate::eager::SlotValue for $ty<A, F>

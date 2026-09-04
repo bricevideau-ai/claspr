@@ -161,7 +161,42 @@ today's refs). Glam is no longer in the generated TOML (spirv-std re-exports it)
 
 ### Graph mutation invalidates the recorded CB wholesale → two-tier dirtiness + mutable dispatch
 
-From the miniWeather claspr port (2026-08-20, `argonne-demo/miniweather-claspr`; cliloader
+**(b) LANDED 2026-09-04 — keyed LRU (`CbLru`). (a) mutable dispatch DECLINED for now**
+(`cl_khr_command_buffer_mutable_dispatch` is experimental and barely supported; PoCL
+advertises it, almost nothing else does). Measured on the 24-command / 30-step
+miniWeather shape (`tests/tier2/examples/cb_mutate_trace.rs` under cliloader), steady
+state, before → after:
+
+| | before | after |
+|---|---|---|
+| `clCreateCommandBufferKHR` | 30 | **2** |
+| `clCommandNDRangeKernelKHR` | 690 | **46** |
+| `clSetKernelArg` | 2070 | **138** |
+| `clGetDeviceInfo` | 60 | **0** |
+| total host API calls | 4776 | **408** (−91%) |
+
+`CbCache` went from `Option<Arc<FinalizedCb>>` to a small keyed cache: `current` +
+up to `CB_LRU_CAP` (4) parked CBs, each filed under the digests of the slots it baked.
+Rotation happens at MUTATE time, not replay time, so the replay hot path is untouched:
+`SlotEq` gained `slot_digest()` (same trait, so the two can't drift), `SlotBinder`
+carries the digest of the value it binds, and `DeviceOp::invalidate_cbs` became
+`apply_binding_delta(&BindingDelta, rotate)` — set-once binds seed the state, mutates
+rotate. Unkeyable cells (pipe-fed) still hard-clear, so the old behaviour is the
+fallback rather than the rule. Bonus: rebinding a slot to the value it already holds
+is now free (digest match → no rotation, no re-record); it used to re-record.
+
+Wall-clock on PoCL/CPU moved much less than the API counts (~4-8% per sync, at the
+edge of run-to-run noise) — PoCL's CB recording is cheap. The 30% figure below was
+measured under cliloader, whose per-call overhead inflates exactly the calls this
+removes. Expect the API-count win to matter more on drivers where recording does real
+validation/patching work.
+
+Still open from this section: nothing blocking. Revisit (a) if a driver landscape
+emerges where mutable dispatch is broadly available.
+
+---
+
+Original finding, from the miniWeather claspr port (2026-08-20, `argonne-demo/miniweather-claspr`; cliloader
 host-timing traces on local PoCL). A replayed Tier-2 graph whose scalar slots are
 `mutate_*`-ed between syncs re-records its command buffer EVERY replay: 30-step run =
 30x `clCreateCommandBufferKHR` + 720x `clCommandNDRangeKernelKHR` (24 dispatches
@@ -301,6 +336,35 @@ verification on `clGetKernelArgInfo` for SPIR-V programs for now — the arg-inf
 semantics for SPIR-V are in flux at the OpenCL WG (Brice, 2026-08); revisit when the
 WG lands a resolution.
 
+### CB region choice: maximal munch optimizes the wrong objective
+
+Raised 2026-09-03, no code. The boundary algorithm (`cb_should_open_boundary`) is
+greedy maximal-subtree tiling — textbook maximal munch. For the pure subtree rule that
+is actually OPTIMAL for coverage and CB count: the graph is a term tree of combinators,
+so every candidate region is convex by construction and the maximal addable subtrees
+form a unique antichain any other partition refines. (The general problem — convex
+partitioning of a DAG — is NP-hard; claspr dodges it by partitioning syntax, not
+dataflow.)
+
+But coverage is not the objective worth maximizing. A bigger tile costs twice:
+
+1. `cl_khr_command_buffer` has no per-command event wait and returns ONE completion
+   event, so a CB is a join/fork barrier — the first command waits on the last external
+   producer, and every consumer waits on the whole CB. Maximal tiles maximize that.
+2. A bigger tile is more to re-record when anything in it is touched. The keyed cache
+   above softens this but does not remove it (a cache MISS re-records the whole tile).
+
+So the right objective has a cut cost and a mutation-frequency term; greedy has neither.
+Tractable improvement if it ever matters: Aho-Johnson-style DP over the term tree with
+state "is this node inside the parent's tile", costing each cut by crossing dependence
+edges. Caveat: pipes threading across bundle branches overlay a DAG on the tree, which
+may drag it back toward the NP-hard formulation.
+
+Also note `cb_spine_head_addable` (the interior-seam span rule) is NOT subtree-shaped
+and is genuinely greedy-suboptimal — it takes the longest addable spine PREFIX, and the
+`closed` latch then forces independent post-seam work out of the CB on syntactic
+position rather than dataflow reachability.
+
 ### Tier-2 papercuts from the same port (small, independent)
 
 - **`Checkout::read_into(&self, &mut [T])`.** The only compile error in an 1,100-line
@@ -350,6 +414,28 @@ trigger:** a user wants one of those.
 
 ## Concerns
 
+### PoCL: sustained CB replay eventually fails `CL_INVALID_OPERATION` (pre-existing)
+
+Found 2026-09-04 while benching the keyed cache; **not** caused by it (reproduces with
+every runtime change reverted). Replaying ONE finalized command buffer in a `sync` loop
+returns `-59` from `clEnqueueCommandBufferKHR` at a NON-DETERMINISTIC iteration —
+observed at 841, 1023, 1173, 1605, 3462; sometimes 6000 replays pass clean. Repro:
+`tests/tier2/examples/cb_replay_limit.rs`.
+
+What is known:
+- Hits BOTH in-order and out-of-order queues, so it is not queue-ordering.
+- The FIRST graph in a process reliably survives; failures start only after a prior
+  `FinalizedCb` has been released — smells like handle reuse after
+  `clReleaseCommandBufferKHR` (cf. the PoCL release/UAF repros in `scratch/`).
+- claspr's side looks correct: `wait_deps_reconcile` does `clWaitForEvents` on the CB's
+  completion event before returning, so the buffer should be back in Executable state.
+  An API trace of the steady-state loop is clean — enqueue → wait → release event, no
+  errors, no missing dependency.
+- Disappears under cliloader (timing-sensitive), which is itself evidence of a race.
+
+Impact: caps sustained replay, which is exactly what Tier 2 is for. Worth a minimal
+C repro against PoCL upstream. `cb_bench` defaults to 400 iterations to stay clear of it.
+
 - **Intel NEO (legacy) crashes on malformed SPIR-V** — a valid-header module with a
   scrambled instruction stream SIGSEGVs inside the driver's IL frontend, and a
   half-truncated module is silently ACCEPTED (no validation). `tier1/errors.rs`
@@ -391,6 +477,7 @@ trigger:** a user wants one of those.
 
 | Commit | What |
 |---|---|
+| (this branch) | Keyed CB cache (`CbLru`) + `slot_digest`; cache device extensions (2 `clGetDeviceInfo`/sync → 0); memoize `cb_addable`/`contains_host_seam`; fix `FanOut::bind_slots` (slots in fan-out branches were unbindable). |
 | `6a33585` | Quality-review fix set: lent-buffer stranding guard, CopyTo2 CB-replay external deps, image length/dim → Result, CbBuilder pointer-arith `pub(crate)`, config-surface dedup, kernel-sig rejection. |
 | `a50af0f` | Abstraction round 2 (−743 lines): `impl_image_verbs!`, `capabilities!` table, `impl_{acquire,release}_view!`, `impl_kernel_image_arg_matrix!`. |
 | `994f6b4` | Complexity hotspot pass: `expand_kernel` (cyc 66→23), `try_bind_slot` (cog 39→7), `wait_on` decomposed. |
