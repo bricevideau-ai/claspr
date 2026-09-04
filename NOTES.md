@@ -414,10 +414,52 @@ trigger:** a user wants one of those.
 
 ## Concerns
 
-### PoCL: sustained CB replay eventually fails `CL_INVALID_OPERATION` (pre-existing)
+### PoCL: sustained CB replay eventually fails `CL_INVALID_OPERATION` — **FIXED upstream-ready 2026-09-04**
 
-Found 2026-09-04 while benching the keyed cache; **not** caused by it (reproduces with
-every runtime change reverted). Replaying ONE finalized command buffer in a `sync` loop
+Root-caused and fixed: pocl branch `fix/cmdbuf-pending-race`, one commit
+("Command-buffers: retire the submission before publishing CL_COMPLETE"), rebased on
+current pocl `main` (v7.2+). Standalone repro kept at
+`scratch/pocl_cmdbuf_replay_race.c`; pocl's own regression is in
+`tests/runtime/test_command_buffer.c`.
+
+Two bugs, one commit:
+
+1. **The race.** `pocl_update_event_finished` wrote `event->status = CL_COMPLETE` and
+   released the event lock ~30 lines before decrementing `command_buffer->pending`.
+   `pocl_pthread_wait_event` tests `event->status > CL_COMPLETE` BEFORE waiting on its
+   condvar, so an app thread arriving at `clWaitForEvents` inside that window sees
+   CL_COMPLETE, never waits, and its next `clEnqueueCommandBufferKHR` finds
+   `pending != 0`. An app that blocks BEFORE completion is woken from
+   `notify_event_finished`, which runs after the retire — hence "needs host work between
+   enqueue and wait", the random iteration, and the disappearance under a tracer.
+   Confirmed by construction: spin 2000 → first failure at 6594, 20000 → 897,
+   200000 → 386; spin 0 never fails. Fix: decrement under the event lock already held,
+   before publishing the status (`command_buffer->mutex` is a leaf, so no new lock-order
+   edge); leave `clReleaseCommandBufferKHR` outside the locks.
+2. **Conformance.** `clEnqueueCommandBufferKHR` set `state = FINALIZED` to mean "in
+   flight". The spec has three states and no Pending: *Finalized* = "finalized but some
+   command has unset arguments" (mutable buffers only), *Executable* = fully specified,
+   and a buffer STAYS Executable while submissions run. So
+   `clGetCommandBufferInfoKHR(CL_COMMAND_BUFFER_STATE_KHR)` reported "an argument is
+   unset" for a correctly built running buffer. Fix: gate on `pending`, leave `state`.
+
+**claspr was not at fault.** The spec defines simultaneous use as submitting "without a
+prerequisite on all the previous submissions ... which are not in the CL_COMPLETE state"
+and names events as a way to express that prerequisite — so waiting on the completion
+event and re-enqueueing is conformant and must succeed.
+
+Verified on a clean reconfigure+build of rebased pocl: full `ctest` 317/341, with the
+24 failures **identical to the pre-fix baseline** (kernel-compiler / SPIR-V tests,
+unrelated, pre-existing on LLVM 20 + aarch64). CB tests 3/3. The new regression test
+fails without the fix and passes with it.
+
+Remaining: send it upstream. `cb_bench` can have its 400-iteration cap lifted once a
+fixed pocl is installed.
+
+---
+
+Original finding, 2026-09-04, while benching the keyed cache; **not** caused by it
+(reproduced with every runtime change reverted). Replaying ONE finalized command buffer in a `sync` loop
 returns `-59` from `clEnqueueCommandBufferKHR` at a NON-DETERMINISTIC iteration —
 observed at 841, 1023, 1173, 1605, 3462; sometimes 6000 replays pass clean. Repro:
 `tests/tier2/examples/cb_replay_limit.rs`.
