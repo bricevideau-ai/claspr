@@ -14,17 +14,36 @@
 //! only per-width text left in this file is the two-line dispatch in `main`
 //! and the `Width` cast helper).
 //!
-//! The whole timestep (6 semi-steps x 4 kernels = 24 dispatches) is ONE
-//! Tier-2 eager graph, built once and replayed with `sync` every DOUBLE
-//! step. All nine buffers are literals threaded through every dispatch as
-//! pipes (they rehome automatically each replay); the per-step direction
-//! alternation and launch extents are literals, so a steady-state replay
-//! mutates nothing and the recorded command buffer is reused; only the
-//! dt-dependent scalars are slots, re-bound when the clamped dt changes.
+//! ## Two graph shapes, proven equivalent
+//!
+//! The timestep is a Tier-2 eager graph built once and replayed with `sync`.
+//! It is built in TWO shapes, and `main` runs both and compares:
+//!
+//! - **`Shape::Unrolled`** — two timesteps per graph (48 dispatches). Fusing
+//!   the pair makes the x-first/z-first alternation and the launch extents
+//!   LITERALS, so a steady-state replay mutates nothing at all. One binding
+//!   state, one recorded command buffer.
+//! - **`Shape::PerTimestep`** — one timestep per graph (24 dispatches),
+//!   mirroring the reference's `perform_timestep` one-to-one. Direction,
+//!   extents and hyperviscosity ride SLOTS and flip every step — the
+//!   reference's `direction_switch`, expressed as a rebind rather than as
+//!   unrolled code. Two binding states, both held by the keyed command-buffer
+//!   cache, so it still records twice rather than once per sync.
+//!
+//! The unrolled shape exists only because direction used to have to be a
+//! literal: before the keyed cache, alternating a slot re-recorded the whole
+//! command buffer every step. It no longer does, so the natural shape is now
+//! affordable — it costs a few percent of wall time for one extra `sync` per
+//! pair of steps, and reads like the Fortran.
+//!
+//! All nine buffers are threaded through every dispatch as pipes (they rehome
+//! automatically each replay); the read-only hydrostatic arrays are `Arc`-shared
+//! rather than threaded, so they cost no pass-through parameters.
 //!
 //! Self-validating: `cargo test -p miniweather-example` runs short thermal
 //! integrations at both widths and checks the domain-integrated mass/energy
-//! drift (and f32-vs-f64 agreement). Full runs:
+//! drift, f32-vs-f64 agreement, and that the two graph shapes above are
+//! BIT-IDENTICAL. Full runs:
 //! `cargo run -p miniweather-example -- --nx 400 --nz 200 --sim-time 400`.
 
 use claspr::eager::DeviceOpExt;
@@ -716,6 +735,28 @@ slots! {
     H2B1<R>: R, H2B2<R>: R, H2B3<R>: R, // step 2, x half
 }
 
+// Slots for the NON-UNROLLED graph: one graph = one timestep = two halves,
+// mirroring the reference `perform_timestep`. Everything that differs between
+// the two halves is a slot rather than a literal, so the SAME graph runs
+// x-then-z on odd steps and z-then-x on even ones. Both halves of a timestep
+// share the stage dts (the reference passes dt/3, dt/2, dt/1 to all six
+// `semi_discrete_step` calls), so there are three of those, not six.
+slots! {
+    PtA<R>: R, PtB<R>: R, PtC<R>: R,       // stage dts, shared by both halves
+    PvA1<R>: R, PvA2<R>: R, PvA3<R>: R,    // hyperviscosity, first half
+    PvB1<R>: R, PvB2<R>: R, PvB3<R>: R,    // hyperviscosity, second half
+}
+
+// Direction and launch extents are width-INDEPENDENT (u32 / LaunchSpec), so
+// unlike the dt-carrying tags above these need no generic parameter: the f64
+// and f32 graphs can share the tag type because `bind_slots` walks one graph
+// and only ever fills that graph's cells.
+slots! {
+    PdA: u32, PdB: u32,                    // DIR_X = 0 / DIR_Z = 1, per half
+    PgA: LaunchSpec, PfA: LaunchSpec,      // halo / flux extents, first half
+    PgB: LaunchSpec, PfB: LaunchSpec,      // halo / flux extents, second half
+}
+
 // ── Tier-2 driver, instantiated per precision ────────────────────────────────
 
 /// The example's numeric-width bound: host-boundary casts for a
@@ -743,10 +784,43 @@ impl Width for f32 {
     }
 }
 
-/// Run the case on the device; returns (initial, final) state as
-/// f64 (initial = after the precision round-trip, i.e. exactly
-/// what the device evolved from).
-fn run<Real, K>(ctx: &Context, cfg: &Config, init: &Init) -> claspr::Result<(Vec<f64>, Vec<f64>)>
+/// Which graph shape to build. Both compute the same thing; they differ only in
+/// whether the x-first/z-first alternation is UNROLLED into the graph or carried
+/// by slots and flipped per step.
+///
+/// Only ONE is built per `run` call: the other would be dead weight. Stack is no
+/// longer the constraint — every 12-dispatch half is `.erase()`d, so a debug
+/// build of `run` (both arms in one frame) needs under 512 KiB of a test
+/// thread's 2 MiB (measured 2026-10-27).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shape {
+    /// Two timesteps per graph, directions and extents as literals. One binding
+    /// state, so a steady-state replay mutates nothing.
+    Unrolled,
+    /// One timestep per graph, mirroring the reference's `perform_timestep`.
+    /// Direction, extents and hyperviscosity ride slots; two binding states,
+    /// both held by the keyed command-buffer cache.
+    PerTimestep,
+}
+
+/// One device run of one shape.
+struct RunOut {
+    /// Initial state after the precision round-trip — what the device evolved from.
+    state0: Vec<f64>,
+    /// Final state.
+    final_: Vec<f64>,
+    secs: f64,
+    /// `sync` calls performed (the unrolled shape advances TWO timesteps per sync).
+    syncs: u64,
+    /// Command buffers RECORDED — the number the keyed cache exists to hold down.
+    cbs: u64,
+}
+
+/// Run the case on the device with ONE graph `shape`. Running both and comparing
+/// the final states bit-for-bit is the equivalence proof — separate graphs over
+/// separate buffers from identical host state. Mirrors gray-scott's
+/// swap-vs-immutable pairing.
+fn run<Real, K>(ctx: &Context, cfg: &Config, init: &Init, shape: Shape) -> claspr::Result<RunOut>
 where
     K: gpu::Kernels<Real>,
     Real: Width,
@@ -767,6 +841,7 @@ where
     let t = DeviceSlice::<Real>::from_vec(ctx, state_h)?;
     let fx = DeviceSlice::<Real>::alloc_zero(ctx, 4 * (nz + 1) * (nx + 1))?;
     let td = DeviceSlice::<Real>::alloc_zero(ctx, 4 * nz * nx)?;
+
     // Read-only hydrostatic arrays: Arc-shared, one clone bound as
     // a literal at every dispatch site that reads them (the Arc
     // fan-out pattern; no pipe threading, no slots).
@@ -938,127 +1013,59 @@ where
             };
         }
 
-    // Seed dispatch takes the owned buffers; every later half is
-    // uniform. Step 1 = x-first (x half via seed+rest, then z),
-    // step 2 = z-first (z, then x). The seed half is erased by hand,
-    // like every `half!`.
-    let g0 = ks
-        .halo_s(
-            gh_x,
-            s,
-            t,
-            fx,
-            td,
-            hd.clone(),
-            hdt.clone(),
-            nxu,
-            nzu,
-            0u32,
-            inj,
-            dz_t,
-        )
-        .and_then(move |(s, t, fx, td, _hd, _hdt)| {
-            ks.flux_s(
-                gf_x,
-                s,
-                t,
-                fx,
-                td,
-                hd.clone(),
-                hdt.clone(),
-                hdi.clone(),
-                hdti.clone(),
-                hpi.clone(),
-                nxu,
-                nzu,
-                0u32,
-                slot!(H1A1<Real>),
-            )
-        })
-        .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
-            ks.tend_s(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
-        })
-        .and_then(move |(s, t, fx, td)| ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!(Dt1A<Real>)))
-        .and_then(move |(s, t, fx, td)| {
-            ks.halo_t(
-                gh_x,
-                s,
-                t,
-                fx,
-                td,
-                hd.clone(),
-                hdt.clone(),
-                nxu,
-                nzu,
-                0u32,
-                inj,
-                dz_t,
-            )
-        })
-        .and_then(move |(s, t, fx, td, _hd, _hdt)| {
-            ks.flux_t(
-                gf_x,
-                s,
-                t,
-                fx,
-                td,
-                hd.clone(),
-                hdt.clone(),
-                hdi.clone(),
-                hdti.clone(),
-                hpi.clone(),
-                nxu,
-                nzu,
-                0u32,
-                slot!(H1A2<Real>),
-            )
-        })
-        .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
-            ks.tend_t(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
-        })
-        .and_then(move |(s, t, fx, td)| ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!(Dt1B<Real>)))
-        .and_then(move |(s, t, fx, td)| {
-            ks.halo_t(
-                gh_x,
-                s,
-                t,
-                fx,
-                td,
-                hd.clone(),
-                hdt.clone(),
-                nxu,
-                nzu,
-                0u32,
-                inj,
-                dz_t,
-            )
-        })
-        .and_then(move |(s, t, fx, td, _hd, _hdt)| {
-            ks.flux_t(
-                gf_x,
-                s,
-                t,
-                fx,
-                td,
-                hd.clone(),
-                hdt.clone(),
-                hdi.clone(),
-                hdti.clone(),
-                hpi.clone(),
-                nxu,
-                nzu,
-                0u32,
-                slot!(H1A3<Real>),
-            )
-        })
-        .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
-            ks.tend_t(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
-        })
-        .and_then(move |(s, t, fx, td)| ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!(Dt1C<Real>)))
-        .erase();
-    let g1 = half!(g0, gh_z, gf_z, 1u32, H1B1, H1B2, H1B3, Dt1A, Dt1B, Dt1C);
-    let g2 = half!(g1, gh_z, gf_z, 1u32, H2A1, H2A2, H2A3, Dt2A, Dt2B, Dt2C);
-    let g = half!(g2, gh_x, gf_x, 0u32, H2B1, H2B2, H2B3, Dt2A, Dt2B, Dt2C);
+    // The SEED half: identical to `half!` except it consumes the OWNED buffers
+    // instead of picking them off an upstream chain's pipes. Same parameters, so
+    // both graph shapes below (unrolled double-step, non-unrolled per-timestep)
+    // are built from the same two macros and cannot drift apart. Erased like
+    // every `half!`.
+    #[rustfmt::skip]
+        macro_rules! seed_half {
+            ($s:expr, $t:expr, $fx:expr, $td:expr, $gh:expr, $gf:expr, $d:expr,
+                                     $hv1:ident, $hv2:ident, $hv3:ident,
+                                     $dta:ident, $dtb:ident, $dtc:ident) => {
+                ks.halo_s($gh, $s, $t, $fx, $td, hd.clone(), hdt.clone(),
+                          nxu, nzu, $d, inj, dz_t)
+                .and_then(move |(s, t, fx, td, _hd, _hdt)| {
+                    ks.flux_s($gf, s, t, fx, td, hd.clone(), hdt.clone(), hdi.clone(),
+                              hdti.clone(), hpi.clone(), nxu, nzu, $d, slot!($hv1<Real>))
+                })
+                .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
+                    ks.tend_s(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
+                })
+                .and_then(move |(s, t, fx, td)| {
+                    ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dta<Real>))
+                })
+                .and_then(move |(s, t, fx, td)| {
+                    ks.halo_t($gh, s, t, fx, td, hd.clone(), hdt.clone(),
+                              nxu, nzu, $d, inj, dz_t)
+                })
+                .and_then(move |(s, t, fx, td, _hd, _hdt)| {
+                    ks.flux_t($gf, s, t, fx, td, hd.clone(), hdt.clone(), hdi.clone(),
+                              hdti.clone(), hpi.clone(), nxu, nzu, $d, slot!($hv2<Real>))
+                })
+                .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
+                    ks.tend_t(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
+                })
+                .and_then(move |(s, t, fx, td)| {
+                    ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dtb<Real>))
+                })
+                .and_then(move |(s, t, fx, td)| {
+                    ks.halo_t($gh, s, t, fx, td, hd.clone(), hdt.clone(),
+                              nxu, nzu, $d, inj, dz_t)
+                })
+                .and_then(move |(s, t, fx, td, _hd, _hdt)| {
+                    ks.flux_t($gf, s, t, fx, td, hd.clone(), hdt.clone(), hdi.clone(),
+                              hdti.clone(), hpi.clone(), nxu, nzu, $d, slot!($hv3<Real>))
+                })
+                .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
+                    ks.tend_t(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
+                })
+                .and_then(move |(s, t, fx, td)| {
+                    ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!($dtc<Real>))
+                })
+                .erase()
+            };
+        }
 
     // hv(d, stage, dt) with the dt = 0 no-op convention
     let hv = |d: f64, q: f64, dt: f64| -> Real {
@@ -1092,73 +1099,230 @@ where
             H2B3(hv(dx, 1.0, dt2)),
         )
     };
-    let b = bind_all(dt0, dt0);
-    let g = g
-        .bind(b.0)
-        .bind(b.1)
-        .bind(b.2)
-        .bind(b.3)
-        .bind(b.4)
-        .bind(b.5)
-        .bind(b.6)
-        .bind(b.7)
-        .bind(b.8)
-        .bind(b.9)
-        .bind(b.10)
-        .bind(b.11)
-        .bind(b.12)
-        .bind(b.13)
-        .bind(b.14)
-        .bind(b.15)
-        .bind(b.16)
-        .bind(b.17);
-
-    let mut etime = 0.0f64;
-    let mut dt = dt0;
-    let mut bound = (dt0, dt0);
-    let mut final_state = vec![Real::default(); state_len];
-    let mut nstep = 0u64;
-    while etime < cfg.sim_time {
-        // derive this pair's two step dts with the Fortran's exact
-        // clamp arithmetic; dt2 = 0 means "no-op second step"
-        if etime + dt > cfg.sim_time {
-            dt = cfg.sim_time - etime;
-        }
-        let dt1 = dt;
-        let e1 = etime + dt1;
-        let dt2 = if e1 < cfg.sim_time {
-            if e1 + dt > cfg.sim_time {
-                cfg.sim_time - e1
-            } else {
-                dt
-            }
+    // ── Graph B bindings: one timestep, direction chosen by slot. ────────────
+    // `first_is_x` IS the reference's `direction_switch`. Everything that
+    // distinguishes the two halves — direction flag, halo/flux extents, and the
+    // hyperviscosity coefficients (which carry the grid spacing, dx vs dz) —
+    // flips together, so the graph has exactly TWO binding states while dt holds
+    // steady. Both live in the keyed CB cache, so neither is ever re-recorded.
+    let bind_per = |first_is_x: bool, dt: f64| {
+        let (da, db) = if first_is_x {
+            (0u32, 1u32)
         } else {
-            0.0
+            (1u32, 0u32)
         };
-        if (dt1, dt2) != bound {
-            let b = bind_all(dt1, dt2);
-            g.mutate_call((b.0, b.1, b.2, b.3))?;
-            g.mutate_call((b.4, b.5, b.6, b.7))?;
-            g.mutate_call((b.8, b.9, b.10, b.11))?;
-            g.mutate_call((b.12, b.13, b.14, b.15))?;
-            g.mutate_call((b.16, b.17))?;
-            bound = (dt1, dt2);
+        let (gha, gfa, ghb, gfb) = if first_is_x {
+            (gh_x, gf_x, gh_z, gf_z)
+        } else {
+            (gh_z, gf_z, gh_x, gf_x)
+        };
+        // Spacing follows the direction: hv_coef = -hv_beta * d / (16*dt).
+        let (sa, sb) = if first_is_x { (dx, dzf) } else { (dzf, dx) };
+        (
+            PtA(Real::of(dt / 3.0)),
+            PtB(Real::of(dt / 2.0)),
+            PtC(Real::of(dt)),
+            PvA1(hv(sa, 3.0, dt)),
+            PvA2(hv(sa, 2.0, dt)),
+            PvA3(hv(sa, 1.0, dt)),
+            PvB1(hv(sb, 3.0, dt)),
+            PvB2(hv(sb, 2.0, dt)),
+            PvB3(hv(sb, 1.0, dt)),
+            PdA(da),
+            PdB(db),
+            PgA(gha),
+            PfA(gfa),
+            PgB(ghb),
+            PfB(gfb),
+        )
+    };
+
+    // Only the selected shape is built (see `Shape`).
+    let (final_state, secs, syncs, cbs) = match shape {
+        Shape::Unrolled => {
+            // ── Graph A: the UNROLLED double timestep (x-first step, then z-first). ──
+            // Directions and extents are literals, so a steady-state replay mutates
+            // nothing at all. Two timesteps per sync.
+            let g0 = seed_half!(
+                s, t, fx, td, gh_x, gf_x, 0u32, H1A1, H1A2, H1A3, Dt1A, Dt1B, Dt1C
+            );
+            let g1 = half!(g0, gh_z, gf_z, 1u32, H1B1, H1B2, H1B3, Dt1A, Dt1B, Dt1C);
+            let g2 = half!(g1, gh_z, gf_z, 1u32, H2A1, H2A2, H2A3, Dt2A, Dt2B, Dt2C);
+            let g = half!(g2, gh_x, gf_x, 0u32, H2B1, H2B2, H2B3, Dt2A, Dt2B, Dt2C);
+
+            let b = bind_all(dt0, dt0);
+            let g = g
+                .bind(b.0)
+                .bind(b.1)
+                .bind(b.2)
+                .bind(b.3)
+                .bind(b.4)
+                .bind(b.5)
+                .bind(b.6)
+                .bind(b.7)
+                .bind(b.8)
+                .bind(b.9)
+                .bind(b.10)
+                .bind(b.11)
+                .bind(b.12)
+                .bind(b.13)
+                .bind(b.14)
+                .bind(b.15)
+                .bind(b.16)
+                .bind(b.17);
+
+            let cb0 = claspr::record::cb_records_total();
+            let t_unrolled = std::time::Instant::now();
+            let mut etime = 0.0f64;
+            let mut dt = dt0;
+            let mut bound = (dt0, dt0);
+            let mut final_state = vec![Real::default(); state_len];
+            let mut nstep = 0u64;
+            while etime < cfg.sim_time {
+                // derive this pair's two step dts with the Fortran's exact
+                // clamp arithmetic; dt2 = 0 means "no-op second step"
+                if etime + dt > cfg.sim_time {
+                    dt = cfg.sim_time - etime;
+                }
+                let dt1 = dt;
+                let e1 = etime + dt1;
+                let dt2 = if e1 < cfg.sim_time {
+                    if e1 + dt > cfg.sim_time {
+                        cfg.sim_time - e1
+                    } else {
+                        dt
+                    }
+                } else {
+                    0.0
+                };
+                if (dt1, dt2) != bound {
+                    let b = bind_all(dt1, dt2);
+                    g.mutate_call((b.0, b.1, b.2, b.3))?;
+                    g.mutate_call((b.4, b.5, b.6, b.7))?;
+                    g.mutate_call((b.8, b.9, b.10, b.11))?;
+                    g.mutate_call((b.12, b.13, b.14, b.15))?;
+                    g.mutate_call((b.16, b.17))?;
+                    bound = (dt1, dt2);
+                }
+                if dt2 != 0.0 {
+                    dt = dt2; // the Fortran dt variable persists across steps
+                }
+                let co = g.sync(ctx)?;
+                etime = e1 + dt2;
+                nstep += if dt2 != 0.0 { 2 } else { 1 };
+                if etime >= cfg.sim_time {
+                    let (cs, _ct, _cfx, _ctd) = co;
+                    let view = (*cs).map().wait()?;
+                    final_state.copy_from_slice(&view);
+                }
+            }
+            let secs_unrolled = t_unrolled.elapsed().as_secs_f64();
+            let cbs_unrolled = claspr::record::cb_records_total() - cb0;
+
+            (final_state, secs_unrolled, nstep.div_ceil(2), cbs_unrolled)
         }
-        if dt2 != 0.0 {
-            dt = dt2; // the Fortran dt variable persists across steps
+        Shape::PerTimestep => {
+            // ── Graph B: the NON-UNROLLED single timestep. ───────────────────────────
+            // One graph = one `perform_timestep`: two halves, three RK stages each.
+            // Direction and extents ride slots, so the SAME graph is x-then-z on odd
+            // steps and z-then-x on even ones — the reference's `direction_switch`,
+            // expressed as a rebind instead of as unrolled code. Two binding states,
+            // both resident in the keyed command-buffer cache, so the steady state
+            // records nothing (see NOTES, "keyed LRU").
+            let p0 = seed_half!(
+                s,
+                t,
+                fx,
+                td,
+                slot!(PgA),
+                slot!(PfA),
+                slot!(PdA),
+                PvA1,
+                PvA2,
+                PvA3,
+                PtA,
+                PtB,
+                PtC
+            );
+            let gp = half!(
+                p0,
+                slot!(PgB),
+                slot!(PfB),
+                slot!(PdB),
+                PvB1,
+                PvB2,
+                PvB3,
+                PtA,
+                PtB,
+                PtC
+            );
+
+            let p = bind_per(true, dt0);
+            let gp = gp
+                .bind(p.0)
+                .bind(p.1)
+                .bind(p.2)
+                .bind(p.3)
+                .bind(p.4)
+                .bind(p.5)
+                .bind(p.6)
+                .bind(p.7)
+                .bind(p.8)
+                .bind(p.9)
+                .bind(p.10)
+                .bind(p.11)
+                .bind(p.12)
+                .bind(p.13)
+                .bind(p.14);
+
+            // ── Graph B loop: one sync per timestep, exactly the reference's loop. ───
+            //   do while (etime < sim_time)
+            //     if (etime + dt > sim_time) dt = sim_time - etime
+            //     call perform_timestep(...); etime = etime + dt
+            let cb1 = claspr::record::cb_records_total();
+            let t_per_step = std::time::Instant::now();
+            let mut etime_p = 0.0f64;
+            let mut dt_p = dt0;
+            let mut first_is_x = true;
+            let mut bound_p = (true, dt0);
+            let mut final_p = vec![Real::default(); state_len];
+            let mut nstep_p = 0u64;
+            while etime_p < cfg.sim_time {
+                if etime_p + dt_p > cfg.sim_time {
+                    dt_p = cfg.sim_time - etime_p;
+                }
+                if (first_is_x, dt_p) != bound_p {
+                    let p = bind_per(first_is_x, dt_p);
+                    gp.mutate_call((p.0, p.1, p.2, p.3))?;
+                    gp.mutate_call((p.4, p.5, p.6, p.7))?;
+                    gp.mutate_call((p.8, p.9, p.10, p.11))?;
+                    gp.mutate_call((p.12, p.13, p.14))?;
+                    bound_p = (first_is_x, dt_p);
+                }
+                let co = gp.sync(ctx)?;
+                etime_p += dt_p;
+                nstep_p += 1;
+                first_is_x = !first_is_x;
+                if etime_p >= cfg.sim_time {
+                    let (cs, _ct, _cfx, _ctd) = co;
+                    let view = (*cs).map().wait()?;
+                    final_p.copy_from_slice(&view);
+                }
+            }
+            let secs_per_step = t_per_step.elapsed().as_secs_f64();
+            let cbs_per_step = claspr::record::cb_records_total() - cb1;
+
+            (final_p, secs_per_step, nstep_p, cbs_per_step)
         }
-        let co = g.sync(ctx)?;
-        etime = e1 + dt2;
-        nstep += if dt2 != 0.0 { 2 } else { 1 };
-        if etime >= cfg.sim_time {
-            let (cs, _ct, _cfx, _ctd) = co;
-            let view = (*cs).map().wait()?;
-            final_state.copy_from_slice(&view);
-        }
-    }
-    eprintln!("steps: {nstep}");
-    let final_f64: Vec<f64> = final_state.iter().map(|&x| x.to_f64()).collect();
-    Ok((state0, final_f64))
+    };
+    eprintln!("{shape:?}: {syncs} syncs, {cbs} command buffers recorded");
+    Ok(RunOut {
+        state0,
+        final_: final_state.iter().map(|&x| x.to_f64()).collect(),
+        secs,
+        syncs,
+        cbs,
+    })
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -1237,20 +1401,59 @@ fn main() -> claspr::Result<()> {
 
     let init = initialize(&cfg);
     let t0 = std::time::Instant::now();
-    let (state0, state1) = if use_f64 {
-        run::<f64, gpu::f64::Kernels>(&ctx, &cfg, &init)?
-    } else {
-        run::<f32, gpu::f32::Kernels>(&ctx, &cfg, &init)?
+    // Run BOTH shapes and compare. They are one meta-kernel: same kernels, same
+    // order, same scalars — the only difference is whether the direction
+    // alternation is unrolled into the graph or carried by slots the keyed
+    // command-buffer cache keys on. Byte equality of the final state is the proof.
+    let go = |shape| -> claspr::Result<RunOut> {
+        if use_f64 {
+            run::<f64, gpu::f64::Kernels>(&ctx, &cfg, &init, shape)
+        } else {
+            run::<f32, gpu::f32::Kernels>(&ctx, &cfg, &init, shape)
+        }
     };
+    let a = go(Shape::Unrolled)?;
+    let b = go(Shape::PerTimestep)?;
+    let (state0, state1) = (&a.state0, &a.final_);
     eprintln!("device loop: {:.3}s", t0.elapsed().as_secs_f64());
 
-    let (mass0, te0) = reductions(&state0, &init, cfg.nx, cfg.nz);
-    let (mass, te) = reductions(&state1, &init, cfg.nx, cfg.nz);
+    println!(
+        "unrolled double-step:     {:.3}s  {:>4} syncs  {:>2} CBs recorded  {:.0}us/sync",
+        a.secs,
+        a.syncs,
+        a.cbs,
+        a.secs * 1e6 / a.syncs as f64
+    );
+    println!(
+        "non-unrolled per-step:    {:.3}s  {:>4} syncs  {:>2} CBs recorded  {:.0}us/sync",
+        b.secs,
+        b.syncs,
+        b.cbs,
+        b.secs * 1e6 / b.syncs as f64
+    );
+    println!(
+        "per-timestep vs unrolled: {:+.1}% wall -- final state {}",
+        (b.secs / a.secs - 1.0) * 100.0,
+        if a.final_ == b.final_ {
+            "BIT-IDENTICAL".to_string()
+        } else {
+            let worst = a
+                .final_
+                .iter()
+                .zip(&b.final_)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f64, f64::max);
+            format!("DIFFERS (max abs {worst:.3e})")
+        }
+    );
+
+    let (mass0, te0) = reductions(state0, &init, cfg.nx, cfg.nz);
+    let (mass, te) = reductions(state1, &init, cfg.nx, cfg.nz);
     println!("d_mass: {:.15e}", (mass - mass0) / mass0);
     println!("d_te:   {:.15e}", (te - te0) / te0);
 
     if let Some(path) = &cfg.dump {
-        let fields = output_fields(&state1, &init, cfg.nx, cfg.nz);
+        let fields = output_fields(state1, &init, cfg.nx, cfg.nz);
         let mut bytes = Vec::with_capacity(fields.len() * 8);
         for v in &fields {
             bytes.extend_from_slice(&v.to_le_bytes());
@@ -1301,9 +1504,10 @@ mod tests {
         }
         let cfg = test_cfg();
         let init = initialize(&cfg);
-        let (s0, s1) = run::<f64, gpu::f64::Kernels>(&ctx, &cfg, &init).expect("run f64");
-        let (m0, e0) = reductions(&s0, &init, cfg.nx, cfg.nz);
-        let (m1, e1) = reductions(&s1, &init, cfg.nx, cfg.nz);
+        let r = run::<f64, gpu::f64::Kernels>(&ctx, &cfg, &init, Shape::Unrolled).expect("run f64");
+        let (s0, s1) = (&r.state0, &r.final_);
+        let (m0, e0) = reductions(s0, &init, cfg.nx, cfg.nz);
+        let (m1, e1) = reductions(s1, &init, cfg.nx, cfg.nz);
         let dm = ((m1 - m0) / m0).abs();
         let de = ((e1 - e0) / e0).abs();
         assert!(dm < 1e-12, "f64 mass drift too large: {dm:e}");
@@ -1321,13 +1525,72 @@ mod tests {
         };
         let cfg = test_cfg();
         let init = initialize(&cfg);
-        let (s0, s1) = run::<f32, gpu::f32::Kernels>(&ctx, &cfg, &init).expect("run f32");
-        let (m0, e0) = reductions(&s0, &init, cfg.nx, cfg.nz);
-        let (m1, e1) = reductions(&s1, &init, cfg.nx, cfg.nz);
+        let r = run::<f32, gpu::f32::Kernels>(&ctx, &cfg, &init, Shape::Unrolled).expect("run f32");
+        let (s0, s1) = (&r.state0, &r.final_);
+        let (m0, e0) = reductions(s0, &init, cfg.nx, cfg.nz);
+        let (m1, e1) = reductions(s1, &init, cfg.nx, cfg.nz);
         let dm = ((m1 - m0) / m0).abs();
         let de = ((e1 - e0) / e0).abs();
         assert!(dm < 1e-8, "f32 mass drift too large: {dm:e}");
         assert!(de < 5e-4, "f32 energy drift too large: {de:e}");
+    }
+
+    /// **The two graph shapes are one meta-kernel.** The unrolled graph hard-codes
+    /// the x-first/z-first alternation by fusing two timesteps; the non-unrolled
+    /// one carries direction, extents and hyperviscosity in slots and flips them
+    /// per step, mirroring the reference's `direction_switch`. Same kernels, same
+    /// order, same scalars — so the final states must agree BIT-for-bit, not
+    /// approximately. Separate graphs over separate buffers, so agreement is a
+    /// real equivalence proof rather than aliasing.
+    ///
+    /// Also pins the payoff: the per-timestep shape alternates between two
+    /// binding states and must record a SMALL CONSTANT number of command buffers
+    /// (two states plus the final clipped-dt one), not one per sync. Without the
+    /// keyed cache this would be one record per sync.
+    #[test]
+    fn unrolled_and_per_timestep_are_bit_identical() {
+        let Ok(ctx) = Context::any() else {
+            eprintln!("SKIP: no OpenCL device");
+            return;
+        };
+        let cfg = test_cfg();
+        let init = initialize(&cfg);
+        let go = |shape| {
+            if has_fp64(&ctx) {
+                run::<f64, gpu::f64::Kernels>(&ctx, &cfg, &init, shape)
+            } else {
+                run::<f32, gpu::f32::Kernels>(&ctx, &cfg, &init, shape)
+            }
+            .expect("run")
+        };
+        let a = go(Shape::Unrolled);
+        let b = go(Shape::PerTimestep);
+        assert_eq!(
+            a.final_.len(),
+            b.final_.len(),
+            "both shapes must produce the same state length"
+        );
+        if a.final_ != b.final_ {
+            let (i, x, y) = a
+                .final_
+                .iter()
+                .zip(&b.final_)
+                .enumerate()
+                .find(|(_, (x, y))| x != y)
+                .map(|(i, (x, y))| (i, *x, *y))
+                .expect("lengths equal and vectors differ");
+            panic!("first divergence at {i}: unrolled {x:.17e} vs per-timestep {y:.17e}");
+        }
+        // A CB-capable device should hold this to a handful; a device without the
+        // extension records none at all, so only assert the upper bound.
+        assert!(
+            b.cbs <= 4,
+            "per-timestep shape recorded {} command buffers over {} syncs -- the \
+             keyed cache should hold it to the two direction states plus the final \
+             clipped-dt one",
+            b.cbs,
+            b.syncs
+        );
     }
 
     /// Cross-width agreement: the two stamps run the SAME kernel source, so
@@ -1345,8 +1608,12 @@ mod tests {
         }
         let cfg = test_cfg();
         let init = initialize(&cfg);
-        let (_, s64) = run::<f64, gpu::f64::Kernels>(&ctx, &cfg, &init).expect("run f64");
-        let (_, s32) = run::<f32, gpu::f32::Kernels>(&ctx, &cfg, &init).expect("run f32");
+        let s64 = run::<f64, gpu::f64::Kernels>(&ctx, &cfg, &init, Shape::Unrolled)
+            .expect("run f64")
+            .final_;
+        let s32 = run::<f32, gpu::f32::Kernels>(&ctx, &cfg, &init, Shape::Unrolled)
+            .expect("run f32")
+            .final_;
         let f64_fields = output_fields(&s64, &init, cfg.nx, cfg.nz);
         let f32_fields = output_fields(&s32, &init, cfg.nx, cfg.nz);
         let max_diff = f64_fields

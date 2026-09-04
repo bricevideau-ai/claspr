@@ -220,6 +220,25 @@ App-side workaround that motivated this: restructuring miniWeather's graph to on
 DOUBLE timestep (directions/extents as literals, dt scalars mutated ≤2x/run) got
 1 CB per whole 600-step run. That shouldn't be necessary for scalars.
 
+**Retired 2026-09-04.** `examples/miniweather` now builds BOTH shapes and `main`
+compares them: `Shape::Unrolled` (48 dispatches, direction/extents literal) and
+`Shape::PerTimestep` (24 dispatches, mirroring the reference `perform_timestep`,
+with direction/extents/hyperviscosity in slots flipped every step). Final states
+are BIT-IDENTICAL at both widths. Measured on PoCL/M3, 600 steps, f64:
+
+| shape | wall | syncs | CBs recorded |
+|---|---|---|---|
+| unrolled double-step | 1.348s | 300 | 2 |
+| non-unrolled per-timestep | 1.432s | 600 | 3 |
+
+The natural shape costs **+6.2%** (f64; +4.5% f32) — one extra `sync` per pair of
+steps — and the keyed cache holds the alternation to a small constant instead of
+one record per sync. Counts are 2/3 not 1/2 because the final clipped-dt step is
+its own binding state; neither grows with step count, which is the point.
+
+The unrolled shape stays as `main`'s reported numbers and as the A-side of the
+equivalence proof, as gray-scott keeps `run_swap` alongside `run_immutable`.
+
 ### Generic device-module instantiation — `#[claspr::device(instantiate(Real = [f64, f32]))]`
 
 **MVP LANDED 2026-08-21** (`tests/instantiate` is the showcase): attribute grammar
@@ -413,6 +432,24 @@ trigger:** a user wants one of those.
 ---
 
 ## Concerns
+
+### Large graphs are stack-hungry in debug builds
+
+Found 2026-09-04 adding miniWeather's second graph shape. A claspr graph is a
+deeply nested `AndThen` held BY VALUE, and a debug build gives every intermediate
+in the chain its own stack slot with no reuse. Putting both shapes in one `fn` (as
+two `match` arms, only one of which ever runs) sizes the frame for BOTH and
+overflows the test harness's 2 MiB threads — confirmed by stubbing one arm, which
+makes it pass. The release binary is fine on the 8 MiB main thread.
+
+Originally worked around with an `on_big_stack` helper (spawn at 64 MiB), then
+with per-stage `Box<O>` + `recursion_limit = 512`. **Resolved 2026-10-27** by
+transparent `.erase()` (landed upstream 2026-10-26): each `half!`/`seed_half!`
+erases its 12-dispatch segment, which bounds both the build-frame stack and the
+type nesting per segment; both workarounds are gone and the tests run on the
+default test-thread stack. Still worth knowing generally: a user writing a long
+UNERASED graph hits this in `cargo test` first, and "has overflowed its stack"
+points nowhere near the cause — the answer is `.erase()` every few dozen links.
 
 ### PoCL: sustained CB replay eventually fails `CL_INVALID_OPERATION` — **FIXED upstream-ready 2026-09-04**
 
