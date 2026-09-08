@@ -433,6 +433,42 @@ trigger:** a user wants one of those.
 
 ## Concerns
 
+### Where per-sync time actually goes (profiled 2026-09-08) — NOT the walk
+
+Closes the deferred "should we skip the LendOnly walk on a cache hit?" question
+from the keyed-cache work. Answer: **no**, and the reason is not what the plan
+assumed. `perf` is unavailable here (`perf_event_paranoid=4`), so this was
+measured two other ways.
+
+**The replay walk is a rounding error.** `cb_bench` gained a `walk-lean` /
+`walk-heavy` pair: identical two-command CBs over the same buffer, differing only
+in 24 zero-command `forward` passthrough nodes. Median per-sync 93.8/91.8/94.5 vs
+91.4/97.1/95.3 us over three runs — a ~1 us delta for 24 nodes, inside the noise.
+That is **~50 ns per node**. A 100-node graph spends ~5 us of a ~94 us sync in the
+walk. Skipping it would buy under 5% while touching the home invariant and the
+lend/rehome lifecycle, which is the riskiest part of Tier 2. Not worth it.
+
+**It is pocl scheduler synchronisation.** CPU time exceeds wall time (0.55s vs
+0.40s: multi-threaded) and `sys` beats `user` 4:1. `strace -c -f` says **99.16% of
+syscall time is futex**. Futex traffic scales with COMMANDS, not syncs:
+
+| workload | commands/sync | futex/sync |
+|---|---|---|
+| walk-lean | 2 | 69.5 |
+| control-deep | 24 | 711.7 |
+
+i.e. **~29 futex ops per command + ~11 per sync**. So on pocl's CPU device a
+command buffer avoids the RE-RECORD but not the per-command dispatch handshake —
+each command still goes to the worker pool individually. That explains why the
+keyed cache's 91% API-call reduction only moved wall-clock 4-8%, and why
+miniWeather's per-timestep shape costs ~6% (it pays the per-sync constant twice
+as often).
+
+Consequence for claspr: there is no host-side lever left worth pulling here. The
+remaining cost is a runtime property. On a driver where CB replay is one hardware
+submission the picture should differ sharply — worth re-running this on Intel
+GPU/Level Zero before drawing conclusions about CB value in general.
+
 ### Large graphs are stack-hungry in debug builds
 
 Found 2026-09-04 adding miniWeather's second graph shape. A claspr graph is a

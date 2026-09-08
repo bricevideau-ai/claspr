@@ -23,7 +23,7 @@
 //!   cargo run -p claspr-tier2-tests --example cb_bench --release
 //! ```
 
-use claspr::eager::{DeviceOp, DeviceOpExt, bundle2, fill};
+use claspr::eager::{DeviceOp, DeviceOpExt, bundle2, fill, forward};
 use claspr::record::cb_records_total;
 use claspr::{Context, DeviceSlice, slot, slots};
 use claspr_test_kernels::kernels;
@@ -352,6 +352,71 @@ fn seam_chain(ctx: &Context) -> claspr::Result<Report> {
     })
 }
 
+/// Stack `.and_then(forward)` once per token — zero-command passthrough nodes.
+macro_rules! stack_forward {
+    ($head:expr $(, $tok:tt)*) => {
+        $head $( .and_then(|p| { let _ = stringify!($tok); forward(p) }) )*
+    };
+}
+
+/// **walk-lean / walk-heavy** — the pair that isolates the REPLAY WALK.
+///
+/// Both graphs record the SAME two commands (a fill and a scale) over the same
+/// buffer, so their device work, their command-buffer contents and their
+/// per-sync enqueue/wait costs are identical. They differ only in how many
+/// zero-command `forward` passthrough nodes the walk has to traverse: 0 vs 24.
+///
+/// So `(walk_heavy - walk_lean) / 24` is the marginal cost of one node in the
+/// `LendOnly` replay walk, measured rather than inferred — which is the number
+/// that decides whether skipping the walk on a cache hit is worth doing.
+fn walk_lean(ctx: &Context) -> claspr::Result<Report> {
+    let ks = kernels::kernels(ctx)?;
+    let buf = DeviceSlice::<u32>::alloc_zero(ctx, n())?;
+    let g = fill(buf, 1u32).and_then(|b| ks.scale_u32([n()], b, 1u32));
+    measure("walk-lean", |_| {
+        drop(g.sync(ctx)?);
+        Ok(())
+    })
+}
+
+fn walk_heavy(ctx: &Context) -> claspr::Result<Report> {
+    let ks = kernels::kernels(ctx)?;
+    let buf = DeviceSlice::<u32>::alloc_zero(ctx, n())?;
+    // 24 passthroughs between the two commands: same CB, 24 more nodes to walk.
+    let g = stack_forward!(
+        fill(buf, 1u32),
+        a,
+        b,
+        c,
+        d,
+        e,
+        f,
+        g,
+        h,
+        i,
+        j,
+        k,
+        l,
+        m,
+        n2,
+        o,
+        p,
+        q,
+        r,
+        s,
+        t,
+        u,
+        v,
+        w,
+        x
+    )
+    .and_then(|b| ks.scale_u32([n()], b, 1u32));
+    measure("walk-heavy", |_| {
+        drop(g.sync(ctx)?);
+        Ok(())
+    })
+}
+
 fn main() -> claspr::Result<()> {
     let Some(ctx) = ctx() else { return Ok(()) };
     println!(
@@ -375,6 +440,8 @@ fn main() -> claspr::Result<()> {
         ("control-deep", control_deep),
         ("scalar-alt-deep", scalar_alternate_deep),
         ("seam-chain", seam_chain),
+        ("walk-lean", walk_lean),
+        ("walk-heavy", walk_heavy),
     ];
     // `CB_BENCH_ONLY=<substring>` restricts the run to matching workloads.
     let only = std::env::var("CB_BENCH_ONLY").unwrap_or_default();
