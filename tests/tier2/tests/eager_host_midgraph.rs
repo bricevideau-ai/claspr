@@ -7,8 +7,8 @@
 //! which collapsed a bundle source to `home == None` (no re-home) and exposed a
 //! single `Pipe<S::Output>` (`= Pipe<tuple>`, so the written branches could not be
 //! routed to separate downstream kernels). Option A completes #212: `AndThenHost`
-//! is now multi-output-aware mid-graph via the `SeamScatter` trait — `Handle =
-//! S::Handle` (per-branch element pipes) + `execute` gathers per-branch, runs the
+//! is now multi-output-aware mid-graph via the `SeamScatter` trait — `Shape =
+//! Seamed<S::Shape>` (per-branch element pipes) + `execute` gathers per-branch, runs the
 //! closure, and RE-SCATTERS each written-back branch (value+home) into its own
 //! element pipe (mirroring `Bundle::execute`).
 //!
@@ -157,7 +157,7 @@ fn midgraph_seam_downstream_discards_one_branch_still_rehomes() {
 
 // ── REGRESSION GUARD: single-output mid-graph seam still re-homes ─────────────
 //
-// The single-output path must stay byte-behavior-identical: `Handle = Pipe<O>`,
+// The single-output path must stay byte-behavior-identical: handle `Pipe<O>`,
 // `SeamScatter` is the identity (one pipe), the seam threads exactly one home
 // through to a downstream kernel. Replayed ≥2×.
 #[test]

@@ -47,8 +47,8 @@ use crate::access::{KernelAccess, MemMode};
 use crate::buffer::{Buffer, DeviceSlice};
 use crate::context::Context;
 use crate::eager::{
-    CbCache, CbWalk, Checkout, Deps, DeviceOp, DeviceOpExt, ExecMode, Input, Pipe,
-    cb_collect_external, cb_leaf_build, deps_to_wait_list, new_cb_cache, single_dep,
+    CbCache, CbWalk, Checkout, CheckoutsOf, Deps, DeviceOp, DeviceOpExt, ExecMode, HandleOf, Input,
+    Pipe, cb_collect_external, cb_leaf_build, deps_to_wait_list, new_cb_cache, single_dep,
 };
 use crate::error::Error;
 use crate::exec_ctx::ExecutionContext;
@@ -765,7 +765,7 @@ impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -884,7 +884,7 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -997,8 +997,7 @@ pub struct ImageCopy<Src: ImageEnqueue, Dst: ImageEnqueue> {
 
 impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
     type Output = (Src, Dst);
-    type Handle = (Pipe<Src>, Pipe<Dst>);
-    type Checkouts = (crate::eager::Checkout<Src>, crate::eager::Checkout<Dst>);
+    type Shape = (crate::eager::Single<Src>, crate::eager::Single<Dst>);
 
     fn output_pipe(&self) -> Option<Pipe<(Src, Dst)>> {
         // Multi-output: the value is reconstructed in `collect` from the two
@@ -1007,7 +1006,7 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         None
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         (self.src_pipe.clone(), self.dst_pipe.clone())
     }
 
@@ -1115,7 +1114,7 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         &self,
         ec: &ExecutionContext<'_>,
         mode: ExecMode,
-    ) -> Result<(Self::Checkouts, Deps)> {
+    ) -> Result<(CheckoutsOf<Self>, Deps)> {
         // Drain each element pipe with its own home → a tuple of independent
         // Checkouts (image copy preserves type, so both homes re-arm correctly).
         let src_pipe = self.src_pipe.clone();
@@ -1241,7 +1240,7 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 

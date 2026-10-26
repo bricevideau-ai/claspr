@@ -1770,7 +1770,8 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
     // a kernel with image args is just a multi/single-output kernel whose output
     // type(s) happen to be image types.
     let eager_impl = if multi_output {
-        // `Handle = (Pipe<D0>, Pipe<D1>, …)`; per-element scatter; reconstruct
+        // `Shape = (Single<D0>, Single<D1>, …)` — so `Handle = (Pipe<D0>, …)`
+        // and `Checkouts = (Checkout<D0>, …)`; per-element scatter; reconstruct
         // in `into_output`. `output_pipe()` is unused on this path (the default
         // `into_output` is overridden) and a multi-output op has no single storage
         // pipe — return `None`.
@@ -1782,11 +1783,11 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
         // output, each with its own home → same-typed multi-buffer kernels
         // (`add(a, b, out)`) re-arm every concrete cell correctly.
         let checkouts_ty = quote! { ( #( ::claspr::Checkout<#output_types> ),* ) };
+        let shape_ty = quote! { ( #( ::claspr::Single<#output_types> ),* ) };
         quote! {
             impl #gen_decl ::claspr::DeviceOp for Op #gen_use {
                 type Output = #output_ty;
-                type Handle = #handle_ty;
-                type Checkouts = #checkouts_ty;
+                type Shape = #shape_ty;
 
                 fn output_pipe(&self) -> ::core::option::Option<::claspr::Pipe<#output_ty>> {
                     // Multi-output storage is the per-element pipes; there is no
@@ -1795,7 +1796,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     ::core::option::Option::None
                 }
 
-                fn handle(&self) -> Self::Handle {
+                fn handle(&self) -> #handle_ty {
                     #handle_expr
                 }
 
@@ -1938,7 +1939,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     &self,
                     ec: &::claspr::ExecutionContext<'_>,
                     mode: ::claspr::ExecMode,
-                ) -> ::claspr::Result<(Self::Checkouts, ::claspr::Deps)> {
+                ) -> ::claspr::Result<(#checkouts_ty, ::claspr::Deps)> {
                     // Scatter via `execute`, then drain each element pipe (value +
                     // HOME) into its OWN `Checkout`, so each output buffer re-arms
                     // its exact concrete cell on drop (the same-typed-args case the
@@ -2037,7 +2038,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     ::core::option::Option::Some(::core::clone::Clone::clone(&self.__claspr_out))
                 }
 
-                // Default `Handle = Pipe<Output>`: a kernel's downstream handle
+                // Default `Shape = Single<Output>`: a kernel's downstream handle
                 // is its single output pipe.
                 fn handle(&self) -> ::claspr::Pipe<#output_ty> {
                     ::core::clone::Clone::clone(&self.__claspr_out)
@@ -2895,16 +2896,14 @@ fn instantiate_trait_methods(
             quote! {
                 impl ::claspr::DeviceOp<
                     Output = #d,
-                    Handle = ::claspr::Pipe<#d>,
-                    Checkouts = ::claspr::Checkout<#d>,
+                    Shape = ::claspr::Single<#d>,
                 >
             }
         } else {
             quote! {
                 impl ::claspr::DeviceOp<
                     Output = ( #(#outs),* ),
-                    Handle = ( #(::claspr::Pipe<#outs>),* ),
-                    Checkouts = ( #(::claspr::Checkout<#outs>),* ),
+                    Shape = ( #(::claspr::Single<#outs>),* ),
                 >
             }
         };

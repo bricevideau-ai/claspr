@@ -12,7 +12,7 @@ the codebase is laid out, read `ARCHITECTURE.md` (the map for agents/newcomers).
 
 Nothing in flight as of 2026-07-15 (working tree clean on `main`). The
 2026-07-12→14 campaign — agent cost-of-entry refactor (eager.rs module split,
-`ARCHITECTURE.md`, `OutputShape`), abstraction rounds, complexity-hotspot pass, and
+`ARCHITECTURE.md`, `OutputShape` — since superseded by `OpShape`), abstraction rounds, complexity-hotspot pass, and
 the full quality-review fix set — has all landed. See git log; recent landings table
 below.
 
@@ -22,7 +22,7 @@ below.
   `solve_with` is the ONLY generic-subgraph fn; every other reusable-graph pattern
   uses type-inferred CLOSURES with zero signature boilerplate. The macro would add a
   DSL + opaque expansion errors (a cost-of-entry COST) to save ~15 lines at exactly
-  one site that `OutputShape` already made readable. **REVISIT TRIGGER: 3+ generic-fn
+  one site that `OutputShape` (now `OpShape`) already made readable. **REVISIT TRIGGER: 3+ generic-fn
   subgraph authors accumulate.**
 - **Leaf memory-family unification** (`leaf_fill!`/`leaf_write!`) — DECLINED.
   **RE-CONFIRMED 2026-08-21 by measurement**: `leaves.rs` is 19 `DeviceOp` impls;
@@ -221,7 +221,7 @@ device macro now also emits `pub trait Kernels<Real>` in the instantiated module
 plus one impl per stamp — the impls live INSIDE the stamp modules where `Real`
 is aliased, so trait decl and impls share identical signature tokens (the
 no-substitution trick, third use). Launcher methods return opaque
-`impl DeviceOp<Output=…, Handle=…, Checkouts=…>` (all three pinned → and_then /
+`impl DeviceOp<Output=…, Shape=…>` (since 2026-10-26; was Output+Handle+Checkouts → and_then /
 bind / sync / mutate_call type-check exactly as with concrete launchers).
 Proven: miniweather's `make_runner!` macro is DELETED — one
 `fn run<Real: Width, K: gpu::Kernels<Real>>` drives the full 24-dispatch replay

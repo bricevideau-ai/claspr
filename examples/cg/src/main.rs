@@ -111,7 +111,7 @@
 //! workgroup memory / barriers, robust on every ICD.
 
 use claspr::eager::{DeviceOp, DeviceOpExt, bundle2, bundle4, bundle6, lift};
-use claspr::{Context, DeviceScalar, DeviceSlice, Pipe};
+use claspr::{Context, DeviceScalar, DeviceSlice, Pipe, Single};
 
 #[claspr::device]
 pub mod gpu {
@@ -422,19 +422,20 @@ fn solve_host_seam(ctx: &Context, b_host: &[f32]) -> claspr::Result<(Vec<f32>, u
 /// reuses the same buffer), `rsold` threaded on (β needs the OLD value).
 /// `compute_beta` takes the threaded `(r, partials, rsold, beta)` pipes + concrete `rsnew`,
 /// runs `norm2_partial` internally, and produces `rsnew` (the loop-boundary read).
-/// The 6-field output shape of the α subgraph, named ONCE so the `solve_with` bound
-/// can spell it as `Output` and PROJECT `Handle`/`Checkouts` from it via
-/// [`OutputShape`](claspr::eager::OutputShape) — instead of re-writing the parallel
-/// `Pipe<_>` and `Checkout<_>` tuples. (A bare `A::Output` projection would cycle:
-/// bounds on `A` can't reference `A`'s own associated types; a concrete alias can.)
-type AlphaOut = (
-    DeviceSlice<f32>,
-    DeviceSlice<f32>,
-    DeviceSlice<f32>,
-    DeviceScalar<f32>,
-    DeviceScalar<f32>,
-    DeviceScalar<f32>,
+/// The 6-field output SHAPE of the α subgraph, named ONCE so the `solve_with` bound
+/// pins it with a single `Shape = AlphaShape` — the op's `Output`, its downstream
+/// `Handle` (6 pipes) and its terminal `Checkouts` (6 checkouts) are all projected
+/// from it (see [`OpShape`](claspr::OpShape)). (A bare `A::Output` projection would
+/// cycle: bounds on `A` can't reference `A`'s own associated types; a concrete alias can.)
+type AlphaShape = (
+    Single<DeviceSlice<f32>>,
+    Single<DeviceSlice<f32>>,
+    Single<DeviceSlice<f32>>,
+    Single<DeviceScalar<f32>>,
+    Single<DeviceScalar<f32>>,
+    Single<DeviceScalar<f32>>,
 );
+type AlphaOut = <AlphaShape as claspr::OpShape>::Output;
 
 #[allow(clippy::type_complexity)]
 fn solve_with<CA, CB, A, B>(
@@ -462,26 +463,17 @@ where
         Pipe<DeviceScalar<f32>>,
         DeviceScalar<f32>,
     ) -> B,
-    // A's Output is the `AlphaOut` alias; its `Handle`/`Checkouts` are PROJECTED from
-    // it via `OutputShape` (normalizing to the concrete 6-tuples of `Pipe<_>` /
-    // `Checkout<_>`), so the shape is written ONCE. The `Handle` projection lets
+    // A's shape is the `AlphaShape` alias: `Output`, `Handle` and `Checkouts` are all
+    // PROJECTED from it, so the 6-field shape is written ONCE. The handle lets
     // `compute_alpha(..).and_then(move |(p, ap, partials, alpha, nalpha, rsold)| ..)`
-    // destructure the 6 pipes; the `Checkouts` projection feeds the `FromCheckout`.
-    A: DeviceOp<
-            Output = AlphaOut,
-            Handle = <AlphaOut as claspr::eager::OutputShape>::Handle,
-            Checkouts = <AlphaOut as claspr::eager::OutputShape>::Checkouts,
-        >,
+    // destructure the 6 pipes; the checkouts feed the `FromCheckout` bound.
+    A: DeviceOp<Output = AlphaOut, Shape = AlphaShape>,
     // A generic op nested in a `bundle`/`and_then` must prove
-    // `Checkouts: FromCheckout<Output>`; `AlphaOut` names the tuple already spelled.
-    A::Checkouts: claspr::FromCheckout<AlphaOut>,
-    // B's single-scalar shape likewise: `Output` once, `Handle`/`Checkouts` projected.
-    // `g.sync()` destructures B's `Checkouts`; `bundle2(x, rsnew)` feeds B's `Handle`.
-    B: DeviceOp<
-            Output = DeviceScalar<f32>,
-            Handle = <DeviceScalar<f32> as claspr::eager::OutputShape>::Handle,
-            Checkouts = <DeviceScalar<f32> as claspr::eager::OutputShape>::Checkouts,
-        >,
+    // `Checkouts: FromCheckout<Output>`; the aliases name both already.
+    claspr::CheckoutsOf<A>: claspr::FromCheckout<AlphaOut>,
+    // B's single-scalar shape likewise. `g.sync()` destructures B's checkouts;
+    // `bundle2(x, rsnew)` feeds B's handle.
+    B: DeviceOp<Output = DeviceScalar<f32>, Shape = Single<DeviceScalar<f32>>>,
 {
     let kernels = gpu::kernels(ctx)?;
     let ks = &kernels;

@@ -196,7 +196,7 @@ pub(crate) fn cb_graph_eligible<O: DeviceOp + ?Sized>(op: &O, ec: &ExecutionCont
 
 /// The **CB BOUNDARY protocol** (design v2): gather a maximal CB-eligible subtree
 /// `op` as ONE command buffer, homing it in `op`'s [`cb_cache`](DeviceOp::cb_cache),
-/// and return its terminal [`Checkouts`](DeviceOp::Checkouts) + the ONE completion
+/// and return its terminal [`Checkouts`](CheckoutsOf) + the ONE completion
 /// event (as [`Deps`]) the caller waits on. Used by the terminal for a whole
 /// all-device graph AND by a host seam for each device sub-subtree — both are "run
 /// this seam-free subtree as a CB".
@@ -219,11 +219,11 @@ pub(crate) fn cb_boundary_gather<O>(
     op: &O,
     ec: &ExecutionContext<'_>,
     mode: ExecMode,
-) -> Result<(O::Checkouts, Deps)>
+) -> Result<(CheckoutsOf<O>, Deps)>
 where
     O: DeviceOp,
     O::Output: Send + 'static,
-    O::Checkouts: FromCheckout<O::Output>,
+    CheckoutsOf<O>: FromCheckout<O::Output>,
 {
     use crate::Launcher;
     let queue = ec.cl_queue().get();
@@ -397,11 +397,11 @@ pub(crate) fn cb_gather_child<O>(
     child: &O,
     ec: &ExecutionContext<'_>,
     mode: ExecMode,
-) -> Result<(O::Checkouts, Deps)>
+) -> Result<(CheckoutsOf<O>, Deps)>
 where
     O: DeviceOp,
     O::Output: Send + 'static,
-    O::Checkouts: FromCheckout<O::Output>,
+    CheckoutsOf<O>: FromCheckout<O::Output>,
 {
     if cb_span_closed(ec) {
         // A deeper close already sealed this frame's span CB → gather the child in

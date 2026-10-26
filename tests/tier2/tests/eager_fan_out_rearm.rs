@@ -1,7 +1,7 @@
 //! #214: `FanOut` re-arms PER-BRANCH across replays — the dynamic-`Vec` analog of
 //! the fixed-arity `bundle!` re-arm (#207/#212).
 //!
-//! `FanOut`'s terminal `Checkouts` is now `Vec<U::Checkouts>` (one `Checkout` — or
+//! `FanOut`'s terminal `Checkouts` is now `Vec<CheckoutsOf<U>>` (one `Checkout` — or
 //! nested tuple, for a multi-output branch — per branch, each threading its own
 //! return home), and `gather_checkouts` delegates to each branch's own gather. So
 //! a fan-out over in-place caller-owned buffers returns every buffer to its cell on

@@ -69,7 +69,7 @@ pub enum SlotState<T> {
     /// This is the fifth slot state and the engine half of the pipe-feed source
     /// (`Tag(pipe)` through [`bind`](DeviceOpExt::bind) / [`call`](DeviceOpExt::call)):
     /// it lets a `slot!(Tag)` declared in one
-    /// subgraph be wired to an upstream [`Handle`](DeviceOp::Handle) (a build-time
+    /// subgraph be wired to an upstream [`Handle`](HandleOf) (a build-time
     /// [`Pipe`]) at compose time, so a downstream stage READS whatever an upstream
     /// stage produced without a concrete buffer ever being named. It is how the
     /// crossed double-buffer rotation is expressed as *data* in the arg list.

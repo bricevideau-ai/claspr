@@ -926,7 +926,7 @@ fn bundle2_caller_buffers_rearm_x2_stable_handles() {
 // ───────────────────────────────────────────────────────────────────────────
 // 15. fan_out over caller-owned buffers RE-ARMS per-branch, x2, stable handles
 //     (#214 — the dynamic-`Vec` analog of #14's bundle re-arm). `FanOut`'s
-//     terminal `Checkouts` is a `Vec<U::Checkouts>` — one `Checkout` per branch,
+//     terminal `Checkouts` is a `Vec<CheckoutsOf<U>>` — one `Checkout` per branch,
 //     each threading its OWN return home — so dropping the Vec returns every
 //     caller buffer to its cell and the SAME fan-out replays with stable `cl_mem`
 //     handles, exactly like `bundle!` at fixed arity. (Was pinned as a documented

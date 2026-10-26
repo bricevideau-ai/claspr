@@ -76,16 +76,13 @@ where
 {
     type Output = U::Output;
     // The chain's downstream handle is the tail op's handle.
-    type Handle = U::Handle;
-    // The chain's terminal checkout shape is the tail op's: a multi-output tail
-    // (bundle*, arc_split, CopyTo pair) yields its tuple/array of `Checkout`s.
-    type Checkouts = U::Checkouts;
+    type Shape = U::Shape;
 
     fn output_pipe(&self) -> Option<Pipe<U::Output>> {
         self.next.output_pipe()
     }
 
-    fn handle(&self) -> U::Handle {
+    fn handle(&self) -> HandleOf<U> {
         self.next.handle()
     }
 
@@ -178,11 +175,11 @@ where
         &self,
         ec: &ExecutionContext<'_>,
         mode: ExecMode,
-    ) -> Result<(Self::Checkouts, Deps)>
+    ) -> Result<(CheckoutsOf<Self>, Deps)>
     where
         Self: Sized,
         Self::Output: Send + 'static,
-        Self::Checkouts: FromCheckout<Self::Output>,
+        CheckoutsOf<Self>: FromCheckout<Self::Output>,
     {
         // OPEN a maximal span at SELF (see `execute`): an interior-seam spine-head
         // reached in gather position (the terminal drives the root through here for a
@@ -377,13 +374,13 @@ pub fn value<T: Send + Clone + 'static>(v: T) -> Value<T> {
 impl<T: Send + Clone + 'static> DeviceOp for Value<T> {
     type Output = T;
     // By-value handle: downstream gets `T`, enabling build-time host compute.
-    type Handle = T;
+    type Shape = ByValue<T>;
 
     fn output_pipe(&self) -> Option<Pipe<T>> {
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         // Clone the value out for the downstream closure; `self.v` keeps its own
         // copy for `execute` (which clones again each run — idempotent).
         self.v.clone()
@@ -464,7 +461,7 @@ impl<T: crate::record::RecordableBuffer + Send + 'static> DeviceOp for Lift<T> {
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -552,7 +549,7 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -708,7 +705,7 @@ impl<T: Send + 'static> DeviceOp for DeviceDynOp<'_, T> {
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -774,7 +771,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -907,9 +904,7 @@ where
     type Output = [S::Output; N];
     // An array of N element pipes; the downstream closure does
     // `let [a, b, c] = handle` and routes each pipe into its own branch.
-    type Handle = [Pipe<S::Output>; N];
-    // Per-branch Checkouts (homes are all `None` — these are read-only Arc clones).
-    type Checkouts = [Checkout<S::Output>; N];
+    type Shape = [Single<S::Output>; N];
 
     fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
         // Multi-output storage is the per-element pipes; there is no single
@@ -918,7 +913,7 @@ where
         None
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.outs.clone()
     }
 
@@ -995,7 +990,7 @@ where
         &self,
         ec: &ExecutionContext<'_>,
         mode: ExecMode,
-    ) -> Result<(Self::Checkouts, Deps)> {
+    ) -> Result<(CheckoutsOf<Self>, Deps)> {
         // Drain each branch pipe with its home → a `[Checkout; N]`. Arc-clone
         // branches carry no home (read-only fan-out), so each Checkout's home is
         // `None`; the per-branch shape is still correct.
@@ -1133,7 +1128,7 @@ macro_rules! impl_eager_bundle {
             // `Output` — the branch's OWN `gather_checkouts` bound. Holds for every
             // real op: a single-output branch's `Checkout<O>` via the identity impl,
             // a multi-output branch's tuple via the recursive `FromCheckout` family.
-            $(<$ty as DeviceOp>::Checkouts: FromCheckout<<$ty as DeviceOp>::Output>,)+
+            $(CheckoutsOf<$ty>: FromCheckout<<$ty as DeviceOp>::Output>,)+
         {
             type Output = ( $(<$ty as DeviceOp>::Output,)+ );
             // A tuple of each branch's OWN build-time handle (NOT forced to a
@@ -1144,7 +1139,7 @@ macro_rules! impl_eager_bundle {
             // for a nested bundle / multi-output branch it is that branch's own
             // composite handle. Composing per-branch handles (rather than
             // flattening to pipes) is what carries computable host values down.
-            type Handle = ( $(<$ty as DeviceOp>::Handle,)+ );
+            type Shape = ( $(<$ty as DeviceOp>::Shape,)+ );
             // STRUCTURE-PRESERVING per-branch Checkouts: each branch contributes
             // its OWN `Checkouts` — NOT a single `Checkout` over the whole branch
             // output. A single-output branch contributes `Checkout<buf>`; a
@@ -1158,7 +1153,6 @@ macro_rules! impl_eager_bundle {
             // its OWN per-buffer return homes via its OWN `gather_checkouts`, so a
             // bundle of multi-output branches RE-ARMS (the former limitation, now
             // fixed).
-            type Checkouts = ( $(<$ty as DeviceOp>::Checkouts,)+ );
 
             fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
                 // Multi-output storage is the per-branch pipes (owned by each
@@ -1168,7 +1162,7 @@ macro_rules! impl_eager_bundle {
                 None
             }
 
-            fn handle(&self) -> Self::Handle {
+            fn handle(&self) -> HandleOf<Self> {
                 // Delegate to each branch's own `handle()` — preserves by-value
                 // for `value`, pipe for buffers, composite for nested bundles.
                 ( $(self.$field.handle(),)+ )
@@ -1245,7 +1239,7 @@ macro_rules! impl_eager_bundle {
                 &self,
                 ec: &ExecutionContext<'_>,
                 _mode: ExecMode,
-            ) -> Result<(Self::Checkouts, Deps)> {
+            ) -> Result<(CheckoutsOf<Self>, Deps)> {
                 // TERMINAL gather — the structure-preserving delegate. Each branch
                 // runs its OWN `gather_checkouts`, producing its OWN `Checkouts`
                 // (a `Checkout` for a single-output branch, a tuple for a
@@ -1445,8 +1439,8 @@ macro_rules! bundle {
 ///
 /// Like [`bundle!`](crate::bundle) (whose per-branch [`Checkout`] tuple carries
 /// each branch's return [`home`](BoxedHome) so a bundle over caller-owned buffers
-/// replays), `FanOut`'s terminal [`Checkouts`](DeviceOp::Checkouts) is a
-/// `Vec<U::Checkouts>` — ONE `Checkout` (or nested `Checkouts` tuple, for a
+/// replays), `FanOut`'s terminal [`Checkouts`](CheckoutsOf) is a
+/// `Vec<CheckoutsOf<U>>` — ONE `Checkout` (or nested `Checkouts` tuple, for a
 /// multi-output branch) per branch, each threading its OWN return home. So a
 /// fan-out whose branches are IN-PLACE ops over caller-owned buffers (e.g.
 /// `fan_out(bufs, |b| fill(b, v))`) returns every buffer to its cell on drop, and
@@ -1515,7 +1509,7 @@ where
     // Each branch's terminal `Checkouts` must reconstruct from its own `Output` —
     // the branch's OWN `gather_checkouts` bound (single-output via the identity
     // impl, multi-output via the recursive tuple family).
-    U::Checkouts: FromCheckout<U::Output>,
+    CheckoutsOf<U>: FromCheckout<U::Output>,
 {
     type Output = Vec<U::Output>;
     // STRUCTURE-PRESERVING per-branch Checkouts: a `Vec` of each branch's OWN
@@ -1523,13 +1517,13 @@ where
     // multi-output branch), each threading its own per-buffer return home — so
     // every branch re-arms its origin cell on drop and the fan-out replays. The
     // dynamic-`Vec` analog of `bundle!`'s per-branch tuple `Checkouts`.
-    type Checkouts = Vec<U::Checkouts>;
+    type Shape = FanOutShape<U::Shape>;
 
     fn output_pipe(&self) -> Option<Pipe<Vec<U::Output>>> {
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1595,7 +1589,7 @@ where
         &self,
         ec: &ExecutionContext<'_>,
         _mode: ExecMode,
-    ) -> Result<(Self::Checkouts, Deps)> {
+    ) -> Result<(CheckoutsOf<Self>, Deps)> {
         // TERMINAL gather — the per-branch re-arm. Each branch runs its OWN
         // `gather_checkouts` (a single-output branch builds one `Checkout` with its
         // return home; a multi-output branch its tuple, every buffer homed), so
@@ -1604,7 +1598,7 @@ where
         // dynamic-`Vec` analog of `bundle!`'s per-branch `gather_checkouts` delegation.
         let n = self.ops.len();
         let mut branch_deps: Vec<Deps> = Vec::with_capacity(n);
-        let mut cos: Vec<U::Checkouts> = Vec::with_capacity(n);
+        let mut cos: Vec<CheckoutsOf<U>> = Vec::with_capacity(n);
         for op in &self.ops {
             let (co, d) = op.gather_checkouts(ec, ExecMode::Pipelined)?;
             cos.push(co);
@@ -1723,7 +1717,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1782,7 +1776,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1882,7 +1876,7 @@ pub(crate) type HostSeamFn<O> = Arc<
 pub struct AndThenHost<S: DeviceOp>
 where
     S::Output: crate::mappable::Mappable,
-    S::Checkouts: SeamScatter<Value = S::Output>,
+    CheckoutsOf<S>: SeamScatter<Value = S::Output>,
 {
     pub(crate) source: S,
     pub(crate) f: HostSeamFn<S::Output>,
@@ -1892,7 +1886,7 @@ where
     // these, so downstream can route each written branch to its own kernel AND
     // every branch re-homes across replays. Owned (not `Pipe::new()` per run) so
     // `handle()` hands out stable pipe identities.
-    pub(crate) handle: <S::Checkouts as SeamScatter>::Handle,
+    pub(crate) handle: <CheckoutsOf<S> as SeamScatter>::Handle,
 }
 
 /// Shared body for the host seam: enqueue maps for the source value (wait-list =
@@ -2130,38 +2124,36 @@ where
     // is `Checkout<S::Output>` (identity split — the #211 path stays byte-for-byte
     // the same); for a bundle / multi-output source it is that source's per-branch
     // `Checkouts` tuple, split/reassembled recursively (any arity, any nesting).
-    S::Checkouts: CheckoutSplit<Value = S::Output>,
+    CheckoutsOf<S>: CheckoutSplit<Value = S::Output>,
     // MID-GRAPH re-scatter (#212 completion): the same per-branch structure, but
     // exposed as element PIPES downstream + re-homed via `execute`. Single-output
     // → `Handle = Pipe<O>` (pre-#212 default, byte-identical); multi-output → a
     // tuple of pipes, so written branches route to separate downstream kernels AND
     // re-home across replays.
-    S::Checkouts: SeamScatter<Value = S::Output>,
+    CheckoutsOf<S>: SeamScatter<Value = S::Output>,
     // The source's own `gather_checkouts` needs this bound too — a bundle/multi-
     // output source's `Checkouts` satisfies it via the recursive `FromCheckout`
     // family, a single-output source via the identity impl.
-    S::Checkouts: FromCheckout<S::Output>,
+    CheckoutsOf<S>: FromCheckout<S::Output>,
 {
     type Output = S::Output;
-    // The downstream-facing handle is the source's per-branch PIPE shape (via
-    // `SeamScatter::Handle`): `Pipe<O>` for a single-output source (unchanged), a
-    // tuple of pipes for a bundle/multi-output source — so `and_then(|(a, b)| …)`
-    // can route each written branch to its own kernel.
-    type Handle = <S::Checkouts as SeamScatter>::Handle;
-    // The seam's terminal result IS the source's — one `Checkout` for a
-    // single-output source, a per-branch tuple for a bundle/multi-output source.
-    // The seam re-threads EACH branch's home (via `CheckoutSplit`) so every branch
-    // re-arms its origin cell across `sync`s — the multi-home replay a single
-    // collapsed `collect_home` slot cannot carry.
-    type Checkouts = S::Checkouts;
+    // `Seamed`: the downstream-facing handle is the source's per-branch PIPE shape
+    // (via `SeamScatter::Handle`): `Pipe<O>` for a single-output source, a tuple of
+    // pipes for a bundle/multi-output source — so `and_then(|(a, b)| …)` can route
+    // each written branch to its own kernel. The terminal result IS the source's —
+    // one `Checkout` for a single-output source, a per-branch tuple for a bundle/
+    // multi-output source. The seam re-threads EACH branch's home (via
+    // `CheckoutSplit`) so every branch re-arms its origin cell across `sync`s — the
+    // multi-home replay a single collapsed `collect_home` slot cannot carry.
+    type Shape = Seamed<S::Shape>;
 
     fn output_pipe(&self) -> Option<Pipe<S::Output>> {
         // Single-output: `Some` of the storage pipe; multi-output: `None`
         // (storage is the element pipes). See `SeamScatter::output_pipe_view`.
-        <S::Checkouts as SeamScatter>::output_pipe_view(&self.handle)
+        <CheckoutsOf<S> as SeamScatter>::output_pipe_view(&self.handle)
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.handle.clone()
     }
 
@@ -2203,7 +2195,7 @@ where
         let context = ec.context().clone();
         let (out_value, out_deps) =
             run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(&context, view))?;
-        <S::Checkouts as SeamScatter>::scatter(&self.handle, out_value, homes, &out_deps);
+        <CheckoutsOf<S> as SeamScatter>::scatter(&self.handle, out_value, homes, &out_deps);
         Ok(())
     }
 
@@ -2216,7 +2208,7 @@ where
         // Single-output drains one pipe (unchanged); multi-output reconstructs the
         // tuple, joining deps.
         self.execute(ec, mode)?;
-        <S::Checkouts as SeamScatter>::reconstruct(&self.handle)
+        <CheckoutsOf<S> as SeamScatter>::reconstruct(&self.handle)
     }
 
     #[allow(clippy::type_complexity)]
@@ -2233,14 +2225,14 @@ where
         // (the #211 nested-in-`and_then` re-arm); multi-output returns `home ==
         // None` (per-branch homes ride the Checkout / element-pipe path).
         self.execute(ec, mode)?;
-        <S::Checkouts as SeamScatter>::reconstruct_home(&self.handle)
+        <CheckoutsOf<S> as SeamScatter>::reconstruct_home(&self.handle)
     }
 
     fn gather_checkouts(
         &self,
         ec: &ExecutionContext<'_>,
         _mode: ExecMode,
-    ) -> Result<(Self::Checkouts, Deps)> {
+    ) -> Result<(CheckoutsOf<Self>, Deps)> {
         // TERMINAL / CHECKOUT gather — the #212 pass-1 path, UNCHANGED (byte-for-
         // byte). Gather the source per-branch, split into value + homes, run the
         // seam, REASSEMBLE the checkouts re-threading each ORIGINAL home so every
@@ -2253,7 +2245,7 @@ where
         let context = ec.context().clone();
         let (out_value, out_deps) =
             run_host_seam::<S::Output, _>(value, deps, ec, move |view| (*f)(&context, view))?;
-        let checkouts = <S::Checkouts as CheckoutSplit>::reassemble(out_value, homes);
+        let checkouts = <CheckoutsOf<S> as CheckoutSplit>::reassemble(out_value, homes);
         Ok((checkouts, out_deps))
     }
 
@@ -2265,7 +2257,7 @@ where
         // are no-ops. The source's own reclaim runs too (its outputs were consumed
         // into the seam's checkouts at `execute`, so this is a no-op there, but keep
         // the traversal complete).
-        <S::Checkouts as SeamScatter>::reclaim(&self.handle);
+        <CheckoutsOf<S> as SeamScatter>::reclaim(&self.handle);
         self.source.reclaim_undelivered();
     }
 
@@ -2371,7 +2363,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 

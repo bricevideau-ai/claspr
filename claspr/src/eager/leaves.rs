@@ -93,7 +93,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -292,7 +292,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -414,7 +414,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -506,7 +506,7 @@ where
         self.inner.output_pipe()
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.inner.handle()
     }
 
@@ -551,7 +551,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -683,7 +683,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -832,7 +832,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -925,7 +925,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1039,7 +1039,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1156,7 +1156,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1219,7 +1219,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1308,7 +1308,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1423,7 +1423,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1499,7 +1499,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1657,7 +1657,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1759,7 +1759,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1854,7 +1854,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -1962,7 +1962,7 @@ macro_rules! impl_alloc_uninit {
                 Some(self.out.clone())
             }
 
-            fn handle(&self) -> Self::Handle {
+            fn handle(&self) -> HandleOf<Self> {
                 self.out.clone()
             }
 
@@ -2048,7 +2048,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -2111,7 +2111,7 @@ where
         Some(self.out.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.out.clone()
     }
 
@@ -2199,7 +2199,7 @@ macro_rules! impl_acquire_view {
             fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
                 Some(self.out.clone())
             }
-            fn handle(&self) -> Self::Handle {
+            fn handle(&self) -> HandleOf<Self> {
                 self.out.clone()
             }
             fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -2255,7 +2255,7 @@ macro_rules! impl_release_view {
             fn output_pipe(&self) -> Option<Pipe<$Out>> {
                 Some(self.out.clone())
             }
-            fn handle(&self) -> Self::Handle {
+            fn handle(&self) -> HandleOf<Self> {
                 self.out.clone()
             }
             fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -2640,14 +2640,9 @@ where
     );
     // Two element pipes, like the multi-output kernel: the downstream closure
     // gets `(pa, pb)` and selects either buffer.
-    type Handle = (
-        Pipe<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Src>,
-        Pipe<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Dst>,
-    );
-    // Per-output Checkouts: each side independently readable / into_inner'd.
-    type Checkouts = (
-        Checkout<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Src>,
-        Checkout<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Dst>,
+    type Shape = (
+        Single<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Src>,
+        Single<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Dst>,
     );
 
     fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
@@ -2657,7 +2652,7 @@ where
         None
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         (self.src_pipe.clone(), self.dst_pipe.clone())
     }
 
@@ -2821,7 +2816,7 @@ where
         &self,
         ec: &ExecutionContext<'_>,
         mode: ExecMode,
-    ) -> Result<(Self::Checkouts, Deps)> {
+    ) -> Result<(CheckoutsOf<Self>, Deps)> {
         // Drain each element pipe with its own home → a tuple of independent
         // Checkouts. Each output carries the home `execute` threaded (concrete cell,
         // slot, or `None` for a pipe), so the two sides re-arm independently:

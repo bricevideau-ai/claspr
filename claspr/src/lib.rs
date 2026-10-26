@@ -1,4 +1,4 @@
-// `associated_type_defaults`: `DeviceOp::Handle` defaults to `Pipe<Output>`
+// `associated_type_defaults`: `DeviceOp::Shape` defaults to `Single<Output>`
 // (the common case); multi-output combinators override it. See `eager`.
 #![feature(associated_type_defaults)]
 //! claspr — single-source OpenCL with rust-gpu.
@@ -173,15 +173,15 @@ pub use eager::DeviceChainFuture;
 // `bundle!` macro) stays reachable at `claspr::eager::…` but is NOT
 // re-exported here.
 pub use eager::{
-    AndThenHost, ArcSplit, BindAll, BindMode, Cell, Checkout, CopyTo2, Dep, Deps, DeviceDynOp,
-    DeviceEnqueue, DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt, Download, ExecMode,
-    FanOut, Fill, FillMapped, FromCheckout, GraphNode, ImageDownloadEager, ImageUploadEager, Input,
-    IntoBound, OnDevice, Pipe, ReadInto, ScalarInput, ScalarSlotCell, ScalarSlotState,
-    ScalarUpload, ScalarZero, SlotBinder, SlotCell, SlotHandle, SlotState, SlotValue, Tag, ToInput,
-    TransferToDevice, Upload, WriteDevice, WriteMapped, arc_split, arced, download, eager_copy_to,
-    fan_out, fill, fill_mapped, forward, image_download, image_upload, lift, read_into,
-    scalar_value, scalar_value_as, scalar_zero, scalar_zero_as, transfer_to_device,
-    transfer_to_device_at, upload, value, write, write_mapped,
+    AndThenHost, ArcSplit, BindAll, BindMode, Cell, Checkout, CheckoutsOf, CopyTo2, Dep, Deps,
+    DeviceDynOp, DeviceEnqueue, DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt, Download,
+    ExecMode, FanOut, Fill, FillMapped, FromCheckout, GraphNode, HandleOf, ImageDownloadEager,
+    ImageUploadEager, Input, IntoBound, OnDevice, OpShape, Pipe, ReadInto, ScalarInput,
+    ScalarSlotCell, ScalarSlotState, ScalarUpload, ScalarZero, Single, SlotBinder, SlotCell,
+    SlotHandle, SlotState, SlotValue, Tag, ToInput, TransferToDevice, Upload, WriteDevice,
+    WriteMapped, arc_split, arced, download, eager_copy_to, fan_out, fill, fill_mapped, forward,
+    image_download, image_upload, lift, read_into, scalar_value, scalar_value_as, scalar_zero,
+    scalar_zero_as, transfer_to_device, transfer_to_device_at, upload, value, write, write_mapped,
 };
 
 // Stage-3 proc-macro frontend.

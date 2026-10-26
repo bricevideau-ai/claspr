@@ -10,7 +10,7 @@
 //! gathered its source via `collect_home`, which collapses a tuple output to ONE
 //! home slot (`home == None` for a multi-output source by construction). So no
 //! branch re-armed its origin cell and the graph broke on the 2nd `sync`. The fix
-//! gives the seam `type Checkouts = S::Checkouts` and a `gather_checkouts` override
+//! gives the seam `Shape = Seamed<S::Shape>` (checkouts = the source's) and a `gather_checkouts` override
 //! that SPLITs the source's per-branch checkouts (value + homes), maps the tuple
 //! value through the closure, then REASSEMBLEs re-threading each ORIGINAL home — so
 //! every branch re-arms and the graph replays.
@@ -30,7 +30,7 @@ use claspr_test_support::{N, ctx, handle_of, seeded};
 // ── #211 regression guard: single-output-fed seam still replays ──────────
 //
 // The single-output source path must stay byte-behavior-identical after #212:
-// `S::Checkouts` collapses to `Checkout<O>`, `CheckoutSplit` is the identity
+// `CheckoutsOf<S>` collapses to `Checkout<O>`, `CheckoutSplit` is the identity
 // (one value + one home), and the seam threads exactly one home. This is the
 // same shape as `and_then_host_replays_and_reruns_each_sync`, kept here so a
 // regression in the single-output path is caught alongside the multi-home tests.
@@ -153,7 +153,7 @@ fn bundle_of_single_output_branches_fed_seam_rearms_x2() {
 //
 // The nested / transitive case: the outer bundle's first branch is ITSELF a
 // multi-output kernel (`add_u32(a, b, out)` → `(a, b, out)`), the second is a
-// single-output identity. So `S::Output = ((a, b, out), c)` and `S::Checkouts =
+// single-output identity. So `S::Output = ((a, b, out), c)` and `CheckoutsOf<S> =
 // ((Checkout, Checkout, Checkout), Checkout)`. `CheckoutSplit` must descend into
 // the nested tuple, hand the closure `((&mut[], &mut[], &mut[]), &mut[])`, and
 // reassemble re-threading ALL FOUR homes at BOTH nesting levels. This is the seam

@@ -40,7 +40,7 @@
 //!
 //! | You want to… | Use | Notes |
 //! |---|---|---|
-//! | sequence: run B on A's output | [`and_then`](DeviceOpExt::and_then) | builder runs at construction over A's [`Handle`](DeviceOp::Handle) |
+//! | sequence: run B on A's output | [`and_then`](DeviceOpExt::and_then) | builder runs at construction over A's [`Handle`](HandleOf) |
 //! | **carry a value PAST an intervening step** (keep it to hand to a later op / the terminal) | **[`forward`]** | `forward(x)` re-exposes an already-produced value as a one-node op; capture its handle in the `move` closures. This is the "thread a buffer forward" primitive. |
 //! | run device ops in PARALLEL | [`bundle2`] / [`bundle!`](crate::bundle) | independent branches; per-branch structure-preserving `Checkouts` |
 //! | N-way homogeneous parallel | [`fan_out`] | one op per item |
@@ -109,12 +109,12 @@
 //!
 //! ## What [`sync`](DeviceOpExt::sync) hands back
 //!
-//! The [`Checkouts`](DeviceOp::Checkouts) shape mirrors the graph's output shape:
+//! The [`Checkouts`](CheckoutsOf) shape mirrors the graph's output shape:
 //! - a single-output op → one `Checkout<Output>`;
 //! - a **multi-output kernel** → per-buffer Checkouts, `(Checkout<a>, Checkout<b>,
 //!   …)` — each droppable/readable independently;
 //! - a **[`bundle`](bundle2)** → per-branch, structure-preserving:
-//!   `(A::Checkouts, B::Checkouts)` (a single-output branch contributes one
+//!   `(CheckoutsOf<A>, CheckoutsOf<B>)` (a single-output branch contributes one
 //!   `Checkout`, a multi-output branch its own tuple, a nested bundle its nested
 //!   shape). Grouped by branch, per-buffer within each branch.
 //!
@@ -875,7 +875,7 @@ impl<T: Send + 'static> DeviceOp for Pipe<T> {
         Some(self.clone())
     }
 
-    fn handle(&self) -> Self::Handle {
+    fn handle(&self) -> HandleOf<Self> {
         self.clone()
     }
 
@@ -1507,7 +1507,7 @@ pub fn graph_edge_table(nodes: &[GraphNode]) -> Vec<(usize, Vec<usize>)> {
 /// | Tier | Members | When you write them |
 /// |------|---------|---------------------|
 /// | **1. Core contract** | [`Output`](Self::Output), [`output_pipe`](Self::output_pipe), [`handle`](Self::handle), [`execute`](Self::execute), [`describe`](Self::describe) | ALWAYS — every one of the 33 impls defines these five. |
-/// | **2. Output shape** | [`Handle`](Self::Handle), [`Checkouts`](Self::Checkouts), [`collect`](Self::collect), [`collect_home`](Self::collect_home), [`into_output`](Self::into_output), [`gather_checkouts`](Self::gather_checkouts) | Only for MULTI-OUTPUT ops (6 impls). Single-output ops take the defaults, which build one [`Pipe`]/[`Checkout`] from `Output`. |
+/// | **2. Output shape** | [`Shape`](Self::Shape), [`collect`](Self::collect), [`collect_home`](Self::collect_home), [`into_output`](Self::into_output), [`gather_checkouts`](Self::gather_checkouts) | Only for MULTI-OUTPUT ops (6 impls). Single-output ops take the defaults, which build one [`Pipe`]/[`Checkout`] from `Output`. |
 /// | **3. Slots & readiness** | [`bind_slots`](Self::bind_slots), [`check_ready`](Self::check_ready), [`reclaim_undelivered`](Self::reclaim_undelivered) | If your op holds [`Input`]s that can be slots: forward to each input. Leaves with concrete-only args take the defaults. |
 /// | **4. Command-buffer participation** | [`cb_addable`](Self::cb_addable), [`cbable_weight`](Self::cbable_weight), [`cb_cache`](Self::cb_cache), [`invalidate_cbs`](Self::invalidate_cbs), [`collect_cb_ids`](Self::collect_cb_ids), [`cb_restamp`](Self::cb_restamp), [`cb_spine_head_addable`](Self::cb_spine_head_addable) | Only if your op enqueues commands a `cl_khr_command_buffer` can RECORD (45% of impls). The defaults say "not recordable", which is always CORRECT — never unsound, just slower (the op runs per-enqueue instead of being baked into a replayed CB). |
 /// | **5. Introspection** | [`node_label`](Self::node_label), [`dump_graph`](Self::dump_graph), [`contains_host_seam`](Self::contains_host_seam) | Combinators that nest children override these to recurse; leaves almost never do. |
@@ -1527,28 +1527,23 @@ pub trait DeviceOp: Send {
     // ── Tier 2: output shape — MULTI-OUTPUT ops only. The defaults build one
     // Pipe/Checkout from `Output`, which is right for every single-output op ─
 
-    /// The **build-time, downstream-facing handle** — what a downstream
-    /// `and_then` closure receives. Defaults to a single [`Pipe<Output>`]
-    /// (the common case: leaves, kernels). A multi-output combinator overrides
-    /// it to expose its parts individually at build time — e.g. a 2-branch
-    /// bundle sets `Handle = (A::Handle, B::Handle)` so the closure gets two
-    /// pipes (`|(pa, pb)| …`) rather than one `Pipe<(A,B)>`. `Clone` so it can
-    /// be handed to the closure while the op keeps its own copy.
-    type Handle: Clone = Pipe<Self::Output>;
-
-    /// The **terminal result** — what [`sync`](DeviceOpExt::sync) /
-    /// [`wait_on`](DeviceOpExt::wait_on) hand back. Defaults to a single
-    /// [`Checkout<Output>`] (the common case). A **multi-output** op overrides it
-    /// to the per-element tuple `(Checkout<A>, Checkout<B>, …)` so each output is
-    /// independently readable / `into_inner`'d / returned-on-drop — built by
-    /// [`gather_checkouts`](Self::gather_checkouts) draining each element pipe with
-    /// its own [`home`](Cell). Mirrors how [`Handle`](Self::Handle) exposes the
-    /// per-element build-time pipes.
-    type Checkouts = Checkout<Self::Output>;
+    /// The op's **output shape** — one descriptor from which the build-time
+    /// downstream handle ([`HandleOf<Self>`](HandleOf): what an `and_then`
+    /// closure receives) and the terminal result ([`CheckoutsOf<Self>`](CheckoutsOf):
+    /// what [`sync`](DeviceOpExt::sync) / [`wait_on`](DeviceOpExt::wait_on) hand
+    /// back) are both projected. See [`OpShape`].
+    ///
+    /// Defaults to [`Single<Output>`](Single) — one `Pipe` downstream, one
+    /// `Checkout` at the terminal — which is right for every single-output op. A
+    /// **multi-output** op overrides it to expose its parts individually: a
+    /// 2-branch bundle sets `Shape = (A::Shape, B::Shape)`, so the closure gets
+    /// two handles (`|(pa, pb)| …`) and the terminal two `Checkout`s, each
+    /// independently readable / `into_inner`'d / returned-on-drop.
+    type Shape: OpShape<Output = Self::Output> = Single<Self::Output>;
 
     /// The **runtime value-storage** pipe — where `execute` deposits the result;
     /// what the single-output terminal (`sync`) drains. `Some` for a single-output
-    /// op (its one storage pipe, independent of the build-time [`Handle`](Self::Handle)),
+    /// op (its one storage pipe, independent of the build-time [`Handle`](HandleOf<Self>)),
     /// `None` for a **multi-output** op (Bundle2..16, [`FanOut`], [`CopyTo2`],
     /// `arc_split`, the `and_then_host` seam over a multi-output source, …), whose
     /// storage is per-branch/element pipes with no single collapsed pipe. The
@@ -1559,14 +1554,14 @@ pub trait DeviceOp: Send {
     /// `None` case is never reached through them.
     fn output_pipe(&self) -> Option<Pipe<Self::Output>>;
 
-    /// The downstream-facing [`Handle`](Self::Handle) — what a downstream `and_then`
+    /// The downstream-facing [`Handle`](HandleOf<Self>) — what a downstream `and_then`
     /// closure receives. A single-output op returns its output pipe (`self.out.clone()`
     /// — i.e. `self.output_pipe().unwrap()`); a multi-output combinator returns its
     /// per-element tuple. **No default body**: the single-output form isn't expressible
-    /// generically (the trait can't construct `Self::Handle` without a `From<Pipe<
+    /// generically (the trait can't construct `HandleOf<Self>` without a `From<Pipe<
     /// Output>>` bound that would then break generic callers on tuple-`Handle` ops), so
     /// every op writes it explicitly — one line for a leaf.
-    fn handle(&self) -> Self::Handle;
+    fn handle(&self) -> HandleOf<Self>;
 
     /// Run the op for ONE run: **lend** inputs (take from their cells / upstream
     /// pipes for the duration of the run), enqueue, deposit the result + its
@@ -1683,7 +1678,7 @@ pub trait DeviceOp: Send {
     }
 
     /// Run this op as the **chain terminal** and build its
-    /// [`Checkouts`](Self::Checkouts) — the per-output [`Checkout`] guard(s),
+    /// [`Checkouts`](CheckoutsOf<Self>) — the per-output [`Checkout`] guard(s),
     /// each carrying its own typed return [`home`](Cell) — **without** waiting on
     /// the completion events (the caller waits, per `mode`, on the returned
     /// [`Deps`]).
@@ -1701,11 +1696,11 @@ pub trait DeviceOp: Send {
         &self,
         ec: &ExecutionContext<'_>,
         mode: ExecMode,
-    ) -> Result<(Self::Checkouts, Deps)>
+    ) -> Result<(CheckoutsOf<Self>, Deps)>
     where
         Self: Sized,
         Self::Output: Send + 'static,
-        Self::Checkouts: FromCheckout<Self::Output>,
+        CheckoutsOf<Self>: FromCheckout<Self::Output>,
     {
         let out = self.output_pipe().expect(
             "single-output op must have an output pipe (multi-output overrides gather_checkouts)",
@@ -1715,7 +1710,7 @@ pub trait DeviceOp: Send {
             .take_home()
             .ok_or(Error::NotSupported("eager graph: op produced no output"))?;
         Ok((
-            Self::Checkouts::from_single(Checkout::new(value, home)),
+            <CheckoutsOf<Self>>::from_single(Checkout::new(value, home)),
             deps,
         ))
     }
@@ -2038,73 +2033,125 @@ pub trait DeviceOp: Send {
     }
 }
 
-/// The canonical `Handle` / `Checkouts` SHAPE of a [`DeviceOp::Output`].
+/// The **output shape** of a [`DeviceOp`] — ONE type-level descriptor from which
+/// the op's run-time [`Output`](Self::Output), its build-time downstream
+/// [`Handle`](Self::Handle) and its terminal [`Checkouts`](Self::Checkouts) are
+/// all projected.
 ///
-/// Every built-in op's [`Handle`](DeviceOp::Handle) and
-/// [`Checkouts`](DeviceOp::Checkouts) are *mechanically determined* by its
-/// [`Output`](DeviceOp::Output): a single-value output has `Handle = Pipe<O>` /
-/// `Checkouts = Checkout<O>` (the trait defaults), and a tuple output has the
-/// element-wise tuple of each. So for EVERY op the identity
-/// `A::Output: OutputShape<Handle = A::Handle, Checkouts = A::Checkouts>` holds.
+/// A handle and a checkout are two phases of the same edge — the `Pipe` a
+/// downstream builder reads at construction, the owned `Checkout` a terminal
+/// hands back after a run — so they always have the same STRUCTURE (one per
+/// output, nested the same way). The shape states that structure once, instead
+/// of each op (and each generic bound over an op) spelling the parallel `Pipe`
+/// and `Checkout` tuples separately. [`DeviceOp::Shape`] defaults to
+/// [`Single<Output>`](Single), so a single-output op never names it.
 ///
-/// This trait exposes that shape keyed on the OUTPUT TYPE, so a generic subgraph
-/// bound can pin the shape ONCE via `Output` and *project* `Handle`/`Checkouts`
-/// from it — instead of re-spelling the parallel `Pipe<_>` and `Checkout<_>` tuples
-/// (which for a 6-field subgraph is three copies of the same shape). See
-/// `examples/cg`'s `solve_with`, whose two closure-result bounds shrink from
-/// Output+Handle+Checkouts blocks to `Output` + a one-line `OutputShape` projection.
-pub trait OutputShape {
-    /// The `DeviceOp::Handle` an op producing `Self` has (`Pipe<Self>`, or the
-    /// element-wise tuple of handles).
-    type Handle;
-    /// The `DeviceOp::Checkouts` an op producing `Self` has (`Checkout<Self>`, or the
-    /// element-wise tuple of checkouts).
+/// The shape can NOT be keyed on `Output` alone: the same output type has
+/// different shapes under different ops (`value(t)` hands `T` downstream BY
+/// VALUE where a kernel hands a `Pipe<T>`; a `fan_out`'s `Vec<X>` checks out
+/// per branch where a `download`'s `Vec<X>` is one `Checkout`). Hence explicit
+/// markers: [`Single`], [`ByValue`], tuples of shapes, arrays `[S; N]`,
+/// [`FanOutShape`], [`Seamed`].
+pub trait OpShape {
+    /// What an op of this shape produces at run time ([`DeviceOp::Output`]).
+    type Output: Send;
+    /// What a downstream [`and_then`](DeviceOpExt::and_then) builder receives
+    /// ([`HandleOf`]). `Clone` so the op keeps its own copy.
+    type Handle: Clone;
+    /// What a terminal ([`sync`](DeviceOpExt::sync) / [`wait_on`](DeviceOpExt::wait_on))
+    /// hands back ([`CheckoutsOf`]).
     type Checkouts;
 }
 
-/// A single-value output: `Handle = Pipe<Self>`, `Checkouts = Checkout<Self>` — the
-/// [`DeviceOp`] associated-type defaults. Per-family (not a blanket `impl<V>`, which
-/// would collide with the tuple impls under coherence).
-macro_rules! impl_output_shape_leaf {
-    ($($t:ty),+ $(,)?) => { $(
-        impl<T: Send + 'static, M: MemMode> OutputShape for $t {
-            type Handle = Pipe<$t>;
-            type Checkouts = Checkout<$t>;
-        }
-    )+ };
-}
-impl_output_shape_leaf!(DeviceSlice<T, M>, MappedSlice<T, M>, USMSlice<T, M>);
+/// The build-time downstream handle of op `Op` — its shape's [`OpShape::Handle`].
+pub type HandleOf<Op> = <<Op as DeviceOp>::Shape as OpShape>::Handle;
 
-/// A device/mapped/usm SCALAR ([`Scalar<B>`], e.g. `DeviceScalar<T,M>`) output.
-impl<B: Send + 'static> OutputShape for Scalar<B> {
-    type Handle = Pipe<Scalar<B>>;
-    type Checkouts = Checkout<Scalar<B>>;
+/// The terminal result of op `Op` — its shape's [`OpShape::Checkouts`].
+pub type CheckoutsOf<Op> = <<Op as DeviceOp>::Shape as OpShape>::Checkouts;
+
+/// One output, one edge: `Handle = Pipe<T>`, `Checkouts = Checkout<T>`. The
+/// [`DeviceOp::Shape`] default — every single-output op (leaves, single-buffer
+/// kernels) has it without naming it.
+pub struct Single<T>(PhantomData<fn() -> T>);
+
+impl<T: Send> OpShape for Single<T> {
+    type Output = T;
+    type Handle = Pipe<T>;
+    type Checkouts = Checkout<T>;
 }
 
-/// A host-`Vec` output (a `download` terminal's value).
-impl<T: Send + 'static> OutputShape for Vec<T> {
-    type Handle = Pipe<Vec<T>>;
-    type Checkouts = Checkout<Vec<T>>;
+/// One output handed downstream BY VALUE (`Handle = T`) so a builder can compute
+/// on it at construction — [`value`]'s shape. Still checks out as one `Checkout<T>`.
+pub struct ByValue<T>(PhantomData<fn() -> T>);
+
+impl<T: Send + Clone> OpShape for ByValue<T> {
+    type Output = T;
+    type Handle = T;
+    type Checkouts = Checkout<T>;
 }
 
-/// A tuple output (bundle / multi-branch): the element-wise tuple of each field's
-/// shape — exactly what the bundle/tuple `DeviceOp` impls compute for `Handle` /
-/// `Checkouts`.
-macro_rules! impl_output_shape_tuple {
+/// A [`fan_out`]'s shape: ONE downstream pipe over the gathered `Vec`, but
+/// per-branch checkouts (a `Vec` of each branch's own `Checkouts`), so every
+/// branch re-arms its own cells.
+pub struct FanOutShape<S>(PhantomData<fn() -> S>);
+
+impl<S: OpShape> OpShape for FanOutShape<S> {
+    type Output = Vec<S::Output>;
+    type Handle = Pipe<Vec<S::Output>>;
+    type Checkouts = Vec<S::Checkouts>;
+}
+
+/// An [`and_then_host`](DeviceOpExt::and_then_host) seam's shape over a source of
+/// shape `S`: the source's checkouts, re-scattered downstream as PIPES (a
+/// [`ByValue`] branch becomes a `Pipe` once it has crossed the seam).
+pub struct Seamed<S>(PhantomData<fn() -> S>);
+
+impl<S: OpShape> OpShape for Seamed<S>
+where
+    S::Checkouts: SeamScatter<Value = S::Output>,
+{
+    type Output = S::Output;
+    type Handle = <S::Checkouts as SeamScatter>::Handle;
+    type Checkouts = S::Checkouts;
+}
+
+/// N same-shaped outputs ([`arc_split`]): element-wise arrays.
+impl<S: OpShape, const N: usize> OpShape for [S; N] {
+    type Output = [S::Output; N];
+    type Handle = [S::Handle; N];
+    type Checkouts = [S::Checkouts; N];
+}
+
+/// A tuple of shapes (bundles, multi-output kernels, copy pairs): element-wise,
+/// nested the same way as `Output`.
+macro_rules! impl_op_shape_tuple {
     ($($ty:ident),+ $(,)?) => {
-        impl<$($ty: OutputShape),+> OutputShape for ($($ty,)+) {
-            type Handle = ($(<$ty as OutputShape>::Handle,)+);
-            type Checkouts = ($(<$ty as OutputShape>::Checkouts,)+);
+        impl<$($ty: OpShape),+> OpShape for ($($ty,)+) {
+            type Output = ($(<$ty as OpShape>::Output,)+);
+            type Handle = ($(<$ty as OpShape>::Handle,)+);
+            type Checkouts = ($(<$ty as OpShape>::Checkouts,)+);
         }
     };
 }
-impl_output_shape_tuple!(A0, A1);
-impl_output_shape_tuple!(A0, A1, A2);
-impl_output_shape_tuple!(A0, A1, A2, A3);
-impl_output_shape_tuple!(A0, A1, A2, A3, A4);
-impl_output_shape_tuple!(A0, A1, A2, A3, A4, A5);
-impl_output_shape_tuple!(A0, A1, A2, A3, A4, A5, A6);
-impl_output_shape_tuple!(A0, A1, A2, A3, A4, A5, A6, A7);
+impl_op_shape_tuple!(A0, A1);
+impl_op_shape_tuple!(A0, A1, A2);
+impl_op_shape_tuple!(A0, A1, A2, A3);
+impl_op_shape_tuple!(A0, A1, A2, A3, A4);
+impl_op_shape_tuple!(A0, A1, A2, A3, A4, A5);
+impl_op_shape_tuple!(A0, A1, A2, A3, A4, A5, A6);
+impl_op_shape_tuple!(A0, A1, A2, A3, A4, A5, A6, A7);
+impl_op_shape_tuple!(A0, A1, A2, A3, A4, A5, A6, A7, A8);
+impl_op_shape_tuple!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9);
+impl_op_shape_tuple!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
+impl_op_shape_tuple!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11);
+impl_op_shape_tuple!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12);
+impl_op_shape_tuple!(A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13);
+impl_op_shape_tuple!(
+    A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14
+);
+impl_op_shape_tuple!(
+    A0, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15
+);
 
 /// Builder verbs for composing [`DeviceOp`]s. Blanket-implemented.
 pub trait DeviceOpExt: DeviceOp + Sized {
@@ -2113,14 +2160,14 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     ///
     /// **False friend with cuda-oxide.** Unlike cuda-oxide's `and_then` (whose
     /// closure runs at *execute* time over the runtime value), claspr's runs the
-    /// builder **now, at construction**, over a build-time [`Handle`](DeviceOp::Handle)
+    /// builder **now, at construction**, over a build-time [`Handle`](HandleOf)
     /// — a [`Pipe`] or, for [`value`], the by-value `T` — and retains no closure.
     /// Same name, opposite timing: the eager build is what makes the resulting
     /// graph a closure-free, [`describe`](DeviceOp::describe)-able struct.
     fn and_then<U, F>(self, f: F) -> AndThen<Self, U>
     where
         U: DeviceOp,
-        F: FnOnce(Self::Handle) -> U,
+        F: FnOnce(HandleOf<Self>) -> U,
     {
         let next = f(self.handle());
         let cbable_weight = self.cbable_weight() + next.cbable_weight();
@@ -2174,7 +2221,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     fn and_then_host<F>(self, f: F) -> AndThenHost<Self>
     where
         Self::Output: crate::mappable::Mappable,
-        Self::Checkouts: SeamScatter<Value = Self::Output>,
+        CheckoutsOf<Self>: SeamScatter<Value = Self::Output>,
         F: for<'a> Fn(<Self::Output as crate::mappable::Mappable>::View<'a>) -> Result<()>
             + Send
             + Sync
@@ -2185,7 +2232,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         AndThenHost {
             source: self,
             f: Arc::new(move |_ctx: &Context, view| f(view)),
-            handle: <Self::Checkouts as SeamScatter>::empty_handle(),
+            handle: <CheckoutsOf<Self> as SeamScatter>::empty_handle(),
         }
     }
 
@@ -2199,7 +2246,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     fn and_then_host_with_context<F>(self, f: F) -> AndThenHost<Self>
     where
         Self::Output: crate::mappable::Mappable,
-        Self::Checkouts: SeamScatter<Value = Self::Output>,
+        CheckoutsOf<Self>: SeamScatter<Value = Self::Output>,
         F: for<'a> Fn(
                 &Context,
                 <Self::Output as crate::mappable::Mappable>::View<'a>,
@@ -2211,7 +2258,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         AndThenHost {
             source: self,
             f: Arc::new(f),
-            handle: <Self::Checkouts as SeamScatter>::empty_handle(),
+            handle: <CheckoutsOf<Self> as SeamScatter>::empty_handle(),
         }
     }
 
@@ -2525,10 +2572,10 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// default OOO queue; a `Queue`/`ExecutionContext` → that exact queue), so
     /// `wait_on` is also the cross-queue / cross-device control (Tier-1 heritage).
     /// [`sync`](Self::sync) is `wait_on` over a `Context`.
-    fn wait_on<L: crate::Launcher + ?Sized>(&self, launcher: &L) -> Result<Self::Checkouts>
+    fn wait_on<L: crate::Launcher + ?Sized>(&self, launcher: &L) -> Result<CheckoutsOf<Self>>
     where
         Self::Output: Send + 'static,
-        Self::Checkouts: FromCheckout<Self::Output>,
+        CheckoutsOf<Self>: FromCheckout<Self::Output>,
     {
         // ATOMICITY PRE-PASS — validate that EVERY input cell of the whole graph is
         // satisfiable BEFORE touching anything. This is the read-only mirror of the
@@ -2646,17 +2693,17 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     }
 
     /// Run `self` to completion on `context`'s default out-of-order queue and
-    /// hand back its [`Checkouts`](DeviceOp::Checkouts) — a [`Checkout`] over the
+    /// hand back its [`Checkouts`](CheckoutsOf) — a [`Checkout`] over the
     /// output (or a tuple of `Checkout`s for a multi-output graph). The named
     /// graph terminal (cuda-oxide / Rust-CUDA heritage spelling); equal to
     /// [`wait_on`](Self::wait_on) over the `context`. Use `wait_on` with an
     /// explicit `Queue` for cross-queue ordering.
     ///
     /// Reusable: `&self`. See [`wait_on`](Self::wait_on) and [`Checkout`].
-    fn sync(&self, context: &Context) -> Result<Self::Checkouts>
+    fn sync(&self, context: &Context) -> Result<CheckoutsOf<Self>>
     where
         Self::Output: Send + 'static,
-        Self::Checkouts: FromCheckout<Self::Output>,
+        CheckoutsOf<Self>: FromCheckout<Self::Output>,
     {
         let device = context.device().clone();
         let queue = context.default_outoforder_queue(&device)?;
@@ -3117,9 +3164,9 @@ where
 }
 
 /// Bridge for the default [`gather_checkouts`](DeviceOp::gather_checkouts): lets a
-/// single-output op build its `Self::Checkouts` (which defaults to
+/// single-output op build its `CheckoutsOf<Self>` (which defaults to
 /// `Checkout<Output>`) from one [`Checkout`] without the trait method statically
-/// knowing `Self::Checkouts == Checkout<Output>`. Implemented ONLY for
+/// knowing `CheckoutsOf<Self> == Checkout<Output>`. Implemented ONLY for
 /// `Checkout<O>`; multi-output ops override `gather_checkouts` and never use it.
 pub trait FromCheckout<O> {
     /// Wrap a single output's checkout as the terminal result.
@@ -3143,7 +3190,7 @@ impl<O> FromCheckout<O> for Checkout<O> {
 // branch that element IS `Checkout<$ty>` (via the identity impl above); for a
 // **multi-output** branch it is that branch's OWN `Checkouts` (itself a tuple,
 // satisfying `FromCheckout` via this same family one level down). So a
-// `bundle!`'s `Checkouts = (A::Checkouts, B::Checkouts, …)` satisfies
+// `bundle!`'s `Checkouts = (CheckoutsOf<A>, CheckoutsOf<B>, …)` satisfies
 // `FromCheckout<(A::Output, B::Output, …)>` at ANY branch multiplicity and
 // nesting depth — the delegation composes transitively. No overlap with the
 // identity impl: a `Checkout<O>` is never a tuple type.
@@ -3210,7 +3257,7 @@ where
 // The DYNAMIC-length homogeneous `Vec<C>` shape produced by [`FanOut`] — the
 // dynamic-arity analog of the `[C; N]` impl above. `C` need only be
 // `FromCheckout<O>` (a fan-out branch may itself be multi-output, so `C =
-// U::Checkouts`, a tuple, satisfying `FromCheckout` via the recursive tuple
+// CheckoutsOf<U>`, a tuple, satisfying `FromCheckout` via the recursive tuple
 // family; a single-output branch's `C = Checkout<O>` via the identity impl).
 // Never reaches `from_single`: `FanOut` overrides `gather_checkouts` to build the
 // `Vec` per-branch. No overlap with the array/tuple/identity impls (`Vec` is a
@@ -3228,7 +3275,7 @@ where
 }
 
 /// The **bidirectional companion** to [`FromCheckout`]: SPLIT a
-/// [`Checkouts`](DeviceOp::Checkouts) value into its assembled output value plus
+/// [`Checkouts`](CheckoutsOf) value into its assembled output value plus
 /// its per-branch return homes, and REASSEMBLE it from a (possibly
 /// seam-mutated) value + those same homes.
 ///
@@ -3355,7 +3402,7 @@ impl_checkout_split_tuple!(
 
 /// The **MID-GRAPH companion** to [`CheckoutSplit`]: give a host seam
 /// ([`AndThenHost`]) its own per-branch **element pipes** — shaped like the
-/// source's [`Checkouts`](DeviceOp::Checkouts) — and SCATTER a seam-mutated value
+/// source's [`Checkouts`](CheckoutsOf) — and SCATTER a seam-mutated value
 /// plus per-branch homes into them, so a bundle / multi-output source's branches
 /// stay individually consumable **downstream** (a `Pipe` per branch, not one
 /// `Pipe<tuple>`) AND re-home across replays.
@@ -3372,7 +3419,7 @@ impl_checkout_split_tuple!(
 pub trait SeamScatter: CheckoutSplit {
     /// The pipe-shaped downstream handle: `Pipe<O>` for a single-output source, a
     /// tuple of these for a bundle / multi-output source (mirrors
-    /// [`Handle`](DeviceOp::Handle)). Owned by the seam; `execute` fills it,
+    /// [`Handle`](HandleOf)). Owned by the seam; `execute` fills it,
     /// downstream reads it. `Send` because the seam struct owns one and
     /// [`DeviceOp`] is `Send`.
     type Handle: Clone + Send;
