@@ -1516,6 +1516,17 @@ pub fn graph_edge_table(nodes: &[GraphNode]) -> Vec<(usize, Vec<usize>)> {
 /// six members. A new **combinator** additionally recurses tiers 3–5 into its
 /// children. Reach for tier 4 only when the op is CB-recordable, and note the
 /// defaults are the safe answer, not a stub to fill in.
+///
+/// # Adding a member to this trait
+///
+/// **Forward it through [`DeviceDynOp`].** The erased op restates every member
+/// in a private mirror trait (`ErasedDeviceOp`, in `eager/combinators.rs`) and
+/// forwards each to the op it wraps. A NEW member with a default body compiles
+/// without being forwarded — and every erased op then silently runs the default
+/// instead of the wrapped op's override (the bug class that once left erased ops
+/// unable to bind slots or record command buffers). Add it to the mirror trait,
+/// its blanket impl, and `DeviceDynOp`'s `DeviceOp` impl, and extend the parity
+/// test (`tests/tier2/tests/eager_erase.rs`) to compare it.
 #[must_use = "device ops do nothing until a terminal like .sync()/.wait()/.run() is called"]
 pub trait DeviceOp: Send {
     // ── Tier 1: core contract — every one of the 33 in-tree impls defines
@@ -2052,6 +2063,10 @@ pub trait DeviceOp: Send {
 /// per branch where a `download`'s `Vec<X>` is one `Checkout`). Hence explicit
 /// markers: [`Single`], [`ByValue`], tuples of shapes, arrays `[S; N]`,
 /// [`FanOutShape`], [`Seamed`].
+///
+/// Naming one parameter is also what makes the op type-erasable without losing
+/// its per-output handles: [`DeviceDynOp<'op, S>`](DeviceDynOp) is generic over
+/// a shape only.
 pub trait OpShape {
     /// What an op of this shape produces at run time ([`DeviceOp::Output`]).
     type Output: Send;
@@ -2177,6 +2192,27 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             cb_cache: new_cb_cache(),
             cbable_weight,
         }
+    }
+
+    /// Erase this op's concrete type into a [`DeviceDynOp`] of the same
+    /// [`Shape`](DeviceOp::Shape). Transparent — the erased op behaves exactly
+    /// like `self` (slots, command buffers, homes, per-output handles all
+    /// forward); only the type changes.
+    ///
+    /// Use it to unify the arms of a conditional graph, and to CUT a long chain
+    /// into segments: `a.and_then(..)…and_then(..).erase().and_then(..)…`. Each
+    /// `.and_then` nests the type one level deeper, and the compiler walks that
+    /// nesting to prove the `DeviceOp: Send` supertrait, so an unbroken chain
+    /// hits the default `recursion_limit` at ~110 links (and costs a debug build
+    /// quadratic stack while building). Erasing every few dozen links keeps both
+    /// flat, for one allocation per erased segment.
+    fn erase<'op>(self) -> DeviceDynOp<'op, Self::Shape>
+    where
+        Self: 'op,
+        Self::Output: 'static,
+        CheckoutsOf<Self>: FromCheckout<Self::Output>,
+    {
+        DeviceDynOp::new(self)
     }
 
     /// Route this op's `execute` to `device`'s default out-of-order queue

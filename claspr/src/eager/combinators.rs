@@ -1,7 +1,7 @@
 //! Structural combinators for the eager graph — the nodes that COMPOSE other ops
 //! rather than do device work: `AndThen` (source->next), `Value`/`Lift` (lift a
 //! host value / owned resource), `Forward` (identity/select), `DeviceDynOp`
-//! (type-erased single-output), `Arced`/`ArcSplit` (share one output read-only),
+//! (transparent type erasure), `Arced`/`ArcSplit` (share one output read-only),
 //! `Bundle*`/`FanOut` (N independent branches). Each delegates execution/CB/slots
 //! to its children. See `ARCHITECTURE.md`.
 
@@ -598,36 +598,72 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
     }
 }
 
-// ── DeviceDynOp: type-erased single-output op for conditional graphs ─────
+// ── DeviceDynOp: transparent type erasure (conditional arms, deep chains) ──
 
-/// Object-safe erasure of [`DeviceOp`], specialised to output `T`. Crate-internal
-/// — users go through [`DeviceDynOp`]. `DeviceOp` itself is NOT object-safe (it has
-/// an associated `Handle` type and `self`-consuming `collect`/`into_output`), so
-/// this mirror trait restates the one operation a terminal/branch needs —
-/// gather `(value, deps)` — as a `self: Box<Self>` method that *is*
-/// dyn-dispatchable. It delegates to the concrete op's [`collect`](DeviceOp::collect),
-/// which already reconstructs any arity down to a single `Output`, so even a
-/// multi-output inner op erases cleanly to a single-output `DeviceDynOp`.
-trait ErasedDeviceOp<T>: Send {
-    fn collect_erased(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(T, Deps)>;
-
+/// Object-safe mirror of [`DeviceOp`], specialised to one [`OpShape`] `S`.
+/// Crate-internal — users go through [`DeviceDynOp`]. `DeviceOp` itself is NOT
+/// object-safe (associated types, and the gather methods are `Self: Sized`), so
+/// this restates EVERY member as a `&self` method over the fixed shape. Every
+/// member forwards, so an erased op is behaviourally the op it wraps: its slots
+/// bind, its commands record into the surrounding command buffer, its outputs
+/// keep their homes and its per-output handles survive.
+///
+/// **Keep in lockstep with [`DeviceOp`].** Every `DeviceOp` member must appear
+/// here, in the blanket impl below, and in `DeviceDynOp`'s `DeviceOp` impl. The
+/// compiler does NOT catch a missing one: an unforwarded member with a default
+/// body makes every erased op run that default. `eager_erase.rs`'s parity test
+/// compares erased vs. plain twins member by member — extend it with the member.
+trait ErasedDeviceOp<S: OpShape>: Send {
+    fn output_pipe_erased(&self) -> Option<Pipe<S::Output>>;
+    fn handle_erased(&self) -> S::Handle;
+    fn execute_erased(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()>;
+    fn collect_erased(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(S::Output, Deps)>;
+    #[allow(clippy::type_complexity)]
+    fn collect_home_erased(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(S::Output, Deps, Option<BoxedHome<S::Output>>)>;
+    fn gather_checkouts_erased(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(S::Checkouts, Deps)>;
     fn describe_erased(&self, out: &mut Vec<String>);
-
-    /// Forwards [`DeviceOp::check_ready`] through the erasure so a [`DeviceDynOp`]'s
-    /// atomicity pre-pass covers whichever concrete arm it wraps (the arm's inputs
-    /// are resolved by `collect_erased` at run, so they must be pre-checked too).
+    fn node_label_erased(&self) -> String;
+    fn dump_graph_erased(&self, depth: usize, out: &mut Vec<GraphNode>);
+    fn bind_slots_erased(&self, binder: &mut SlotBinder);
     fn check_ready_erased(&self) -> Result<()>;
-
-    /// Forwards [`DeviceOp::contains_host_seam`] through the erasure so a
-    /// [`DeviceDynOp`] reports the right gate bit for whichever concrete arm it
-    /// wraps.
+    fn reclaim_undelivered_erased(&self);
     fn contains_host_seam_erased(&self) -> bool;
+    fn cb_addable_erased(&self) -> bool;
+    fn cbable_weight_erased(&self) -> usize;
+    fn cb_cache_erased(&self) -> Option<&CbCache>;
+    fn invalidate_cbs_erased(&self, mutated: &std::collections::BTreeSet<usize>);
+    fn collect_cb_ids_erased(&self, out: &mut Vec<usize>);
+    fn cb_restamp_erased(&self, evs: &Deps);
+    fn cb_spine_head_addable_erased(&self) -> bool;
 }
 
-impl<O> ErasedDeviceOp<O::Output> for O
+impl<O> ErasedDeviceOp<O::Shape> for O
 where
     O: DeviceOp,
+    O::Output: 'static,
+    CheckoutsOf<O>: FromCheckout<O::Output>,
 {
+    fn output_pipe_erased(&self) -> Option<Pipe<O::Output>> {
+        self.output_pipe()
+    }
+    fn handle_erased(&self) -> HandleOf<O> {
+        self.handle()
+    }
+    fn execute_erased(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        self.execute(ec, mode)
+    }
     fn collect_erased(
         &self,
         ec: &ExecutionContext<'_>,
@@ -635,103 +671,224 @@ where
     ) -> Result<(O::Output, Deps)> {
         self.collect(ec, mode)
     }
-
+    fn collect_home_erased(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(O::Output, Deps, Option<BoxedHome<O::Output>>)> {
+        self.collect_home(ec, mode)
+    }
+    fn gather_checkouts_erased(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(CheckoutsOf<O>, Deps)> {
+        self.gather_checkouts(ec, mode)
+    }
     fn describe_erased(&self, out: &mut Vec<String>) {
         self.describe(out);
     }
-
+    fn node_label_erased(&self) -> String {
+        self.node_label()
+    }
+    fn dump_graph_erased(&self, depth: usize, out: &mut Vec<GraphNode>) {
+        self.dump_graph(depth, out);
+    }
+    fn bind_slots_erased(&self, binder: &mut SlotBinder) {
+        self.bind_slots(binder);
+    }
     fn check_ready_erased(&self) -> Result<()> {
         self.check_ready()
     }
-
+    fn reclaim_undelivered_erased(&self) {
+        self.reclaim_undelivered();
+    }
     fn contains_host_seam_erased(&self) -> bool {
         self.contains_host_seam()
     }
+    fn cb_addable_erased(&self) -> bool {
+        self.cb_addable()
+    }
+    fn cbable_weight_erased(&self) -> usize {
+        self.cbable_weight()
+    }
+    fn cb_cache_erased(&self) -> Option<&CbCache> {
+        self.cb_cache()
+    }
+    fn invalidate_cbs_erased(&self, mutated: &std::collections::BTreeSet<usize>) {
+        self.invalidate_cbs(mutated);
+    }
+    fn collect_cb_ids_erased(&self, out: &mut Vec<usize>) {
+        self.collect_cb_ids(out);
+    }
+    fn cb_restamp_erased(&self, evs: &Deps) {
+        self.cb_restamp(evs);
+    }
+    fn cb_spine_head_addable_erased(&self) -> bool {
+        self.cb_spine_head_addable()
+    }
 }
 
-/// Type-erased single-output [`DeviceOp`] yielding `T`. Lets `if` / `match` arms
-/// produce DIFFERENT concrete op types as long as they agree on `Output` — the
-/// eager analog of the legacy closure-layer `DynOp`.
+/// A type-erased [`DeviceOp`] of shape `S` — one nominal type standing for any
+/// op with that [`OpShape`]. Built with [`DeviceDynOp::new`] or the
+/// [`erase`](DeviceOpExt::erase) builder.
 ///
-/// Each combinator chain has its own deeply-nested concrete type
-/// (`AndThen<Upload, AndThen<…>>` vs `Value<T>`), so an `if`/`else` that builds a
-/// chain in each arm is a type-mismatch error. Wrapping each arm in
-/// `DeviceDynOp::new(...)` erases the concrete type to one nominal
-/// `DeviceDynOp<'op, T>`, which is itself an [`DeviceOp`] and composes with
-/// `and_then` / `bundle` / `fan_out` like any single-output leaf.
+/// **Transparent.** Every `DeviceOp` member forwards to the wrapped op, so
+/// erasing changes the TYPE and nothing else: slots inside still bind, commands
+/// inside still record into the surrounding command buffer, outputs keep their
+/// return homes, and the per-output handles survive (a 4-output kernel erases to
+/// a `DeviceDynOp<'_, (Single<A>, Single<B>, Single<C>, Single<D>)>` whose
+/// `and_then` closure still receives four pipes). It adds no node of its own to
+/// [`describe`](DeviceOp::describe) / [`dump_graph`](DeviceOp::dump_graph).
 ///
-/// ```ignore
-/// let chain: DeviceDynOp<u32> = if use_kernel {
-///     DeviceDynOp::new(upload(v).and_then(|b| ks.fill_u32([N], b, 9)).and_then(|_| value(0u32)))
-/// } else {
-///     DeviceDynOp::new(value(0u32))            // different concrete type, same Output
-/// };
-/// let r = chain.sync(&ctx)?;
-/// ```
+/// Two uses:
 ///
-/// One heap allocation per erased op. The `'op` lifetime lets the boxed op borrow
-/// from the surrounding scope (typically `&Kernels` for kernel launches); it
-/// infers to `'static` for chains built from owned data only.
+/// - **Conditional graphs.** Each chain has its own deeply-nested concrete type
+///   (`AndThen<Upload, AndThen<…>>` vs `Value<T>`), so an `if`/`else` building a
+///   chain per arm is a type mismatch. Erasing each arm unifies them, provided
+///   the arms agree on SHAPE (not only on `Output`: a `value(t)` arm hands `T`
+///   downstream by value, a kernel arm a `Pipe<T>`).
 ///
-/// **Single-output.** `Handle = Pipe<T>` (the default). A multi-output op CAN be
-/// erased — its tuple `Output` becomes the `T` of the `DeviceDynOp` (reconstructed
-/// via the inner op's `collect`), but the per-element build-time handle is gone;
-/// downstream sees one `Pipe<tuple>`. For the conditional-graph use case (arms
-/// agreeing on one `Output`) that is exactly right.
-pub struct DeviceDynOp<'op, T> {
-    inner: Box<dyn ErasedDeviceOp<T> + 'op>,
-    out: Pipe<T>,
+///   ```ignore
+///   let chain: DeviceDynOp<ByValue<u32>> = if use_kernel {
+///       upload(v).and_then(|b| ks.fill_u32([N], b, 9)).and_then(|_| value(0u32)).erase()
+///   } else {
+///       value(0u32).erase()            // different concrete type, same shape
+///   };
+///   let r = chain.sync(&ctx)?;
+///   ```
+///
+/// - **Long chains.** An `.and_then` chain's type nests one level per link, and
+///   the compiler proves `Send` (a `DeviceOp` supertrait) by walking that whole
+///   nesting — at the default `recursion_limit = 128` a chain stops compiling
+///   at ~110 links. Inline storage also costs a debug build stack space
+///   quadratic in chain length (every intermediate `AndThen` gets its own
+///   slot). Erasing every segment of a long chain (`.erase()` per stage) resets
+///   the nesting to one level and moves each finished segment to the heap.
+///
+/// One heap allocation and one virtual call per member per erased op. The `'op`
+/// lifetime lets the boxed op borrow from the surrounding scope (typically
+/// `&Kernels`); it infers to `'static` for chains built from owned data only.
+pub struct DeviceDynOp<'op, S: OpShape> {
+    inner: Box<dyn ErasedDeviceOp<S> + 'op>,
 }
 
-impl<'op, T: Send + 'static> DeviceDynOp<'op, T> {
-    /// Erase a concrete op into a single-output `DeviceDynOp`. Both arms of an
-    /// `if`/`match` can produce `DeviceDynOp::new(...)` of the same `T` without
-    /// their concrete types matching.
+impl<'op, S> DeviceDynOp<'op, S>
+where
+    S: OpShape,
+    S::Output: 'static,
+    S::Checkouts: FromCheckout<S::Output>,
+{
+    /// Erase `op` into a `DeviceDynOp` of its own shape. Equivalent to
+    /// [`op.erase()`](DeviceOpExt::erase).
     pub fn new<O>(op: O) -> Self
     where
-        O: DeviceOp<Output = T> + 'op,
+        // `Output = S::Output` is implied by `Shape = S` (the trait bounds
+        // `Shape: OpShape<Output = Self::Output>`), but the solver doesn't
+        // normalize through it — spell it out.
+        O: DeviceOp<Output = S::Output, Shape = S> + 'op,
     {
         DeviceDynOp {
             inner: Box::new(op),
-            out: Pipe::new(),
         }
     }
 }
 
-impl<T: Send + 'static> DeviceOp for DeviceDynOp<'_, T> {
-    type Output = T;
+impl<S> DeviceOp for DeviceDynOp<'_, S>
+where
+    S: OpShape,
+    S::Output: 'static,
+    S::Checkouts: FromCheckout<S::Output>,
+{
+    type Output = S::Output;
+    type Shape = S;
 
-    fn output_pipe(&self) -> Option<Pipe<T>> {
-        Some(self.out.clone())
+    fn output_pipe(&self) -> Option<Pipe<S::Output>> {
+        self.inner.output_pipe_erased()
     }
 
-    fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+    fn handle(&self) -> S::Handle {
+        self.inner.handle_erased()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        // Gather the erased inner op (any arity → one value + deps) and deposit
-        // into our own pipe, so the default collect/into_output/handle path treats
-        // this as an ordinary single-output leaf. The inner op observes `mode`
-        // (it is the real terminal work when this DeviceDynOp is the chain tail).
-        // `&self`: the inner op runs by reference, so an erased arm is reusable.
-        let (v, deps) = self.inner.collect_erased(ec, mode)?;
-        self.out.put(v, deps);
-        Ok(())
+        self.inner.execute_erased(ec, mode)
+    }
+
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(S::Output, Deps)> {
+        self.inner.collect_erased(ec, mode)
+    }
+
+    fn collect_home(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(S::Output, Deps, Option<BoxedHome<S::Output>>)> {
+        self.inner.collect_home_erased(ec, mode)
+    }
+
+    fn gather_checkouts(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(S::Checkouts, Deps)> {
+        self.inner.gather_checkouts_erased(ec, mode)
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        self.inner.describe_erased(out);
+    }
+
+    fn node_label(&self) -> String {
+        self.inner.node_label_erased()
+    }
+
+    fn dump_graph(&self, depth: usize, out: &mut Vec<GraphNode>) {
+        self.inner.dump_graph_erased(depth, out);
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        self.inner.bind_slots_erased(binder);
     }
 
     fn check_ready(&self) -> Result<()> {
         self.inner.check_ready_erased()
     }
 
-    fn describe(&self, out: &mut Vec<String>) {
-        out.push("dyn_op{".into());
-        self.inner.describe_erased(out);
-        out.push("}".into());
+    fn reclaim_undelivered(&self) {
+        self.inner.reclaim_undelivered_erased();
     }
 
     fn contains_host_seam(&self) -> bool {
         self.inner.contains_host_seam_erased()
+    }
+
+    fn cb_addable(&self) -> bool {
+        self.inner.cb_addable_erased()
+    }
+
+    fn cbable_weight(&self) -> usize {
+        self.inner.cbable_weight_erased()
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        self.inner.cb_cache_erased()
+    }
+
+    fn invalidate_cbs(&self, mutated: &std::collections::BTreeSet<usize>) {
+        self.inner.invalidate_cbs_erased(mutated);
+    }
+
+    fn collect_cb_ids(&self, out: &mut Vec<usize>) {
+        self.inner.collect_cb_ids_erased(out);
+    }
+
+    fn cb_restamp(&self, evs: &Deps) {
+        self.inner.cb_restamp_erased(evs);
+    }
+
+    fn cb_spine_head_addable(&self) -> bool {
+        self.inner.cb_spine_head_addable_erased()
     }
 }
 

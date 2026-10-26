@@ -99,8 +99,9 @@ below.
       annotation fights graph reusability.
   Scope if ever revived: ~36 `DeviceOp` impls gain `type Slots` (default `HNil`);
   ~9 composing combinators `Append` children's sets; close the latent
-  `bind_slots` gaps (FanOut/Arced/ArcSplit/OnDevice/Profiled/DeviceDynOp — several
-  don't walk slots at runtime today); `DeviceDynOp` erasure can't carry static
+  `bind_slots` gaps (FanOut/Arced/ArcSplit/OnDevice/Profiled — several don't walk
+  slots at runtime today; DeviceDynOp's was closed 2026-10-26 by the transparent
+  erasure rewrite); `DeviceDynOp` erasure can't carry static
   `Slots` (stored graphs fall back to runtime). Verified feasible: distinct-tags
   type-state (18/18 old spike, re-greened today) and shared-via-explicit-Reuse
   (spiked green today, no unstable features). **REVISIT TRIGGER: if the
@@ -325,6 +326,18 @@ WG lands a resolution.
   Arc-of-read-only variant that is NOT threaded into the output tuple (it has no home to
   rehome — the clone is the ownership story), or just show the destructure-and-drop
   idiom in the fan-out docs so chain authors know it's expected.
+
+### Erasure leftovers: shape-strict arms (2026-10-26, not started)
+
+`OpShape` + transparent `.erase()` landed (see the commit messages for the
+chain-depth measurements). Two loose ends, neither needed by any in-tree code:
+- `Seamed<Single<T>>` ≠ `Single<T>` though their projections match, so a
+  conditional arm ending in `and_then_host` won't unify with a plain kernel arm.
+- The old `DeviceDynOp<T>` unified arms by `Output` alone (collapsing to one
+  pipe); the transparent one needs equal SHAPES, so a `value(t)` arm
+  (`ByValue`) and a kernel arm (`Single`) no longer mix. A `.collapse()` (own
+  pipe, `collect_home` to keep the home, CB-opaque) would restore it.
+**REVISIT TRIGGER: the first real graph that needs either.**
 
 ### Tier 1 scoped launcher (`ctx.scope(|s| {...})`)
 
