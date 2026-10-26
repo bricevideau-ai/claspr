@@ -799,10 +799,14 @@ where
     let gf_z = LaunchSpec::from([nx * (nz + 1)]);
 
     // Twelve dispatches of one half-step (3 RK stages x 4 kernels),
-    // Twelve dispatches of one half-step (3 RK stages x 4 kernels),
-    // appended to an existing chain. The four mutable buffers ride
-    // the pipes; the hy arrays enter as Arc clones per site. Free
-    // identifiers (ks, gt, hd, ...) resolve at the expansion site.
+    // appended to an existing chain and erased (`.erase()`): erasure
+    // is transparent at run time (same slots, same command buffer),
+    // but it caps the graph's type nesting at 12 links instead of 48,
+    // so longer graphs (e.g. several double steps fused into one)
+    // stay under rustc's recursion limit and a debug build's stack.
+    // The four mutable buffers ride the pipes; the hy arrays enter as
+    // Arc clones per site. Free identifiers (ks, gt, hd, ...) resolve
+    // at the expansion site.
     // rustfmt oscillates on the parameter continuation line of a
     // macro_rules! nested this deep (adds indentation every pass)
     // — freeze it.
@@ -930,12 +934,14 @@ where
                 .and_then(move |(s, t, fx, td)| {
                     ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!($dtc<Real>))
                 })
+                .erase()
             };
         }
 
     // Seed dispatch takes the owned buffers; every later half is
     // uniform. Step 1 = x-first (x half via seed+rest, then z),
-    // step 2 = z-first (z, then x).
+    // step 2 = z-first (z, then x). The seed half is erased by hand,
+    // like every `half!`.
     let g0 = ks
         .halo_s(
             gh_x,
@@ -1048,7 +1054,8 @@ where
         .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
             ks.tend_t(gt, s, t, fx, td, nxu, nzu, 0u32, dx_t, dz_t)
         })
-        .and_then(move |(s, t, fx, td)| ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!(Dt1C<Real>)));
+        .and_then(move |(s, t, fx, td)| ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!(Dt1C<Real>)))
+        .erase();
     let g1 = half!(g0, gh_z, gf_z, 1u32, H1B1, H1B2, H1B3, Dt1A, Dt1B, Dt1C);
     let g2 = half!(g1, gh_z, gf_z, 1u32, H2A1, H2A2, H2A3, Dt2A, Dt2B, Dt2C);
     let g = half!(g2, gh_x, gf_x, 0u32, H2B1, H2B2, H2B3, Dt2A, Dt2B, Dt2C);
