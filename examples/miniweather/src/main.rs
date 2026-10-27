@@ -789,7 +789,7 @@ impl Width for f32 {
 /// by slots and flipped per step.
 ///
 /// Only ONE is built per `run` call: the other would be dead weight. Stack is no
-/// longer the constraint — every 12-dispatch half is `.erase()`d, so a debug
+/// longer the constraint — `and_then` erases the chain it extends, so a debug
 /// build of `run` (both arms in one frame) needs under 512 KiB of a test
 /// thread's 2 MiB (measured 2026-10-27).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -874,12 +874,7 @@ where
     let gf_z = LaunchSpec::from([nx * (nz + 1)]);
 
     // Twelve dispatches of one half-step (3 RK stages x 4 kernels),
-    // appended to an existing chain and erased (`.erase()`): erasure
-    // is transparent at run time (same slots, same command buffer),
-    // but it caps the graph's type nesting at 12 links instead of 48,
-    // so longer graphs (e.g. several double steps fused into one)
-    // stay under rustc's recursion limit and a debug build's stack.
-    // The four mutable buffers ride the pipes; the hy arrays enter as
+    // appended to an existing chain. The four mutable buffers ride the pipes; the hy arrays enter as
     // Arc clones per site. Free identifiers (ks, gt, hd, ...) resolve
     // at the expansion site.
     // rustfmt oscillates on the parameter continuation line of a
@@ -1009,15 +1004,13 @@ where
                 .and_then(move |(s, t, fx, td)| {
                     ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!($dtc<Real>))
                 })
-                .erase()
             };
         }
 
     // The SEED half: identical to `half!` except it consumes the OWNED buffers
     // instead of picking them off an upstream chain's pipes. Same parameters, so
     // both graph shapes below (unrolled double-step, non-unrolled per-timestep)
-    // are built from the same two macros and cannot drift apart. Erased like
-    // every `half!`.
+    // are built from the same two macros and cannot drift apart.
     #[rustfmt::skip]
         macro_rules! seed_half {
             ($s:expr, $t:expr, $fx:expr, $td:expr, $gh:expr, $gf:expr, $d:expr,
@@ -1063,7 +1056,6 @@ where
                 .and_then(move |(s, t, fx, td)| {
                     ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!($dtc<Real>))
                 })
-                .erase()
             };
         }
 

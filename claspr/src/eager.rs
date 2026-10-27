@@ -2206,15 +2206,23 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// — a [`Pipe`] or, for [`value`], the by-value `T` — and retains no closure.
     /// Same name, opposite timing: the eager build is what makes the resulting
     /// graph a closure-free, [`describe`](DeviceOp::describe)-able struct.
-    fn and_then<U, F>(self, f: F) -> AndThen<Self, U>
+    fn and_then<'op, U, F>(self, f: F) -> AndThen<DeviceDynOp<'op, Self::Shape>, U>
     where
+        Self: 'op,
+        Self::Output: 'static,
+        CheckoutsOf<Self>: FromCheckout<Self::Output>,
         U: DeviceOp,
         F: FnOnce(HandleOf<Self>) -> U,
     {
         let next = f(self.handle());
         let cbable_weight = self.cbable_weight() + next.cbable_weight();
         AndThen {
-            source: self,
+            // The chain so far is ERASED: a graph's type then nests per COMBINATOR
+            // in the source, not per link, so long chains neither hit the
+            // `recursion_limit` (rustc proves `Send` through the whole nesting)
+            // nor cost a debug build quadratic stack. Transparent at run time —
+            // `DeviceDynOp` forwards every member.
+            source: self.erase(),
             next,
             cb_cache: new_cb_cache(),
             cbable_weight,

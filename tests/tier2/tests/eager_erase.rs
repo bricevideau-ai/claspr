@@ -51,12 +51,13 @@ macro_rules! sixteen_links {
     };
 }
 
-/// 1 + 8×16 = 129 three-output kernel links: past the ~110-link ceiling of an
-/// unbroken chain, so this compiles ONLY because each 16-link segment is erased.
-/// Built and run on a default-sized (2 MiB) spawned thread — the stack a
-/// `cargo test` thread gets — to pin the debug-build stack cost too.
+/// 1 + 8×16 = 129 three-output kernel links: past the ~110-link ceiling the
+/// chain had before `and_then` erased by default. The explicit per-segment
+/// `.erase()` calls below are now redundant (kept to exercise them). Built and
+/// run on a default-sized (2 MiB) spawned thread — the stack a `cargo test`
+/// thread gets — to pin the debug-build stack cost too.
 #[test]
-fn erased_segments_lift_the_chain_length_ceiling() {
+fn long_chain_compiles_and_runs_at_default_limit() {
     std::thread::Builder::new()
         .stack_size(2 * 1024 * 1024)
         .spawn(|| {
