@@ -38,6 +38,9 @@ jobs:
           sudo apt-get update
           sudo apt install -y mesa-opencl-icd
 
+      - name: Print OpenCL stack versions
+        run: dpkg -l | grep -E 'mesa|libllvm|libclc|llvmspirv' | awk '{print $2, $3}'
+
       # Compute the host triple and pass it as `--target $TARGET` to
       # every build/clippy/test step. Cargo issue #6313: when host ==
       # target *implicitly*, the host build-dep dylib
