@@ -1368,11 +1368,19 @@ impl<T> Input<T> {
     where
         T: CopyHome<Out> + Send + 'static,
     {
+        // A slot FED BY a pipe holds no buffer of its own: what it resolves to came
+        // from the upstream pipe, so it goes home like a pipe input (to its origin),
+        // not into the slot cell — which would leave the origin empty ("busy").
+        let pipe_fed = matches!(
+            self,
+            Input::Slot { cell, .. } if matches!(&*lock_unpoisoned(cell), SlotState::FedByPipe(_))
+        );
         let (v, deps, in_home) = self.resolve_home(ec)?;
         let out_home = match self {
             // The pipe payload's home is the origin's; forward it output-typed.
             Input::Pipe(_) => in_home.and_then(<T as CopyHome<Out>>::pipe_home),
-            // Concrete / slot: rebuild the retype-aware home from the cell.
+            Input::Slot { .. } if pipe_fed => in_home.and_then(<T as CopyHome<Out>>::pipe_home),
+            // Concrete / value-bound slot: rebuild the retype-aware home from the cell.
             Input::Concrete(_) | Input::Slot { .. } => self.copy_input_home(),
         };
         Ok((v, deps, out_home))

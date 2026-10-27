@@ -15,9 +15,15 @@
 //!   buffer is the stronger capability — wired via a downgrade rehome that
 //!   re-wraps it as `DeviceSliceUninit` before storing.
 
-use claspr::eager::{DeviceOpExt, eager_copy_to};
-use claspr::{DeviceSlice, MappedSlice, SvmLevel, USMSlice};
+use claspr::eager::{DeviceOpExt, download, eager_copy_to};
+use claspr::{DeviceSlice, MappedSlice, SvmLevel, USMSlice, slot, slots};
+use claspr_test_kernels::kernels;
 use claspr_test_support::ctx;
+
+slots! {
+    CopySrc: DeviceSlice<u32>,
+    CopyDst: DeviceSlice<u32>,
+}
 
 const N: usize = 16;
 
@@ -181,5 +187,34 @@ fn failed_bundle_branch_does_not_strand_sibling() {
             matches!(err, claspr::Error::LengthMismatch { .. }),
             "run {run}: expected LengthMismatch, got {err:?}"
         );
+    }
+}
+
+/// A copy whose `src` AND `dst` are both slots, `dst` fed by an upstream pipe.
+/// The copy's slot walk used to stop after `src` as soon as the binder had no
+/// value left — which a pipe-feed binder never has — so `CopyDst(pipe)` never
+/// reached `dst` and the graph failed `SlotUnbound` (the same skip hid `dst`
+/// from the atomicity probe and from the command-buffer digest collection).
+#[test]
+fn pipe_fed_copy_destination_slot_binds() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("kernels");
+    let data = vec![7u32; N];
+    let g = ks
+        .scale_u32(
+            [N],
+            DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("dst"),
+            1u32,
+        )
+        .and_then(|d| {
+            eager_copy_to(slot!(CopySrc), slot!(CopyDst)).call((
+                CopySrc(DeviceSlice::<u32>::from_slice(&ctx, &data).expect("src")),
+                CopyDst(d),
+            ))
+        })
+        .and_then(|(_src, dst)| download(dst));
+    for run in 1..=2 {
+        let out = g.sync(&ctx).unwrap_or_else(|e| panic!("run {run}: {e:?}"));
+        assert_eq!(out, data, "run {run}");
     }
 }
