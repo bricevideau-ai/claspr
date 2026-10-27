@@ -192,6 +192,18 @@ impl SpirvBuilderSettings {
     /// device module without consuming the settings.
     fn apply_to(&self, crate_path: &Path) -> SpirvBuilder {
         let mut sb = SpirvBuilder::new(crate_path, &self.target_env);
+        // Pin the nested kernel build to the toolchain running THIS build
+        // script. spirv-builder scrubs `RUSTUP_TOOLCHAIN` from the nested
+        // cargo, so without an explicit `+toolchain` rustup resolves it from
+        // the nested cargo's cwd — the generated crate under `OUT_DIR`, i.e.
+        // inside the target dir. A target dir outside the workspace (shared
+        // `CARGO_TARGET_DIR`) then finds no `rust-toolchain.toml` and falls
+        // back to the default toolchain (stable: "the `-Z` flag is only
+        // accepted on the nightly channel"). The nested rustc must match the
+        // outer one anyway: it loads the `rustc_codegen_spirv` dylib the outer
+        // toolchain built. Set before the customizers so `.with(...)` can
+        // still override it.
+        sb.toolchain_overwrite = outer_toolchain(std::env::var("RUSTUP_TOOLCHAIN").ok());
         for cap in &self.capabilities {
             sb = sb.capability(*cap);
         }
@@ -381,6 +393,17 @@ impl CompileBuilder {
 fn emit_rerun_if_changed(crate_path: &Path) {
     println!("cargo:rerun-if-changed={}/Cargo.toml", crate_path.display());
     println!("cargo:rerun-if-changed={}/src", crate_path.display());
+}
+
+/// The toolchain to hand the nested kernel build as `cargo +<toolchain>`, from
+/// this build script's `RUSTUP_TOOLCHAIN` (rustup sets it to the resolved name,
+/// e.g. `nightly-2026-05-22-x86_64-unknown-linux-gnu`, whether it came from a
+/// `rust-toolchain.toml`, a `+toolchain` or the env). `None` — leave
+/// spirv-builder's default — when not built under rustup, or for a path
+/// toolchain, which `+` can't name.
+fn outer_toolchain(rustup_toolchain: Option<String>) -> Option<String> {
+    rustup_toolchain
+        .filter(|t| !t.is_empty() && !t.contains(std::path::MAIN_SEPARATOR) && !t.contains('/'))
 }
 
 /// Copy the freshly-built SPIR-V module next to the generated `.rs` file and
@@ -1081,4 +1104,18 @@ fn write_generated_lib_rs(crate_dir: &Path, file: &syn::File) -> Result<()> {
     }));
     std::fs::write(crate_dir.join("src/lib.rs"), s)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::outer_toolchain;
+
+    #[test]
+    fn outer_toolchain_forwards_named_toolchains_only() {
+        let named = "nightly-2026-05-22-x86_64-unknown-linux-gnu";
+        assert_eq!(outer_toolchain(Some(named.into())).as_deref(), Some(named));
+        assert_eq!(outer_toolchain(None), None);
+        assert_eq!(outer_toolchain(Some(String::new())), None);
+        assert_eq!(outer_toolchain(Some("/opt/rust/my-toolchain".into())), None);
+    }
 }
