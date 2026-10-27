@@ -793,6 +793,40 @@ where
     fn cb_spine_head_addable(&self) -> bool {
         self.inner.cb_spine_head_addable()
     }
+
+    fn into_dyn<'b>(self) -> DeviceDynOp<'b, S>
+    where
+        Self: 'b,
+    {
+        // Already erased: hand back the same box rather than boxing it again.
+        self
+    }
+}
+
+#[cfg(test)]
+mod dyn_op_tests {
+    use super::*;
+
+    /// Address of the op a `DeviceDynOp` boxes — identity, not contents.
+    fn boxed_addr<S: OpShape>(op: &DeviceDynOp<'_, S>) -> usize {
+        &*op.inner as *const _ as *const () as usize
+    }
+
+    // Erasing an erased op, or extending it with `and_then` (which erases its
+    // source), must reuse the existing box, not wrap it in a second one.
+    #[test]
+    fn erasing_an_erased_op_does_not_rebox() {
+        let erased = forward::<u32>(Pipe::new()).erase();
+        let addr = boxed_addr(&erased);
+        let again = erased.erase();
+        assert_eq!(boxed_addr(&again), addr, "erase() re-boxed an erased op");
+        let chained = again.and_then(forward);
+        assert_eq!(
+            boxed_addr(&chained.source),
+            addr,
+            "and_then re-boxed an erased source"
+        );
+    }
 }
 
 // ── Arced: wrap the output in Arc<T> ───────────────────────────────────

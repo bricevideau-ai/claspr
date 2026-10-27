@@ -1557,7 +1557,8 @@ pub fn graph_edge_table(nodes: &[GraphNode]) -> Vec<(usize, Vec<usize>)> {
 /// Keep every member DISPATCHABLE: no `where Self: Sized` and no generic
 /// parameters. A non-dispatchable member is missing from `dyn DeviceOp`'s
 /// vtable, so the forwarder could only reach its default body, never the wrapped
-/// op's override.
+/// op's override. The one exception is the by-value conversion
+/// [`into_dyn`](Self::into_dyn), which `DeviceDynOp` implements itself.
 #[must_use = "device ops do nothing until a terminal like .sync()/.wait()/.run() is called"]
 pub trait DeviceOp: Send {
     // ── Tier 1: core contract — every one of the 33 in-tree impls defines
@@ -2065,6 +2066,28 @@ pub trait DeviceOp: Send {
     fn cb_spine_head_addable(&self) -> bool {
         self.cb_addable()
     }
+
+    // ── Conversion — by value, so the one member deliberately NOT dispatchable ─
+
+    /// Box this op into a [`DeviceDynOp`] of its own shape: the conversion behind
+    /// [`erase`](DeviceOpExt::erase), and so behind every
+    /// [`and_then`](DeviceOpExt::and_then) source. The default boxes;
+    /// [`DeviceDynOp`] overrides it to return itself, so re-erasing an erased op
+    /// (an erased conditional arm extended with `and_then`) does not box it twice.
+    ///
+    /// `Self: Sized` because it consumes `self` — the one exception to "keep every
+    /// member dispatchable" (see "Adding a member to this trait"): a `dyn DeviceOp`
+    /// is never converted, only a concrete op or a `DeviceDynOp`, which implements
+    /// it itself.
+    #[doc(hidden)]
+    fn into_dyn<'op>(self) -> DeviceDynOp<'op, Self::Shape>
+    where
+        Self: Sized + 'op,
+        Self::Output: 'static,
+        CheckoutsOf<Self>: FromCheckout<Self::Output>,
+    {
+        DeviceDynOp::new(self)
+    }
 }
 
 /// The **output shape** of a [`DeviceOp`] — ONE type-level descriptor from which
@@ -2244,7 +2267,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         Self::Output: 'static,
         CheckoutsOf<Self>: FromCheckout<Self::Output>,
     {
-        DeviceDynOp::new(self)
+        self.into_dyn()
     }
 
     /// Route this op's `execute` to `device`'s default out-of-order queue
