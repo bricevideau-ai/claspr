@@ -1545,15 +1545,19 @@ pub fn graph_edge_table(nodes: &[GraphNode]) -> Vec<(usize, Vec<usize>)> {
 ///
 /// # Adding a member to this trait
 ///
-/// **Forward it through [`DeviceDynOp`].** The erased op restates every member
-/// in a private mirror trait (`ErasedDeviceOp`, in `eager/combinators.rs`) and
-/// forwards each to the op it wraps. A NEW member with a default body compiles
-/// without being forwarded — and every erased op then silently runs the default
-/// instead of the wrapped op's override (the bug class that once left erased ops
-/// unable to bind slots or record command buffers). `clippy::missing_trait_methods`
-/// on `DeviceDynOp`'s impl flags the omission there. Add it to the mirror trait,
-/// its blanket impl, and `DeviceDynOp`'s `DeviceOp` impl, and extend the parity
-/// test (`tests/tier2/tests/eager_erase.rs`) to compare it.
+/// **Forward it through [`DeviceDynOp`].** The erased op boxes a `dyn DeviceOp`
+/// and forwards every member to it by hand, in its `DeviceOp` impl
+/// (`eager/combinators.rs`). A NEW member with a default body compiles without
+/// being forwarded — and every erased op (every `and_then` source) then silently
+/// runs the default instead of the wrapped op's override (the bug class that once
+/// left erased ops unable to bind slots or record command buffers).
+/// `clippy::missing_trait_methods` on that impl turns the omission into a clippy
+/// error; also extend the parity test (`tests/tier2/tests/eager_erase.rs`).
+///
+/// Keep every member DISPATCHABLE: no `where Self: Sized` and no generic
+/// parameters. A non-dispatchable member is missing from `dyn DeviceOp`'s
+/// vtable, so the forwarder could only reach its default body, never the wrapped
+/// op's override.
 #[must_use = "device ops do nothing until a terminal like .sync()/.wait()/.run() is called"]
 pub trait DeviceOp: Send {
     // ── Tier 1: core contract — every one of the 33 in-tree impls defines
@@ -1636,10 +1640,7 @@ pub trait DeviceOp: Send {
     ///   `output_pipe().take()` — is exactly the nested-multi-output bug).
     /// - The terminals [`into_output`](Self::into_output) (blocking) and the
     ///   async `run` wrap `collect` and decide *when* to wait.
-    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
-    where
-        Self: Sized,
-    {
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)> {
         let out = self
             .output_pipe()
             .expect("single-output op must have an output pipe (multi-output overrides collect)");
@@ -1681,7 +1682,6 @@ pub trait DeviceOp: Send {
         mode: ExecMode,
     ) -> Result<(Self::Output, Deps, Option<BoxedHome<Self::Output>>)>
     where
-        Self: Sized,
         Self::Output: Send + 'static,
     {
         let out = self.output_pipe().expect(
@@ -1704,10 +1704,7 @@ pub trait DeviceOp: Send {
     /// not consumed (the name predates the model — it "produces the output", it no
     /// longer consumes the op).
     #[allow(clippy::wrong_self_convention)]
-    fn into_output(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output>
-    where
-        Self: Sized,
-    {
+    fn into_output(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output> {
         let (value, deps) = self.collect(ec, mode)?;
         for d in &deps {
             d.as_ref().wait().map_err(Error::OpenCl)?;
@@ -1736,7 +1733,6 @@ pub trait DeviceOp: Send {
         mode: ExecMode,
     ) -> Result<(CheckoutsOf<Self>, Deps)>
     where
-        Self: Sized,
         Self::Output: Send + 'static,
         CheckoutsOf<Self>: FromCheckout<Self::Output>,
     {

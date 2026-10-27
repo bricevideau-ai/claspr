@@ -8,9 +8,10 @@
 //! re-bind, commands inside still record into one command buffer, per-output
 //! handles survive, and the graph's description is unchanged.
 //!
-//! **Parity guard.** `DeviceDynOp` forwards each `DeviceOp` member by hand
-//! through a private mirror trait; an unforwarded member with a default body
-//! would compile and silently run the default for every erased op. The
+//! **Parity guard.** `DeviceDynOp` forwards each `DeviceOp` member by hand to
+//! the boxed `dyn DeviceOp`; an unforwarded member with a default body would
+//! compile and silently run the default for every erased op
+//! (`clippy::missing_trait_methods` on the impl catches the omission statically). The
 //! `parity_*` tests build each graph twice — plain and erased — and compare
 //! every member they can observe, before and after running. When you add a
 //! `DeviceOp` member, add it to `assert_static_parity` (or the run-time checks).

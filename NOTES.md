@@ -48,8 +48,9 @@ below.
   has unicode-perl off.
 - **`DeviceOp` trait split** (`CommandBufferOp` supertrait) — DECLINED (R1). Would
   cascade `+ CommandBufferOp` bounds through ~7 CB helpers + every combinator (~53
-  impl splits, ~60 call sites) with ZERO object-safety benefit (no `dyn DeviceOp`
-  anywhere). The "CB is a skippable layer" goal is met by the module split instead.
+  impl splits, ~60 call sites) with ZERO object-safety benefit (`dyn DeviceOp`
+  works unsplit: `DeviceDynOp` boxes one since 2026-10-27, once the gather
+  members' vestigial `Self: Sized` gates were dropped). The "CB is a skippable layer" goal is met by the module split instead.
   **RE-CONFIRMED 2026-08-21 on a different axis** (attempt 2 asked about AGENT CONTEXT
   cost, not impl cost — a fair re-open, and it still declines): measured across the 33
   in-tree impls, **45% override at least one `cb_*` member** (`cb_addable` 14,

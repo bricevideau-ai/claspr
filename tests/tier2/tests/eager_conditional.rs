@@ -4,7 +4,7 @@
 //! `conditional.rs` is built entirely around `DynOp` — a boxed, type-erased op so
 //! that `if`/`match` arms producing DIFFERENT concrete op types can share one
 //! `Output` and compose. The eager analog is `DeviceDynOp<'op, S>`
-//! (`claspr::eager::DeviceDynOp`): an object-safe `ErasedDeviceOp` shim boxed into a
+//! (`claspr::eager::DeviceDynOp`): a boxed `dyn DeviceOp` wrapped as a
 //! transparent `DeviceOp` of the same `OpShape` `S` — so arms must agree on SHAPE
 //! (a `value` arm is `ByValue<T>`, a kernel arm `Single<T>`). All seven `DynOp`
 //! tests now port; only the
