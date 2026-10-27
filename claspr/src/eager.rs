@@ -131,6 +131,47 @@
 //! recordable region, replayed, with a small host readback between replays).
 //! `examples/cg` is this pattern end-to-end.
 //!
+//! ## Reusable subgraphs: curry, then compose (library-provided graphs)
+//!
+//! A library hands out a multi-dispatch graph as a value: it declares its slot
+//! tags with [`slots!`](crate::slots), leaves every late-bound input as a
+//! `slot!(..)` hole, and returns a NAMED erased type ([`DeviceDynOp`] of the
+//! graph's [`Shape`](DeviceOp::Shape)). Build-time invariants can simply be plain
+//! function arguments.
+//!
+//! ```ignore
+//! slots! { AffIn: DeviceSlice<u32>, Bias: DeviceSlice<u32>, AffOut: DeviceSlice<u32>, Factor: u32 }
+//! pub type Affine = DeviceDynOp<'static, Single<DeviceSlice<u32>>>;
+//! pub fn affine(ks: &Kernels) -> Affine {   // AffOut = (AffIn + Bias) * Factor
+//!     ks.add_u32([N], slot!(AffIn), slot!(Bias), slot!(AffOut))
+//!         .and_then(move |(_a, _b, out)| ks.scale_u32([N], out, slot!(Factor)))
+//!         .erase()
+//! }
+//! ```
+//!
+//! The user curries with the set-once [`call`](DeviceOpExt::call) and composes the
+//! result inside `and_then` (a slot can take an upstream pipe: `AffIn(x)`). To
+//! reuse ONE curried configuration at several sites, wrap it in a closure — the
+//! closure is the template; each call builds a fresh instance:
+//!
+//! ```ignore
+//! let double = |x, bias, out| affine(&ks).call((AffIn(x), Factor(2), Bias(bias), AffOut(out)));
+//! let g = upstream
+//!     .and_then(|x| double(x, b1, o1))
+//!     .and_then(|y| double(y, b2, o2))
+//!     .and_then(download);
+//! ```
+//!
+//! **Bind before composing.** A tag bound on an instance before it is composed
+//! affects only that instance. A tag left OPEN through composition fans out: one
+//! bind on the composed graph fills it in every instance (the shared-slot rule,
+//! see [`SlotValue`]). That is right for a knob all instances share (a launch
+//! extent, a time step) and wrong for a per-instance value. Erasure is transparent:
+//! slots inside an erased instance bind, its commands record into the
+//! surrounding command buffer, and instances are ordinary values (store them,
+//! choose one at run time, compose a run-time number of them in a loop).
+//! `tests/tier2/tests/library_subgraph.rs` exercises each of these.
+//!
 //! ## Slots, scalars, and other authoring notes
 //!
 //! - **Slots** ([`slot!`](crate::slot) / [`slots!`](crate::slots)) make a graph

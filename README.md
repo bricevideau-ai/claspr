@@ -202,6 +202,12 @@ once with set-once `call`, and vary only the rotating buffers per step.
 ways — a mutable-swap replay and a curried immutable compose — proven
 bit-identical.
 
+A library can hand such a graph out ready to curry: it declares its slot tags
+and returns a named erased type (`DeviceDynOp<'static, Shape>`); users `call`
+it to curry, compose it inside `and_then`, and reuse one configuration at
+several sites through a closure. See "Reusable subgraphs: curry, then compose"
+in the `eager` module guide (`tests/tier2/tests/library_subgraph.rs`).
+
 ## Workspace layout
 
 | Crate | Role |
