@@ -550,10 +550,9 @@ pub fn rehome_consumed<T>(buf: T, home: Option<BoxedHome<T>>) {
 /// channel; the buffer is rehomed regardless so the graph stays reusable.
 ///
 /// Only call it once the run is fully enqueued (the terminals do; the CB
-/// fallbacks drain pipes a discarded build left with EMPTY deps). `pub` +
-/// `#[doc(hidden)]` for the same cross-crate reason as `rehome_consumed`.
-#[doc(hidden)]
-pub fn rehome_undelivered<T>(buf: T, deps: Deps, home: Option<BoxedHome<T>>) {
+/// fallbacks drain pipes a discarded build left with EMPTY deps). Reached
+/// through [`Pipe::reclaim`].
+pub(crate) fn rehome_undelivered<T>(buf: T, deps: Deps, home: Option<BoxedHome<T>>) {
     for d in &deps {
         let _ = d.as_ref().wait();
     }
@@ -868,6 +867,20 @@ impl<T> Pipe<T> {
                 .expect("PipePayload drained twice — internal bug");
             (value, std::mem::take(&mut p.deps), home)
         })
+    }
+
+    /// Drain an UNDELIVERED value — one nothing downstream consumed — and return
+    /// it to its origin cell once the device work that produced it has finished
+    /// ([`rehome_undelivered`]). A no-op on an empty pipe (already drained
+    /// downstream, or never produced). What every
+    /// [`reclaim_undelivered`](DeviceOp::reclaim_undelivered) does per output
+    /// pipe. `pub` + `#[doc(hidden)]`: the `#[kernel]` macro emits it in user
+    /// crates for multi-output kernels.
+    #[doc(hidden)]
+    pub fn reclaim(&self) {
+        if let Some((value, deps, home)) = self.take_home() {
+            rehome_undelivered(value, deps, home);
+        }
     }
 
     /// Stable identity of this pipe's storage cell — the graph-edge key. Two
@@ -1533,7 +1546,7 @@ pub fn graph_edge_table(nodes: &[GraphNode]) -> Vec<(usize, Vec<usize>)> {
 /// | Tier | Members | When you write them |
 /// |------|---------|---------------------|
 /// | **1. Core contract** | [`Output`](Self::Output), [`output_pipe`](Self::output_pipe), [`handle`](Self::handle), [`execute`](Self::execute), [`describe`](Self::describe) | ALWAYS — every one of the 33 impls defines these five. |
-/// | **2. Output shape** | [`Shape`](Self::Shape), [`collect`](Self::collect), [`collect_home`](Self::collect_home), [`into_output`](Self::into_output), [`gather_checkouts`](Self::gather_checkouts) | Only for MULTI-OUTPUT ops (6 impls). Single-output ops take the defaults, which build one [`Pipe`]/[`Checkout`] from `Output`. |
+/// | **2. Output shape** | [`Shape`](Self::Shape), [`collect`](Self::collect), [`collect_home`](Self::collect_home), [`gather_checkouts`](Self::gather_checkouts) | Only for MULTI-OUTPUT ops (6 impls). Single-output ops take the defaults, which build one [`Pipe`]/[`Checkout`] from `Output`. |
 /// | **3. Slots & readiness** | [`bind_slots`](Self::bind_slots), [`check_ready`](Self::check_ready), [`reclaim_undelivered`](Self::reclaim_undelivered) | If your op holds [`Input`]s that can be slots: forward to each input. Leaves with concrete-only args take the defaults. |
 /// | **4. Command-buffer participation** | [`cb_addable`](Self::cb_addable), [`cbable_weight`](Self::cbable_weight), [`cb_cache`](Self::cb_cache), [`apply_binding_delta`](Self::apply_binding_delta), [`collect_cb_ids`](Self::collect_cb_ids), [`cb_restamp`](Self::cb_restamp), [`cb_spine_head_addable`](Self::cb_spine_head_addable) | Only if your op enqueues commands a `cl_khr_command_buffer` can RECORD (45% of impls). The defaults say "not recordable", which is always CORRECT — never unsound, just slower (the op runs per-enqueue instead of being baked into a replayed CB). |
 /// | **5. Introspection** | [`node_label`](Self::node_label), [`dump_graph`](Self::dump_graph), [`contains_host_seam`](Self::contains_host_seam) | Combinators that nest children override these to recurse; leaves almost never do. |
@@ -1639,8 +1652,9 @@ pub trait DeviceOp: Send {
     ///   so a branch that is itself multi-output runs its own override instead
     ///   of being drained from an empty single pipe (the alternative —
     ///   `output_pipe().take()` — is exactly the nested-multi-output bug).
-    /// - The terminals [`into_output`](Self::into_output) (blocking) and the
-    ///   async `run` wrap `collect` and decide *when* to wait.
+    /// - The async `run` terminal wraps `collect` and decides *when* to wait
+    ///   (`sync` goes through [`gather_checkouts`](Self::gather_checkouts)
+    ///   instead, to keep each output's return home).
     fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)> {
         let out = self
             .output_pipe()
@@ -1691,26 +1705,6 @@ pub trait DeviceOp: Send {
         self.execute(ec, mode)?;
         out.take_home()
             .ok_or(Error::NotSupported("eager graph: op produced no output"))
-    }
-
-    /// Run this op as the **chain terminal** and yield its [`Output`](Self::Output),
-    /// having waited on its completion events per `mode`.
-    ///
-    /// Uniform across single- and multi-output ops: it [`collect`](Self::collect)s
-    /// (which dispatches to the right per-op gather) then waits once on the
-    /// returned deps. This is the seam that lets [`sync`](DeviceOpExt::sync) be
-    /// arity-agnostic. Ops never override this — they override `collect`.
-    ///
-    /// Takes `&self` (not `self`): in the reusable-graph model the op is borrowed,
-    /// not consumed (the name predates the model — it "produces the output", it no
-    /// longer consumes the op).
-    #[allow(clippy::wrong_self_convention)]
-    fn into_output(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<Self::Output> {
-        let (value, deps) = self.collect(ec, mode)?;
-        for d in &deps {
-            d.as_ref().wait().map_err(Error::OpenCl)?;
-        }
-        Ok(value)
     }
 
     /// Run this op as the **chain terminal** and build its
@@ -1887,16 +1881,11 @@ pub trait DeviceOp: Send {
     /// pipe. A consuming/transforming leaf whose output has no home (download's Vec,
     /// host-views) is a no-op in effect — `take_home` yields `home == None`.
     fn reclaim_undelivered(&self) {
-        // Drain the output pipe and fire the rehome explicitly: `take_home` moves
-        // `value` + `home` OUT of the `PipePayload` (so its `Drop` no longer
-        // rehomes), so we must call `rehome_consumed` ourselves. `None` (already
-        // drained downstream, or never produced) is a no-op; `home == None` (a
-        // minted/transformed output) just releases the value.
-        // Single-output only (multi-output ops override this to drain each element
-        // pipe); `output_pipe()` is therefore always `Some` here. Use `and_then`
-        // so a defensive `None` is simply a no-op rather than a panic.
-        if let Some((value, deps, home)) = self.output_pipe().and_then(|p| p.take_home()) {
-            rehome_undelivered(value, deps, home);
+        // Single-output only (multi-output ops override this to reclaim each
+        // element pipe); `output_pipe()` is therefore always `Some` here, and a
+        // defensive `None` is simply a no-op rather than a panic.
+        if let Some(pipe) = self.output_pipe() {
+            pipe.reclaim();
         }
     }
 
@@ -3579,9 +3568,7 @@ impl<O: Send + 'static> SeamScatter for Checkout<O> {
         handle.put_home(value, deps.clone(), homes);
     }
     fn reclaim(handle: &Pipe<O>) {
-        if let Some((value, deps, home)) = handle.take_home() {
-            rehome_undelivered(value, deps, home);
-        }
+        handle.reclaim();
     }
     fn reconstruct(handle: &Pipe<O>) -> Result<(O, Deps)> {
         handle

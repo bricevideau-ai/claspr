@@ -1624,13 +1624,13 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
     // ── Output-pipe storage: single `Pipe<Output>` vs per-element pipes ──
     //
     // Single-output (incl. zero): one `__claspr_out: Pipe<Output>` field; the
-    // DeviceOp impl uses the default `into_output` (drain that pipe + wait).
+    // DeviceOp impl uses the default `collect` (drain that pipe; the terminal waits).
     //
     // Multi-output: one element pipe per output buffer (`__claspr_op0: Pipe<D0>,
     // …`). `Handle = (Pipe<D0>, …)`; `handle()` clones them so a downstream
     // `|(pa, pb, pc)|` closure selects. `execute` scatters each buffer into its
     // pipe (move-once) with a clone of the single enqueue `Dep` on each.
-    // `into_output` is overridden: execute (scatter), then reconstruct the
+    // `collect` is overridden: execute (scatter), then reconstruct the
     // `Output` tuple by draining all element pipes, gather their deps, wait.
     // `op_out_destructure` was the `KernelOp::enqueue_into` field-ignore pattern;
     // that impl is gone (kernels are DeviceOp-only), so it's unused now.
@@ -1772,8 +1772,8 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
     let eager_impl = if multi_output {
         // `Shape = (Single<D0>, Single<D1>, …)` — so `Handle = (Pipe<D0>, …)`
         // and `Checkouts = (Checkout<D0>, …)`; per-element scatter; reconstruct
-        // in `into_output`. `output_pipe()` is unused on this path (the default
-        // `into_output` is overridden) and a multi-output op has no single storage
+        // in `collect`. `output_pipe()` is unused on this path (multi-output ops
+        // override `collect`) and a multi-output op has no single storage
         // pipe — return `None`.
         let handle_ty = quote! { ( #( ::claspr::Pipe<#output_types> ),* ) };
         let handle_expr = quote! {
@@ -1791,7 +1791,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
 
                 fn output_pipe(&self) -> ::core::option::Option<::claspr::Pipe<#output_ty>> {
                     // Multi-output storage is the per-element pipes; there is no
-                    // single storage pipe (the default `into_output` is overridden,
+                    // single storage pipe (multi-output ops override `collect`,
                     // and `and_then` uses `handle()`).
                     ::core::option::Option::None
                 }
@@ -1896,7 +1896,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                 ) -> ::claspr::Result<(Self::Output, ::claspr::Deps)> {
                     // Clone the element pipes (cheap Arc), scatter via `execute`
                     // (&self), then drain + reconstruct the tuple, gathering deps
-                    // (the terminal `into_output` waits on them).
+                    // (the terminal `sync` / `run` waits on them).
                     #(
                         let #op_pipe_fields = ::core::clone::Clone::clone(&self.#op_pipe_fields);
                     )*
@@ -1995,13 +1995,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     // buffer returns to its origin cell so the reused graph's
                     // upstream re-lends it next run. Pipes already drained by a
                     // terminal Checkout / downstream consumer are no-ops.
-                    #(
-                        if let ::core::option::Option::Some((__v, __d, __h)) =
-                            self.#op_pipe_fields.take_home()
-                        {
-                            ::claspr::eager::rehome_undelivered(__v, __d, __h);
-                        }
-                    )*
+                    #( self.#op_pipe_fields.reclaim(); )*
                 }
 
                 fn cb_cache(&self) -> ::core::option::Option<&::claspr::eager::CbCache> {
@@ -2363,9 +2357,9 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
             // wait-list, enqueues NON-BLOCKING via `LaunchOp` (a kernel has no
             // native blocking enqueue, so `ExecMode` is ignored), and deposits
             // the output buffer(s) + completion event into the output pipe(s).
-            // Single-output: one `Pipe<Output>`, default `into_output`.
+            // Single-output: one `Pipe<Output>`, default `collect`.
             // Multi-output: per-element pipes (`Handle = (Pipe<D0>, …)`),
-            // scatter-in-`execute` + reconstruct-in-`into_output` (see above).
+            // scatter-in-`execute` + reconstruct-in-`collect` (see above).
             #eager_impl
         }
     }

@@ -854,7 +854,7 @@ where
         let target_q = ec.context().default_outoforder_queue(&device)?;
         // Enqueue the migrate with the upstream events as the wait-list, on the
         // target queue (`&*target_q` is the `Queue: Launcher`). Non-blocking —
-        // mode is ignored; the chain terminal's `into_output` does the final
+        // mode is ignored; the chain terminal does the final
         // wait. The migrate body mirrors the closure layer's
         // `transfer_to_device.rs` exactly.
         let raw = deps_to_wait_list(&deps);
@@ -2319,7 +2319,7 @@ impl_release_view!(
 // mirrors the macro-emitted multi-output kernel shape (commit 0f7083d): two
 // element pipes (`Handle = (Pipe<OS>, Pipe<OD>)`), `execute` enqueues once and
 // scatters each output into its element pipe (cloning the single completion
-// `Dep` onto both), and `into_output` drains both pipes to reconstruct the
+// `Dep` onto both), and `collect` drains both pipes to reconstruct the
 // `(src, dst)` tuple.
 //
 // Rather than re-deriving the ten (src, dst) family bodies (incl. the unsafe
@@ -2336,7 +2336,7 @@ impl_release_view!(
 
 /// Split a copy op's 2-tuple `Output` into its source + destination halves so
 /// the eager [`CopyTo2`] op can hold one typed element pipe per side and
-/// reconstruct the tuple in `into_output`. Implemented once for every `(A, B)`.
+/// reconstruct the tuple in `collect`. Implemented once for every `(A, B)`.
 pub trait CopyOutputs {
     /// The post-copy source buffer (element 0 of the copy Output).
     type Src: Send;
@@ -2503,7 +2503,7 @@ where
     dst: Input<Dst>,
     // One element pipe per copy output (move-once storage), mirroring the
     // macro-emitted multi-output kernel. The output tuple is reconstructed from
-    // both in `into_output`.
+    // both in `collect`.
     src_pipe: Pipe<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Src>,
     dst_pipe: Pipe<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Dst>,
     /// Design-v2 CB home: a copy records `clCommandCopyBufferKHR` (cl_mem↔cl_mem) or
@@ -2647,7 +2647,7 @@ where
 
     fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
         // Multi-output storage is the per-element pipes; there is no single
-        // storage pipe (the default `into_output` is overridden, and `and_then`
+        // storage pipe (multi-output ops override `collect`, and `and_then`
         // uses `handle()`), so return `None`.
         None
     }
@@ -2775,13 +2775,10 @@ where
         Ok(())
     }
 
-    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
-    where
-        Self: Sized,
-    {
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)> {
         // Grab the element pipes before consuming `self`, then scatter via
         // `execute`, then drain + reconstruct the `(src, dst)` tuple, gathering
-        // both pipes' deps (the terminal `into_output` waits on them once).
+        // both pipes' deps (the terminal `sync` / `run` waits on them once).
         let src_pipe = self.src_pipe.clone();
         let dst_pipe = self.dst_pipe.clone();
         self.execute(ec, mode)?;
@@ -2802,7 +2799,6 @@ where
         mode: ExecMode,
     ) -> Result<(Self::Output, Deps, Option<BoxedHome<Self::Output>>)>
     where
-        Self: Sized,
         Self::Output: Send + 'static,
     {
         // Multi-output (`(src, dst)`): each side's home rides its own `Checkout`
@@ -2891,11 +2887,7 @@ where
         // copy whose output is partly discarded (e.g. `…and_then(|(src, _dst)| …)`)
         // returns the dropped side's buffer to its origin cell. Already-drained
         // pipes (delivered to a terminal Checkout / consumed downstream) are no-ops.
-        if let Some((v, d, home)) = self.src_pipe.take_home() {
-            rehome_undelivered(v, d, home);
-        }
-        if let Some((v, d, home)) = self.dst_pipe.take_home() {
-            rehome_undelivered(v, d, home);
-        }
+        self.src_pipe.reclaim();
+        self.dst_pipe.reclaim();
     }
 }

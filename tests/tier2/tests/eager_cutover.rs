@@ -238,7 +238,7 @@ fn fan_out_device_work() {
 /// downstream `and_then(|(_a, _b, out)| download(out))` selects the `out` pipe
 /// and drops the other two (move-once: the dropped element pipes are never
 /// `take`n). Proves both halves of the contract: per-element selection in
-/// `and_then` AND terminal reconstruct via the overridden `into_output`.
+/// `and_then` AND terminal reconstruct via the overridden `collect`.
 #[test]
 fn multi_output_kernel_element_select() {
     let Some(ctx) = ctx() else { return };
@@ -264,7 +264,7 @@ fn multi_output_kernel_element_select() {
 
 /// Multi-output kernel as a TERMINAL: `.sync()` reconstructs the full
 /// `(a, b, out)` tuple by draining all three element pipes (the
-/// `into_output` override), proving the Tier-1 whole-tuple contract.
+/// `collect` override), proving the Tier-1 whole-tuple contract.
 #[test]
 fn multi_output_kernel_terminal_tuple() {
     let Some(ctx) = ctx() else { return };
@@ -324,7 +324,7 @@ fn arc_split_read_only_fan_out() {
 }
 
 /// `arc_split` as the TERMINAL: with no downstream `and_then`, `.sync()`
-/// reconstructs the `[Arc<T>; N]` array (the `into_output` override drains all
+/// reconstructs the `[Arc<T>; N]` array (the `collect` override drains all
 /// N element pipes). Each array element is a clone of the same producer output;
 /// `Arc::ptr_eq` confirms they point at one shared allocation, not copies.
 #[test]

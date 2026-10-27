@@ -121,10 +121,7 @@ where
         Ok(())
     }
 
-    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(U::Output, Deps)>
-    where
-        Self: Sized,
-    {
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(U::Output, Deps)> {
         // Delegate the gather to the tail op so a multi-output `next` (bundle*,
         // arc_split, CopyTo pair) runs its *overridden* `collect`
         // (scatter-then-reconstruct over its per-element pipes) rather than the
@@ -159,7 +156,6 @@ where
         mode: ExecMode,
     ) -> Result<(U::Output, Deps, Option<BoxedHome<U::Output>>)>
     where
-        Self: Sized,
         U::Output: Send + 'static,
     {
         // Mirror `collect`, but preserve the tail's return home so an
@@ -184,7 +180,6 @@ where
         mode: ExecMode,
     ) -> Result<(CheckoutsOf<Self>, Deps)>
     where
-        Self: Sized,
         Self::Output: Send + 'static,
         CheckoutsOf<Self>: FromCheckout<Self::Output>,
     {
@@ -718,10 +713,6 @@ where
         self.inner.collect(ec, mode)
     }
 
-    fn into_output(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<S::Output> {
-        self.inner.into_output(ec, mode)
-    }
-
     fn collect_home(
         &self,
         ec: &ExecutionContext<'_>,
@@ -1002,7 +993,7 @@ where
 
     fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
         // Multi-output storage is the per-element pipes; there is no single
-        // storage pipe (the default `into_output` is overridden, and `and_then`
+        // storage pipe (multi-output ops override `collect`, and `and_then`
         // uses `handle()`), so return `None`.
         None
     }
@@ -1042,13 +1033,10 @@ where
         Ok(())
     }
 
-    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)>
-    where
-        Self: Sized,
-    {
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(Self::Output, Deps)> {
         // Grab the element pipes before consuming `self`, scatter via `execute`,
         // then drain all N to reconstruct the `[clone; N]` array, gathering
-        // every branch's deps (the terminal `into_output` waits on them once).
+        // every branch's deps (the terminal `sync` / `run` waits on them once).
         let outs = self.outs.clone();
         self.execute(ec, mode)?;
         let mut all_deps: Deps = Deps::new();
@@ -1260,8 +1248,8 @@ macro_rules! impl_eager_bundle {
 
             fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
                 // Multi-output storage is the per-branch pipes (owned by each
-                // branch); there is no single storage pipe (the default
-                // `into_output` is overridden, and `and_then` uses `handle()`), so
+                // branch); there is no single storage pipe (multi-output
+                // ops override `collect`, and `and_then` uses `handle()`), so
                 // return `None`.
                 None
             }
@@ -1307,10 +1295,8 @@ macro_rules! impl_eager_bundle {
             }
 
             fn collect(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<(Self::Output, Deps)>
-            where
-                Self: Sized,
             {
-                // Terminal by-value gather (async `run` / `into_output`): delegate
+                // Terminal by-value gather (async `run`): delegate
                 // to each branch's OWN `collect` so a multi-output branch runs its
                 // override (scatter-then-reconstruct over its element pipes) rather
                 // than a drain of a pipe it never fills. Branches pipeline; the
@@ -2355,11 +2341,8 @@ where
         Ok(())
     }
 
-    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(S::Output, Deps)>
-    where
-        Self: Sized,
-    {
-        // BY-VALUE gather (async `run` / `into_output`): scatter via `execute`,
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(S::Output, Deps)> {
+        // BY-VALUE gather (async `run`): scatter via `execute`,
         // then reconstruct the assembled value by draining the element pipe(s).
         // Single-output drains one pipe (unchanged); multi-output reconstructs the
         // tuple, joining deps.
@@ -2374,7 +2357,6 @@ where
         mode: ExecMode,
     ) -> Result<(S::Output, Deps, Option<BoxedHome<S::Output>>)>
     where
-        Self: Sized,
         S::Output: Send + 'static,
     {
         // Home-preserving by-value gather: single-output preserves its one home

@@ -51,7 +51,7 @@ Read these five first; they are the "mandatory core" every graph task touches:
    own rustdoc carries the authoritative tier table (read it before adding an op);
    in short — **tier 1, always**: `Output` + `output_pipe` + `handle` + `execute` +
    `describe` (all 33 impls define exactly these five); **tier 2, multi-output only**
-   (`Shape`/`collect`/`collect_home`/`into_output`/`gather_checkouts`,
+   (`Shape`/`collect`/`collect_home`/`gather_checkouts`,
    6 impls); **tier 3, if you hold `Input`s** (`bind_slots`/`check_ready`/
    `reclaim_undelivered`); **tier 4, CB participation** (`cb_addable`/`cbable_weight`/
    `cb_cache`/`apply_binding_delta`/`collect_cb_ids`/`cb_restamp`/`cb_spine_head_addable`
