@@ -2220,6 +2220,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             cbable_weight,
             cb_addable_memo: PredMemo::new(),
             seam_memo: PredMemo::new(),
+            spine_head_memo: PredMemo::new(),
         }
     }
 

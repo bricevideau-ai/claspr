@@ -71,6 +71,9 @@ pub struct AndThen<S, U> {
     pub(crate) cb_addable_memo: PredMemo,
     /// Memo for [`contains_host_seam`](DeviceOp::contains_host_seam) — see [`PredMemo`].
     pub(crate) seam_memo: PredMemo,
+    /// Memo for [`cb_spine_head_addable`](DeviceOp::cb_spine_head_addable) — see
+    /// [`PredMemo`].
+    pub(crate) spine_head_memo: PredMemo,
 }
 
 impl<S, U> DeviceOp for AndThen<S, U>
@@ -311,7 +314,15 @@ where
         // `source.cb_addable()`) lets the span extend across nested spine `AndThen`s
         // whose own `next` is still addable, closing only at the `AndThen` whose
         // `next` is the seam.
-        self.source.cb_spine_head_addable()
+        //
+        // Memoized like `cb_addable`: `cb_should_open_span` asks at EVERY spine
+        // `AndThen` of an Off-mode walk, and the recursion descends the whole
+        // left-deep spine, so unmemoized the walk is O(n²). With a concrete source
+        // type rustc folds the recursion to a constant and hides that; through an
+        // erased `DeviceDynOp` source it is n real calls per node.
+        pred_memo(&self.spine_head_memo, || {
+            self.source.cb_spine_head_addable()
+        })
     }
 
     fn cb_restamp(&self, evs: &Deps) {
