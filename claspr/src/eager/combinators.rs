@@ -609,10 +609,12 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
 /// keep their homes and its per-output handles survive.
 ///
 /// **Keep in lockstep with [`DeviceOp`].** Every `DeviceOp` member must appear
-/// here, in the blanket impl below, and in `DeviceDynOp`'s `DeviceOp` impl. The
-/// compiler does NOT catch a missing one: an unforwarded member with a default
-/// body makes every erased op run that default. `eager_erase.rs`'s parity test
-/// compares erased vs. plain twins member by member — extend it with the member.
+/// here, in the blanket impl below, and in `DeviceDynOp`'s `DeviceOp` impl. An
+/// unforwarded member with a default body would make every erased op run that
+/// default; `clippy::missing_trait_methods` on `DeviceDynOp`'s impl flags one
+/// that was never overridden there (CI runs clippy with `-D warnings`), and
+/// `eager_erase.rs`'s parity test compares erased vs. plain twins member by
+/// member — extend it with the member.
 trait ErasedDeviceOp<S: OpShape>: Send {
     fn output_pipe_erased(&self) -> Option<Pipe<S::Output>>;
     fn handle_erased(&self) -> S::Handle;
@@ -622,6 +624,8 @@ trait ErasedDeviceOp<S: OpShape>: Send {
         ec: &ExecutionContext<'_>,
         mode: ExecMode,
     ) -> Result<(S::Output, Deps)>;
+    #[allow(clippy::wrong_self_convention)]
+    fn into_output_erased(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<S::Output>;
     #[allow(clippy::type_complexity)]
     fn collect_home_erased(
         &self,
@@ -670,6 +674,9 @@ where
         mode: ExecMode,
     ) -> Result<(O::Output, Deps)> {
         self.collect(ec, mode)
+    }
+    fn into_output_erased(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<O::Output> {
+        self.into_output(ec, mode)
     }
     fn collect_home_erased(
         &self,
@@ -794,6 +801,9 @@ where
     }
 }
 
+// Every defaulted member must be overridden here to forward (see
+// `ErasedDeviceOp`); the lint turns a forgotten one into a clippy error.
+#[warn(clippy::missing_trait_methods)]
 impl<S> DeviceOp for DeviceDynOp<'_, S>
 where
     S: OpShape,
@@ -817,6 +827,10 @@ where
 
     fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(S::Output, Deps)> {
         self.inner.collect_erased(ec, mode)
+    }
+
+    fn into_output(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<S::Output> {
+        self.inner.into_output_erased(ec, mode)
     }
 
     fn collect_home(

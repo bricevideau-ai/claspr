@@ -1524,7 +1524,8 @@ pub fn graph_edge_table(nodes: &[GraphNode]) -> Vec<(usize, Vec<usize>)> {
 /// forwards each to the op it wraps. A NEW member with a default body compiles
 /// without being forwarded — and every erased op then silently runs the default
 /// instead of the wrapped op's override (the bug class that once left erased ops
-/// unable to bind slots or record command buffers). Add it to the mirror trait,
+/// unable to bind slots or record command buffers). `clippy::missing_trait_methods`
+/// on `DeviceDynOp`'s impl flags the omission there. Add it to the mirror trait,
 /// its blanket impl, and `DeviceDynOp`'s `DeviceOp` impl, and extend the parity
 /// test (`tests/tier2/tests/eager_erase.rs`) to compare it.
 #[must_use = "device ops do nothing until a terminal like .sync()/.wait()/.run() is called"]
