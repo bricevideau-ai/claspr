@@ -102,8 +102,21 @@ below.
   ~9 composing combinators `Append` children's sets; close the latent
   `bind_slots` gaps (FanOut/Arced/ArcSplit/OnDevice/Profiled — several don't walk
   slots at runtime today; DeviceDynOp's was closed 2026-10-26 by the transparent
-  erasure rewrite); `DeviceDynOp` erasure can't carry static
-  `Slots` (stored graphs fall back to runtime). Verified feasible: distinct-tags
+  erasure rewrite). **Erasure is NOT a blocker (corrected 2026-10-27, spiked):**
+  the slot set rides as a PHANTOM parameter (`DeviceDynOp<'op, S, Slots>`, or a
+  side trait), never pinned in `dyn DeviceOp`, so `bind` on an erased graph
+  re-tags the same box. Verified in a standalone model: slots survive per-link
+  erasure + explicit `.erase()`, bind-after-erase works, equal-slot arms unify,
+  a stored graph can name its set in ANY order via a frunk-style `reorder`
+  (distinct tags, no specialization), fully-bound graphs share one type; all six
+  misuse cases are compile errors. Real limits, none from erasure: (1) the
+  shared-slot wall above (`E0283` on a repeated tag — reproduced WITHOUT
+  erasure; gray-scott has 25 sites over 7 tags, miniweather reuses its dt tags);
+  (2) slot-list length vs `recursion_limit` — prepend each link's slots and
+  re-tag instead of wrapping on bind, and only `Remove`'s search depth remains,
+  ~125 slot sites at the default limit (real graphs: 18–25). Wrapping every bind
+  in `Bound<..>` instead ICEs rustc (nightly-2026-05-22, `instance.rs:566 failed
+  to resolve`, ~100 binds). Verified feasible: distinct-tags
   type-state (18/18 old spike, re-greened today) and shared-via-explicit-Reuse
   (spiked green today, no unstable features). **REVISIT TRIGGER: if the
   deferred-error machinery grows further (more sink/poison cases), the trade tips
