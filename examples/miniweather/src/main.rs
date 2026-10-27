@@ -46,7 +46,7 @@
 //! BIT-IDENTICAL. Full runs:
 //! `cargo run -p miniweather-example -- --nx 400 --nz 200 --sim-time 400`.
 
-use claspr::eager::DeviceOpExt;
+use claspr::eager::{DeviceOp, DeviceOpExt};
 use claspr::{Context, DeviceSlice, LaunchSpec, slot, slots};
 
 // ── Physical + scheme constants (host, f64) ─────────────────────────────────
@@ -784,6 +784,16 @@ impl Width for f32 {
     }
 }
 
+/// Command buffers graph `g` has recorded over its life, read from its root's
+/// own cache. Not the process-wide `cb_records_total()`: that also counts every
+/// OTHER graph's records — under `cargo test` the concurrently running tests'
+/// — which made the per-timestep CB-count assertion flake (~1 in 8 parallel runs).
+fn cbs_recorded<O: DeviceOp>(g: &O) -> u64 {
+    g.cb_cache()
+        .map(|c| c.lock().unwrap().records())
+        .unwrap_or(0)
+}
+
 /// Which graph shape to build. Both compute the same thing; they differ only in
 /// whether the x-first/z-first alternation is UNROLLED into the graph or carried
 /// by slots and flipped per step.
@@ -1163,7 +1173,6 @@ where
                 .bind(b.16)
                 .bind(b.17);
 
-            let cb0 = claspr::record::cb_records_total();
             let t_unrolled = std::time::Instant::now();
             let mut etime = 0.0f64;
             let mut dt = dt0;
@@ -1209,7 +1218,7 @@ where
                 }
             }
             let secs_unrolled = t_unrolled.elapsed().as_secs_f64();
-            let cbs_unrolled = claspr::record::cb_records_total() - cb0;
+            let cbs_unrolled = cbs_recorded(&g);
 
             (final_state, secs_unrolled, nstep.div_ceil(2), cbs_unrolled)
         }
@@ -1271,7 +1280,6 @@ where
             //   do while (etime < sim_time)
             //     if (etime + dt > sim_time) dt = sim_time - etime
             //     call perform_timestep(...); etime = etime + dt
-            let cb1 = claspr::record::cb_records_total();
             let t_per_step = std::time::Instant::now();
             let mut etime_p = 0.0f64;
             let mut dt_p = dt0;
@@ -1302,7 +1310,7 @@ where
                 }
             }
             let secs_per_step = t_per_step.elapsed().as_secs_f64();
-            let cbs_per_step = claspr::record::cb_records_total() - cb1;
+            let cbs_per_step = cbs_recorded(&gp);
 
             (final_p, secs_per_step, nstep_p, cbs_per_step)
         }

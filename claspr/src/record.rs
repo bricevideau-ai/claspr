@@ -211,8 +211,11 @@ unsafe impl Sync for CbBuilder {}
 static CB_CREATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Read [`CB_CREATES`] — total command buffers created since process start.
-/// Take a delta around the region you care about; see `cb_records_total` usage in
-/// `tests/tier2/tests/cb_keyed_cache.rs`.
+/// Take a delta around the region you care about. PROCESS-WIDE: a delta also
+/// counts every other graph's records, including concurrently running tests', so
+/// to assert one graph's count read its root cache instead
+/// (`g.cb_cache()` → [`CbLru::records`](crate::eager::CbLru::records), or
+/// `cb_records_of` in the test-support crate).
 #[doc(hidden)]
 pub fn cb_records_total() -> u64 {
     CB_CREATES.load(std::sync::atomic::Ordering::Relaxed)

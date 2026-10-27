@@ -8,7 +8,7 @@
 //! cycle through a handful of binding states, so the CB for the state you are
 //! returning to was usually recorded moments ago and thrown out.
 //!
-//! These tests assert the RECORD COUNT (via the `cb_records_total` hook), not
+//! These tests assert the RECORD COUNT (per graph, via `cb_records_of`), not
 //! timings — the count is deterministic and is the thing that actually regressed.
 
 use claspr::eager::{DeviceOp, DeviceOpExt, bundle2, fill};
