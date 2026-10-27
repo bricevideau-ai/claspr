@@ -454,6 +454,10 @@ where
     };
 
     // The EXTERNAL cl_event accumulator for THIS command buffer, on this frame.
+    // Every per-op fallback below re-runs `op` with ITS boundary suppressed: a
+    // bundle / span head opens its CB from inside its own `execute`, so re-running
+    // it unmarked would reopen this boundary, fail the same way, and recurse.
+    let fallback = ec.without_boundary_at(cache);
     let ext: Mutex<Deps> = Mutex::new(Deps::new());
     // The span-closed latch (see `CbWalk::Build::closed`), owned by this frame.
     let closed = std::sync::atomic::AtomicBool::new(false);
@@ -486,7 +490,7 @@ where
     let platform = ec.context().device().platform().raw_id();
     let Some(builder) = crate::record::CbBuilder::new(platform, queue) else {
         // Extension unreachable after all — fall back to the normal path.
-        return op.gather_checkouts(ec, mode);
+        return op.gather_checkouts(&fallback, mode);
     };
     let build_ec = ec.with_cb(CbWalk::Build {
         builder: &builder,
@@ -509,7 +513,7 @@ where
         // reclaim mid-graph intermediates, and re-run the normal per-op path.
         drop(checkouts);
         op.reclaim_undelivered();
-        return op.gather_checkouts(ec, mode);
+        return op.gather_checkouts(&fallback, mode);
     }
 
     if builder.recorded() == 0 {
@@ -529,7 +533,7 @@ where
         // Finalize failed: same clean fallback as ineligible.
         drop(checkouts);
         op.reclaim_undelivered();
-        return op.gather_checkouts(ec, mode);
+        return op.gather_checkouts(&fallback, mode);
     };
     let finalized = Arc::new(finalized);
     // HOME the CB in the boundary node's OWN cache (drops with the graph).
@@ -737,7 +741,8 @@ fn drain_ext(ext: &Mutex<Deps>) -> Vec<crate::cl_event> {
 /// spine-head opens its span from inside its own `execute`/`gather`.
 pub(crate) fn cb_should_open_span<O: DeviceOp>(op: &O, ec: &ExecutionContext<'_>) -> bool {
     matches!(ec.cb(), CbWalk::Off)
-        && op.cb_cache().is_some()
+        // Not inside this op's own boundary fallback (else: unbounded recursion).
+        && op.cb_cache().is_some_and(|c| ec.may_open_boundary_at(c))
         && ec.context().has_cl_khr_command_buffer()
         && op.cb_spine_head_addable()
         && !op.cb_addable()
@@ -831,6 +836,10 @@ where
         debug_assert!(false, "cb_boundary_execute on an op without a cb_cache");
         return op.execute(ec, mode);
     };
+    // Every per-op fallback below re-runs `op` with ITS boundary suppressed: a
+    // bundle / span head opens its CB from inside its own `execute`, so re-running
+    // it unmarked would reopen this boundary, fail the same way, and recurse.
+    let fallback = ec.without_boundary_at(cache);
     let ext: Mutex<Deps> = Mutex::new(Deps::new());
     let closed = std::sync::atomic::AtomicBool::new(false);
 
@@ -858,7 +867,7 @@ where
 
     let platform = ec.context().device().platform().raw_id();
     let Some(builder) = crate::record::CbBuilder::new(platform, queue) else {
-        return op.execute(ec, mode);
+        return op.execute(&fallback, mode);
     };
     let build_ec = ec.with_cb(CbWalk::Build {
         builder: &builder,
@@ -880,7 +889,7 @@ where
         // deps. Reclaim (rehome) them and re-run the normal per-op path so the
         // buffers are re-lent + real device work runs.
         op.reclaim_undelivered();
-        return op.execute(ec, mode);
+        return op.execute(&fallback, mode);
     }
 
     if builder.recorded() == 0 {
@@ -900,7 +909,7 @@ where
 
     let Some(finalized) = builder.finalize() else {
         op.reclaim_undelivered();
-        return op.execute(ec, mode);
+        return op.execute(&fallback, mode);
     };
     let finalized = Arc::new(finalized);
     lock_unpoisoned(cache).install(Arc::clone(&finalized));

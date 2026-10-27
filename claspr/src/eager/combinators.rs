@@ -1380,8 +1380,11 @@ macro_rules! impl_eager_bundle {
                 // impl, below) stamps the one CB event onto every branch pipe. Without
                 // this, each branch would open its OWN CB (per-branch spans) — correct
                 // but N create/finalize/enqueue instead of one.
+                // Not when this IS the boundary's per-op fallback (its build was
+                // discarded): reopening here would fail the same way and recurse.
                 if matches!(ec.cb(), CbWalk::Off)
                     && ec.context().has_cl_khr_command_buffer()
+                    && ec.may_open_boundary_at(&self.cb_cache)
                     && self.cbable_weight() >= 2
                     && self.cb_addable()
                 {

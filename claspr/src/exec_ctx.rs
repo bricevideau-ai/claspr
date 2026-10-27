@@ -209,6 +209,15 @@ pub struct ExecutionContext<'ctx> {
     /// carry its origin so the downstream leaf can `note_slot` it. (Sync points are
     /// CB-local and reset per CB; slot origins are graph-global for one sync.)
     cb_reach: CbReach,
+    /// The ONE op whose own command-buffer boundary must NOT reopen in this
+    /// context: the address of its `cb_cache` field, set by a boundary that just
+    /// discarded its build ([`without_boundary_at`](Self::without_boundary_at)).
+    /// Bundles and span-head `AndThen`s open their CB from inside their own
+    /// `execute`, so a fallback that re-ran that `execute` unmarked would reopen
+    /// the same boundary, fail the same way and recurse until the stack overflows.
+    /// Keyed by cache address so it suppresses exactly that op: children carry
+    /// their own caches and still open theirs. Reset by [`with_cb`](Self::with_cb).
+    suppressed_boundary: Option<usize>,
 }
 
 impl<'ctx> ExecutionContext<'ctx> {
@@ -230,6 +239,7 @@ impl<'ctx> ExecutionContext<'ctx> {
             cb: CbWalk::Off,
             sp_edges: Arc::new(Mutex::new(HashMap::new())),
             cb_reach: Arc::new(Mutex::new(HashMap::new())),
+            suppressed_boundary: None,
         }
     }
 
@@ -269,6 +279,7 @@ impl<'ctx> ExecutionContext<'ctx> {
             // Slot origins are graph-global for the sync — share across the routed
             // sub-chain too (its slots key on their own cell ids; no collision).
             cb_reach,
+            suppressed_boundary: None,
         }
     }
 
@@ -307,7 +318,37 @@ impl<'ctx> ExecutionContext<'ctx> {
             // SHARED across the CB boundary (unlike sp_edges): a slot threaded across
             // a seam into this child's CB must carry its origin. See `cb_reach`.
             cb_reach: Arc::clone(&self.cb_reach),
+            suppressed_boundary: None,
         }
+    }
+
+    /// This context, identical in every respect (same CB walk, same sync-point
+    /// map), except that the op owning `cache` must not reopen its own command
+    /// buffer boundary. What a boundary's per-op FALLBACK runs the op in, after
+    /// discarding its build — see [`suppressed_boundary`](Self::suppressed_boundary).
+    pub(crate) fn without_boundary_at<'a>(
+        &'a self,
+        cache: &crate::eager::CbCache,
+    ) -> ExecutionContext<'a> {
+        ExecutionContext {
+            context: self.context,
+            device: self.device.clone(),
+            cl_queue: self.cl_queue,
+            host_error: Arc::clone(&self.host_error),
+            start: self.start,
+            workers: Arc::clone(&self.workers),
+            cb: self.cb,
+            sp_edges: Arc::clone(&self.sp_edges),
+            cb_reach: Arc::clone(&self.cb_reach),
+            suppressed_boundary: Some(cache as *const crate::eager::CbCache as usize),
+        }
+    }
+
+    /// Whether the op owning `cache` may open its own command-buffer boundary
+    /// here (false only inside its own fallback; see
+    /// [`without_boundary_at`](Self::without_boundary_at)).
+    pub(crate) fn may_open_boundary_at(&self, cache: &crate::eager::CbCache) -> bool {
+        self.suppressed_boundary != Some(cache as *const crate::eager::CbCache as usize)
     }
 
     /// The CB walk mode at this walk position. The per-node fork reads this to

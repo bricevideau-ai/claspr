@@ -435,3 +435,42 @@ fn fill_device_uninit_records_into_command_buffer() {
         );
     }
 }
+
+/// A bundle whose command-buffer build turns out INELIGIBLE must fall back to
+/// per-op execution ONCE — not re-open its own boundary forever. A bundle opens
+/// its CB from inside its own `execute`; the fallback used to re-run that same
+/// `execute` in the same mode, so a deterministic ineligibility (here: a copy
+/// whose length check marks the build ineligible on purpose, so the per-op path
+/// can report `LengthMismatch`) recursed until the stack overflowed (first seen
+/// as `eager_erase`'s parity tests aborting on a rusticl whose CB recording fails).
+/// Expected: the
+/// copy's own error. Trivially passes on a device without the
+/// extension (no boundary is ever opened).
+#[test]
+fn ineligible_bundle_build_falls_back_instead_of_recursing() {
+    use claspr::eager::{bundle2, eager_copy_to, value};
+    let Some(ctx) = ctx() else { return };
+
+    let data: Vec<u32> = (0..N as u32).collect();
+    let src_a = DeviceSlice::<u32>::from_slice(&ctx, &data).expect("src a");
+    let dst_a = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("dst a");
+    let src_b = DeviceSlice::<u32>::from_slice(&ctx, &data).expect("src b");
+    // Deliberately too small: the copy marks the CB build ineligible.
+    let small_dst = DeviceSlice::<u32>::alloc_zero(&ctx, N / 2).expect("small dst");
+
+    // MID-graph (execute position): a root bundle is gathered, and the gather
+    // fallback never re-enters the bundle's own boundary check.
+    let g = bundle2(eager_copy_to(src_a, dst_a), eager_copy_to(src_b, small_dst))
+        .and_then(|_| value(0u32));
+    // One sync only: a SECOND sync currently reports the graph busy, because the
+    // valid sibling's outputs are stranded when a mid-graph bundle branch fails —
+    // a separate bug that reproduces with no command buffer at all (NOTES →
+    // Concerns). This test pins the recursion fix: the copy's own error, no crash.
+    let err = g
+        .sync(&ctx)
+        .expect_err("a bundle containing a mismatched copy must error");
+    assert!(
+        matches!(err, claspr::Error::LengthMismatch { .. }),
+        "expected LengthMismatch, got {err:?}"
+    );
+}
