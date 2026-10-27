@@ -4,8 +4,8 @@
 //! runs the builder `f` **once at construction**, handing it a [`Pipe<T>`]
 //! handle for the upstream's future output, and stores the **returned op** —
 //! never the closure. So `g = upload(v).and_then(|p| fill(p, 7))` is a plain
-//! struct (`AndThen<Upload, Fill>`); it can be traversed/inspected without
-//! executing.
+//! struct (`AndThen<DeviceDynOp<'_, Single<_>>, Fill>` — `and_then` erases the
+//! chain it extends); it can be traversed/inspected without executing.
 //!
 //! ## Edges carry `(value, Deps)`
 //!
@@ -2237,13 +2237,11 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// like `self` (slots, command buffers, homes, per-output handles all
     /// forward); only the type changes.
     ///
-    /// Use it to unify the arms of a conditional graph, and to CUT a long chain
-    /// into segments: `a.and_then(..)…and_then(..).erase().and_then(..)…`. Each
-    /// `.and_then` nests the type one level deeper, and the compiler walks that
-    /// nesting to prove the `DeviceOp: Send` supertrait, so an unbroken chain
-    /// hits the default `recursion_limit` at ~110 links (and costs a debug build
-    /// quadratic stack while building). Erasing every few dozen links keeps both
-    /// flat, for one allocation per erased segment.
+    /// Use it to unify the arms of a conditional graph that agree on shape.
+    /// You do NOT need it to cut a long chain: [`and_then`](Self::and_then)
+    /// already erases the chain it extends, so a graph's type nests per
+    /// combinator (bundle, `fan_out`, `and_then_host`), not per link, and a
+    /// 200-link chain compiles at the default `recursion_limit`.
     fn erase<'op>(self) -> DeviceDynOp<'op, Self::Shape>
     where
         Self: 'op,

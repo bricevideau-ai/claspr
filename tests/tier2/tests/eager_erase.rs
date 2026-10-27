@@ -1,11 +1,10 @@
 //! `.erase()` / `DeviceDynOp` — transparent type erasure.
 //!
-//! An `.and_then` chain's type nests one level per link, and rustc proves the
-//! `DeviceOp: Send` supertrait by walking the whole nesting: at the default
-//! `recursion_limit = 128` an unbroken chain stops compiling at ~110 links
-//! (E0275 `overflow evaluating the requirement AndThen<…>: Send`). Erasing each
-//! segment resets the nesting. These tests pin that a long erased chain compiles
-//! and runs, and that erasure is TRANSPARENT: slots inside still bind and
+//! `.and_then` erases the chain it extends, so a chain's type nests per
+//! combinator, not per link (it used to nest per link and hit the default
+//! `recursion_limit = 128` at ~110 links, E0275 on `AndThen<…>: Send`). Explicit
+//! `.erase()` remains for unifying conditional arms. These tests pin that a long
+//! chain compiles and runs, and that erasure is TRANSPARENT: slots inside still bind and
 //! re-bind, commands inside still record into one command buffer, per-output
 //! handles survive, and the graph's description is unchanged.
 //!

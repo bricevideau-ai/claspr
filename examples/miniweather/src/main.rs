@@ -790,7 +790,7 @@ impl Width for f32 {
 ///
 /// Only ONE is built per `run` call: the other would be dead weight. Stack is no
 /// longer the constraint — `and_then` erases the chain it extends, so a debug
-/// build of `run` (both arms in one frame) needs under 512 KiB of a test
+/// build of `run` (both arms in one frame) needs under 256 KiB of a test
 /// thread's 2 MiB (measured 2026-10-27).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Shape {

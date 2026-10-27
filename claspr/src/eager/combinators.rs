@@ -620,7 +620,7 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
     }
 }
 
-// ── DeviceDynOp: transparent type erasure (conditional arms, deep chains) ──
+// ── DeviceDynOp: transparent type erasure (conditional arms; `and_then` uses it per link) ──
 
 /// Object-safe mirror of [`DeviceOp`], specialised to one [`OpShape`] `S`.
 /// Crate-internal — users go through [`DeviceDynOp`]. `DeviceOp` itself is NOT
@@ -770,7 +770,7 @@ where
 /// `and_then` closure still receives four pipes). It adds no node of its own to
 /// [`describe`](DeviceOp::describe) / [`dump_graph`](DeviceOp::dump_graph).
 ///
-/// Two uses:
+/// Its explicit use is unifying conditional graphs:
 ///
 /// - **Conditional graphs.** Each chain has its own deeply-nested concrete type
 ///   (`AndThen<Upload, AndThen<…>>` vs `Value<T>`), so an `if`/`else` building a
@@ -787,13 +787,11 @@ where
 ///   let r = chain.sync(&ctx)?;
 ///   ```
 ///
-/// - **Long chains.** An `.and_then` chain's type nests one level per link, and
-///   the compiler proves `Send` (a `DeviceOp` supertrait) by walking that whole
-///   nesting — at the default `recursion_limit = 128` a chain stops compiling
-///   at ~110 links. Inline storage also costs a debug build stack space
-///   quadratic in chain length (every intermediate `AndThen` gets its own
-///   slot). Erasing every segment of a long chain (`.erase()` per stage) resets
-///   the nesting to one level and moves each finished segment to the heap.
+/// Long chains need no manual erasure: [`and_then`](DeviceOpExt::and_then)
+/// erases the chain it extends, so the type nests per combinator rather than
+/// per link (no `recursion_limit` ceiling, no quadratic debug-build stack).
+/// The cost is one heap allocation per link at build time and ~12 ns per link
+/// per replay walk (measured on PoCL: 73 vs 61 ns/link, linear in chain length).
 ///
 /// One heap allocation and one virtual call per member per erased op. The `'op`
 /// lifetime lets the boxed op borrow from the surrounding scope (typically

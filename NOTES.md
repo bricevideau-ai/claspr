@@ -412,8 +412,8 @@ position rather than dataflow reachability.
 
 ### Erasure leftovers: shape-strict arms (2026-10-26, not started)
 
-`OpShape` + transparent `.erase()` landed (see the commit messages for the
-chain-depth measurements). Two loose ends, neither needed by any in-tree code:
+`OpShape` + transparent `.erase()` landed; `and_then` now erases the chain it
+extends by default, so users never cut long chains by hand. Two loose ends, neither needed by any in-tree code:
 - `Seamed<Single<T>>` ≠ `Single<T>` though their projections match, so a
   conditional arm ending in `and_then_host` won't unify with a plain kernel arm.
 - The old `DeviceDynOp<T>` unified arms by `Output` alone (collapsing to one
@@ -480,12 +480,10 @@ makes it pass. The release binary is fine on the 8 MiB main thread.
 
 Originally worked around with an `on_big_stack` helper (spawn at 64 MiB), then
 with per-stage `Box<O>` + `recursion_limit = 512`. **Resolved 2026-10-27** by
-transparent `.erase()` (landed upstream 2026-10-26): each `half!`/`seed_half!`
-erases its 12-dispatch segment, which bounds both the build-frame stack and the
-type nesting per segment; both workarounds are gone and the tests run on the
-default test-thread stack. Still worth knowing generally: a user writing a long
-UNERASED graph hits this in `cargo test` first, and "has overflowed its stack"
-points nowhere near the cause — the answer is `.erase()` every few dozen links.
+transparent `.erase()`, now applied by `and_then` itself: the chain's type nests
+per combinator, not per link, so there is no recursion-limit ceiling and no
+quadratic build-frame stack. miniweather's debug `run` needs under 256 KiB (was
+512 KiB) and the tests run on the default test-thread stack.
 
 ### PoCL: sustained CB replay eventually fails `CL_INVALID_OPERATION` — **FIXED upstream-ready 2026-09-04**
 
