@@ -155,3 +155,31 @@ fn failed_copy_does_not_strand_operands() {
         "run 2: operands must have been rehomed → same LengthMismatch, got {err2:?}"
     );
 }
+
+/// A FAILED mid-graph bundle branch must not strand its sibling's outputs. The
+/// valid branch ran and deposited its buffers into pipes the aborted walk never
+/// drained; the terminal's error path used to return without reclaiming them, so
+/// the SECOND `sync` failed "graph is busy" instead of reaching the copy again.
+/// No command buffer involved: the host seam on the valid branch makes the bundle
+/// non-recordable, so this exercises the plain per-op error path.
+#[test]
+fn failed_bundle_branch_does_not_strand_sibling() {
+    use claspr::eager::{bundle2, value};
+    let Some(ctx) = ctx() else { return };
+
+    let data: Vec<u32> = (0..N as u32).collect();
+    let src_a = DeviceSlice::<u32>::from_slice(&ctx, &data).expect("src a");
+    let dst_a = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("dst a");
+    let src_b = DeviceSlice::<u32>::from_slice(&ctx, &data).expect("src b");
+    let small_dst = DeviceSlice::<u32>::alloc_zero(&ctx, N / 2).expect("small dst");
+
+    let good = eager_copy_to(src_a, dst_a).and_then_host(|_| Ok(()));
+    let g = bundle2(good, eager_copy_to(src_b, small_dst)).and_then(|_| value(0u32));
+    for run in 1..=2 {
+        let err = g.sync(&ctx).expect_err("the mismatched copy must error");
+        assert!(
+            matches!(err, claspr::Error::LengthMismatch { .. }),
+            "run {run}: expected LengthMismatch, got {err:?}"
+        );
+    }
+}

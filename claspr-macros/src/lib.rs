@@ -1996,10 +1996,10 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     // upstream re-lends it next run. Pipes already drained by a
                     // terminal Checkout / downstream consumer are no-ops.
                     #(
-                        if let ::core::option::Option::Some((__v, _d, __h)) =
+                        if let ::core::option::Option::Some((__v, __d, __h)) =
                             self.#op_pipe_fields.take_home()
                         {
-                            ::claspr::eager::rehome_consumed(__v, __h);
+                            ::claspr::eager::rehome_undelivered(__v, __d, __h);
                         }
                     )*
                 }

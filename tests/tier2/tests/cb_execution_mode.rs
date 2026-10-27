@@ -443,8 +443,7 @@ fn fill_device_uninit_records_into_command_buffer() {
 /// whose length check marks the build ineligible on purpose, so the per-op path
 /// can report `LengthMismatch`) recursed until the stack overflowed (first seen
 /// as `eager_erase`'s parity tests aborting on a rusticl whose CB recording fails).
-/// Expected: the
-/// copy's own error. Trivially passes on a device without the
+/// Expected: the copy's own error, on every sync. Trivially passes on a device without the
 /// extension (no boundary is ever opened).
 #[test]
 fn ineligible_bundle_build_falls_back_instead_of_recursing() {
@@ -462,15 +461,41 @@ fn ineligible_bundle_build_falls_back_instead_of_recursing() {
     // fallback never re-enters the bundle's own boundary check.
     let g = bundle2(eager_copy_to(src_a, dst_a), eager_copy_to(src_b, small_dst))
         .and_then(|_| value(0u32));
-    // One sync only: a SECOND sync currently reports the graph busy, because the
-    // valid sibling's outputs are stranded when a mid-graph bundle branch fails —
-    // a separate bug that reproduces with no command buffer at all (NOTES →
-    // Concerns). This test pins the recursion fix: the copy's own error, no crash.
-    let err = g
-        .sync(&ctx)
-        .expect_err("a bundle containing a mismatched copy must error");
-    assert!(
-        matches!(err, claspr::Error::LengthMismatch { .. }),
-        "expected LengthMismatch, got {err:?}"
-    );
+    // Twice: the second sync must reach the copy again (the valid sibling's
+    // outputs are rehomed after the failed run, not stranded "busy").
+    for run in 1..=2 {
+        let err = g
+            .sync(&ctx)
+            .expect_err("a bundle containing a mismatched copy must error");
+        assert!(
+            matches!(err, claspr::Error::LengthMismatch { .. }),
+            "run {run}: expected LengthMismatch, got {err:?}"
+        );
+    }
+}
+
+/// Device work whose outputs NOTHING consumes must still be complete when
+/// `sync` returns. Here the graph's output is `value(0)`, which depends on
+/// neither copy, so the terminal's own wait covers none of the device work; the
+/// copies' buffers were rehomed while the command buffer could still be running
+/// — a data race, and on the next `sync` a re-enqueue of the still-PENDING cached
+/// CB (`CL_INVALID_OPERATION`; measured 25/30 failing runs of 3 syncs on PoCL).
+/// The fix waits on an undelivered intermediate's events before rehoming it.
+#[test]
+fn discarded_device_branch_completes_before_sync_returns() {
+    use claspr::eager::{bundle2, eager_copy_to, value};
+    let Some(ctx) = ctx() else { return };
+
+    let data: Vec<u32> = (0..N as u32).collect();
+    let src_a = DeviceSlice::<u32>::from_slice(&ctx, &data).expect("src a");
+    let dst_a = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("dst a");
+    let src_b = DeviceSlice::<u32>::from_slice(&ctx, &data).expect("src b");
+    let dst_b = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("dst b");
+
+    let g =
+        bundle2(eager_copy_to(src_a, dst_a), eager_copy_to(src_b, dst_b)).and_then(|_| value(0u32));
+    for run in 1..=50 {
+        let out = g.sync(&ctx).unwrap_or_else(|e| panic!("sync {run}: {e:?}"));
+        assert_eq!(*out, 0);
+    }
 }

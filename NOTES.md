@@ -487,30 +487,6 @@ default test-thread stack. Still worth knowing generally: a user writing a long
 UNERASED graph hits this in `cargo test` first, and "has overflowed its stack"
 points nowhere near the cause — the answer is `.erase()` every few dozen links.
 
-### Mid-graph bundle: a failed branch strands its sibling's outputs (2026-10-27, not started)
-
-`bundle2(good_copy, mismatched_copy).and_then(..)`: sync 1 returns the copy's
-`LengthMismatch` correctly, but sync 2 fails "graph is busy" — the good branch ran,
-its outputs sit in pipes nobody consumes, and the error path never rehomes them.
-Deterministic, and reproduces with NO command buffer (a host seam on the good branch
-makes the bundle non-recordable; same result). A root bundle (gather path) and a
-mid-graph single copy are both fine — it is the execute path's sibling cleanup.
-Until 2026-10-27 this was masked by the CB-fallback recursion (sync 1 crashed).
-`cb_execution_mode.rs::ineligible_bundle_build_falls_back_instead_of_recursing`
-asserts sync 1 only for this reason; extend it to two syncs once fixed.
-
-### PoCL: mid-graph bundle-of-copies replay intermittently fails `-59` (2026-10-27, not started)
-
-`bundle2(copy, copy).and_then(|_| value(0))` built and synced twice on PoCL: sync 2
-returns `OpenCl(ClError(-59))` in ~40% of runs (12/30 at 8dbefb3, 13/30 at 7b683fc —
-NOT the keyed cache). The installed PoCL (`fix/cmdbuf-pending-race-0-g17bdf16f2`)
-carries the replay-race fix below (code-identical to pocl#2306's 5b0699e33), so this
-is a different race — PoCL or claspr, not yet known. Fails on sync 2, not after
-hundreds of replays, so not the same pattern either. No in-tree test has this shape,
-which is why CI never saw it. Note pocl#2306 was CLOSED unmerged: upstream wants the
-0.9.8/1.0 rewrite that drops pending-count tracking (pocl#2314), so CI-installed and
-distro PoCLs still have the race below.
-
 ### PoCL: sustained CB replay eventually fails `CL_INVALID_OPERATION` — **FIXED upstream-ready 2026-09-04**
 
 Root-caused and fixed: pocl branch `fix/cmdbuf-pending-race`, one commit

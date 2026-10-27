@@ -2891,11 +2891,11 @@ where
         // copy whose output is partly discarded (e.g. `…and_then(|(src, _dst)| …)`)
         // returns the dropped side's buffer to its origin cell. Already-drained
         // pipes (delivered to a terminal Checkout / consumed downstream) are no-ops.
-        if let Some((v, _d, home)) = self.src_pipe.take_home() {
-            rehome_consumed(v, home);
+        if let Some((v, d, home)) = self.src_pipe.take_home() {
+            rehome_undelivered(v, d, home);
         }
-        if let Some((v, _d, home)) = self.dst_pipe.take_home() {
-            rehome_consumed(v, home);
+        if let Some((v, d, home)) = self.dst_pipe.take_home() {
+            rehome_undelivered(v, d, home);
         }
     }
 }

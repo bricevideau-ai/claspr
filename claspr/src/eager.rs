@@ -535,6 +535,32 @@ pub fn rehome_consumed<T>(buf: T, home: Option<BoxedHome<T>>) {
     // else: homeless → `buf` drops here, releasing it.
 }
 
+/// [`rehome_consumed`] for an UNDELIVERED intermediate that
+/// [`reclaim_undelivered`](DeviceOp::reclaim_undelivered) drained from a pipe:
+/// first wait on the `deps` the pipe held — the device work that produced it.
+///
+/// Nothing downstream consumed the value, so nothing else waits on that work:
+/// the terminal waits only on its OWN output's events, and a discarded branch
+/// (`bundle2(copy, copy).and_then(|_| value(0))`) feeds none of them. Rehoming
+/// at once would hand the buffer back to its cell while the device may still be
+/// writing it — a data race for the caller, and on replay the cached command
+/// buffer still PENDING when the next `sync` re-enqueues it
+/// (`CL_INVALID_OPERATION` from `clEnqueueCommandBufferKHR`). A wait error is
+/// not surfaced: the value was discarded, and `reclaim_undelivered` has no error
+/// channel; the buffer is rehomed regardless so the graph stays reusable.
+///
+/// Only call it once the run is fully enqueued (the terminals do; the CB
+/// fallbacks drain pipes a discarded build left with EMPTY deps). `pub` +
+/// `#[doc(hidden)]` for the same cross-crate reason as `rehome_consumed`.
+#[doc(hidden)]
+pub fn rehome_undelivered<T>(buf: T, deps: Deps, home: Option<BoxedHome<T>>) {
+    for d in &deps {
+        let _ = d.as_ref().wait();
+    }
+    drop(deps);
+    rehome_consumed(buf, home);
+}
+
 /// RAII guard over a buffer lent out of its origin cell by
 /// [`resolve_home`](Input::resolve_home), for the window between the lend and the
 /// deposit ([`put_home`](Pipe::put_home) / [`rehome_consumed`]).
@@ -1872,8 +1898,8 @@ pub trait DeviceOp: Send {
         // Single-output only (multi-output ops override this to drain each element
         // pipe); `output_pipe()` is therefore always `Some` here. Use `and_then`
         // so a defensive `None` is simply a no-op rather than a panic.
-        if let Some((value, _deps, home)) = self.output_pipe().and_then(|p| p.take_home()) {
-            rehome_consumed(value, home);
+        if let Some((value, deps, home)) = self.output_pipe().and_then(|p| p.take_home()) {
+            rehome_undelivered(value, deps, home);
         }
     }
 
@@ -2666,7 +2692,14 @@ pub trait DeviceOpExt: DeviceOp + Sized {
                 // A failing `and_then_host` worker stashed its rich error and
                 // signalled its user event negative; the blocking wait may return
                 // the cl_event cascade (`Error::OpenCl(-1)`). Prefer the stash.
-                Err(cascade) => Err(ec.take_host_error().unwrap_or(cascade)),
+                Err(cascade) => {
+                    // A FAILED run still deposited whatever ran before the failure
+                    // (a bundle's other branch, an upstream stage) into pipes the
+                    // aborted walk never drained; rehome it (after its device work)
+                    // so the next `sync` doesn't find the graph busy.
+                    self.reclaim_undelivered();
+                    Err(ec.take_host_error().unwrap_or(cascade))
+                }
                 Ok((checkouts, deps)) => {
                     // Mop up the run's UNDELIVERED intermediates (multi-output
                     // values an `and_then` closure discarded): return each homed
@@ -2706,15 +2739,14 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             Err(setup_err) => {
                 // Setup failed before/while enqueueing. Join any workers that did
                 // spawn so their CL calls finish before we return, then surface
-                // the rich error if the seam stashed one.
+                // the rich error if the seam stashed one. Reclaim AFTER the join (a
+                // worker may still deposit into a pipe), as on the fast path's
+                // error arm: what ran before the failure must not strand.
                 ec.join_workers();
+                self.reclaim_undelivered();
                 return Err(ec.take_host_error().unwrap_or(setup_err));
             }
         };
-        // Mop up undelivered intermediates (see the fast-path note) so a reused
-        // graph re-arms its upstream cells.
-        self.reclaim_undelivered();
-
         // Wait on the chain's completion events (NOT clFinish — clFinish on a
         // terminated command is the pocl hang). A negative `proceed` from a failing
         // seam surfaces as a cl_event cascade; `wait_deps_reconcile` reconciles it
@@ -2731,6 +2763,10 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         }
         drop(deps);
         ec.join_workers();
+        // Mop up undelivered intermediates (see the fast-path note) so a reused
+        // graph re-arms its upstream cells — AFTER the join, so a host seam whose
+        // output nothing consumed has deposited it before we drain.
+        self.reclaim_undelivered();
         match ec.take_host_error() {
             Some(rust_err) => Err(rust_err),
             None => match wait_err {
@@ -3517,8 +3553,8 @@ impl<O: Send + 'static> SeamScatter for Checkout<O> {
         handle.put_home(value, deps.clone(), homes);
     }
     fn reclaim(handle: &Pipe<O>) {
-        if let Some((value, _deps, home)) = handle.take_home() {
-            rehome_consumed(value, home);
+        if let Some((value, deps, home)) = handle.take_home() {
+            rehome_undelivered(value, deps, home);
         }
     }
     fn reconstruct(handle: &Pipe<O>) -> Result<(O, Deps)> {
