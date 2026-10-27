@@ -820,6 +820,176 @@ mod dyn_op_tests {
     }
 }
 
+// ── Renamed: user-side slot renaming (per-instance slot identity) ────────
+
+/// `op` with its `From` slot sites answering to the tag `To` instead — built by
+/// [`rename`](DeviceOpExt::rename).
+///
+/// Lets the USER decide, per use site, whether an instance of a reusable graph
+/// shares a slot with other instances (leave it alone: one bind fans out to
+/// every site) or gets its own (rename it: binding `To` reaches only this
+/// instance, and binding `From` from outside no longer does). The graph's author
+/// keeps plain fixed tags and never has to guess which slots users will want
+/// per instance.
+///
+/// Transparent like [`DeviceDynOp`]: every member forwards to the wrapped op
+/// except [`bind_slots`](DeviceOp::bind_slots), which translates the binder's
+/// tag on the way in, and [`check_ready`](DeviceOp::check_ready), which reports
+/// a renamed site's slot errors under `To`'s name (matched by tag NAME). Every
+/// binding path (set-once `bind`/`call`, `mutate_*`, the atomicity probe, the
+/// keyed cache's binding delta) goes through that walk.
+pub struct Renamed<O, From, To> {
+    inner: O,
+    _tags: PhantomData<fn() -> (From, To)>,
+}
+
+impl<O, From, To> Renamed<O, From, To> {
+    pub(crate) fn new(inner: O) -> Self {
+        Renamed {
+            inner,
+            _tags: PhantomData,
+        }
+    }
+}
+
+// Every defaulted member forwards (see `DeviceDynOp`'s impl for why); the lint
+// turns a forgotten one into a clippy error.
+#[warn(clippy::missing_trait_methods)]
+impl<O, From, To> DeviceOp for Renamed<O, From, To>
+where
+    O: DeviceOp,
+    From: Tag,
+    To: Tag<Value = From::Value>,
+{
+    type Output = O::Output;
+    type Shape = O::Shape;
+
+    fn output_pipe(&self) -> Option<Pipe<O::Output>> {
+        self.inner.output_pipe()
+    }
+
+    fn handle(&self) -> HandleOf<O> {
+        self.inner.handle()
+    }
+
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        self.inner.execute(ec, mode)
+    }
+
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(O::Output, Deps)> {
+        self.inner.collect(ec, mode)
+    }
+
+    fn collect_home(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(O::Output, Deps, Option<BoxedHome<O::Output>>)>
+    where
+        O::Output: Send + 'static,
+    {
+        self.inner.collect_home(ec, mode)
+    }
+
+    fn gather_checkouts(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(CheckoutsOf<O>, Deps)>
+    where
+        O::Output: Send + 'static,
+        CheckoutsOf<O>: FromCheckout<O::Output>,
+    {
+        self.inner.gather_checkouts(ec, mode)
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        self.inner.describe(out);
+    }
+
+    fn node_label(&self) -> String {
+        self.inner.node_label()
+    }
+
+    fn dump_graph(&self, depth: usize, out: &mut Vec<GraphNode>) {
+        self.inner.dump_graph(depth, out);
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        let from = TypeId::of::<From::Key>();
+        let to = TypeId::of::<To::Key>();
+        if binder.id == to {
+            // Binding the new name: present it to the subtree as the old one.
+            binder.id = from;
+            self.inner.bind_slots(binder);
+            binder.id = to;
+        } else if binder.id != from {
+            self.inner.bind_slots(binder);
+        }
+        // else: the old name was renamed away — invisible inside this instance.
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        // A slot error raised by a renamed site names the tag the cell was built
+        // with (`From`); the caller has to bind `To`, so report that name.
+        self.inner.check_ready().map_err(|e| {
+            let rename = |n: &'static str| if n == From::NAME { To::NAME } else { n };
+            match e {
+                Error::SlotUnbound(n) => Error::SlotUnbound(rename(n)),
+                Error::SlotConflict(n) => Error::SlotConflict(rename(n)),
+                Error::SlotCheckedOut(n) => Error::SlotCheckedOut(rename(n)),
+                Error::SlotSevered(n) => Error::SlotSevered(rename(n)),
+                other => other,
+            }
+        })
+    }
+
+    fn reclaim_undelivered(&self) {
+        self.inner.reclaim_undelivered();
+    }
+
+    fn contains_host_seam(&self) -> bool {
+        self.inner.contains_host_seam()
+    }
+
+    fn cb_addable(&self) -> bool {
+        self.inner.cb_addable()
+    }
+
+    fn cbable_weight(&self) -> usize {
+        self.inner.cbable_weight()
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        self.inner.cb_cache()
+    }
+
+    fn apply_binding_delta(&self, delta: &BindingDelta, rotate: bool) {
+        self.inner.apply_binding_delta(delta, rotate);
+    }
+
+    fn collect_cb_ids(&self, out: &mut Vec<usize>) {
+        self.inner.collect_cb_ids(out);
+    }
+
+    fn cb_restamp(&self, evs: &Deps) {
+        self.inner.cb_restamp(evs);
+    }
+
+    fn cb_spine_head_addable(&self) -> bool {
+        self.inner.cb_spine_head_addable()
+    }
+
+    fn into_dyn<'op>(self) -> DeviceDynOp<'op, O::Shape>
+    where
+        Self: 'op,
+        O::Output: 'static,
+        CheckoutsOf<O>: FromCheckout<O::Output>,
+    {
+        DeviceDynOp::new(self)
+    }
+}
+
 // ── Arced: wrap the output in Arc<T> ───────────────────────────────────
 
 /// Wrap an upstream op's output in [`Arc`] for shared fan-out. Passes events

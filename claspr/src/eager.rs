@@ -166,7 +166,11 @@
 //! affects only that instance. A tag left OPEN through composition fans out: one
 //! bind on the composed graph fills it in every instance (the shared-slot rule,
 //! see [`SlotValue`]). That is right for a knob all instances share (a launch
-//! extent, a time step) and wrong for a per-instance value. Erasure is transparent:
+//! extent, a time step). For a knob that must stay open PER INSTANCE, the user
+//! renames it at the use site — `affine(&ks).rename::<Factor, LeftF>()` with
+//! their own `slots! { LeftF: u32 }` — so binding `LeftF` reaches only that
+//! instance ([`rename`](DeviceOpExt::rename)). Sharing is decided by the user,
+//! where the need is known; the library keeps plain tags. Erasure is transparent:
 //! slots inside an erased instance bind, its commands record into the
 //! surrounding command buffer, and instances are ordinary values (store them,
 //! choose one at run time, compose a run-time number of them in a loop).
@@ -2302,6 +2306,20 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         CheckoutsOf<Self>: FromCheckout<Self::Output>,
     {
         self.into_dyn()
+    }
+
+    /// Make this op's `From` slot sites answer to the tag `To` instead — per-use
+    /// slot identity for a reusable graph. Binding `To` then reaches only this
+    /// op's sites, and binding `From` from outside no longer does; leave a tag
+    /// un-renamed and it stays shared with every other site carrying it. The
+    /// decision is the caller's, at the use site; the graph's author keeps
+    /// plain fixed tags. See [`Renamed`].
+    fn rename<From, To>(self) -> Renamed<Self, From, To>
+    where
+        From: Tag,
+        To: Tag<Value = From::Value>,
+    {
+        Renamed::new(self)
     }
 
     /// Route this op's `execute` to `device`'s default out-of-order queue

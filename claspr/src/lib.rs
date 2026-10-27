@@ -176,7 +176,7 @@ pub use eager::{
     AndThenHost, ArcSplit, BindAll, BindMode, Cell, Checkout, CheckoutsOf, CopyTo2, Dep, Deps,
     DeviceDynOp, DeviceEnqueue, DeviceFanOutExt, DeviceOp, DeviceOpExt, DeviceProfileExt, Download,
     ExecMode, FanOut, Fill, FillMapped, FromCheckout, GraphNode, HandleOf, ImageDownloadEager,
-    ImageUploadEager, Input, IntoBound, OnDevice, OpShape, Pipe, ReadInto, ScalarInput,
+    ImageUploadEager, Input, IntoBound, OnDevice, OpShape, Pipe, ReadInto, Renamed, ScalarInput,
     ScalarSlotCell, ScalarSlotState, ScalarUpload, ScalarZero, Single, SlotBinder, SlotCell,
     SlotHandle, SlotState, SlotValue, Tag, ToInput, TransferToDevice, Upload, WriteDevice,
     WriteMapped, arc_split, arced, download, eager_copy_to, fan_out, fill, fill_mapped, forward,

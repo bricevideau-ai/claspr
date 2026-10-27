@@ -6,11 +6,13 @@
 //! `call`, compose it inside `and_then`, and reuse one curried configuration at
 //! several sites through a closure. These tests pin the properties that make
 //! the pattern work: instances curried before composing are independent, a slot
-//! left open through composition fans out to every instance, instances are
-//! storable values, and a run-time number of them composes into one graph that
-//! still records a single command buffer.
+//! left open through composition fans out to every instance, renaming a tag
+//! per use site gives an instance its own knob, instances are storable values,
+//! and a run-time number of them composes into one graph that still records a
+//! single command buffer.
 
 use claspr::eager::{DeviceOpExt, download};
+use claspr::{Error, slots};
 use claspr_test_kernels::kernels;
 use claspr_test_support::{N, cb_records_of, ctx, seeded};
 
@@ -41,6 +43,9 @@ mod affine_lib {
     }
 }
 use affine_lib::{AffIn, AffOut, Affine, Bias, Factor, affine};
+
+// The USER's per-instance names for the library's `Factor` (see the rename tests).
+slots! { LeftF: u32, RightF: u32 }
 
 /// The single value every element of a uniform result holds.
 fn uniform(v: &[u32]) -> u32 {
@@ -174,6 +179,80 @@ fn runtime_length_chain_records_one_command_buffer() {
     // 1 on a device with cl_khr_command_buffer, 0 without (per-op path).
     assert!(
         cb_records_of(&g) <= 1,
+        "recorded {} command buffers",
+        cb_records_of(&g)
+    );
+}
+
+/// The USER decides sharing per use site: two instances renamed to their own
+/// tags are bound independently after composition; a third left alone shares
+/// the library's `Factor` (the library never had to guess).
+#[test]
+fn rename_gives_an_instance_its_own_knob() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("kernels");
+    let inst = |x, bias, out| (AffIn(x), Bias(bias), AffOut(out));
+    let g = ks
+        .scale_u32([N], seeded(&ctx, 1), 1u32)
+        .and_then(|x| {
+            affine(&ks)
+                .rename::<Factor, LeftF>()
+                .call(inst(x, seeded(&ctx, 1), seeded(&ctx, 0)))
+        })
+        .and_then(|y| {
+            affine(&ks)
+                .rename::<Factor, RightF>()
+                .call(inst(y, seeded(&ctx, 0), seeded(&ctx, 0)))
+        })
+        .and_then(|z| affine(&ks).call(inst(z, seeded(&ctx, 0), seeded(&ctx, 0))))
+        .and_then(download)
+        .call((LeftF(2), RightF(3), Factor(5)));
+    assert_eq!(uniform(&g.sync(&ctx).expect("sync")), (1 + 1) * 2 * 3 * 5);
+}
+
+/// After a rename, the old name no longer reaches the instance, and the unbound
+/// site is reported under the name the caller has to bind.
+#[test]
+fn renamed_away_tag_no_longer_reaches_the_instance() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("kernels");
+    let g = affine(&ks)
+        .rename::<Factor, LeftF>()
+        .call((
+            AffIn(seeded(&ctx, 1)),
+            Bias(seeded(&ctx, 0)),
+            AffOut(seeded(&ctx, 0)),
+        ))
+        .and_then(download);
+    // Binding the old name finds no site; the renamed site stays unbound.
+    match g.mutate_call((Factor(9),)) {
+        Err(err) => assert!(matches!(err, Error::SlotNoSuchTag(_)), "got {err:?}"),
+        Ok(_) => panic!("binding `Factor` reached a renamed site"),
+    }
+    let err = g.sync(&ctx).expect_err("LeftF is unbound");
+    assert!(matches!(err, Error::SlotUnbound("LeftF")), "got {err:?}");
+}
+
+/// A renamed knob re-binds alone at replay time, and the keyed cache still
+/// recognises each state (one command buffer per state on a CB device).
+#[test]
+fn renamed_knob_rebinds_alone_and_stays_cached() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("kernels");
+    let inst = |x| (AffIn(x), Bias(seeded(&ctx, 0)), AffOut(seeded(&ctx, 0)));
+    let g = ks
+        .scale_u32([N], seeded(&ctx, 1), 1u32)
+        .and_then(|x| affine(&ks).rename::<Factor, LeftF>().call(inst(x)))
+        .and_then(|y| affine(&ks).rename::<Factor, RightF>().call(inst(y)))
+        .and_then(download)
+        .call((LeftF(2), RightF(3)));
+    for i in 0..8u32 {
+        let r = if i % 2 == 0 { 3 } else { 7 };
+        g.mutate_call((RightF(r),)).expect("mutate");
+        assert_eq!(uniform(&g.sync(&ctx).expect("sync")), 2 * r, "sync {i}");
+    }
+    assert!(
+        cb_records_of(&g) <= 2,
         "recorded {} command buffers",
         cb_records_of(&g)
     );
