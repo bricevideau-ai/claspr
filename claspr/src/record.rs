@@ -190,6 +190,11 @@ pub struct CbBuilder {
     /// [`FinalizedCb::captured_slots`](FinalizedCb) at finalize; precise per-slot
     /// invalidation clears this CB iff a mutated slot is in the set.
     slots: Mutex<std::collections::BTreeSet<usize>>,
+    /// What each slot cell under the recording boundary held when recording began
+    /// (`cell id → digest`), collected from the cells themselves by the boundary
+    /// ([`set_slot_digests`](Self::set_slot_digests)). Moved into the
+    /// [`FinalizedCb`]; `CbLru::install` keys the CB from it.
+    slot_digests: Mutex<std::collections::BTreeMap<usize, Option<u64>>>,
 }
 
 // SAFETY: the CB / queue / kernel handles are opaque handles into the
@@ -245,6 +250,7 @@ impl CbBuilder {
             recorded: Mutex::new(0),
             finalized: Mutex::new(false),
             slots: Mutex::new(std::collections::BTreeSet::new()),
+            slot_digests: Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
@@ -268,6 +274,12 @@ impl CbBuilder {
     /// the CBs whose `captured_slots` contains it. Cheap idempotent set insert.
     pub fn note_slot(&self, id: usize) {
         lock_unpoisoned(&self.slots).insert(id);
+    }
+
+    /// Record what the slot cells under the recording boundary hold — collected
+    /// from the cells by the boundary before it records. See `slot_digests`.
+    pub(crate) fn set_slot_digests(&self, digests: std::collections::BTreeMap<usize, Option<u64>>) {
+        *lock_unpoisoned(&self.slot_digests) = digests;
     }
 
     /// How many `clCommand*KHR` commands have been recorded. Zero → the boundary
@@ -731,6 +743,7 @@ impl CbBuilder {
         // the handle we just gave away.
         let kernels = std::mem::take(&mut *lock_unpoisoned(&self.kernels));
         let captured_slots = std::mem::take(&mut *lock_unpoisoned(&self.slots));
+        let slot_digests = std::mem::take(&mut *lock_unpoisoned(&self.slot_digests));
         *done = true;
         Some(FinalizedCb {
             cb: self.cb,
@@ -739,7 +752,8 @@ impl CbBuilder {
             release,
             kernels,
             captured_slots,
-            // Stamped by `CbLru::install`, which knows the binding digests.
+            slot_digests,
+            // Stamped by `CbLru::install` from `slot_digests` + its own bindings.
             key: Mutex::new(None),
         })
     }
@@ -783,6 +797,9 @@ pub struct FinalizedCb {
     /// Slot cell ids this CB baked a buffer/scalar from (directly or transitively
     /// through pipes). Precise invalidation clears this CB iff a mutated slot is here.
     captured_slots: std::collections::BTreeSet<usize>,
+    /// What each slot cell under the boundary held when this CB was recorded
+    /// (`cell id → digest`, from the cells themselves). See `CbBuilder::slot_digests`.
+    slot_digests: std::collections::BTreeMap<usize, Option<u64>>,
     /// **The binding state this CB was recorded in** — the digest of every slot in
     /// [`captured_slots`](Self::captured_slots) at record time, filed by
     /// [`CbLru::install`](crate::eager::CbLru). `None` means unkeyable (some captured
@@ -815,6 +832,13 @@ impl FinalizedCb {
     /// The slot cells this CB baked — see [`captured_slots`](Self::captured_slots).
     pub fn captured_slots(&self) -> &std::collections::BTreeSet<usize> {
         &self.captured_slots
+    }
+
+    /// What slot cell `cell` held when this CB was recorded: `Some(digest)` if the
+    /// recording boundary's collection reached it (`digest` itself `None` when the
+    /// cell had nothing keyable), `None` if it did not.
+    pub(crate) fn slot_digest(&self, cell: usize) -> Option<Option<u64>> {
+        self.slot_digests.get(&cell).copied()
     }
 
     /// The binding state this CB was recorded in, or `None` if unkeyable. See

@@ -11,13 +11,14 @@
 //! These tests assert the RECORD COUNT (per graph, via `cb_records_of`), not
 //! timings — the count is deterministic and is the thing that actually regressed.
 
-use claspr::eager::{DeviceOp, DeviceOpExt, bundle2, fill};
+use claspr::eager::{DeviceOp, DeviceOpExt, bundle2, download, fill};
 use claspr::{DeviceSlice, slot, slots};
 use claspr_test_kernels::kernels;
 use claspr_test_support::{N, cb_records_of, ctx, homed_cb_count, seeded};
 
 slots! {
     Factor: u32,
+    Pre: u32,
     Src: DeviceSlice<u32>,
     Dst: DeviceSlice<u32>,
 }
@@ -178,4 +179,65 @@ fn cycle_longer_than_cap_evicts_and_stays_correct() {
         "cache must stay capped, holding {}",
         homed_cb_count(&g)
     );
+}
+
+/// A chain whose first scale's slot is bound BEFORE composing (`call` on the
+/// kernel, inside the `and_then` closure — the curry-then-compose idiom) and whose
+/// second scale's slot stays open for the root. `fill` resets each run.
+macro_rules! precurried_chain {
+    ($ctx:expr, $ks:expr) => {{
+        let buf = DeviceSlice::<u32>::alloc_zero($ctx, N).expect("alloc");
+        fill(buf, 2u32)
+            .and_then(|b| $ks.scale_u32([N], b, slot!(Pre)).call((Pre(5u32),)))
+            .and_then(|b| $ks.scale_u32([N], b, slot!(Factor)))
+            .and_then(download)
+    }};
+}
+
+/// A slot bound before composing was bound on the SUBGRAPH, before the root node
+/// (and its CB cache) existed, so the root never saw it bound. That used to make
+/// every recorded CB unkeyable — never parked — and alternating the root's slot
+/// re-recorded on every switch (6 records in 6 syncs instead of 2).
+#[test]
+fn slot_bound_before_composing_keeps_the_cache_keyed() {
+    let Some(ctx) = ctx() else { return };
+    if !ctx.has_cl_khr_command_buffer() {
+        eprintln!("SKIP: device lacks cl_khr_command_buffer");
+        return;
+    }
+    let ks = kernels::kernels(&ctx).expect("kernels");
+    let g = precurried_chain!(&ctx, ks);
+    let records = records_during(&g, || {
+        for i in 0..12u32 {
+            let f = if i % 2 == 0 { 3 } else { 7 };
+            g.mutate_bind(Factor(f)).expect("mutate");
+            let out = g.sync(&ctx).expect("sync");
+            assert!(
+                out.iter().all(|&v| v == 2 * 5 * f),
+                "sync {i}: got {}",
+                out[0]
+            );
+        }
+    });
+    assert_eq!(records, 2, "one CB per state, then replay");
+}
+
+/// The pre-composition binding is keyed as "unchanged since the root was built".
+/// Re-binding that slot later through the root must invalidate those CBs: results
+/// stay correct through the change and back (an extra record is fine; a stale
+/// replay is not).
+#[test]
+fn rebinding_a_precurried_slot_through_the_root_stays_correct() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("kernels");
+    let g = precurried_chain!(&ctx, ks);
+    for (pre, f) in [(5, 3), (5, 7), (11, 3), (11, 7), (5, 3), (5, 7), (11, 3)] {
+        g.mutate_call((Pre(pre), Factor(f))).expect("mutate");
+        let out = g.sync(&ctx).expect("sync");
+        assert!(
+            out.iter().all(|&v| v == 2 * pre * f),
+            "pre={pre} f={f}: got {}",
+            out[0]
+        );
+    }
 }

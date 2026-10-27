@@ -116,6 +116,17 @@ impl CbLru {
     /// Install a freshly finalized CB as `current`, filing it under the binding state
     /// it was recorded in (`bound` restricted to the slots it actually baked).
     pub(crate) fn install(&mut self, cb: Arc<crate::record::FinalizedCb>) {
+        // Key by what the cells actually held when recording began (collected from
+        // the cells by the boundary), not only by the binds that happened to walk
+        // through this node: a slot bound on a subgraph BEFORE it was composed (the
+        // curry-then-compose idiom) never reached this cache, but its cell knows.
+        // Folding the cells' digests into `bound` also lets later deltas and
+        // `matches_now` see them.
+        for &cell in cb.captured_slots() {
+            if let Some(digest) = cb.slot_digest(cell) {
+                self.bound.insert(cell, digest);
+            }
+        }
         cb.set_key(self.key_for(&cb));
         self.current = Some(cb);
         self.records += 1;
@@ -138,7 +149,8 @@ impl CbLru {
                 Some(Some(d)) => {
                     key.insert(cell, *d);
                 }
-                // Captured but unkeyable (pipe-fed) or never seen bound: we cannot
+                // Captured but unkeyable (no digest), or not reached by the
+                // boundary's collection and never seen bound here: we cannot
                 // recognise this state again, so refuse to key the CB at all.
                 Some(None) => return None,
                 None => return None,
@@ -408,6 +420,16 @@ pub(crate) fn cb_graph_eligible<O: DeviceOp + ?Sized>(op: &O, ec: &ExecutionCont
     ec.context().has_cl_khr_command_buffer() && op.cb_addable()
 }
 
+/// What every slot cell under `op` holds now (`cell id → digest`), read from the
+/// cells by a [`SlotBinder::digest_collector`] walk. A boundary runs it before
+/// recording so the CB is keyed by what it bakes — renamed and erased sites
+/// included, since the collector matches cells, not tags.
+fn collect_slot_digests<O: DeviceOp>(op: &O) -> std::collections::BTreeMap<usize, Option<u64>> {
+    let mut collector = SlotBinder::digest_collector();
+    op.bind_slots(&mut collector);
+    collector.into_digests().into_iter().collect()
+}
+
 /// The **CB BOUNDARY protocol** (design v2): gather a maximal CB-eligible subtree
 /// `op` as ONE command buffer, homing it in `op`'s [`cb_cache`](DeviceOp::cb_cache),
 /// and return its terminal [`Checkouts`](CheckoutsOf) + the ONE completion
@@ -492,6 +514,7 @@ where
         // Extension unreachable after all — fall back to the normal path.
         return op.gather_checkouts(&fallback, mode);
     };
+    builder.set_slot_digests(collect_slot_digests(op));
     let build_ec = ec.with_cb(CbWalk::Build {
         builder: &builder,
         ext: &ext,
@@ -869,6 +892,7 @@ where
     let Some(builder) = crate::record::CbBuilder::new(platform, queue) else {
         return op.execute(&fallback, mode);
     };
+    builder.set_slot_digests(collect_slot_digests(op));
     let build_ec = ec.with_cb(CbWalk::Build {
         builder: &builder,
         ext: &ext,

@@ -2869,7 +2869,10 @@ where
         // both (execution order: src then dst), short-circuiting once it lands.
         // Non-slot (concrete / pipe) inputs are a no-op in `try_bind_slot`.
         self.src.try_bind_slot(binder);
-        if binder.is_consumed() {
+        // Only a consumed MOVE-ONLY binder may stop here: a fan-out one (probe, pipe
+        // feed, digest collector, clone-able value) carries no single value to have
+        // spent and must reach `dst` too — same gate as the combinators' walks.
+        if !binder.is_fanout() && binder.is_consumed() {
             return;
         }
         self.dst.try_bind_slot(binder);

@@ -1043,6 +1043,10 @@ pub enum Input<T> {
         /// any enqueue. Starts empty; stays empty for a graph the deferred path never
         /// errs on (so the reuse path is unchanged). See [`DeferredErrors`].
         sink: DeferredErrors,
+        /// The [`SlotDigest`] of what the slot currently holds (a value, or the pipe
+        /// feeding it) — written by every bind that installs one, read when a command
+        /// buffer is recorded so it is keyed by what it actually baked.
+        digest: SlotDigest,
     },
 }
 

@@ -95,6 +95,12 @@ pub enum SlotState<T> {
 /// The four-state cell shared by a [`SlotHandle`] and its [`Input::Slot`].
 pub type SlotCell<T> = Arc<Mutex<SlotState<T>>>;
 
+/// The digest of what a slot cell currently holds ([`SlotEq::slot_digest`] of its
+/// value, or of the pipe feeding it); `None` until a bind installs one. Lives beside
+/// the cell, shared the same way, so the binding is recorded where the slot is and
+/// not only in whichever command-buffer caches a bind happened to walk through.
+pub type SlotDigest = Arc<Mutex<Option<u64>>>;
+
 // ── DeferredErrors: the graph-reachable sink for the INFALLIBLE apply path ──
 
 /// A **graph-reachable deferred-error sink** — the record-don't-drop channel for
@@ -239,6 +245,10 @@ pub trait SlotEq {
     /// twice, and every `Tg::Value: SlotEq` bound in the crate already carries it.
     fn slot_digest(&self) -> u64;
 }
+
+/// Domain separator for a pipe feed's digest, so a pipe's cell id never hashes
+/// like a buffer handle of the same numeric value.
+const PIPE_FEED_DIGEST: u8 = 0xF5;
 
 /// Hash `x` to the `u64` a [`SlotEq::slot_digest`] impl returns. `DefaultHasher`
 /// is deterministic within a process (which is all a per-graph cache key needs) and
@@ -756,6 +766,12 @@ pub struct SlotBinder {
     /// presence is mutually exclusive with a `value` (a feed binder carries no
     /// value; its `eq`/`clone` are inert dummies).
     pub(crate) feed_pipe: Option<Box<dyn Any + Send>>,
+    /// **Digest collector.** When `Some`, this binder binds nothing: every slot
+    /// cell the walk reaches pushes `(cell id, digest)` here, whatever its tag. A
+    /// command-buffer boundary runs one over its subtree before recording
+    /// ([`digest_collector`](Self::digest_collector)), so the recording is keyed by
+    /// what each cell actually holds. Fans out (visits every cell).
+    pub(crate) digest_sink: Option<Vec<(usize, Option<u64>)>>,
     /// **Infallible-apply marker.** `true` ONLY for a binder built by the consuming,
     /// infallible [`bind`](DeviceOpExt::bind) / [`call`](DeviceOpExt::call) path (via
     /// the deferred `bind`/`feed` helpers behind [`CallArg::apply`]). When set, the
@@ -821,6 +837,7 @@ impl SlotBinder {
             feed_pipe: None,
             deferred: false,
             captured_sink: None,
+            digest_sink: None,
         }
     }
 
@@ -844,13 +861,15 @@ impl SlotBinder {
             outcome: Ok(()),
             matched: 0,
             matched_cells: ::std::vec::Vec::new(),
-            // A pipe-fed slot has no value to digest → unkeyable → hard clear.
-            value_digest: None,
+            // A pipe-fed slot is keyed by WHICH pipe feeds it (the edge, like an
+            // internal pipe edge): re-feeding the same pipe matches, another differs.
+            value_digest: Some(slot_digest_of((PIPE_FEED_DIGEST, pipe.cell_id()))),
             probe: false,
             severable_cells: Vec::new(),
             feed_pipe: Some(Box::new(pipe)),
             deferred: false,
             captured_sink: None,
+            digest_sink: None,
         }
     }
 
@@ -882,12 +901,41 @@ impl SlotBinder {
             feed_pipe: None,
             deferred: false,
             captured_sink: None,
+            digest_sink: None,
         }
     }
 
     /// Whether this binder is a read-only [`probe`](Self::probe) (phase-0 dry run).
     pub(crate) fn is_probe(&self) -> bool {
         self.probe
+    }
+
+    /// A binder that collects `(cell id, digest)` from every slot cell it is
+    /// offered and binds nothing — see [`digest_sink`](Self::digest_sink).
+    pub(crate) fn digest_collector() -> Self {
+        SlotBinder {
+            id: TypeId::of::<()>(),
+            mode: BindMode::Set,
+            value: None,
+            eq: Box::new(|_, _| false),
+            clone: Box::new(|_| None),
+            outcome: Ok(()),
+            matched: 0,
+            matched_cells: ::std::vec::Vec::new(),
+            value_digest: None,
+            probe: false,
+            severable_cells: Vec::new(),
+            feed_pipe: None,
+            deferred: false,
+            captured_sink: None,
+            digest_sink: Some(Vec::new()),
+        }
+    }
+
+    /// The `(cell id, digest)` pairs a [`digest_collector`](Self::digest_collector)
+    /// gathered.
+    pub(crate) fn into_digests(self) -> Vec<(usize, Option<u64>)> {
+        self.digest_sink.unwrap_or_default()
     }
 
     /// Predict the outcome of the verb 2×2 on a target that is currently
@@ -967,7 +1015,10 @@ impl SlotBinder {
         // A pipe-feed binder also fans out — one `Tag(pipe)` installs
         // `FedByPipe` at EVERY site the tag appears (e.g. a `UIn` at both its
         // laplacian and combine positions), cloning the pipe per cell.
-        self.probe || self.feed_pipe.is_some() || self.fill_clone().is_some()
+        self.probe
+            || self.feed_pipe.is_some()
+            || self.digest_sink.is_some()
+            || self.fill_clone().is_some()
     }
 
     /// Whether the binding has already been deposited into (or rejected by) a
@@ -1093,6 +1144,8 @@ pub enum ScalarInput<V> {
         /// same role as [`Input::Slot`]'s `sink`. A scalar slot fed a conflicting
         /// value-bind records here; `check_ready` drains it. Starts empty.
         sink: DeferredErrors,
+        /// Same role as [`Input::Slot`]'s `digest`.
+        digest: SlotDigest,
     },
 }
 
@@ -1180,6 +1233,7 @@ impl<V: Send + 'static> ScalarInput<V> {
             name,
             cell,
             sink,
+            digest,
         } = self
         else {
             return;
@@ -1190,6 +1244,15 @@ impl<V: Send + 'static> ScalarInput<V> {
         // sets `binder.deferred`.
         if binder.deferred && binder.captured_sink.is_none() {
             binder.captured_sink = Some(Arc::clone(sink));
+        }
+        // A digest collector reads every slot cell, whatever its tag (so renamed and
+        // erased sites alike), and binds nothing.
+        if let Some(found) = binder.digest_sink.as_mut() {
+            found.push((
+                Arc::as_ptr(cell) as *const () as usize,
+                *lock_unpoisoned(digest),
+            ));
+            return;
         }
         if *id != binder.id {
             return;
@@ -1229,6 +1292,7 @@ impl<V: Send + 'static> ScalarInput<V> {
             ScalarSlotState::Unbound => {
                 if let Some(new) = provide(binder) {
                     *guard = ScalarSlotState::Bound(new);
+                    *lock_unpoisoned(digest) = binder.value_digest;
                 }
             }
             ScalarSlotState::Bound(cur) => match binder.mode {
@@ -1248,6 +1312,7 @@ impl<V: Send + 'static> ScalarInput<V> {
                 BindMode::Mutate => {
                     if let Some(new) = provide(binder) {
                         *guard = ScalarSlotState::Bound(new);
+                        *lock_unpoisoned(digest) = binder.value_digest;
                     }
                 }
             },
@@ -1304,6 +1369,7 @@ impl<Tg: Tag> SlotHandle<Tg> {
             // Fresh empty deferred-error sink (see [`DeferredErrors`]): written only
             // by the infallible `bind`/`call` apply path, drained by `check_ready`.
             sink: Arc::new(Mutex::new(Vec::new())),
+            digest: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1321,6 +1387,7 @@ impl<Tg: Tag> SlotHandle<Tg> {
             cell: Arc::new(Mutex::new(ScalarSlotState::Unbound)),
             // Fresh empty deferred-error sink (see [`DeferredErrors`]).
             sink: Arc::new(Mutex::new(Vec::new())),
+            digest: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1676,6 +1743,7 @@ impl<T> Input<T> {
             name,
             cell,
             sink,
+            digest,
         } = self
         else {
             return;
@@ -1688,6 +1756,15 @@ impl<T> Input<T> {
         // `binder.deferred` (the fluent verbs leave it `None` → no capture, no cost).
         if binder.deferred && binder.captured_sink.is_none() {
             binder.captured_sink = Some(Arc::clone(sink));
+        }
+        // A digest collector reads every slot cell, whatever its tag (so renamed and
+        // erased sites alike), and binds nothing.
+        if let Some(found) = binder.digest_sink.as_mut() {
+            found.push((
+                Arc::as_ptr(cell) as *const () as usize,
+                *lock_unpoisoned(digest),
+            ));
+            return;
         }
         if *id != binder.id {
             return;
@@ -1715,7 +1792,7 @@ impl<T> Input<T> {
             return;
         }
         if binder.feed_pipe.is_some() {
-            Self::feed_bind(binder, cell);
+            Self::feed_bind(binder, cell, digest);
             return;
         }
         // A move-only binder is consumed after its single value lands; bail. A
@@ -1724,7 +1801,7 @@ impl<T> Input<T> {
         if binder.value.is_none() {
             return;
         }
-        Self::apply_value_bind(binder, cell, name);
+        Self::apply_value_bind(binder, cell, name, digest);
     }
 
     /// Phase 1 — the read-only PROBE (phase-0 dry run of `call`/`mutate_call`).
@@ -1771,7 +1848,7 @@ impl<T> Input<T> {
     /// is still sound — the pipe is drained fresh next run. Runs BEFORE the
     /// `value.is_none()` bail (a feed binder carries no value, so it would otherwise
     /// be misread as "consumed" and skip every cell).
-    fn feed_bind(binder: &mut SlotBinder, cell: &SlotCell<T>)
+    fn feed_bind(binder: &mut SlotBinder, cell: &SlotCell<T>, digest: &SlotDigest)
     where
         T: 'static,
     {
@@ -1779,6 +1856,7 @@ impl<T> Input<T> {
             && let Some(pipe) = boxed.downcast_ref::<Pipe<T>>()
         {
             *lock_unpoisoned(cell) = SlotState::FedByPipe(pipe.clone());
+            *lock_unpoisoned(digest) = binder.value_digest;
         }
     }
 
@@ -1788,8 +1866,12 @@ impl<T> Input<T> {
     /// binder CLONES its value (so it can fill the next cell too); a move-only binder
     /// TAKES its single value. `provide` is called at most once per cell, lazily, so
     /// an idempotent no-op / conflict / sever-reject path costs no clone or move.
-    fn apply_value_bind(binder: &mut SlotBinder, cell: &SlotCell<T>, name: &'static str)
-    where
+    fn apply_value_bind(
+        binder: &mut SlotBinder,
+        cell: &SlotCell<T>,
+        name: &'static str,
+        digest: &SlotDigest,
+    ) where
         T: Send + 'static,
     {
         let fanout = binder.is_fanout();
@@ -1805,6 +1887,7 @@ impl<T> Input<T> {
             SlotState::Unbound => {
                 if let Some(new) = provide(binder) {
                     *guard = SlotState::Bound(new);
+                    *lock_unpoisoned(digest) = binder.value_digest;
                 }
             }
             // Severed — was bound, the caller took its value via `into_inner`.
@@ -1820,6 +1903,7 @@ impl<T> Input<T> {
                 BindMode::Mutate => {
                     if let Some(new) = provide(binder) {
                         *guard = SlotState::Bound(new);
+                        *lock_unpoisoned(digest) = binder.value_digest;
                     }
                 }
             },
@@ -1845,6 +1929,7 @@ impl<T> Input<T> {
                     // Overwrite: the prior value drops here.
                     if let Some(new) = provide(binder) {
                         *guard = SlotState::Bound(new);
+                        *lock_unpoisoned(digest) = binder.value_digest;
                     }
                 }
             },
@@ -1867,6 +1952,7 @@ impl<T> Input<T> {
                 BindMode::Mutate => {
                     if let Some(new) = provide(binder) {
                         *guard = SlotState::Bound(new);
+                        *lock_unpoisoned(digest) = binder.value_digest;
                     }
                 }
             },
