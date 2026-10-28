@@ -113,6 +113,37 @@ jobs:
         # skip. `--release` matches the build step above so artifacts
         # are reused — release also surfaces a handful of
         # kernel-codegen issues that don't appear in debug.
-        run: cargo test --workspace --release --target $TARGET
+        #
+        # Known driver bug, worked around ONLY on the affected Mesa release:
+        # rusticl SIGSEGVs (in libLLVM's `LLVMTypeOf`) while compiling
+        # miniweather's f64 kernels on Mesa 26.2.5 — reproduced outside CI
+        # and on claspr commits that predate the example's recent changes,
+        # so it is the driver, not claspr. A SIGSEGV kills the whole test
+        # binary, and cargo then stops, leaving every later test binary
+        # (the remaining examples + all doc-tests) unrun.
+        #
+        # On that release, miniweather runs on its own with fp64 HIDDEN
+        # from rusticl (`RUSTICL_FEATURES` empty): its tests gate their f64
+        # stamp on the device's fp64 support (as on Intel legacy, which has
+        # none), so the f32 paths keep their coverage and any f64 test added
+        # later is covered without a name list. The match is on the upstream
+        # Mesa version (`~kisak…` suffix stripped), so the full fp64 run
+        # comes back by itself on the next kisak-mesa upgrade; if it still
+        # crashes there, CI goes red and the version list needs re-checking.
+        run: |
+          mesa=$(dpkg-query -W -f='${Version}' mesa-opencl-icd | sed 's/~.*//')
+          echo "mesa-opencl-icd upstream version: $mesa"
+          case "$mesa" in
+            26.2.5)
+              echo "::warning::Mesa $mesa: miniweather runs without fp64 (known rusticl SIGSEGV on its f64 kernels)"
+              rc=0
+              cargo test --workspace --release --target $TARGET --exclude miniweather-example || rc=1
+              RUSTICL_FEATURES= cargo test --release --target $TARGET -p miniweather-example || rc=1
+              exit $rc
+              ;;
+            *)
+              cargo test --workspace --release --target $TARGET
+              ;;
+          esac
         env:
           CLASPR_REQUIRE_DEVICE: 1
