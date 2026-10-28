@@ -1339,6 +1339,11 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
         let ids = generics.iter().map(|(id, _)| id);
         quote! { < #( #ids, )* #slots_expr > }
     };
+    // The op's `DeviceOp::Bare`: the same launch with its slot set forgotten.
+    let op_bare_use: TokenStream2 = {
+        let ids = generics.iter().map(|(id, _)| id);
+        quote! { < #( #ids, )* ::claspr::HNil > }
+    };
 
     // The kernel METHOD's generic decl = Op generics (`__D{n}`) PLUS the
     // method-only input generics (`__S{n}: ToInput<…>`). The Op struct/impls
@@ -1662,6 +1667,27 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
     // `Output` tuple by draining all element pipes, gather their deps, wait.
     // `op_out_destructure` was the `KernelOp::enqueue_into` field-ignore pattern;
     // that impl is gone (kernels are DeviceOp-only), so it's unused now.
+    // The output field(s) by name, for `into_bare`'s move (leading comma, like
+    // the decl/init lists).
+    let op_out_field_move: TokenStream2 = if multi_output {
+        quote! { , #(#op_pipe_fields),* }
+    } else {
+        quote! { , __claspr_out }
+    };
+    let op_into_bare = quote! {
+        type Bare = Op #op_bare_use;
+
+        fn into_bare(self) -> Self::Bare {
+            let Op {
+                kernel, spec, args, deps, profile_cb, ctx, __claspr_cb_cache,
+                __claspr_slots: _ #op_out_field_move
+            } = self;
+            Op {
+                kernel, spec, args, deps, profile_cb, ctx, __claspr_cb_cache,
+                __claspr_slots: ::core::marker::PhantomData #op_out_field_move
+            }
+        }
+    };
     let (op_out_field_decl, op_out_field_init, _op_out_destructure) = if multi_output {
         let decls = op_pipe_fields
             .iter()
@@ -1815,6 +1841,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
         quote! {
             impl #op_gen_decl ::claspr::DeviceOp for Op #op_gen_use {
                 type Slots = __claspr_Sl;
+                #op_into_bare
                 type Output = #output_ty;
                 type Shape = #shape_ty;
 
@@ -2056,6 +2083,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
         quote! {
             impl #op_gen_decl ::claspr::DeviceOp for Op #op_gen_use {
                 type Slots = __claspr_Sl;
+                #op_into_bare
                 type Output = #output_ty;
 
                 fn output_pipe(&self) -> ::core::option::Option<::claspr::Pipe<#output_ty>> {

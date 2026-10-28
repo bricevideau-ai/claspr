@@ -87,6 +87,10 @@ where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
@@ -286,6 +290,10 @@ where
     T: Copy + Send + Sync + 'static,
     M: crate::UploadReseed + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
@@ -408,6 +416,10 @@ where
     T: Copy + Send + Sync + 'static,
     M: crate::UploadReseed + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = DeviceScalar<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceScalar<T, M>>> {
@@ -500,6 +512,10 @@ where
     T: Copy + Default + Send + Sync + 'static,
     M: crate::UploadReseed + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = DeviceScalar<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceScalar<T, M>>> {
@@ -545,6 +561,10 @@ where
     T: Clone + Default + Send + 'static,
     M: MemMode + HostReadable + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = Vec<T>;
 
     fn output_pipe(&self) -> Option<Pipe<Vec<T>>> {
@@ -677,6 +697,10 @@ where
     T: Send + 'static,
     M: MemMode + HostReadable + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
@@ -826,6 +850,10 @@ where
     T: Send + 'static,
     M: MemMode + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
@@ -919,6 +947,10 @@ where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
@@ -1033,6 +1065,10 @@ where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = MappedSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
@@ -1150,6 +1186,10 @@ where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = USMSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<USMSlice<T, M>>> {
@@ -1213,6 +1253,10 @@ where
     T: Send + Sync + 'static,
     M: MemMode + HostWritable + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
@@ -1302,6 +1346,10 @@ where
     T: Send + Sync + 'static,
     M: MemMode + HostWritable + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
@@ -1417,6 +1465,10 @@ where
     T: Send + Sync + 'static,
     M: MemMode + HostWritable + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = MappedSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
@@ -1493,6 +1545,10 @@ where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = MappedSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
@@ -1651,6 +1707,10 @@ where
     T: Send + Sync + 'static,
     M: MemMode + HostWritable + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = MappedSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
@@ -1753,6 +1813,10 @@ where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = USMSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<USMSlice<T, M>>> {
@@ -1848,6 +1912,10 @@ where
     T: Copy + Send + Sync + 'static,
     M: crate::UploadReseed + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = USMSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<USMSlice<T, M>>> {
@@ -1956,6 +2024,10 @@ macro_rules! impl_alloc_uninit {
             T: Send + 'static,
             M: MemMode + Send + 'static,
         {
+            fn into_bare(self) -> Self {
+                self
+            }
+
             type Output = $Uninit<T, M>;
 
             fn output_pipe(&self) -> Option<Pipe<$Uninit<T, M>>> {
@@ -2042,6 +2114,10 @@ where
     I: ImageHostTransfer + crate::image::ImageEnqueue + Send + 'static,
     I::Pixel: Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = I;
 
     fn output_pipe(&self) -> Option<Pipe<I>> {
@@ -2105,6 +2181,10 @@ where
     I: ImageHostTransfer + crate::image::ImageEnqueue + Send + 'static,
     I::Pixel: Default + Copy + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = Vec<I::Pixel>;
 
     fn output_pipe(&self) -> Option<Pipe<Vec<I::Pixel>>> {
@@ -2195,6 +2275,10 @@ macro_rules! impl_acquire_view {
             T: $($tb)+,
             M: $($mb)+,
         {
+            fn into_bare(self) -> Self {
+                self
+            }
+
             type Output = $Out;
             fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
                 Some(self.out.share())
@@ -2251,6 +2335,10 @@ macro_rules! impl_release_view {
             M: $($mb)+,
             A: MapAccess,
         {
+            fn into_bare(self) -> Self {
+                self
+            }
+
             type Output = $Out;
             fn output_pipe(&self) -> Option<Pipe<$Out>> {
                 Some(self.out.share())
@@ -2634,6 +2722,10 @@ where
     Src: CopyHome<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Src>,
     Dst: CopyHome<<<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Dst>,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = (
         <<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Src,
         <<Src::Op as crate::copy::CopyRun>::Output as CopyOutputs>::Dst,

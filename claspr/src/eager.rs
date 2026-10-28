@@ -968,6 +968,10 @@ impl<T> Pipe<T> {
 // source first, so this holds). If not, `collect` finds an empty cell and returns
 // the standard "op produced no output" error — loud, never silent.
 impl<T: Send + 'static> DeviceOp for Pipe<T> {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = T;
 
     fn output_pipe(&self) -> Option<Pipe<T>> {
@@ -1678,6 +1682,23 @@ pub trait DeviceOp: Send {
     /// checks only).
     type Slots: SlotList = HNil;
 
+    /// The same op with its compile-time slot set FORGOTTEN — what a combinator
+    /// stores for a child, so node types depend on the graph's shape and never
+    /// on its tags (otherwise every structurally identical subgraph with other
+    /// tags is a new type, and every generic walk is monomorphized again for
+    /// it). `Self` for every op that carries no slot set in its type.
+    type Bare: DeviceOp<Output = Self::Output, Shape = Self::Shape>
+        = Self
+    where
+        Self: Sized;
+
+    /// Convert to [`Bare`](Self::Bare) — the identity, except for the few ops
+    /// whose type carries a slot set (kernel launches, [`DeviceDynOp`],
+    /// [`Slotted`]).
+    fn into_bare(self) -> Self::Bare
+    where
+        Self: Sized;
+
     /// The **runtime value-storage** pipe — where `execute` deposits the result;
     /// what the single-output terminal (`sync`) drains. `Some` for a single-output
     /// op (its one storage pipe, independent of the build-time [`Handle`](HandleOf<Self>)),
@@ -2039,19 +2060,6 @@ pub trait DeviceOp: Send {
         0
     }
 
-    /// Run `self` as a child of a combinator's walk, opening a CB boundary at it if
-    /// eligible ([`cb_exec_child`](cb::cb_exec_child)). Overridden only by
-    /// [`DeviceDynOp`], which walks its box instead, so the CB walk is instantiated
-    /// once per erased shape rather than once per (shape, slot set); every other
-    /// impl keeps the default.
-    #[doc(hidden)]
-    fn cb_exec_as_child(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()>
-    where
-        Self: Sized,
-    {
-        cb::cb_exec_child_impl(self, ec, mode)
-    }
-
     /// This node's OWN [`CbCache`] home, if it is a CB-capable node (design v2).
     /// Default `None` (a node that never creates/homes a command buffer — host
     /// seams, transfers, the identity `Pipe`). CB-capable nodes (`AndThen`,
@@ -2309,7 +2317,14 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// — a [`Pipe`] or, for [`value`], the by-value `T` — and retains no closure.
     /// Same name, opposite timing: the eager build is what makes the resulting
     /// graph a closure-free, [`describe`](DeviceOp::describe)-able struct.
-    fn and_then<'op, U, F>(self, f: F) -> AndThen<DeviceDynOp<'op, Self::Shape, Self::Slots>, U>
+    #[allow(clippy::type_complexity)]
+    fn and_then<'op, U, F>(
+        self,
+        f: F,
+    ) -> Slotted<
+        AndThen<DeviceDynOp<'op, Self::Shape>, U::Bare>,
+        <U::Slots as SlotList>::Append<Self::Slots>,
+    >
     where
         Self: 'op,
         Self::Output: 'static,
@@ -2319,20 +2334,22 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     {
         let next = f(self.handle());
         let cbable_weight = self.cbable_weight() + next.cbable_weight();
-        AndThen {
+        // The node stores both halves BARE; the slot set lives only in the
+        // `Slotted` wrapper (see `DeviceOp::Bare`).
+        Slotted::new(AndThen {
             // The chain so far is ERASED: a graph's type then nests per COMBINATOR
             // in the source, not per link, so long chains neither hit the
             // `recursion_limit` (rustc proves `Send` through the whole nesting)
             // nor cost a debug build quadratic stack. Transparent at run time —
             // `DeviceDynOp` forwards every member.
-            source: self.erase(),
-            next,
+            source: self.into_dyn().retag(),
+            next: next.into_bare(),
             cb_cache: new_cb_cache(),
             cbable_weight,
             cb_addable_memo: PredMemo::new(),
             seam_memo: PredMemo::new(),
             spine_head_memo: PredMemo::new(),
-        }
+        })
     }
 
     /// Erase this op's concrete type into a [`DeviceDynOp`] of the same

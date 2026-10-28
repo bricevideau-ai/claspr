@@ -759,6 +759,10 @@ pub struct ImageWrite<'a, I: ImageEnqueue, E> {
 }
 
 impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = I;
 
     fn output_pipe(&self) -> Option<Pipe<I>> {
@@ -878,6 +882,10 @@ pub struct ImageRead<'a, I: ImageEnqueue, E> {
 }
 
 impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = I;
 
     fn output_pipe(&self) -> Option<Pipe<I>> {
@@ -996,6 +1004,10 @@ pub struct ImageCopy<Src: ImageEnqueue, Dst: ImageEnqueue> {
 }
 
 impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = (Src, Dst);
     type Shape = (crate::eager::Single<Src>, crate::eager::Single<Dst>);
 
@@ -1237,6 +1249,10 @@ pub struct ImageFill<I: ImageEnqueue, T: Copy> {
 }
 
 impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = I;
 
     fn output_pipe(&self) -> Option<Pipe<I>> {

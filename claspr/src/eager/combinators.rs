@@ -81,12 +81,13 @@ where
     S: DeviceOp,
     U: DeviceOp,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = U::Output;
     // The chain's downstream handle is the tail op's handle.
     type Shape = U::Shape;
-    // Both halves' slots: the new link's first, so appending costs the link's
-    // own (short) set, not the chain's.
-    type Slots = <U::Slots as SlotList>::Append<S::Slots>;
 
     fn output_pipe(&self) -> Option<Pipe<U::Output>> {
         self.next.output_pipe()
@@ -392,6 +393,10 @@ pub fn value<T: Send + Clone + 'static>(v: T) -> Value<T> {
 }
 
 impl<T: Send + Clone + 'static> DeviceOp for Value<T> {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = T;
     // By-value handle: downstream gets `T`, enabling build-time host compute.
     type Shape = ByValue<T>;
@@ -474,6 +479,10 @@ pub fn lift<T: crate::record::RecordableBuffer + Send + 'static>(v: T) -> Lift<T
 }
 
 impl<T: crate::record::RecordableBuffer + Send + 'static> DeviceOp for Lift<T> {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = T;
     // Default `Handle = Pipe<T>` — a resource flows, it isn't read at build.
 
@@ -563,6 +572,10 @@ pub fn forward<T: Send + 'static>(pipe: Pipe<T>) -> Forward<T> {
 }
 
 impl<T: Send + 'static> DeviceOp for Forward<T> {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = T;
 
     fn output_pipe(&self) -> Option<Pipe<T>> {
@@ -662,7 +675,7 @@ pub struct DeviceDynOp<'op, S: OpShape, Sl: SlotList = HNil> {
     // `DeviceOp` is dyn-compatible once its associated types are pinned (every
     // member is a `&self` method with no `Self: Sized` gate), so the vtable
     // carries every override — including the multi-output gather ones. The
-    // boxed op's slot set is pinned to `Dynamic` through `ForgetSlots`, and the
+    // boxed op's slot set is pinned to `Dynamic` through `Slotted<_, Dynamic>`, and the
     // erased op's own set is `Sl`: `bind` re-tags `Sl` over the SAME box.
     inner: Box<dyn DeviceOp<Output = S::Output, Shape = S, Slots = Dynamic> + 'op>,
     _slots: PhantomData<fn() -> Sl>,
@@ -685,7 +698,8 @@ where
         O: DeviceOp<Output = S::Output, Shape = S, Slots = Sl> + 'op,
     {
         DeviceDynOp {
-            inner: Box::new(ForgetSlots(op)),
+            // Box the BARE op: one vtable per node shape, whatever the slot set.
+            inner: Box::new(Slotted::<_, Dynamic>::new(op.into_bare())),
             _slots: PhantomData,
         }
     }
@@ -706,7 +720,7 @@ where
 // member left to its default body would run the default for every erased op.
 // The lint turns a forgotten one into a clippy error.
 #[warn(clippy::missing_trait_methods)]
-impl<S, Sl> DeviceOp for DeviceDynOp<'_, S, Sl>
+impl<'op, S, Sl> DeviceOp for DeviceDynOp<'op, S, Sl>
 where
     S: OpShape,
     Sl: SlotList,
@@ -716,6 +730,11 @@ where
     type Output = S::Output;
     type Shape = S;
     type Slots = Sl;
+    type Bare = DeviceDynOp<'op, S>;
+
+    fn into_bare(self) -> Self::Bare {
+        self.retag()
+    }
 
     fn output_pipe(&self) -> Option<Pipe<S::Output>> {
         self.inner.output_pipe()
@@ -785,12 +804,6 @@ where
         self.inner.cbable_weight()
     }
 
-    fn cb_exec_as_child(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        // Walk the BOX (`dyn DeviceOp`, slot set erased): one instantiation of the
-        // CB walk per shape, however many slot sets name this shape.
-        cb_exec_child_impl(&*self.inner, ec, mode)
-    }
-
     fn cb_cache(&self) -> Option<&CbCache> {
         self.inner.cb_cache()
     }
@@ -839,25 +852,40 @@ mod dyn_op_tests {
         assert_eq!(boxed_addr(&again), addr, "erase() re-boxed an erased op");
         let chained = again.and_then(forward);
         assert_eq!(
-            boxed_addr(&chained.source),
+            boxed_addr(&chained.0.source),
             addr,
             "and_then re-boxed an erased source"
         );
     }
 }
 
-/// `op` with its compile-time slot set forgotten ([`Dynamic`]) — the object a
-/// [`DeviceDynOp`] boxes, so the boxed `dyn DeviceOp` has ONE pinned set and the
-/// erased op can re-tag its own over the same box. Zero-cost newtype; every
-/// member forwards (`clippy::missing_trait_methods` enforced).
-pub(crate) struct ForgetSlots<O>(pub(crate) O);
+/// `op` under the compile-time slot set `Sl` instead of its own. Zero-cost
+/// newtype; every member forwards (`clippy::missing_trait_methods` enforced).
+///
+/// Combinators return their node as `Slotted<Node, Set>`: the node stores its
+/// children [bare](DeviceOp::Bare), so its type depends only on the graph's
+/// shape, and the set is carried here, outside it. A [`DeviceDynOp`] boxes
+/// `Slotted<_, Dynamic>`, so the boxed `dyn DeviceOp` has ONE pinned set and the
+/// erased op re-tags its own over the same box.
+pub struct Slotted<O, Sl: SlotList>(O, PhantomData<fn() -> Sl>);
+
+impl<O, Sl: SlotList> Slotted<O, Sl> {
+    pub(crate) fn new(op: O) -> Self {
+        Slotted(op, PhantomData)
+    }
+}
 
 // Every defaulted member forwards (see `DeviceDynOp`'s impl for why).
 #[warn(clippy::missing_trait_methods)]
-impl<O: DeviceOp> DeviceOp for ForgetSlots<O> {
+impl<O: DeviceOp, Sl: SlotList> DeviceOp for Slotted<O, Sl> {
     type Output = O::Output;
     type Shape = O::Shape;
-    type Slots = Dynamic;
+    type Slots = Sl;
+    type Bare = O::Bare;
+
+    fn into_bare(self) -> O::Bare {
+        self.0.into_bare()
+    }
 
     fn output_pipe(&self) -> Option<Pipe<O::Output>> {
         self.0.output_pipe()
@@ -934,12 +962,6 @@ impl<O: DeviceOp> DeviceOp for ForgetSlots<O> {
         self.0.cbable_weight()
     }
 
-    fn cb_exec_as_child(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        // Reached only as the box of a `DeviceDynOp`, which walks `dyn` directly;
-        // the default body, spelled out for the lint.
-        cb_exec_child_impl(self, ec, mode)
-    }
-
     fn cb_cache(&self) -> Option<&CbCache> {
         self.0.cb_cache()
     }
@@ -960,7 +982,7 @@ impl<O: DeviceOp> DeviceOp for ForgetSlots<O> {
         self.0.cb_spine_head_addable()
     }
 
-    fn into_dyn<'op>(self) -> DeviceDynOp<'op, O::Shape, Dynamic>
+    fn into_dyn<'op>(self) -> DeviceDynOp<'op, O::Shape, Sl>
     where
         Self: 'op,
         O::Output: 'static,
@@ -1016,6 +1038,10 @@ where
     O::Slots: RenameKey<From::Key, To::Key, I>,
     I: 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = O::Output;
     type Shape = O::Shape;
     type Slots = <O::Slots as RenameKey<From::Key, To::Key, I>>::Out;
@@ -1116,11 +1142,6 @@ where
         self.inner.cbable_weight()
     }
 
-    fn cb_exec_as_child(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
-        // NOT forwarded: the walk must see this node, whose slot walk translates.
-        cb_exec_child_impl(self, ec, mode)
-    }
-
     fn cb_cache(&self) -> Option<&CbCache> {
         self.inner.cb_cache()
     }
@@ -1181,6 +1202,10 @@ where
     S: DeviceOp,
     S::Output: Sync,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = Arc<S::Output>;
     type Slots = S::Slots;
 
@@ -1318,6 +1343,10 @@ where
     S: DeviceOp,
     S::Output: Clone,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = [S::Output; N];
     // An array of N element pipes; the downstream closure does
     // `let [a, b, c] = handle` and routes each pipe into its own branch.
@@ -1563,6 +1592,10 @@ macro_rules! impl_eager_bundle {
             // a multi-output branch's tuple via the recursive `FromCheckout` family.
             $(CheckoutsOf<$ty>: FromCheckout<<$ty as DeviceOp>::Output>,)+
         {
+            fn into_bare(self) -> Self {
+                self
+            }
+
             type Output = ( $(<$ty as DeviceOp>::Output,)+ );
             // A tuple of each branch's OWN build-time handle (NOT forced to a
             // pipe). For a buffer-producing branch that handle defaults to
@@ -2004,6 +2037,10 @@ where
     // impl, multi-output via the recursive tuple family).
     CheckoutsOf<U>: FromCheckout<U::Output>,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = Vec<U::Output>;
     // STRUCTURE-PRESERVING per-branch Checkouts: a `Vec` of each branch's OWN
     // `Checkouts` (a `Checkout<O>` for a single-output branch; its tuple for a
@@ -2240,6 +2277,10 @@ where
     T: Copy + Default + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
@@ -2299,6 +2340,10 @@ where
     S: DeviceOp<Output = S2>,
     S2: Send,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = S::Output;
     type Slots = S::Slots;
 
@@ -2666,6 +2711,10 @@ where
     // family, a single-output source via the identity impl.
     CheckoutsOf<S>: FromCheckout<S::Output>,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     type Output = S::Output;
     // `Seamed`: the downstream-facing handle is the source's per-branch PIPE shape
     // (via `SeamScatter::Handle`): `Pipe<O>` for a single-output source, a tuple of
@@ -2883,6 +2932,10 @@ where
     S::Output: Send + 'static,
     F: Fn(Result<crate::ProfilingInfo>) + Send + Sync + 'static,
 {
+    fn into_bare(self) -> Self {
+        self
+    }
+
     // Profiling is a host side-effect; the chain's data flow is unchanged.
     type Output = S::Output;
     type Slots = S::Slots;

@@ -34,14 +34,16 @@ phantom. Whole workspace + tests green on PoCL. **Writability verdict: OK.**
   over-declared tag demands a bind the runtime rejects.
 - GAP: leaves with slot operands (copy/fill/…) still report `HNil` → `sync` with
   them unbound type-checks (runtime catches), and `bind` on them is REJECTED.
-**BLOCKER-LEVEL COST: monomorphization.** Slot sets in node types make each
-structurally identical subgraph with different tags a distinct type: miniweather
-incremental build 6.2 s → 12.9 s, binary 3.6 → 9.9 MB (AndThen impls 16 → 140, one
-kernel `Op` type per call site instead of per kernel). gray-scott/cg +10–15%. A
-`cb_exec_as_child` hook (DeviceDynOp walks its `dyn` box) recovers only ~7%.
-Fix direction: nodes stay slot-free; the set lives only in an outermost phantom
-wrapper (launcher returns `Slotted<Op, Sl>`, `Op` loses `__claspr_Sl`;
-combinators store unwrapped/erased children). Not started.
+**Monomorphization — RESOLVED by bare nodes.** Slot sets inside node types made
+every structurally identical subgraph with other tags a new type (miniweather
+incremental 6.2 → 12.9 s, binary 3.6 → 9.9 MB). Now `DeviceOp::Bare`/`into_bare`
+(identity except kernel `Op` → `Op<.., HNil>`, `DeviceDynOp` → `<.., HNil>`,
+`Slotted` → inner): `and_then` stores BARE children and returns
+`Slotted<AndThen<..>, Set>` (`Slotted` = the old `ForgetSlots` generalized; the
+DeviceDynOp box holds `Slotted<Bare, Dynamic>`). vs main: incremental +3–11%
+(miniweather 6.6 s), binaries +2–7%. Still typed-child (correct, just not
+deduped): bundles, FanOut, Arced, ArcSplit, OnDevice, AndThenHost, Profiled,
+Renamed — convert the same way if they show up in a profile.
 
 ### Decisions — assessed & DECLINED (kept so future sessions don't re-litigate)
 
