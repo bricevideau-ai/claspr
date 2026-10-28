@@ -1010,15 +1010,12 @@ impl<O: DeviceOp, Sl: SlotList> DeviceOp for Slotted<O, Sl> {
 /// a renamed site's slot errors under `To`'s name (matched by tag NAME). Every
 /// binding path (set-once `bind`/`call`, `mutate_*`, the atomicity probe, the
 /// keyed cache's binding delta) goes through that walk.
-pub struct Renamed<O, From, To, I> {
+pub struct Renamed<O, From, To> {
     inner: O,
-    _tags: RenameTags<From, To, I>,
+    _tags: PhantomData<fn() -> (From, To)>,
 }
 
-/// `Renamed`'s phantom: the two tags and the inferred position of `From`.
-type RenameTags<From, To, I> = PhantomData<fn() -> (From, To, I)>;
-
-impl<O, From, To, I> Renamed<O, From, To, I> {
+impl<O, From, To> Renamed<O, From, To> {
     pub(crate) fn new(inner: O) -> Self {
         Renamed {
             inner,
@@ -1030,13 +1027,11 @@ impl<O, From, To, I> Renamed<O, From, To, I> {
 // Every defaulted member forwards (see `DeviceDynOp`'s impl for why); the lint
 // turns a forgotten one into a clippy error.
 #[warn(clippy::missing_trait_methods)]
-impl<O, From, To, I> DeviceOp for Renamed<O, From, To, I>
+impl<O, From, To> DeviceOp for Renamed<O, From, To>
 where
     O: DeviceOp,
     From: Tag,
     To: Tag<Value = From::Value>,
-    O::Slots: RenameKey<From::Key, To::Key, I>,
-    I: 'static,
 {
     fn into_bare(self) -> Self {
         self
@@ -1044,7 +1039,6 @@ where
 
     type Output = O::Output;
     type Shape = O::Shape;
-    type Slots = <O::Slots as RenameKey<From::Key, To::Key, I>>::Out;
 
     fn output_pipe(&self) -> Option<Pipe<O::Output>> {
         self.inner.output_pipe()
@@ -1186,15 +1180,15 @@ pub struct Arced<S: DeviceOp> {
 
 /// Wrap `source`'s output in `Arc`. ≈ cuda-oxide's `.arc()` (also available here
 /// as the [`arc`](DeviceOpExt::arc) method).
-pub fn arced<S: DeviceOp>(source: S) -> Arced<S>
+pub fn arced<S: DeviceOp>(source: S) -> Slotted<Arced<S::Bare>, S::Slots>
 where
     S::Output: Sync,
 {
-    Arced {
-        source,
+    Slotted::new(Arced {
+        source: source.into_bare(),
         out: Pipe::new(),
         cb_cache: new_cb_cache(),
-    }
+    })
 }
 
 impl<S> DeviceOp for Arced<S>
@@ -1207,7 +1201,6 @@ where
     }
 
     type Output = Arc<S::Output>;
-    type Slots = S::Slots;
 
     fn output_pipe(&self) -> Option<Pipe<Arc<S::Output>>> {
         Some(self.out.share())
@@ -1327,15 +1320,15 @@ where
 ///
 /// ≈ a homogeneous N-ary `unzip!` over a shared [`arc`](DeviceOpExt::arc)ed input
 /// (one producer, `N` read-only consumers).
-pub fn arc_split<const N: usize, S: DeviceOp>(source: S) -> ArcSplit<S, N>
+pub fn arc_split<const N: usize, S: DeviceOp>(source: S) -> Slotted<ArcSplit<S::Bare, N>, S::Slots>
 where
     S::Output: Clone,
 {
-    ArcSplit {
-        source,
+    Slotted::new(ArcSplit {
+        source: source.into_bare(),
         outs: std::array::from_fn(|_| Pipe::new()),
         cb_cache: new_cb_cache(),
-    }
+    })
 }
 
 impl<S, const N: usize> DeviceOp for ArcSplit<S, N>
@@ -1351,7 +1344,6 @@ where
     // An array of N element pipes; the downstream closure does
     // `let [a, b, c] = handle` and routes each pipe into its own branch.
     type Shape = [Single<S::Output>; N];
-    type Slots = S::Slots;
 
     fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
         // Multi-output storage is the per-element pipes; there is no single
@@ -1568,15 +1560,18 @@ macro_rules! impl_eager_bundle {
         #[doc = concat!("Construct an eager [`", stringify!($name),
             "`]. \u{2248} cuda-oxide's `zip!` at this fixed arity.")]
         #[allow(clippy::too_many_arguments)]
-        pub fn $ctor<$($ty: DeviceOp),+>($($field: $ty),+) -> $name<$($ty),+> {
+        pub fn $ctor<$($ty: DeviceOp),+>(
+            $($field: $ty),+
+        ) -> Slotted<$name<$(<$ty as DeviceOp>::Bare),+>, bundle_slots!($($ty),+)> {
             let cbable_weight = 0 $(+ $field.cbable_weight())+;
-            $name {
-                $($field,)+
+            // Branches stored BARE; their slots ride on `Slotted` (see `DeviceOp::Bare`).
+            Slotted::new($name {
+                $($field: $field.into_bare(),)+
                 cb_cache: new_cb_cache(),
                 cbable_weight,
                 cb_addable_memo: PredMemo::new(),
                 seam_memo: PredMemo::new(),
-            }
+            })
         }
 
         impl<$($ty: DeviceOp),+> DeviceOp for $name<$($ty),+>
@@ -1606,7 +1601,6 @@ macro_rules! impl_eager_bundle {
             // composite handle. Composing per-branch handles (rather than
             // flattening to pipes) is what carries computable host values down.
             type Shape = ( $(<$ty as DeviceOp>::Shape,)+ );
-            type Slots = bundle_slots!($($ty),+);
             // STRUCTURE-PRESERVING per-branch Checkouts: each branch contributes
             // its OWN `Checkouts` — NOT a single `Checkout` over the whole branch
             // output. A single-output branch contributes `Checkout<buf>`; a
@@ -1987,21 +1981,25 @@ pub struct FanOut<U: DeviceOp> {
 }
 
 /// Build a fan-out: `f` is called now for each input, producing the branch ops.
-pub fn fan_out<I, F, U>(inputs: Vec<I>, mut f: F) -> FanOut<U>
+///
+/// Every branch is the same op type, so binding a tag fills it in all of them:
+/// the fan-out's slot set is one branch's.
+pub fn fan_out<I, F, U>(inputs: Vec<I>, mut f: F) -> Slotted<FanOut<U::Bare>, U::Slots>
 where
     F: FnMut(I) -> U,
     U: DeviceOp,
 {
-    let ops: Vec<U> = inputs.into_iter().map(&mut f).collect();
+    // Branches stored BARE; their (shared) set rides on `Slotted`.
+    let ops: Vec<U::Bare> = inputs.into_iter().map(|i| f(i).into_bare()).collect();
     let cbable_weight = ops.iter().map(|op| op.cbable_weight()).sum();
-    FanOut {
+    Slotted::new(FanOut {
         ops,
         out: Pipe::new(),
         cb_cache: new_cb_cache(),
         cbable_weight,
         cb_addable_memo: PredMemo::new(),
         seam_memo: PredMemo::new(),
-    }
+    })
 }
 
 /// Method-call form of [`fan_out`]: `vec![a, b].fan_out(|i| value(i))`.
@@ -2010,14 +2008,14 @@ where
 /// the free-fn form stays available — use whichever fits the call site.
 pub trait DeviceFanOutExt<I>: Sized {
     /// See [`fan_out`] — this delegates to it.
-    fn fan_out<F, U>(self, f: F) -> FanOut<U>
+    fn fan_out<F, U>(self, f: F) -> Slotted<FanOut<U::Bare>, U::Slots>
     where
         F: FnMut(I) -> U,
         U: DeviceOp;
 }
 
 impl<I> DeviceFanOutExt<I> for Vec<I> {
-    fn fan_out<F, U>(self, f: F) -> FanOut<U>
+    fn fan_out<F, U>(self, f: F) -> Slotted<FanOut<U::Bare>, U::Slots>
     where
         F: FnMut(I) -> U,
         U: DeviceOp,
@@ -2048,9 +2046,6 @@ where
     // every branch re-arms its origin cell on drop and the fan-out replays. The
     // dynamic-`Vec` analog of `bundle!`'s per-branch tuple `Checkouts`.
     type Shape = FanOutShape<U::Shape>;
-    // Every branch is the same op type, so binding a tag fills it in all of
-    // them: the set is one branch's.
-    type Slots = U::Slots;
 
     fn output_pipe(&self) -> Option<Pipe<Vec<U::Output>>> {
         Some(self.out.share())
@@ -2345,7 +2340,6 @@ where
     }
 
     type Output = S::Output;
-    type Slots = S::Slots;
 
     fn output_pipe(&self) -> Option<Pipe<S::Output>> {
         Some(self.out.share())
@@ -2725,7 +2719,6 @@ where
     // `CheckoutSplit`) so every branch re-arms its origin cell across `sync`s — the
     // multi-home replay a single collapsed `collect_home` slot cannot carry.
     type Shape = Seamed<S::Shape>;
-    type Slots = S::Slots;
 
     fn output_pipe(&self) -> Option<Pipe<S::Output>> {
         // Single-output: `Some` of the storage pipe; multi-output: `None`
@@ -2910,15 +2903,15 @@ pub trait DeviceProfileExt: DeviceOp + Sized {
     /// **Reusable / replayable.** `cb` is `Fn` (not `FnOnce`), so a `.profiled()`
     /// graph can be `sync`'d repeatedly — the callback re-fires each run with that
     /// run's timestamps (borrow / `Arc` / clone captures, don't move-consume them).
-    fn profiled<F>(self, cb: F) -> Profiled<Self, F>
+    fn profiled<F>(self, cb: F) -> Slotted<Profiled<Self::Bare, F>, Self::Slots>
     where
         F: Fn(Result<crate::ProfilingInfo>) + Send + Sync + 'static,
     {
-        Profiled {
-            source: self,
+        Slotted::new(Profiled {
+            source: self.into_bare(),
             cb: Arc::new(cb),
             out: Pipe::new(),
-        }
+        })
     }
 }
 impl<T: DeviceOp> DeviceProfileExt for T {}
@@ -2938,7 +2931,6 @@ where
 
     // Profiling is a host side-effect; the chain's data flow is unchanged.
     type Output = S::Output;
-    type Slots = S::Slots;
 
     fn output_pipe(&self) -> Option<Pipe<S::Output>> {
         Some(self.out.share())

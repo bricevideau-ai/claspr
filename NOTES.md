@@ -32,18 +32,17 @@ phantom. Whole workspace + tests green on PoCL. **Writability verdict: OK.**
 - First fill must be `bind`/`call`; `mutate_*` (`&self`) can't change the type.
 - `erase_as` checks graph ⊆ declared only (superset needs type equality): an
   over-declared tag demands a bind the runtime rejects.
-- GAP: leaves with slot operands (copy/fill/…) still report `HNil` → `sync` with
-  them unbound type-checks (runtime catches), and `bind` on them is REJECTED.
+- Leaf operands are typed too (`Operand<Buf>`: buffer/pipe/checkout/`slot!`);
+  a free leaf fn returns `Slotted<Leaf, _>` (inherent methods need `into_bare`).
 **Monomorphization — RESOLVED by bare nodes.** Slot sets inside node types made
 every structurally identical subgraph with other tags a new type (miniweather
 incremental 6.2 → 12.9 s, binary 3.6 → 9.9 MB). Now `DeviceOp::Bare`/`into_bare`
 (identity except kernel `Op` → `Op<.., HNil>`, `DeviceDynOp` → `<.., HNil>`,
-`Slotted` → inner): `and_then` stores BARE children and returns
-`Slotted<AndThen<..>, Set>` (`Slotted` = the old `ForgetSlots` generalized; the
-DeviceDynOp box holds `Slotted<Bare, Dynamic>`). vs main: incremental +3–11%
-(miniweather 6.6 s), binaries +2–7%. Still typed-child (correct, just not
-deduped): bundles, FanOut, Arced, ArcSplit, OnDevice, AndThenHost, Profiled,
-Renamed — convert the same way if they show up in a profile.
+`Slotted` → inner): every combinator (and_then, bundles, fan_out, arced,
+arc_split, on_device, and_then_host, profiled, rename) stores BARE children and
+returns `Slotted<Node, Set>` (`Slotted` = the old `ForgetSlots` generalized; the
+DeviceDynOp box holds `Slotted<Bare, Dynamic>`). vs main: incremental +0–5%
+(miniweather 6.4 s), binaries +3–7%.
 
 ### Decisions — assessed & DECLINED (kept so future sessions don't re-litigate)
 

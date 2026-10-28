@@ -2409,25 +2409,31 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     ///
     /// Call as `.rename::<From, To, _>()` (the `_` is the inferred position of
     /// `From` in the op's slot set).
-    fn rename<From, To, I>(self) -> Renamed<Self, From, To, I>
+    #[allow(clippy::type_complexity)]
+    fn rename<From, To, I>(
+        self,
+    ) -> Slotted<
+        Renamed<Self::Bare, From, To>,
+        <Self::Slots as RenameKey<From::Key, To::Key, I>>::Out,
+    >
     where
         From: Tag,
         To: Tag<Value = From::Value>,
         Self::Slots: RenameKey<From::Key, To::Key, I>,
     {
-        Renamed::new(self)
+        Slotted::new(Renamed::new(self.into_bare()))
     }
 
     /// Route this op's `execute` to `device`'s default out-of-order queue
     /// instead of the chain's primary queue. Downstream stages resume on the
     /// parent's queue; the routed op's events are valid across both via
     /// OpenCL's shared-context event semantics. See [`OnDevice`].
-    fn on_device(self, device: &crate::Device) -> OnDevice<Self> {
-        OnDevice {
-            source: self,
+    fn on_device(self, device: &crate::Device) -> Slotted<OnDevice<Self::Bare>, Self::Slots> {
+        Slotted::new(OnDevice {
+            source: self.into_bare(),
             target: DeviceTarget::Concrete(device.clone()),
             out: Pipe::new(),
-        }
+        })
     }
 
     /// Like [`on_device`](Self::on_device) but names the target device by
@@ -2437,12 +2443,12 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     ///
     /// **Panics** at execute if `index` is out of range for `context().devices()`
     /// (same timing/semantics as resolving `ec.device_at(index)` did).
-    fn on_device_at(self, index: usize) -> OnDevice<Self> {
-        OnDevice {
-            source: self,
+    fn on_device_at(self, index: usize) -> Slotted<OnDevice<Self::Bare>, Self::Slots> {
+        Slotted::new(OnDevice {
+            source: self.into_bare(),
             target: DeviceTarget::Index(index),
             out: Pipe::new(),
-        }
+        })
     }
 
     /// Run a host closure on a borrowed [`Mappable::View`](crate::mappable::Mappable::View) of this op's output,
@@ -2457,7 +2463,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// clones its captures rather than move-consuming them (the right constraint
     /// for something that runs more than once). The engine keeps the closure in an
     /// `Arc` and hands the per-run worker thread its own owned handle.
-    fn and_then_host<F>(self, f: F) -> AndThenHost<Self>
+    fn and_then_host<F>(self, f: F) -> Slotted<AndThenHost<Self::Bare>, Self::Slots>
     where
         Self::Output: crate::mappable::Mappable,
         CheckoutsOf<Self>: SeamScatter<Value = Self::Output>,
@@ -2468,11 +2474,11 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     {
         // Wrap the no-context closure into the canonical `Fn(&Context, View)` shape
         // (see `HostSeamFn`), so `AndThenHost` is ONE type for both builders.
-        AndThenHost {
-            source: self,
+        Slotted::new(AndThenHost {
+            source: self.into_bare(),
             f: Arc::new(move |_ctx: &Context, view| f(view)),
             handle: <CheckoutsOf<Self> as SeamScatter>::empty_handle(),
-        }
+        })
     }
 
     /// Like [`and_then_host`](Self::and_then_host) but the closure also receives
@@ -2482,7 +2488,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// **Reusable / replayable** — same as [`and_then_host`](Self::and_then_host):
     /// the closure is `Fn`, the graph replays, and the closure re-runs each
     /// `sync` (borrow / `Arc` / clone captures, don't move-consume them).
-    fn and_then_host_with_context<F>(self, f: F) -> AndThenHost<Self>
+    fn and_then_host_with_context<F>(self, f: F) -> Slotted<AndThenHost<Self::Bare>, Self::Slots>
     where
         Self::Output: crate::mappable::Mappable,
         CheckoutsOf<Self>: SeamScatter<Value = Self::Output>,
@@ -2494,11 +2500,11 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             + Sync
             + 'static,
     {
-        AndThenHost {
-            source: self,
+        Slotted::new(AndThenHost {
+            source: self.into_bare(),
             f: Arc::new(f),
             handle: <CheckoutsOf<Self> as SeamScatter>::empty_handle(),
-        }
+        })
     }
 
     /// **Set-once** bind of ONE typed slot — **consuming + infallible**. Deposit
@@ -3104,7 +3110,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// method spelling of the free fn [`arced(self)`](arced). Equivalent in every
     /// way; pick whichever reads better at the call site
     /// (`upload(v).arc()` vs `arced(upload(v))`). Feeds [`arc_split`].
-    fn arc(self) -> Arced<Self>
+    fn arc(self) -> Slotted<Arced<Self::Bare>, Self::Slots>
     where
         Self::Output: Sync,
     {
