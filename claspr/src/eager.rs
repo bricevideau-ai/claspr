@@ -3980,7 +3980,7 @@ impl<T, M: MemMode> Pipe<DeviceSlice<T, M>> {
         M: HostWritable + Send + 'static,
         S: Into<UploadSource<T>>,
     {
-        write(self, src)
+        write(self, src).into_bare()
     }
 
     /// Read this piped buffer into a fresh `Vec<T>` — delegates to [`download`].
@@ -3990,7 +3990,7 @@ impl<T, M: MemMode> Pipe<DeviceSlice<T, M>> {
         T: Clone + Default + Send + 'static,
         M: HostReadable + Send + 'static,
     {
-        download(self)
+        download(self).into_bare()
     }
 
     /// Fill this piped buffer with `value` — delegates to [`fill`]. Same
@@ -4000,7 +4000,7 @@ impl<T, M: MemMode> Pipe<DeviceSlice<T, M>> {
         T: Copy + Send + Sync + 'static,
         M: Fillable + Send + 'static,
     {
-        fill(self, value)
+        fill(self, value).into_bare()
     }
 
     /// Device-to-device copy this piped buffer into `dst` — delegates to
@@ -4028,7 +4028,7 @@ impl<T, M: MemMode> Pipe<DeviceSliceUninit<T, M>> {
         M: HostWritable + Send + 'static,
         S: Into<UploadSource<T>>,
     {
-        write_device_uninit(self, src)
+        write_device_uninit(self, src).into_bare()
     }
 
     /// Fill this piped uninit buffer with `value` (transitioning it to init) —
@@ -4038,7 +4038,7 @@ impl<T, M: MemMode> Pipe<DeviceSliceUninit<T, M>> {
         T: Copy + Send + Sync + 'static,
         M: Fillable + Send + 'static,
     {
-        fill_device_uninit(self, value)
+        fill_device_uninit(self, value).into_bare()
     }
 }
 
@@ -4052,7 +4052,7 @@ impl<T, M: MemMode> Pipe<MappedSlice<T, M>> {
         M: HostWritable + Send + 'static,
         S: Into<UploadSource<T>>,
     {
-        write_mapped(self, src)
+        write_mapped(self, src).into_bare()
     }
 
     /// Fill this piped SVM buffer with `value` — delegates to
@@ -4063,7 +4063,7 @@ impl<T, M: MemMode> Pipe<MappedSlice<T, M>> {
         T: Copy + Send + Sync + 'static,
         M: Fillable + Send + 'static,
     {
-        fill_mapped(self, value)
+        fill_mapped(self, value).into_bare()
     }
 
     /// SVM→SVM copy this piped buffer into `dst` — delegates to
@@ -4073,7 +4073,7 @@ impl<T, M: MemMode> Pipe<MappedSlice<T, M>> {
     where
         MappedSlice<T, M>: crate::CopyTo<Dst>,
         <<MappedSlice<T, M> as crate::CopyTo<Dst>>::Op as DeviceEnqueue>::Output: CopyOutputs,
-        Dst: CopyOperand<Dst>,
+        Dst: Operand<Dst>,
     {
         copy_node(self, dst)
     }
@@ -4088,7 +4088,7 @@ impl<T, M: MemMode> Pipe<MappedSliceUninit<T, M>> {
         M: HostWritable + Send + 'static,
         S: Into<UploadSource<T>>,
     {
-        write_mapped_uninit(self, src)
+        write_mapped_uninit(self, src).into_bare()
     }
 
     /// Fill this piped uninit mapped buffer with `value` — delegates to
@@ -4098,7 +4098,7 @@ impl<T, M: MemMode> Pipe<MappedSliceUninit<T, M>> {
         T: Copy + Send + Sync + 'static,
         M: Fillable + Send + 'static,
     {
-        fill_mapped_uninit(self, value)
+        fill_mapped_uninit(self, value).into_bare()
     }
 }
 
@@ -4111,7 +4111,7 @@ impl<T, M: MemMode> Pipe<USMSliceUninit<T, M>> {
         M: Send + 'static,
         S: Into<UploadSource<T>>,
     {
-        write_usm_uninit(self, src)
+        write_usm_uninit(self, src).into_bare()
     }
 
     /// Fill this piped uninit USM buffer with `value` — delegates to
@@ -4121,7 +4121,7 @@ impl<T, M: MemMode> Pipe<USMSliceUninit<T, M>> {
         T: Copy + Send + Sync + 'static,
         M: Send + 'static,
     {
-        fill_usm_uninit(self, value)
+        fill_usm_uninit(self, value).into_bare()
     }
 }
 

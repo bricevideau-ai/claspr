@@ -1590,25 +1590,34 @@ fn image_copy_op<Src: ImageEnqueue, Dst: ImageEnqueue>(
 }
 
 /// Pipe-fed image→image copy for a graph: both operands accept a concrete image OR
-/// an upstream `Pipe`/`Checkout`/`slot!` of one (`impl Into<Input<_>>`), so an image
-/// copy can chain off `and_then` (unlike the concrete `copy_to`, which consumes a
-/// concrete image by value). The copy extent is derived at execute from the lent
-/// src image. `Output = (Src, Dst)`: both images rebind out for reuse.
-pub fn eager_image_copy<Src, Dst, S, D>(src: S, dst: D) -> ImageCopy<Src, Dst>
+/// an upstream `Pipe`/`slot!` of one (see [`Operand`](crate::eager::Operand)), so an
+/// image copy can chain off `and_then` (unlike the concrete `copy_to`, which
+/// consumes a concrete image by value). The copy extent is derived at execute from
+/// the lent src image. `Output = (Src, Dst)`: both images rebind out for reuse.
+#[allow(clippy::type_complexity)]
+pub fn eager_image_copy<Src, Dst, S, D>(
+    src: S,
+    dst: D,
+) -> crate::eager::Slotted<
+    ImageCopy<Src, Dst>,
+    <<S as crate::eager::Operand<Src>>::Slots as crate::eager::SlotList>::Append<
+        <D as crate::eager::Operand<Dst>>::Slots,
+    >,
+>
 where
     Src: ImageEnqueue,
     Dst: ImageEnqueue,
-    S: Into<Input<Src>>,
-    D: Into<Input<Dst>>,
+    S: crate::eager::Operand<Src>,
+    D: crate::eager::Operand<Dst>,
 {
-    ImageCopy {
-        src: src.into(),
-        dst: dst.into(),
+    crate::eager::Slotted::new(ImageCopy {
+        src: src.into_operand_input(),
+        dst: dst.into_operand_input(),
         region: None, // derived at execute from the lent src
         src_pipe: Pipe::new(),
         dst_pipe: Pipe::new(),
         cb_cache: new_cb_cache(),
-    }
+    })
 }
 
 fn image_fill_op<I: ImageEnqueue, T: Copy>(

@@ -258,7 +258,7 @@ fn concrete_consumed_by_download_is_rehomed() {
 
     // A graph that downloads buf. The device buffer is rehomed on the run's drop
     // (its output is a host Vec; the buffer itself returns to its concrete cell).
-    let g = download::<u32, _>(buf);
+    let g = download::<u32, _, _>(buf);
     let out = g.sync(&ctx).expect("download once");
     assert!(out.iter().all(|&v| v == 9));
     drop(out);

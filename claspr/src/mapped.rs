@@ -457,7 +457,7 @@ impl<T, M: MemMode> MappedSlice<T, M> {
         T: Copy + Send + Sync + 'static,
         M: Fillable + Send + 'static,
     {
-        crate::eager::fill_mapped(self, value)
+        crate::eager::DeviceOp::into_bare(crate::eager::fill_mapped(self, value))
     }
 
     /// SVM→SVM copy from `self` into `dst` — wraps `clEnqueueSVMMemcpy`
@@ -479,7 +479,7 @@ impl<T, M: MemMode> MappedSlice<T, M> {
         Self: crate::CopyTo<Dst>,
         <<Self as crate::CopyTo<Dst>>::Op as crate::eager::DeviceEnqueue>::Output:
             crate::eager::CopyOutputs,
-        Dst: crate::eager::CopyOperand<Dst>,
+        Dst: crate::eager::Operand<Dst>,
     {
         crate::eager::copy_node(self, dst)
     }
@@ -508,7 +508,7 @@ impl<T, M: MemMode> MappedSlice<T, M> {
         M: HostWritable + Send + 'static,
         S: Into<crate::transfer::UploadSource<T>>,
     {
-        crate::eager::write_mapped(self, src)
+        crate::eager::DeviceOp::into_bare(crate::eager::write_mapped(self, src))
     }
 
     /// Blocking, **borrowing** host→SVM upload — the synchronous

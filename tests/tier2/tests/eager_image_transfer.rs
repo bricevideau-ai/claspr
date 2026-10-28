@@ -25,7 +25,7 @@ fn image2d_round_trip() {
     let pixels: Vec<u32> = (0..(W * H)).map(|i| 0xCAFE_0000 | i).collect();
 
     let result = image_upload::<Image2D<ReadWrite, R32Uint>>(pixels.clone(), (W, H))
-        .and_then(image_download::<Image2D<ReadWrite, R32Uint>>)
+        .and_then(image_download::<Image2D<ReadWrite, R32Uint>, _>)
         .sync(&ctx)
         .expect("chain");
 
@@ -40,7 +40,7 @@ fn image1d_round_trip() {
     let pixels: Vec<u32> = (0..W).map(|i| i * 13 + 5).collect();
 
     let result = image_upload::<Image1D<ReadWrite, R32Uint>>(pixels.clone(), W)
-        .and_then(image_download::<Image1D<ReadWrite, R32Uint>>)
+        .and_then(image_download::<Image1D<ReadWrite, R32Uint>, _>)
         .sync(&ctx)
         .expect("chain");
 
@@ -57,7 +57,7 @@ fn image3d_round_trip() {
     let pixels: Vec<u32> = (0..(W * H * D)).map(|i| i + 1000).collect();
 
     let result = image_upload::<Image3D<ReadWrite, R32Uint>>(pixels.clone(), (W, H, D))
-        .and_then(image_download::<Image3D<ReadWrite, R32Uint>>)
+        .and_then(image_download::<Image3D<ReadWrite, R32Uint>, _>)
         .sync(&ctx)
         .expect("chain");
 
@@ -74,7 +74,7 @@ fn image1d_array_round_trip() {
     let pixels: Vec<u32> = (0..(W * LAYERS)).map(|i| 0xA000 + i).collect();
 
     let result = image_upload::<Image1DArray<ReadWrite, R32Uint>>(pixels.clone(), (W, LAYERS))
-        .and_then(image_download::<Image1DArray<ReadWrite, R32Uint>>)
+        .and_then(image_download::<Image1DArray<ReadWrite, R32Uint>, _>)
         .sync(&ctx)
         .expect("chain");
 
@@ -92,7 +92,7 @@ fn image2d_array_round_trip() {
     let pixels: Vec<u32> = (0..(W * H * LAYERS)).map(|i| 0xB000 + i).collect();
 
     let result = image_upload::<Image2DArray<ReadWrite, R32Uint>>(pixels.clone(), (W, H, LAYERS))
-        .and_then(image_download::<Image2DArray<ReadWrite, R32Uint>>)
+        .and_then(image_download::<Image2DArray<ReadWrite, R32Uint>, _>)
         .sync(&ctx)
         .expect("chain");
 

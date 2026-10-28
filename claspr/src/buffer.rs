@@ -540,7 +540,7 @@ where
     where
         S: Into<crate::transfer::UploadSource<T>>,
     {
-        crate::eager::write(self, src)
+        crate::eager::DeviceOp::into_bare(crate::eager::write(self, src))
     }
 
     /// Blocking, **borrowing** host→device upload — the synchronous
@@ -621,7 +621,7 @@ impl<T, M: MemMode + HostReadable> DeviceSlice<T, M> {
         T: Send + 'static,
         M: Send + 'static,
     {
-        crate::eager::read_into(self, dst)
+        crate::eager::DeviceOp::into_bare(crate::eager::read_into(self, dst))
     }
 
     /// Begin a host read map of this buffer (zero-copy alternative to
@@ -693,7 +693,7 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
         T: Send + 'static,
         M: Send + 'static,
     {
-        crate::eager::transfer_to_device(self, device)
+        crate::eager::DeviceOp::into_bare(crate::eager::transfer_to_device(self, device))
     }
 
     /// Fill this buffer's contents with `value` repeated for every element
@@ -714,7 +714,7 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
         T: Copy + Send + Sync + 'static,
         M: Fillable + Send + 'static,
     {
-        crate::eager::fill(self, value)
+        crate::eager::DeviceOp::into_bare(crate::eager::fill(self, value))
     }
 }
 

@@ -722,12 +722,11 @@ fn buffer_slot_in_write_position_binds_and_rearms() {
     let ks = kernels::kernels(&ctx).expect("load kernels");
     let ks = &ks;
 
-    let g = write(slot!(Buf).into_slot_input(), vec![5u32; N])
+    let g = write(slot!(Buf), vec![5u32; N])
         .and_then(|b| ks.scale_u32([N], b, 2u32))
         .and_then(download);
 
-    g.mutate_bind(Buf(seeded(&ctx, 0)))
-        .expect("bind Buf in a write position");
+    let g = g.bind(Buf(seeded(&ctx, 0)));
     let co1 = g.sync(&ctx).expect("run 1");
     assert!(
         co1.iter().all(|&v| v == 10),
@@ -754,10 +753,9 @@ fn buffer_slot_in_write_position_binds_and_rearms() {
 fn buffer_slot_in_download_position_binds_and_rearms() {
     let Some(ctx) = ctx() else { return };
 
-    let g = download(slot!(Buf).into_slot_input());
+    let g = download(slot!(Buf));
 
-    g.mutate_bind(Buf(seeded(&ctx, 7)))
-        .expect("bind Buf in a download position");
+    let g = g.bind(Buf(seeded(&ctx, 7)));
     let co = g.sync(&ctx).expect("run 1");
     assert!(
         co.iter().all(|&v| v == 7),

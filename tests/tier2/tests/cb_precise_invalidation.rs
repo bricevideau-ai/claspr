@@ -315,12 +315,13 @@ fn fill_slot_position_mutate_clears_its_cb() {
     let ks = &ks;
 
     // weight-2 CB capturing the Buf slot in a FILL position: fill(Buf, 7) -> scale(*3).
-    let g = fill(slot!(Buf).into_slot_input(), 7u32).and_then(|b| ks.scale_u32([N], b, 3u32));
+    let g = fill(slot!(Buf), 7u32).and_then(|b| ks.scale_u32([N], b, 3u32));
     if has_cb {
         assert_eq!(g.cbable_weight(), 2, "fill + scale = weight 2");
     }
 
-    g.mutate_bind(Buf(seeded(&ctx, 0))).expect("bind Buf");
+    // Type-changing bind of the fill slot (statically tracked), then re-bind below.
+    let g = g.bind(Buf(seeded(&ctx, 0)));
     let co = g.sync(&ctx).expect("sync 1");
     let r1 = co.map().wait().expect("read 1");
     assert!(
@@ -387,7 +388,7 @@ fn image_slot_mutate_clears_its_cb() {
     let mid = RgbaImg::alloc(&ctx, W, H).expect("alloc mid");
 
     let g = bundle2(
-        eager_image_copy(slot!(SrcImg).into_slot_input(), dst),
+        eager_image_copy(slot!(SrcImg), dst),
         eager_image_copy(other, mid),
     );
     if has_cb {
@@ -404,7 +405,7 @@ fn image_slot_mutate_clears_its_cb() {
     };
 
     // Bind SrcImg = src_a, sync: dst must carry src_a's pixels. Homes the CB.
-    g.mutate_bind(SrcImg(src_a)).expect("bind src_a");
+    let g = g.bind(SrcImg(src_a));
     let got_a = read_dst(&g, &ctx);
     assert!(
         got_a.iter().all(|&px| px == [11, 12, 13, 14]),

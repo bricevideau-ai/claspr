@@ -69,17 +69,18 @@ pub struct Fill<T: Copy, M: MemMode> {
 }
 
 /// Build a fill leaf over an upstream buffer.
-pub fn fill<T, M>(buf: impl Into<Input<DeviceSlice<T, M>>>, value: T) -> Fill<T, M>
+pub fn fill<T, M, B>(buf: B, value: T) -> Slotted<Fill<T, M>, B::Slots>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
+    B: Operand<DeviceSlice<T, M>>,
 {
-    Fill {
-        buf: buf.into(),
+    Slotted::new(Fill {
+        buf: buf.into_operand_input(),
         value,
         out: Pipe::new(),
         cb_cache: new_cb_cache(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for Fill<T, M>
@@ -545,15 +546,16 @@ pub struct Download<T, M: MemMode = ReadWrite> {
 }
 
 /// Build a download leaf over an upstream buffer.
-pub fn download<T, M>(buf: impl Into<Input<DeviceSlice<T, M>>>) -> Download<T, M>
+pub fn download<T, M, B>(buf: B) -> Slotted<Download<T, M>, B::Slots>
 where
     T: Clone + Default + Send + 'static,
     M: MemMode + HostReadable + Send + 'static,
+    B: Operand<DeviceSlice<T, M>>,
 {
-    Download {
-        buf: buf.into(),
+    Slotted::new(Download {
+        buf: buf.into_operand_input(),
         out: Pipe::new(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for Download<T, M>
@@ -677,19 +679,17 @@ pub struct ReadInto<'d, T, M: MemMode = ReadWrite> {
 
 /// Build a read-into leaf: read `buf` into the caller slice `dst`. See
 /// [`ReadInto`].
-pub fn read_into<T, M>(
-    buf: impl Into<Input<DeviceSlice<T, M>>>,
-    dst: &mut [T],
-) -> ReadInto<'_, T, M>
+pub fn read_into<T, M, B>(buf: B, dst: &mut [T]) -> Slotted<ReadInto<'_, T, M>, B::Slots>
 where
     T: Send + 'static,
     M: MemMode + HostReadable + Send + 'static,
+    B: Operand<DeviceSlice<T, M>>,
 {
-    ReadInto {
-        buf: buf.into(),
+    Slotted::new(ReadInto {
+        buf: buf.into_operand_input(),
         dst: Mutex::new(dst),
         out: Pipe::new(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for ReadInto<'_, T, M>
@@ -786,7 +786,7 @@ where
 /// is a buffer-*consuming* leaf: it resolves the upstream `DeviceSlice` value,
 /// reads its `cl_mem`, and enqueues a migrate. That puts it in the same family as
 /// [`download`] / [`fill`] / [`copy_to`](crate::eager::eager_copy_to) — every member
-/// takes `impl Into<Input<DeviceSlice<…>>>` as its dataflow input — and mirrors
+/// takes an `Operand<DeviceSlice<…>>` as its dataflow input — and mirrors
 /// the old free-fn signature `transfer_to_device(buf, dev)` 1:1. A method form
 /// would have to pin `S::Output = DeviceSlice<T>` (like [`OnDevice`]) yet still
 /// resolve the value (unlike `OnDevice`), fighting both patterns; the leaf form
@@ -809,19 +809,20 @@ pub struct TransferToDevice<T, M: MemMode = ReadWrite> {
 /// Build a transfer-to-device leaf: migrate `buf` onto `device`'s default OOO
 /// queue, yielding the migrated buffer. See [`TransferToDevice`] for semantics
 /// and the rationale for the leaf (free-fn) shape over a wrapping method.
-pub fn transfer_to_device<T, M>(
-    buf: impl Into<Input<DeviceSlice<T, M>>>,
+pub fn transfer_to_device<T, M, B>(
+    buf: B,
     device: &crate::Device,
-) -> TransferToDevice<T, M>
+) -> Slotted<TransferToDevice<T, M>, B::Slots>
 where
     T: Send + 'static,
     M: MemMode + Send + 'static,
+    B: Operand<DeviceSlice<T, M>>,
 {
-    TransferToDevice {
-        buf: buf.into(),
+    Slotted::new(TransferToDevice {
+        buf: buf.into_operand_input(),
         target: DeviceTarget::Concrete(device.clone()),
         out: Pipe::new(),
-    }
+    })
 }
 
 /// Build a transfer-to-device leaf targeting the device at `index` in the
@@ -830,19 +831,20 @@ where
 ///
 /// **Panics** at execute if `index` is out of range for `context().devices()`
 /// (same timing/semantics as resolving `ec.device_at(index)` did).
-pub fn transfer_to_device_at<T, M>(
-    buf: impl Into<Input<DeviceSlice<T, M>>>,
+pub fn transfer_to_device_at<T, M, B>(
+    buf: B,
     index: usize,
-) -> TransferToDevice<T, M>
+) -> Slotted<TransferToDevice<T, M>, B::Slots>
 where
     T: Send + 'static,
     M: MemMode + Send + 'static,
+    B: Operand<DeviceSlice<T, M>>,
 {
-    TransferToDevice {
-        buf: buf.into(),
+    Slotted::new(TransferToDevice {
+        buf: buf.into_operand_input(),
         target: DeviceTarget::Index(index),
         out: Pipe::new(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for TransferToDevice<T, M>
@@ -926,20 +928,18 @@ pub struct FillDeviceUninit<T: Copy, M: MemMode> {
 }
 
 /// Build an eager fill-from-uninit leaf over a `DeviceSliceUninit`.
-pub fn fill_device_uninit<T, M>(
-    uninit: impl Into<Input<DeviceSliceUninit<T, M>>>,
-    value: T,
-) -> FillDeviceUninit<T, M>
+pub fn fill_device_uninit<T, M, B>(uninit: B, value: T) -> Slotted<FillDeviceUninit<T, M>, B::Slots>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
+    B: Operand<DeviceSliceUninit<T, M>>,
 {
-    FillDeviceUninit {
-        uninit: uninit.into(),
+    Slotted::new(FillDeviceUninit {
+        uninit: uninit.into_operand_input(),
         value,
         out: Pipe::new(),
         cb_cache: new_cb_cache(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for FillDeviceUninit<T, M>
@@ -1044,20 +1044,18 @@ pub struct FillMappedUninit<T: Copy, M: MemMode> {
 }
 
 /// Build an eager fill-from-uninit leaf over a `MappedSliceUninit`.
-pub fn fill_mapped_uninit<T, M>(
-    uninit: impl Into<Input<MappedSliceUninit<T, M>>>,
-    value: T,
-) -> FillMappedUninit<T, M>
+pub fn fill_mapped_uninit<T, M, B>(uninit: B, value: T) -> Slotted<FillMappedUninit<T, M>, B::Slots>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
+    B: Operand<MappedSliceUninit<T, M>>,
 {
-    FillMappedUninit {
-        uninit: uninit.into(),
+    Slotted::new(FillMappedUninit {
+        uninit: uninit.into_operand_input(),
         value,
         out: Pipe::new(),
         cb_cache: new_cb_cache(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for FillMappedUninit<T, M>
@@ -1166,19 +1164,17 @@ pub struct FillUsmUninit<T: Copy, M: MemMode> {
 }
 
 /// Build an eager fill-from-uninit leaf over a `USMSliceUninit`.
-pub fn fill_usm_uninit<T, M>(
-    uninit: impl Into<Input<USMSliceUninit<T, M>>>,
-    value: T,
-) -> FillUsmUninit<T, M>
+pub fn fill_usm_uninit<T, M, B>(uninit: B, value: T) -> Slotted<FillUsmUninit<T, M>, B::Slots>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Send + 'static,
+    B: Operand<USMSliceUninit<T, M>>,
 {
-    FillUsmUninit {
-        uninit: uninit.into(),
+    Slotted::new(FillUsmUninit {
+        uninit: uninit.into_operand_input(),
         value,
         out: Pipe::new(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for FillUsmUninit<T, M>
@@ -1232,20 +1228,21 @@ pub struct WriteDeviceUninit<T, M: MemMode> {
 }
 
 /// Build an eager write-from-uninit leaf over a `DeviceSliceUninit`.
-pub fn write_device_uninit<T, M, S>(
-    uninit: impl Into<Input<DeviceSliceUninit<T, M>>>,
+pub fn write_device_uninit<T, M, S, B>(
+    uninit: B,
     src: S,
-) -> WriteDeviceUninit<T, M>
+) -> Slotted<WriteDeviceUninit<T, M>, B::Slots>
 where
     T: Send + Sync + 'static,
     M: MemMode + HostWritable + Send + 'static,
     S: Into<UploadSource<T>>,
+    B: Operand<DeviceSliceUninit<T, M>>,
 {
-    WriteDeviceUninit {
-        uninit: uninit.into(),
+    Slotted::new(WriteDeviceUninit {
+        uninit: uninit.into_operand_input(),
         src: src.into(),
         out: Pipe::new(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for WriteDeviceUninit<T, M>
@@ -1328,17 +1325,18 @@ pub struct WriteDevice<T, M: MemMode = ReadWrite> {
 /// Build an eager in-place write leaf over an existing `DeviceSlice` (concrete or
 /// piped). `M: HostWritable` — same gate as the closure layer's
 /// `device_slice_write`.
-pub fn write<T, M, S>(buf: impl Into<Input<DeviceSlice<T, M>>>, src: S) -> WriteDevice<T, M>
+pub fn write<T, M, S, B>(buf: B, src: S) -> Slotted<WriteDevice<T, M>, B::Slots>
 where
     T: Send + Sync + 'static,
     M: MemMode + HostWritable + Send + 'static,
     S: Into<UploadSource<T>>,
+    B: Operand<DeviceSlice<T, M>>,
 {
-    WriteDevice {
-        buf: buf.into(),
+    Slotted::new(WriteDevice {
+        buf: buf.into_operand_input(),
         src: src.into(),
         out: Pipe::new(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for WriteDevice<T, M>
@@ -1444,20 +1442,21 @@ pub struct WriteMappedUninit<T, M: MemMode> {
 }
 
 /// Build an eager write-from-uninit leaf over a `MappedSliceUninit`.
-pub fn write_mapped_uninit<T, M, S>(
-    uninit: impl Into<Input<MappedSliceUninit<T, M>>>,
+pub fn write_mapped_uninit<T, M, S, B>(
+    uninit: B,
     src: S,
-) -> WriteMappedUninit<T, M>
+) -> Slotted<WriteMappedUninit<T, M>, B::Slots>
 where
     T: Send + Sync + 'static,
     M: MemMode + HostWritable + Send + 'static,
     S: Into<UploadSource<T>>,
+    B: Operand<MappedSliceUninit<T, M>>,
 {
-    WriteMappedUninit {
-        uninit: uninit.into(),
+    Slotted::new(WriteMappedUninit {
+        uninit: uninit.into_operand_input(),
         src: src.into(),
         out: Pipe::new(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for WriteMappedUninit<T, M>
@@ -1527,17 +1526,18 @@ pub struct FillMapped<T: Copy, M: MemMode> {
 }
 
 /// Build an SVM fill leaf over an existing `MappedSlice` (concrete or piped).
-pub fn fill_mapped<T, M>(buf: impl Into<Input<MappedSlice<T, M>>>, value: T) -> FillMapped<T, M>
+pub fn fill_mapped<T, M, B>(buf: B, value: T) -> Slotted<FillMapped<T, M>, B::Slots>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Fillable + Send + 'static,
+    B: Operand<MappedSlice<T, M>>,
 {
-    FillMapped {
-        buf: buf.into(),
+    Slotted::new(FillMapped {
+        buf: buf.into_operand_input(),
         value,
         out: Pipe::new(),
         cb_cache: new_cb_cache(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for FillMapped<T, M>
@@ -1689,17 +1689,18 @@ pub struct WriteMapped<T, M: MemMode = ReadWrite> {
 
 /// Build an in-place SVM write leaf over an existing `MappedSlice` (concrete or
 /// piped). `M: HostWritable` — same gate as [`MappedSlice::write`].
-pub fn write_mapped<T, M, S>(buf: impl Into<Input<MappedSlice<T, M>>>, src: S) -> WriteMapped<T, M>
+pub fn write_mapped<T, M, S, B>(buf: B, src: S) -> Slotted<WriteMapped<T, M>, B::Slots>
 where
     T: Send + Sync + 'static,
     M: MemMode + HostWritable + Send + 'static,
     S: Into<UploadSource<T>>,
+    B: Operand<MappedSlice<T, M>>,
 {
-    WriteMapped {
-        buf: buf.into(),
+    Slotted::new(WriteMapped {
+        buf: buf.into_operand_input(),
         src: src.into(),
         out: Pipe::new(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for WriteMapped<T, M>
@@ -1792,20 +1793,18 @@ pub struct WriteUsmUninit<T: Copy, M: MemMode> {
 }
 
 /// Build an eager write-from-uninit leaf over a `USMSliceUninit`.
-pub fn write_usm_uninit<T, M, S>(
-    uninit: impl Into<Input<USMSliceUninit<T, M>>>,
-    src: S,
-) -> WriteUsmUninit<T, M>
+pub fn write_usm_uninit<T, M, S, B>(uninit: B, src: S) -> Slotted<WriteUsmUninit<T, M>, B::Slots>
 where
     T: Copy + Send + Sync + 'static,
     M: MemMode + Send + 'static,
     S: Into<UploadSource<T>>,
+    B: Operand<USMSliceUninit<T, M>>,
 {
-    WriteUsmUninit {
-        uninit: uninit.into(),
+    Slotted::new(WriteUsmUninit {
+        uninit: uninit.into_operand_input(),
         src: src.into(),
         out: Pipe::new(),
-    }
+    })
 }
 
 impl<T, M> DeviceOp for WriteUsmUninit<T, M>
@@ -2165,15 +2164,16 @@ pub struct ImageDownloadEager<I: ImageHostTransfer> {
 }
 
 /// Build an eager image-download leaf over an upstream image.
-pub fn image_download<I>(img: impl Into<Input<I>>) -> ImageDownloadEager<I>
+pub fn image_download<I, B>(img: B) -> Slotted<ImageDownloadEager<I>, B::Slots>
 where
     I: ImageHostTransfer + crate::image::ImageEnqueue + Send + 'static,
     I::Pixel: Default + Copy + Send + 'static,
+    B: Operand<I>,
 {
-    ImageDownloadEager {
-        img: img.into(),
+    Slotted::new(ImageDownloadEager {
+        img: img.into_operand_input(),
         out: Pipe::new(),
-    }
+    })
 }
 
 impl<I> DeviceOp for ImageDownloadEager<I>
@@ -2262,12 +2262,13 @@ macro_rules! impl_acquire_view {
         }
 
         #[doc = concat!("Build an eager `", stringify!($Op), "` leaf.")]
-        pub fn $ctor<T, M>(buf: impl Into<Input<$In>>) -> $Op<T, M>
+        pub fn $ctor<T, M, B>(buf: B) -> Slotted<$Op<T, M>, B::Slots>
         where
             T: $($tb)+,
             M: $($mb)+,
+            B: Operand<$In>,
         {
-            $Op { buf: buf.into(), out: Pipe::new() }
+            Slotted::new($Op { buf: buf.into_operand_input(), out: Pipe::new() })
         }
 
         impl<T, M> DeviceOp for $Op<T, M>
@@ -2320,13 +2321,14 @@ macro_rules! impl_release_view {
         }
 
         #[doc = concat!("Build an eager `", stringify!($Op), "` leaf.")]
-        pub fn $ctor<T, M, A>(view: impl Into<Input<$View>>) -> $Op<T, M, A>
+        pub fn $ctor<T, M, A, B>(view: B) -> Slotted<$Op<T, M, A>, B::Slots>
         where
             T: Send + 'static,
             M: $($mb)+,
             A: MapAccess,
+            B: Operand<$View>,
         {
-            $Op { view: view.into(), out: Pipe::new() }
+            Slotted::new($Op { view: view.into_operand_input(), out: Pipe::new() })
         }
 
         impl<T, M, A> DeviceOp for $Op<T, M, A>
@@ -2600,34 +2602,39 @@ where
     cb_cache: CbCache,
 }
 
-/// A value usable as a [`eager_copy_to`] **operand**: a concrete buffer, an
-/// upstream [`Pipe`], a [`Checkout`], or a [`slot!`](crate::slot)`(Tag)` hole. It
-/// resolves to an `Input<Buf>` over the concrete buffer family `Buf` the copy
-/// then drives (via `Buf: CopyTo<…>`).
+/// A value usable as a buffer/image **operand** of an eager leaf ([`fill`],
+/// [`download`], [`write()`], [`eager_copy_to`], the host-view and image leaves, …):
+/// a concrete buffer or image, an upstream [`Pipe`], a [`Checkout`] (buffers), or a
+/// [`slot!`](crate::slot)`(Tag)` hole. It resolves to an `Input<Buf>` over the
+/// concrete buffer family `Buf` the leaf then drives, and reports the slots it
+/// contributes to the leaf's compile-time slot set ([`Operand::Slots`]).
 ///
 /// ## Why a dedicated trait (not `Into<Input<Buf>>`)
 ///
 /// `SlotHandle<Tg>` cannot impl `Into<Input<Tg::Value>>` — the blanket
 /// `From<T> for Input<T>` blocks it under coherence (the compiler can't rule out
-/// `Tg::Value == SlotHandle<Tg>`). `CopyOperand` is a distinct nominal trait with
-/// no such clash, so a slot plugs straight into a copy operand position
-/// (`eager_copy_to(slot!(Src), slot!(Dst))`) exactly as it already does in a
-/// kernel-arg position via [`ToInput`]. Concrete buffers / pipes / checkouts route
-/// through their existing `Into<Input<_>>` conversions.
-pub trait CopyOperand<Buf> {
+/// `Tg::Value == SlotHandle<Tg>`). A slot reaching a leaf through
+/// `SlotHandle::into_slot_input` would also erase its tag, so the leaf's graph
+/// type would claim "no slots". `Operand` is a distinct nominal trait with no such
+/// clash, and it carries [`Operand::Slots`], so a slot plugs straight into a leaf
+/// operand position (`fill(slot!(Buf), 0)`, `eager_copy_to(slot!(Src),
+/// slot!(Dst))`) with its tag tracked, exactly as it does in a kernel-arg position
+/// via [`ToInput`]. Concrete buffers / pipes / checkouts route through the same
+/// `Input` constructors as their `Into<Input<_>>` conversions.
+pub trait Operand<Buf> {
     /// The slots this operand contributes to the copy's compile-time set: none,
     /// or `{Tag}` for a `slot!(Tag)` (as a kernel argument's [`ToInput::Slots`]).
     type Slots: SlotList = HNil;
 
     /// Resolve into the copy's input edge over the concrete buffer type `Buf`.
-    fn into_copy_input(self) -> Input<Buf>;
+    fn into_operand_input(self) -> Input<Buf>;
 }
 
 // A slot plugs into a copy operand position, mirroring its kernel-arg `ToInput`.
-impl<Tg: Tag> CopyOperand<Tg::Value> for SlotHandle<Tg> {
+impl<Tg: Tag> Operand<Tg::Value> for SlotHandle<Tg> {
     type Slots = HCons<Tg::Key, HNil>;
 
-    fn into_copy_input(self) -> Input<Tg::Value> {
+    fn into_operand_input(self) -> Input<Tg::Value> {
         self.into_input()
     }
 }
@@ -2636,25 +2643,25 @@ impl<Tg: Tag> CopyOperand<Tg::Value> for SlotHandle<Tg> {
 // (not a blanket over `Into<Input<_>>`) so it stays disjoint from the `SlotHandle`
 // impl — a blanket would collide because the compiler can't rule out
 // `Tg::Value == SlotHandle<Tg>`.
-impl<Buf> CopyOperand<Buf> for Pipe<Buf> {
-    fn into_copy_input(self) -> Input<Buf> {
+impl<Buf> Operand<Buf> for Pipe<Buf> {
+    fn into_operand_input(self) -> Input<Buf> {
         Input::Pipe(self)
     }
 }
 
-/// Implement [`CopyOperand`] for a concrete buffer family + its `Checkout`
+/// Implement [`Operand`] for a concrete buffer family + its `Checkout`
 /// wrapper (each a distinct nominal type, disjoint from the slot/pipe impls).
-macro_rules! impl_copy_operand_concrete {
+macro_rules! impl_operand_concrete {
     ($buf:ident) => {
-        impl<E, M> CopyOperand<$crate::$buf<E, M>> for $crate::$buf<E, M>
+        impl<E, M> Operand<$crate::$buf<E, M>> for $crate::$buf<E, M>
         where
             M: $crate::MemMode,
         {
-            fn into_copy_input(self) -> Input<$crate::$buf<E, M>> {
+            fn into_operand_input(self) -> Input<$crate::$buf<E, M>> {
                 Input::from(self)
             }
         }
-        impl<E, M> CopyOperand<$crate::$buf<E, M>> for Checkout<$crate::$buf<E, M>>
+        impl<E, M> Operand<$crate::$buf<E, M>> for Checkout<$crate::$buf<E, M>>
         where
             M: $crate::MemMode,
             E: Send,
@@ -2664,38 +2671,78 @@ macro_rules! impl_copy_operand_concrete {
             // BUSY while the borrow is held, then re-arms for a plain `sync()` (no
             // `mutate_bind`). Identical semantics to the `ToInput`/`From` Checkout
             // arg paths; `.into_inner()` remains the explicit sever verb.
-            fn into_copy_input(self) -> Input<$crate::$buf<E, M>> {
+            fn into_operand_input(self) -> Input<$crate::$buf<E, M>> {
                 let (value, home) = self.into_value_and_home();
                 Input::lent(value, home)
             }
         }
     };
 }
-impl_copy_operand_concrete!(DeviceSlice);
-impl_copy_operand_concrete!(MappedSlice);
-impl_copy_operand_concrete!(USMSlice);
+impl_operand_concrete!(DeviceSlice);
+impl_operand_concrete!(MappedSlice);
+impl_operand_concrete!(USMSlice);
 
-// The Uninit dst families are valid copy *destinations* (never a slot value), so
-// they need a concrete + checkout operand impl too.
-macro_rules! impl_copy_operand_uninit {
+// The Uninit families (copy destinations, fill/write-from-uninit inputs) are
+// operands too — concrete only (no `Checkout` lend path exists for them).
+macro_rules! impl_operand_uninit {
     ($buf:ident) => {
-        impl<E, M> CopyOperand<$crate::$buf<E, M>> for $crate::$buf<E, M>
+        impl<E, M> Operand<$crate::$buf<E, M>> for $crate::$buf<E, M>
         where
             M: $crate::MemMode,
         {
-            fn into_copy_input(self) -> Input<$crate::$buf<E, M>> {
+            fn into_operand_input(self) -> Input<$crate::$buf<E, M>> {
                 Input::from(self)
             }
         }
     };
 }
-impl_copy_operand_uninit!(DeviceSliceUninit);
-impl_copy_operand_uninit!(MappedSliceUninit);
-impl_copy_operand_uninit!(USMSliceUninit);
+impl_operand_uninit!(DeviceSliceUninit);
+impl_operand_uninit!(MappedSliceUninit);
+impl_operand_uninit!(USMSliceUninit);
+
+// The image families: concrete or piped only (no `Checkout` lend path exists for
+// images — an image operand is consumed by value or fed from a pipe/slot).
+macro_rules! impl_operand_image {
+    ($img:ident) => {
+        impl<A, F> Operand<$crate::$img<A, F>> for $crate::$img<A, F>
+        where
+            A: $crate::KernelAccess,
+            F: $crate::image::format::Format,
+        {
+            fn into_operand_input(self) -> Input<$crate::$img<A, F>> {
+                Input::from(self)
+            }
+        }
+    };
+}
+impl_operand_image!(Image1D);
+impl_operand_image!(Image2D);
+impl_operand_image!(Image3D);
+impl_operand_image!(Image1DArray);
+impl_operand_image!(Image2DArray);
+impl_operand_image!(Image1DBuffer);
+
+// The host-view families (input of the release leaves): concrete or piped only — a
+// view is never a slot value or a checkout.
+macro_rules! impl_operand_view {
+    ($view:ident) => {
+        impl<T, M, A> Operand<$crate::$view<T, M, A>> for $crate::$view<T, M, A>
+        where
+            M: $crate::MemMode,
+            A: $crate::MapAccess,
+        {
+            fn into_operand_input(self) -> Input<$crate::$view<T, M, A>> {
+                Input::from(self)
+            }
+        }
+    };
+}
+impl_operand_view!(DeviceSliceHostView);
+impl_operand_view!(MappedSliceHostView);
 
 /// Build an eager copy leaf. `src` / `dst` may each be a concrete buffer, an
 /// upstream [`Pipe`], a [`Checkout`], or a [`slot!`](crate::slot)`(Tag)` hole (see
-/// [`CopyOperand`]). Output is `(src, dst)` (an `Uninit` dst comes back `Init` —
+/// [`Operand`]). Output is `(src, dst)` (an `Uninit` dst comes back `Init` —
 /// the copy wrote every byte). See [`CopyTo2`].
 #[allow(clippy::type_complexity)]
 pub fn eager_copy_to<Src, Dst, S, D>(
@@ -2705,8 +2752,8 @@ pub fn eager_copy_to<Src, Dst, S, D>(
 where
     Src: CopyTo<Dst>,
     <Src::Op as crate::copy::CopyRun>::Output: CopyOutputs,
-    S: CopyOperand<Src>,
-    D: CopyOperand<Dst>,
+    S: Operand<Src>,
+    D: Operand<Dst>,
 {
     // The node holds tag-free `Input`s; the operands' slots ride on `Slotted`.
     Slotted::new(copy_node(src, dst))
@@ -2718,12 +2765,12 @@ pub(crate) fn copy_node<Src, Dst, S, D>(src: S, dst: D) -> CopyTo2<Src, Dst>
 where
     Src: CopyTo<Dst>,
     <Src::Op as crate::copy::CopyRun>::Output: CopyOutputs,
-    S: CopyOperand<Src>,
-    D: CopyOperand<Dst>,
+    S: Operand<Src>,
+    D: Operand<Dst>,
 {
     CopyTo2 {
-        src: src.into_copy_input(),
-        dst: dst.into_copy_input(),
+        src: src.into_operand_input(),
+        dst: dst.into_operand_input(),
         src_pipe: Pipe::new(),
         dst_pipe: Pipe::new(),
         cb_cache: new_cb_cache(),

@@ -46,7 +46,7 @@ fn op_shapes_project_handle_and_checkouts() {
     projects::<u32, Checkout<u32>, _>(&v);
 
     // Run them so the guard isn't only a type-check: results confirm the ops are real.
-    let _filled = leaf.wait().expect("run leaf");
+    let _filled = leaf.into_bare().wait().expect("run leaf");
     assert_eq!(*v.sync(&ctx).expect("run value"), 5);
 
     let (bo, co) = tup.sync(&ctx).expect("run tuple");

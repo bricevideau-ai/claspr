@@ -1402,15 +1402,22 @@ impl<Tg: Tag> Default for SlotHandle<Tg> {
 // flow into the `impl Into<Input<_>>` positions (`download`/`fill`/`write`/copy),
 // but it collides with the blanket `From<T> for Input<T>` (the compiler can't rule
 // out `Tg::Value == SlotHandle<Tg>`). So a slot reaches those positions via the
-// `into_slot_input` helper / an explicit `Input::from`-free path. The KERNEL-ARG
-// position — the primary slot site — works through the [`ToInput`] impl below,
-// which is a distinct nominal trait with no such clash.
+// `into_slot_input` helper (untracked) — but the eager leaves take `slot!(Tag)`
+// directly via `Operand`. The KERNEL-ARG position — the primary slot site — works
+// through the [`ToInput`] impl below, which is a distinct nominal trait with no
+// such clash.
 
 impl<Tg: Tag> SlotHandle<Tg> {
     /// Convert into the deferred [`Input::Slot`] for an `Into<Input<_>>`-typed
-    /// position (e.g. `download(slot.into_slot_input())`). The blanket
-    /// `From<T> for Input<T>` blocks a direct `From<SlotHandle>` impl (coherence),
-    /// so this named conversion is the explicit bridge for non-kernel positions.
+    /// position. The blanket `From<T> for Input<T>` blocks a direct
+    /// `From<SlotHandle>` impl (coherence), so this named conversion is the explicit
+    /// bridge for such positions.
+    ///
+    /// **Untracked:** the result is a plain `Input`, so the slot's tag is erased and
+    /// the op's compile-time slot set does not include it (`sync` would type-check
+    /// with the slot unbound). Eager leaf operands (`fill`, `download`, `write`,
+    /// `eager_copy_to`, the image and host-view leaves, …) take `slot!(Tag)`
+    /// directly via [`Operand`](crate::eager::Operand), which tracks the tag; prefer that.
     pub fn into_slot_input(self) -> Input<Tg::Value> {
         self.into_input()
     }
