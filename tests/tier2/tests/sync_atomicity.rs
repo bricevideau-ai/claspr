@@ -65,7 +65,9 @@ fn unbound_slot_in_later_node_leaves_earlier_cells_untouched() {
     let g = bundle2(
         ks.scale_u32([N], early, 1u32),
         ks.scale_u32([N], slot!(Missing), 2u32),
-    );
+    )
+    // Opt out of static tracking: this test exercises the RUN-TIME checks.
+    .erase_unchecked();
 
     // First sync: the later slot is unbound → `SlotUnbound`. With the atomicity
     // pre-pass this fires BEFORE the early branch lends its concrete buffer.
@@ -197,7 +199,8 @@ fn early_caught_error_is_identical_slot_unbound() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    let g = ks.scale_u32([N], slot!(Missing), 2u32);
+    // Opt out of static tracking: this test exercises the RUN-TIME checks.
+    let g = ks.scale_u32([N], slot!(Missing), 2u32).erase_unchecked();
     let err = g.sync(&ctx).expect_err("unbound slot must error at sync");
     match err {
         Error::SlotUnbound(name) => assert!(
@@ -318,7 +321,8 @@ fn unbound_slot_errors_at_submit_on_without_enqueue() {
 
     // A single-node graph over an UNBOUND slot. `submit_on` consumes `self`, so
     // re-run against a freshly built graph after the failure.
-    let g = ks.scale_u32([N], slot!(Missing), 2u32);
+    // Opt out of static tracking: this test exercises the RUN-TIME checks.
+    let g = ks.scale_u32([N], slot!(Missing), 2u32).erase_unchecked();
     let err = g
         .submit_on(&queue)
         .expect_err("unbound slot must error at submit_on (async atomicity)");

@@ -84,6 +84,8 @@ fn call_defers_absent_tag_to_sync() {
     // bind B/Out; it is infallible, so NOTHING errors HERE (deferred to sync).
     let g = ks
         .add_u32([N], slot!(A), slot!(B), slot!(Out))
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked()
         .call((A(seeded(&ctx, 2)), Absent(seeded(&ctx, 9))));
 
     // The deferred catch: sync fails closed (nothing enqueued). The recorded
@@ -99,6 +101,7 @@ fn call_defers_absent_tag_to_sync() {
     // build it, then assert `sync` surfaces the recorded SlotNoSuchTag.
     let g2 = ks
         .add_u32([N], slot!(A), slot!(B), slot!(Out))
+        .erase_unchecked()
         .bind(A(seeded(&ctx, 2)))
         .bind(Absent(seeded(&ctx, 9)));
     match g2.sync(&ctx) {
@@ -251,6 +254,8 @@ fn call_conflict_surfaces_at_sync_not_silent() {
     // silent-swallow path would have run 1*4 = 4.
     let g = ks
         .scale_u32([N], slot!(Buf), 4u32)
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked()
         .bind(Buf(seeded(&ctx, 1))) // Buf := Bound(1s)
         .bind(Buf(seeded(&ctx, 9))) // CONFLICT: set-once onto Bound → recorded
         .and_then(download);
@@ -279,6 +284,8 @@ fn deferred_error_is_sticky_rebuild_recovers() {
     // Build an errored graph (conflicting set-once bind), as in (7).
     let g = ks
         .scale_u32([N], slot!(Buf), 4u32)
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked()
         .bind(Buf(seeded(&ctx, 1)))
         .bind(Buf(seeded(&ctx, 9))) // CONFLICT → recorded, poisons g
         .and_then(download);
@@ -361,6 +368,8 @@ fn call_absent_tag_surfaces_when_real_slots_satisfied() {
     // Absent tag in the SAME call. The old path would drop Absent and run 2+5=7.
     let g = ks
         .add_u32([N], slot!(A), slot!(B), slot!(Out))
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked()
         .call((
             A(seeded(&ctx, 2)),
             B(seeded(&ctx, 5)),

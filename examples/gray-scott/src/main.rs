@@ -152,7 +152,7 @@
 
 use claspr::eager::DeviceOpExt;
 use claspr::{Context, DeviceSlice, LaunchSpec};
-use claspr::{graph, slot, slots};
+use claspr::{SlotSet, graph, slot, slots};
 
 #[claspr::device]
 mod gpu {
@@ -441,13 +441,15 @@ fn run_swap(
             slot!(K),
         )
     }
-    .bind(F(F1))
-    .bind(K(K1))
-    .bind(Grid(LaunchSpec::from([grid_w, grid_h])))
-    .bind(UIn(u_a))
-    .bind(VIn(v_a))
-    .bind(UOut(u_b))
-    .bind(VOut(v_b));
+    .call_all((
+        F(F1),
+        K(K1),
+        Grid(LaunchSpec::from([grid_w, grid_h])),
+        UIn(u_a),
+        VIn(v_a),
+        UOut(u_b),
+        VOut(v_b),
+    ));
 
     let total = steps_phase1 + steps_phase2;
 
@@ -688,6 +690,9 @@ fn run_immutable(
             // caller sees `(u_in, v_in, u_out, v_out)`.
             bundle4(u_in, v_in, u_out, v_out)
         }
+        // `Grid` feeds all three dispatches: declare the distinct slot set
+        // once, so `call` can bind a repeated tag by name.
+        .erase_as::<SlotSet![Grid, F, K, UIn, VIn, UOut, VOut], _>()
     };
 
     // `curried_kernel` partially binds the INVARIANTS that never rotate — `Grid`,

@@ -84,6 +84,9 @@ where
     type Output = U::Output;
     // The chain's downstream handle is the tail op's handle.
     type Shape = U::Shape;
+    // Both halves' slots: the new link's first, so appending costs the link's
+    // own (short) set, not the chain's.
+    type Slots = <U::Slots as SlotList>::Append<S::Slots>;
 
     fn output_pipe(&self) -> Option<Pipe<U::Output>> {
         self.next.output_pipe()
@@ -655,16 +658,20 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
 /// One heap allocation and one virtual call per member per erased op. The `'op`
 /// lifetime lets the boxed op borrow from the surrounding scope (typically
 /// `&Kernels`); it infers to `'static` for chains built from owned data only.
-pub struct DeviceDynOp<'op, S: OpShape> {
-    // `DeviceOp` is dyn-compatible once `Output` and `Shape` are pinned (every
+pub struct DeviceDynOp<'op, S: OpShape, Sl: SlotList = HNil> {
+    // `DeviceOp` is dyn-compatible once its associated types are pinned (every
     // member is a `&self` method with no `Self: Sized` gate), so the vtable
-    // carries every override — including the multi-output gather ones.
-    inner: Box<dyn DeviceOp<Output = S::Output, Shape = S> + 'op>,
+    // carries every override — including the multi-output gather ones. The
+    // boxed op's slot set is pinned to `Dynamic` through `ForgetSlots`, and the
+    // erased op's own set is `Sl`: `bind` re-tags `Sl` over the SAME box.
+    inner: Box<dyn DeviceOp<Output = S::Output, Shape = S, Slots = Dynamic> + 'op>,
+    _slots: PhantomData<fn() -> Sl>,
 }
 
-impl<'op, S> DeviceDynOp<'op, S>
+impl<'op, S, Sl> DeviceDynOp<'op, S, Sl>
 where
     S: OpShape,
+    Sl: SlotList,
     S::Output: 'static,
     S::Checkouts: FromCheckout<S::Output>,
 {
@@ -675,10 +682,21 @@ where
         // `Output = S::Output` is implied by `Shape = S` (the trait bounds
         // `Shape: OpShape<Output = Self::Output>`), but the solver doesn't
         // normalize through it — spell it out.
-        O: DeviceOp<Output = S::Output, Shape = S> + 'op,
+        O: DeviceOp<Output = S::Output, Shape = S, Slots = Sl> + 'op,
     {
         DeviceDynOp {
-            inner: Box::new(op),
+            inner: Box::new(ForgetSlots(op)),
+            _slots: PhantomData,
+        }
+    }
+
+    /// The same erased op under another compile-time slot set — no new box. The
+    /// callers (`bind`, `call`, `erase_as`, `erase_unchecked`) establish that
+    /// the new set is right.
+    pub(crate) fn retag<Sl2: SlotList>(self) -> DeviceDynOp<'op, S, Sl2> {
+        DeviceDynOp {
+            inner: self.inner,
+            _slots: PhantomData,
         }
     }
 }
@@ -688,14 +706,16 @@ where
 // member left to its default body would run the default for every erased op.
 // The lint turns a forgotten one into a clippy error.
 #[warn(clippy::missing_trait_methods)]
-impl<S> DeviceOp for DeviceDynOp<'_, S>
+impl<S, Sl> DeviceOp for DeviceDynOp<'_, S, Sl>
 where
     S: OpShape,
+    Sl: SlotList,
     S::Output: 'static,
     S::Checkouts: FromCheckout<S::Output>,
 {
     type Output = S::Output;
     type Shape = S;
+    type Slots = Sl;
 
     fn output_pipe(&self) -> Option<Pipe<S::Output>> {
         self.inner.output_pipe()
@@ -765,6 +785,12 @@ where
         self.inner.cbable_weight()
     }
 
+    fn cb_exec_as_child(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // Walk the BOX (`dyn DeviceOp`, slot set erased): one instantiation of the
+        // CB walk per shape, however many slot sets name this shape.
+        cb_exec_child_impl(&*self.inner, ec, mode)
+    }
+
     fn cb_cache(&self) -> Option<&CbCache> {
         self.inner.cb_cache()
     }
@@ -785,7 +811,7 @@ where
         self.inner.cb_spine_head_addable()
     }
 
-    fn into_dyn<'b>(self) -> DeviceDynOp<'b, S>
+    fn into_dyn<'b>(self) -> DeviceDynOp<'b, S, Sl>
     where
         Self: 'b,
     {
@@ -820,6 +846,130 @@ mod dyn_op_tests {
     }
 }
 
+/// `op` with its compile-time slot set forgotten ([`Dynamic`]) — the object a
+/// [`DeviceDynOp`] boxes, so the boxed `dyn DeviceOp` has ONE pinned set and the
+/// erased op can re-tag its own over the same box. Zero-cost newtype; every
+/// member forwards (`clippy::missing_trait_methods` enforced).
+pub(crate) struct ForgetSlots<O>(pub(crate) O);
+
+// Every defaulted member forwards (see `DeviceDynOp`'s impl for why).
+#[warn(clippy::missing_trait_methods)]
+impl<O: DeviceOp> DeviceOp for ForgetSlots<O> {
+    type Output = O::Output;
+    type Shape = O::Shape;
+    type Slots = Dynamic;
+
+    fn output_pipe(&self) -> Option<Pipe<O::Output>> {
+        self.0.output_pipe()
+    }
+
+    fn handle(&self) -> HandleOf<O> {
+        self.0.handle()
+    }
+
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        self.0.execute(ec, mode)
+    }
+
+    fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<(O::Output, Deps)> {
+        self.0.collect(ec, mode)
+    }
+
+    fn collect_home(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(O::Output, Deps, Option<BoxedHome<O::Output>>)>
+    where
+        O::Output: Send + 'static,
+    {
+        self.0.collect_home(ec, mode)
+    }
+
+    fn gather_checkouts(
+        &self,
+        ec: &ExecutionContext<'_>,
+        mode: ExecMode,
+    ) -> Result<(CheckoutsOf<O>, Deps)>
+    where
+        O::Output: Send + 'static,
+        CheckoutsOf<O>: FromCheckout<O::Output>,
+    {
+        self.0.gather_checkouts(ec, mode)
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        self.0.describe(out);
+    }
+
+    fn node_label(&self) -> String {
+        self.0.node_label()
+    }
+
+    fn dump_graph(&self, depth: usize, out: &mut Vec<GraphNode>) {
+        self.0.dump_graph(depth, out);
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        self.0.bind_slots(binder);
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.0.check_ready()
+    }
+
+    fn reclaim_undelivered(&self) {
+        self.0.reclaim_undelivered();
+    }
+
+    fn contains_host_seam(&self) -> bool {
+        self.0.contains_host_seam()
+    }
+
+    fn cb_addable(&self) -> bool {
+        self.0.cb_addable()
+    }
+
+    fn cbable_weight(&self) -> usize {
+        self.0.cbable_weight()
+    }
+
+    fn cb_exec_as_child(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // Reached only as the box of a `DeviceDynOp`, which walks `dyn` directly;
+        // the default body, spelled out for the lint.
+        cb_exec_child_impl(self, ec, mode)
+    }
+
+    fn cb_cache(&self) -> Option<&CbCache> {
+        self.0.cb_cache()
+    }
+
+    fn apply_binding_delta(&self, delta: &BindingDelta, rotate: bool) {
+        self.0.apply_binding_delta(delta, rotate);
+    }
+
+    fn collect_cb_ids(&self, out: &mut Vec<usize>) {
+        self.0.collect_cb_ids(out);
+    }
+
+    fn cb_restamp(&self, evs: &Deps) {
+        self.0.cb_restamp(evs);
+    }
+
+    fn cb_spine_head_addable(&self) -> bool {
+        self.0.cb_spine_head_addable()
+    }
+
+    fn into_dyn<'op>(self) -> DeviceDynOp<'op, O::Shape, Dynamic>
+    where
+        Self: 'op,
+        O::Output: 'static,
+        CheckoutsOf<O>: FromCheckout<O::Output>,
+    {
+        DeviceDynOp::new(self)
+    }
+}
+
 // ── Renamed: user-side slot renaming (per-instance slot identity) ────────
 
 /// `op` with its `From` slot sites answering to the tag `To` instead — built by
@@ -838,12 +988,15 @@ mod dyn_op_tests {
 /// a renamed site's slot errors under `To`'s name (matched by tag NAME). Every
 /// binding path (set-once `bind`/`call`, `mutate_*`, the atomicity probe, the
 /// keyed cache's binding delta) goes through that walk.
-pub struct Renamed<O, From, To> {
+pub struct Renamed<O, From, To, I> {
     inner: O,
-    _tags: PhantomData<fn() -> (From, To)>,
+    _tags: RenameTags<From, To, I>,
 }
 
-impl<O, From, To> Renamed<O, From, To> {
+/// `Renamed`'s phantom: the two tags and the inferred position of `From`.
+type RenameTags<From, To, I> = PhantomData<fn() -> (From, To, I)>;
+
+impl<O, From, To, I> Renamed<O, From, To, I> {
     pub(crate) fn new(inner: O) -> Self {
         Renamed {
             inner,
@@ -855,14 +1008,17 @@ impl<O, From, To> Renamed<O, From, To> {
 // Every defaulted member forwards (see `DeviceDynOp`'s impl for why); the lint
 // turns a forgotten one into a clippy error.
 #[warn(clippy::missing_trait_methods)]
-impl<O, From, To> DeviceOp for Renamed<O, From, To>
+impl<O, From, To, I> DeviceOp for Renamed<O, From, To, I>
 where
     O: DeviceOp,
     From: Tag,
     To: Tag<Value = From::Value>,
+    O::Slots: RenameKey<From::Key, To::Key, I>,
+    I: 'static,
 {
     type Output = O::Output;
     type Shape = O::Shape;
+    type Slots = <O::Slots as RenameKey<From::Key, To::Key, I>>::Out;
 
     fn output_pipe(&self) -> Option<Pipe<O::Output>> {
         self.inner.output_pipe()
@@ -960,6 +1116,11 @@ where
         self.inner.cbable_weight()
     }
 
+    fn cb_exec_as_child(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // NOT forwarded: the walk must see this node, whose slot walk translates.
+        cb_exec_child_impl(self, ec, mode)
+    }
+
     fn cb_cache(&self) -> Option<&CbCache> {
         self.inner.cb_cache()
     }
@@ -980,7 +1141,7 @@ where
         self.inner.cb_spine_head_addable()
     }
 
-    fn into_dyn<'op>(self) -> DeviceDynOp<'op, O::Shape>
+    fn into_dyn<'op>(self) -> DeviceDynOp<'op, O::Shape, Self::Slots>
     where
         Self: 'op,
         O::Output: 'static,
@@ -1021,6 +1182,7 @@ where
     S::Output: Sync,
 {
     type Output = Arc<S::Output>;
+    type Slots = S::Slots;
 
     fn output_pipe(&self) -> Option<Pipe<Arc<S::Output>>> {
         Some(self.out.share())
@@ -1160,6 +1322,7 @@ where
     // An array of N element pipes; the downstream closure does
     // `let [a, b, c] = handle` and routes each pipe into its own branch.
     type Shape = [Single<S::Output>; N];
+    type Slots = S::Slots;
 
     fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
         // Multi-output storage is the per-element pipes; there is no single
@@ -1345,6 +1508,14 @@ pub fn deps_into_single_event(ec: &ExecutionContext<'_>, deps: Deps) -> Result<c
     Ok(marker)
 }
 
+/// A bundle's slot set: every branch's, concatenated.
+macro_rules! bundle_slots {
+    ($t:ident) => { <$t as DeviceOp>::Slots };
+    ($t:ident, $($rest:ident),+) => {
+        <<$t as DeviceOp>::Slots as SlotList>::Append<bundle_slots!($($rest),+)>
+    };
+}
+
 macro_rules! impl_eager_bundle {
     ($name:ident, $ctor:ident, $($field:ident : $ty:ident : $pf:ident),+) => {
         #[doc = concat!("Eager bundle of independent branches (arity ",
@@ -1402,6 +1573,7 @@ macro_rules! impl_eager_bundle {
             // composite handle. Composing per-branch handles (rather than
             // flattening to pipes) is what carries computable host values down.
             type Shape = ( $(<$ty as DeviceOp>::Shape,)+ );
+            type Slots = bundle_slots!($($ty),+);
             // STRUCTURE-PRESERVING per-branch Checkouts: each branch contributes
             // its OWN `Checkouts` — NOT a single `Checkout` over the whole branch
             // output. A single-output branch contributes `Checkout<buf>`; a
@@ -1839,6 +2011,9 @@ where
     // every branch re-arms its origin cell on drop and the fan-out replays. The
     // dynamic-`Vec` analog of `bundle!`'s per-branch tuple `Checkouts`.
     type Shape = FanOutShape<U::Shape>;
+    // Every branch is the same op type, so binding a tag fills it in all of
+    // them: the set is one branch's.
+    type Slots = U::Slots;
 
     fn output_pipe(&self) -> Option<Pipe<Vec<U::Output>>> {
         Some(self.out.share())
@@ -2125,6 +2300,7 @@ where
     S2: Send,
 {
     type Output = S::Output;
+    type Slots = S::Slots;
 
     fn output_pipe(&self) -> Option<Pipe<S::Output>> {
         Some(self.out.share())
@@ -2500,6 +2676,7 @@ where
     // `CheckoutSplit`) so every branch re-arms its origin cell across `sync`s — the
     // multi-home replay a single collapsed `collect_home` slot cannot carry.
     type Shape = Seamed<S::Shape>;
+    type Slots = S::Slots;
 
     fn output_pipe(&self) -> Option<Pipe<S::Output>> {
         // Single-output: `Some` of the storage pipe; multi-output: `None`
@@ -2708,6 +2885,7 @@ where
 {
     // Profiling is a host side-effect; the chain's data flow is unchanged.
     type Output = S::Output;
+    type Slots = S::Slots;
 
     fn output_pipe(&self) -> Option<Pipe<S::Output>> {
         Some(self.out.share())

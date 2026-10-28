@@ -2589,6 +2589,8 @@ pub trait ToInputImage<SF: format::SampledTypeFamily> {
     /// The concrete owning image type this arg resolves to — the macro
     /// pins it as the Op's per-image generic and applies the matching
     /// `KernelImage<dim>D<Access>Arg<SF>` bound to it.
+    /// The slots this argument contributes (see [`ToInput::Slots`](crate::eager::ToInput)).
+    type Slots: crate::eager::SlotList = crate::eager::HNil;
     type Buf;
     /// Wrap as a concrete or piped [`Input`].
     fn to_input_image(self) -> Input<Self::Buf>;
@@ -2651,6 +2653,7 @@ where
     SF: format::SampledTypeFamily,
     Tg: crate::eager::Tag,
 {
+    type Slots = crate::eager::HCons<Tg::Key, crate::eager::HNil>;
     type Buf = Tg::Value;
     fn to_input_image(self) -> Input<Tg::Value> {
         self.into_slot_input()

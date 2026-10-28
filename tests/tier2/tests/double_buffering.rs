@@ -251,7 +251,9 @@ fn double_buffer_plain_bind_after_sever_rejected() {
         .add_u32([N], slot!(In), slot!(Ones), slot!(Out))
         .bind(In(a))
         .bind(Ones(ones))
-        .bind(Out(b));
+        .bind(Out(b))
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked();
 
     let (in_co, ones_co, out_co) = g.sync(&ctx).expect("step 0 sync");
 

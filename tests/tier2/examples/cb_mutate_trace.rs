@@ -55,8 +55,8 @@ fn main() -> claspr::Result<()> {
         u,
         v,
         w
-    );
-    g.mutate_bind(Factor(1u32))?;
+    )
+    .call_all((Factor(1u32),));
     eprintln!("=== STEADY STATE BEGINS ===");
     for i in 0..iters {
         g.mutate_bind(Factor(if i % 2 == 0 { 1u32 } else { 2u32 }))?;

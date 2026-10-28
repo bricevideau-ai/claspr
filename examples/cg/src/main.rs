@@ -467,13 +467,17 @@ where
     // PROJECTED from it, so the 6-field shape is written ONCE. The handle lets
     // `compute_alpha(..).and_then(move |(p, ap, partials, alpha, nalpha, rsold)| ..)`
     // destructure the 6 pipes; the checkouts feed the `FromCheckout` bound.
-    A: DeviceOp<Output = AlphaOut, Shape = AlphaShape>,
+    A: DeviceOp<Output = AlphaOut, Shape = AlphaShape, Slots = claspr::HNil>,
     // A generic op nested in a `bundle`/`and_then` must prove
     // `Checkouts: FromCheckout<Output>`; the aliases name both already.
     claspr::CheckoutsOf<A>: claspr::FromCheckout<AlphaOut>,
     // B's single-scalar shape likewise. `g.sync()` destructures B's checkouts;
     // `bundle2(x, rsnew)` feeds B's handle.
-    B: DeviceOp<Output = DeviceScalar<f32>, Shape = Single<DeviceScalar<f32>>>,
+    B: DeviceOp<
+            Output = DeviceScalar<f32>,
+            Shape = Single<DeviceScalar<f32>>,
+            Slots = claspr::HNil,
+        >,
 {
     let kernels = gpu::kernels(ctx)?;
     let ks = &kernels;

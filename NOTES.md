@@ -16,6 +16,33 @@ Nothing in flight as of 2026-07-15 (working tree clean on `main`). The
 the full quality-review fix set — has all landed. See git log; recent landings table
 below.
 
+### Typed slot sets — vertical slice on branch `typed-slot-sets` (2026-10-27, uncommitted)
+
+Revisits the DECLINED type-state entry below. `DeviceOp::Slots` (type-level key
+list, `eager/slot_sets.rs`); kernel launchers derive it from arg types (`SlotsOf`
+blanket over `Copy` + `ToInput::Slots`), combinators `Append`, `bind`/`call`
+`Remove`, terminals gate on `AllBound`, `DeviceDynOp<'op, S, Sl>` carries it as a
+phantom. Whole workspace + tests green on PoCL. **Writability verdict: OK.**
+- `call_all((..))` (graph ⊆ the tuple's distinct keys) breaks the old "fill-all
+  needs type equality" wall: miniweather's 18/15-bind chains became one call each.
+- Partial curry of a REPEATED tag → one `erase_as::<SlotSet![..], _>()` line
+  (gray-scott `get_meta_kernel`). Error for forgetting it is a raw E0283.
+- Generic `sync`-ing fns pin `Slots = HNil` (cg: 2 bounds). `rename::<F, T, _>()`.
+- Libraries name two types: uncurried `DeviceDynOp<'_, S, SlotSet![..]>` + curried.
+- First fill must be `bind`/`call`; `mutate_*` (`&self`) can't change the type.
+- `erase_as` checks graph ⊆ declared only (superset needs type equality): an
+  over-declared tag demands a bind the runtime rejects.
+- GAP: leaves with slot operands (copy/fill/…) still report `HNil` → `sync` with
+  them unbound type-checks (runtime catches), and `bind` on them is REJECTED.
+**BLOCKER-LEVEL COST: monomorphization.** Slot sets in node types make each
+structurally identical subgraph with different tags a distinct type: miniweather
+incremental build 6.2 s → 12.9 s, binary 3.6 → 9.9 MB (AndThen impls 16 → 140, one
+kernel `Op` type per call site instead of per kernel). gray-scott/cg +10–15%. A
+`cb_exec_as_child` hook (DeviceDynOp walks its `dyn` box) recovers only ~7%.
+Fix direction: nodes stay slot-free; the set lives only in an outermost phantom
+wrapper (launcher returns `Slotted<Op, Sl>`, `Op` loses `__claspr_Sl`;
+combinators store unwrapped/erased children). Not started.
+
 ### Decisions — assessed & DECLINED (kept so future sessions don't re-litigate)
 
 - **`meta_kernel!` macro** (#241) — DECLINED. A repo-wide scan found `cg`'s

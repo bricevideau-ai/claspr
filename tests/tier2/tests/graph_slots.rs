@@ -174,7 +174,11 @@ fn unbound_slot_sync_errors() {
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     // Never bound — the slot stays `Unbound`.
-    let g = ks.scale_u32([N], slot!(Buf), 2u32).and_then(download);
+    // Opt out of static tracking: this test exercises the RUN-TIME checks.
+    let g = ks
+        .scale_u32([N], slot!(Buf), 2u32)
+        .and_then(download)
+        .erase_unchecked();
 
     let err = g.sync(&ctx).expect_err("unbound slot must error at sync");
     match err {
@@ -219,6 +223,8 @@ fn bind_same_buffer_is_idempotent() {
     // duplicate + the remaining binds fold into ONE consuming chain.
     let (a_co, _b, out_co) = ks
         .add_u32([N], slot!(SharedA), slot!(B), slot!(Out))
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked()
         .bind(SharedA(Arc::clone(&shared)))
         .bind(SharedA(Arc::clone(&shared))) // idempotent no-op (same buffer)
         .bind(B(seeded(&ctx, 5)))
@@ -259,6 +265,8 @@ fn bind_conflict_then_mutate() {
     let conflict = ks
         .scale_u32([N], slot!(Buf), 2u32)
         .and_then(download)
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked()
         .bind(Buf(seeded(&ctx, 3))) // Buf := Bound(3s)
         .bind(Buf(seeded(&ctx, 10))); // CONFLICT: set-once onto Bound → recorded
     match conflict.sync(&ctx) {
@@ -272,9 +280,11 @@ fn bind_conflict_then_mutate() {
 
     // The EAGER recovery path, on a fresh graph: `mutate_bind` overwrites a Bound
     // slot (seeded 3 → seeded 10), and the new buffer drives the result.
-    let g = ks.scale_u32([N], slot!(Buf), 2u32).and_then(download);
-    g.mutate_bind(Buf(seeded(&ctx, 3)))
-        .expect("first mutate_bind");
+    // First fill is the type-changing `bind` at build time (seeded 3).
+    let g = ks
+        .scale_u32([N], slot!(Buf), 2u32)
+        .and_then(download)
+        .bind(Buf(seeded(&ctx, 3)));
     let out = g
         .mutate_bind(Buf(seeded(&ctx, 10)))
         .expect("mutate_bind changes a bound slot")
@@ -295,7 +305,11 @@ fn mutate_bind_fills_unbound_in_loop() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
-    let g = ks.scale_u32([N], slot!(Buf), 2u32).and_then(download);
+    // Opt out of static tracking: this test exercises the RUN-TIME checks.
+    let g = ks
+        .scale_u32([N], slot!(Buf), 2u32)
+        .and_then(download)
+        .erase_unchecked();
 
     // First iteration: slot is Unbound; `mutate_bind` fills it. Subsequent
     // iterations: the slot was severed-back-to-Unbound by `into_inner` (download
@@ -355,7 +369,9 @@ fn bind_while_checked_out_errors() {
     {
         let probe = ks
             .scale_u32([N], slot!(Buf), 2u32)
-            .bind(Buf(seeded(&ctx, 3)));
+            .bind(Buf(seeded(&ctx, 3)))
+            // Opt out of static tracking: this test exercises the RUN-TIME checks.
+            .erase_unchecked();
         let probe_co = probe.sync(&ctx).expect("probe run"); // slot now Lent
         let err = probe
             .bind(Buf(seeded(&ctx, 9)))
@@ -405,7 +421,9 @@ fn into_inner_severs_slot_then_bind_rejected_mutate_rearms() {
     {
         let probe = ks
             .scale_u32([N], slot!(Buf), 2u32)
-            .bind(Buf(seeded(&ctx, 3)));
+            .bind(Buf(seeded(&ctx, 3)))
+            // Opt out of static tracking: this test exercises the RUN-TIME checks.
+            .erase_unchecked();
         let kept = probe.sync(&ctx).expect("probe run").into_inner(); // sever
         drop(kept);
         let err = probe
@@ -487,6 +505,8 @@ fn call_with_conflicting_element_errors() {
     // B/Out elements bind fine. Folded into one consuming chain.
     let g = ks
         .add_u32([N], slot!(A), slot!(B), slot!(Out))
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked()
         .bind(A(seeded(&ctx, 1))) // A := Bound(1s)
         .call((A(seeded(&ctx, 2)), B(seeded(&ctx, 5)), Out(seeded(&ctx, 0))));
 

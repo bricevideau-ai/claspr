@@ -101,7 +101,9 @@ fn erased_segment_forwards_slots_and_command_buffers() {
     let g = fill(buf, 1u32)
         .and_then(|b| ks.scale_u32([N], b, slot!(Factor)))
         .erase()
-        .and_then(|b| ks.scale_u32([N], b, 2u32));
+        .and_then(|b| ks.scale_u32([N], b, 2u32))
+        // The loop re-binds before every sync; start from its first value.
+        .bind(Factor(3u32));
 
     for factor in [3u32, 5, 5, 7] {
         g.mutate_bind(Factor(factor)).expect("bind factor");
@@ -216,12 +218,16 @@ fn parity_slot_kernel_chain() {
         .and_then(|b| ks.scale_u32([N], b, slot!(Factor)))
         .erase()
         .and_then(|b| ks.scale_u32([N], b, 2u32))
-        .erase();
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked();
     assert_static_parity(&plain, &erased);
     assert!(
         erased.check_ready().is_err(),
         "unbound slot must fail check_ready"
     );
+    // TYPED-SLOTS: `plain` stays concrete for the parity/check_ready checks above;
+    // it is erased only now, so the run-time bind-then-sync loop below type-checks.
+    let plain = plain.erase_unchecked();
 
     for factor in [3u32, 3, 4] {
         plain.mutate_bind(Factor(factor)).expect("bind plain");

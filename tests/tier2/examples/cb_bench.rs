@@ -150,8 +150,8 @@ fn scalar_alternate(ctx: &Context) -> claspr::Result<Report> {
     let buf = DeviceSlice::<u32>::alloc_zero(ctx, n())?;
     let g = fill(buf, 2u32)
         .and_then(|b| ks.scale_u32([n()], b, slot!(Factor)))
-        .and_then(|b| ks.scale_u32([n()], b, 1u32));
-    g.mutate_bind(Factor(3u32))?;
+        .and_then(|b| ks.scale_u32([n()], b, 1u32))
+        .bind(Factor(3u32));
     measure("scalar-alternate", |i| {
         // Flip BEFORE the sync so every measured sync sees a freshly mutated slot.
         g.mutate_bind(Factor(if i % 2 == 0 { 3u32 } else { 4u32 }))?;
@@ -173,8 +173,8 @@ fn buffer_pingpong(ctx: &Context) -> claspr::Result<Report> {
     let g = bundle2(
         ks.scale_u32([n()], slot!(Src), 1u32),
         ks.scale_u32([n()], slot!(Dst), 2u32),
-    );
-    g.mutate_call((Src(a), Dst(b)))?;
+    )
+    .call((Src(a), Dst(b)));
     measure("buffer-pingpong", |_| {
         let (src_co, dst_co) = g.sync(ctx)?;
         // Cross the checkouts: each slot ADOPTS the other's buffer (Lent → Severed
@@ -239,13 +239,13 @@ fn scalar_alternate_deep(ctx: &Context) -> claspr::Result<Report> {
         u,
         v,
         w
-    );
+    )
+    .call_all((Factor(1u32),));
     assert_eq!(
         g.cbable_weight(),
         DEEP,
         "deep chain should be DEEP commands"
     );
-    g.mutate_bind(Factor(1u32))?;
     measure("scalar-alt-deep", |i| {
         g.mutate_bind(Factor(if i % 2 == 0 { 1u32 } else { 2u32 }))?;
         let co = g.sync(ctx)?;
@@ -288,8 +288,8 @@ fn control_deep(ctx: &Context) -> claspr::Result<Report> {
         u,
         v,
         w
-    );
-    g.mutate_bind(Factor(1u32))?;
+    )
+    .call_all((Factor(1u32),));
     measure("control-deep", |_| {
         let co = g.sync(ctx)?;
         drop(co);
@@ -308,8 +308,8 @@ fn scalar_rebind_same(ctx: &Context) -> claspr::Result<Report> {
     let buf = DeviceSlice::<u32>::alloc_zero(ctx, n())?;
     let g = fill(buf, 2u32)
         .and_then(|b| ks.scale_u32([n()], b, slot!(Factor)))
-        .and_then(|b| ks.scale_u32([n()], b, 1u32));
-    g.mutate_bind(Factor(3u32))?;
+        .and_then(|b| ks.scale_u32([n()], b, 1u32))
+        .bind(Factor(3u32));
     measure("scalar-rebind-same", |_| {
         g.mutate_bind(Factor(3u32))?;
         let co = g.sync(ctx)?;

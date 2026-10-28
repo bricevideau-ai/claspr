@@ -687,6 +687,9 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // input generics. The Op is generic over `__D{n}` only (it stores
     // `Input<__D>`), so these would be "unused type parameter" errors there.
     let mut method_only_generics: Vec<(TokenStream2, TokenStream2)> = Vec::new();
+    // Per-arg compile-time slot contribution (`<__claspr_S{n} as ToInput<E>>::Slots`,
+    // …), in signature order; folded with the grid's into the Op's `Slots`.
+    let mut arg_slots: Vec<TokenStream2> = Vec::new();
     let mut method_params: Vec<TokenStream2> = Vec::new();
     let mut arg_types: Vec<TokenStream2> = Vec::new();
     let mut op_arg_pass: Vec<TokenStream2> = Vec::new();
@@ -841,6 +844,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     quote! { #gid: ::claspr::KernelSliceReadArg<#elem> }
                 };
                 let ibound: TokenStream2 = quote! { #sid: ::claspr::ToInput<#elem, Buf = #gid> };
+                arg_slots.push(quote! { <#sid as ::claspr::ToInput<#elem>>::Slots });
                 generics.push((gid_tt.clone(), dbound));
                 method_only_generics.push((iid_tt.clone(), ibound));
 
@@ -936,6 +940,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     quote! { #gid: ::claspr::KernelScalarRefArg<#elem> }
                 };
                 let ibound: TokenStream2 = quote! { #sid: ::claspr::ToInput<#elem, Buf = #gid> };
+                arg_slots.push(quote! { <#sid as ::claspr::ToInput<#elem>>::Slots });
                 generics.push((gid_tt.clone(), dbound));
                 method_only_generics.push((iid_tt.clone(), ibound));
 
@@ -1029,6 +1034,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 let dbound: TokenStream2 = quote! { #gid: ::claspr::#trait_name<#family> + ::claspr::record::RecordableBuffer };
                 let ibound: TokenStream2 =
                     quote! { #sid: ::claspr::ToInputImage<#family, Buf = #gid> };
+                arg_slots.push(quote! { <#sid as ::claspr::ToInputImage<#family>>::Slots });
                 generics.push((gid_tt.clone(), dbound));
                 method_only_generics.push((iid_tt.clone(), ibound));
 
@@ -1102,8 +1108,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // `Into<ScalarInput<#ty>>` (not a projected-`Val` trait) so a bare
                 // integer literal still infers the kernel's scalar type — e.g.
                 // `fill_u32([N], buf, 5)` resolves `5: u32`.
-                let ssbound: TokenStream2 =
-                    quote! { #ssid: ::core::convert::Into<::claspr::ScalarInput<#ty>> };
+                let ssbound: TokenStream2 = quote! {
+                    #ssid: ::core::convert::Into<::claspr::ScalarInput<#ty>> + ::claspr::SlotsOf
+                };
+                arg_slots.push(quote! { <#ssid as ::claspr::SlotsOf>::Slots });
                 method_only_generics.push((quote! { #ssid }, ssbound));
 
                 host_names.push(pname.clone());
@@ -1229,6 +1237,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         output_origins,
         cb_arg_stmts,
         method_only_generics,
+        arg_slots,
         generics,
     };
     Ok(emit_kernel_launch(func, args, parts))
@@ -1258,6 +1267,8 @@ struct KernelParts {
     output_origins: Vec<TokenStream2>,
     cb_arg_stmts: Vec<TokenStream2>,
     method_only_generics: Vec<(TokenStream2, TokenStream2)>,
+    /// Per-arg compile-time slot contribution, in signature order.
+    arg_slots: Vec<TokenStream2>,
     generics: Vec<(TokenStream2, TokenStream2)>,
 }
 
@@ -1288,7 +1299,8 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
         output_homes,
         output_origins,
         cb_arg_stmts,
-        method_only_generics,
+        mut method_only_generics,
+        arg_slots,
         generics,
     } = parts;
 
@@ -1299,17 +1311,33 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
     //   `<__D0: K..., __D1: K...>`  — for declarator positions (impl
     //                                  blocks, method generic lists).
     //   `(empty)`                   — when there are no slice params.
-    let gen_decl: TokenStream2 = if generics.is_empty() {
-        quote! {}
-    } else {
+    // The GRID is a slot position too (`slot!(Grid)`): a named generic so its
+    // contribution can be named in the return type.
+    method_only_generics.push((
+        quote! { __claspr_G },
+        quote! {
+            __claspr_G: ::core::convert::Into<::claspr::ScalarInput<::claspr::LaunchSpec>>
+                + ::claspr::SlotsOf
+        },
+    ));
+    // The launch's compile-time slot set: the grid's, then each arg's.
+    let slots_expr: TokenStream2 = arg_slots.iter().fold(
+        quote! { <__claspr_G as ::claspr::SlotsOf>::Slots },
+        |acc, a| quote! { <#acc as ::claspr::SlotList>::Append<#a> },
+    );
+    // The Op struct/impls are generic over their slot set too (the launcher fills
+    // it in with `slots_expr`); it is NOT a method generic.
+    let op_gen_decl: TokenStream2 = {
         let bounds = generics.iter().map(|(_, b)| b);
-        quote! { < #( #bounds ),* > }
+        quote! { < #( #bounds, )* __claspr_Sl: ::claspr::SlotList > }
     };
-    let gen_use: TokenStream2 = if generics.is_empty() {
-        quote! {}
-    } else {
+    let op_gen_use: TokenStream2 = {
         let ids = generics.iter().map(|(id, _)| id);
-        quote! { < #( #ids ),* > }
+        quote! { < #( #ids, )* __claspr_Sl > }
+    };
+    let op_ret_use: TokenStream2 = {
+        let ids = generics.iter().map(|(id, _)| id);
+        quote! { < #( #ids, )* #slots_expr > }
     };
 
     // The kernel METHOD's generic decl = Op generics (`__D{n}`) PLUS the
@@ -1785,7 +1813,8 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
         let checkouts_ty = quote! { ( #( ::claspr::Checkout<#output_types> ),* ) };
         let shape_ty = quote! { ( #( ::claspr::Single<#output_types> ),* ) };
         quote! {
-            impl #gen_decl ::claspr::DeviceOp for Op #gen_use {
+            impl #op_gen_decl ::claspr::DeviceOp for Op #op_gen_use {
+                type Slots = __claspr_Sl;
                 type Output = #output_ty;
                 type Shape = #shape_ty;
 
@@ -2025,7 +2054,8 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
         }
     } else {
         quote! {
-            impl #gen_decl ::claspr::DeviceOp for Op #gen_use {
+            impl #op_gen_decl ::claspr::DeviceOp for Op #op_gen_use {
+                type Slots = __claspr_Sl;
                 type Output = #output_ty;
 
                 fn output_pipe(&self) -> ::core::option::Option<::claspr::Pipe<#output_ty>> {
@@ -2179,7 +2209,10 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
             /// return `(Output, Event)`.
             pub fn submit(
                 self,
-            ) -> ::claspr::Result<(#output_ty, ::claspr::Event)> {
+            ) -> ::claspr::Result<(#output_ty, ::claspr::Event)>
+            where
+                __claspr_Sl: ::claspr::AllBound,
+            {
                 let ctx = ::core::clone::Clone::clone(&self.ctx);
                 self.submit_on(&ctx)
             }
@@ -2200,6 +2233,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
             ) -> ::claspr::Result<(#output_ty, ::claspr::Event)>
             where
                 L: ::claspr::Launcher,
+                __claspr_Sl: ::claspr::AllBound,
             {
                 // The kernel Op is a `DeviceOp`; `submit_value_on` runs its
                 // single enqueue on the launcher's queue and returns the
@@ -2211,7 +2245,10 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
             /// `Kernels`' context default queue and wait on the
             /// completion event. Returns the slice arg(s) so the
             /// caller can keep using them.
-            pub fn wait(self) -> ::claspr::Result<#output_ty> {
+            pub fn wait(self) -> ::claspr::Result<#output_ty>
+            where
+                __claspr_Sl: ::claspr::AllBound,
+            {
                 let ctx = ::core::clone::Clone::clone(&self.ctx);
                 // The kernel Op is a `DeviceOp`; `wait_on` blocks and returns
                 // its `Checkouts` (one `Checkout` for a single-output kernel, a
@@ -2238,9 +2275,9 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                 // `Into<ScalarInput<LaunchSpec>>`. Stored as
                 // `ScalarInput<LaunchSpec>` (read at execute), so the same graph can
                 // re-dispatch at a DIFFERENT grid across replays.
-                grid: impl ::core::convert::Into<::claspr::ScalarInput<::claspr::LaunchSpec>>,
+                grid: __claspr_G,
                 #(#method_params),*
-            ) -> #op_mod_ident::Op #gen_use {
+            ) -> #op_mod_ident::Op #op_ret_use {
                 #op_mod_ident::Op {
                     kernel: self.kernel(#kernel_name_lit),
                     spec: ::core::convert::Into::into(grid),
@@ -2248,7 +2285,8 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     deps: ::std::vec::Vec::new(),
                     profile_cb: ::core::option::Option::None,
                     ctx: ::core::clone::Clone::clone(&self.__claspr_ctx),
-                    __claspr_cb_cache: ::claspr::eager::new_cb_cache()
+                    __claspr_cb_cache: ::claspr::eager::new_cb_cache(),
+                    __claspr_slots: ::core::marker::PhantomData
                     #op_out_field_init
                 }
             }
@@ -2259,7 +2297,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
         pub mod #op_mod_ident {
             use super::*;
 
-            pub struct Op #gen_decl {
+            pub struct Op #op_gen_decl {
                 /// Per-launch `cl_kernel` minted by `clCreateKernel`.
                 /// Owned and never aliased, so `clSetKernelArg` on it
                 /// can't race with any other launch.
@@ -2301,14 +2339,16 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                 /// Design-v2 command-buffer home: when this kernel is the boundary
                 /// of a seam-free CB-eligible subtree, its finalized CB is cached
                 /// here and replayed across syncs. See `claspr::eager::CbCache`.
-                pub __claspr_cb_cache: ::claspr::eager::CbCache
+                pub __claspr_cb_cache: ::claspr::eager::CbCache,
+                /// The launch's compile-time slot set (see `claspr::eager::SlotList`).
+                pub __claspr_slots: ::core::marker::PhantomData<fn() -> __claspr_Sl>
                 #op_out_field_decl
             }
 
             // Op is `Send` automatically — every field is Send. No
             // unsafe impl, no lifetime, no `&Kernels` borrow.
 
-            impl #gen_decl Op #gen_use {
+            impl #op_gen_decl Op #op_gen_use {
                 /// Add a cross-queue dependency. Takes the event by
                 /// value because the Op may be moved into an executor
                 /// thread; a borrowed `&Event` could outlive the
@@ -2834,6 +2874,7 @@ fn instantiate_trait_methods(
     'fns: for func in kernel_fns {
         let name = &func.sig.ident;
         let mut gens: Vec<TokenStream2> = Vec::new();
+        let mut tslots: Vec<TokenStream2> = Vec::new();
         let mut params: Vec<TokenStream2> = Vec::new();
         let mut arg_names: Vec<TokenStream2> = Vec::new();
         let mut outs: Vec<TokenStream2> = Vec::new();
@@ -2861,6 +2902,7 @@ fn instantiate_trait_methods(
                     };
                     gens.push(quote! { #d: #bound });
                     gens.push(quote! { #s: ::claspr::ToInput<#elem, Buf = #d> });
+                    tslots.push(quote! { <#s as ::claspr::ToInput<#elem>>::Slots });
                     params.push(quote! { #pname: #s });
                     arg_names.push(pname);
                     outs.push(quote! { #d });
@@ -2868,7 +2910,10 @@ fn instantiate_trait_methods(
                 }
                 ParamRole::Scalar { name: pname, ty } => {
                     let ss = quote::format_ident!("__claspr_TSS{idx}");
-                    gens.push(quote! { #ss: ::core::convert::Into<::claspr::ScalarInput<#ty>> });
+                    gens.push(quote! {
+                        #ss: ::core::convert::Into<::claspr::ScalarInput<#ty>> + ::claspr::SlotsOf
+                    });
+                    tslots.push(quote! { <#ss as ::claspr::SlotsOf>::Slots });
                     params.push(quote! { #pname: #ss });
                     arg_names.push(pname);
                     idx += 1;
@@ -2885,12 +2930,22 @@ fn instantiate_trait_methods(
             skipped.push(name.to_string());
             continue;
         }
+        // Same slot set as the concrete launcher: the grid's, then each arg's.
+        gens.push(quote! {
+            __claspr_TG: ::core::convert::Into<::claspr::ScalarInput<::claspr::LaunchSpec>>
+                + ::claspr::SlotsOf
+        });
+        let tslots_expr: TokenStream2 = tslots.iter().fold(
+            quote! { <__claspr_TG as ::claspr::SlotsOf>::Slots },
+            |acc, a| quote! { <#acc as ::claspr::SlotList>::Append<#a> },
+        );
         let ret = if outs.len() == 1 {
             let d = &outs[0];
             quote! {
                 impl ::claspr::DeviceOp<
                     Output = #d,
                     Shape = ::claspr::Single<#d>,
+                    Slots = #tslots_expr,
                 >
             }
         } else {
@@ -2898,6 +2953,7 @@ fn instantiate_trait_methods(
                 impl ::claspr::DeviceOp<
                     Output = ( #(#outs),* ),
                     Shape = ( #(::claspr::Single<#outs>),* ),
+                    Slots = #tslots_expr,
                 >
             }
         };
@@ -2905,7 +2961,7 @@ fn instantiate_trait_methods(
         let sig = quote! {
             fn #name< #(#gens),* >(
                 &self,
-                grid: impl ::core::convert::Into<::claspr::ScalarInput<::claspr::LaunchSpec>>,
+                grid: __claspr_TG,
                 #(#params),*
             ) -> #ret
         };

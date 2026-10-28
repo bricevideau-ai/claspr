@@ -19,7 +19,9 @@ fn fan_out_branches_bind_slots() {
     let bufs: Vec<_> = (0..3).map(|_| seeded(&ctx, 0)).collect();
     let g = fan_out(bufs, |b| {
         fill(b, 2u32).and_then(|b| ks.scale_u32([N], b, slot!(Factor)))
-    });
+    })
+    // Opt out of static tracking: this test exercises the RUN-TIME checks.
+    .erase_unchecked();
 
     // The bug: this returned Err(SlotNoSuchTag("Factor")).
     g.mutate_bind(Factor(5u32))

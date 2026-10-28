@@ -288,10 +288,12 @@ fn mutate_invalidates_and_rebuilds_command_buffer() {
     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("alloc");
 
     // fill(buf,1) -> scale_u32(buf, Factor). Factor is an unbound scalar slot.
-    let g = fill(buf, 1u32).and_then(|b| ks.scale_u32([N], b, slot!(Factor)));
+    // Bound at build time to Factor=3 (the type-changing first fill).
+    let g = fill(buf, 1u32)
+        .and_then(|b| ks.scale_u32([N], b, slot!(Factor)))
+        .bind(Factor(3u32));
 
-    // Bind Factor=3, sync: 1*3 = 3. Homes the CB.
-    g.mutate_bind(Factor(3u32)).expect("bind factor 3");
+    // Sync: 1*3 = 3. Homes the CB.
     let co = g.sync(&ctx).expect("sync 1");
     let g1 = co.map().wait().expect("read 1");
     assert!(g1.iter().all(|&v| v == 3), "factor 3: {:?}", &g1[..8]);

@@ -16,7 +16,7 @@
 //!   re-wraps it as `DeviceSliceUninit` before storing.
 
 use claspr::eager::{DeviceOpExt, download, eager_copy_to};
-use claspr::{DeviceSlice, MappedSlice, SvmLevel, USMSlice, slot, slots};
+use claspr::{DeviceSlice, MappedSlice, SlotSet, SvmLevel, USMSlice, slot, slots};
 use claspr_test_kernels::kernels;
 use claspr_test_support::ctx;
 
@@ -207,10 +207,14 @@ fn pipe_fed_copy_destination_slot_binds() {
             1u32,
         )
         .and_then(|d| {
-            eager_copy_to(slot!(CopySrc), slot!(CopyDst)).call((
-                CopySrc(DeviceSlice::<u32>::from_slice(&ctx, &data).expect("src")),
-                CopyDst(d),
-            ))
+            // TYPED-SLOTS: `CopyTo2` does not report its slot operands in `Slots`
+            // (the graph is `HNil` though both holes are open), so declare them here.
+            eager_copy_to(slot!(CopySrc), slot!(CopyDst))
+                .erase_as::<SlotSet![CopySrc, CopyDst], _>()
+                .call((
+                    CopySrc(DeviceSlice::<u32>::from_slice(&ctx, &data).expect("src")),
+                    CopyDst(d),
+                ))
         })
         .and_then(|(_src, dst)| download(dst));
     for run in 1..=2 {

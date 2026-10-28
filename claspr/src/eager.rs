@@ -418,6 +418,9 @@ pub use cb::*;
 mod slots;
 pub use slots::*;
 
+mod slot_sets;
+pub use slot_sets::*;
+
 // ── Rehome: type-erased "deposit an output back into its origin cell" ───
 
 /// How a run's output value is returned to the (possibly weaker-typed) cell it
@@ -1666,6 +1669,15 @@ pub trait DeviceOp: Send {
     /// independently readable / `into_inner`'d / returned-on-drop.
     type Shape: OpShape<Output = Self::Output> = Single<Self::Output>;
 
+    /// The op's **compile-time slot set** — the tag keys still to bind (see
+    /// [`SlotList`]). Defaults to
+    /// [`HNil`], right for every op with no slot inputs. Kernel launchers compute
+    /// theirs from their argument types; combinators combine their children's;
+    /// [`bind`](DeviceOpExt::bind) / [`call`](DeviceOpExt::call) remove what they
+    /// fill; the terminals require [`AllBound`]. [`Dynamic`] opts out (run-time
+    /// checks only).
+    type Slots: SlotList = HNil;
+
     /// The **runtime value-storage** pipe — where `execute` deposits the result;
     /// what the single-output terminal (`sync`) drains. `Some` for a single-output
     /// op (its one storage pipe, independent of the build-time [`Handle`](HandleOf<Self>)),
@@ -2027,6 +2039,19 @@ pub trait DeviceOp: Send {
         0
     }
 
+    /// Run `self` as a child of a combinator's walk, opening a CB boundary at it if
+    /// eligible ([`cb_exec_child`](cb::cb_exec_child)). Overridden only by
+    /// [`DeviceDynOp`], which walks its box instead, so the CB walk is instantiated
+    /// once per erased shape rather than once per (shape, slot set); every other
+    /// impl keeps the default.
+    #[doc(hidden)]
+    fn cb_exec_as_child(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()>
+    where
+        Self: Sized,
+    {
+        cb::cb_exec_child_impl(self, ec, mode)
+    }
+
     /// This node's OWN [`CbCache`] home, if it is a CB-capable node (design v2).
     /// Default `None` (a node that never creates/homes a command buffer — host
     /// seams, transfers, the identity `Pipe`). CB-capable nodes (`AndThen`,
@@ -2137,7 +2162,7 @@ pub trait DeviceOp: Send {
     /// is never converted, only a concrete op or a `DeviceDynOp`, which implements
     /// it itself.
     #[doc(hidden)]
-    fn into_dyn<'op>(self) -> DeviceDynOp<'op, Self::Shape>
+    fn into_dyn<'op>(self) -> DeviceDynOp<'op, Self::Shape, Self::Slots>
     where
         Self: Sized + 'op,
         Self::Output: 'static,
@@ -2284,7 +2309,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// — a [`Pipe`] or, for [`value`], the by-value `T` — and retains no closure.
     /// Same name, opposite timing: the eager build is what makes the resulting
     /// graph a closure-free, [`describe`](DeviceOp::describe)-able struct.
-    fn and_then<'op, U, F>(self, f: F) -> AndThen<DeviceDynOp<'op, Self::Shape>, U>
+    fn and_then<'op, U, F>(self, f: F) -> AndThen<DeviceDynOp<'op, Self::Shape, Self::Slots>, U>
     where
         Self: 'op,
         Self::Output: 'static,
@@ -2320,7 +2345,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// already erases the chain it extends, so a graph's type nests per
     /// combinator (bundle, `fan_out`, `and_then_host`), not per link, and a
     /// 200-link chain compiles at the default `recursion_limit`.
-    fn erase<'op>(self) -> DeviceDynOp<'op, Self::Shape>
+    fn erase<'op>(self) -> DeviceDynOp<'op, Self::Shape, Self::Slots>
     where
         Self: 'op,
         Self::Output: 'static,
@@ -2329,16 +2354,49 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         self.into_dyn()
     }
 
+    /// [`erase`](Self::erase), DECLARING the graph's slot set as `Target` (a
+    /// [`SlotSet!`](crate::SlotSet) of distinct tags, in any order). Every slot of
+    /// the graph must be in `Target`; repeats of a tag (one tag at several slot
+    /// sites) collapse to the one declared entry, so a single bind then fills them
+    /// all. Needed before binding a repeated tag; also how a library names its
+    /// graph's slots in a type alias. Call as `.erase_as::<SlotSet![A, B], _>()`.
+    fn erase_as<'op, Target, Idx>(self) -> DeviceDynOp<'op, Self::Shape, Target>
+    where
+        Self: 'op,
+        Self::Output: 'static,
+        CheckoutsOf<Self>: FromCheckout<Self::Output>,
+        Target: SlotList,
+        Self::Slots: SubsetOf<Target, Idx>,
+    {
+        self.into_dyn().retag()
+    }
+
+    /// [`erase`](Self::erase) into a graph whose slots are NOT tracked statically
+    /// ([`Dynamic`]): binds and `sync` are checked at run time only, as before
+    /// typed slot sets. The opt-out for code that prefers not to carry slot sets.
+    fn erase_unchecked<'op>(self) -> DeviceDynOp<'op, Self::Shape, Dynamic>
+    where
+        Self: 'op,
+        Self::Output: 'static,
+        CheckoutsOf<Self>: FromCheckout<Self::Output>,
+    {
+        self.into_dyn().retag()
+    }
+
     /// Make this op's `From` slot sites answer to the tag `To` instead — per-use
     /// slot identity for a reusable graph. Binding `To` then reaches only this
     /// op's sites, and binding `From` from outside no longer does; leave a tag
     /// un-renamed and it stays shared with every other site carrying it. The
     /// decision is the caller's, at the use site; the graph's author keeps
     /// plain fixed tags. See [`Renamed`].
-    fn rename<From, To>(self) -> Renamed<Self, From, To>
+    ///
+    /// Call as `.rename::<From, To, _>()` (the `_` is the inferred position of
+    /// `From` in the op's slot set).
+    fn rename<From, To, I>(self) -> Renamed<Self, From, To, I>
     where
         From: Tag,
         To: Tag<Value = From::Value>,
+        Self::Slots: RenameKey<From::Key, To::Key, I>,
     {
         Renamed::new(self)
     }
@@ -2490,11 +2548,19 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// [`Input`] (kernels, `download`/`fill`/`write`/copy, the bundles) propagate
     /// it; a slot placed in an op that does not yet override `bind_slots` simply
     /// stays unbound (caught at `sync`).
-    fn bind<A: CallArg>(self, arg: A) -> Self
+    fn bind<'op, A: CallArg, I>(
+        self,
+        arg: A,
+    ) -> DeviceDynOp<'op, Self::Shape, <Self::Slots as Remove<A::Key, I>>::Out>
     where
-        Self: Sized,
+        Self: 'op,
+        Self::Output: 'static,
+        CheckoutsOf<Self>: FromCheckout<Self::Output>,
+        Self::Slots: Remove<A::Key, I>,
     {
-        self.call((arg,))
+        let g = self.into_dyn();
+        arg.apply(&g);
+        g.retag()
     }
 
     /// **Set/change** bind of one typed slot — the mutating sibling of
@@ -2653,12 +2719,37 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// later. Any slot still unbound at `sync` errors there (deferred, as above).
     ///
     /// Tuple ORDER does not matter for success (each binds its own tag).
-    fn call<T: CallArgs>(self, args: T) -> Self
+    fn call<'op, T: CallArgs, Is>(
+        self,
+        args: T,
+    ) -> DeviceDynOp<'op, Self::Shape, <Self::Slots as RemoveAll<T::Keys, Is>>::Out>
     where
-        Self: Sized,
+        Self: 'op,
+        Self::Output: 'static,
+        CheckoutsOf<Self>: FromCheckout<Self::Output>,
+        Self::Slots: RemoveAll<T::Keys, Is>,
     {
-        args.apply_all(&self);
-        self
+        let g = self.into_dyn();
+        args.apply_all(&g);
+        g.retag()
+    }
+
+    /// [`call`](Self::call) binding **every** slot of the graph at once; returns the
+    /// fully curried graph. Unlike `call`, a tag that appears at several slot
+    /// sites (a shared launch extent, a time step reused across stages) needs no
+    /// declaration first: each slot is checked against the tuple's own distinct
+    /// tags, which is unambiguous however often a tag repeats in the graph.
+    /// Rejected at compile time if any slot of the graph is missing from `args`.
+    fn call_all<'op, T: CallArgs, Idx>(self, args: T) -> DeviceDynOp<'op, Self::Shape, HNil>
+    where
+        Self: 'op,
+        Self::Output: 'static,
+        CheckoutsOf<Self>: FromCheckout<Self::Output>,
+        Self::Slots: SubsetOf<T::Keys, Idx>,
+    {
+        let g = self.into_dyn();
+        args.apply_all(&g);
+        g.retag()
     }
 
     /// **Mutate several slots at once** — the mutating sibling of [`call`](Self::call).
@@ -2747,6 +2838,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// [`sync`](Self::sync) is `wait_on` over a `Context`.
     fn wait_on<L: crate::Launcher + ?Sized>(&self, launcher: &L) -> Result<CheckoutsOf<Self>>
     where
+        Self::Slots: AllBound,
         Self::Output: Send + 'static,
         CheckoutsOf<Self>: FromCheckout<Self::Output>,
     {
@@ -2885,6 +2977,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// Reusable: `&self`. See [`wait_on`](Self::wait_on) and [`Checkout`].
     fn sync(&self, context: &Context) -> Result<CheckoutsOf<Self>>
     where
+        Self::Slots: AllBound,
         Self::Output: Send + 'static,
         CheckoutsOf<Self>: FromCheckout<Self::Output>,
     {
@@ -2903,7 +2996,10 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     ///
     /// ≈ cuda-oxide's `unsafe async_on`, but safe here and event-returning
     /// (you get a completion [`Event`](crate::Event) to chain, not a raw stream).
-    fn submit_on<L: crate::Launcher + ?Sized>(self, launcher: &L) -> Result<crate::Event> {
+    fn submit_on<L: crate::Launcher + ?Sized>(self, launcher: &L) -> Result<crate::Event>
+    where
+        Self::Slots: AllBound,
+    {
         use crate::Launcher;
         // Atomicity pre-pass: validate all inputs before any enqueue, mirroring wait_on.
         self.check_ready()?;
@@ -2974,6 +3070,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     #[cfg(feature = "async-events")]
     fn run(self, context: &Context) -> DeviceChainFuture<Self::Output>
     where
+        Self::Slots: AllBound,
         Self::Output: Unpin,
     {
         run_eager_chain(self, context)
@@ -3131,6 +3228,9 @@ impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
 /// consuming (usable as the bare `U` an [`and_then`](DeviceOpExt::and_then) closure
 /// requires); see those methods' docs for the full rationale.
 pub trait CallArg {
+    /// The [`Tag::Key`] this element binds — what [`bind`](DeviceOpExt::bind)
+    /// removes from the graph's slot set.
+    type Key: 'static;
     /// Apply this element's binding to graph `g`, INFALLIBLY (errors deferred to
     /// `sync`). A value tag folds through [`bind_deferred`](DeviceOpExt::bind_deferred)
     /// (set-once); a pipe-source tag folds through
@@ -3158,8 +3258,17 @@ pub trait CallArg {
 /// (`Buf(v)`) or a pipe feed (`Buf(pipe)`), applied left-to-right, infallibly.
 /// Implemented for arities 1..=16 (mirroring [`BindAll`]).
 pub trait CallArgs {
+    /// The keys every element binds, as a known slot set — what
+    /// [`call`](DeviceOpExt::call) removes.
+    type Keys: Known;
     /// Apply every element to `g` (infallibly, in tuple order).
     fn apply_all<Op: DeviceOp>(self, g: &Op);
+}
+
+/// The known slot set of a `call` tuple's keys, in tuple order.
+macro_rules! call_keys {
+    ($h:ident $(, $t:ident)*) => { HCons<<$h as CallArg>::Key, call_keys!($($t),*)> };
+    () => { HNil };
 }
 
 /// Implement [`CallArgs`] for one tuple arity. Each element is any [`CallArg`]
@@ -3167,6 +3276,7 @@ pub trait CallArgs {
 macro_rules! impl_call_args_tuple {
     ($($name:ident),+ $(,)?) => {
         impl<$($name: CallArg),+> CallArgs for ($($name,)+) {
+            type Keys = call_keys!($($name),+);
             #[allow(non_snake_case)]
             fn apply_all<Op: DeviceOp>(self, g: &Op) {
                 let ($($name,)+) = self;
@@ -3191,6 +3301,22 @@ impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M);
 impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
 impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
 impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T);
+impl_call_args_tuple!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U
+);
+impl_call_args_tuple!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V
+);
+impl_call_args_tuple!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W
+);
+impl_call_args_tuple!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X
+);
 
 // ── Checkout: runtime guard over one run's output ───────────────────────
 

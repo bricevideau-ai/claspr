@@ -1153,25 +1153,7 @@ where
             let g = half!(g2, gh_x, gf_x, 0u32, H2B1, H2B2, H2B3, Dt2A, Dt2B, Dt2C);
 
             let b = bind_all(dt0, dt0);
-            let g = g
-                .bind(b.0)
-                .bind(b.1)
-                .bind(b.2)
-                .bind(b.3)
-                .bind(b.4)
-                .bind(b.5)
-                .bind(b.6)
-                .bind(b.7)
-                .bind(b.8)
-                .bind(b.9)
-                .bind(b.10)
-                .bind(b.11)
-                .bind(b.12)
-                .bind(b.13)
-                .bind(b.14)
-                .bind(b.15)
-                .bind(b.16)
-                .bind(b.17);
+            let g = g.call_all(b);
 
             let t_unrolled = std::time::Instant::now();
             let mut etime = 0.0f64;
@@ -1259,22 +1241,7 @@ where
             );
 
             let p = bind_per(true, dt0);
-            let gp = gp
-                .bind(p.0)
-                .bind(p.1)
-                .bind(p.2)
-                .bind(p.3)
-                .bind(p.4)
-                .bind(p.5)
-                .bind(p.6)
-                .bind(p.7)
-                .bind(p.8)
-                .bind(p.9)
-                .bind(p.10)
-                .bind(p.11)
-                .bind(p.12)
-                .bind(p.13)
-                .bind(p.14);
+            let gp = gp.call_all(p);
 
             // ── Graph B loop: one sync per timestep, exactly the reference's loop. ───
             //   do while (etime < sim_time)

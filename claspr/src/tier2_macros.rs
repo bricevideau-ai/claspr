@@ -373,6 +373,7 @@ macro_rules! slots {
             where
                 $val: $crate::eager::SlotEq + $crate::SlotValue,
             {
+                type Key = $name<$R>;
                 fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
                     // Infallible but RECORD-don't-drop, same as the concrete arm.
                     $crate::DeviceOpExt::bind_deferred(g, self);
@@ -439,6 +440,7 @@ macro_rules! slots {
             where
                 $val: $crate::eager::SlotEq + $crate::SlotValue,
             {
+                type Key = $name<$crate::eager::KeyMarker>;
                 fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
                     // Infallible but RECORD-don't-drop: a bind error is recorded into
                     // the graph's deferred-error sink and surfaced FIRST at sync's
@@ -453,6 +455,7 @@ macro_rules! slots {
             where
                 $val: $crate::eager::SlotEq + $crate::SlotValue + ::core::marker::Send,
             {
+                type Key = $name<$crate::eager::KeyMarker>;
                 fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
                     // Infallible but RECORD-don't-drop (see the raw-value arm): the
                     // sever-and-adopt error is recorded into the sink, surfaced at sync.
@@ -476,6 +479,7 @@ macro_rules! slots {
                 V: $crate::record::RecordableBuffer + ::core::marker::Send + 'static,
                 $name<V>: $crate::Tag<Value = V>,
             {
+                type Key = $name<$crate::eager::KeyMarker>;
                 fn apply<Op: $crate::DeviceOp>(self, g: &Op) {
                     // Infallible but RECORD-don't-drop: an absent-tag feed error is
                     // recorded into the graph's deferred-error sink and surfaced at

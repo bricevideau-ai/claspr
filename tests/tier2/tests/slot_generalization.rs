@@ -104,9 +104,11 @@ fn scalar_slot_mutate_across_replays() {
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     // scale -> download: each pass mints a fresh buffer + a fresh factor.
+    // The first fill (Buf, Factor=3) is a type-changing `call` at build time.
     let g = ks
         .scale_u32([N], slot!(Buf), slot!(Factor))
-        .and_then(download);
+        .and_then(download)
+        .call((Buf(seeded(&ctx, 5)), Factor(3u32)));
 
     // First an explicit mutate to 3, asserting ×3.
     let out = g
@@ -156,6 +158,8 @@ fn scalar_slot_idempotent_and_conflict() {
     let idem_out = ks
         .scale_u32([N], slot!(Buf), slot!(Factor))
         .and_then(download)
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked()
         .bind(Factor(2u32))
         .bind(Factor(2u32)) // idempotent no-op (same value)
         .bind(Buf(seeded(&ctx, 5)))
@@ -174,6 +178,7 @@ fn scalar_slot_idempotent_and_conflict() {
     let conflict = ks
         .scale_u32([N], slot!(Buf), slot!(Factor))
         .and_then(download)
+        .erase_unchecked()
         .bind(Factor(2u32)) // Factor := Bound(2)
         .bind(Buf(seeded(&ctx, 2)))
         .bind(Factor(9u32)); // CONFLICT: set-once onto Bound(2) → recorded
@@ -217,7 +222,9 @@ fn scalar_slot_unbound_sync_errors() {
     let g = ks
         .scale_u32([N], slot!(Buf), slot!(Factor))
         .and_then(download)
-        .bind(Buf(seeded(&ctx, 3)));
+        .bind(Buf(seeded(&ctx, 3)))
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked();
 
     let err = g
         .sync(&ctx)
@@ -248,7 +255,10 @@ fn launch_slot_redispatch_at_different_grid() {
     let ks = kernels::kernels(&ctx).expect("load kernels");
 
     const SENTINEL: u32 = 0xDEAD_BEEF;
-    let g = ks.global_id_u32(slot!(Grid), slot!(Buf));
+    // The first fill (Grid [N], sentinel Buf) is a type-changing `call` at build time.
+    let g = ks
+        .global_id_u32(slot!(Grid), slot!(Buf))
+        .call((Grid(LaunchSpec::from([N])), Buf(seeded(&ctx, SENTINEL))));
 
     // Pass 1: dispatch at full [N] over a sentinel-seeded buffer.
     let co = g
@@ -312,8 +322,7 @@ fn shared_scalar_slot_fans_out() {
 
     // ONE bind of K fills the scalar slot at BOTH dispatch sites.
     let out = g
-        .bind(Buf(seeded(&ctx, 2)))
-        .bind(K(3u32)) // one bind fills both K sites
+        .call_all((Buf(seeded(&ctx, 2)), K(3u32))) // one K binding fills both K sites
         .sync(&ctx)
         .expect("sync");
     // 2 * 3 * 3 = 18 — only correct if BOTH sites saw K=3.
@@ -360,9 +369,11 @@ fn shared_launch_slot_fans_out() {
 
     // ONE bind of Grid fills BOTH sites at [N/2]; the bundle delivers both outputs.
     let (a_co, b_co) = g
-        .bind(Grid(LaunchSpec::from([half]))) // one bind fills both Grid sites
-        .bind(BufA(seeded(&ctx, SENTINEL)))
-        .bind(BufB(seeded(&ctx, SENTINEL)))
+        .call_all((
+            Grid(LaunchSpec::from([half])), // one binding fills both Grid sites
+            BufA(seeded(&ctx, SENTINEL)),
+            BufB(seeded(&ctx, SENTINEL)),
+        ))
         .sync(&ctx)
         .expect("sync shared grid");
 
@@ -440,10 +451,12 @@ fn shared_arc_buffer_fans_out() {
     // ONE bind of each Arc operand fills BOTH add sites (Arc::clone fan-out); the
     // bundle delivers both outs as a `(Checkout, Checkout)` tuple.
     let (out_a, out_b) = g
-        .bind(Shared(Arc::clone(&shared))) // one bind fills both Shared sites
-        .bind(SharedB(Arc::clone(&shared_b))) // one bind fills both SharedB sites
-        .bind(OutA(seeded(&ctx, 0)))
-        .bind(OutB(seeded(&ctx, 0)))
+        .call_all((
+            Shared(Arc::clone(&shared)),    // one binding fills both Shared sites
+            SharedB(Arc::clone(&shared_b)), // one binding fills both SharedB sites
+            OutA(seeded(&ctx, 0)),
+            OutB(seeded(&ctx, 0)),
+        ))
         .sync(&ctx)
         .expect("sync two-site");
 
@@ -556,6 +569,8 @@ fn bind_absent_tag_errors() {
     // The absent-tag `SlotNoSuchTag(Absent)` is recorded and surfaces at `sync`.
     let g = ks
         .scale_u32([N], seeded(&ctx, 1), slot!(Present))
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked()
         .bind(Present(2u32))
         .bind(Absent(7u32));
     match g.sync(&ctx) {
@@ -603,7 +618,7 @@ fn fan_out_across_bundle_branches() {
 
     // ONE bind of K must fan out into BOTH branches (no early stop at branch 1).
     let (a_co, b_co) = g
-        .bind(K(3u32)) // one fan-out bind fills K in BOTH bundle branches
+        .call_all((K(3u32),)) // one fan-out binding fills K in BOTH bundle branches
         .sync(&ctx)
         .expect("both branches' K bound → sync runs");
 
@@ -645,7 +660,9 @@ fn bind_checkout_into_slot_severs_source_adopts_target() {
     // (consuming) folded in; `src_graph` is re-`bind`'d (deferred error) below.
     let src_graph = ks
         .scale_u32([N], slot!(Src), 2u32)
-        .bind(Src(seeded(&ctx, 5))); // 5*2=10
+        .bind(Src(seeded(&ctx, 5))) // 5*2=10
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked();
     let co = src_graph.sync(&ctx).expect("source run");
     let src_handle = handle_of(&*co); // identity of the buffer the Checkout holds
 

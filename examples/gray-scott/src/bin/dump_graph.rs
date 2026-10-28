@@ -23,7 +23,7 @@
 
 use claspr::eager::{DeviceOp, DeviceOpExt, GraphNode, bundle4, graph_edge_table};
 use claspr::{Context, DeviceSlice, LaunchSpec};
-use claspr::{graph, slot, slots};
+use claspr::{SlotSet, graph, slot, slots};
 
 #[claspr::device]
 mod gpu {
@@ -246,13 +246,15 @@ fn main() -> claspr::Result<()> {
             slot!(K),
         )
     }
-    .bind(F(F1))
-    .bind(K(K1))
-    .bind(Grid(LaunchSpec::from([W, H])))
-    .bind(UIn(u_a))
-    .bind(VIn(v_a))
-    .bind(UOut(u_b))
-    .bind(VOut(v_b));
+    .call_all((
+        F(F1),
+        K(K1),
+        Grid(LaunchSpec::from([W, H])),
+        UIn(u_a),
+        VIn(v_a),
+        UOut(u_b),
+        VOut(v_b),
+    ));
 
     dump("PER-STEP graph (run_swap / single step)", &g);
 
@@ -297,6 +299,7 @@ fn main() -> claspr::Result<()> {
             );
             bundle4(u_in, v_in, u_out, v_out)
         }
+        .erase_as::<SlotSet![Grid, F, K, UIn, VIn, UOut, VOut], _>()
         .call((F(F1), K(K1), Grid(LaunchSpec::from([W, H]))))
     };
 

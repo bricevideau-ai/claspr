@@ -1431,6 +1431,9 @@ pub trait ToInput<E> {
     /// The concrete buffer type this arg resolves to. The macro pins it via
     /// `Buf = __D{n}` and bounds `__D{n}` with the right per-arg slice trait
     /// (`KernelSliceReadArg` / `…ReadWriteArg`), so no bound is needed here.
+    /// The slots this argument contributes to the op it is passed to:
+    /// none, except for a [`SlotHandle`] (`slot!(Tag)`), which contributes its tag.
+    type Slots: SlotList = HNil;
     type Buf;
     /// Wrap as a concrete or piped [`Input`].
     fn to_input(self) -> Input<Self::Buf>;
@@ -1487,6 +1490,7 @@ impl<E, Tg> ToInput<E> for SlotHandle<Tg>
 where
     Tg: Tag,
 {
+    type Slots = HCons<Tg::Key, HNil>;
     type Buf = Tg::Value;
     fn to_input(self) -> Input<Tg::Value> {
         self.into_input()

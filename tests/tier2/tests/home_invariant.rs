@@ -32,7 +32,7 @@ use claspr::eager::{
 };
 use claspr::image::format::R32Uint;
 use claspr::{DeviceSlice, Error, Image2D, ReadOnly, WriteOnly};
-use claspr::{slot, slots};
+use claspr::{SlotSet, slot, slots};
 use claspr_test_kernels::kernels;
 use claspr_test_support::{N, ctx, handle_of, seeded};
 
@@ -327,7 +327,10 @@ fn copy_slot_src_and_slot_dst_x2_both_rehome() {
 
     // Both copy operands are SLOTS, set-once bound (consuming) before the run and
     // folded into `g`; `g` is then re-`sync`'d by `&` below.
+    // TYPED-SLOTS: `CopyTo2` does not report its slot operands in `Slots` (the graph is
+    // `HNil` though both holes are open), so declare them here.
     let g = eager_copy_to(slot!(Src), slot!(Dst))
+        .erase_as::<SlotSet![Src, Dst], _>()
         .bind(Src(_src))
         .bind(Dst(_dst));
 
@@ -576,7 +579,11 @@ fn into_inner_still_severs() {
     // re-arms the very same slot below).
     {
         let probe_b = seeded(&ctx, 4);
-        let probe = ks.scale_u32([N], slot!(Buf), 2u32).bind(Buf(probe_b));
+        let probe = ks
+            .scale_u32([N], slot!(Buf), 2u32)
+            .bind(Buf(probe_b))
+            // Opt out of static tracking: this test exercises the RUN-TIME checks.
+            .erase_unchecked();
         let probe_co = probe.sync(&ctx).expect("probe run");
         let _kept = probe_co.into_inner(); // sever the probe's slot
         let err = probe
@@ -790,7 +797,10 @@ fn multi_output_copy_independence() {
 
     // Concrete src + SLOT dst: the dst is governed by the 4-state slot machine.
     // Set-once bind (consuming) folded into `g`; re-`sync`'d / `mutate_bind`'d by `&`.
-    let g = eager_copy_to(src, slot!(Dst)).bind(Dst(dst));
+    // TYPED-SLOTS: `CopyTo2` does not report its slot operand in `Slots` (see above).
+    let g = eager_copy_to(src, slot!(Dst))
+        .erase_as::<SlotSet![Dst], _>()
+        .bind(Dst(dst));
 
     let (co_src, co_dst) = g.sync(&ctx).expect("copy run 1");
     assert_eq!(handle_of(&*co_src), hs, "src handle stable run 1");
@@ -811,7 +821,10 @@ fn multi_output_copy_independence() {
     {
         let psrc = DeviceSlice::<u32>::from_slice(&ctx, &data).expect("psrc");
         let pdst = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("pdst");
-        let probe = eager_copy_to(psrc, slot!(Dst)).bind(Dst(pdst));
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        let probe = eager_copy_to(psrc, slot!(Dst))
+            .erase_unchecked()
+            .bind(Dst(pdst));
         let (ps, pd) = probe.sync(&ctx).expect("probe copy run");
         let _kept = pd.into_inner(); // sever the probe's dst slot
         drop(ps); // re-arm the concrete src (so ONLY the severed Dst is exercised)

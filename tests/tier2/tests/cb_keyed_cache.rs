@@ -54,8 +54,7 @@ fn alternating_scalar_records_two_cbs_not_one_per_sync() {
         return;
     }
     let ks = kernels::kernels(&ctx).expect("kernels");
-    let g = scaled_chain!(&ctx, ks);
-    g.mutate_bind(Factor(3u32)).expect("bind");
+    let g = scaled_chain!(&ctx, ks).bind(Factor(3u32));
 
     let n_sync = 12;
     let records = records_during(&g, || {
@@ -89,8 +88,7 @@ fn rebinding_the_same_value_does_not_re_record() {
         return;
     }
     let ks = kernels::kernels(&ctx).expect("kernels");
-    let g = scaled_chain!(&ctx, ks);
-    g.mutate_bind(Factor(3u32)).expect("bind");
+    let g = scaled_chain!(&ctx, ks).bind(Factor(3u32));
     let co = g.sync(&ctx).expect("warm-up sync");
     drop(co);
 
@@ -116,9 +114,8 @@ fn buffer_pingpong_records_two_cbs() {
     let g = bundle2(
         ks.scale_u32([N], slot!(Src), 1u32),
         ks.scale_u32([N], slot!(Dst), 1u32),
-    );
-    g.mutate_call((Src(seeded(&ctx, 1)), Dst(seeded(&ctx, 1))))
-        .expect("initial bind");
+    )
+    .call((Src(seeded(&ctx, 1)), Dst(seeded(&ctx, 1))));
 
     let records = records_during(&g, || {
         for _ in 0..10 {
@@ -141,8 +138,7 @@ fn cycle_longer_than_cap_evicts_and_stays_correct() {
         return;
     }
     let ks = kernels::kernels(&ctx).expect("kernels");
-    let g = scaled_chain!(&ctx, ks);
-    g.mutate_bind(Factor(1u32)).expect("bind");
+    let g = scaled_chain!(&ctx, ks).bind(Factor(1u32));
 
     // 3 states fit under CB_LRU_CAP (4 parked + 1 current): record 3, then hit.
     let three = records_during(&g, || {
@@ -206,7 +202,8 @@ fn slot_bound_before_composing_keeps_the_cache_keyed() {
         return;
     }
     let ks = kernels::kernels(&ctx).expect("kernels");
-    let g = precurried_chain!(&ctx, ks);
+    // Initial value = the first iteration's (3); every iteration re-binds before its sync.
+    let g = precurried_chain!(&ctx, ks).bind(Factor(3u32));
     let records = records_during(&g, || {
         for i in 0..12u32 {
             let f = if i % 2 == 0 { 3 } else { 7 };
@@ -230,7 +227,8 @@ fn slot_bound_before_composing_keeps_the_cache_keyed() {
 fn rebinding_a_precurried_slot_through_the_root_stays_correct() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("kernels");
-    let g = precurried_chain!(&ctx, ks);
+    // Initial value is arbitrary: every iteration re-binds both slots before its sync.
+    let g = precurried_chain!(&ctx, ks).bind(Factor(3u32));
     for (pre, f) in [(5, 3), (5, 7), (11, 3), (11, 7), (5, 3), (5, 7), (11, 3)] {
         g.mutate_call((Pre(pre), Factor(f))).expect("mutate");
         let out = g.sync(&ctx).expect("sync");

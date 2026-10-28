@@ -19,7 +19,7 @@ use claspr_test_support::{N, cb_records_of, ctx, seeded};
 /// Stands in for a library crate: it owns its slot tags and hands out a graph.
 mod affine_lib {
     use claspr::eager::{DeviceDynOp, DeviceOpExt};
-    use claspr::{DeviceSlice, Single, slot, slots};
+    use claspr::{DeviceSlice, Single, SlotSet, slot, slots};
     use claspr_test_kernels::kernels::Kernels;
     use claspr_test_support::N;
 
@@ -31,7 +31,13 @@ mod affine_lib {
     }
 
     /// The library's public graph type: named, storable, no bounds to restate.
-    pub type Affine = DeviceDynOp<'static, Single<DeviceSlice<u32>>>;
+    /// Its slot set is part of the type, so `sync` is refused until all four are
+    /// bound.
+    pub type Affine = DeviceDynOp<'static, Single<DeviceSlice<u32>>, Slots>;
+    /// The slots of [`Affine`], in the order the library chooses to declare.
+    pub type Slots = SlotSet![AffIn, Bias, AffOut, Factor];
+    /// A fully curried [`Affine`]: nothing left to bind.
+    pub type Curried = DeviceDynOp<'static, Single<DeviceSlice<u32>>>;
 
     /// `AffOut = (AffIn + Bias) * Factor`. Every input is a slot; `AffIn` takes
     /// a value or an upstream pipe. The input buffer is never written, so a
@@ -39,10 +45,10 @@ mod affine_lib {
     pub fn affine(ks: &Kernels) -> Affine {
         ks.add_u32([N], slot!(AffIn), slot!(Bias), slot!(AffOut))
             .and_then(move |(_a, _b, out)| ks.scale_u32([N], out, slot!(Factor)))
-            .erase()
+            .erase_as::<Slots, _>()
     }
 }
-use affine_lib::{AffIn, AffOut, Affine, Bias, Factor, affine};
+use affine_lib::{AffIn, AffOut, Bias, Curried, Factor, affine};
 
 // The USER's per-instance names for the library's `Factor` (see the rename tests).
 slots! { LeftF: u32, RightF: u32 }
@@ -111,7 +117,7 @@ fn open_slot_fans_out_across_instances() {
         .and_then(|x| affine(&ks).call((AffIn(x), Bias(seeded(&ctx, 1)), AffOut(seeded(&ctx, 0)))))
         .and_then(|y| affine(&ks).call((AffIn(y), Bias(seeded(&ctx, 4)), AffOut(seeded(&ctx, 0)))))
         .and_then(download)
-        .call((Factor(7),));
+        .call_all((Factor(7),));
     let out = g.sync(&ctx).expect("sync");
     assert_eq!(uniform(&out), ((3 + 1) * 7 + 4) * 7);
 }
@@ -120,8 +126,8 @@ fn open_slot_fans_out_across_instances() {
 #[test]
 fn curried_instances_are_storable() {
     struct Presets {
-        double: Affine,
-        triple: Affine,
+        double: Curried,
+        triple: Curried,
     }
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("kernels");
@@ -148,7 +154,7 @@ fn curried_instances_are_storable() {
 }
 
 /// A run-time number of instances composes in a plain loop (each step erases
-/// back to `Affine`, so the loop variable keeps one type) and the whole chain
+/// back to `Curried`, so the loop variable keeps one type) and the whole chain
 /// still records ONE command buffer, replayed on later syncs.
 #[test]
 fn runtime_length_chain_records_one_command_buffer() {
@@ -163,7 +169,7 @@ fn runtime_length_chain_records_one_command_buffer() {
             AffOut(seeded(&ctx, 0)),
         ))
     };
-    let mut g: Affine = affine(&ks).call((
+    let mut g: Curried = affine(&ks).call((
         AffIn(seeded(&ctx, 1)),
         Factor(2),
         Bias(seeded(&ctx, 0)),
@@ -196,13 +202,15 @@ fn rename_gives_an_instance_its_own_knob() {
         .scale_u32([N], seeded(&ctx, 1), 1u32)
         .and_then(|x| {
             affine(&ks)
-                .rename::<Factor, LeftF>()
+                .rename::<Factor, LeftF, _>()
                 .call(inst(x, seeded(&ctx, 1), seeded(&ctx, 0)))
         })
         .and_then(|y| {
-            affine(&ks)
-                .rename::<Factor, RightF>()
-                .call(inst(y, seeded(&ctx, 0), seeded(&ctx, 0)))
+            affine(&ks).rename::<Factor, RightF, _>().call(inst(
+                y,
+                seeded(&ctx, 0),
+                seeded(&ctx, 0),
+            ))
         })
         .and_then(|z| affine(&ks).call(inst(z, seeded(&ctx, 0), seeded(&ctx, 0))))
         .and_then(download)
@@ -217,13 +225,15 @@ fn renamed_away_tag_no_longer_reaches_the_instance() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("kernels");
     let g = affine(&ks)
-        .rename::<Factor, LeftF>()
+        .rename::<Factor, LeftF, _>()
         .call((
             AffIn(seeded(&ctx, 1)),
             Bias(seeded(&ctx, 0)),
             AffOut(seeded(&ctx, 0)),
         ))
-        .and_then(download);
+        .and_then(download)
+        // Opt out of static tracking: this test exercises the RUN-TIME checks.
+        .erase_unchecked();
     // Binding the old name finds no site; the renamed site stays unbound.
     match g.mutate_call((Factor(9),)) {
         Err(err) => assert!(matches!(err, Error::SlotNoSuchTag(_)), "got {err:?}"),
@@ -242,8 +252,8 @@ fn renamed_knob_rebinds_alone_and_stays_cached() {
     let inst = |x| (AffIn(x), Bias(seeded(&ctx, 0)), AffOut(seeded(&ctx, 0)));
     let g = ks
         .scale_u32([N], seeded(&ctx, 1), 1u32)
-        .and_then(|x| affine(&ks).rename::<Factor, LeftF>().call(inst(x)))
-        .and_then(|y| affine(&ks).rename::<Factor, RightF>().call(inst(y)))
+        .and_then(|x| affine(&ks).rename::<Factor, LeftF, _>().call(inst(x)))
+        .and_then(|y| affine(&ks).rename::<Factor, RightF, _>().call(inst(y)))
         .and_then(download)
         .call((LeftF(2), RightF(3)));
     for i in 0..8u32 {

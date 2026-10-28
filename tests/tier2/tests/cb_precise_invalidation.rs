@@ -96,11 +96,10 @@ fn distinct_slots_mutate_clears_only_its_region() {
         .and_then(|b| {
             ks.scale_u32([N], b, slot!(Factor2))
                 .and_then(|b2| ks.scale_u32([N], b2, 1u32))
-        });
+        })
+        .call((Factor1(3u32), Factor2(5u32)));
 
-    // Bind both factors, sync: 2 * 3 * 1 * 5 * 1 = 30. Homes both regions' CBs.
-    g.mutate_bind(Factor1(3u32)).expect("bind f1");
-    g.mutate_bind(Factor2(5u32)).expect("bind f2");
+    // Both factors bound at build time; sync: 2 * 3 * 1 * 5 * 1 = 30. Homes both regions' CBs.
     let co = g.sync(&ctx).expect("sync 1");
     let g1 = co.map().wait().expect("read 1");
     assert!(g1.iter().all(|&v| v == 30), "f1=3 f2=5: {:?}", &g1[..8]);
@@ -174,10 +173,10 @@ fn buffer_slot_threaded_across_seam_clears_downstream_cb() {
         .and_then(|b| {
             ks.scale_u32([N], b, 3u32)
                 .and_then(|b2| ks.scale_u32([N], b2, 1u32))
-        });
+        })
+        .bind(Buf(seeded(&ctx, 10)));
 
-    // Bind Buf := [10; N], sync: 10 * 2 * 3 = 60.
-    g.mutate_bind(Buf(seeded(&ctx, 10))).expect("bind Buf=10");
+    // Buf := [10; N] bound at build time; sync: 10 * 2 * 3 = 60.
     let co = g.sync(&ctx).expect("sync 1");
     let r1 = co.map().wait().expect("read 1");
     assert!(r1.iter().all(|&v| v == 60), "Buf=10: {:?}", &r1[..8]);
@@ -244,10 +243,9 @@ fn bundle_branch_interior_cb_precise_recursion() {
             .and_then(|x| ks.scale_u32([N], x, slot!(Factor2)))
             .and_then_host(noop_seam)
             .and_then(|x| ks.scale_u32([N], x, 1u32)),
-    );
+    )
+    .call((Factor1(3u32), Factor2(4u32)));
 
-    g.mutate_bind(Factor1(3u32)).expect("bind f1");
-    g.mutate_bind(Factor2(4u32)).expect("bind f2");
     let (ca, cb) = g.sync(&ctx).expect("sync 1");
     let ra = ca.map().wait().expect("read a");
     let rb = cb.map().wait().expect("read b");

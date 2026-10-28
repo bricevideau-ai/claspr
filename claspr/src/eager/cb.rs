@@ -424,7 +424,9 @@ pub(crate) fn cb_graph_eligible<O: DeviceOp + ?Sized>(op: &O, ec: &ExecutionCont
 /// cells by a [`SlotBinder::digest_collector`] walk. A boundary runs it before
 /// recording so the CB is keyed by what it bakes — renamed and erased sites
 /// included, since the collector matches cells, not tags.
-fn collect_slot_digests<O: DeviceOp>(op: &O) -> std::collections::BTreeMap<usize, Option<u64>> {
+fn collect_slot_digests<O: DeviceOp + ?Sized>(
+    op: &O,
+) -> std::collections::BTreeMap<usize, Option<u64>> {
     let mut collector = SlotBinder::digest_collector();
     op.bind_slots(&mut collector);
     collector.into_digests().into_iter().collect()
@@ -589,7 +591,7 @@ where
 /// The `>= 2` cutoff: a single-command span runs per-op — a CB holding one command is
 /// pure create/finalize/enqueue overhead with no batching benefit. Exact here (the
 /// boundaried span IS the whole child subtree).
-fn cb_should_open_boundary<O: DeviceOp>(child: &O, ec: &ExecutionContext<'_>) -> bool {
+fn cb_should_open_boundary<O: DeviceOp + ?Sized>(child: &O, ec: &ExecutionContext<'_>) -> bool {
     matches!(ec.cb(), CbWalk::Off)
         && child.cb_cache().is_some()
         && cb_graph_eligible(child, ec)
@@ -623,10 +625,21 @@ pub(crate) fn cb_exec_child<O: DeviceOp>(
     ec: &ExecutionContext<'_>,
     mode: ExecMode,
 ) -> Result<()> {
+    // Through the op, so an erased node walks its box: one instantiation per shape,
+    // not one per (shape, slot set).
+    child.cb_exec_as_child(ec, mode)
+}
+
+/// The body of [`cb_exec_child`]; unsized so it runs on a `dyn DeviceOp` too.
+pub(crate) fn cb_exec_child_impl<O: DeviceOp + ?Sized>(
+    child: &O,
+    ec: &ExecutionContext<'_>,
+    mode: ExecMode,
+) -> Result<()> {
     if cb_span_closed(ec) {
         // A deeper close already sealed this frame's span CB → run the child in `Off`
         // (it opens its own fresh boundary if eligible). Never add to a sealed CB.
-        return cb_exec_child(child, &ec.with_cb(CbWalk::Off), mode);
+        return cb_exec_child_impl(child, &ec.with_cb(CbWalk::Off), mode);
     }
     if cb_should_open_boundary(child, ec) {
         cb_boundary_execute(child, ec, mode)
@@ -849,7 +862,7 @@ pub(crate) fn cb_boundary_execute<O>(
     mode: ExecMode,
 ) -> Result<()>
 where
-    O: DeviceOp,
+    O: DeviceOp + ?Sized,
 {
     use crate::Launcher;
     let queue = ec.cl_queue().get();
