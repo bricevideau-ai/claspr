@@ -2615,12 +2615,18 @@ where
 /// kernel-arg position via [`ToInput`]. Concrete buffers / pipes / checkouts route
 /// through their existing `Into<Input<_>>` conversions.
 pub trait CopyOperand<Buf> {
+    /// The slots this operand contributes to the copy's compile-time set: none,
+    /// or `{Tag}` for a `slot!(Tag)` (as a kernel argument's [`ToInput::Slots`]).
+    type Slots: SlotList = HNil;
+
     /// Resolve into the copy's input edge over the concrete buffer type `Buf`.
     fn into_copy_input(self) -> Input<Buf>;
 }
 
 // A slot plugs into a copy operand position, mirroring its kernel-arg `ToInput`.
 impl<Tg: Tag> CopyOperand<Tg::Value> for SlotHandle<Tg> {
+    type Slots = HCons<Tg::Key, HNil>;
+
     fn into_copy_input(self) -> Input<Tg::Value> {
         self.into_input()
     }
@@ -2691,7 +2697,24 @@ impl_copy_operand_uninit!(USMSliceUninit);
 /// upstream [`Pipe`], a [`Checkout`], or a [`slot!`](crate::slot)`(Tag)` hole (see
 /// [`CopyOperand`]). Output is `(src, dst)` (an `Uninit` dst comes back `Init` —
 /// the copy wrote every byte). See [`CopyTo2`].
-pub fn eager_copy_to<Src, Dst, S, D>(src: S, dst: D) -> CopyTo2<Src, Dst>
+#[allow(clippy::type_complexity)]
+pub fn eager_copy_to<Src, Dst, S, D>(
+    src: S,
+    dst: D,
+) -> Slotted<CopyTo2<Src, Dst>, <S::Slots as SlotList>::Append<D::Slots>>
+where
+    Src: CopyTo<Dst>,
+    <Src::Op as crate::copy::CopyRun>::Output: CopyOutputs,
+    S: CopyOperand<Src>,
+    D: CopyOperand<Dst>,
+{
+    // The node holds tag-free `Input`s; the operands' slots ride on `Slotted`.
+    Slotted::new(copy_node(src, dst))
+}
+
+/// The bare copy node of [`eager_copy_to`] — for the `.copy_to` methods, whose
+/// operands are concrete buffers (no slots).
+pub(crate) fn copy_node<Src, Dst, S, D>(src: S, dst: D) -> CopyTo2<Src, Dst>
 where
     Src: CopyTo<Dst>,
     <Src::Op as crate::copy::CopyRun>::Output: CopyOutputs,

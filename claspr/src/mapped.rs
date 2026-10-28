@@ -481,7 +481,7 @@ impl<T, M: MemMode> MappedSlice<T, M> {
             crate::eager::CopyOutputs,
         Dst: crate::eager::CopyOperand<Dst>,
     {
-        crate::eager::eager_copy_to(self, dst)
+        crate::eager::copy_node(self, dst)
     }
 
     /// Write host `data` into this buffer — wraps `clEnqueueSVMMemcpy`

@@ -674,7 +674,7 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
         M: Send + 'static,
         M2: MemMode + Send + 'static,
     {
-        crate::eager::eager_copy_to(self, dst)
+        crate::eager::copy_node(self, dst)
     }
 
     /// Migrate this buffer onto `device` via `clEnqueueMigrateMemObjects`,

@@ -4015,7 +4015,7 @@ impl<T, M: MemMode> Pipe<DeviceSlice<T, M>> {
         M: Send + 'static,
         M2: MemMode + Send + 'static,
     {
-        eager_copy_to(self, dst)
+        copy_node(self, dst)
     }
 }
 
@@ -4075,7 +4075,7 @@ impl<T, M: MemMode> Pipe<MappedSlice<T, M>> {
         <<MappedSlice<T, M> as crate::CopyTo<Dst>>::Op as DeviceEnqueue>::Output: CopyOutputs,
         Dst: CopyOperand<Dst>,
     {
-        eager_copy_to(self, dst)
+        copy_node(self, dst)
     }
 }
 

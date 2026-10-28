@@ -32,7 +32,7 @@ use claspr::eager::{
 };
 use claspr::image::format::R32Uint;
 use claspr::{DeviceSlice, Error, Image2D, ReadOnly, WriteOnly};
-use claspr::{SlotSet, slot, slots};
+use claspr::{slot, slots};
 use claspr_test_kernels::kernels;
 use claspr_test_support::{N, ctx, handle_of, seeded};
 
@@ -327,10 +327,7 @@ fn copy_slot_src_and_slot_dst_x2_both_rehome() {
 
     // Both copy operands are SLOTS, set-once bound (consuming) before the run and
     // folded into `g`; `g` is then re-`sync`'d by `&` below.
-    // TYPED-SLOTS: `CopyTo2` does not report its slot operands in `Slots` (the graph is
-    // `HNil` though both holes are open), so declare them here.
     let g = eager_copy_to(slot!(Src), slot!(Dst))
-        .erase_as::<SlotSet![Src, Dst], _>()
         .bind(Src(_src))
         .bind(Dst(_dst));
 
@@ -797,10 +794,7 @@ fn multi_output_copy_independence() {
 
     // Concrete src + SLOT dst: the dst is governed by the 4-state slot machine.
     // Set-once bind (consuming) folded into `g`; re-`sync`'d / `mutate_bind`'d by `&`.
-    // TYPED-SLOTS: `CopyTo2` does not report its slot operand in `Slots` (see above).
-    let g = eager_copy_to(src, slot!(Dst))
-        .erase_as::<SlotSet![Dst], _>()
-        .bind(Dst(dst));
+    let g = eager_copy_to(src, slot!(Dst)).bind(Dst(dst));
 
     let (co_src, co_dst) = g.sync(&ctx).expect("copy run 1");
     assert_eq!(handle_of(&*co_src), hs, "src handle stable run 1");
