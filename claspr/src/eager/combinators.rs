@@ -2933,12 +2933,23 @@ where
     let marker = match unsafe { queue.raw().enqueue_marker_with_wait_list(&wait_list) } {
         Ok(ev) => ev,
         Err(code) => {
+            // A host seam whose source has no deps (e.g. `value(()).and_then_host`)
+            // is not behind the start gate, so its worker may already have failed
+            // and completed `proceed` negative — and a strict driver (rusticl)
+            // then rejects this enqueue with
+            // `CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST`. That code is the
+            // cascade, not the cause: prefer the worker's stash (visible after the
+            // join), like every other terminal error path.
             release_start(&start);
             drop(deps);
             join_chain_workers(&workers);
             drop(queue);
             context.invalidate_default_outoforder_queue(&device);
-            return DeviceChainFuture::Errored(Some(Error::OpenCl(code)));
+            return DeviceChainFuture::Errored(Some(
+                lock_unpoisoned(&host_error)
+                    .take()
+                    .unwrap_or(Error::OpenCl(code)),
+            ));
         }
     };
     drop(deps);
@@ -2957,7 +2968,8 @@ where
         join_chain_workers(&workers);
         drop(queue);
         context.invalidate_default_outoforder_queue(&device);
-        return DeviceChainFuture::Errored(Some(e));
+        // Same precedence as the marker path above: a seam's stash beats the code.
+        return DeviceChainFuture::Errored(Some(lock_unpoisoned(&host_error).take().unwrap_or(e)));
     }
     // `start` (if any) has been completed; its retained dep refs keep the cl_event
     // alive in the wait-lists until those commands run. Safe to drop here.
