@@ -475,6 +475,15 @@ trigger:** a user wants one of those.
 
 ## Concerns
 
+### Async `.run()` host-error race (seen 2026-10-27, rusticl, pre-existing on main)
+
+`eager_error_fidelity::async_terminal_run_also_delivers_rich_variant` flakes under
+load on rusticl: `.run(&ctx).await` returns the marker cascade
+`OpenCl(ClError(-14))` (EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST) instead of the
+host closure's stashed rich error. 0/300 serial; ~1% with 8 concurrent copies, the
+same on main (17/1440) and typed-slot-sets (15/1440). Likely the future's poll
+reads the marker status before the host-error slot is filled. Not investigated.
+
 ### Where per-sync time actually goes (profiled 2026-09-08) — NOT the walk
 
 Closes the deferred "should we skip the LendOnly walk on a cache hit?" question
