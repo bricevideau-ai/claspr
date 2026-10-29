@@ -38,7 +38,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use claspr::eager::{DeviceDynOp, DeviceOpExt, Pipe, bundle2, forward};
-use claspr::{Context, DeviceScalar, DeviceSlice, Single};
+use claspr::{Context, DeviceScalar, DeviceSlice, Single, graph};
 
 #[claspr::device]
 mod gpu {
@@ -707,55 +707,23 @@ impl Builder<'_> {
         let ks = self.ks;
         let (d, kvd, hs) = (c.dim as u32, c.kv_dim() as u32, c.head_size() as u32);
         let (seq, kv_mul) = (c.seq_len as u32, c.kv_mul() as u32);
-        Ok(g.and_then(move |(x, step)| {
-            ks.rmsnorm([c.dim], x, rms, xb, d)
-                .and_then(move |(x, _rms, xb)| {
-                    ks.matmul([c.dim], wq, xb, q, d)
-                        .and_then(move |(_wq, xb, q)| {
-                            ks.kv([c.kv_dim()], wk, wv, xb, k_cache, v_cache, step, d, kvd)
-                                .and_then(move |(_wk, _wv, _xb, k_cache, v_cache, step)| {
-                                    ks.rope([c.dim / 2], q, k_cache, step, kvd, hs)
-                                        .and_then(move |(q, k_cache, step)| {
-                                            ks.att_scores(
-                                                [c.n_heads * c.seq_len],
-                                                q,
-                                                k_cache,
-                                                att,
-                                                step,
-                                                seq,
-                                                hs,
-                                                kvd,
-                                                kv_mul,
-                                            )
-                                        })
-                                        .and_then(move |(_q, _k_cache, att, step)| {
-                                            ks.softmax([c.n_heads], att, step, seq)
-                                        })
-                                        .and_then(move |(att, step)| {
-                                            ks.att_mix(
-                                                [c.dim],
-                                                att,
-                                                v_cache,
-                                                xb2,
-                                                step,
-                                                seq,
-                                                hs,
-                                                kvd,
-                                                kv_mul,
-                                            )
-                                        })
-                                        .and_then(move |(_att, _v_cache, xb2, step)| {
-                                            ks.matmul([c.dim], wo, xb2, xo, d)
-                                                .and_then(move |(_wo, _xb2, xo)| {
-                                                    ks.add([c.dim], x, xo)
-                                                })
-                                                .and_then(move |(x, _xo)| {
-                                                    bundle2(forward(x), forward(step))
-                                                })
-                                        })
-                                })
-                        })
-                })
+        Ok(g.and_then(|(x, step)| {
+            graph! {
+                let (x, _rms, xb) = ks.rmsnorm([c.dim], x, rms, xb, d);
+                let (_wq, xb, q) = ks.matmul([c.dim], wq, xb, q, d);
+                let (_wk, _wv, _xb, k_cache, v_cache, step) =
+                    ks.kv([c.kv_dim()], wk, wv, xb, k_cache, v_cache, step, d, kvd);
+                let (q, k_cache, step) = ks.rope([c.dim / 2], q, k_cache, step, kvd, hs);
+                let (_q, _k_cache, att, step) = ks.att_scores(
+                    [c.n_heads * c.seq_len], q, k_cache, att, step, seq, hs, kvd, kv_mul,
+                );
+                let (att, step) = ks.softmax([c.n_heads], att, step, seq);
+                let (_att, _v_cache, xb2, step) =
+                    ks.att_mix([c.dim], att, v_cache, xb2, step, seq, hs, kvd, kv_mul);
+                let (_wo, _xb2, xo) = ks.matmul([c.dim], wo, xb2, xo, d);
+                let (x, _xo) = ks.add([c.dim], x, xo);
+                bundle2(forward(x), forward(step))
+            }
         })
         .erase())
     }
@@ -768,19 +736,17 @@ impl Builder<'_> {
         let [h1, h3] = self.zeros_n(c.hidden_dim)?;
         let ks = self.ks;
         let (d, h) = (c.dim as u32, c.hidden_dim as u32);
-        Ok(map_x(g, move |x| {
-            ks.rmsnorm([c.dim], x, rms, xb, d)
-                .and_then(move |(x, _rms, xb)| {
-                    ks.matmul([c.hidden_dim], w1, xb, h1, d)
-                        .and_then(move |(_w1, xb, h1)| {
-                            ks.matmul([c.hidden_dim], w3, xb, h3, d)
-                                .and_then(move |(_w3, _xb, h3)| ks.swiglu([c.hidden_dim], h1, h3))
-                                .and_then(move |(h1, _h3)| ks.matmul([c.dim], w2, h1, xo, h))
-                                .and_then(move |(_w2, _h1, xo)| ks.add([c.dim], x, xo))
-                                .and_then(|(x, _xo)| forward(x))
-                        })
-                })
-                .erase()
+        Ok(map_x(g, |x| {
+            graph! {
+                let (x, _rms, xb) = ks.rmsnorm([c.dim], x, rms, xb, d);
+                let (_w1, xb, h1) = ks.matmul([c.hidden_dim], w1, xb, h1, d);
+                let (_w3, _xb, h3) = ks.matmul([c.hidden_dim], w3, xb, h3, d);
+                let (h1, _h3) = ks.swiglu([c.hidden_dim], h1, h3);
+                let (_w2, _h1, xo) = ks.matmul([c.dim], w2, h1, xo, h);
+                let (x, _xo) = ks.add([c.dim], x, xo);
+                forward(x)
+            }
+            .erase()
         }))
     }
 }

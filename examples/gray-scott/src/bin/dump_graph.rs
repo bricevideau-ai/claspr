@@ -23,7 +23,7 @@
 
 use claspr::eager::{DeviceOp, DeviceOpExt, GraphNode, bundle4, graph_edge_table};
 use claspr::{Context, DeviceSlice, LaunchSpec};
-use claspr::{slot, slots};
+use claspr::{graph, slot, slots};
 
 #[claspr::device]
 mod gpu {
@@ -231,31 +231,28 @@ fn main() -> claspr::Result<()> {
     // Three dispatches (lap_u, lap_v, combine); `bind(Grid(..))` fans one launch
     // spec to all three; each laplacian threads BOTH outputs (field + scratch)
     // forward as pipes; combine reads four upstream pipes.
-    let g = ks
-        .laplacian(slot!(Grid), slot!(UIn), lap_u_buf)
-        .and_then(move |(u_in, lap_u)| {
-            ks.laplacian(slot!(Grid), slot!(VIn), lap_v_buf)
-                .and_then(move |(v_in, lap_v)| {
-                    ks.combine(
-                        slot!(Grid),
-                        u_in,
-                        v_in,
-                        lap_u,
-                        lap_v,
-                        slot!(UOut),
-                        slot!(VOut),
-                        slot!(F),
-                        slot!(K),
-                    )
-                })
-        })
-        .bind(F(F1))
-        .bind(K(K1))
-        .bind(Grid(LaunchSpec::from([W, H])))
-        .bind(UIn(u_a))
-        .bind(VIn(v_a))
-        .bind(UOut(u_b))
-        .bind(VOut(v_b));
+    let g = graph! {
+        let (u_in, lap_u) = ks.laplacian(slot!(Grid), slot!(UIn), lap_u_buf);
+        let (v_in, lap_v) = ks.laplacian(slot!(Grid), slot!(VIn), lap_v_buf);
+        ks.combine(
+            slot!(Grid),
+            u_in,
+            v_in,
+            lap_u,
+            lap_v,
+            slot!(UOut),
+            slot!(VOut),
+            slot!(F),
+            slot!(K),
+        )
+    }
+    .bind(F(F1))
+    .bind(K(K1))
+    .bind(Grid(LaunchSpec::from([W, H])))
+    .bind(UIn(u_a))
+    .bind(VIn(v_a))
+    .bind(UOut(u_b))
+    .bind(VOut(v_b));
 
     dump("PER-STEP graph (run_swap / single step)", &g);
 
@@ -284,29 +281,23 @@ fn main() -> claspr::Result<()> {
     // the launchers clone the context internally, so the returned graph owns
     // everything it needs.
     let curried = |ks: &gpu::Kernels, lap_u, lap_v| {
-        ks.laplacian(slot!(Grid), slot!(UIn), lap_u)
-            .and_then(move |(u_in, lap_u_pipe)| {
-                ks.laplacian(slot!(Grid), slot!(VIn), lap_v)
-                    .and_then(move |(v_in, lap_v_pipe)| {
-                        ks.combine(
-                            slot!(Grid),
-                            u_in,
-                            v_in,
-                            lap_u_pipe,
-                            lap_v_pipe,
-                            slot!(UOut),
-                            slot!(VOut),
-                            slot!(F),
-                            slot!(K),
-                        )
-                        .and_then(
-                            |(u_in, v_in, _lap_u, _lap_v, u_out, v_out)| {
-                                bundle4(u_in, v_in, u_out, v_out)
-                            },
-                        )
-                    })
-            })
-            .call((F(F1), K(K1), Grid(LaunchSpec::from([W, H]))))
+        graph! {
+            let (u_in, lap_u) = ks.laplacian(slot!(Grid), slot!(UIn), lap_u);
+            let (v_in, lap_v) = ks.laplacian(slot!(Grid), slot!(VIn), lap_v);
+            let (u_in, v_in, _lap_u, _lap_v, u_out, v_out) = ks.combine(
+                slot!(Grid),
+                u_in,
+                v_in,
+                lap_u,
+                lap_v,
+                slot!(UOut),
+                slot!(VOut),
+                slot!(F),
+                slot!(K),
+            );
+            bundle4(u_in, v_in, u_out, v_out)
+        }
+        .call((F(F1), K(K1), Grid(LaunchSpec::from([W, H]))))
     };
 
     // Compose step 1 (concrete bufs) THEN step 2 (fed from step 1's output pipes).

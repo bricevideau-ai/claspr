@@ -41,6 +41,7 @@
 //! | You want to… | Use | Notes |
 //! |---|---|---|
 //! | sequence: run B on A's output | [`and_then`](DeviceOpExt::and_then) | builder runs at construction over A's [`Handle`](HandleOf) |
+//! | a sequence whose later steps use earlier steps' outputs | [`graph!`](crate::graph) | one `let` per step, written straight-line; expands to the nested `and_then` closures that keep every earlier binding in scope |
 //! | **carry a value PAST an intervening step** (keep it to hand to a later op / the terminal) | **[`forward`]** | `forward(x)` re-exposes an already-produced value as a one-node op; capture its handle in the `move` closures. This is the "thread a buffer forward" primitive. |
 //! | run device ops in PARALLEL | [`bundle2`] / [`bundle!`](crate::bundle) | independent branches; per-branch structure-preserving `Checkouts` |
 //! | N-way homogeneous parallel | [`fan_out`] | one op per item |
