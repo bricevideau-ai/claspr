@@ -38,6 +38,8 @@
 //! - `uninit_to_read_arg` — an uninitialised buffer is accepted only by a
 //!   write-only `PerItemOut<T>` parameter; passing it to a parameter the kernel
 //!   may read (`&[T]`) is rejected.
+//! - `per_item_out_without_written` — a kernel with write-only `PerItemOut`
+//!   outputs must return `Written` (proof every output is written).
 //! - `pipe_not_clone` — `Pipe` is not `Clone`: a handle pipe can't be
 //!   duplicated to feed one value to two consumers (share it with
 //!   `.arc()` / `arc_split`).

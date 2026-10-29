@@ -243,3 +243,24 @@ fn per_item_in_accepts_a_shared_read_only_buffer() {
         );
     }
 }
+
+/// Two write-only outputs, initialised from uninitialised buffers, through a
+/// kernel whose early-return path must also prove both writes.
+#[test]
+fn per_item_out_two_outputs_with_an_early_return() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let input: Vec<u32> = (0..N as u32)
+        .map(|i| if i % 4 == 0 { 0 } else { (i << 16) | (i + 7) })
+        .collect();
+    let a = DeviceSlice::<u32>::from_slice(&ctx, &input).expect("a");
+    let lo = DeviceSlice::<u32>::alloc_uninit(&ctx, N).expect("lo");
+    let hi = DeviceSlice::<u32>::alloc_uninit(&ctx, N).expect("hi");
+    let (_a, lo, hi) = ks.split_halves_u32([N], a, lo, hi).wait().expect("launch");
+    let (mut l, mut h) = (vec![0u32; N], vec![0u32; N]);
+    lo.read(&mut l).wait().expect("read lo");
+    hi.read(&mut h).wait().expect("read hi");
+    for (i, &v) in input.iter().enumerate() {
+        assert_eq!((l[i], h[i]), (v & 0xffff, v >> 16), "element {i}");
+    }
+}

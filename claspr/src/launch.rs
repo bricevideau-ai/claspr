@@ -333,16 +333,13 @@ mod kernel_slice_write_arg_sealed {
 /// A buffer a kernel can take as a write-only `PerItemOut<T>` argument: an
 /// initialised writable buffer, or an UNINITIALISED one
 /// ([`DeviceSliceUninit`](crate::DeviceSliceUninit)) that the launch
-/// initialises, handing back [`Init`](Self::Init). What is guaranteed: the
-/// launch checks the grid gives every element exactly one work-item, and that
-/// work-item's view can only write it (never read it).
-///
-/// **PROTOTYPE — not yet sound in general:** nothing forces the work-item to
-/// actually write (a kernel that returns early leaves its element unwritten),
-/// yet the buffer comes back as initialised. Harmless garbage for numeric `T`;
-/// undefined behaviour for `T` with invalid bit patterns. Closing it needs the
-/// write to be structural — the kernel body producing the element as a value
-/// (see NOTES).
+/// initialises, handing back [`Init`](Self::Init). Every element IS written:
+/// the launch checks the grid gives every element exactly one work-item; that
+/// work-item's view can only write it (never read it); and a kernel with a
+/// `PerItemOut` must return `Written`, buildable only from each output's
+/// consuming `write`, so every path that completes has written every output
+/// (claspr-build makes the body a closure returning it). A kernel that never
+/// completes (abort, endless loop) fails the launch instead.
 pub trait KernelSliceWriteArg<T>:
     KernelArg + Send + 'static + kernel_slice_write_arg_sealed::Sealed<T>
 {
@@ -408,9 +405,9 @@ impl<
         })
     }
     fn __claspr_into_init(self) -> DeviceSlice<T, M> {
-        // SAFETY (prototype, see the trait docs): the grid was checked to give
-        // every element one `PerItemOut` writer; that each writer WRITES is the
-        // kernel's convention, not yet enforced.
+        // SAFETY: the launch completed, its grid was checked to give every
+        // element one `PerItemOut` writer, and the kernel's `Written` return
+        // proves each writer wrote (see the trait docs).
         unsafe { self.assume_init() }
     }
     fn __claspr_forget_init(init: DeviceSlice<T, M>) -> Self {

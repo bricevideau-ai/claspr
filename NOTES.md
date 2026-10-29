@@ -28,13 +28,14 @@ bounds them too — llama2's `add`/`swiglu`/`rmsnorm` weights use it, no cost).
 `KernelSliceWriteArg` it accepts a `DeviceSliceUninit` and outputs the initialised
 `DeviceSlice` (home adapter forgets init on return), incl. `DeviceScratch` memory —
 the safe version of the documented "kernel-write-only + assume_init" pattern.
-**OPEN — soundness of `PerItemOut`:** the grid check gives each element exactly one
-writer and the view forbids reads, but nothing forces the writer to WRITE (an early
-`return`, cf. llama2's `att_scores` for `t > pos`), yet the buffer comes back
-initialised: garbage for numeric `T`, UB for invalid-bit-pattern `T`. Real fix: make
-the write structural — the kernel body yields the element as a value (`-> T` or an
-`#[out]` marker) and the generated wrapper stores it, so Rust forces every path to
-produce one. Weaker fallback: bound `T` to any-bit-pattern types. Also not done:
+**`PerItemOut` writes are compile-time enforced:** `write(self, v)` consumes the
+view and returns a `Proof<marker>`; a kernel with `PerItemOut` params must return
+`Written` (generated per kernel, one field per output), so a missing output, a
+double write, another output's proof, a forged proof or a bare `return;` are all
+compile errors, and early returns must prove too (claspr-build wraps the body in a
+closure returning `Written`). llama2's embed/rmsnorm/matmul/att_mix outputs use it
+over `alloc_uninit` buffers: byte-identical, 1 CB, no cost (151.0 vs 150.9).
+Also not done:
 `MappedSliceUninit`/`USMSliceUninit` (SVM arg setting), 2-D partitions.
 
 ### Decisions — assessed & DECLINED (kept so future sessions don't re-litigate)

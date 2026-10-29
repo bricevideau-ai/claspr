@@ -1,4 +1,4 @@
-error: a `#[claspr::kernel]` fn cannot return a value — a kernel writes through its buffer/image args, so the signature must return `()`
+error: a `#[claspr::kernel]` fn cannot return a value — a kernel writes through its buffer/image args, so the signature must return `()` (only a kernel with `PerItemOut` params returns `Written`)
   --> compile_fail/macro/kernel_returns_value.rs:13:14
    |
 13 |         ) -> u32;

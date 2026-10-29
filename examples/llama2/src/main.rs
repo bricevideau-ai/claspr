@@ -64,11 +64,14 @@ mod gpu {
     pub fn embed(
         #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] table: &[f32],
-        #[spirv(cross_workgroup)] x: PerItem<f32>,
+        #[spirv(cross_workgroup)] x: PerItemOut<f32>,
         #[spirv(cross_workgroup)] step: &Step,
         dim: u32,
-    ) {
-        *x = table[step.token as usize * dim as usize + x.index()];
+    ) -> Written {
+        let i = x.index();
+        Written {
+            x: x.write(table[step.token as usize * dim as usize + i]),
+        }
     }
 
     /// `out = w * x / rms(x)`. Every work-item recomputes the sum of squares (`n`
@@ -79,9 +82,9 @@ mod gpu {
         #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] x: &[f32],
         #[spirv(cross_workgroup)] w: PerItemIn<f32>,
-        #[spirv(cross_workgroup)] out: PerItem<f32>,
+        #[spirv(cross_workgroup)] out: PerItemOut<f32>,
         n: u32,
-    ) {
+    ) -> Written {
         let i = out.index();
         let mut ss = 0.0f32;
         let mut j = 0usize;
@@ -90,7 +93,9 @@ mod gpu {
             j += 1;
         }
         let scale = 1.0 / ocl::sqrt(ss / n as f32 + 1e-5);
-        *out = *w * (scale * x[i]);
+        Written {
+            out: out.write(*w * (scale * x[i])),
+        }
     }
 
     /// `out = W x` for a row-major `W` of `n` columns (one row per work-item).
@@ -99,9 +104,9 @@ mod gpu {
         #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] w: &[f32],
         #[spirv(cross_workgroup)] x: &[f32],
-        #[spirv(cross_workgroup)] out: PerItem<f32>,
+        #[spirv(cross_workgroup)] out: PerItemOut<f32>,
         n: u32,
-    ) {
+    ) -> Written {
         let row = out.index() * n as usize;
         let mut acc = 0.0f32;
         let mut j = 0usize;
@@ -109,7 +114,9 @@ mod gpu {
             acc += w[row + j] * x[j];
             j += 1;
         }
-        *out = acc;
+        Written {
+            out: out.write(acc),
+        }
     }
 
     /// The key and value projections of `x`, written straight into the current
@@ -241,13 +248,13 @@ mod gpu {
         #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] att: &[f32],
         #[spirv(cross_workgroup)] v_cache: &[f32],
-        #[spirv(cross_workgroup)] out: PerItem<f32>,
+        #[spirv(cross_workgroup)] out: PerItemOut<f32>,
         #[spirv(cross_workgroup)] step: &Step,
         seq_len: u32,
         head_size: u32,
         kv_dim: u32,
         kv_mul: u32,
-    ) {
+    ) -> Written {
         let hs = head_size as usize;
         let (h, j) = (id.x / hs, id.x % hs);
         let vo = (h / kv_mul as usize) * hs + j;
@@ -257,7 +264,9 @@ mod gpu {
             acc += att[h * seq_len as usize + t] * v_cache[t * kv_dim as usize + vo];
             t += 1;
         }
-        *out = acc;
+        Written {
+            out: out.write(acc),
+        }
     }
 
     /// `x += y`: the residual connection.
@@ -610,6 +619,21 @@ impl Builder<'_> {
         DeviceSlice::<f32>::alloc_zero(self.ctx, len).map_err(|e| format!("alloc: {e:?}"))
     }
 
+    /// An uninitialised buffer of `len` floats, for a kernel's write-only
+    /// (`PerItemOut`) output: the launch initialises it, no zero-fill needed.
+    fn uninit(&self, len: usize) -> Result<claspr::DeviceSliceUninit<f32>, String> {
+        DeviceSlice::<f32>::alloc_uninit(self.ctx, len).map_err(|e| format!("alloc: {e:?}"))
+    }
+
+    /// `N` uninitialised output buffers of `len` floats.
+    fn uninit_n<const N: usize>(
+        &self,
+        len: usize,
+    ) -> Result<[claspr::DeviceSliceUninit<f32>; N], String> {
+        let bufs: Vec<_> = (0..N).map(|_| self.uninit(len)).collect::<Result<_, _>>()?;
+        Ok(bufs.try_into().expect("N buffers"))
+    }
+
     /// `N` zeroed scratch buffers of `len` floats.
     fn zeros_n<const N: usize>(&self, len: usize) -> Result<[DeviceSlice<f32>; N], String> {
         let bufs: Vec<_> = (0..N).map(|_| self.zeros(len)).collect::<Result<_, _>>()?;
@@ -648,7 +672,7 @@ impl Builder<'_> {
     /// The first op: the token's embedding, and the step state, starting
     /// generation at BOS, position 0.
     fn embed(&self, table: &str) -> Result<Stream, String> {
-        let (table, x) = (self.shared_weight(table)?, self.zeros(self.cfg.dim)?);
+        let (table, x) = (self.shared_weight(table)?, self.uninit(self.cfg.dim)?);
         let step = DeviceScalar::new(self.ctx, gpu::Step { token: BOS, pos: 0 })
             .map_err(|e| format!("alloc step: {e:?}"))?;
         let dim = self.cfg.dim as u32;
@@ -660,7 +684,7 @@ impl Builder<'_> {
     }
 
     fn rmsnorm(&self, g: Stream, w: &str, layer: Option<usize>) -> Result<Stream, String> {
-        let (w, out) = (self.weight(w, layer)?, self.zeros(self.cfg.dim)?);
+        let (w, out) = (self.weight(w, layer)?, self.uninit(self.cfg.dim)?);
         let (ks, d) = (self.ks, self.cfg.dim);
         Ok(map_x(g, move |x| {
             ks.rmsnorm([d], x, w, out, d as u32)
@@ -670,7 +694,7 @@ impl Builder<'_> {
     }
 
     fn classifier(&self, g: Stream, w: &str) -> Result<Stream, String> {
-        let (w, logits) = (self.shared_weight(w)?, self.zeros(self.cfg.vocab_size)?);
+        let (w, logits) = (self.shared_weight(w)?, self.uninit(self.cfg.vocab_size)?);
         let (ks, d, v) = (self.ks, self.cfg.dim, self.cfg.vocab_size);
         Ok(map_x(g, move |x| {
             ks.matmul([v], w, x, logits, d as u32)
@@ -699,7 +723,7 @@ impl Builder<'_> {
     ) -> Result<Stream, String> {
         let c = self.cfg;
         let [rms, wq, wk, wv, wo] = self.weights(w, layer)?;
-        let [xb, q, xb2, xo] = self.zeros_n(c.dim)?;
+        let [xb, q, xb2, xo] = self.uninit_n(c.dim)?;
         let [k_cache, v_cache] = self.zeros_n(c.seq_len * c.kv_dim())?;
         let att = self.zeros(c.n_heads * c.seq_len)?;
         let ks = self.ks;
@@ -730,8 +754,8 @@ impl Builder<'_> {
     fn ffn(&self, g: Stream, layer: Option<usize>, w: &[String; 4]) -> Result<Stream, String> {
         let c = self.cfg;
         let [rms, w1, w2, w3] = self.weights(w, layer)?;
-        let [xb, xo] = self.zeros_n(c.dim)?;
-        let [h1, h3] = self.zeros_n(c.hidden_dim)?;
+        let [xb, xo] = self.uninit_n(c.dim)?;
+        let [h1, h3] = self.uninit_n(c.hidden_dim)?;
         let ks = self.ks;
         let (d, h) = (c.dim as u32, c.hidden_dim as u32);
         Ok(map_x(g, |x| {

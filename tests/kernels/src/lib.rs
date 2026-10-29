@@ -201,16 +201,40 @@ pub mod kernels {
     }
 
     /// `out[i] = a[i] * factor` into a write-only `PerItemOut`: `out` may be
-    /// an UNINITIALISED buffer, which the launch initialises (every element is
-    /// written exactly once; the kernel cannot read it).
+    /// an UNINITIALISED buffer, which the launch initialises. Returning
+    /// `Written` (built only from `out.write(..)`) is the compile-time proof
+    /// that every element is written; the kernel cannot read `out`.
     #[claspr::kernel]
     pub fn scaled_copy_out_u32(
         #[spirv(cross_workgroup)] a: &[u32],
         #[spirv(cross_workgroup)] out: PerItemOut<u32>,
         factor: u32,
-    ) {
+    ) -> Written {
         let i = out.index();
-        out.write(a[i].wrapping_mul(factor));
+        Written {
+            out: out.write(a[i].wrapping_mul(factor)),
+        }
+    }
+
+    /// Two write-only outputs, matched to `Written`'s fields by name, with an
+    /// early return (which must also prove both writes): `lo = a & 0xffff`,
+    /// `hi = a >> 16`, or both 0 for a zero input.
+    #[claspr::kernel]
+    pub fn split_halves_u32(
+        #[spirv(cross_workgroup)] a: PerItemIn<u32>,
+        #[spirv(cross_workgroup)] lo: PerItemOut<u32>,
+        #[spirv(cross_workgroup)] hi: PerItemOut<u32>,
+    ) -> Written {
+        if *a == 0 {
+            return Written {
+                lo: lo.write(0),
+                hi: hi.write(0),
+            };
+        }
+        Written {
+            hi: hi.write(*a >> 16),
+            lo: lo.write(*a & 0xffff),
+        }
     }
 
     /// A user struct passed BY REFERENCE to kernels, held on the host side in

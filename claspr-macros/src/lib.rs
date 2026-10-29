@@ -100,11 +100,13 @@ use syn::{
 /// - `PerItemIn<T>` is the read-only form (`*name`, `name.index()`, no
 ///   write; accepts what `&[T]` does, incl. `Arc<DeviceSlice>`): an input read
 ///   element-wise, so the launch's grid check bounds the INPUT too.
-/// - `PerItemOut<T>` is the write-only form (`name.write(v)`, `name.index()`,
-///   no read). It also accepts an UNINITIALISED buffer (`DeviceSliceUninit`)
-///   and outputs the initialised one. Prototype caveat: a work-item that
-///   returns without writing leaves its element unwritten (see
-///   `KernelSliceWriteArg`).
+/// - `PerItemOut<T>` is the write-only form (`name.index()`, no read). Its
+///   `write(v)` consumes the view and returns a proof, and a kernel with
+///   `PerItemOut` params must return `Written` — a struct with one field per
+///   output, filled only by those proofs (`Written { out: out.write(v) }`) — so
+///   an output left unwritten on any completing path is a compile error. It
+///   accepts an UNINITIALISED buffer (`DeviceSliceUninit`) and outputs the
+///   initialised one.
 /// - A parameter `&Image!(...)` is translated to a generic arg bounded by
 ///   the matching `KernelImage<dim>D<Access>Arg<family>` trait (1D/2D/3D/
 ///   Buffer, arrayed variants), also threaded through `Output`.
@@ -614,14 +616,52 @@ fn validate_kernel_sig(sig: &Signature) -> syn::Result<()> {
              from the buffer/image params",
         ));
     }
-    if let syn::ReturnType::Type(_, ty) = &sig.output {
-        return Err(syn::Error::new_spanned(
+    // A kernel with write-only `PerItemOut` params returns `Written` — the proof
+    // (checked on the device side by claspr-build) that every output was
+    // written. Nothing else may return a value.
+    let outs: Vec<String> = sig
+        .inputs
+        .iter()
+        .filter_map(|a| match a {
+            syn::FnArg::Typed(pt) => match (&*pt.pat, &*pt.ty) {
+                (Pat::Ident(pi), Type::Path(tp))
+                    if tp
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|s| s.ident == "PerItemOut") =>
+                {
+                    Some(pi.ident.to_string())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let returns_written = matches!(
+        &sig.output,
+        syn::ReturnType::Type(_, ty) if matches!(&**ty, Type::Path(tp) if tp.path.is_ident("Written"))
+    );
+    match (&sig.output, outs.is_empty()) {
+        (syn::ReturnType::Type(_, ty), true) => Err(syn::Error::new_spanned(
             ty,
             "a `#[claspr::kernel]` fn cannot return a value — a kernel writes through \
-             its buffer/image args, so the signature must return `()`",
-        ));
+             its buffer/image args, so the signature must return `()` (only a kernel \
+             with `PerItemOut` params returns `Written`)",
+        )),
+        (_, false) if !returns_written => {
+            let fields: Vec<String> = outs.iter().map(|o| format!("{o}: {o}.write(..)")).collect();
+            Err(syn::Error::new_spanned(
+                &sig.ident,
+                format!(
+                    "this kernel has `PerItemOut` parameters, so it must return `Written`: \
+                     end its body with `Written {{ {} }}` — proof that every output is written",
+                    fields.join(", ")
+                ),
+            ))
+        }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {

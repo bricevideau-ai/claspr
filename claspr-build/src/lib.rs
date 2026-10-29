@@ -865,10 +865,12 @@ fn translate_and_inline(items: Vec<syn::Item>, dir: &Path) -> Result<Vec<syn::It
     for item in items {
         match item {
             syn::Item::Fn(mut f) => {
+                let mut extra = Vec::new();
                 if f.attrs.iter().any(is_claspr_kernel_attr) {
-                    rewrite_per_item_params(&mut f);
+                    extra = rewrite_per_item_params(&mut f)?;
                 }
                 translate_fn_attrs(&mut f.attrs);
+                out.extend(extra);
                 out.push(syn::Item::Fn(f));
             }
             syn::Item::Mod(mut m) => {
@@ -1022,7 +1024,14 @@ fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, PerItemAccess)> {
 /// has none. The host side treats the parameter as a written slice and checks at
 /// launch that the 1-D grid matches the buffer's length, so `gid.x` indexes every
 /// element exactly once.
-fn rewrite_per_item_params(f: &mut syn::ItemFn) {
+///
+/// A kernel with `PerItemOut<T>` params must return `Written`: a per-kernel struct
+/// with one field per write-only param, each of a type only that param's
+/// `write(self, v)` returns. The body becomes a closure returning `Written`, so
+/// every path that completes has written every output (a missing field, a
+/// second write, another output's proof or a forged one are compile errors).
+/// Returns the generated items (the per-output marker types and `Written`).
+fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
     let is_gid = |pt: &syn::PatType| {
         pt.attrs.iter().any(|a| {
             a.path().is_ident("spirv")
@@ -1059,7 +1068,7 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) {
         lowered.push((name, raw, access));
     }
     if lowered.is_empty() {
-        return;
+        return Ok(Vec::new());
     }
     let gid = gid.unwrap_or_else(|| {
         let id = quote::format_ident!("__claspr_gid");
@@ -1069,21 +1078,83 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) {
         );
         id
     });
+    let kernel = f.sig.ident.clone();
+    let marker = |name: &syn::Ident| quote::format_ident!("__claspr_out_{}_{}", kernel, name);
     let prologue: Vec<syn::Stmt> = lowered
         .iter()
-        .map(|(name, raw, access)| {
-            let view = match access {
-                PerItemAccess::ReadWrite => quote::quote!(PerItem),
-                PerItemAccess::Read => quote::quote!(PerItemIn),
-                PerItemAccess::Write => quote::quote!(PerItemOut),
-            };
-            syn::parse_quote! {
-                #[allow(unused_mut)]
-                let mut #name = crate::__claspr::#view::__claspr_new(#raw, #gid.x);
+        .map(|(name, raw, access)| match access {
+            PerItemAccess::Write => {
+                let m = marker(name);
+                syn::parse_quote! {
+                    let #name = crate::__claspr::PerItemOut::<_, #m>::__claspr_new(#raw, #gid.x);
+                }
+            }
+            PerItemAccess::ReadWrite | PerItemAccess::Read => {
+                let view = if *access == PerItemAccess::Read {
+                    quote::quote!(PerItemIn)
+                } else {
+                    quote::quote!(PerItem)
+                };
+                syn::parse_quote! {
+                    #[allow(unused_mut)]
+                    let mut #name = crate::__claspr::#view::__claspr_new(#raw, #gid.x);
+                }
             }
         })
         .collect();
-    f.block.stmts.splice(0..0, prologue);
+    let outs: Vec<&syn::Ident> = lowered
+        .iter()
+        .filter(|(_, _, a)| *a == PerItemAccess::Write)
+        .map(|(name, _, _)| name)
+        .collect();
+    if outs.is_empty() {
+        f.block.stmts.splice(0..0, prologue);
+        return Ok(Vec::new());
+    }
+    // Write-only outputs: the body must yield `Written`, proof that each one was
+    // written on every path that completes.
+    let returns_written = matches!(
+        &f.sig.output,
+        syn::ReturnType::Type(_, ty) if matches!(&**ty, syn::Type::Path(tp) if tp.path.is_ident("Written"))
+    );
+    if !returns_written {
+        let fields: Vec<String> = outs.iter().map(|o| format!("{o}: {o}.write(..)")).collect();
+        return Err(format!(
+            "kernel `{kernel}` has `PerItemOut` parameters, so it must return `Written` \
+             (end its body with `Written {{ {} }}`) — proof that every output is written",
+            fields.join(", ")
+        )
+        .into());
+    }
+    let written = quote::format_ident!("__claspr_Written_{}", kernel);
+    let markers: Vec<syn::Ident> = outs.iter().map(|o| marker(o)).collect();
+    let mut items: Vec<syn::Item> = markers
+        .iter()
+        .map(|m| {
+            syn::parse_quote! {
+                #[doc(hidden)]
+                #[allow(non_camel_case_types)]
+                pub struct #m;
+            }
+        })
+        .collect();
+    items.push(syn::parse_quote! {
+        /// Proof that every write-only output of this kernel was written.
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        pub struct #written {
+            #( pub #outs: crate::__claspr::Proof<#markers>, )*
+        }
+    });
+    let body = std::mem::take(&mut f.block.stmts);
+    f.block.stmts = syn::parse_quote! {
+        #[allow(unused_imports)]
+        use self::#written as Written;
+        #(#prologue)*
+        let _: #written = (|| -> #written { #(#body)* })();
+    };
+    f.sig.output = syn::ReturnType::Default;
+    Ok(items)
 }
 
 fn translate_fn_attrs(attrs: &mut Vec<syn::Attribute>) {
@@ -1251,18 +1322,28 @@ pub mod __claspr {
         }
     }
 
+    /// Proof that the `PerItemOut` output tagged `M` was written: returned only
+    /// by its `write`, and not constructible elsewhere (private field).
+    pub struct Proof<M>(core::marker::PhantomData<M>);
+
     /// This work-item's element of a `PerItemOut<T>` kernel argument —
-    /// write-only, as the buffer may not be initialised yet.
-    pub struct PerItemOut<'a, T> {
+    /// write-only, as the buffer may not be initialised yet. `M` tags which
+    /// output it is, so its proof fills only its own field of `Written`.
+    pub struct PerItemOut<'a, T, M> {
         slot: &'a mut core::mem::MaybeUninit<T>,
         index: usize,
+        _output: core::marker::PhantomData<M>,
     }
 
-    impl<'a, T> PerItemOut<'a, T> {
+    impl<'a, T, M> PerItemOut<'a, T, M> {
         #[doc(hidden)]
         #[inline(always)]
         pub fn __claspr_new(buf: &'a mut [core::mem::MaybeUninit<T>], index: usize) -> Self {
-            PerItemOut { slot: &mut buf[index], index }
+            PerItemOut {
+                slot: &mut buf[index],
+                index,
+                _output: core::marker::PhantomData,
+            }
         }
 
         /// The element's index in the buffer (the global invocation id).
@@ -1272,10 +1353,12 @@ pub mod __claspr {
         }
 
         /// Write this work-item's element — the only access a write-only view
-        /// gives.
+        /// gives. Consumes the view (one write) and returns the proof that goes
+        /// in the kernel's `Written`.
         #[inline(always)]
-        pub fn write(&mut self, value: T) {
+        pub fn write(self, value: T) -> Proof<M> {
             self.slot.write(value);
+            Proof(core::marker::PhantomData)
         }
     }
 }

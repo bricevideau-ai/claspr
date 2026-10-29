@@ -1,0 +1,8 @@
+error: this kernel has `PerItemOut` parameters, so it must return `Written`: end its body with `Written { out: out.write(..) }` — proof that every output is written
+ --> compile_fail/per_item_out_without_written.rs:9:8
+  |
+9 | pub fn forgets_written(
+  |        ^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+
