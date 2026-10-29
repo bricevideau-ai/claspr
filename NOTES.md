@@ -14,7 +14,7 @@ Nothing in flight on `main` as of 2026-10-29. Parked, deliberately unmerged:
 branch `typed-slot-sets` (compile-time slot sets, see the DECLINED entry below).
 Recent work is in the landings table at the end.
 
-### Partitioned kernel args — prototype on branch `partitioned-args` (2026-10-29)
+### Partitioned kernel args — landed on main (2026-10-29)
 
 Inspired by arXiv 2608.13759 ("GPU Offload in Rust", partitioned views). A kernel
 param `PerItem<T>` hands each work-item ITS element (`*out = v`, `out.index()`);
