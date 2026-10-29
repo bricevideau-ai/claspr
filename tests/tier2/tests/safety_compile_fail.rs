@@ -32,6 +32,9 @@
 //!   (`F(pipe)`) must be rejected: the unified `Tag(pipe)` pipe-feed `CallArg`
 //!   arm is gated to buffer-valued tags (`RecordableBuffer`), so `F<Pipe<f32>>`
 //!   has no `CallArg`. Guards the buffer/scalar asymmetry of the feed unify.
+//! - `pipe_not_clone` — `Pipe` is not `Clone`: a handle pipe can't be
+//!   duplicated to feed one value to two consumers (share it with
+//!   `.arc()` / `arc_split`).
 //!
 //! A second `compile_pass` config (`Mode::Pass`) runs `compile_pass/sanity.rs`:
 //! a known-good unified-API `DeviceOp` chain that MUST compile. It is the

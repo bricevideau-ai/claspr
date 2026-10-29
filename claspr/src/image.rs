@@ -762,11 +762,11 @@ impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
     type Output = I;
 
     fn output_pipe(&self) -> Option<Pipe<I>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -881,11 +881,11 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
     type Output = I;
 
     fn output_pipe(&self) -> Option<Pipe<I>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -1007,7 +1007,7 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        (self.src_pipe.clone(), self.dst_pipe.clone())
+        (self.src_pipe.share(), self.dst_pipe.share())
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -1097,8 +1097,8 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
     }
 
     fn collect(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<((Src, Dst), Deps)> {
-        let src_pipe = self.src_pipe.clone();
-        let dst_pipe = self.dst_pipe.clone();
+        let src_pipe = self.src_pipe.share();
+        let dst_pipe = self.dst_pipe.share();
         self.execute(ec, mode)?;
         let (src, src_deps) = src_pipe
             .take()
@@ -1117,8 +1117,8 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
     ) -> Result<(CheckoutsOf<Self>, Deps)> {
         // Drain each element pipe with its own home → a tuple of independent
         // Checkouts (image copy preserves type, so both homes re-arm correctly).
-        let src_pipe = self.src_pipe.clone();
-        let dst_pipe = self.dst_pipe.clone();
+        let src_pipe = self.src_pipe.share();
+        let dst_pipe = self.dst_pipe.share();
         self.execute(ec, mode)?;
         let (src, src_deps, src_home) = src_pipe
             .take_home()
@@ -1240,11 +1240,11 @@ impl<I: ImageEnqueue, T: Copy + Send + 'static> DeviceOp for ImageFill<I, T> {
     type Output = I;
 
     fn output_pipe(&self) -> Option<Pipe<I>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {

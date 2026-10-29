@@ -791,9 +791,13 @@ impl<T: Send> Rehome<T> for SlotHome<T> {
 
 /// A build-time handle to an op's future output, carrying `(value, Deps)`. The
 /// producing op **moves** its value + the events its commands enqueued in at
-/// execute; the consuming op moves them out as its own wait-list. Cheap-clone
-/// (`Arc`); identity is the `Arc` cell, so independently-built subgraphs
-/// compose with no global numbering.
+/// execute; the consuming op moves them out as its own wait-list. The producer
+/// and its consumer each hold a handle to the same `Arc` cell — that shared
+/// cell IS the edge, and its identity keys it, so independently-built subgraphs
+/// compose with no global numbering. Not `Clone`: a handle pipe moves into the
+/// one op that drains it, so feeding one value to two consumers is a compile
+/// error (share a value between readers with [`arc`](DeviceOpExt::arc) /
+/// [`arc_split`]).
 pub struct Pipe<T> {
     cell: Arc<Mutex<Option<PipePayload<T>>>>,
 }
@@ -845,14 +849,6 @@ struct PipePayload<T> {
     deps: Deps,
 }
 
-impl<T> Clone for Pipe<T> {
-    fn clone(&self) -> Self {
-        Pipe {
-            cell: Arc::clone(&self.cell),
-        }
-    }
-}
-
 impl<T> Default for Pipe<T> {
     fn default() -> Self {
         Pipe {
@@ -865,6 +861,23 @@ impl<T> Pipe<T> {
     /// A fresh, empty pipe.
     pub fn new() -> Self {
         Self::default()
+    }
+    /// Another handle to the SAME cell — how an edge is made: the producer
+    /// keeps one handle (to deposit into) and its [`handle`](DeviceOp::handle)
+    /// hands out another (for the consumer to drain). Deliberately not `Clone`:
+    /// a user duplicating a handle pipe would feed one value to two consumers,
+    /// and the second would find it drained. Sharing a value between readers
+    /// goes through [`arc`](DeviceOpExt::arc) / [`arc_split`] instead.
+    pub(crate) fn share(&self) -> Self {
+        Pipe {
+            cell: Arc::clone(&self.cell),
+        }
+    }
+    /// [`share`](Self::share) for the code the `#[kernel]` macro emits in user
+    /// crates. Not API.
+    #[doc(hidden)]
+    pub fn __claspr_share(&self) -> Self {
+        self.share()
     }
     /// Deposit the value and the events its commands produced, with **no home**
     /// (the common case: a producer that mints a fresh value or transforms/consumes
@@ -928,10 +941,10 @@ impl<T> Pipe<T> {
         }
     }
 
-    /// Stable identity of this pipe's storage cell — the graph-edge key. Two
-    /// clones of the same pipe share it; independently-built pipes differ. Used
+    /// Stable identity of this pipe's storage cell — the graph-edge key. Handles
+    /// to the same cell share it; independently-built pipes differ. Used
     /// by the record walk to thread a producer's output handle to the consumer
-    /// that holds a clone of the same pipe (the recording twin of how `execute`
+    /// that holds a handle to the same cell (the recording twin of how `execute`
     /// moves the value through the cell).
     pub fn cell_id(&self) -> usize {
         std::sync::Arc::as_ptr(&self.cell) as *const () as usize
@@ -956,11 +969,11 @@ impl<T: Send + 'static> DeviceOp for Pipe<T> {
     fn output_pipe(&self) -> Option<Pipe<T>> {
         // The pipe is its OWN output storage — no separate `out`. The producer
         // already (or will) deposit here; we alias it.
-        Some(self.clone())
+        Some(self.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.clone()
+        self.share()
     }
 
     fn execute(&self, _ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -1132,7 +1145,7 @@ impl<T> Input<T> {
         {
             let guard = lock_unpoisoned(cell);
             if let SlotState::FedByPipe(pipe) = &*guard {
-                let pipe = pipe.clone();
+                let pipe = pipe.share();
                 drop(guard);
                 return pipe
                     .take_home()
@@ -2160,8 +2173,10 @@ pub trait OpShape {
     /// What an op of this shape produces at run time ([`DeviceOp::Output`]).
     type Output: Send;
     /// What a downstream [`and_then`](DeviceOpExt::and_then) builder receives
-    /// ([`HandleOf`]). `Clone` so the op keeps its own copy.
-    type Handle: Clone;
+    /// ([`HandleOf`]). Not `Clone`: its pipes are graph edges, each drained by
+    /// exactly one consumer (an op that keeps its own copy shares the pipes, see
+    /// [`SeamScatter::share_handle`]).
+    type Handle;
     /// What a terminal ([`sync`](DeviceOpExt::sync) / [`wait_on`](DeviceOpExt::wait_on))
     /// hands back ([`CheckoutsOf`]).
     type Checkouts;
@@ -3589,10 +3604,13 @@ pub trait SeamScatter: CheckoutSplit {
     /// [`Handle`](HandleOf)). Owned by the seam; `execute` fills it,
     /// downstream reads it. `Send` because the seam struct owns one and
     /// [`DeviceOp`] is `Send`.
-    type Handle: Clone + Send;
+    type Handle: Send;
     /// A fresh, empty handle (each element an empty [`Pipe`]) — built once at
     /// construction, refilled every `execute`.
     fn empty_handle() -> Self::Handle;
+    /// Another handle to the same pipes — the seam keeps its handle (to fill)
+    /// and gives downstream this one (to drain).
+    fn share_handle(handle: &Self::Handle) -> Self::Handle;
     /// The seam's [`output_pipe`](DeviceOp::output_pipe) view — an optional single
     /// `Pipe<Value>`. For a **single-output** source this is `Some` of the storage
     /// pipe (so [`AndThen`]'s orphaned-source-deps threading works when a downstream
@@ -3628,9 +3646,12 @@ impl<O: Send + 'static> SeamScatter for Checkout<O> {
     fn empty_handle() -> Pipe<O> {
         Pipe::new()
     }
+    fn share_handle(handle: &Pipe<O>) -> Pipe<O> {
+        handle.share()
+    }
     fn output_pipe_view(handle: &Pipe<O>) -> Option<Pipe<O>> {
         // Single-output: the handle IS the storage pipe.
-        Some(handle.clone())
+        Some(handle.share())
     }
     fn scatter(handle: &Pipe<O>, value: O, homes: Option<BoxedHome<O>>, deps: &Deps) {
         handle.put_home(value, deps.clone(), homes);
@@ -3659,6 +3680,9 @@ macro_rules! impl_seam_scatter_tuple {
             type Handle = ( $(<$ck as SeamScatter>::Handle,)+ );
             fn empty_handle() -> Self::Handle {
                 ( $(<$ck as SeamScatter>::empty_handle(),)+ )
+            }
+            fn share_handle(handle: &Self::Handle) -> Self::Handle {
+                ( $(<$ck as SeamScatter>::share_handle(&handle.$idx),)+ )
             }
             fn output_pipe_view(_handle: &Self::Handle) -> Option<Pipe<Self::Value>> {
                 // Multi-output: storage is the element pipes; there is no single

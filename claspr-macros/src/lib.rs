@@ -1777,7 +1777,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
         // pipe — return `None`.
         let handle_ty = quote! { ( #( ::claspr::Pipe<#output_types> ),* ) };
         let handle_expr = quote! {
-            ( #( ::core::clone::Clone::clone(&self.#op_pipe_fields) ),* )
+            ( #( self.#op_pipe_fields.__claspr_share() ),* )
         };
         // Per-output Checkouts tuple type: one independent `Checkout` per buffer
         // output, each with its own home → same-typed multi-buffer kernels
@@ -1898,7 +1898,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     // (&self), then drain + reconstruct the tuple, gathering deps
                     // (the terminal `sync` / `run` waits on them).
                     #(
-                        let #op_pipe_fields = ::core::clone::Clone::clone(&self.#op_pipe_fields);
+                        let #op_pipe_fields = self.#op_pipe_fields.__claspr_share();
                     )*
                     self.execute(ec, mode)?;
                     let mut __claspr_deps: ::claspr::Deps = ::claspr::Deps::new();
@@ -1945,7 +1945,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     // its exact concrete cell on drop (the same-typed-args case the
                     // old single-guard / type-match design could not handle).
                     #(
-                        let #op_pipe_fields = ::core::clone::Clone::clone(&self.#op_pipe_fields);
+                        let #op_pipe_fields = self.#op_pipe_fields.__claspr_share();
                     )*
                     self.execute(ec, mode)?;
                     let mut __claspr_deps: ::claspr::Deps = ::claspr::Deps::new();
@@ -2029,13 +2029,13 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                 type Output = #output_ty;
 
                 fn output_pipe(&self) -> ::core::option::Option<::claspr::Pipe<#output_ty>> {
-                    ::core::option::Option::Some(::core::clone::Clone::clone(&self.__claspr_out))
+                    ::core::option::Option::Some(self.__claspr_out.__claspr_share())
                 }
 
                 // Default `Shape = Single<Output>`: a kernel's downstream handle
                 // is its single output pipe.
                 fn handle(&self) -> ::claspr::Pipe<#output_ty> {
-                    ::core::clone::Clone::clone(&self.__claspr_out)
+                    self.__claspr_out.__claspr_share()
                 }
 
                 fn execute(

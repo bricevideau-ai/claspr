@@ -394,7 +394,7 @@ impl<T: Send + Clone + 'static> DeviceOp for Value<T> {
     type Shape = ByValue<T>;
 
     fn output_pipe(&self) -> Option<Pipe<T>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
@@ -475,11 +475,11 @@ impl<T: crate::record::RecordableBuffer + Send + 'static> DeviceOp for Lift<T> {
     // Default `Handle = Pipe<T>` — a resource flows, it isn't read at build.
 
     fn output_pipe(&self) -> Option<Pipe<T>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -563,11 +563,11 @@ impl<T: Send + 'static> DeviceOp for Forward<T> {
     type Output = T;
 
     fn output_pipe(&self) -> Option<Pipe<T>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -1023,11 +1023,11 @@ where
     type Output = Arc<S::Output>;
 
     fn output_pipe(&self) -> Option<Pipe<Arc<S::Output>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -1169,7 +1169,7 @@ where
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.outs.clone()
+        self.outs.each_ref().map(Pipe::share)
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -1207,7 +1207,7 @@ where
         // Grab the element pipes before consuming `self`, scatter via `execute`,
         // then drain all N to reconstruct the `[clone; N]` array, gathering
         // every branch's deps (the terminal `sync` / `run` waits on them once).
-        let outs = self.outs.clone();
+        let outs = self.outs.each_ref().map(Pipe::share);
         self.execute(ec, mode)?;
         let mut all_deps: Deps = Deps::new();
         let mut vals: Vec<S::Output> = Vec::with_capacity(N);
@@ -1246,7 +1246,7 @@ where
         // Drain each branch pipe with its home → a `[Checkout; N]`. Arc-clone
         // branches carry no home (read-only fan-out), so each Checkout's home is
         // `None`; the per-branch shape is still correct.
-        let outs = self.outs.clone();
+        let outs = self.outs.each_ref().map(Pipe::share);
         self.execute(ec, mode)?;
         let mut all_deps: Deps = Deps::new();
         let mut cos: Vec<Checkout<S::Output>> = Vec::with_capacity(N);
@@ -1799,11 +1799,11 @@ where
     type Shape = FanOutShape<U::Shape>;
 
     fn output_pipe(&self) -> Option<Pipe<Vec<U::Output>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -2026,11 +2026,11 @@ where
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -2085,11 +2085,11 @@ where
     type Output = S::Output;
 
     fn output_pipe(&self) -> Option<Pipe<S::Output>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, parent: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -2466,7 +2466,7 @@ where
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.handle.clone()
+        <CheckoutsOf<S> as SeamScatter>::share_handle(&self.handle)
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -2668,11 +2668,11 @@ where
     type Output = S::Output;
 
     fn output_pipe(&self) -> Option<Pipe<S::Output>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
