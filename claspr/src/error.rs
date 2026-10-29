@@ -31,11 +31,12 @@ pub enum Error {
     /// first, and a handle pipe moves into exactly one op (pipes are not
     /// `Clone`), so this is a claspr bug: please report it. Carries which pipe.
     PipeDrained(&'static str),
-    /// A kernel launched with a grid that does not cover one of its
-    /// `PerItem<T>` arguments exactly: a `PerItem` argument gives work-item `i`
-    /// element `i`, so the grid must be one-dimensional with as many work-items
-    /// as the buffer has elements (more would index past the end, fewer would
-    /// leave elements unwritten). Carries the argument, the grid, and the length.
+    /// A kernel launched with a grid that does not cover one of its per-item
+    /// arguments (`PerItem` / `PerItemIn` / `PerItemOut`) exactly: each
+    /// work-item owns one element (row-major over the grid), so the grid must
+    /// have as many work-items in all as the buffer has elements (more would
+    /// index past the end, fewer would leave elements unvisited). Carries the
+    /// argument, the grid, and the length.
     GridMismatch {
         arg: &'static str,
         grid: Vec<usize>,
@@ -129,8 +130,9 @@ impl fmt::Display for Error {
             Error::NotSupported(what) => write!(f, "not supported on this device: {what}"),
             Error::GridMismatch { arg, grid, len } => write!(
                 f,
-                "kernel launch: `PerItem` argument `{arg}` has {len} elements but the grid is \
-                 {grid:?}; a `PerItem` argument needs a 1-D grid of exactly its length"
+                "kernel launch: per-item argument `{arg}` has {len} elements but the grid {grid:?} \
+                 has {} work-items; a per-item argument needs exactly one work-item per element",
+                grid.iter().product::<usize>()
             ),
             Error::PipeDrained(which) => write!(
                 f,

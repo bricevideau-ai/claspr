@@ -225,6 +225,12 @@ impl<T, M: MemMode> MappedSliceUninit<T, M> {
     /// type-state — the sound downgrade used by the reusable-graph home channel
     /// (see [`crate::DeviceSliceUninit::from_init`]). Safe private-field re-wrap,
     /// the inverse of [`assume_init`](Self::assume_init).
+    /// [`from_init`](Self::from_init) for a `PerItemOut` output returning to its
+    /// uninitialised origin cell.
+    pub(crate) fn forget_init(inner: MappedSlice<T, M>) -> Self {
+        Self::from_init(inner)
+    }
+
     pub(crate) fn from_init(inner: MappedSlice<T, M>) -> Self {
         MappedSliceUninit { inner }
     }

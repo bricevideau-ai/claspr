@@ -35,8 +35,10 @@ double write, another output's proof, a forged proof or a bare `return;` are all
 compile errors, and early returns must prove too (claspr-build wraps the body in a
 closure returning `Written`). llama2's embed/rmsnorm/matmul/att_mix outputs use it
 over `alloc_uninit` buffers: byte-identical, 1 CB, no cost (151.0 vs 150.9).
-Also not done:
-`MappedSliceUninit`/`USMSliceUninit` (SVM arg setting), 2-D partitions.
+Uninitialised `MappedSlice`/`USMSlice` outputs work too. Partitions are N-D: a
+1-, 2- or 3-D grid with one work-item per element, work-item `(x, y, z)` owning
+element `x + w * (y + h * z)` (`coord()` gives the coordinates); gray-scott's 2-D
+`laplacian`/`combine` use it (frames byte-identical). Not done: named handles.
 
 ### Decisions — assessed & DECLINED (kept so future sessions don't re-litigate)
 

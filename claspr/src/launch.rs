@@ -341,16 +341,15 @@ mod kernel_slice_write_arg_sealed {
 /// (claspr-build makes the body a closure returning it). A kernel that never
 /// completes (abort, endless loop) fails the launch instead.
 pub trait KernelSliceWriteArg<T>:
-    KernelArg + Send + 'static + kernel_slice_write_arg_sealed::Sealed<T>
+    Send + 'static + kernel_slice_write_arg_sealed::Sealed<T>
 {
     /// The buffer once every element has been written — an ordinary writable
-    /// slice from then on.
+    /// slice from then on. The launch converts to it before enqueueing, so the
+    /// kernel argument set (or recorded) is always this initialised form.
     type Init: KernelSliceReadWriteArg<T>;
     /// Number of elements (what the grid must cover).
     fn element_count(&self) -> usize;
-    /// The recording handle, as [`KernelSliceReadArg::record_handle`].
-    fn record_handle(&self) -> crate::Result<crate::record::BufHandle>;
-    /// After a launch that wrote every element. Not API.
+    /// After the launch's grid check: every element will be written. Not API.
     #[doc(hidden)]
     fn __claspr_into_init(self) -> Self::Init;
     /// Back to `Self` to return a value to its origin cell (forgetting
@@ -365,22 +364,11 @@ impl<T, B: KernelSliceReadWriteArg<T>> KernelSliceWriteArg<T> for B {
     fn element_count(&self) -> usize {
         KernelSliceReadArg::element_count(self)
     }
-    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
-        KernelSliceReadArg::record_handle(self)
-    }
     fn __claspr_into_init(self) -> B {
         self
     }
     fn __claspr_forget_init(init: B) -> B {
         init
-    }
-}
-
-impl<T, M: crate::access::MemMode> KernelArg for crate::DeviceSliceUninit<T, M> {
-    fn set(&self, exec: &mut ExecuteKernel<'_>) {
-        // Same (cl_mem, length) pair as the initialised slice: the kernel side
-        // is a `&mut [MaybeUninit<T>]`.
-        self.as_raw().set(exec);
     }
 }
 
@@ -397,13 +385,6 @@ impl<
     fn element_count(&self) -> usize {
         crate::Buffer::len(self.as_raw())
     }
-    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
-        use opencl3::memory::ClMem;
-        Ok(crate::record::BufHandle {
-            mem: crate::record::MemRef::Buffer(self.as_raw().buffer().get()),
-            byte_len: self.as_raw().byte_len(),
-        })
-    }
     fn __claspr_into_init(self) -> DeviceSlice<T, M> {
         // SAFETY: the launch completed, its grid was checked to give every
         // element one `PerItemOut` writer, and the kernel's `Written` return
@@ -414,6 +395,36 @@ impl<
         crate::DeviceSliceUninit::forget_init(init)
     }
 }
+
+macro_rules! impl_write_arg_svm_uninit {
+    ($uninit:ident, $init:ident) => {
+        impl<T: Send + 'static, M: crate::access::MemMode> kernel_slice_write_arg_sealed::Sealed<T>
+            for crate::$uninit<T, M>
+        {
+        }
+        impl<
+            T: Send + 'static,
+            M: crate::access::MemMode + crate::access::KernelReadable + crate::access::KernelWritable,
+        > KernelSliceWriteArg<T> for crate::$uninit<T, M>
+        {
+            type Init = crate::$init<T, M>;
+            fn element_count(&self) -> usize {
+                self.len()
+            }
+            fn __claspr_into_init(self) -> crate::$init<T, M> {
+                // SAFETY: as for `DeviceSliceUninit` — the launch's grid gives
+                // every element one `PerItemOut` writer and `Written` proves
+                // each one writes.
+                unsafe { self.assume_init() }
+            }
+            fn __claspr_forget_init(init: crate::$init<T, M>) -> Self {
+                crate::$uninit::forget_init(init)
+            }
+        }
+    };
+}
+impl_write_arg_svm_uninit!(MappedSliceUninit, MappedSlice);
+impl_write_arg_svm_uninit!(USMSliceUninit, USMSlice);
 
 // ── MappedSlice<T, M> impls ────────────────────────────────────────
 
@@ -753,18 +764,21 @@ pub struct LaunchSpec {
     dims: u8,
 }
 
-/// Check that `spec` covers a `PerItem<T>` kernel argument of `len` elements
-/// exactly: a 1-D grid of `len` work-items, so work-item `i` owns element `i`.
+/// Check that `spec` covers a per-item kernel argument of `len` elements
+/// exactly: the grid has `len` work-items in all (any 1-, 2- or 3-D shape), so
+/// each owns one element — work-item `(x, y, z)` element `x + w * (y + h * z)`.
 /// Called by the code the `#[kernel]` macro emits, before the enqueue. Not API.
 #[doc(hidden)]
 pub fn check_per_item_grid(spec: &LaunchSpec, len: usize, arg: &'static str) -> crate::Result<()> {
-    match spec.global() {
-        [g] if *g == len => Ok(()),
-        grid => Err(crate::Error::GridMismatch {
+    let grid = spec.global();
+    if grid.iter().product::<usize>() == len {
+        Ok(())
+    } else {
+        Err(crate::Error::GridMismatch {
             arg,
             grid: grid.to_vec(),
             len,
-        }),
+        })
     }
 }
 

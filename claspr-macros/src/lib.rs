@@ -94,9 +94,11 @@ use syn::{
 ///   element's index, so no two work-items hold a `&mut` to the same element.
 ///   claspr-build lowers it to `&mut [T]` plus that per-item view (adding a
 ///   global-id parameter if the kernel has none). On the host it accepts what
-///   `&mut [T]` does, and every launch first checks that the grid is 1-D and
-///   exactly the buffer's length (`Error::GridMismatch` otherwise, with any
-///   lent input returned so a graph stays retryable).
+///   `&mut [T]` does, and every launch first checks that the grid has exactly
+///   one work-item per element, in any 1-, 2- or 3-D shape (`Error::GridMismatch`
+///   otherwise, with any lent input returned so a graph stays retryable).
+///   Work-item `(x, y, z)` owns element `x + w * (y + h * z)` (row-major over the
+///   grid; `name.coord()` gives the coordinates).
 /// - `PerItemIn<T>` is the read-only form (`*name`, `name.index()`, no
 ///   write; accepts what `&[T]` does, incl. `Arc<DeviceSlice>`): an input read
 ///   element-wise, so the launch's grid check bounds the INPUT too.

@@ -8,7 +8,9 @@
 //! before anything is enqueued, and leaves a graph retryable.
 
 use claspr::eager::{DeviceOpExt, download};
-use claspr::{DeviceScratch, DeviceSlice, Error, LaunchSpec, slot, slots};
+use claspr::{
+    DeviceScratch, DeviceSlice, Error, LaunchSpec, MappedSlice, SvmLevel, USMSlice, slot, slots,
+};
 use claspr_test_kernels::kernels;
 use claspr_test_support::ctx;
 
@@ -51,16 +53,17 @@ fn per_item_in_place_update() {
     assert!(host.iter().all(|&v| v == 15), "got {:?}", &host[..4]);
 }
 
-/// A grid that would index past the end, one that would leave elements
-/// unwritten, and a 2-D grid are all rejected before the launch.
+/// A grid with more work-items than elements (would index past the end) or
+/// fewer (would leave elements unvisited), in 1 or 2 dimensions, is rejected
+/// before the launch.
 #[test]
-fn grid_must_be_one_dimensional_and_cover_the_buffer_exactly() {
+fn grid_must_cover_the_buffer_exactly() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
     for grid in [
         LaunchSpec::from([N + 1]),
         LaunchSpec::from([N - 1]),
-        LaunchSpec::from([N, 1]),
+        LaunchSpec::from([N, 2]),
     ] {
         let err = ks
             .add_per_item_u32(grid, buf(&ctx, 3), buf(&ctx, 4), buf(&ctx, 0))
@@ -263,4 +266,69 @@ fn per_item_out_two_outputs_with_an_early_return() {
     for (i, &v) in input.iter().enumerate() {
         assert_eq!((l[i], h[i]), (v & 0xffff, v >> 16), "element {i}");
     }
+}
+
+/// The packed `(x, y, z)` element `i` of a `coords_u32` run on a `w × h × …`
+/// grid holds: row-major, x fastest.
+fn expected_coords(i: usize, w: usize, h: usize) -> u32 {
+    let (x, y, z) = (i % w, (i / w) % h, i / (w * h));
+    ((z << 20) | (y << 10) | x) as u32
+}
+
+/// 2-D and 3-D grids: work-item `(x, y, z)` owns element `x + w * (y + h * z)`,
+/// and any grid shape with one work-item per element passes the check.
+#[test]
+fn per_item_partitions_two_and_three_dimensional_grids() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    for grid in [
+        LaunchSpec::from([16, N / 16]),
+        LaunchSpec::from([4, 8, N / 32]),
+        LaunchSpec::from([N, 1]),
+    ] {
+        let out = DeviceSlice::<u32>::alloc_uninit(&ctx, N).expect("alloc uninit");
+        let out = ks.coords_u32(grid, out).wait().expect("launch");
+        let mut host = vec![0u32; N];
+        out.read(&mut host).wait().expect("read");
+        let g = grid.global();
+        let (w, h) = (g[0], g.get(1).copied().unwrap_or(1));
+        for (i, &v) in host.iter().enumerate() {
+            assert_eq!(v, expected_coords(i, w, h), "grid {g:?}, element {i}");
+        }
+    }
+}
+
+/// An uninitialised SVM (`MappedSlice`) buffer initialised by a `PerItemOut`
+/// kernel; the launch hands back the initialised `MappedSlice`.
+#[test]
+fn per_item_out_initialises_an_uninitialised_mapped_slice() {
+    let Some(ctx) = claspr_test_support::ctx_with_svm() else {
+        return;
+    };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let uninit = MappedSlice::<u32>::alloc_uninit(&ctx, N).expect("alloc uninit");
+    let (_a, out): (_, MappedSlice<u32>) = ks
+        .scaled_copy_out_u32([N], buf(&ctx, 6), uninit, 7)
+        .wait()
+        .expect("launch");
+    let view = out.map().wait().expect("map");
+    assert!(view.iter().all(|&v| v == 42), "got {:?}", &view[..4]);
+}
+
+/// An uninitialised USM (`USMSlice`, fine-grain system SVM) buffer initialised
+/// by a `PerItemOut` kernel.
+#[test]
+fn per_item_out_initialises_an_uninitialised_usm_slice() {
+    let Some(ctx) = ctx() else { return };
+    if ctx.svm_capability() != SvmLevel::FineSystem {
+        eprintln!("SKIP: no fine-grain-system SVM");
+        return;
+    }
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let uninit = USMSlice::<u32>::alloc_uninit(&ctx, N).expect("alloc uninit");
+    let (_a, out): (_, USMSlice<u32>) = ks
+        .scaled_copy_out_u32([N], buf(&ctx, 5), uninit, 9)
+        .wait()
+        .expect("launch");
+    assert!(out.iter().all(|&v| v == 45), "got {:?}", &out[..4]);
 }

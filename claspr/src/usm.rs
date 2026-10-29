@@ -97,6 +97,17 @@ unsafe impl<T: Send, M: MemMode> Send for USMSlice<T, M> {}
 unsafe impl<T: Sync, M: MemMode> Sync for USMSlice<T, M> {}
 
 impl<T, M: MemMode> USMSlice<T, M> {
+    /// Wait for every kernel still using this allocation (errors bump the
+    /// context's sticky error flag, like `Drop`).
+    pub(crate) fn wait_in_flight(&self) {
+        let events = std::mem::take(&mut *lock_unpoisoned(&self.in_flight));
+        for ev in &events {
+            if ev.wait().is_err() {
+                self.ctx.record_err();
+            }
+        }
+    }
+
     /// Wrap `data` as a USMSlice with the marker `M`. Errors with
     /// [`Error::NotSupported`] if the
     /// context's device doesn't advertise
@@ -358,6 +369,14 @@ impl<T, M: MemMode> USMSliceUninit<T, M> {
     ///
     /// Mirrors `assume_init` in reverse to preserve the heap address — the SVM
     /// pointer was taken from `data.as_ptr()` and must stay valid.
+    /// [`from_init`](Self::from_init) for a `PerItemOut` output returning to its
+    /// uninitialised origin cell: first waits for any kernel still using the
+    /// allocation (which `from_init` assumes already happened).
+    pub(crate) fn forget_init(slice: USMSlice<T, M>) -> Self {
+        slice.wait_in_flight();
+        Self::from_init(slice)
+    }
+
     pub(crate) fn from_init(slice: USMSlice<T, M>) -> Self {
         // `USMSlice: Drop` (it waits on in-flight events, then frees the Vec), so
         // we can't move its fields out by value. Suppress its Drop with

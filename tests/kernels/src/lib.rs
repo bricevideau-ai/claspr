@@ -216,6 +216,17 @@ pub mod kernels {
         }
     }
 
+    /// Each work-item writes its own grid coordinates, packed as
+    /// `z << 20 | y << 10 | x`, through a `PerItemOut` — pins the row-major
+    /// work-item → element mapping on 2-D and 3-D grids.
+    #[claspr::kernel]
+    pub fn coords_u32(#[spirv(cross_workgroup)] out: PerItemOut<u32>) -> Written {
+        let c = out.coord();
+        Written {
+            out: out.write(((c.z << 20) | (c.y << 10) | c.x) as u32),
+        }
+    }
+
     /// Two write-only outputs, matched to `Written`'s fields by name, with an
     /// early return (which must also prove both writes): `lo = a & 0xffff`,
     /// `hi = a >> 16`, or both 0 for a zero input.

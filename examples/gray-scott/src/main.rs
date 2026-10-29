@@ -205,17 +205,16 @@ mod gpu {
     /// ceiling — because the grid extent rides the launch slot, not an arg.
     #[claspr::kernel]
     pub fn laplacian(
-        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
         #[spirv(cross_workgroup)] field_in: &[f32],
-        #[spirv(cross_workgroup)] lap_out: &mut [f32],
-    ) {
-        let x = id.x as u32;
-        let y = id.y as u32;
-        if x >= W || y >= H {
-            return;
+        #[spirv(cross_workgroup)] lap_out: PerItemOut<f32>,
+    ) -> Written {
+        // `lap_out` is this work-item's cell of the `[W, H]` grid (the launch
+        // checks the grid covers the field exactly); the field is read around it.
+        let c = lap_out.coord();
+        let lap = laplacian_at(field_in, c.x as u32, c.y as u32, W, H);
+        Written {
+            lap_out: lap_out.write(lap),
         }
-        let i = (y * W + x) as usize;
-        lap_out[i] = laplacian_at(field_in, x, y, W, H);
     }
 
     /// COMBINE pass — the reaction + diffusion update. Reads the current fields
@@ -231,32 +230,27 @@ mod gpu {
     #[claspr::kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn combine(
-        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
-        #[spirv(cross_workgroup)] u_in: &[f32],
-        #[spirv(cross_workgroup)] v_in: &[f32],
-        #[spirv(cross_workgroup)] lap_u: &[f32],
-        #[spirv(cross_workgroup)] lap_v: &[f32],
-        #[spirv(cross_workgroup)] u_out: &mut [f32],
-        #[spirv(cross_workgroup)] v_out: &mut [f32],
+        #[spirv(cross_workgroup)] u_in: PerItemIn<f32>,
+        #[spirv(cross_workgroup)] v_in: PerItemIn<f32>,
+        #[spirv(cross_workgroup)] lap_u: PerItemIn<f32>,
+        #[spirv(cross_workgroup)] lap_v: PerItemIn<f32>,
+        #[spirv(cross_workgroup)] u_out: PerItemOut<f32>,
+        #[spirv(cross_workgroup)] v_out: PerItemOut<f32>,
         feed_rate: f32,
         kill_rate: f32,
-    ) {
-        let x = id.x as u32;
-        let y = id.y as u32;
-        if x >= W || y >= H {
-            return;
-        }
-        let i = (y * W + x) as usize;
-
-        let u = u_in[i];
-        let v = v_in[i];
+    ) -> Written {
+        // Every argument is this work-item's cell: element-wise in, element-wise
+        // out, each grid-checked at launch.
+        let (u, v) = (*u_in, *v_in);
         let uvv = u * v * v;
 
-        let u_next = u + DT * (DU * lap_u[i] - uvv + feed_rate * (1.0 - u));
-        let v_next = v + DT * (DV * lap_v[i] + uvv - (feed_rate + kill_rate) * v);
+        let u_next = u + DT * (DU * *lap_u - uvv + feed_rate * (1.0 - u));
+        let v_next = v + DT * (DV * *lap_v + uvv - (feed_rate + kill_rate) * v);
 
-        u_out[i] = u_next;
-        v_out[i] = v_next;
+        Written {
+            u_out: u_out.write(u_next),
+            v_out: v_out.write(v_next),
+        }
     }
 }
 

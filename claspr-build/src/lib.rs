@@ -1019,7 +1019,8 @@ fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, PerItemAccess)> {
 
 /// Lower a kernel's `PerItem<T>` parameters for the device crate: each becomes the
 /// raw `&mut [T]` buffer it is on the wire, and a prologue rebinds the user's name
-/// to this work-item's element (`PerItem::__claspr_new(raw, gid.x)`, defined in the
+/// to this work-item's element (`PerItem::__claspr_new(raw, gid, gsize)`: the row-major
+/// linear id over the grid, so 1-, 2- and 3-D grids all work; defined in the
 /// generated preamble). A global-invocation-id parameter is added if the kernel
 /// has none. The host side treats the parameter as a written slice and checks at
 /// launch that the 1-D grid matches the buffer's length, so `gid.x` indexes every
@@ -1039,7 +1040,15 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
                     .is_ok_and(|i| i == "global_invocation_id")
         })
     };
+    let is_gsize = |pt: &syn::PatType| {
+        pt.attrs.iter().any(|a| {
+            a.path().is_ident("spirv")
+                && a.parse_args::<syn::Ident>()
+                    .is_ok_and(|i| i == "global_size")
+        })
+    };
     let mut gid: Option<syn::Ident> = None;
+    let mut gsize: Option<syn::Ident> = None;
     let mut lowered: Vec<(syn::Ident, syn::Ident, PerItemAccess)> = Vec::new();
     for input in f.sig.inputs.iter_mut() {
         let syn::FnArg::Typed(pt) = input else {
@@ -1050,6 +1059,10 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
         };
         if is_gid(pt) {
             gid = Some(pi.ident.clone());
+            continue;
+        }
+        if is_gsize(pt) {
+            gsize = Some(pi.ident.clone());
             continue;
         }
         let Some((elem, access)) = per_item_elem(&pt.ty) else {
@@ -1078,6 +1091,15 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
         );
         id
     });
+    // The grid's extent, to linearise an N-D work-item id (row-major: x fastest).
+    let gsize = gsize.unwrap_or_else(|| {
+        let id = quote::format_ident!("__claspr_gsize");
+        f.sig.inputs.insert(
+            0,
+            syn::parse_quote!(#[spirv(global_size)] #id: spirv_std::glam::USizeVec3),
+        );
+        id
+    });
     let kernel = f.sig.ident.clone();
     let marker = |name: &syn::Ident| quote::format_ident!("__claspr_out_{}_{}", kernel, name);
     let prologue: Vec<syn::Stmt> = lowered
@@ -1086,7 +1108,7 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
             PerItemAccess::Write => {
                 let m = marker(name);
                 syn::parse_quote! {
-                    let #name = crate::__claspr::PerItemOut::<_, #m>::__claspr_new(#raw, #gid.x);
+                    let #name = crate::__claspr::PerItemOut::<_, #m>::__claspr_new(#raw, #gid, #gsize);
                 }
             }
             PerItemAccess::ReadWrite | PerItemAccess::Read => {
@@ -1097,7 +1119,7 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
                 };
                 syn::parse_quote! {
                     #[allow(unused_mut)]
-                    let mut #name = crate::__claspr::#view::__claspr_new(#raw, #gid.x);
+                    let mut #name = crate::__claspr::#view::__claspr_new(#raw, #gid, #gsize);
                 }
             }
         })
@@ -1260,22 +1282,39 @@ const PER_ITEM_PREAMBLE: &str = r#"
 #[doc(hidden)]
 pub mod __claspr {
     /// This work-item's element of a `PerItem<T>` kernel argument.
+    use spirv_std::glam::USizeVec3;
+
+    /// Row-major linear id of work-item `gid` in a grid of extent `gsize`.
+    #[inline(always)]
+    fn linear(gid: USizeVec3, gsize: USizeVec3) -> usize {
+        gid.x + gsize.x * (gid.y + gsize.y * gid.z)
+    }
+
     pub struct PerItem<'a, T> {
         slot: &'a mut T,
         index: usize,
+        coord: USizeVec3,
     }
 
     impl<'a, T> PerItem<'a, T> {
         #[doc(hidden)]
         #[inline(always)]
-        pub fn __claspr_new(buf: &'a mut [T], index: usize) -> Self {
-            PerItem { slot: &mut buf[index], index }
+        pub fn __claspr_new(buf: &'a mut [T], gid: USizeVec3, gsize: USizeVec3) -> Self {
+            let index = linear(gid, gsize);
+            PerItem { slot: &mut buf[index], index, coord: gid }
         }
 
-        /// The element's index in the buffer (the global invocation id).
+        /// The element's index in the buffer: the work-item's row-major linear
+        /// id over the grid (`x + w * (y + h * z)`; just `x` for a 1-D grid).
         #[inline(always)]
         pub fn index(&self) -> usize {
             self.index
+        }
+
+        /// The work-item's coordinates in the grid (its global invocation id).
+        #[inline(always)]
+        pub fn coord(&self) -> USizeVec3 {
+            self.coord
         }
     }
 
@@ -1298,19 +1337,27 @@ pub mod __claspr {
     pub struct PerItemIn<'a, T> {
         slot: &'a T,
         index: usize,
+        coord: USizeVec3,
     }
 
     impl<'a, T> PerItemIn<'a, T> {
         #[doc(hidden)]
         #[inline(always)]
-        pub fn __claspr_new(buf: &'a [T], index: usize) -> Self {
-            PerItemIn { slot: &buf[index], index }
+        pub fn __claspr_new(buf: &'a [T], gid: USizeVec3, gsize: USizeVec3) -> Self {
+            let index = linear(gid, gsize);
+            PerItemIn { slot: &buf[index], index, coord: gid }
         }
 
-        /// The element's index in the buffer (the global invocation id).
+        /// The element's index in the buffer (see `PerItem::index`).
         #[inline(always)]
         pub fn index(&self) -> usize {
             self.index
+        }
+
+        /// The work-item's coordinates in the grid.
+        #[inline(always)]
+        pub fn coord(&self) -> USizeVec3 {
+            self.coord
         }
     }
 
@@ -1332,24 +1379,37 @@ pub mod __claspr {
     pub struct PerItemOut<'a, T, M> {
         slot: &'a mut core::mem::MaybeUninit<T>,
         index: usize,
+        coord: USizeVec3,
         _output: core::marker::PhantomData<M>,
     }
 
     impl<'a, T, M> PerItemOut<'a, T, M> {
         #[doc(hidden)]
         #[inline(always)]
-        pub fn __claspr_new(buf: &'a mut [core::mem::MaybeUninit<T>], index: usize) -> Self {
+        pub fn __claspr_new(
+            buf: &'a mut [core::mem::MaybeUninit<T>],
+            gid: USizeVec3,
+            gsize: USizeVec3,
+        ) -> Self {
+            let index = linear(gid, gsize);
             PerItemOut {
                 slot: &mut buf[index],
                 index,
+                coord: gid,
                 _output: core::marker::PhantomData,
             }
         }
 
-        /// The element's index in the buffer (the global invocation id).
+        /// The element's index in the buffer (see `PerItem::index`).
         #[inline(always)]
         pub fn index(&self) -> usize {
             self.index
+        }
+
+        /// The work-item's coordinates in the grid.
+        #[inline(always)]
+        pub fn coord(&self) -> USizeVec3 {
+            self.coord
         }
 
         /// Write this work-item's element — the only access a write-only view
