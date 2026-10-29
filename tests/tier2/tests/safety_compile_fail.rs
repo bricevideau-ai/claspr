@@ -35,6 +35,9 @@
 //! - `graph_macro_pipe_used_twice` — `graph!` expands to nested `and_then`
 //!   closures, so a pipe bound by one step and used by the next can't be used
 //!   again by a later step (use-after-move), exactly as when written by hand.
+//! - `pipe_not_clone` — `Pipe` is not `Clone`: a handle pipe can't be
+//!   duplicated to feed one value to two consumers (share it with
+//!   `.arc()` / `arc_split`).
 //!
 //! A second `compile_pass` config (`Mode::Pass`) runs `compile_pass/sanity.rs`:
 //! a known-good unified-API `DeviceOp` chain that MUST compile. It is the

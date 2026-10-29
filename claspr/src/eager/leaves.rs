@@ -90,11 +90,11 @@ where
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -289,11 +289,11 @@ where
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -411,11 +411,11 @@ where
     type Output = DeviceScalar<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceScalar<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -548,11 +548,11 @@ where
     type Output = Vec<T>;
 
     fn output_pipe(&self) -> Option<Pipe<Vec<T>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -680,11 +680,11 @@ where
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -829,11 +829,11 @@ where
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -922,11 +922,11 @@ where
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -1036,11 +1036,11 @@ where
     type Output = MappedSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -1153,11 +1153,11 @@ where
     type Output = USMSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<USMSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -1216,11 +1216,11 @@ where
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -1305,11 +1305,11 @@ where
     type Output = DeviceSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<DeviceSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -1420,11 +1420,11 @@ where
     type Output = MappedSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -1496,11 +1496,11 @@ where
     type Output = MappedSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -1654,11 +1654,11 @@ where
     type Output = MappedSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<MappedSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
@@ -1756,11 +1756,11 @@ where
     type Output = USMSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<USMSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -1851,11 +1851,11 @@ where
     type Output = USMSlice<T, M>;
 
     fn output_pipe(&self) -> Option<Pipe<USMSlice<T, M>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -1959,11 +1959,11 @@ macro_rules! impl_alloc_uninit {
             type Output = $Uninit<T, M>;
 
             fn output_pipe(&self) -> Option<Pipe<$Uninit<T, M>>> {
-                Some(self.out.clone())
+                Some(self.out.share())
             }
 
             fn handle(&self) -> HandleOf<Self> {
-                self.out.clone()
+                self.out.share()
             }
 
             fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -2045,11 +2045,11 @@ where
     type Output = I;
 
     fn output_pipe(&self) -> Option<Pipe<I>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -2108,11 +2108,11 @@ where
     type Output = Vec<I::Pixel>;
 
     fn output_pipe(&self) -> Option<Pipe<Vec<I::Pixel>>> {
-        Some(self.out.clone())
+        Some(self.out.share())
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        self.out.clone()
+        self.out.share()
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -2197,10 +2197,10 @@ macro_rules! impl_acquire_view {
         {
             type Output = $Out;
             fn output_pipe(&self) -> Option<Pipe<Self::Output>> {
-                Some(self.out.clone())
+                Some(self.out.share())
             }
             fn handle(&self) -> HandleOf<Self> {
-                self.out.clone()
+                self.out.share()
             }
             fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
                 // Delegate the one map enqueue (always non-blocking — `mode` ignored).
@@ -2253,10 +2253,10 @@ macro_rules! impl_release_view {
         {
             type Output = $Out;
             fn output_pipe(&self) -> Option<Pipe<$Out>> {
-                Some(self.out.clone())
+                Some(self.out.share())
             }
             fn handle(&self) -> HandleOf<Self> {
-                self.out.clone()
+                self.out.share()
             }
             fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
                 let (view, deps) = self.view.resolve(ec)?;
@@ -2653,7 +2653,7 @@ where
     }
 
     fn handle(&self) -> HandleOf<Self> {
-        (self.src_pipe.clone(), self.dst_pipe.clone())
+        (self.src_pipe.share(), self.dst_pipe.share())
     }
 
     fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
@@ -2779,8 +2779,8 @@ where
         // Grab the element pipes before consuming `self`, then scatter via
         // `execute`, then drain + reconstruct the `(src, dst)` tuple, gathering
         // both pipes' deps (the terminal `sync` / `run` waits on them once).
-        let src_pipe = self.src_pipe.clone();
-        let dst_pipe = self.dst_pipe.clone();
+        let src_pipe = self.src_pipe.share();
+        let dst_pipe = self.dst_pipe.share();
         self.execute(ec, mode)?;
         let (out_src, mut deps) = src_pipe
             .take()
@@ -2818,8 +2818,8 @@ where
         // slot, or `None` for a pipe), so the two sides re-arm independently:
         // dropping one side's Checkout rehomes it while `into_inner` on the other
         // severs only that side (scenario 11).
-        let src_pipe = self.src_pipe.clone();
-        let dst_pipe = self.dst_pipe.clone();
+        let src_pipe = self.src_pipe.share();
+        let dst_pipe = self.dst_pipe.share();
         self.execute(ec, mode)?;
         let (out_src, mut deps, src_home) = src_pipe
             .take_home()

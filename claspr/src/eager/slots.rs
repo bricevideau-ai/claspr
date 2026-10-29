@@ -1840,7 +1840,7 @@ impl<T> Input<T> {
     }
 
     /// Phase 2 — PIPE-FEED install (the `feed` verb). Deposit
-    /// `FedByPipe(pipe.clone())` into this cell — a fan-out, so every matching site
+    /// `FedByPipe(pipe.share())` into this cell — a fan-out, so every matching site
     /// is fed. Unconditional over the current state: the common case installs onto a
     /// virgin (`Unbound`) slot freshly built by the subgraph; re-feeding an
     /// already-`FedByPipe` cell just re-installs the same-or-new pipe. `Lent` should
@@ -1855,7 +1855,7 @@ impl<T> Input<T> {
         if let Some(boxed) = &binder.feed_pipe
             && let Some(pipe) = boxed.downcast_ref::<Pipe<T>>()
         {
-            *lock_unpoisoned(cell) = SlotState::FedByPipe(pipe.clone());
+            *lock_unpoisoned(cell) = SlotState::FedByPipe(pipe.share());
             *lock_unpoisoned(digest) = binder.value_digest;
         }
     }

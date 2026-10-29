@@ -1,10 +1,6 @@
-//@no-rustfix
 //! `graph!` is syntax over nested `and_then` closures, so it inherits their
 //! ownership checks: a pipe bound by one step moves into the closure of the
 //! step that uses it, and using it again in a later step is a use-after-move.
-//!
-//! The `no-rustfix` directive above stops ui_test from applying rustc's
-//! `.clone()` suggestion, whose span lies partly in the macro's definition.
 
 use claspr::prelude::*;
 use claspr_test_kernels::kernels;
