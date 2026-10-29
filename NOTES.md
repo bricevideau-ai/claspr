@@ -161,7 +161,8 @@ scalar slot whose value changes EVERY step (a token position) keys a new CB per 
 so nothing is ever replayed (200 tokens → 200 recordings). The fix is in the graph,
 not the cache: keep per-step state on the device as data (llama2's `Step` in a
 `DeviceScalar`, advanced by its last kernel) → 1 recording per run, +6% on PoCL.
-Worth a paragraph in the eager guide if a second app hits it.
+Now in the eager guide ("Per-step state: keep it on the device"), pinned by
+`eager_scalar_ref::device_resident_struct_state_advances_per_sync`.
 
 ### Generic device-module instantiation — `#[claspr::device(instantiate(Real = [f64, f32]))]`
 
@@ -216,18 +217,6 @@ position rather than dataflow reachability.
 
 ### Tier-2 papercuts from the same port (small, independent)
 
-- **`Checkout::read_into(&self, &mut [T])`.** The only compile error in an 1,100-line
-  first build: `(*co).read(...)` moves the slice out of the checkout (E0507). The
-  documented `(*co).map().wait()?` + copy works but is discoverable only from the
-  eager.rs module docs. A borrowing read on `Checkout` (or `read` on `&DeviceSlice`)
-  closes it.
-- **Doc pointer, not a bug:** `Arc<DeviceSlice<T, M>>: KernelSliceReadArg` (launch.rs)
-  is the answer to "read-only buffer used at N graph sites" — the port initially threaded
-  5 hydrostatic arrays through all 24 dispatches as pipes ("caravan" signatures) for want
-  of finding it. Worth a line in the eager.rs docs next to the fan-out discussion
-  (slots fan out Copy values; Arc fans out read-only buffers). Applying it shrank the
-  port's caravan 9→4 buffers and its kernels by 52 pass-through params, bit-identical
-  on all 3 ICDs.
 - **Arc args come back in the output tuple.** The typed launcher returns Arc buffer args
   like any other buffer arg, so an `and_then` chain over Arc-heavy kernels destructures
   and drops them at every transition (`|(s, t, fx, td, _hd, _hdt)| …`) — the next site
