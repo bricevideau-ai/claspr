@@ -273,3 +273,30 @@ fn concrete_consumed_by_download_is_rehomed() {
         "second download reads the rehomed buffer: still 9"
     );
 }
+
+/// `Checkout::read_into` reads WITHOUT consuming the Checkout: the buffer
+/// re-homes on drop, so the graph syncs again (unlike `co.read(..)`, which takes
+/// the Checkout by value and severs the return). A wrong-length destination is
+/// a `LengthMismatch`, not a panic.
+#[test]
+fn checkout_read_into_borrows_and_rearms() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let a = DeviceSlice::<u32>::from_slice(&ctx, &[3; N]).expect("a");
+    let b = DeviceSlice::<u32>::from_slice(&ctx, &[4; N]).expect("b");
+    let out = DeviceSlice::<u32>::alloc_zero(&ctx, N).expect("out");
+    let g = ks.add_u32([N], a, b, out);
+    for run in 1..=3 {
+        let (_a, _b, out_co) = g.sync(&ctx).expect("sync");
+        let mut host = vec![0u32; N];
+        out_co.read_into(&mut host).expect("read_into");
+        assert!(host.iter().all(|&v| v == 7), "run {run}: {:?}", &host[..4]);
+    }
+    let (_a, _b, out_co) = g.sync(&ctx).expect("sync after reads");
+    let mut short = vec![0u32; N - 1];
+    let err = out_co.read_into(&mut short).expect_err("short destination");
+    assert!(
+        matches!(err, Error::LengthMismatch { src: N, dst } if dst == N - 1),
+        "got {err:?}"
+    );
+}

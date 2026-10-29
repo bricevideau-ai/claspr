@@ -43,6 +43,7 @@
 //! | sequence: run B on A's output | [`and_then`](DeviceOpExt::and_then) | builder runs at construction over A's [`Handle`](HandleOf) |
 //! | a sequence whose later steps use earlier steps' outputs | [`graph!`](crate::graph) | one `let` per step, written straight-line; expands to the nested `and_then` closures that keep every earlier binding in scope |
 //! | **carry a value PAST an intervening step** (keep it to hand to a later op / the terminal) | **[`forward`]** | `forward(x)` re-exposes an already-produced value as a one-node op; capture its handle in the `move` closures. This is the "thread a buffer forward" primitive. |
+//! | **share one READ-ONLY buffer between several ops** | an `Arc<DeviceSlice>` — or [`arc`](DeviceOpExt::arc) / [`arc_split`] for one produced inside the graph | each launch site takes its own `Arc::clone` as a read-only kernel arg; no pipe threading, no slot, one device copy. Writable buffers can't be shared this way — they flow through pipes. |
 //! | run device ops in PARALLEL | [`bundle2`] / [`bundle!`](crate::bundle) | independent branches; per-branch structure-preserving `Checkouts` |
 //! | N-way homogeneous parallel | [`fan_out`] | one op per item |
 //! | hold a host VALUE as a graph input | [`value`] (by-value, `Clone`) or [`lift`] (owned / non-`Clone`, self-rehoming — replays) | |
@@ -79,14 +80,18 @@
 //!
 //! ## Reading a result: deref + `map` (borrow, don't consume)
 //!
-//! A [`Checkout<O>`] **derefs to `O`**, and buffer reads (`.map()`, `.read()`)
-//! take `&self` — so you can read a result **without consuming** the Checkout,
-//! leaving it free to rehome on drop:
+//! A [`Checkout<O>`] **derefs to `O`**, so a borrowing read leaves the Checkout
+//! free to rehome on drop (and the graph to replay):
 //!
 //! ```ignore
 //! let co = g.sync(ctx)?;
-//! let v = (*co).map().wait()?;   // borrows — co still drops/rehomes afterward
+//! co.read_into(&mut host)?;      // copy out; co still drops/rehomes afterward
+//! let v = (*co).map().wait()?;   // or map it and read in place
 //! ```
+//!
+//! Not `co.read(&mut host)`: the buffer's `read` verb takes the buffer BY VALUE, so
+//! through a Checkout it severs the return — fine for a last read, but the next
+//! `sync` then finds that cell empty.
 //!
 //! ## [`into_inner`](Checkout::into_inner) vs `drop` — sever vs rehome
 //!
@@ -128,9 +133,25 @@
 //! capturing its handle in the `move` closures, not by naming the concrete cell
 //! twice, which would double-lend). `sync` in a loop; drop the Checkout to re-arm.
 //! Keeping loop control on the host (a convergence test) while all compute is one
-//! device graph is the ideal shape for the future command-buffer backend (one
-//! recordable region, replayed, with a small host readback between replays).
-//! `examples/cg` is this pattern end-to-end.
+//! device graph is the ideal shape for command buffers: one recorded region,
+//! replayed, with a small host readback between replays. `examples/cg` is this
+//! pattern end-to-end.
+//!
+//! ## Per-step state: keep it on the device, not in a slot
+//!
+//! State that changes on EVERY replay — a step index, a token position, an
+//! iteration counter — can be a scalar slot re-bound before each `sync`, but each
+//! distinct value is a distinct binding state, and the keyed command-buffer cache
+//! records one command buffer per state: a per-step slot records a new one on
+//! every `sync` and never replays any. Keep such state on the device instead: a
+//! [`DeviceScalar`] (of a scalar, or of a `#[repr(C)]` struct, passed to kernels by
+//! reference — `&T` to read, `&mut T` to advance) that flows through the graph as
+//! data, read by the kernels that need it and advanced by the last kernel that
+//! uses it. Nothing the host binds changes between syncs, so the graph is recorded
+//! once and replayed; the host reads the state back from the sync's Checkout
+//! (`read_value()`). Slots remain the tool for configuration that changes rarely
+//! (a regime switch, a clamped final step). `examples/llama2` (its
+//! `Step { token, pos }`) is this pattern end to end.
 //!
 //! ## Reusable subgraphs: curry, then compose (library-provided graphs)
 //!
@@ -3019,8 +3040,9 @@ impl<T: DeviceOp> DeviceOpExt for T {}
 ///
 /// `mutate_all` has no `SlotConflict` leg (mutate overwrites), so it is FULLY
 /// all-or-nothing. Order does not matter for *success*: every element binds its own
-/// tag independently. Implemented for tuples of arity 1..=16 (mirroring
-/// [`KernelArgs`](crate::KernelArgs)). See the `mutate_all_body!` macro for the three
+/// tag independently. Implemented for tuples of arity 1..=24 — a graph's full
+/// rebind fits one call, keeping it all-or-nothing (miniweather rebinds 18 slots).
+/// See the `mutate_all_body!` macro for the three
 /// phases (probe → sever → fold).
 ///
 /// (The set-once tuple path — [`call`](DeviceOpExt::call) — does NOT route through
@@ -3105,6 +3127,22 @@ impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M);
 impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
 impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
 impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S);
+impl_bind_all_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T);
+impl_bind_all_tuple!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U
+);
+impl_bind_all_tuple!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V
+);
+impl_bind_all_tuple!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W
+);
+impl_bind_all_tuple!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X
+);
 
 // ── CallArg / CallArgs: the mixed value-or-feed tuple for `bind` / `call` ────
 
@@ -3156,7 +3194,7 @@ pub trait CallArg {
 /// A tuple of [`CallArg`]s — the argument to [`call`](DeviceOpExt::call) (and, as a
 /// 1-tuple, [`bind`](DeviceOpExt::bind)). Each element is INDEPENDENTLY a value tag
 /// (`Buf(v)`) or a pipe feed (`Buf(pipe)`), applied left-to-right, infallibly.
-/// Implemented for arities 1..=16 (mirroring [`BindAll`]).
+/// Implemented for arities 1..=24 (mirroring [`BindAll`]).
 pub trait CallArgs {
     /// Apply every element to `g` (infallibly, in tuple order).
     fn apply_all<Op: DeviceOp>(self, g: &Op);
@@ -3191,6 +3229,22 @@ impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M);
 impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
 impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
 impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S);
+impl_call_args_tuple!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T);
+impl_call_args_tuple!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U
+);
+impl_call_args_tuple!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V
+);
+impl_call_args_tuple!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W
+);
+impl_call_args_tuple!(
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X
+);
 
 // ── Checkout: runtime guard over one run's output ───────────────────────
 
@@ -3785,6 +3839,32 @@ impl<O> std::ops::DerefMut for Checkout<O> {
         self.homed
             .value_mut()
             .expect("Checkout dereferenced after into_inner — internal bug")
+    }
+}
+
+impl<T: Copy, M: crate::access::MemMode + crate::access::HostReadable> Checkout<DeviceSlice<T, M>> {
+    /// Copy the checked-out buffer into `dst`, **borrowing** the `Checkout`: it
+    /// stays alive and still re-homes the buffer on drop, so the graph replays.
+    /// (The buffer's own `read` verb takes the buffer by value, so calling it
+    /// through the `Checkout` would move the buffer out — rustc E0507.)
+    ///
+    /// ```ignore
+    /// let co = g.sync(&ctx)?;
+    /// co.read_into(&mut host)?;   // blocking map + copy; `co` re-homes on drop
+    /// ```
+    ///
+    /// Errors with [`LengthMismatch`](Error::LengthMismatch) if `dst` is not the
+    /// buffer's length.
+    pub fn read_into(&self, dst: &mut [T]) -> Result<()> {
+        let src: &DeviceSlice<T, M> = self;
+        if src.len() != dst.len() {
+            return Err(Error::LengthMismatch {
+                src: src.len(),
+                dst: dst.len(),
+            });
+        }
+        dst.copy_from_slice(&src.map().wait()?);
+        Ok(())
     }
 }
 

@@ -328,3 +328,46 @@ fn usm_scalar_reads_via_scalar_ref() {
         .expect("usm-scalar scale-by-ref chain");
     assert!(result.iter().all(|&v| v == 21), "got {result:?}");
 }
+
+/// Per-step state kept ON THE DEVICE: a graph whose first kernel advances a
+/// `&mut Counter` struct and whose next kernel reads it as `&Counter`. Each
+/// `sync` advances the state with nothing re-bound in between, so a
+/// command-buffer device records the graph once and replays it (contrast a
+/// scalar slot re-bound every step, which keys a new recording per step).
+#[test]
+fn device_resident_struct_state_advances_per_sync() {
+    use claspr_test_kernels::kernels::Counter;
+    use claspr_test_support::cb_records_of;
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let counter =
+        DeviceScalar::<Counter>::new(&ctx, Counter { value: 0, step: 2 }).expect("counter");
+    let data = claspr::DeviceSlice::<u32>::from_slice(&ctx, &[0; N]).expect("data");
+
+    let g = ks
+        .advance_counter([1], counter)
+        .and_then(|counter| ks.add_counter_u32([N], data, counter))
+        .and_then(|(data, counter)| bundle2(download(data), forward(counter)));
+    for run in 1..=3u32 {
+        let (out, counter) = g.sync(&ctx).expect("sync");
+        // value after this run is 2 * run; data accumulates 2 + 4 + … + 2 * run.
+        assert_eq!(
+            counter.read_value().expect("read counter"),
+            Counter {
+                value: 2 * run,
+                step: 2
+            }
+        );
+        assert!(
+            out.iter().all(|&v| v == run * (run + 1)),
+            "run {run}: {:?}",
+            &out[..4]
+        );
+    }
+    // 1 on a device with cl_khr_command_buffer, 0 without (per-op path).
+    assert!(
+        cb_records_of(&g) <= 1,
+        "recorded {} command buffers",
+        cb_records_of(&g)
+    );
+}

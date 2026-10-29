@@ -24,8 +24,10 @@
 //! ## Design constraints (per `IMPLEMENTATION-PLAN.md` Phase 5)
 //!
 //! - **OpenCL 1.2 only**, max portability across pocl / rusticl / Intel.
-//! - **`u32` and `f64` scalars / slices only** — no vector or struct
-//!   args.
+//! - **`u32` and `f64` scalars / slices** — no vector args. One
+//!   `#[repr(C)]` struct, [`kernels::Counter`], is passed BY REFERENCE
+//!   (`&Counter` / `&mut Counter` over a `DeviceScalar<Counter>`) to pin
+//!   user structs as scalar-ref args.
 //! - **One operation per kernel** — runtime tests compose them.
 
 #[claspr::device]
@@ -161,6 +163,39 @@ pub mod kernels {
     ) {
         let i = id.x;
         data[i] = data[i].wrapping_add(*addend);
+    }
+
+    /// A user struct passed BY REFERENCE to kernels, held on the host side in
+    /// a `DeviceScalar<Counter>` — e.g. per-step state a graph advances itself.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    #[repr(C)]
+    pub struct Counter {
+        pub value: u32,
+        pub step: u32,
+    }
+
+    /// Add the counter's current `value` to every element in place (a struct
+    /// READ through `&Counter`).
+    #[claspr::kernel]
+    pub fn add_counter_u32(
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
+        #[spirv(cross_workgroup)] data: &mut [u32],
+        #[spirv(cross_workgroup)] counter: &Counter,
+    ) {
+        let i = id.x;
+        data[i] = data[i].wrapping_add(counter.value);
+    }
+
+    /// Advance the counter by its `step` (a struct WRITE through
+    /// `&mut Counter`; launch with one work-item).
+    #[claspr::kernel]
+    pub fn advance_counter(
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
+        #[spirv(cross_workgroup)] counter: &mut Counter,
+    ) {
+        if id.x == 0 {
+            counter.value = counter.value.wrapping_add(counter.step);
+        }
     }
 }
 
