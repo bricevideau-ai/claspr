@@ -22,6 +22,8 @@ claspr-build lowers it to `&mut [T]` + a per-item view (adding a global id if
 none), and the host checks at every launch that the grid is 1-D and exactly the
 buffer's length (`Error::GridMismatch`, lent inputs returned → retryable). llama2's
 7 per-element kernels use it: byte-identical, no device cost (148.6 vs 148.1 tok/s).
+`PerItemIn<T>` is the read-only form (inputs read element-wise; the grid check
+bounds them too — llama2's `add`/`swiglu`/`rmsnorm` weights use it, no cost).
 `PerItemOut<T>` is the write-only form (lowered to `&mut [MaybeUninit<T>]`); via
 `KernelSliceWriteArg` it accepts a `DeviceSliceUninit` and outputs the initialised
 `DeviceSlice` (home adapter forgets init on return), incl. `DeviceScratch` memory —

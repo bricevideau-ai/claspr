@@ -981,15 +981,27 @@ fn has_any_claspr_device_attr(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(is_claspr_device_attr)
 }
 
-/// The element type `T` and whether the view is write-only, if `ty` is a
-/// `PerItem<T>` / `PerItemOut<T>` kernel parameter (last path segment, one type
-/// argument).
-fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, bool)> {
+/// How a per-item kernel parameter may touch its element.
+#[derive(Clone, Copy, PartialEq)]
+enum PerItemAccess {
+    /// `PerItem<T>`: read and write.
+    ReadWrite,
+    /// `PerItemIn<T>`: read only.
+    Read,
+    /// `PerItemOut<T>`: write only (the buffer may be uninitialised).
+    Write,
+}
+
+/// The element type `T` and access, if `ty` is a `PerItem<T>` /
+/// `PerItemIn<T>` / `PerItemOut<T>` kernel parameter (last path segment, one
+/// type argument).
+fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, PerItemAccess)> {
     let syn::Type::Path(tp) = ty else { return None };
     let seg = tp.path.segments.last()?;
-    let write_only = match seg.ident.to_string().as_str() {
-        "PerItem" => false,
-        "PerItemOut" => true,
+    let access = match seg.ident.to_string().as_str() {
+        "PerItem" => PerItemAccess::ReadWrite,
+        "PerItemIn" => PerItemAccess::Read,
+        "PerItemOut" => PerItemAccess::Write,
         _ => return None,
     };
     let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
@@ -1000,7 +1012,7 @@ fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, bool)> {
         _ => None,
     });
     let elem = types.next()?;
-    types.next().is_none().then_some((elem, write_only))
+    types.next().is_none().then_some((elem, access))
 }
 
 /// Lower a kernel's `PerItem<T>` parameters for the device crate: each becomes the
@@ -1019,7 +1031,7 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) {
         })
     };
     let mut gid: Option<syn::Ident> = None;
-    let mut lowered: Vec<(syn::Ident, syn::Ident, bool)> = Vec::new();
+    let mut lowered: Vec<(syn::Ident, syn::Ident, PerItemAccess)> = Vec::new();
     for input in f.sig.inputs.iter_mut() {
         let syn::FnArg::Typed(pt) = input else {
             continue;
@@ -1031,7 +1043,7 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) {
             gid = Some(pi.ident.clone());
             continue;
         }
-        let Some((elem, write_only)) = per_item_elem(&pt.ty) else {
+        let Some((elem, access)) = per_item_elem(&pt.ty) else {
             continue;
         };
         let name = pi.ident.clone();
@@ -1039,12 +1051,12 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) {
         *pt.pat = syn::parse_quote!(#raw);
         // A write-only view may cover uninitialised memory: `MaybeUninit`, so
         // no `&mut T` to it ever exists.
-        *pt.ty = if write_only {
-            syn::parse_quote!(&mut [core::mem::MaybeUninit<#elem>])
-        } else {
-            syn::parse_quote!(&mut [#elem])
+        *pt.ty = match access {
+            PerItemAccess::ReadWrite => syn::parse_quote!(&mut [#elem]),
+            PerItemAccess::Read => syn::parse_quote!(&[#elem]),
+            PerItemAccess::Write => syn::parse_quote!(&mut [core::mem::MaybeUninit<#elem>]),
         };
-        lowered.push((name, raw, write_only));
+        lowered.push((name, raw, access));
     }
     if lowered.is_empty() {
         return;
@@ -1059,11 +1071,11 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) {
     });
     let prologue: Vec<syn::Stmt> = lowered
         .iter()
-        .map(|(name, raw, write_only)| {
-            let view = if *write_only {
-                quote::quote!(PerItemOut)
-            } else {
-                quote::quote!(PerItem)
+        .map(|(name, raw, access)| {
+            let view = match access {
+                PerItemAccess::ReadWrite => quote::quote!(PerItem),
+                PerItemAccess::Read => quote::quote!(PerItemIn),
+                PerItemAccess::Write => quote::quote!(PerItemOut),
             };
             syn::parse_quote! {
                 #[allow(unused_mut)]
@@ -1207,6 +1219,34 @@ pub mod __claspr {
     impl<T> core::ops::DerefMut for PerItem<'_, T> {
         #[inline(always)]
         fn deref_mut(&mut self) -> &mut T {
+            self.slot
+        }
+    }
+
+    /// This work-item's element of a `PerItemIn<T>` kernel argument — read-only.
+    pub struct PerItemIn<'a, T> {
+        slot: &'a T,
+        index: usize,
+    }
+
+    impl<'a, T> PerItemIn<'a, T> {
+        #[doc(hidden)]
+        #[inline(always)]
+        pub fn __claspr_new(buf: &'a [T], index: usize) -> Self {
+            PerItemIn { slot: &buf[index], index }
+        }
+
+        /// The element's index in the buffer (the global invocation id).
+        #[inline(always)]
+        pub fn index(&self) -> usize {
+            self.index
+        }
+    }
+
+    impl<T> core::ops::Deref for PerItemIn<'_, T> {
+        type Target = T;
+        #[inline(always)]
+        fn deref(&self) -> &T {
             self.slot
         }
     }

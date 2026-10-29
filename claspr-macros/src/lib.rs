@@ -97,6 +97,9 @@ use syn::{
 ///   `&mut [T]` does, and every launch first checks that the grid is 1-D and
 ///   exactly the buffer's length (`Error::GridMismatch` otherwise, with any
 ///   lent input returned so a graph stays retryable).
+/// - `PerItemIn<T>` is the read-only form (`*name`, `name.index()`, no
+///   write; accepts what `&[T]` does, incl. `Arc<DeviceSlice>`): an input read
+///   element-wise, so the launch's grid check bounds the INPUT too.
 /// - `PerItemOut<T>` is the write-only form (`name.write(v)`, `name.index()`,
 ///   no read). It also accepts an UNINITIALISED buffer (`DeviceSliceUninit`)
 ///   and outputs the initialised one. Prototype caveat: a work-item that
@@ -859,9 +862,6 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // excluding ReadOnly / Frozen at the type level).
                 let dbound: TokenStream2 = if write_only {
                     quote! { #gid: ::claspr::KernelSliceWriteArg<#elem> }
-                } else if per_item {
-                    // The grid check reads the buffer's length.
-                    quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> + ::claspr::Buffer<#elem> }
                 } else if mutable {
                     quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> }
                 } else {
@@ -896,7 +896,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     let len = if write_only {
                         quote! { ::claspr::KernelSliceWriteArg::<#elem>::element_count(&#pname) }
                     } else {
-                        quote! { ::claspr::Buffer::<#elem>::len(&#pname) }
+                        quote! { ::claspr::KernelSliceReadArg::<#elem>::element_count(&#pname) }
                     };
                     per_item_checks.push(quote! {
                         ::claspr::check_per_item_grid(&__claspr_spec, #len, #name_lit)?;
@@ -2486,8 +2486,9 @@ enum ParamRole {
         /// stricter `KernelSliceReadWriteArg<T>` bound); `false` for
         /// `&[T]` (emits `KernelSliceReadArg<T>`).
         mutable: bool,
-        /// A `PerItem<T>` param: a written slice whose work-item `i` owns
-        /// element `i`; the launch checks the 1-D grid equals its length.
+        /// A `PerItem<T>` / `PerItemIn<T>` / `PerItemOut<T>` param: work-item
+        /// `i` touches element `i` only; the launch checks the 1-D grid equals
+        /// its length (`mutable` is false for `PerItemIn`).
         per_item: bool,
         /// A `PerItemOut<T>` param: `per_item`, write-only — it accepts an
         /// uninitialised buffer (`KernelSliceWriteArg`) and outputs its `Init`.
@@ -2653,17 +2654,17 @@ enum CrossWorkgroupTy {
 fn cross_workgroup_element_ty(ty: &Type) -> syn::Result<CrossWorkgroupTy> {
     // `PerItem<T>`: a written slice partitioned one element per work-item
     // (claspr-build lowers it to `&mut [T]` + a per-item view on the device).
-    // `PerItemOut<T>`: the same, write-only (it can initialise an uninitialised
-    // buffer).
+    // `PerItemIn<T>` / `PerItemOut<T>`: the same, read-only / write-only (the
+    // latter can initialise an uninitialised buffer).
     if let Type::Path(tp) = ty
         && let Some(seg) = tp.path.segments.last()
-        && (seg.ident == "PerItem" || seg.ident == "PerItemOut")
+        && (seg.ident == "PerItem" || seg.ident == "PerItemIn" || seg.ident == "PerItemOut")
         && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
         && let [syn::GenericArgument::Type(inner)] = args.args.iter().collect::<Vec<_>>()[..]
     {
         return Ok(CrossWorkgroupTy::Slice {
             elem: quote! { #inner },
-            mutable: true,
+            mutable: seg.ident != "PerItemIn",
             per_item: true,
             write_only: seg.ident == "PerItemOut",
         });

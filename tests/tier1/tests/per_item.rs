@@ -186,3 +186,60 @@ fn per_item_out_initialises_device_scratch() {
     out.read(&mut host).wait().expect("read");
     assert!(host.iter().all(|&v| v == 21), "got {:?}", &host[..4]);
 }
+
+/// `PerItemIn` inputs are read element-wise through a read-only view.
+#[test]
+fn per_item_in_inputs_are_read_element_wise() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let (_a, _b, out) = ks
+        .add_per_item_in_u32([N], buf(&ctx, 3), buf(&ctx, 4), buf(&ctx, 0))
+        .wait()
+        .expect("launch");
+    let mut host = vec![0u32; N];
+    out.read(&mut host).wait().expect("read");
+    assert!(host.iter().all(|&v| v == 7), "got {:?}", &host[..4]);
+}
+
+/// The grid check bounds `PerItemIn` INPUTS too: an input shorter than the grid
+/// (which a plain `&[T]` would read past the end of) is rejected, naming it.
+#[test]
+fn per_item_in_input_shorter_than_the_grid_is_rejected() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let short = DeviceSlice::<u32>::from_slice(&ctx, &[3; N / 2]).expect("short input");
+    let err = ks
+        .add_per_item_in_u32([N], short, buf(&ctx, 4), buf(&ctx, 0))
+        .wait()
+        .expect_err("short input");
+    assert!(
+        matches!(err, Error::GridMismatch { arg: "a", len, .. } if len == N / 2),
+        "got {err:?}"
+    );
+}
+
+/// A read-only shared buffer (`Arc<DeviceSlice>`) is a valid `PerItemIn`.
+#[test]
+fn per_item_in_accepts_a_shared_read_only_buffer() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let shared = std::sync::Arc::new(buf(&ctx, 10));
+    for addend in [1u32, 2] {
+        let (_a, _b, out) = ks
+            .add_per_item_in_u32(
+                [N],
+                std::sync::Arc::clone(&shared),
+                buf(&ctx, addend),
+                buf(&ctx, 0),
+            )
+            .wait()
+            .expect("launch");
+        let mut host = vec![0u32; N];
+        out.read(&mut host).wait().expect("read");
+        assert!(
+            host.iter().all(|&v| v == 10 + addend),
+            "got {:?}",
+            &host[..4]
+        );
+    }
+}

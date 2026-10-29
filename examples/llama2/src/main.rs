@@ -78,7 +78,7 @@ mod gpu {
     pub fn rmsnorm(
         #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] x: &[f32],
-        #[spirv(cross_workgroup)] w: &[f32],
+        #[spirv(cross_workgroup)] w: PerItemIn<f32>,
         #[spirv(cross_workgroup)] out: PerItem<f32>,
         n: u32,
     ) {
@@ -90,7 +90,7 @@ mod gpu {
             j += 1;
         }
         let scale = 1.0 / ocl::sqrt(ss / n as f32 + 1e-5);
-        *out = w[i] * (scale * x[i]);
+        *out = *w * (scale * x[i]);
     }
 
     /// `out = W x` for a row-major `W` of `n` columns (one row per work-item).
@@ -265,9 +265,9 @@ mod gpu {
     pub fn add(
         #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] x: PerItem<f32>,
-        #[spirv(cross_workgroup)] y: &[f32],
+        #[spirv(cross_workgroup)] y: PerItemIn<f32>,
     ) {
-        *x += y[x.index()];
+        *x += *y;
     }
 
     /// `h1 = silu(h1) * h3`: the SwiGLU gate.
@@ -275,10 +275,10 @@ mod gpu {
     pub fn swiglu(
         #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] h1: PerItem<f32>,
-        #[spirv(cross_workgroup)] h3: &[f32],
+        #[spirv(cross_workgroup)] h3: PerItemIn<f32>,
     ) {
         let v = *h1;
-        *h1 = v * (1.0 / (1.0 + ocl::exp(-v))) * h3[h1.index()];
+        *h1 = v * (1.0 / (1.0 + ocl::exp(-v))) * *h3;
     }
 
     /// Greedy sampling and the step advance, on the device (one work-item; ties

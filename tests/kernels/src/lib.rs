@@ -189,6 +189,17 @@ pub mod kernels {
         *data = data.wrapping_mul(factor);
     }
 
+    /// `out[i] = a[i] + b[i]` with `PerItemIn` inputs: each read element-wise,
+    /// so the launch's grid check bounds the inputs as well as the output.
+    #[claspr::kernel]
+    pub fn add_per_item_in_u32(
+        #[spirv(cross_workgroup)] a: PerItemIn<u32>,
+        #[spirv(cross_workgroup)] b: PerItemIn<u32>,
+        #[spirv(cross_workgroup)] out: PerItem<u32>,
+    ) {
+        *out = a.wrapping_add(*b);
+    }
+
     /// `out[i] = a[i] * factor` into a write-only `PerItemOut`: `out` may be
     /// an UNINITIALISED buffer, which the launch initialises (every element is
     /// written exactly once; the kernel cannot read it).
