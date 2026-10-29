@@ -1,0 +1,24 @@
+error[E0382]: use of moved value: `a`
+  --> compile_fail/graph_macro_pipe_used_twice.rs:16:13
+   |
+16 |       let _ = graph! {
+   |  _____________^
+17 | |         let (a, b, out) = ks.add_u32([4usize], buf(1), buf(2), buf(0));
+   | |              - move occurs because `a` has type `claspr::Pipe<claspr::DeviceSlice<u32>>`, which does not implement the `Copy` trait
+18 | |         let (_a, _b, _out) = ks.add_u32([4usize], a, b, out);
+   | |                                                   - value moved here
+19 | |         // `a` was moved into the previous step: using it again must not compile.
+20 | |         ks.scale_u32([4usize], a, 2u32)
+   | |                                - use occurs due to use in closure
+21 | |     };
+   | |_____^ value used here after move
+   |
+   = note: this error originates in the macro `$crate::graph` which comes from the expansion of the macro `graph` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: consider cloning the value if the performance cost is acceptable
+   |
+18 |         let (_a, _b, _out) = ks.add_u32([4usize], a.clone(), b, out);
+   |                                                    ++++++++
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0382`.

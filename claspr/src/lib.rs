@@ -205,7 +205,7 @@ pub use opencl3::types::cl_event;
 /// access markers ([`ReadWrite`]/[`ReadOnly`]/[`WriteOnly`]/[`Frozen`]), the
 /// high-frequency Tier 2 constructors (`upload`/`download`/`fill`/`alloc_zero`/
 /// `value`/`lift`/`bundle2..16`/`fan_out`/`arc_split`/…), the chain-entry
-/// macros (`bundle!`/`device_slice!`/`mapped_slice!`/…), and the core
+/// macros (`bundle!`/`graph!`/`device_slice!`/`mapped_slice!`/…), and the core
 /// types ([`Context`]/[`DeviceSlice`]/[`Device`]/[`Result`]/[`Error`]) into
 /// scope — so callers can invoke the trait methods without hand-listing every
 /// extension trait.
@@ -245,7 +245,7 @@ pub mod prelude {
     // and had no remaining users.
     pub use crate::{
         bundle, device_slice, device_slice_alloc_uninit, device_slice_alloc_zero,
-        device_slice_filled, device_slice_from_slice, slot, slots,
+        device_slice_filled, device_slice_from_slice, graph, slot, slots,
     };
 
     // ── Typed-slot tags + multi-fill ──

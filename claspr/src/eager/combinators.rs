@@ -1697,6 +1697,48 @@ macro_rules! bundle {
     };
 }
 
+/// Sequential composition written as straight-line code: each `let` binds an
+/// op's [handle](DeviceOp::handle), and everything after it — the remaining
+/// steps and the final op — can use that binding.
+///
+/// ```ignore
+/// graph! {
+///     let (x, _w, xb) = ks.rmsnorm([d], x, w, xb, n);
+///     let (_wq, _xb, q) = ks.matmul([d], wq, xb, q, n);
+///     ks.add([d], x, q)   // `x` from the first step is still in scope
+/// }
+/// ```
+///
+/// expands to the nested [`and_then`](DeviceOpExt::and_then) chain one would
+/// write by hand — each step's closure holds the rest of the block, which is
+/// what keeps earlier bindings in scope:
+///
+/// ```ignore
+/// ks.rmsnorm([d], x, w, xb, n).and_then(|(x, _w, xb)| {
+///     ks.matmul([d], wq, xb, q, n).and_then(|(_wq, _xb, q)| ks.add([d], x, q))
+/// })
+/// ```
+///
+/// So it is purely syntax: the graph, its types and its behaviour are those of
+/// the hand-written chain, and ownership is checked the same way. The closures
+/// are not `move`: each captures what its body uses in the least demanding
+/// mode, so pipes and buffers passed by value move in (using one twice is a
+/// compile error) while the context and kernels, only borrowed, stay usable
+/// after the block — `and_then` runs each closure immediately, so nothing
+/// outlives the call. Every `let` is a graph step — compute host-side values
+/// before the block. The block's last expression is the graph's final op.
+#[macro_export]
+macro_rules! graph {
+    // The `let` arm comes first: an `expr` fragment would commit to parsing
+    // `let …` and fail instead of falling through.
+    (let $pat:pat = $op:expr; $($rest:tt)+) => {
+        $crate::eager::DeviceOpExt::and_then($op, |$pat| $crate::graph!($($rest)+))
+    };
+    ($tail:expr) => {
+        $tail
+    };
+}
+
 // ── FanOut: a homogeneous Vec of branches, joined by a marker ──────────
 
 /// Eager fan-out: build one op per input (the builder `f` runs at construction

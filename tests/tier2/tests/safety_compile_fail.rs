@@ -32,6 +32,9 @@
 //!   (`F(pipe)`) must be rejected: the unified `Tag(pipe)` pipe-feed `CallArg`
 //!   arm is gated to buffer-valued tags (`RecordableBuffer`), so `F<Pipe<f32>>`
 //!   has no `CallArg`. Guards the buffer/scalar asymmetry of the feed unify.
+//! - `graph_macro_pipe_used_twice` — `graph!` expands to nested `and_then`
+//!   closures, so a pipe bound by one step and used by the next can't be used
+//!   again by a later step (use-after-move), exactly as when written by hand.
 //!
 //! A second `compile_pass` config (`Mode::Pass`) runs `compile_pass/sanity.rs`:
 //! a known-good unified-API `DeviceOp` chain that MUST compile. It is the
