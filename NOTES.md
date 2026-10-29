@@ -10,11 +10,9 @@ the codebase is laid out, read `ARCHITECTURE.md` (the map for agents/newcomers).
 
 ## Active
 
-Nothing in flight as of 2026-07-15 (working tree clean on `main`). The
-2026-07-12→14 campaign — agent cost-of-entry refactor (eager.rs module split,
-`ARCHITECTURE.md`, `OutputShape` — since superseded by `OpShape`), abstraction rounds, complexity-hotspot pass, and
-the full quality-review fix set — has all landed. See git log; recent landings table
-below.
+Nothing in flight on `main` as of 2026-10-29. Parked, deliberately unmerged:
+branch `typed-slot-sets` (compile-time slot sets, see the DECLINED entry below).
+Recent work is in the landings table at the end.
 
 ### Decisions — assessed & DECLINED (kept so future sessions don't re-litigate)
 
@@ -23,7 +21,9 @@ below.
   uses type-inferred CLOSURES with zero signature boilerplate. The macro would add a
   DSL + opaque expansion errors (a cost-of-entry COST) to save ~15 lines at exactly
   one site that `OutputShape` (now `OpShape`) already made readable. **REVISIT TRIGGER: 3+ generic-fn
-  subgraph authors accumulate.**
+  subgraph authors accumulate.** Not the same thing as `graph!` (landed 2026-10-29):
+  that is straight-line `let` syntax for a sequence of steps, not a DSL for
+  generic subgraph signatures, and it does not trip this trigger.
 - **Leaf memory-family unification** (`leaf_fill!`/`leaf_write!`) — DECLINED.
   **RE-CONFIRMED 2026-08-21 by measurement**: `leaves.rs` is 19 `DeviceOp` impls;
   18 of them average ~55 lines with 5–11 members, i.e. genuinely irreducible
@@ -140,201 +140,50 @@ build re-resolves against the floating ref. Fix: walk up from `OUT_DIR` to the h
 `Cargo.lock`, extract the pinned revs, write them into the generated TOML (fallback to
 today's refs). Glam is no longer in the generated TOML (spirv-std re-exports it).
 
-### Graph mutation invalidates the recorded CB wholesale → two-tier dirtiness + mutable dispatch
+### Command-buffer reuse under mutation: keyed cache landed, mutable dispatch declined
 
-**(b) LANDED 2026-09-04 — keyed LRU (`CbLru`). (a) mutable dispatch DECLINED for now**
-(`cl_khr_command_buffer_mutable_dispatch` is experimental and barely supported; PoCL
-advertises it, almost nothing else does). Measured on the 24-command / 30-step
-miniWeather shape (`tests/tier2/examples/cb_mutate_trace.rs` under cliloader), steady
-state, before → after:
+**Keyed LRU landed 2026-09-04** (`CbLru`), **re-keyed 2026-10-27** (`43605dc`): a
+graph keeps `current` + up to `CB_LRU_CAP` (4) parked command buffers, each filed
+under what its slot CELLS held when recorded (cell id → value digest, so renamed
+and erased sites key correctly). Rotation happens at mutate time, not replay time;
+rebinding a slot to the value it already holds is free. A pipe-fed slot has no
+digest, so a mutate touching one falls back to a hard clear. On the 24-command
+miniWeather shape: host API calls −91%, wall-clock 4–8% on PoCL (its recording is
+cheap; see "Where per-sync time goes" below). miniweather's natural per-timestep
+shape costs +6% over the unrolled one and records 3 CBs per run, not one per step.
 
-| | before | after |
-|---|---|---|
-| `clCreateCommandBufferKHR` | 30 | **2** |
-| `clCommandNDRangeKernelKHR` | 690 | **46** |
-| `clSetKernelArg` | 2070 | **138** |
-| `clGetDeviceInfo` | 60 | **0** |
-| total host API calls | 4776 | **408** (−91%) |
+**Mutable dispatch** (`cl_khr_command_buffer_mutable_dispatch`, update by-value
+scalars/extents in place) **declined for now**: experimental, and PoCL is about the
+only driver advertising it. Revisit if that changes.
 
-`CbCache` went from `Option<Arc<FinalizedCb>>` to a small keyed cache: `current` +
-up to `CB_LRU_CAP` (4) parked CBs, each filed under the digests of the slots it baked.
-Rotation happens at MUTATE time, not replay time, so the replay hot path is untouched:
-`SlotEq` gained `slot_digest()` (same trait, so the two can't drift), `SlotBinder`
-carries the digest of the value it binds, and `DeviceOp::invalidate_cbs` became
-`apply_binding_delta(&BindingDelta, rotate)` — set-once binds seed the state, mutates
-rotate. Unkeyable cells (pipe-fed) still hard-clear, so the old behaviour is the
-fallback rather than the rule. Bonus: rebinding a slot to the value it already holds
-is now free (digest match → no rotation, no re-record); it used to re-record.
-
-Wall-clock on PoCL/CPU moved much less than the API counts (~4-8% per sync, at the
-edge of run-to-run noise) — PoCL's CB recording is cheap. The 30% figure below was
-measured under cliloader, whose per-call overhead inflates exactly the calls this
-removes. Expect the API-count win to matter more on drivers where recording does real
-validation/patching work.
-
-Still open from this section: nothing blocking. Revisit (a) if a driver landscape
-emerges where mutable dispatch is broadly available.
-
----
-
-Original finding, from the miniWeather claspr port (2026-08-20, `argonne-demo/miniweather-claspr`; cliloader
-host-timing traces on local PoCL). A replayed Tier-2 graph whose scalar slots are
-`mutate_*`-ed between syncs re-records its command buffer EVERY replay: 30-step run =
-30x `clCreateCommandBufferKHR` + 720x `clCommandNDRangeKernelKHR` (24 dispatches
-re-recorded/step) + 16,020x `clSetKernelArg`, each CB enqueued once then released
-(~30% of wall on a 100x50 grid). Control run with zero mutation confirms the cache
-itself is correct: 1 CB, recorded once, replayed 30x, 534 arg-sets. Two fixes, in order:
-
-- **(a) Two-tier invalidation + `cl_khr_command_buffer_mutable_dispatch`.** Local PoCL
-  advertises it (rusticl/llvmpipe and Intel legacy have no CB ext at all, so plain-enqueue
-  fallback is unaffected). A by-value scalar rebind — and a LaunchSpec rebind, via
-  `CL_MUTABLE_DISPATCH_GLOBAL_SIZE_KHR` — is `clUpdateMutableCommandsKHR` on the existing
-  CB; only structural dirt (buffer identity, graph shape) should force re-record. Record
-  with `CL_COMMAND_BUFFER_MUTABLE_KHR` only when the graph has scalar/extent slots, so
-  fully-literal graphs pay nothing.
-- **(b) Small keyed CB cache as the no-ext fallback.** LRU of ~2-4 finalized CBs keyed by
-  the record-relevant binding state. Covers the dominant ALTERNATING pattern: step-parity
-  slots (miniWeather's x-first/z-first), ping-pong buffer swaps (gray-scott re-records
-  every step today for exactly this reason).
-
-App-side workaround that motivated this: restructuring miniWeather's graph to one
-DOUBLE timestep (directions/extents as literals, dt scalars mutated ≤2x/run) got
-1 CB per whole 600-step run. That shouldn't be necessary for scalars.
-
-**Retired 2026-09-04.** `examples/miniweather` now builds BOTH shapes and `main`
-compares them: `Shape::Unrolled` (48 dispatches, direction/extents literal) and
-`Shape::PerTimestep` (24 dispatches, mirroring the reference `perform_timestep`,
-with direction/extents/hyperviscosity in slots flipped every step). Final states
-are BIT-IDENTICAL at both widths. Measured on PoCL/M3, 600 steps, f64:
-
-| shape | wall | syncs | CBs recorded |
-|---|---|---|---|
-| unrolled double-step | 1.348s | 300 | 2 |
-| non-unrolled per-timestep | 1.432s | 600 | 3 |
-
-The natural shape costs **+6.2%** (f64; +4.5% f32) — one extra `sync` per pair of
-steps — and the keyed cache holds the alternation to a small constant instead of
-one record per sync. Counts are 2/3 not 1/2 because the final clipped-dt step is
-its own binding state; neither grows with step count, which is the point.
-
-The unrolled shape stays as `main`'s reported numbers and as the A-side of the
-equivalence proof, as gray-scott keeps `run_swap` alongside `run_immutable`.
+**What the keyed cache cannot fix** (found with `examples/llama2`, 2026-10-29): a
+scalar slot whose value changes EVERY step (a token position) keys a new CB per step,
+so nothing is ever replayed (200 tokens → 200 recordings). The fix is in the graph,
+not the cache: keep per-step state on the device as data (llama2's `Step` in a
+`DeviceScalar`, advanced by its last kernel) → 1 recording per run, +6% on PoCL.
+Worth a paragraph in the eager guide if a second app hits it.
 
 ### Generic device-module instantiation — `#[claspr::device(instantiate(Real = [f64, f32]))]`
 
-**MVP LANDED 2026-08-21** (`tests/instantiate` is the showcase): attribute grammar
-(claspr-macros + mirrored claspr-build parser — keep in sync), per-stamp kernel
-sub-crates + host stamp sub-modules (`gpu::f64` / `gpu::f32`), alias injection on
-both sides (no substitution), auto-`Float64` for f64 stamps only (verified by a
-capability-walk test: f32 stamp SPIR-V is Float64-free), 4/4 tests green on 3 ICDs.
-miniWeather REWORKED onto instantiate 2026-08-21 (`examples/miniweather`, single
-900-line file): deletes the separate kernel crate, the dual-compile build.rs, and
-the 110-line hand-stamped `claspr::kernels!` signature macro; output fields
-BIT-IDENTICAL to the explicit-compile port at both widths on PoCL; self-validating
-(mass/energy drift + cross-width agreement) on 3 ICDs.
-
-**`GpuKernels<Real>` trait requirements — the width leaks the rework left behind**
-(everything `make_runner!` still parameterizes; gathered per the plan of porting
-first, designing the trait second):
-- the per-stamp constructor (`stamp::kernels(ctx)`) — the trait needs an
-  associated ctor, and the stamp must be nameable generically;
-- the launcher methods themselves (8 here, each with per-arg
-  `KernelSliceRead[Write]Arg<Real>` generics and a complex concrete return type —
-  RPITIT or associated types needed to hide it);
-- ~~`slots!` declarations with `Real`-typed values~~ SOLVED 2026-08-21: the
-  generic-value `slots!` arm (`Tag<R>: <value>`) landed — miniweather's 18
-  slots are now ONE module-level declaration and `make_runner!` no longer
-  stamps a slots block. Generic tags are identity-source only (no
-  `Checkout`/`Pipe` — buffer mechanisms scalars never use), which is what
-  dissolves the coherence overlaps; each instantiation is its own slot
-  identity (`Key = Tag<R>`). Engine tests: `tier2/tests/generic_slots.rs`;
-- `DeviceSlice::<Real>` allocations + the host f64→Real cast at the boundary
-  (a `Real: num-ish` bound or claspr-provided `FromF64` shim);
-- scalar `as Real` casts at bind sites (`dz as Real`, hv coefficients).
-
-**GpuKernels<Real> trait: DONE 2026-08-21** (same-day prototype, merged). The
-device macro now also emits `pub trait Kernels<Real>` in the instantiated module
-plus one impl per stamp — the impls live INSIDE the stamp modules where `Real`
-is aliased, so trait decl and impls share identical signature tokens (the
-no-substitution trick, third use). Launcher methods return opaque
-`impl DeviceOp<Output=…, Shape=…>` (since 2026-10-26; was Output+Handle+Checkouts → and_then /
-bind / sync / mutate_call type-check exactly as with concrete launchers).
-Proven: miniweather's `make_runner!` macro is DELETED — one
-`fn run<Real: Width, K: gpu::Kernels<Real>>` drives the full 24-dispatch replay
-graph at both widths, output BIT-IDENTICAL. Caller-side bounds a generic driver
-states: `ScalarInput<Real>: From<Real>` (scalar From impls are deliberately
-per-type) + `SlotValue + SlotEq` if the driver declares generic slots + its own
-numeric casts (miniweather's 8-line `Width` trait). Limitations: Tier-1 inherent
-terminals (`.wait()`/`.submit()`) aren't visible through the opaque returns
-(generic code uses DeviceOpExt verbs); kernels with image params (or no buffer
-output) are skipped from the trait and listed in its docs — call those via the
-stamp modules; revisit when an image-using instantiated module exists.
-
-Historical (what the trait needed, kept for context): (1) the generated `trait` unifying stamp surfaces so
-drivers are written once (`fn run<R, K: GpuKernels<R>>`) — the showcase's
-`axpb_round_trip!` macro marks exactly what it erases; (2) per-stamp vector-family
-aliases (`RealVec3` → `DVec3`/`Vec3`, `Real4` → `cl::Double4`/`Float4`) — PROBE
-ANSWERED 2026-08-21 (rust-gpu `91323ce1b02`, pinned compiletest): generic
-`#[rust_gpu::vector]` structs DO monomorphize into valid OpTypeVector at
-f32/f64/u32 with per-element capability validation — so `spirv_std::cl` can grow
-a generic layer for IN-KERNEL vector math. But the HOST-ABI half stays concrete:
-a generic struct can't express the element-dependent `repr(align(N))` the cl::*
-types carry, so vector-typed KERNEL PARAMETERS (buffers of vectors) keep needing
-the aligned concrete types → per-stamp alias families remain the right bridge for
-signatures, generic cl vectors the right tool inside kernel bodies; (3) ~~`slots!` generic value type~~ DONE 2026-08-21 (generic-value `slots!` arm; see the trait-requirements list above).
-Limitation to document if it bites: the extra stamp-module level shifts `super::`
-paths in the body by one.
-
-From the miniWeather port (2026-08-20): a precision-generic app must duplicate its device
-module per width today — 297 of the port's 1,005 code lines were a textual f64→f32 copy,
-because kernels can't be generic and the proc-macro/build scan can't see macro-generated
-modules. Proposed feature: one module written against a placeholder type (`Real`,
-unsuffixed float literals), stamped N times.
-
-Why it fits THIS architecture unusually well: `compile_from_host` already owns the module
-body as text/AST and already walks every param type (`classify_param`) to emit the typed
-launchers — stamping N sub-crates (prepend `type Real = X;`) and substituting `Real → X`
-in the emitted `Kernels` signatures is mechanical. The proc-macro side emits N
-`include!`s/constructors instead of one.
-
-Constraints that make per-width stamping the CORRECT shape (not a workaround):
-- SPIR-V entry points cannot be generic — per-width modules are forced by the target.
-- Both widths in one SPIR-V module is a portability non-starter: the module would declare
-  `Float64` → clBuildProgram fails on non-fp64 devices; rusticl/iris SEGV (see NOTES
-  history). One module per instantiation is what drivers require.
-- Capability handling already works: `.with_f64()` + auto-declare-on-use leaves the f32
-  stamp's SPIR-V clean (miniWeather's f32 module ran on Intel legacy + rusticl).
-
-The real design surface is the HOST side: N stamped `Kernels` structs with identical
-method shapes still force users into a per-type macro for their driver. Full win = also
-emit a generated trait per device module (all signatures known at generation time;
-`trait GpuKernels<Real>` impl'd by every stamp) so users write one
-`fn run<R, K: GpuKernels<R>>`. `slots!` needs a small extension (generic value type) or
-stays user-instantiated (~15 lines, acceptable).
-
-Workaround available TODAY (validated in the miniWeather port): explicit-compile mode —
-one raw kernel crate with `#[cfg(feature = "f64")] pub type Real = f64;`, build.rs runs
-`claspr_build::compile(..)` twice with `.with(|sb| sb.shader_crate_features...)`, host
-declares the two surfaces via a user macro wrapping `claspr::kernels!`. Collapses the
-duplication to signature declarations; the `instantiate` feature would erase those too.
-DONE in the port 2026-08-20 (1,005 → ~700 code lines, bit-identical on 3 ICDs). One trap
-hit on the way, worth a guard in claspr-build: `write_to`'s generated file
-`include_bytes!`-es the .spv at its BUILD location, so two `compile()` calls on the same
-kernel crate share a target dir + product name and the second silently overwrites the
-first — both host includes then embed the same (last-written) module. Symptom: the "f32"
-blob failed Intel with "Double type is not supported". FIXED 2026-08-21 (`ce11135`):
-both generation paths now freeze a copy of the .spv beside the generated .rs and embed
-that (`freeze_spv_beside`); regression-tested by a dual-feature compile of the
-explicit-compile kernel crate whose tests assert the embedded blobs differ and behave
-differently on device. The user-facing `target_dir_path` workaround is no longer needed.
-
-On declaration drift in explicit mode (`kernels!` block vs the actual blob): today only
-entry-point NAMES are validated at bind; arg mismatches surface at first launch. A
-bind-time `CL_KERNEL_NUM_ARGS` count check (core `clGetKernelInfo`, safe everywhere)
-would catch added/removed params deterministically at startup. Do NOT build name/type
-verification on `clGetKernelArgInfo` for SPIR-V programs for now — the arg-info
-semantics for SPIR-V are in flux at the OpenCL WG (Brice, 2026-08); revisit when the
-WG lands a resolution.
+**LANDED 2026-08-21** (showcase `tests/instantiate`, full-scale `examples/miniweather`:
+one `fn run<Real: Width, K: gpu::Kernels<Real>>` drives the 24-dispatch graph at both
+widths, bit-identical to the explicit-compile port). Design and history are in the git
+log and CLAUDE.md. Still open:
+- Tier-1 inherent terminals (`.wait()`/`.submit()`) aren't visible through the
+  generated trait's opaque `impl DeviceOp` returns — generic code uses the
+  `DeviceOpExt` verbs.
+- Kernels with image params (or no buffer output) are left out of the generated
+  trait (listed in its docs); call them through the stamp modules. Revisit when an
+  instantiated module uses images.
+- Per-stamp vector-family aliases (`RealVec3` → `DVec3`/`Vec3`, …) not done. Probe
+  answered 2026-08-21: generic `#[rust_gpu::vector]` structs work INSIDE kernels, but
+  vector-typed kernel PARAMETERS need the aligned concrete `cl::*` types, so aliases
+  remain the bridge for signatures.
+- The stamp-module level shifts `super::` paths in the body by one (document if it bites).
+- Explicit-compile mode validates only entry-point NAMES at bind; a bind-time
+  `CL_KERNEL_NUM_ARGS` count check would catch added/removed params at startup. Do
+  NOT build on `clGetKernelArgInfo` for SPIR-V (semantics in flux at the OpenCL WG,
+  Brice 2026-08).
 
 ### CB region choice: maximal munch optimizes the wrong objective
 
@@ -372,10 +221,6 @@ position rather than dataflow reachability.
   documented `(*co).map().wait()?` + copy works but is discoverable only from the
   eager.rs module docs. A borrowing read on `Checkout` (or `read` on `&DeviceSlice`)
   closes it.
-- **Re-record churn (minor, moot if (a)/(b) land).** Each re-record does per-command
-  `clRetainKernel` + full `clSetKernelArg` sweeps (720 retains / 534 arg-sets per
-  24-dispatch record); per-site arg caching would shrink it, but it's noise once the
-  CB stops being re-recorded.
 - **Doc pointer, not a bug:** `Arc<DeviceSlice<T, M>>: KernelSliceReadArg` (launch.rs)
   is the answer to "read-only buffer used at N graph sites" — the port initially threaded
   5 hydrostatic arrays through all 24 dispatches as pipes ("caravan" signatures) for want
@@ -450,97 +295,34 @@ remaining cost is a runtime property. On a driver where CB replay is one hardwar
 submission the picture should differ sharply — worth re-running this on Intel
 GPU/Level Zero before drawing conclusions about CB value in general.
 
-### Large graphs are stack-hungry in debug builds
+### PoCL: sustained CB replay fails `CL_INVALID_OPERATION` — fixed LOCALLY only
 
-Found 2026-09-04 adding miniWeather's second graph shape. A claspr graph is a
-deeply nested `AndThen` held BY VALUE, and a debug build gives every intermediate
-in the chain its own stack slot with no reuse. Putting both shapes in one `fn` (as
-two `match` arms, only one of which ever runs) sizes the frame for BOTH and
-overflows the test harness's 2 MiB threads — confirmed by stubbing one arm, which
-makes it pass. The release binary is fine on the 8 MiB main thread.
+Replaying one finalized command buffer in a `sync` loop returned `-59` from
+`clEnqueueCommandBufferKHR` at a random iteration. PoCL race (diagnosed 2026-09-04):
+`pocl_update_event_finished` publishes `CL_COMPLETE` before decrementing the buffer's
+`pending` count, so a waiter arriving in that window re-enqueues while `pending != 0`.
+claspr is conformant (waiting on the completion event before re-enqueueing).
 
-Originally worked around with an `on_big_stack` helper (spawn at 64 MiB), then
-with per-stage `Box<O>` + `recursion_limit = 512`. **Resolved 2026-10-27** by
-transparent `.erase()`, now applied by `and_then` itself: the chain's type nests
-per combinator, not per link, so there is no recursion-limit ceiling and no
-quadratic build-frame stack. miniweather's debug `run` needs under 256 KiB (was
-512 KiB) and the tests run on the default test-thread stack.
+The fix (branch `fix/cmdbuf-pending-race`, repro `scratch/pocl_cmdbuf_replay_race.c`)
+is installed in the local pocl 8.0-pre (`~/.local`), so `cb_bench` and the suites run
+clean here. **Upstream it was NOT merged**: pocl/pocl#2306 was closed 2026-09-09 — the
+maintainer would rather move the implementation to the v1.0 command-buffer spec
+(0.9.8 drops simultaneous-use and the `pending` bookkeeping entirely), tracked as
+pocl/pocl#2314 (open). So stock pocl still has the race — one more reason the pocl
+CI job stays deferred until a suitable pocl is easy to install.
 
-### PoCL: sustained CB replay eventually fails `CL_INVALID_OPERATION` — **FIXED upstream-ready 2026-09-04**
+### rusticl (Mesa 26.2.5) driver bugs that show up in CI — reported, do not gate
 
-Root-caused and fixed: pocl branch `fix/cmdbuf-pending-race`, one commit
-("Command-buffers: retire the submission before publishing CL_COMPLETE"), rebased on
-current pocl `main` (v7.2+). Standalone repro kept at
-`scratch/pocl_cmdbuf_replay_race.c`; pocl's own regression is in
-`tests/runtime/test_command_buffer.c`.
+- **mesa#16714** — llvmpipe SIGSEGVs JIT-compiling any kernel that calls `fma()` on
+  `double` (miniweather's f64 kernels). CI runs miniweather with fp64 hidden on that
+  Mesa (`6c2b322`); locally `RUSTICL_FEATURES=fp64` reproduces it.
+- **mesa#16723** — heap corruption (`llvmpipe_set_global_binding` SIGSEGV or glibc
+  `malloc(): corrupted top size`) when kernels in flight on two queues are joined by
+  one cross-queue sync. Surfaces as a ~15% flake of `tier1 cross_queue::
+  after_all_orders_launch_after_multiple_cross_queue_events`; reproduced on x86-64 and
+  aarch64.
 
-Two bugs, one commit:
-
-1. **The race.** `pocl_update_event_finished` wrote `event->status = CL_COMPLETE` and
-   released the event lock ~30 lines before decrementing `command_buffer->pending`.
-   `pocl_pthread_wait_event` tests `event->status > CL_COMPLETE` BEFORE waiting on its
-   condvar, so an app thread arriving at `clWaitForEvents` inside that window sees
-   CL_COMPLETE, never waits, and its next `clEnqueueCommandBufferKHR` finds
-   `pending != 0`. An app that blocks BEFORE completion is woken from
-   `notify_event_finished`, which runs after the retire — hence "needs host work between
-   enqueue and wait", the random iteration, and the disappearance under a tracer.
-   Confirmed by construction: spin 2000 → first failure at 6594, 20000 → 897,
-   200000 → 386; spin 0 never fails. Fix: decrement under the event lock already held,
-   before publishing the status (`command_buffer->mutex` is a leaf, so no new lock-order
-   edge); leave `clReleaseCommandBufferKHR` outside the locks.
-2. **Conformance.** `clEnqueueCommandBufferKHR` set `state = FINALIZED` to mean "in
-   flight". The spec has three states and no Pending: *Finalized* = "finalized but some
-   command has unset arguments" (mutable buffers only), *Executable* = fully specified,
-   and a buffer STAYS Executable while submissions run. So
-   `clGetCommandBufferInfoKHR(CL_COMMAND_BUFFER_STATE_KHR)` reported "an argument is
-   unset" for a correctly built running buffer. Fix: gate on `pending`, leave `state`.
-
-**claspr was not at fault.** The spec defines simultaneous use as submitting "without a
-prerequisite on all the previous submissions ... which are not in the CL_COMPLETE state"
-and names events as a way to express that prerequisite — so waiting on the completion
-event and re-enqueueing is conformant and must succeed.
-
-Verified on a clean reconfigure+build of rebased pocl: full `ctest` 317/341, with the
-24 failures **identical to the pre-fix baseline** (kernel-compiler / SPIR-V tests,
-unrelated, pre-existing on LLVM 20 + aarch64). CB tests 3/3. The new regression test
-fails without the fix and passes with it.
-
-**Rolled out 2026-09-04**: pocl 8.0-pre (rebased fix branch) installed to `~/.local`,
-PR opened as pocl/pocl#2306. `cb_bench`'s iteration cap lifted 400 -> 2000; 5000
-replays run clean. Backup of the previous install at
-`~/.local/pocl-backup-20260904-1552/`.
-
-Build-trap caught during the rollout, now in auto-memory: a CLEAN pocl reconfigure
-picks up the unversioned `/usr/lib/.../libLLVMSPIRVLib.so`, which apt repoints at the
-newest LLVM (22) regardless of `WITH_LLVM_CONFIG` (20). Two LLVM majors in one
-address space -> SIGSEGV in `llvm::FixedVectorType::get` on the first SPIR-V
-translation, and 24 pocl ctest failures that look like upstream regressions. Always
-configure with `-DLLVM_SPIRV_LIB=/usr/lib/aarch64-linux-gnu/libLLVMSPIRVLib.so.20.1`
-and `-DHOST_LLVM_SPIRV=/usr/bin/llvm-spirv-20`; verify with
-`ldd build/lib/CL/libpocl.so | grep -i llvm` showing ONE major. With the pins:
-pocl ctest 341/341.
-
----
-
-Original finding, 2026-09-04, while benching the keyed cache; **not** caused by it
-(reproduced with every runtime change reverted). Replaying ONE finalized command buffer in a `sync` loop
-returns `-59` from `clEnqueueCommandBufferKHR` at a NON-DETERMINISTIC iteration —
-observed at 841, 1023, 1173, 1605, 3462; sometimes 6000 replays pass clean. Repro:
-`tests/tier2/examples/cb_replay_limit.rs`.
-
-What is known:
-- Hits BOTH in-order and out-of-order queues, so it is not queue-ordering.
-- The FIRST graph in a process reliably survives; failures start only after a prior
-  `FinalizedCb` has been released — smells like handle reuse after
-  `clReleaseCommandBufferKHR` (cf. the PoCL release/UAF repros in `scratch/`).
-- claspr's side looks correct: `wait_deps_reconcile` does `clWaitForEvents` on the CB's
-  completion event before returning, so the buffer should be back in Executable state.
-  An API trace of the steady-state loop is clean — enqueue → wait → release event, no
-  errors, no missing dependency.
-- Disappears under cliloader (timing-sensitive), which is itself evidence of a race.
-
-Impact: caps sustained replay, which is exactly what Tier 2 is for. Worth a minimal
-C repro against PoCL upstream. `cb_bench` defaults to 400 iterations to stay clear of it.
+### Other driver quirks and coverage gaps
 
 - **Intel NEO (legacy) crashes on malformed SPIR-V** — a valid-header module with a
   scrambled instruction stream SIGSEGVs inside the driver's IL frontend, and a
@@ -572,10 +354,6 @@ C repro against PoCL upstream. `cb_bench` defaults to 400 iterations to stay cle
 - **Library-crate transitive spirv-std dependency** — pure kernel libs cfg-gate spirv-std
   imports; helpers taking device-only types can't be host-callable in that pattern.
   (CLAUDE.md gotcha.)
-- **tier1 `image_dispatch::dim3_fill_pattern_r32_uint` (+ dim2_array) fail on pocl only** —
-  NOT a pocl regression: rust-gpu emitted vec3 image coords for 3D/2D-array where the
-  OpenCL SPIR-V env spec mandates vec4. FIXED in rust-gpu codegen 2026-07-12
-  (writes now pass on all ICDs); re-verify once claspr picks up the rust-gpu bump.
 
 ---
 
@@ -583,10 +361,9 @@ C repro against PoCL upstream. `cb_bench` defaults to 400 iterations to stay cle
 
 | Commit | What |
 |---|---|
-| (this branch) | Keyed CB cache (`CbLru`) + `slot_digest`; cache device extensions (2 `clGetDeviceInfo`/sync → 0); memoize `cb_addable`/`contains_host_seam`; fix `FanOut::bind_slots` (slots in fan-out branches were unbindable). |
-| `6a33585` | Quality-review fix set: lent-buffer stranding guard, CopyTo2 CB-replay external deps, image length/dim → Result, CbBuilder pointer-arith `pub(crate)`, config-surface dedup, kernel-sig rejection. |
-| `a50af0f` | Abstraction round 2 (−743 lines): `impl_image_verbs!`, `capabilities!` table, `impl_{acquire,release}_view!`, `impl_kernel_image_arg_matrix!`. |
-| `994f6b4` | Complexity hotspot pass: `expand_kernel` (cyc 66→23), `try_bind_slot` (cog 39→7), `wait_on` decomposed. |
-| `2fb5aab` | Delete `spikes/` — design prototypes fully absorbed into the shipped suite. |
-| `f8c50b7` | R3: delete the legacy `RecordContext`/`RecordExt` record→replay path (−1454 lines); `record.rs` is now the CB toolkit only. |
-| eager split | `eager.rs` 11,023 → 3,674 lines into `eager/{cb,leaves,combinators,slots}.rs`. |
+| `02777ad` `b94809c` | `Pipe` is not `Clone` (a handle pipe moves into the one op that drains it; duplicating it is a compile error); dedicated `Error::PipeDrained`. |
+| `94e37b3` `fbe385d` | `graph!`: sequential composition as straight-line `let` bindings; llama2 attention/ffn and gray-scott meta-kernels rewritten with it. |
+| `9eac837` | `examples/llama2`: a llama2.c model built at run time from a text spec, replayed once per token, greedy output byte-identical to `run.c`. |
+| `a384727` `c62a138` | `rename` (per-use-site slot identity for reusable graphs); a pipe-fed copy operand goes home to its origin. |
+| `43605dc` `fdff0f7` | Keyed CB cache re-keyed by slot cell contents; library-provided reusable subgraphs (curry, then compose) documented and tested. |
+| `f74e66c` `a2afd59` | `and_then` erases the chain it extends; `DeviceDynOp` boxes `dyn DeviceOp` directly (no mirror trait). |
