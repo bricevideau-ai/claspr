@@ -38,13 +38,21 @@ over `alloc_uninit` buffers: byte-identical, 1 CB, no cost (151.0 vs 150.9).
 Uninitialised `MappedSlice`/`USMSlice` outputs work too. Partitions are N-D: a
 1-, 2- or 3-D grid with one work-item per element, work-item `(x, y, z)` owning
 element `x + w * (y + h * z)` (`coord()` gives the coordinates); gray-scott's 2-D
-`laplacian`/`combine` use it (frames byte-identical).
+`laplacian`/`combine` use it (frames byte-identical). miniweather's `tend_s/t`
+(`PerItemOut` + `Written`: the whole `tend` is proven rewritten each stage) and
+`update_a/b` (`PerItemIn`) run on a 3-D `[nx, nz, 4]` grid — `tend`'s plane-major
+layout IS that row-major order; bit-identical f64/f32 on PoCL + rusticl, ~4% slower
+on PoCL CPU (4x work-items; local size not the cause), GPU unmeasured. `state`
+(halo-padded), `flux` (partial coverage per direction) and the halo kernels don't
+fit a per-item partition; `tend` can't be `alloc_uninit` (halo kernels read it first
+in the caravan).
 **Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
 inside the kernel, so the positional handle is no worse than before; and the real
 user difficulty is telling which params are PIPED (every buffer-like param —
 slice, `PerItem*` view, scalar-by-ref, image — in signature order; by-value
-scalars are not), which names don't address. Cheap option if it bites: the macro
-generates a "Handle: `(…)`" line in the launcher's rustdoc (IDE hover).
+scalars are not), which names don't address. Instead every launcher (and the
+instantiate trait method) carries a generated rustdoc line naming its handle and
+its non-piped by-value scalars (IDE hover).
 
 ### Decisions — assessed & DECLINED (kept so future sessions don't re-litigate)
 

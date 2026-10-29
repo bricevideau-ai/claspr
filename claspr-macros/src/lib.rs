@@ -1315,6 +1315,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // this function keeps only the fallible parse/classify half. `KernelParts` is
     // a passive carrier (no methods) — the emission still reads each field by name.
     let parts = KernelParts {
+        handle_doc: handle_doc(func)?,
         host_names,
         op_field_init,
         input_resolve_eager,
@@ -1342,11 +1343,47 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     Ok(emit_kernel_launch(func, args, parts))
 }
 
+/// The rustdoc line every launcher carries: which args the handle (what
+/// `.and_then` / `.wait()` hand back) holds, in signature order — every
+/// buffer-like param (slice, `PerItem*`, scalar-by-ref, image) — and which
+/// by-value scalars are consumed without being piped.
+fn handle_doc(func: &ItemFn) -> syn::Result<String> {
+    let mut piped = Vec::new();
+    let mut scalars = Vec::new();
+    for arg in &func.sig.inputs {
+        let syn::FnArg::Typed(pt) = arg else { continue };
+        match classify_param(pt)? {
+            ParamRole::Builtin => {}
+            ParamRole::Slice { name, .. }
+            | ParamRole::ScalarRef { name, .. }
+            | ParamRole::Image { name, .. } => piped.push(name.to_string()),
+            ParamRole::Scalar { name, .. } => scalars.push(name.to_string()),
+        }
+    }
+    let handle = match piped.len() {
+        0 => "`()` (no buffer args)".to_string(),
+        1 => format!("`{}` (a single pipe, not a tuple)", piped[0]),
+        _ => format!("`({})`", piped.join(", ")),
+    };
+    let mut doc = format!(
+        "Handle (what `.and_then` receives, `.wait()` returns): {handle} — buffer args in signature order."
+    );
+    if !scalars.is_empty() {
+        let list: Vec<String> = scalars.iter().map(|n| format!("`{n}`")).collect();
+        doc.push_str(&format!(
+            " Not piped (by-value scalars): {}.",
+            list.join(", ")
+        ));
+    }
+    Ok(doc)
+}
+
 /// Passive carrier for the 20 per-parameter accumulators the `#[kernel]` param
 /// loop collects, handed from [`expand_kernel`] to [`emit_kernel_launch`] across
 /// the producer/consumer seam. A dumb struct — no methods; the emission reads each
 /// field by name exactly as it read the former locals.
 struct KernelParts {
+    handle_doc: String,
     host_names: Vec<TokenStream2>,
     op_field_init: Vec<TokenStream2>,
     input_resolve_eager: Vec<TokenStream2>,
@@ -1381,6 +1418,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
     let vis = &func.vis;
     let name = &func.sig.ident;
     let KernelParts {
+        handle_doc,
         host_names,
         op_field_init,
         input_resolve_eager,
@@ -2361,6 +2399,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
     // choice, so a per-call `#[allow]` would burden every user.
     quote! {
         impl #kernels_path {
+            #[doc = #handle_doc]
             #[allow(clippy::too_many_arguments)]
             #vis fn #name #method_gen_decl (
                 &self,
@@ -3075,7 +3114,10 @@ fn instantiate_trait_methods(
                 >
             }
         };
-        let doc = format!("Width-generic form of the `{name}` launcher.");
+        let doc = format!(
+            "Width-generic form of the `{name}` launcher.\n\n{}",
+            handle_doc(func)?
+        );
         let sig = quote! {
             fn #name< #(#gens),* >(
                 &self,

@@ -261,65 +261,38 @@ pub mod gpu {
         }
     }
 
+    /// One `tend` element — variable `ll` at interior cell `(i, k)`: the flux
+    /// divergence along `dir`, plus gravity on WMOM for z.
     #[allow(clippy::too_many_arguments)]
-    fn tend_body(
+    fn tend_at(
         flux: &[Real],
-        tend: &mut [Real],
         f: &[Real],
-        gid: usize,
+        i: usize,
+        k: usize,
+        ll: usize,
         nx: usize,
         nz: usize,
         dir: u32,
         dx: Real,
         dz: Real,
-    ) {
-        if gid >= nx * nz {
-            return;
-        }
-        let i = gid % nx;
-        let k = gid / nx;
-        let nxp = nx + 2 * HS;
-        let fplane = (nz + 1) * (nx + 1);
-        let mut ll = 0usize;
-        while ll < 4 {
-            let o = ll * nz * nx + k * nx + i;
-            if dir == 0 {
-                let fb = ll * fplane + k * (nx + 1) + i;
-                tend[o] = -(flux[fb + 1] - flux[fb]) / dx;
-            } else {
-                let fb = ll * fplane + k * (nx + 1) + i;
-                let mut v = -(flux[fb + (nx + 1)] - flux[fb]) / dz;
-                if ll == 2 {
-                    v -= f[(k + HS) * nxp + (i + HS)] * GRAV;
-                }
-                tend[o] = v;
+    ) -> Real {
+        let fb = ll * (nz + 1) * (nx + 1) + k * (nx + 1) + i;
+        if dir == 0 {
+            -(flux[fb + 1] - flux[fb]) / dx
+        } else {
+            let mut v = -(flux[fb + (nx + 1)] - flux[fb]) / dz;
+            if ll == 2 {
+                v -= f[(k + HS) * (nx + 2 * HS) + (i + HS)] * GRAV;
             }
-            ll += 1;
+            v
         }
     }
 
-    fn update_from_body(
-        dst: &mut [Real],
-        src: &[Real],
-        tend: &[Real],
-        gid: usize,
-        nx: usize,
-        nz: usize,
-        dt: Real,
-    ) {
-        if gid >= nx * nz {
-            return;
-        }
-        let i = gid % nx;
-        let k = gid / nx;
+    /// Index into a halo-padded state array of the interior cell a
+    /// `[nx, nz, 4]` work-item `c` owns (`c.z` is the variable plane).
+    fn interior(c: USizeVec3, nx: usize, nz: usize) -> usize {
         let nxp = nx + 2 * HS;
-        let plane = (nz + 2 * HS) * nxp;
-        let mut ll = 0usize;
-        while ll < 4 {
-            let c = ll * plane + (k + HS) * nxp + (i + HS);
-            dst[c] = src[c] + dt * tend[ll * nz * nx + k * nx + i];
-            ll += 1;
-        }
+        c.z * (nz + 2 * HS) * nxp + (c.y + HS) * nxp + (c.x + HS)
     }
 
     // ── entry points: caravan order is fixed across all kernels ─────────────
@@ -450,103 +423,102 @@ pub mod gpu {
         );
     }
 
+    // The tend stage writes ALL of `tend` (4 planes of nz x nx, row-major in
+    // exactly the `[nx, nz, 4]` grid order) — one work-item per element, and
+    // `-> Written` proves no element is left stale from the previous stage.
     #[claspr::kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn tend_s(
-        #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] state: &[Real],
         #[spirv(cross_workgroup)] _state_tmp: &[Real],
         #[spirv(cross_workgroup)] flux: &[Real],
-        #[spirv(cross_workgroup)] tend: &mut [Real],
+        #[spirv(cross_workgroup)] tend: PerItemOut<Real>,
         nx: u32,
         nz: u32,
         dir: u32,
         dx: Real,
         dz: Real,
-    ) {
-        tend_body(
+    ) -> Written {
+        let c = tend.coord();
+        let v = tend_at(
             flux,
-            tend,
             state,
-            id.x,
+            c.x,
+            c.y,
+            c.z,
             nx as usize,
             nz as usize,
             dir,
             dx,
             dz,
         );
+        Written {
+            tend: tend.write(v),
+        }
     }
 
     #[claspr::kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn tend_t(
-        #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] _state: &[Real],
         #[spirv(cross_workgroup)] state_tmp: &[Real],
         #[spirv(cross_workgroup)] flux: &[Real],
-        #[spirv(cross_workgroup)] tend: &mut [Real],
+        #[spirv(cross_workgroup)] tend: PerItemOut<Real>,
         nx: u32,
         nz: u32,
         dir: u32,
         dx: Real,
         dz: Real,
-    ) {
-        tend_body(
+    ) -> Written {
+        let c = tend.coord();
+        let v = tend_at(
             flux,
-            tend,
             state_tmp,
-            id.x,
+            c.x,
+            c.y,
+            c.z,
             nx as usize,
             nz as usize,
             dir,
             dx,
             dz,
         );
+        Written {
+            tend: tend.write(v),
+        }
     }
 
-    /// stages 1 & 2: state_tmp = state + dt * tend
+    /// stages 1 & 2: state_tmp = state + dt * tend, one work-item per `tend`
+    /// element on the `[nx, nz, 4]` grid.
     #[claspr::kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn update_a(
-        #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] state: &[Real],
         #[spirv(cross_workgroup)] state_tmp: &mut [Real],
         #[spirv(cross_workgroup)] _flux: &[Real],
-        #[spirv(cross_workgroup)] tend: &[Real],
+        #[spirv(cross_workgroup)] tend: PerItemIn<Real>,
         nx: u32,
         nz: u32,
         dt: Real,
     ) {
-        update_from_body(state_tmp, state, tend, id.x, nx as usize, nz as usize, dt);
+        let c = interior(tend.coord(), nx as usize, nz as usize);
+        state_tmp[c] = state[c] + dt * *tend;
     }
 
     /// stage 3: state = state + dt * tend (in place)
     #[claspr::kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn update_b(
-        #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] state: &mut [Real],
         #[spirv(cross_workgroup)] _state_tmp: &[Real],
         #[spirv(cross_workgroup)] _flux: &[Real],
-        #[spirv(cross_workgroup)] tend: &[Real],
+        #[spirv(cross_workgroup)] tend: PerItemIn<Real>,
         nx: u32,
         nz: u32,
         dt: Real,
     ) {
-        if id.x >= (nx as usize) * (nz as usize) {
-            return;
-        }
-        let (nx, nz) = (nx as usize, nz as usize);
-        let i = id.x % nx;
-        let k = id.x / nx;
-        let nxp = nx + 2 * HS;
-        let plane = (nz + 2 * HS) * nxp;
-        let mut ll = 0usize;
-        while ll < 4 {
-            let c = ll * plane + (k + HS) * nxp + (i + HS);
-            state[c] = state[c] + dt * tend[ll * nz * nx + k * nx + i];
-            ll += 1;
-        }
+        let c = interior(tend.coord(), nx as usize, nz as usize);
+        state[c] = state[c] + dt * *tend;
     }
 }
 
@@ -871,7 +843,9 @@ where
     };
     let dz_t = Real::of(dzf);
     let dx_t = Real::of(dx);
-    let gt = LaunchSpec::from([nx * nz]);
+    // tend/update grid: one work-item per `tend` element (the per-item views'
+    // launch check enforces nx * nz * 4 == td.len()).
+    let gt = LaunchSpec::from([nx, nz, 4]);
     let ks = &ks;
 
     // One graph = one DOUBLE timestep: step 1 is x-first (halves
