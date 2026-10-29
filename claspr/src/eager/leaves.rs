@@ -2782,12 +2782,12 @@ where
         let src_pipe = self.src_pipe.clone();
         let dst_pipe = self.dst_pipe.clone();
         self.execute(ec, mode)?;
-        let (out_src, mut deps) = src_pipe.take().ok_or(Error::NotSupported(
-            "eager graph: terminal copy produced no output",
-        ))?;
-        let (out_dst, dst_deps) = dst_pipe.take().ok_or(Error::NotSupported(
-            "eager graph: terminal copy produced no output",
-        ))?;
+        let (out_src, mut deps) = src_pipe
+            .take()
+            .ok_or(Error::PipeDrained("a copy's output pipe"))?;
+        let (out_dst, dst_deps) = dst_pipe
+            .take()
+            .ok_or(Error::PipeDrained("a copy's output pipe"))?;
         deps.extend(dst_deps);
         Ok(((out_src, out_dst), deps))
     }
@@ -2821,12 +2821,12 @@ where
         let src_pipe = self.src_pipe.clone();
         let dst_pipe = self.dst_pipe.clone();
         self.execute(ec, mode)?;
-        let (out_src, mut deps, src_home) = src_pipe.take_home().ok_or(Error::NotSupported(
-            "eager graph: terminal copy produced no output",
-        ))?;
-        let (out_dst, dst_deps, dst_home) = dst_pipe.take_home().ok_or(Error::NotSupported(
-            "eager graph: terminal copy produced no output",
-        ))?;
+        let (out_src, mut deps, src_home) = src_pipe
+            .take_home()
+            .ok_or(Error::PipeDrained("a copy's output pipe"))?;
+        let (out_dst, dst_deps, dst_home) = dst_pipe
+            .take_home()
+            .ok_or(Error::PipeDrained("a copy's output pipe"))?;
         deps.extend(dst_deps);
         Ok((
             (

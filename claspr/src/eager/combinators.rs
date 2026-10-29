@@ -1212,9 +1212,9 @@ where
         let mut all_deps: Deps = Deps::new();
         let mut vals: Vec<S::Output> = Vec::with_capacity(N);
         for p in &outs {
-            let (v, d) = p.take().ok_or(Error::NotSupported(
-                "eager arc_split: a branch produced no output",
-            ))?;
+            let (v, d) = p
+                .take()
+                .ok_or(Error::PipeDrained("an arc_split branch's output pipe"))?;
             vals.push(v);
             all_deps.extend(d);
         }
@@ -1251,9 +1251,9 @@ where
         let mut all_deps: Deps = Deps::new();
         let mut cos: Vec<Checkout<S::Output>> = Vec::with_capacity(N);
         for p in &outs {
-            let (v, d, home) = p.take_home().ok_or(Error::NotSupported(
-                "eager arc_split: a branch produced no output",
-            ))?;
+            let (v, d, home) = p
+                .take_home()
+                .ok_or(Error::PipeDrained("an arc_split branch's output pipe"))?;
             cos.push(Checkout::new(v, home));
             all_deps.extend(d);
         }

@@ -1134,10 +1134,9 @@ impl<T> Input<T> {
             if let SlotState::FedByPipe(pipe) = &*guard {
                 let pipe = pipe.clone();
                 drop(guard);
-                return pipe.take_home().ok_or(Error::NotSupported(
-                    "eager graph: upstream pipe for a FedByPipe slot was not filled \
-                     before downstream ran — internal ordering bug",
-                ));
+                return pipe
+                    .take_home()
+                    .ok_or(Error::PipeDrained("the upstream pipe feeding a slot"));
             }
         }
         // `Bound(v) → Lent`, take `v`; anything else (Unbound / Severed / already
@@ -1222,10 +1221,9 @@ impl<T> Input<T> {
             // means a previous run's `Checkout` still holds the buffer (busy).
             // Both surface as `SlotUnbound` (its message covers the two).
             Input::Slot { name, cell, .. } => Self::lend_slot(cell, ec, name),
-            Input::Pipe(p) => p.take_home().ok_or(Error::NotSupported(
-                "eager graph: upstream pipe was not filled before downstream ran \
-                 — internal ordering bug",
-            )),
+            Input::Pipe(p) => p
+                .take_home()
+                .ok_or(Error::PipeDrained("an op's input pipe")),
         }
     }
 
@@ -1717,8 +1715,7 @@ pub trait DeviceOp: Send {
             .output_pipe()
             .expect("single-output op must have an output pipe (multi-output overrides collect)");
         self.execute(ec, mode)?;
-        out.take()
-            .ok_or(Error::NotSupported("eager graph: op produced no output"))
+        out.take().ok_or(Error::PipeDrained("an op's output pipe"))
     }
 
     /// Home-preserving analog of [`collect`](Self::collect): run this op as a
@@ -1761,7 +1758,7 @@ pub trait DeviceOp: Send {
         );
         self.execute(ec, mode)?;
         out.take_home()
-            .ok_or(Error::NotSupported("eager graph: op produced no output"))
+            .ok_or(Error::PipeDrained("an op's output pipe"))
     }
 
     /// Run this op as the **chain terminal** and build its
@@ -1794,7 +1791,7 @@ pub trait DeviceOp: Send {
         self.execute(ec, mode)?;
         let (value, deps, home) = out
             .take_home()
-            .ok_or(Error::NotSupported("eager graph: op produced no output"))?;
+            .ok_or(Error::PipeDrained("an op's output pipe"))?;
         Ok((
             <CheckoutsOf<Self>>::from_single(Checkout::new(value, home)),
             deps,
@@ -3644,12 +3641,12 @@ impl<O: Send + 'static> SeamScatter for Checkout<O> {
     fn reconstruct(handle: &Pipe<O>) -> Result<(O, Deps)> {
         handle
             .take()
-            .ok_or(Error::NotSupported("eager graph: seam produced no output"))
+            .ok_or(Error::PipeDrained("a host seam's output pipe"))
     }
     fn reconstruct_home(handle: &Pipe<O>) -> Result<(O, Deps, Option<BoxedHome<O>>)> {
         handle
             .take_home()
-            .ok_or(Error::NotSupported("eager graph: seam produced no output"))
+            .ok_or(Error::PipeDrained("a host seam's output pipe"))
     }
 }
 

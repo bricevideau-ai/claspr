@@ -1100,12 +1100,12 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         let src_pipe = self.src_pipe.clone();
         let dst_pipe = self.dst_pipe.clone();
         self.execute(ec, mode)?;
-        let (src, src_deps) = src_pipe.take().ok_or(Error::NotSupported(
-            "eager graph: image copy produced no src",
-        ))?;
-        let (dst, mut deps) = dst_pipe.take().ok_or(Error::NotSupported(
-            "eager graph: image copy produced no dst",
-        ))?;
+        let (src, src_deps) = src_pipe
+            .take()
+            .ok_or(Error::PipeDrained("an image copy's src pipe"))?;
+        let (dst, mut deps) = dst_pipe
+            .take()
+            .ok_or(Error::PipeDrained("an image copy's dst pipe"))?;
         deps.extend(src_deps);
         Ok(((src, dst), deps))
     }
@@ -1120,12 +1120,12 @@ impl<Src: ImageEnqueue, Dst: ImageEnqueue> DeviceOp for ImageCopy<Src, Dst> {
         let src_pipe = self.src_pipe.clone();
         let dst_pipe = self.dst_pipe.clone();
         self.execute(ec, mode)?;
-        let (src, src_deps, src_home) = src_pipe.take_home().ok_or(Error::NotSupported(
-            "eager graph: image copy produced no src",
-        ))?;
-        let (dst, mut deps, dst_home) = dst_pipe.take_home().ok_or(Error::NotSupported(
-            "eager graph: image copy produced no dst",
-        ))?;
+        let (src, src_deps, src_home) = src_pipe
+            .take_home()
+            .ok_or(Error::PipeDrained("an image copy's src pipe"))?;
+        let (dst, mut deps, dst_home) = dst_pipe
+            .take_home()
+            .ok_or(Error::PipeDrained("an image copy's dst pipe"))?;
         deps.extend(src_deps);
         Ok((
             (

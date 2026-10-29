@@ -26,6 +26,13 @@ pub enum Error {
     LengthMismatch { src: usize, dst: usize },
     /// The selected device or runtime doesn't support a requested feature.
     NotSupported(&'static str),
+    /// A graph edge ([`Pipe`](crate::Pipe)) was empty when it was drained — its
+    /// value had already been taken. Ordering guarantees the producer ran
+    /// first, so the cause is the same pipe consumed twice: a handle pipe
+    /// `.clone()`d and passed to two ops. One value read by several ops is
+    /// shared with [`arc`](crate::DeviceOpExt::arc) /
+    /// [`arc_split`](crate::eager::arc_split) instead. Carries which pipe.
+    PipeDrained(&'static str),
     /// No OpenCL device was found on any platform — usually an
     /// environment problem (no ICD installed, or `OCL_ICD_VENDORS`
     /// pointing at the wrong directory), not a claspr one. The most
@@ -112,6 +119,12 @@ impl fmt::Display for Error {
                 write!(f, "length mismatch: src has {src} elements, dst has {dst}")
             }
             Error::NotSupported(what) => write!(f, "not supported on this device: {what}"),
+            Error::PipeDrained(which) => write!(
+                f,
+                "eager graph: {which} was already drained — the same pipe was consumed \
+                 twice (a handle pipe `.clone()`d into two ops?); share one value between \
+                 readers with `.arc()` / `arc_split`"
+            ),
             Error::NoDevices => f.write_str(
                 "no OpenCL devices found on any platform — is an OpenCL runtime (ICD) \
                  installed? Check `clinfo`; if you select a runtime via OCL_ICD_VENDORS, \
