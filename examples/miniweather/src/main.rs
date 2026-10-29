@@ -46,7 +46,7 @@
 //! BIT-IDENTICAL. Full runs:
 //! `cargo run -p miniweather-example -- --nx 400 --nz 200 --sim-time 400`.
 
-use claspr::eager::{DeviceOp, DeviceOpExt};
+use claspr::eager::{DeviceOp, DeviceOpExt, bundle4, lift};
 use claspr::{Context, DeviceSlice, LaunchSpec, slot, slots};
 
 // ── Physical + scheme constants (host, f64) ─────────────────────────────────
@@ -884,9 +884,11 @@ where
     let gf_z = LaunchSpec::from([nx * (nz + 1)]);
 
     // Twelve dispatches of one half-step (3 RK stages x 4 kernels),
-    // appended to an existing chain. The four mutable buffers ride the pipes; the hy arrays enter as
-    // Arc clones per site. Free identifiers (ks, gt, hd, ...) resolve
-    // at the expansion site.
+    // appended to a chain whose output is the four mutable buffers `(s, t, fx,
+    // td)` — they ride the pipes; the hy arrays enter as Arc clones per site.
+    // The first half is appended to `seed()`, which presents the owned buffers
+    // as such a chain. Free identifiers (ks, gt, hd, ...) resolve at the
+    // expansion site.
     // rustfmt oscillates on the parameter continuation line of a
     // macro_rules! nested this deep (adds indentation every pass)
     // — freeze it.
@@ -1017,57 +1019,10 @@ where
             };
         }
 
-    // The SEED half: identical to `half!` except it consumes the OWNED buffers
-    // instead of picking them off an upstream chain's pipes. Same parameters, so
-    // both graph shapes below (unrolled double-step, non-unrolled per-timestep)
-    // are built from the same two macros and cannot drift apart.
-    #[rustfmt::skip]
-        macro_rules! seed_half {
-            ($s:expr, $t:expr, $fx:expr, $td:expr, $gh:expr, $gf:expr, $d:expr,
-                                     $hv1:ident, $hv2:ident, $hv3:ident,
-                                     $dta:ident, $dtb:ident, $dtc:ident) => {
-                ks.halo_s($gh, $s, $t, $fx, $td, hd.clone(), hdt.clone(),
-                          nxu, nzu, $d, inj, dz_t)
-                .and_then(move |(s, t, fx, td, _hd, _hdt)| {
-                    ks.flux_s($gf, s, t, fx, td, hd.clone(), hdt.clone(), hdi.clone(),
-                              hdti.clone(), hpi.clone(), nxu, nzu, $d, slot!($hv1<Real>))
-                })
-                .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
-                    ks.tend_s(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
-                })
-                .and_then(move |(s, t, fx, td)| {
-                    ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dta<Real>))
-                })
-                .and_then(move |(s, t, fx, td)| {
-                    ks.halo_t($gh, s, t, fx, td, hd.clone(), hdt.clone(),
-                              nxu, nzu, $d, inj, dz_t)
-                })
-                .and_then(move |(s, t, fx, td, _hd, _hdt)| {
-                    ks.flux_t($gf, s, t, fx, td, hd.clone(), hdt.clone(), hdi.clone(),
-                              hdti.clone(), hpi.clone(), nxu, nzu, $d, slot!($hv2<Real>))
-                })
-                .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
-                    ks.tend_t(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
-                })
-                .and_then(move |(s, t, fx, td)| {
-                    ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dtb<Real>))
-                })
-                .and_then(move |(s, t, fx, td)| {
-                    ks.halo_t($gh, s, t, fx, td, hd.clone(), hdt.clone(),
-                              nxu, nzu, $d, inj, dz_t)
-                })
-                .and_then(move |(s, t, fx, td, _hd, _hdt)| {
-                    ks.flux_t($gf, s, t, fx, td, hd.clone(), hdt.clone(), hdi.clone(),
-                              hdti.clone(), hpi.clone(), nxu, nzu, $d, slot!($hv3<Real>))
-                })
-                .and_then(move |(s, t, fx, td, _h1, _h2, _h3, _h4, _h5)| {
-                    ks.tend_t(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
-                })
-                .and_then(move |(s, t, fx, td)| {
-                    ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!($dtc<Real>))
-                })
-            };
-        }
+    // The chain's starting point: the four owned buffers as graph edges (`lift`
+    // presents an owned buffer as a self-rehoming input, no device work), so
+    // every half — the first included — is appended with `half!`.
+    let seed = move || bundle4(lift(s), lift(t), lift(fx), lift(td));
 
     // hv(d, stage, dt) with the dt = 0 no-op convention
     let hv = |d: f64, q: f64, dt: f64| -> Real {
@@ -1145,33 +1100,12 @@ where
             // ── Graph A: the UNROLLED double timestep (x-first step, then z-first). ──
             // Directions and extents are literals, so a steady-state replay mutates
             // nothing at all. Two timesteps per sync.
-            let g0 = seed_half!(
-                s, t, fx, td, gh_x, gf_x, 0u32, H1A1, H1A2, H1A3, Dt1A, Dt1B, Dt1C
-            );
+            let g0 = half!(seed(), gh_x, gf_x, 0u32, H1A1, H1A2, H1A3, Dt1A, Dt1B, Dt1C);
             let g1 = half!(g0, gh_z, gf_z, 1u32, H1B1, H1B2, H1B3, Dt1A, Dt1B, Dt1C);
             let g2 = half!(g1, gh_z, gf_z, 1u32, H2A1, H2A2, H2A3, Dt2A, Dt2B, Dt2C);
             let g = half!(g2, gh_x, gf_x, 0u32, H2B1, H2B2, H2B3, Dt2A, Dt2B, Dt2C);
 
-            let b = bind_all(dt0, dt0);
-            let g = g
-                .bind(b.0)
-                .bind(b.1)
-                .bind(b.2)
-                .bind(b.3)
-                .bind(b.4)
-                .bind(b.5)
-                .bind(b.6)
-                .bind(b.7)
-                .bind(b.8)
-                .bind(b.9)
-                .bind(b.10)
-                .bind(b.11)
-                .bind(b.12)
-                .bind(b.13)
-                .bind(b.14)
-                .bind(b.15)
-                .bind(b.16)
-                .bind(b.17);
+            let g = g.call(bind_all(dt0, dt0));
 
             let t_unrolled = std::time::Instant::now();
             let mut etime = 0.0f64;
@@ -1197,12 +1131,8 @@ where
                     0.0
                 };
                 if (dt1, dt2) != bound {
-                    let b = bind_all(dt1, dt2);
-                    g.mutate_call((b.0, b.1, b.2, b.3))?;
-                    g.mutate_call((b.4, b.5, b.6, b.7))?;
-                    g.mutate_call((b.8, b.9, b.10, b.11))?;
-                    g.mutate_call((b.12, b.13, b.14, b.15))?;
-                    g.mutate_call((b.16, b.17))?;
+                    // One call: the rebind is all-or-nothing.
+                    g.mutate_call(bind_all(dt1, dt2))?;
                     bound = (dt1, dt2);
                 }
                 if dt2 != 0.0 {
@@ -1213,8 +1143,7 @@ where
                 nstep += if dt2 != 0.0 { 2 } else { 1 };
                 if etime >= cfg.sim_time {
                     let (cs, _ct, _cfx, _ctd) = co;
-                    let view = (*cs).map().wait()?;
-                    final_state.copy_from_slice(&view);
+                    cs.read_into(&mut final_state)?;
                 }
             }
             let secs_unrolled = t_unrolled.elapsed().as_secs_f64();
@@ -1230,11 +1159,8 @@ where
             // expressed as a rebind instead of as unrolled code. Two binding states,
             // both resident in the keyed command-buffer cache, so the steady state
             // records nothing (see NOTES, "keyed LRU").
-            let p0 = seed_half!(
-                s,
-                t,
-                fx,
-                td,
+            let p0 = half!(
+                seed(),
                 slot!(PgA),
                 slot!(PfA),
                 slot!(PdA),
@@ -1258,23 +1184,7 @@ where
                 PtC
             );
 
-            let p = bind_per(true, dt0);
-            let gp = gp
-                .bind(p.0)
-                .bind(p.1)
-                .bind(p.2)
-                .bind(p.3)
-                .bind(p.4)
-                .bind(p.5)
-                .bind(p.6)
-                .bind(p.7)
-                .bind(p.8)
-                .bind(p.9)
-                .bind(p.10)
-                .bind(p.11)
-                .bind(p.12)
-                .bind(p.13)
-                .bind(p.14);
+            let gp = gp.call(bind_per(true, dt0));
 
             // ── Graph B loop: one sync per timestep, exactly the reference's loop. ───
             //   do while (etime < sim_time)
@@ -1292,11 +1202,7 @@ where
                     dt_p = cfg.sim_time - etime_p;
                 }
                 if (first_is_x, dt_p) != bound_p {
-                    let p = bind_per(first_is_x, dt_p);
-                    gp.mutate_call((p.0, p.1, p.2, p.3))?;
-                    gp.mutate_call((p.4, p.5, p.6, p.7))?;
-                    gp.mutate_call((p.8, p.9, p.10, p.11))?;
-                    gp.mutate_call((p.12, p.13, p.14))?;
+                    gp.mutate_call(bind_per(first_is_x, dt_p))?;
                     bound_p = (first_is_x, dt_p);
                 }
                 let co = gp.sync(ctx)?;
@@ -1305,8 +1211,7 @@ where
                 first_is_x = !first_is_x;
                 if etime_p >= cfg.sim_time {
                     let (cs, _ct, _cfx, _ctd) = co;
-                    let view = (*cs).map().wait()?;
-                    final_p.copy_from_slice(&view);
+                    cs.read_into(&mut final_p)?;
                 }
             }
             let secs_per_step = t_per_step.elapsed().as_secs_f64();
