@@ -14,6 +14,27 @@ Nothing in flight on `main` as of 2026-10-29. Parked, deliberately unmerged:
 branch `typed-slot-sets` (compile-time slot sets, see the DECLINED entry below).
 Recent work is in the landings table at the end.
 
+### Partitioned kernel args — prototype on branch `partitioned-args` (2026-10-29)
+
+Inspired by arXiv 2608.13759 ("GPU Offload in Rust", partitioned views). A kernel
+param `PerItem<T>` hands each work-item ITS element (`*out = v`, `out.index()`);
+claspr-build lowers it to `&mut [T]` + a per-item view (adding a global id if
+none), and the host checks at every launch that the grid is 1-D and exactly the
+buffer's length (`Error::GridMismatch`, lent inputs returned → retryable). llama2's
+7 per-element kernels use it: byte-identical, no device cost (148.6 vs 148.1 tok/s).
+`PerItemOut<T>` is the write-only form (lowered to `&mut [MaybeUninit<T>]`); via
+`KernelSliceWriteArg` it accepts a `DeviceSliceUninit` and outputs the initialised
+`DeviceSlice` (home adapter forgets init on return), incl. `DeviceScratch` memory —
+the safe version of the documented "kernel-write-only + assume_init" pattern.
+**OPEN — soundness of `PerItemOut`:** the grid check gives each element exactly one
+writer and the view forbids reads, but nothing forces the writer to WRITE (an early
+`return`, cf. llama2's `att_scores` for `t > pos`), yet the buffer comes back
+initialised: garbage for numeric `T`, UB for invalid-bit-pattern `T`. Real fix: make
+the write structural — the kernel body yields the element as a value (`-> T` or an
+`#[out]` marker) and the generated wrapper stores it, so Rust forces every path to
+produce one. Weaker fallback: bound `T` to any-bit-pattern types. Also not done:
+`MappedSliceUninit`/`USMSliceUninit` (SVM arg setting), 2-D partitions.
+
 ### Decisions — assessed & DECLINED (kept so future sessions don't re-litigate)
 
 - **`meta_kernel!` macro** (#241) — DECLINED. A repo-wide scan found `cg`'s

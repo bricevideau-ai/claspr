@@ -619,6 +619,31 @@ pub fn rehome_consumed<T>(buf: T, home: Option<BoxedHome<T>>) {
 /// Only call it once the run is fully enqueued (the terminals do; the CB
 /// fallbacks drain pipes a discarded build left with EMPTY deps). Reached
 /// through [`Pipe::reclaim`].
+/// The home of a `PerItemOut` argument's OUTPUT: the launch turned the lent
+/// buffer `D` into its initialised form `D::Init`, so returning it to the
+/// origin cell converts back (forgetting initialisation — always safe).
+/// Emitted by the `#[kernel]` macro. Not API.
+#[doc(hidden)]
+pub fn __claspr_init_home<D, T>(home: BoxedHome<D>) -> BoxedHome<D::Init>
+where
+    D: crate::KernelSliceWriteArg<T>,
+    T: 'static,
+{
+    struct InitHome<D, T>(BoxedHome<D>, PhantomData<fn() -> T>);
+    impl<D: crate::KernelSliceWriteArg<T>, T: 'static> Rehome<D::Init> for InitHome<D, T> {
+        fn rehome(self: Box<Self>, value: D::Init) {
+            self.0.rehome(D::__claspr_forget_init(value));
+        }
+        fn sever(self: Box<Self>) {
+            self.0.sever();
+        }
+        fn home_cell_id(&self) -> Option<usize> {
+            self.0.home_cell_id()
+        }
+    }
+    Box::new(InitHome::<D, T>(home, PhantomData))
+}
+
 /// [`rehome_undelivered`] for the code the `#[kernel]` macro emits: return a
 /// buffer an op lent for a launch that is then abandoned (a failed pre-enqueue
 /// check), so the graph stays retryable. Not API.

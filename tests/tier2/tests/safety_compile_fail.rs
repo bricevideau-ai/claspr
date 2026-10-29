@@ -35,6 +35,9 @@
 //! - `graph_macro_pipe_used_twice` — `graph!` expands to nested `and_then`
 //!   closures, so a pipe bound by one step and used by the next can't be used
 //!   again by a later step (use-after-move), exactly as when written by hand.
+//! - `uninit_to_read_arg` — an uninitialised buffer is accepted only by a
+//!   write-only `PerItemOut<T>` parameter; passing it to a parameter the kernel
+//!   may read (`&[T]`) is rejected.
 //! - `pipe_not_clone` — `Pipe` is not `Clone`: a handle pipe can't be
 //!   duplicated to feed one value to two consumers (share it with
 //!   `.arc()` / `arc_split`).

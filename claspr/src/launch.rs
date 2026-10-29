@@ -324,6 +324,100 @@ impl<
 {
 }
 
+// ── KernelSliceWriteArg — the write-only `PerItemOut<T>` kernel-arg bound ──
+
+mod kernel_slice_write_arg_sealed {
+    pub trait Sealed<T> {}
+}
+
+/// A buffer a kernel can take as a write-only `PerItemOut<T>` argument: an
+/// initialised writable buffer, or an UNINITIALISED one
+/// ([`DeviceSliceUninit`](crate::DeviceSliceUninit)) that the launch
+/// initialises, handing back [`Init`](Self::Init). What is guaranteed: the
+/// launch checks the grid gives every element exactly one work-item, and that
+/// work-item's view can only write it (never read it).
+///
+/// **PROTOTYPE — not yet sound in general:** nothing forces the work-item to
+/// actually write (a kernel that returns early leaves its element unwritten),
+/// yet the buffer comes back as initialised. Harmless garbage for numeric `T`;
+/// undefined behaviour for `T` with invalid bit patterns. Closing it needs the
+/// write to be structural — the kernel body producing the element as a value
+/// (see NOTES).
+pub trait KernelSliceWriteArg<T>:
+    KernelArg + Send + 'static + kernel_slice_write_arg_sealed::Sealed<T>
+{
+    /// The buffer once every element has been written — an ordinary writable
+    /// slice from then on.
+    type Init: KernelSliceReadWriteArg<T>;
+    /// Number of elements (what the grid must cover).
+    fn element_count(&self) -> usize;
+    /// The recording handle, as [`KernelSliceReadArg::record_handle`].
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle>;
+    /// After a launch that wrote every element. Not API.
+    #[doc(hidden)]
+    fn __claspr_into_init(self) -> Self::Init;
+    /// Back to `Self` to return a value to its origin cell (forgetting
+    /// initialisation is always safe: a replay rewrites every element). Not API.
+    #[doc(hidden)]
+    fn __claspr_forget_init(init: Self::Init) -> Self;
+}
+
+impl<T, B: KernelSliceReadWriteArg<T>> kernel_slice_write_arg_sealed::Sealed<T> for B {}
+impl<T, B: KernelSliceReadWriteArg<T>> KernelSliceWriteArg<T> for B {
+    type Init = B;
+    fn element_count(&self) -> usize {
+        KernelSliceReadArg::element_count(self)
+    }
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
+        KernelSliceReadArg::record_handle(self)
+    }
+    fn __claspr_into_init(self) -> B {
+        self
+    }
+    fn __claspr_forget_init(init: B) -> B {
+        init
+    }
+}
+
+impl<T, M: crate::access::MemMode> KernelArg for crate::DeviceSliceUninit<T, M> {
+    fn set(&self, exec: &mut ExecuteKernel<'_>) {
+        // Same (cl_mem, length) pair as the initialised slice: the kernel side
+        // is a `&mut [MaybeUninit<T>]`.
+        self.as_raw().set(exec);
+    }
+}
+
+impl<T: Send + 'static, M: crate::access::MemMode> kernel_slice_write_arg_sealed::Sealed<T>
+    for crate::DeviceSliceUninit<T, M>
+{
+}
+impl<
+    T: Send + 'static,
+    M: crate::access::MemMode + crate::access::KernelReadable + crate::access::KernelWritable,
+> KernelSliceWriteArg<T> for crate::DeviceSliceUninit<T, M>
+{
+    type Init = DeviceSlice<T, M>;
+    fn element_count(&self) -> usize {
+        crate::Buffer::len(self.as_raw())
+    }
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
+        use opencl3::memory::ClMem;
+        Ok(crate::record::BufHandle {
+            mem: crate::record::MemRef::Buffer(self.as_raw().buffer().get()),
+            byte_len: self.as_raw().byte_len(),
+        })
+    }
+    fn __claspr_into_init(self) -> DeviceSlice<T, M> {
+        // SAFETY (prototype, see the trait docs): the grid was checked to give
+        // every element one `PerItemOut` writer; that each writer WRITES is the
+        // kernel's convention, not yet enforced.
+        unsafe { self.assume_init() }
+    }
+    fn __claspr_forget_init(init: DeviceSlice<T, M>) -> Self {
+        crate::DeviceSliceUninit::forget_init(init)
+    }
+}
+
 // ── MappedSlice<T, M> impls ────────────────────────────────────────
 
 impl<T: Send + 'static, M: crate::access::MemMode> kernel_slice_arg_sealed::Sealed

@@ -981,14 +981,17 @@ fn has_any_claspr_device_attr(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(is_claspr_device_attr)
 }
 
-/// The element type `T` if `ty` is a `PerItem<T>` kernel parameter (the last path
-/// segment named `PerItem`, one type argument).
-fn per_item_elem(ty: &syn::Type) -> Option<syn::Type> {
+/// The element type `T` and whether the view is write-only, if `ty` is a
+/// `PerItem<T>` / `PerItemOut<T>` kernel parameter (last path segment, one type
+/// argument).
+fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, bool)> {
     let syn::Type::Path(tp) = ty else { return None };
     let seg = tp.path.segments.last()?;
-    if seg.ident != "PerItem" {
-        return None;
-    }
+    let write_only = match seg.ident.to_string().as_str() {
+        "PerItem" => false,
+        "PerItemOut" => true,
+        _ => return None,
+    };
     let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
         return None;
     };
@@ -997,7 +1000,7 @@ fn per_item_elem(ty: &syn::Type) -> Option<syn::Type> {
         _ => None,
     });
     let elem = types.next()?;
-    types.next().is_none().then_some(elem)
+    types.next().is_none().then_some((elem, write_only))
 }
 
 /// Lower a kernel's `PerItem<T>` parameters for the device crate: each becomes the
@@ -1016,7 +1019,7 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) {
         })
     };
     let mut gid: Option<syn::Ident> = None;
-    let mut lowered: Vec<(syn::Ident, syn::Ident)> = Vec::new();
+    let mut lowered: Vec<(syn::Ident, syn::Ident, bool)> = Vec::new();
     for input in f.sig.inputs.iter_mut() {
         let syn::FnArg::Typed(pt) = input else {
             continue;
@@ -1028,14 +1031,20 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) {
             gid = Some(pi.ident.clone());
             continue;
         }
-        let Some(elem) = per_item_elem(&pt.ty) else {
+        let Some((elem, write_only)) = per_item_elem(&pt.ty) else {
             continue;
         };
         let name = pi.ident.clone();
         let raw = quote::format_ident!("__claspr_raw_{}", name);
         *pt.pat = syn::parse_quote!(#raw);
-        *pt.ty = syn::parse_quote!(&mut [#elem]);
-        lowered.push((name, raw));
+        // A write-only view may cover uninitialised memory: `MaybeUninit`, so
+        // no `&mut T` to it ever exists.
+        *pt.ty = if write_only {
+            syn::parse_quote!(&mut [core::mem::MaybeUninit<#elem>])
+        } else {
+            syn::parse_quote!(&mut [#elem])
+        };
+        lowered.push((name, raw, write_only));
     }
     if lowered.is_empty() {
         return;
@@ -1050,10 +1059,15 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) {
     });
     let prologue: Vec<syn::Stmt> = lowered
         .iter()
-        .map(|(name, raw)| {
+        .map(|(name, raw, write_only)| {
+            let view = if *write_only {
+                quote::quote!(PerItemOut)
+            } else {
+                quote::quote!(PerItem)
+            };
             syn::parse_quote! {
                 #[allow(unused_mut)]
-                let mut #name = crate::__claspr::PerItem::__claspr_new(#raw, #gid.x);
+                let mut #name = crate::__claspr::#view::__claspr_new(#raw, #gid.x);
             }
         })
         .collect();
@@ -1194,6 +1208,34 @@ pub mod __claspr {
         #[inline(always)]
         fn deref_mut(&mut self) -> &mut T {
             self.slot
+        }
+    }
+
+    /// This work-item's element of a `PerItemOut<T>` kernel argument —
+    /// write-only, as the buffer may not be initialised yet.
+    pub struct PerItemOut<'a, T> {
+        slot: &'a mut core::mem::MaybeUninit<T>,
+        index: usize,
+    }
+
+    impl<'a, T> PerItemOut<'a, T> {
+        #[doc(hidden)]
+        #[inline(always)]
+        pub fn __claspr_new(buf: &'a mut [core::mem::MaybeUninit<T>], index: usize) -> Self {
+            PerItemOut { slot: &mut buf[index], index }
+        }
+
+        /// The element's index in the buffer (the global invocation id).
+        #[inline(always)]
+        pub fn index(&self) -> usize {
+            self.index
+        }
+
+        /// Write this work-item's element — the only access a write-only view
+        /// gives.
+        #[inline(always)]
+        pub fn write(&mut self, value: T) {
+            self.slot.write(value);
         }
     }
 }

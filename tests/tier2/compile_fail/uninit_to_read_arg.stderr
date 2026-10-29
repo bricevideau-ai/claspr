@@ -1,0 +1,27 @@
+error[E0277]: the trait bound `DeviceSliceUninit<u32>: KernelSliceReadArg<u32>` is not satisfied
+  --> compile_fail/uninit_to_read_arg.rs:15:16
+   |
+15 |     let _ = ks.add_u32([4usize], uninit, b, out);
+   |                ^^^^^^^ the trait `KernelSliceReadArg<u32>` is not implemented for `DeviceSliceUninit<u32>`
+   |
+help: the following other types implement trait `KernelSliceReadArg<T>`
+  --> claspr/src/launch.rs:LL:CC
+  ::: claspr/src/launch.rs:LL:CC
+   |
+   = note: `claspr::DeviceSlice<T, M>`
+  ::: claspr/src/launch.rs:LL:CC
+   |
+   = note: `MappedSlice<T, M>`
+  ::: claspr/src/launch.rs:LL:CC
+   |
+   = note: `USMSlice<T, M>`
+  ::: claspr/src/launch.rs:LL:CC
+   |
+   = note: `std::sync::Arc<claspr::DeviceSlice<T, M>>`
+note: required by a bound in `claspr_test_kernels::kernels::Kernels::add_u32`
+  --> tests/kernels/src/lib.rs:47:4
+   = note: this error originates in the attribute macro `claspr::kernel` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0277`.

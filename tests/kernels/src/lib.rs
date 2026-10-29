@@ -189,6 +189,19 @@ pub mod kernels {
         *data = data.wrapping_mul(factor);
     }
 
+    /// `out[i] = a[i] * factor` into a write-only `PerItemOut`: `out` may be
+    /// an UNINITIALISED buffer, which the launch initialises (every element is
+    /// written exactly once; the kernel cannot read it).
+    #[claspr::kernel]
+    pub fn scaled_copy_out_u32(
+        #[spirv(cross_workgroup)] a: &[u32],
+        #[spirv(cross_workgroup)] out: PerItemOut<u32>,
+        factor: u32,
+    ) {
+        let i = out.index();
+        out.write(a[i].wrapping_mul(factor));
+    }
+
     /// A user struct passed BY REFERENCE to kernels, held on the host side in
     /// a `DeviceScalar<Counter>` — e.g. per-step state a graph advances itself.
     #[derive(Clone, Copy, Debug, PartialEq)]

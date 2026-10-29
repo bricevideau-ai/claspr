@@ -289,6 +289,18 @@ impl<T, M: MemMode> DeviceSliceUninit<T, M> {
     }
 }
 
+impl<T, M: MemMode> DeviceSliceUninit<T, M> {
+    /// The underlying allocation, for setting it as a kernel argument (never
+    /// for reading: its bytes are uninitialised).
+    pub(crate) fn as_raw(&self) -> &DeviceSlice<T, M> {
+        &self.inner
+    }
+    /// Forget that `init` is initialised (always safe).
+    pub(crate) fn forget_init(init: DeviceSlice<T, M>) -> Self {
+        DeviceSliceUninit { inner: init }
+    }
+}
+
 impl<T, M: MemMode> crate::record::RecordableBuffer for DeviceSliceUninit<T, M> {
     fn record_handle(&self) -> crate::record::BufHandle {
         // The uninit dst's backing cl_mem is its inner slice's; a recorded copy

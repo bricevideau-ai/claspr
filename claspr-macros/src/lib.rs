@@ -97,6 +97,11 @@ use syn::{
 ///   `&mut [T]` does, and every launch first checks that the grid is 1-D and
 ///   exactly the buffer's length (`Error::GridMismatch` otherwise, with any
 ///   lent input returned so a graph stays retryable).
+/// - `PerItemOut<T>` is the write-only form (`name.write(v)`, `name.index()`,
+///   no read). It also accepts an UNINITIALISED buffer (`DeviceSliceUninit`)
+///   and outputs the initialised one. Prototype caveat: a work-item that
+///   returns without writing leaves its element unwritten (see
+///   `KernelSliceWriteArg`).
 /// - A parameter `&Image!(...)` is translated to a generic arg bounded by
 ///   the matching `KernelImage<dim>D<Access>Arg<family>` trait (1D/2D/3D/
 ///   Buffer, arrayed variants), also threaded through `Output`.
@@ -665,6 +670,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // its grid check — both emitted right after the resolves.
     let mut lent_rehome: Vec<TokenStream2> = Vec::new();
     let mut per_item_checks: Vec<TokenStream2> = Vec::new();
+    let mut write_only_init: Vec<TokenStream2> = Vec::new();
     // SCALAR slot READS, emitted BEFORE the buffer/image lends in execute. A scalar
     // read is a pure clone (no cell mutation), so resolving the non-resource slots
     // first means an UNBOUND scalar errors (`SlotUnbound`) before any buffer is
@@ -833,6 +839,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 elem,
                 mutable,
                 per_item,
+                write_only,
             } => {
                 // Two generics per slice:
                 //   __claspr_D{n} — the concrete BUFFER type (flows to Output,
@@ -850,7 +857,9 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // Buffer bound by mutability: `&[T]` → KernelSliceReadArg<T>;
                 // `&mut [T]` → KernelSliceReadWriteArg<T> (also KernelWritable,
                 // excluding ReadOnly / Frozen at the type level).
-                let dbound: TokenStream2 = if per_item {
+                let dbound: TokenStream2 = if write_only {
+                    quote! { #gid: ::claspr::KernelSliceWriteArg<#elem> }
+                } else if per_item {
                     // The grid check reads the buffer's length.
                     quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> + ::claspr::Buffer<#elem> }
                 } else if mutable {
@@ -884,12 +893,25 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 });
                 if per_item {
                     let name_lit = pname.to_string();
+                    let len = if write_only {
+                        quote! { ::claspr::KernelSliceWriteArg::<#elem>::element_count(&#pname) }
+                    } else {
+                        quote! { ::claspr::Buffer::<#elem>::len(&#pname) }
+                    };
                     per_item_checks.push(quote! {
-                        ::claspr::check_per_item_grid(
-                            &__claspr_spec,
-                            ::claspr::Buffer::<#elem>::len(&#pname),
-                            #name_lit,
-                        )?;
+                        ::claspr::check_per_item_grid(&__claspr_spec, #len, #name_lit)?;
+                    });
+                }
+                if write_only {
+                    // After the grid check: the launch writes every element, so
+                    // the buffer (and its home) become its initialised form; from
+                    // here on it is an ordinary read-write slice.
+                    write_only_init.push(quote! {
+                        let #pname = ::claspr::KernelSliceWriteArg::<#elem>::__claspr_into_init(#pname);
+                        let #home_ident = ::core::option::Option::map(
+                            #home_ident,
+                            ::claspr::eager::__claspr_init_home::<#gid, #elem>,
+                        );
                     });
                 }
                 input_deps_idents.push(quote! { #deps_ident });
@@ -898,7 +920,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 bind_slot_pat_names.push(quote! { #pname });
                 op_arg_pass.push(quote! { &#pname });
                 output_names.push(pname.clone());
-                output_types.push(gid_tt);
+                output_types.push(if write_only {
+                    quote! { <#gid_tt as ::claspr::KernelSliceWriteArg<#elem>>::Init }
+                } else {
+                    gid_tt
+                });
                 output_homes.push(quote! { #home_ident });
                 output_origins.push(quote! { #origin_ident });
                 dump_pat_names.push(quote! { #pname });
@@ -1252,6 +1278,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         input_resolve_eager,
         lent_rehome,
         per_item_checks,
+        write_only_init,
         scalar_resolve_eager,
         input_deps_idents,
         input_bind_slots,
@@ -1283,6 +1310,7 @@ struct KernelParts {
     input_resolve_eager: Vec<TokenStream2>,
     lent_rehome: Vec<TokenStream2>,
     per_item_checks: Vec<TokenStream2>,
+    write_only_init: Vec<TokenStream2>,
     scalar_resolve_eager: Vec<TokenStream2>,
     input_deps_idents: Vec<TokenStream2>,
     input_bind_slots: Vec<TokenStream2>,
@@ -1316,6 +1344,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
         input_resolve_eager,
         lent_rehome,
         per_item_checks,
+        write_only_init,
         scalar_resolve_eager,
         input_deps_idents,
         input_bind_slots,
@@ -1874,6 +1903,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     #(#scalar_resolve_eager)*
                     #(#input_resolve_eager)*
                     #per_item_guard
+                    #(#write_only_init)*
                     // CB-as-execution-mode fork (design v2): in Build/LendOnly this
                     // adds to / lends for the command buffer and RETURNS; in Off it
                     // is empty and we fall through to the normal enqueue below.
@@ -2116,6 +2146,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     #(#scalar_resolve_eager)*
                     #(#input_resolve_eager)*
                     #per_item_guard
+                    #(#write_only_init)*
                     // CB-as-execution-mode fork (design v2): in Build/LendOnly this
                     // adds to / lends for the command buffer and RETURNS; in Off it
                     // is empty and we fall through to the normal enqueue below.
@@ -2458,6 +2489,9 @@ enum ParamRole {
         /// A `PerItem<T>` param: a written slice whose work-item `i` owns
         /// element `i`; the launch checks the 1-D grid equals its length.
         per_item: bool,
+        /// A `PerItemOut<T>` param: `per_item`, write-only — it accepts an
+        /// uninitialised buffer (`KernelSliceWriteArg`) and outputs its `Init`.
+        write_only: bool,
     },
     /// Image param (`&Image!(...)` / `&mut Image!(...)`). Becomes a
     /// pair of generic type parameters on the emitted method:
@@ -2550,11 +2584,13 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
                 elem,
                 mutable,
                 per_item,
+                write_only,
             } => Ok(ParamRole::Slice {
                 name: pname,
                 elem,
                 mutable,
                 per_item,
+                write_only,
             }),
             CrossWorkgroupTy::ScalarRef { elem, mutable } => Ok(ParamRole::ScalarRef {
                 name: pname,
@@ -2601,6 +2637,7 @@ enum CrossWorkgroupTy {
         elem: TokenStream2,
         mutable: bool,
         per_item: bool,
+        write_only: bool,
     },
     ScalarRef {
         elem: TokenStream2,
@@ -2616,9 +2653,11 @@ enum CrossWorkgroupTy {
 fn cross_workgroup_element_ty(ty: &Type) -> syn::Result<CrossWorkgroupTy> {
     // `PerItem<T>`: a written slice partitioned one element per work-item
     // (claspr-build lowers it to `&mut [T]` + a per-item view on the device).
+    // `PerItemOut<T>`: the same, write-only (it can initialise an uninitialised
+    // buffer).
     if let Type::Path(tp) = ty
         && let Some(seg) = tp.path.segments.last()
-        && seg.ident == "PerItem"
+        && (seg.ident == "PerItem" || seg.ident == "PerItemOut")
         && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
         && let [syn::GenericArgument::Type(inner)] = args.args.iter().collect::<Vec<_>>()[..]
     {
@@ -2626,6 +2665,7 @@ fn cross_workgroup_element_ty(ty: &Type) -> syn::Result<CrossWorkgroupTy> {
             elem: quote! { #inner },
             mutable: true,
             per_item: true,
+            write_only: seg.ident == "PerItemOut",
         });
     }
     let Type::Reference(TypeReference {
@@ -2645,6 +2685,7 @@ fn cross_workgroup_element_ty(ty: &Type) -> syn::Result<CrossWorkgroupTy> {
             elem: quote! { #inner },
             mutable,
             per_item: false,
+            write_only: false,
         }),
         // Anything else the reference wraps (a `Type::Path` like `f32`,
         // or another concrete non-slice type) is a scalar-by-reference:

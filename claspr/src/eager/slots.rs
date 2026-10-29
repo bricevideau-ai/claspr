@@ -1463,6 +1463,9 @@ macro_rules! impl_to_input_concrete {
 impl_to_input_concrete!(DeviceSlice);
 impl_to_input_concrete!(MappedSlice);
 impl_to_input_concrete!(USMSlice);
+// An uninitialised buffer is a valid input only where `KernelSliceWriteArg` is
+// accepted (`PerItemOut` params); read/read-write params bound it out.
+impl_to_input_concrete!(DeviceSliceUninit);
 
 // A device SCALAR ([`Scalar<B>`], any memory tier) plugs into a (scalar-ref)
 // kernel-arg position exactly like a slice does into a slice position — the
