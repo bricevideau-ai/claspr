@@ -16,6 +16,7 @@ members = [
     "examples/cg",
     "examples/spv-introspect",
     "examples/miniweather",
+    "examples/llama2",
     "tests/instantiate",
     "tests/kernels",
     "tests/image-kernels",

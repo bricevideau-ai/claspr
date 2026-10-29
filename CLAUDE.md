@@ -35,6 +35,10 @@ examples/miniweather/         instantiate flagship — miniWeather in ONE file
                               at two precisions (device module stamped
                               f64/f32; 24-dispatch Tier-2 replay graph;
                               self-validating conservation tests).
+examples/llama2/              run-time-built graph — a llama2.c checkpoint driven
+                              by a text model spec (stories15M.spec), composed
+                              into one graph replayed once per token; greedy
+                              output byte-identical to llama2.c's run.c.
 
 tests/kernels, tests/image-kernels, tests/explicit-compile,
 tests/instantiate, tests/tier1, tests/tier2

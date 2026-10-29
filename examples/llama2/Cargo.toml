@@ -1,0 +1,24 @@
+[package]
+name = "llama2-example"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "llama2.c-format transformer built at run time from a text model spec — claspr Tier 2 graph replayed once per token"
+
+[[bin]]
+name = "llama2"
+path = "src/main.rs"
+
+[dependencies]
+claspr = { path = "../../claspr" }
+# spirv-std's host arms provide opencl_std::* on the CPU too, so the device
+# module's math helpers stay host-visible without cfg-gating.
+spirv-std.workspace = true
+
+[build-dependencies]
+claspr-build = { path = "../../claspr-build" }
+
+[lints]
+workspace = true
