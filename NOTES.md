@@ -38,7 +38,13 @@ over `alloc_uninit` buffers: byte-identical, 1 CB, no cost (151.0 vs 150.9).
 Uninitialised `MappedSlice`/`USMSlice` outputs work too. Partitions are N-D: a
 1-, 2- or 3-D grid with one work-item per element, work-item `(x, y, z)` owning
 element `x + w * (y + h * z)` (`coord()` gives the coordinates); gray-scott's 2-D
-`laplacian`/`combine` use it (frames byte-identical). Not done: named handles.
+`laplacian`/`combine` use it (frames byte-identical).
+**Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
+inside the kernel, so the positional handle is no worse than before; and the real
+user difficulty is telling which params are PIPED (every buffer-like param —
+slice, `PerItem*` view, scalar-by-ref, image — in signature order; by-value
+scalars are not), which names don't address. Cheap option if it bites: the macro
+generates a "Handle: `(…)`" line in the launcher's rustdoc (IDE hover).
 
 ### Decisions — assessed & DECLINED (kept so future sessions don't re-litigate)
 
