@@ -152,7 +152,7 @@
 
 use claspr::eager::DeviceOpExt;
 use claspr::{Context, DeviceSlice, LaunchSpec};
-use claspr::{slot, slots};
+use claspr::{graph, slot, slots};
 
 #[claspr::device]
 mod gpu {
@@ -422,34 +422,32 @@ fn run_swap(
     // THREE dispatch sites (genuinely 2D — `[W, H]`). UIn/VIn/UOut/VOut are the
     // step-0 buffer roles; UIn/VIn each fan out to their lap dispatch AND combine
     // from this one bind. (Du/Dv are compile-time consts in the device module.)
-    let g = ks
-        .laplacian(slot!(Grid), slot!(UIn), lap_u_buf)
-        .and_then(move |(u_in, lap_u)| {
-            // Inner dispatch: V's Laplacian. We capture the U dispatch's outputs —
-            // `u_in` (the field buffer, threaded through unchanged) and `lap_u`
-            // (its Laplacian) — so `combine` can read both.
-            ks.laplacian(slot!(Grid), slot!(VIn), lap_v_buf)
-                .and_then(move |(v_in, lap_v)| {
-                    ks.combine(
-                        slot!(Grid),
-                        u_in,  // pipe: U field, threaded through the lap_u dispatch
-                        v_in,  // pipe: V field, threaded through the lap_v dispatch
-                        lap_u, // pipe: U-Laplacian scratch from dispatch 1
-                        lap_v, // pipe: V-Laplacian scratch from dispatch 2
-                        slot!(UOut),
-                        slot!(VOut),
-                        slot!(F),
-                        slot!(K),
-                    )
-                })
-        })
-        .bind(F(F1))
-        .bind(K(K1))
-        .bind(Grid(LaunchSpec::from([grid_w, grid_h])))
-        .bind(UIn(u_a))
-        .bind(VIn(v_a))
-        .bind(UOut(u_b))
-        .bind(VOut(v_b));
+    //
+    // `graph!` keeps each dispatch's outputs in scope for the later ones: the U
+    // dispatch's `u_in` (the field, threaded through unchanged) and `lap_u` (its
+    // Laplacian) are still bound when `combine` reads them.
+    let g = graph! {
+        let (u_in, lap_u) = ks.laplacian(slot!(Grid), slot!(UIn), lap_u_buf);
+        let (v_in, lap_v) = ks.laplacian(slot!(Grid), slot!(VIn), lap_v_buf);
+        ks.combine(
+            slot!(Grid),
+            u_in,  // pipe: U field, threaded through the lap_u dispatch
+            v_in,  // pipe: V field, threaded through the lap_v dispatch
+            lap_u, // pipe: U-Laplacian scratch from dispatch 1
+            lap_v, // pipe: V-Laplacian scratch from dispatch 2
+            slot!(UOut),
+            slot!(VOut),
+            slot!(F),
+            slot!(K),
+        )
+    }
+    .bind(F(F1))
+    .bind(K(K1))
+    .bind(Grid(LaunchSpec::from([grid_w, grid_h])))
+    .bind(UIn(u_a))
+    .bind(VIn(v_a))
+    .bind(UOut(u_b))
+    .bind(VOut(v_b));
 
     let total = steps_phase1 + steps_phase2;
 
@@ -671,31 +669,25 @@ fn run_immutable(
     // its two lap-scratch buffers by arg (fresh per call); the returned graph does
     // NOT borrow `ks` (the launchers clone the context/kernels internally).
     let get_meta_kernel = |ks: &gpu::Kernels, lap_u, lap_v| {
-        ks.laplacian(slot!(Grid), slot!(UIn), lap_u)
-            .and_then(move |(u_in, lap_u_pipe)| {
-                ks.laplacian(slot!(Grid), slot!(VIn), lap_v)
-                    .and_then(move |(v_in, lap_v_pipe)| {
-                        ks.combine(
-                            slot!(Grid),
-                            u_in,       // pipe: U field (read)
-                            v_in,       // pipe: V field (read)
-                            lap_u_pipe, // pipe: U-Laplacian
-                            lap_v_pipe, // pipe: V-Laplacian
-                            slot!(UOut),
-                            slot!(VOut),
-                            slot!(F),
-                            slot!(K),
-                        )
-                        // 4-of-6 TRIM: `combine`'s handle is 6 pipes
-                        // (u_in, v_in, lap_u, lap_v, u_out, v_out); re-expose ONLY the
-                        // four FIELD pipes so the caller sees `(u_in, v_in, u_out, v_out)`.
-                        .and_then(
-                            |(u_in, v_in, _lap_u, _lap_v, u_out, v_out)| {
-                                bundle4(u_in, v_in, u_out, v_out)
-                            },
-                        )
-                    })
-            })
+        graph! {
+            let (u_in, lap_u) = ks.laplacian(slot!(Grid), slot!(UIn), lap_u);
+            let (v_in, lap_v) = ks.laplacian(slot!(Grid), slot!(VIn), lap_v);
+            let (u_in, v_in, _lap_u, _lap_v, u_out, v_out) = ks.combine(
+                slot!(Grid),
+                u_in,  // pipe: U field (read)
+                v_in,  // pipe: V field (read)
+                lap_u, // pipe: U-Laplacian
+                lap_v, // pipe: V-Laplacian
+                slot!(UOut),
+                slot!(VOut),
+                slot!(F),
+                slot!(K),
+            );
+            // 4-of-6 TRIM: `combine`'s handle is 6 pipes (u_in, v_in, lap_u,
+            // lap_v, u_out, v_out); re-expose ONLY the four FIELD pipes so the
+            // caller sees `(u_in, v_in, u_out, v_out)`.
+            bundle4(u_in, v_in, u_out, v_out)
+        }
     };
 
     // `curried_kernel` partially binds the INVARIANTS that never rotate — `Grid`,
