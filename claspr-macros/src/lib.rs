@@ -88,6 +88,15 @@ use syn::{
 ///   is **translated** to a generic arg bounded by
 ///   `KernelSliceRead[Write]Arg<T>` (accepts `DeviceSlice`/`MappedSlice`/
 ///   `USMSlice` by value; flows through `Output`). See `ParamRole::Slice`.
+/// - A parameter `#[spirv(cross_workgroup)] name: PerItem<T>` is a written
+///   buffer handed to each work-item as ITS element: in the kernel `name`
+///   derefs to `T` (`*name = v`, `*name += v`) and `name.index()` is the
+///   element's index, so no two work-items hold a `&mut` to the same element.
+///   claspr-build lowers it to `&mut [T]` plus that per-item view (adding a
+///   global-id parameter if the kernel has none). On the host it accepts what
+///   `&mut [T]` does, and every launch first checks that the grid is 1-D and
+///   exactly the buffer's length (`Error::GridMismatch` otherwise, with any
+///   lent input returned so a graph stays retryable).
 /// - A parameter `&Image!(...)` is translated to a generic arg bounded by
 ///   the matching `KernelImage<dim>D<Access>Arg<family>` trait (1D/2D/3D/
 ///   Buffer, arrayed variants), also threaded through `Output`.
@@ -651,6 +660,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // `Input::resolve` (a pipe IS expected here — it's the upstream output).
     // `#pname` becomes the buffer; `#pname __claspr_deps` its wait-list events.
     let mut input_resolve_eager: Vec<TokenStream2> = Vec::new();
+    // Per resolved input, the statement that hands it back to its origin (an
+    // abandoned launch must not strand a lent buffer), and per `PerItem` arg
+    // its grid check — both emitted right after the resolves.
+    let mut lent_rehome: Vec<TokenStream2> = Vec::new();
+    let mut per_item_checks: Vec<TokenStream2> = Vec::new();
     // SCALAR slot READS, emitted BEFORE the buffer/image lends in execute. A scalar
     // read is a pure clone (no cell mutation), so resolving the non-resource slots
     // first means an UNBOUND scalar errors (`SlotUnbound`) before any buffer is
@@ -818,6 +832,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 name: pname,
                 elem,
                 mutable,
+                per_item,
             } => {
                 // Two generics per slice:
                 //   __claspr_D{n} — the concrete BUFFER type (flows to Output,
@@ -835,7 +850,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // Buffer bound by mutability: `&[T]` → KernelSliceReadArg<T>;
                 // `&mut [T]` → KernelSliceReadWriteArg<T> (also KernelWritable,
                 // excluding ReadOnly / Frozen at the type level).
-                let dbound: TokenStream2 = if mutable {
+                let dbound: TokenStream2 = if per_item {
+                    // The grid check reads the buffer's length.
+                    quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> + ::claspr::Buffer<#elem> }
+                } else if mutable {
                     quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> }
                 } else {
                     quote! { #gid: ::claspr::KernelSliceReadArg<#elem> }
@@ -861,6 +879,19 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     &deps_ident,
                     &home_ident,
                 ));
+                lent_rehome.push(quote! {
+                    ::claspr::eager::__claspr_rehome_lent(#pname, #deps_ident, #home_ident);
+                });
+                if per_item {
+                    let name_lit = pname.to_string();
+                    per_item_checks.push(quote! {
+                        ::claspr::check_per_item_grid(
+                            &__claspr_spec,
+                            ::claspr::Buffer::<#elem>::len(&#pname),
+                            #name_lit,
+                        )?;
+                    });
+                }
                 input_deps_idents.push(quote! { #deps_ident });
                 input_bind_slots.push(res_bind_slots(&pname));
                 input_check_ready.push(res_check_ready(&pname));
@@ -953,6 +984,9 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     &deps_ident,
                     &home_ident,
                 ));
+                lent_rehome.push(quote! {
+                    ::claspr::eager::__claspr_rehome_lent(#pname, #deps_ident, #home_ident);
+                });
                 input_deps_idents.push(quote! { #deps_ident });
                 input_bind_slots.push(res_bind_slots(&pname));
                 input_check_ready.push(res_check_ready(&pname));
@@ -1052,6 +1086,9 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     &deps_ident,
                     &home_ident,
                 ));
+                lent_rehome.push(quote! {
+                    ::claspr::eager::__claspr_rehome_lent(#pname, #deps_ident, #home_ident);
+                });
                 input_deps_idents.push(quote! { #deps_ident });
                 input_bind_slots.push(res_bind_slots(&pname));
                 input_check_ready.push(res_check_ready(&pname));
@@ -1213,6 +1250,8 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
         host_names,
         op_field_init,
         input_resolve_eager,
+        lent_rehome,
+        per_item_checks,
         scalar_resolve_eager,
         input_deps_idents,
         input_bind_slots,
@@ -1242,6 +1281,8 @@ struct KernelParts {
     host_names: Vec<TokenStream2>,
     op_field_init: Vec<TokenStream2>,
     input_resolve_eager: Vec<TokenStream2>,
+    lent_rehome: Vec<TokenStream2>,
+    per_item_checks: Vec<TokenStream2>,
     scalar_resolve_eager: Vec<TokenStream2>,
     input_deps_idents: Vec<TokenStream2>,
     input_bind_slots: Vec<TokenStream2>,
@@ -1273,6 +1314,8 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
         host_names,
         op_field_init,
         input_resolve_eager,
+        lent_rehome,
+        per_item_checks,
         scalar_resolve_eager,
         input_deps_idents,
         input_bind_slots,
@@ -1299,6 +1342,20 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
     //   `<__D0: K..., __D1: K...>`  — for declarator positions (impl
     //                                  blocks, method generic lists).
     //   `(empty)`                   — when there are no slice params.
+    // `PerItem` grid checks, run after the inputs resolve (a pipe-fed buffer's
+    // length is only known then); on a mismatch every lent input goes back.
+    let per_item_guard: TokenStream2 = if per_item_checks.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            let __claspr_grid_check: ::claspr::Result<()> =
+                (|| { #(#per_item_checks)* ::core::result::Result::Ok(()) })();
+            if let ::core::result::Result::Err(__claspr_e) = __claspr_grid_check {
+                #(#lent_rehome)*
+                return ::core::result::Result::Err(__claspr_e);
+            }
+        }
+    };
     let gen_decl: TokenStream2 = if generics.is_empty() {
         quote! {}
     } else {
@@ -1816,6 +1873,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                         ::claspr::ScalarInput::read(&self.spec)?;
                     #(#scalar_resolve_eager)*
                     #(#input_resolve_eager)*
+                    #per_item_guard
                     // CB-as-execution-mode fork (design v2): in Build/LendOnly this
                     // adds to / lends for the command buffer and RETURNS; in Off it
                     // is empty and we fall through to the normal enqueue below.
@@ -2057,6 +2115,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                         ::claspr::ScalarInput::read(&self.spec)?;
                     #(#scalar_resolve_eager)*
                     #(#input_resolve_eager)*
+                    #per_item_guard
                     // CB-as-execution-mode fork (design v2): in Build/LendOnly this
                     // adds to / lends for the command buffer and RETURNS; in Off it
                     // is empty and we fall through to the normal enqueue below.
@@ -2396,6 +2455,9 @@ enum ParamRole {
         /// stricter `KernelSliceReadWriteArg<T>` bound); `false` for
         /// `&[T]` (emits `KernelSliceReadArg<T>`).
         mutable: bool,
+        /// A `PerItem<T>` param: a written slice whose work-item `i` owns
+        /// element `i`; the launch checks the 1-D grid equals its length.
+        per_item: bool,
     },
     /// Image param (`&Image!(...)` / `&mut Image!(...)`). Becomes a
     /// pair of generic type parameters on the emitted method:
@@ -2484,10 +2546,15 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
         // (a scalar-ref → pointer only). Peek what the reference wraps
         // to pick the role; anything else hits the shared error below.
         return match cross_workgroup_element_ty(&pt.ty)? {
-            CrossWorkgroupTy::Slice { elem, mutable } => Ok(ParamRole::Slice {
+            CrossWorkgroupTy::Slice {
+                elem,
+                mutable,
+                per_item,
+            } => Ok(ParamRole::Slice {
                 name: pname,
                 elem,
                 mutable,
+                per_item,
             }),
             CrossWorkgroupTy::ScalarRef { elem, mutable } => Ok(ParamRole::ScalarRef {
                 name: pname,
@@ -2530,8 +2597,15 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
 /// `KernelSliceReadArg<T>` (`&`) vs `KernelSliceReadWriteArg<T>` (`&mut`)
 /// bound the emitted host method picks.
 enum CrossWorkgroupTy {
-    Slice { elem: TokenStream2, mutable: bool },
-    ScalarRef { elem: TokenStream2, mutable: bool },
+    Slice {
+        elem: TokenStream2,
+        mutable: bool,
+        per_item: bool,
+    },
+    ScalarRef {
+        elem: TokenStream2,
+        mutable: bool,
+    },
 }
 
 /// Classify a `#[spirv(cross_workgroup)]` parameter's type. The param
@@ -2540,6 +2614,20 @@ enum CrossWorkgroupTy {
 /// former to a `(pointer, ulong length)` pair and the latter to a bare
 /// pointer-to-scalar with no length — the two host arg-setting shapes.
 fn cross_workgroup_element_ty(ty: &Type) -> syn::Result<CrossWorkgroupTy> {
+    // `PerItem<T>`: a written slice partitioned one element per work-item
+    // (claspr-build lowers it to `&mut [T]` + a per-item view on the device).
+    if let Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+        && seg.ident == "PerItem"
+        && let syn::PathArguments::AngleBracketed(args) = &seg.arguments
+        && let [syn::GenericArgument::Type(inner)] = args.args.iter().collect::<Vec<_>>()[..]
+    {
+        return Ok(CrossWorkgroupTy::Slice {
+            elem: quote! { #inner },
+            mutable: true,
+            per_item: true,
+        });
+    }
     let Type::Reference(TypeReference {
         elem, mutability, ..
     }) = ty
@@ -2556,6 +2644,7 @@ fn cross_workgroup_element_ty(ty: &Type) -> syn::Result<CrossWorkgroupTy> {
         Type::Slice(TypeSlice { elem: inner, .. }) => Ok(CrossWorkgroupTy::Slice {
             elem: quote! { #inner },
             mutable,
+            per_item: false,
         }),
         // Anything else the reference wraps (a `Type::Path` like `f32`,
         // or another concrete non-slice type) is a scalar-by-reference:
@@ -2846,6 +2935,7 @@ fn instantiate_trait_methods(
                     name: pname,
                     elem,
                     mutable,
+                    ..
                 }
                 | ParamRole::ScalarRef {
                     name: pname,

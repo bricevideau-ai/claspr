@@ -865,6 +865,9 @@ fn translate_and_inline(items: Vec<syn::Item>, dir: &Path) -> Result<Vec<syn::It
     for item in items {
         match item {
             syn::Item::Fn(mut f) => {
+                if f.attrs.iter().any(is_claspr_kernel_attr) {
+                    rewrite_per_item_params(&mut f);
+                }
                 translate_fn_attrs(&mut f.attrs);
                 out.push(syn::Item::Fn(f));
             }
@@ -978,6 +981,85 @@ fn has_any_claspr_device_attr(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(is_claspr_device_attr)
 }
 
+/// The element type `T` if `ty` is a `PerItem<T>` kernel parameter (the last path
+/// segment named `PerItem`, one type argument).
+fn per_item_elem(ty: &syn::Type) -> Option<syn::Type> {
+    let syn::Type::Path(tp) = ty else { return None };
+    let seg = tp.path.segments.last()?;
+    if seg.ident != "PerItem" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    let mut types = args.args.iter().filter_map(|a| match a {
+        syn::GenericArgument::Type(t) => Some(t.clone()),
+        _ => None,
+    });
+    let elem = types.next()?;
+    types.next().is_none().then_some(elem)
+}
+
+/// Lower a kernel's `PerItem<T>` parameters for the device crate: each becomes the
+/// raw `&mut [T]` buffer it is on the wire, and a prologue rebinds the user's name
+/// to this work-item's element (`PerItem::__claspr_new(raw, gid.x)`, defined in the
+/// generated preamble). A global-invocation-id parameter is added if the kernel
+/// has none. The host side treats the parameter as a written slice and checks at
+/// launch that the 1-D grid matches the buffer's length, so `gid.x` indexes every
+/// element exactly once.
+fn rewrite_per_item_params(f: &mut syn::ItemFn) {
+    let is_gid = |pt: &syn::PatType| {
+        pt.attrs.iter().any(|a| {
+            a.path().is_ident("spirv")
+                && a.parse_args::<syn::Ident>()
+                    .is_ok_and(|i| i == "global_invocation_id")
+        })
+    };
+    let mut gid: Option<syn::Ident> = None;
+    let mut lowered: Vec<(syn::Ident, syn::Ident)> = Vec::new();
+    for input in f.sig.inputs.iter_mut() {
+        let syn::FnArg::Typed(pt) = input else {
+            continue;
+        };
+        let syn::Pat::Ident(pi) = &*pt.pat else {
+            continue;
+        };
+        if is_gid(pt) {
+            gid = Some(pi.ident.clone());
+            continue;
+        }
+        let Some(elem) = per_item_elem(&pt.ty) else {
+            continue;
+        };
+        let name = pi.ident.clone();
+        let raw = quote::format_ident!("__claspr_raw_{}", name);
+        *pt.pat = syn::parse_quote!(#raw);
+        *pt.ty = syn::parse_quote!(&mut [#elem]);
+        lowered.push((name, raw));
+    }
+    if lowered.is_empty() {
+        return;
+    }
+    let gid = gid.unwrap_or_else(|| {
+        let id = quote::format_ident!("__claspr_gid");
+        f.sig.inputs.insert(
+            0,
+            syn::parse_quote!(#[spirv(global_invocation_id)] #id: spirv_std::glam::USizeVec3),
+        );
+        id
+    });
+    let prologue: Vec<syn::Stmt> = lowered
+        .iter()
+        .map(|(name, raw)| {
+            syn::parse_quote! {
+                #[allow(unused_mut)]
+                let mut #name = crate::__claspr::PerItem::__claspr_new(#raw, #gid.x);
+            }
+        })
+        .collect();
+    f.block.stmts.splice(0..0, prologue);
+}
+
 fn translate_fn_attrs(attrs: &mut Vec<syn::Attribute>) {
     let mut out = Vec::with_capacity(attrs.len());
     for attr in attrs.drain(..) {
@@ -1074,6 +1156,50 @@ num-complex = { version = "0.4", default-features = false }
     Ok(())
 }
 
+/// Device-side `PerItem<T>`: what a kernel's `PerItem<T>` parameter is rebound to
+/// (see [`rewrite_per_item_params`]) — this work-item's element of the buffer,
+/// borrowed exclusively, so no two work-items hold a `&mut` to the same element.
+const PER_ITEM_PREAMBLE: &str = r#"
+#[doc(hidden)]
+pub mod __claspr {
+    /// This work-item's element of a `PerItem<T>` kernel argument.
+    pub struct PerItem<'a, T> {
+        slot: &'a mut T,
+        index: usize,
+    }
+
+    impl<'a, T> PerItem<'a, T> {
+        #[doc(hidden)]
+        #[inline(always)]
+        pub fn __claspr_new(buf: &'a mut [T], index: usize) -> Self {
+            PerItem { slot: &mut buf[index], index }
+        }
+
+        /// The element's index in the buffer (the global invocation id).
+        #[inline(always)]
+        pub fn index(&self) -> usize {
+            self.index
+        }
+    }
+
+    impl<T> core::ops::Deref for PerItem<'_, T> {
+        type Target = T;
+        #[inline(always)]
+        fn deref(&self) -> &T {
+            self.slot
+        }
+    }
+
+    impl<T> core::ops::DerefMut for PerItem<'_, T> {
+        #[inline(always)]
+        fn deref_mut(&mut self) -> &mut T {
+            self.slot
+        }
+    }
+}
+
+"#;
+
 fn write_generated_lib_rs(crate_dir: &Path, file: &syn::File) -> Result<()> {
     // Preamble injected by claspr-build. Beyond the no_std attribute,
     // we inject `use spirv_std::spirv;` because claspr-build's own
@@ -1094,6 +1220,7 @@ fn write_generated_lib_rs(crate_dir: &Path, file: &syn::File) -> Result<()> {
     s.push_str("#![cfg_attr(target_arch = \"spirv\", no_std)]\n");
     s.push_str("#![allow(unused_imports)]\n\n");
     s.push_str("use spirv_std::spirv;\n\n");
+    s.push_str(PER_ITEM_PREAMBLE);
     // Pretty-print rather than dumping raw token streams: rustc errors
     // from the kernel build point into this file, and "line 4, column
     // 8213" of token soup is undebuggable.

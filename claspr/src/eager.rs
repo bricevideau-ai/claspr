@@ -619,6 +619,14 @@ pub fn rehome_consumed<T>(buf: T, home: Option<BoxedHome<T>>) {
 /// Only call it once the run is fully enqueued (the terminals do; the CB
 /// fallbacks drain pipes a discarded build left with EMPTY deps). Reached
 /// through [`Pipe::reclaim`].
+/// [`rehome_undelivered`] for the code the `#[kernel]` macro emits: return a
+/// buffer an op lent for a launch that is then abandoned (a failed pre-enqueue
+/// check), so the graph stays retryable. Not API.
+#[doc(hidden)]
+pub fn __claspr_rehome_lent<T>(buf: T, deps: Deps, home: Option<BoxedHome<T>>) {
+    rehome_undelivered(buf, deps, home);
+}
+
 pub(crate) fn rehome_undelivered<T>(buf: T, deps: Deps, home: Option<BoxedHome<T>>) {
     for d in &deps {
         let _ = d.as_ref().wait();

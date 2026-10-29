@@ -662,6 +662,21 @@ pub struct LaunchSpec {
     dims: u8,
 }
 
+/// Check that `spec` covers a `PerItem<T>` kernel argument of `len` elements
+/// exactly: a 1-D grid of `len` work-items, so work-item `i` owns element `i`.
+/// Called by the code the `#[kernel]` macro emits, before the enqueue. Not API.
+#[doc(hidden)]
+pub fn check_per_item_grid(spec: &LaunchSpec, len: usize, arg: &'static str) -> crate::Result<()> {
+    match spec.global() {
+        [g] if *g == len => Ok(()),
+        grid => Err(crate::Error::GridMismatch {
+            arg,
+            grid: grid.to_vec(),
+            len,
+        }),
+    }
+}
+
 impl LaunchSpec {
     /// Number of dimensions (1, 2, or 3).
     pub fn dims(&self) -> u8 {

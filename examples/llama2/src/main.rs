@@ -64,12 +64,11 @@ mod gpu {
     pub fn embed(
         #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] table: &[f32],
-        #[spirv(cross_workgroup)] x: &mut [f32],
+        #[spirv(cross_workgroup)] x: PerItem<f32>,
         #[spirv(cross_workgroup)] step: &Step,
         dim: u32,
     ) {
-        let i = id.x;
-        x[i] = table[step.token as usize * dim as usize + i];
+        *x = table[step.token as usize * dim as usize + x.index()];
     }
 
     /// `out = w * x / rms(x)`. Every work-item recomputes the sum of squares (`n`
@@ -80,10 +79,10 @@ mod gpu {
         #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] x: &[f32],
         #[spirv(cross_workgroup)] w: &[f32],
-        #[spirv(cross_workgroup)] out: &mut [f32],
+        #[spirv(cross_workgroup)] out: PerItem<f32>,
         n: u32,
     ) {
-        let i = id.x;
+        let i = out.index();
         let mut ss = 0.0f32;
         let mut j = 0usize;
         while j < n as usize {
@@ -91,7 +90,7 @@ mod gpu {
             j += 1;
         }
         let scale = 1.0 / ocl::sqrt(ss / n as f32 + 1e-5);
-        out[i] = w[i] * (scale * x[i]);
+        *out = w[i] * (scale * x[i]);
     }
 
     /// `out = W x` for a row-major `W` of `n` columns (one row per work-item).
@@ -100,18 +99,17 @@ mod gpu {
         #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] w: &[f32],
         #[spirv(cross_workgroup)] x: &[f32],
-        #[spirv(cross_workgroup)] out: &mut [f32],
+        #[spirv(cross_workgroup)] out: PerItem<f32>,
         n: u32,
     ) {
-        let i = id.x;
-        let row = i * n as usize;
+        let row = out.index() * n as usize;
         let mut acc = 0.0f32;
         let mut j = 0usize;
         while j < n as usize {
             acc += w[row + j] * x[j];
             j += 1;
         }
-        out[i] = acc;
+        *out = acc;
     }
 
     /// The key and value projections of `x`, written straight into the current
@@ -180,7 +178,7 @@ mod gpu {
         #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] q: &[f32],
         #[spirv(cross_workgroup)] k_cache: &[f32],
-        #[spirv(cross_workgroup)] att: &mut [f32],
+        #[spirv(cross_workgroup)] att: PerItem<f32>,
         #[spirv(cross_workgroup)] step: &Step,
         seq_len: u32,
         head_size: u32,
@@ -200,7 +198,7 @@ mod gpu {
             score += q[qo + i] * k_cache[ko + i];
             i += 1;
         }
-        att[h * seq_len as usize + t] = score / ocl::sqrt(head_size as f32);
+        *att = score / ocl::sqrt(head_size as f32);
     }
 
     /// Softmax of each head's scores over `t <= pos` (one work-item per head).
@@ -243,7 +241,7 @@ mod gpu {
         #[spirv(global_invocation_id)] id: USizeVec3,
         #[spirv(cross_workgroup)] att: &[f32],
         #[spirv(cross_workgroup)] v_cache: &[f32],
-        #[spirv(cross_workgroup)] out: &mut [f32],
+        #[spirv(cross_workgroup)] out: PerItem<f32>,
         #[spirv(cross_workgroup)] step: &Step,
         seq_len: u32,
         head_size: u32,
@@ -259,28 +257,28 @@ mod gpu {
             acc += att[h * seq_len as usize + t] * v_cache[t * kv_dim as usize + vo];
             t += 1;
         }
-        out[id.x] = acc;
+        *out = acc;
     }
 
     /// `x += y`: the residual connection.
     #[claspr::kernel]
     pub fn add(
         #[spirv(global_invocation_id)] id: USizeVec3,
-        #[spirv(cross_workgroup)] x: &mut [f32],
+        #[spirv(cross_workgroup)] x: PerItem<f32>,
         #[spirv(cross_workgroup)] y: &[f32],
     ) {
-        x[id.x] += y[id.x];
+        *x += y[x.index()];
     }
 
     /// `h1 = silu(h1) * h3`: the SwiGLU gate.
     #[claspr::kernel]
     pub fn swiglu(
         #[spirv(global_invocation_id)] id: USizeVec3,
-        #[spirv(cross_workgroup)] h1: &mut [f32],
+        #[spirv(cross_workgroup)] h1: PerItem<f32>,
         #[spirv(cross_workgroup)] h3: &[f32],
     ) {
-        let v = h1[id.x];
-        h1[id.x] = v * (1.0 / (1.0 + ocl::exp(-v))) * h3[id.x];
+        let v = *h1;
+        *h1 = v * (1.0 / (1.0 + ocl::exp(-v))) * h3[h1.index()];
     }
 
     /// Greedy sampling and the step advance, on the device (one work-item; ties

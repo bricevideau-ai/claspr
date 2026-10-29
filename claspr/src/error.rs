@@ -31,6 +31,16 @@ pub enum Error {
     /// first, and a handle pipe moves into exactly one op (pipes are not
     /// `Clone`), so this is a claspr bug: please report it. Carries which pipe.
     PipeDrained(&'static str),
+    /// A kernel launched with a grid that does not cover one of its
+    /// `PerItem<T>` arguments exactly: a `PerItem` argument gives work-item `i`
+    /// element `i`, so the grid must be one-dimensional with as many work-items
+    /// as the buffer has elements (more would index past the end, fewer would
+    /// leave elements unwritten). Carries the argument, the grid, and the length.
+    GridMismatch {
+        arg: &'static str,
+        grid: Vec<usize>,
+        len: usize,
+    },
     /// No OpenCL device was found on any platform — usually an
     /// environment problem (no ICD installed, or `OCL_ICD_VENDORS`
     /// pointing at the wrong directory), not a claspr one. The most
@@ -117,6 +127,11 @@ impl fmt::Display for Error {
                 write!(f, "length mismatch: src has {src} elements, dst has {dst}")
             }
             Error::NotSupported(what) => write!(f, "not supported on this device: {what}"),
+            Error::GridMismatch { arg, grid, len } => write!(
+                f,
+                "kernel launch: `PerItem` argument `{arg}` has {len} elements but the grid is \
+                 {grid:?}; a `PerItem` argument needs a 1-D grid of exactly its length"
+            ),
             Error::PipeDrained(which) => write!(
                 f,
                 "eager graph: {which} was already drained — a pipe was consumed twice, \

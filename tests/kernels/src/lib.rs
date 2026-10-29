@@ -165,6 +165,30 @@ pub mod kernels {
         data[i] = data[i].wrapping_add(*addend);
     }
 
+    /// `out[i] = a[i] + b[i]` with the output as a `PerItem`: each work-item
+    /// owns one element, so the kernel needs no index arithmetic or global id
+    /// (claspr adds one) and the launch checks the grid covers `out` exactly.
+    #[claspr::kernel]
+    pub fn add_per_item_u32(
+        #[spirv(cross_workgroup)] a: &[u32],
+        #[spirv(cross_workgroup)] b: &[u32],
+        #[spirv(cross_workgroup)] out: PerItem<u32>,
+    ) {
+        let i = out.index();
+        *out = a[i].wrapping_add(b[i]);
+    }
+
+    /// Multiply every element by `factor` in place, through a `PerItem` view
+    /// (read and write the work-item's own element).
+    #[claspr::kernel]
+    pub fn scale_per_item_u32(
+        #[spirv(global_invocation_id)] _id: spirv_std::glam::USizeVec3,
+        #[spirv(cross_workgroup)] data: PerItem<u32>,
+        factor: u32,
+    ) {
+        *data = data.wrapping_mul(factor);
+    }
+
     /// A user struct passed BY REFERENCE to kernels, held on the host side in
     /// a `DeviceScalar<Counter>` — e.g. per-step state a graph advances itself.
     #[derive(Clone, Copy, Debug, PartialEq)]
