@@ -65,62 +65,29 @@ below.
   tier-4 defaults become the overwhelming norm), the severable-layer premise becomes
   true and the split is worth re-pricing.**
 - **Type-state slots for Tier 2** (graph type carries the unbound-tag set) —
-  DECLINED (2026-07-15, not enough benefit for the churn). Design: `type Slots`
-  (HList set) per op; `bind`/`call` type-transition `Graph<Remaining>` →
-  `Graph<Remaining∖Tg>`; terminals gate on `Slots=HNil`; `Bound`(static) vs
-  `Ready`(dynamic, stays runtime `check_ready`); `mutate_*` on `Graph<Bound>`.
-  The prize: forgotten-bind / double-bind / typo'd-tag become COMPILE errors, so
-  the whole deferred-error apparatus (`DeferredErrors` sink + `peek_deferred`
-  poison + rebuild-recovery, `eager/slots.rs`) is DELETED, not maintained.
-  Size/`LengthMismatch` stays a runtime terminal `Result` (raised at execute,
-  never in the sink); readiness (lent/severed/pipe) stays runtime.
-  **Why the residual ergonomics don't pay off — the shared-slot wall:**
-  auto-dedup of a tag reused at N sites needs type-level type-equality →
-  associated-type specialization's `default type` won't normalize (min_spec
-  rejects outright; full spec compiles but can't be named downstream) — HARD wall
-  on the pinned nightly, empirically reconfirmed. Consequences:
-    - `bind(Grid(arr))` filling ALL Grid sites at once needs `RemoveAll` = same
-      wall; NOT buildable. A macro can't rescue it (the occurrence count lives in
-      the resolved type, invisible to a syntactic macro).
-    - `g.bind::<rank>(...)` (one specific occurrence via explicit index) IS
-      buildable — escape hatch only.
-    - Fill-all + clone-by-multiplicity are MUTUALLY EXCLUSIVE (fill-all needs the
-      tag once in the type; multiplicity-clone needs it N times).
-  Three wall-free shapes, each with a real cost, none compelling now:
-    - **Multiset + clone/move** (no marker; multiplicity = "consumed N times",
-      clone/move falls out of ownership for free) — but repeated-tag removal is
-      order-sensitive (head-pinned; inferred-index is `E0283`-ambiguous on
-      repeats) and no fill-all.
-    - **Dedup-by-declaration** (graph names its distinct slot set in its type —
-      reusable graphs already do via `impl Graph<Slots=Slots![..]>`) — gives
-      fill-all + order-free + single-move (runtime `TypeId` map fans one bind to
-      all sites, no cloning) — but weaker typo-catching and a dedup annotation is
-      still needed at cross-graph `bundle!` joins.
-    - **`Reuse` marker at reuse sites** — REJECTED by Brice: a per-site
-      annotation fights graph reusability.
-  Scope if ever revived: ~36 `DeviceOp` impls gain `type Slots` (default `HNil`);
-  ~9 composing combinators `Append` children's sets; close the latent
-  `bind_slots` gaps (FanOut/Arced/ArcSplit/OnDevice/Profiled — several don't walk
-  slots at runtime today; DeviceDynOp's was closed 2026-10-26 by the transparent
-  erasure rewrite). **Erasure is NOT a blocker (corrected 2026-10-27, spiked):**
-  the slot set rides as a PHANTOM parameter (`DeviceDynOp<'op, S, Slots>`, or a
-  side trait), never pinned in `dyn DeviceOp`, so `bind` on an erased graph
-  re-tags the same box. Verified in a standalone model: slots survive per-link
-  erasure + explicit `.erase()`, bind-after-erase works, equal-slot arms unify,
-  a stored graph can name its set in ANY order via a frunk-style `reorder`
-  (distinct tags, no specialization), fully-bound graphs share one type; all six
-  misuse cases are compile errors. Real limits, none from erasure: (1) the
-  shared-slot wall above (`E0283` on a repeated tag — reproduced WITHOUT
-  erasure; gray-scott has 25 sites over 7 tags, miniweather reuses its dt tags);
-  (2) slot-list length vs `recursion_limit` — prepend each link's slots and
-  re-tag instead of wrapping on bind, and only `Remove`'s search depth remains,
-  ~125 slot sites at the default limit (real graphs: 18–25). Wrapping every bind
-  in `Bound<..>` instead ICEs rustc (nightly-2026-05-22, `instance.rs:566 failed
-  to resolve`, ~100 binds). Verified feasible: distinct-tags
-  type-state (18/18 old spike, re-greened today) and shared-via-explicit-Reuse
-  (spiked green today, no unstable features). **REVISIT TRIGGER: if the
-  deferred-error machinery grows further (more sink/poison cases), the trade tips
-  — full type-state then deletes it wholesale; revisit dedup-by-declaration.**
+  BUILT, then NOT MERGED (2026-10-29). The old "hard wall" verdict (repeated tags
+  need type equality) was wrong in practice: branch **`typed-slot-sets`** (kept on
+  origin, rebased on main b94809c, all tests green) tracks slots through every
+  op, leaf and combinator. Keys: `DeviceOp::Slots` (type-level list,
+  `eager/slot_sets.rs`), launchers derive it from arg types, `bind`/`call`
+  `Remove`, terminals gate on `AllBound`; `call_all` binds everything at once
+  (repeats free); `erase_as::<SlotSet![..], _>()` declares the set for a partial
+  curry of a repeated tag; nodes store children `Bare` with the set on an outer
+  `Slotted` wrapper — without that, monomorphization doubled miniweather's build.
+  Cost vs main: +0–5% build, +3–7% binary.
+  **Why not merged:** it moves errors that the runtime already reports
+  deterministically on the first `sync` to compile time, but adds permanent cost —
+  user (`erase_as` + raw E0283 when forgotten, `Slots = HNil` in generic code,
+  first fill must be `bind`, `Slotted` returns, extra `_` turbofish), contributor
+  (`into_bare` on every op; a combinator that skips the bare pattern silently
+  brings back the 2× build), and it deletes none of the runtime checks (`Dynamic`,
+  `mutate_*`, readiness stay). llama2 ended up slot-free once made fast:
+  per-step state belongs on the device; slots are configuration.
+  **If revisited: the library-boundary variant** — ops stay untracked, only a
+  declared erasure (`DeviceDynOp<'_, S, SlotSet![..]>`, a library's public graph
+  type) carries a set that `bind`/`call` consume and `sync` requires empty.
+  Typed contracts where they pay, no `Bare`/`Slotted`, no generic bounds; the
+  declaration itself is unchecked (runtime catches a wrong one).
 
 ---
 
