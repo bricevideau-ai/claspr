@@ -6,7 +6,9 @@
 //! launcher decomposes it, and the handle hands the same `Tensor` back, so it
 //! flows through pipes into the next kernel unchanged. A `Tensor` is also
 //! accepted wherever its buffer is (a slice or `PerItem*` param: the shape is
-//! then ignored), so a kernel can fill a tensor's buffer directly. Every launch
+//! then ignored), so a kernel can fill a tensor's buffer directly — including
+//! an uninitialised one, as a `PerItemOut` target, which hands back a `Tensor`
+//! over the initialised buffer. Every launch
 //! with a tensor param first checks the shape stays inside the buffer
 //! ([`check_tensor_shape`]).
 

@@ -711,13 +711,11 @@ impl Builder<'_> {
     ) -> Result<Stream, String> {
         let c = self.cfg;
         let [rms, wq, wk, wv, wo] = self.weights(w, layer)?;
-        let [xb, xb2, xo] = self.uninit_n(c.dim)?;
+        let [xb, q, xb2, xo] = self.uninit_n(c.dim)?;
         // The attention buffers are `Tensor`s from the start — the kernels that
         // gather from them read their shapes; the others just see the buffer.
-        // (`q` is zeroed: a `Tensor` over an uninitialised buffer can't be a
-        // `PerItemOut` target yet.)
         let head = c.head_size();
-        let q = Tensor::new(self.zeros(c.dim)?, [c.n_heads, head]);
+        let q = Tensor::new(q, [c.n_heads, head]);
         let [k_cache, v_cache] = self
             .zeros_n(c.seq_len * c.kv_dim())?
             .map(|b| Tensor::new(b, [c.seq_len, c.n_kv_heads, head]));

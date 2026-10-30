@@ -426,6 +426,44 @@ macro_rules! impl_write_arg_svm_uninit {
 impl_write_arg_svm_uninit!(MappedSliceUninit, MappedSlice);
 impl_write_arg_svm_uninit!(USMSliceUninit, USMSlice);
 
+// A `Tensor` over an uninitialised buffer: initialised like its buffer, keeping
+// its shape. Per uninit family — disjoint from the blanket impl above, since a
+// `Tensor` is a read-write arg only when its buffer is, and these never are.
+macro_rules! impl_write_arg_tensor_uninit {
+    ($uninit:ident) => {
+        impl<T: Send + 'static, M: crate::access::MemMode, const R: usize>
+            kernel_slice_write_arg_sealed::Sealed<T> for crate::Tensor<crate::$uninit<T, M>, R>
+        {
+        }
+        impl<
+            T: Send + 'static,
+            M: crate::access::MemMode + crate::access::KernelReadable + crate::access::KernelWritable,
+            const R: usize,
+        > KernelSliceWriteArg<T> for crate::Tensor<crate::$uninit<T, M>, R>
+        {
+            type Init =
+                crate::Tensor<<crate::$uninit<T, M> as KernelSliceWriteArg<T>>::Init, R>;
+            fn element_count(&self) -> usize {
+                KernelSliceWriteArg::<T>::element_count(self.buffer())
+            }
+            fn __claspr_into_init(self) -> Self::Init {
+                let (buf, shape) = self.into_parts();
+                crate::Tensor::new(buf.__claspr_into_init(), shape)
+            }
+            fn __claspr_forget_init(init: Self::Init) -> Self {
+                let (buf, shape) = init.into_parts();
+                crate::Tensor::new(
+                    <crate::$uninit<T, M> as KernelSliceWriteArg<T>>::__claspr_forget_init(buf),
+                    shape,
+                )
+            }
+        }
+    };
+}
+impl_write_arg_tensor_uninit!(DeviceSliceUninit);
+impl_write_arg_tensor_uninit!(MappedSliceUninit);
+impl_write_arg_tensor_uninit!(USMSliceUninit);
+
 // ── MappedSlice<T, M> impls ────────────────────────────────────────
 
 impl<T: Send + 'static, M: crate::access::MemMode> kernel_slice_arg_sealed::Sealed

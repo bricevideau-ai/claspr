@@ -110,9 +110,10 @@ kernel params map one to one, and no repacking at every call): the launcher
 decomposes it (`KernelTensorArg::shape()` passed as the arg after the buffer, also
 baked into CBs) and the handle hands it back, so it pipes on unchanged. It
 delegates the buffer traits to `B`, so it also fills slice / `PerItem*` params.
-Host `check_tensor_shape` / `Error::TensorShapeMismatch`. Gaps: a `Tensor` over an
-UNINIT buffer can't be a `PerItemOut` target (needs explicit `KernelSliceWriteArg`
-impls per uninit type — coherent, not done; llama2 zeroes `q`); tile walking is
+Host `check_tensor_shape` / `Error::TensorShapeMismatch`. A `Tensor` over an
+UNINIT buffer is a `PerItemOut` target too (explicit `KernelSliceWriteArg` per uninit
+family, `Init` = `Tensor` over the init type; replays forget init again). Gaps:
+`download` takes only a `DeviceSlice` pipe (not a `Tensor` one); tile walking is
 `with_shape` between runs, not a re-bindable shape slot. Device: `t[[i, j]]`,
 `sub(i)` (ranks 2–4), `extent(d)`, rank-1 `t[j]` / `len()`; extent asserts stay,
 buffer access unchecked in the twin. Indexing is unrolled per rank with constant
