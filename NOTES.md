@@ -46,7 +46,7 @@ on PoCL CPU (4x work-items; local size not the cause), GPU unmeasured. `state`
 (halo-padded), `flux` (partial coverage per direction) and the halo kernels don't
 fit a per-item partition; `tend` can't be `alloc_uninit` (halo kernels read it first
 in the caravan).
-**Unchecked per-item views — prototype on branch `unchecked-per-item` (2026-10-30):**
+**Unchecked per-item views — landed on main (2026-10-30):**
 rust-gpu bounds-checks every slice index (compare + OpenCL `printf` + return); the
 per-work-item early exit stops PoCL vectorising (miniweather built with the UB panic
 strategy: 0 → 16 vectorised loops, −5%). Per-item kernels now get TWO entry points
@@ -68,8 +68,10 @@ includes it), only `PerItemOut` needs offset 0 + exact coverage. The host check 
 stricter today (exact for all three) and STAYS so for now (2026-10-30): partial
 coverage is tied to tiling, global offsets and tensor views with leading dimensions
 (buffer extents ≠ grid extents; N-D offsets today would shift rows, stride = grid
-width, not pick a sub-rectangle) — design them together, with the halo/padded views. Before merging: measure the
-extra `clBuildProgram` time. Next: halo/stencil views.
+width, not pick a sub-rectangle) — design them together, with the halo/padded views.
+Build cost of the twins: SPIR-V +19–110%, `clBuildProgram` +0–5 ms (PoCL) / +3–6 ms
+(rusticl), no cold-start cost (both runtimes codegen a kernel lazily at first launch, and
+typed code never launches the checked entry). Next: halo/stencil views.
 **Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
 inside the kernel, so the positional handle is no worse than before; and the real
 user difficulty is telling which params are PIPED (every buffer-like param —
