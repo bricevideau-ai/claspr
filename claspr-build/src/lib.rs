@@ -1032,25 +1032,31 @@ enum PerItemAccess {
     Interior(proc_macro2::TokenStream),
     /// `PerRow<T>` (`mutable`) / `PerRowIn<T>`: this work-item's row.
     Row { mutable: bool },
+    /// `TensorMut<T, R>` (`mutable`) / `Tensor<T, R>`: a strided view; its
+    /// `Shape<R>` arrives as an extra by-value param right after the buffer.
+    Tensor {
+        mutable: bool,
+        rank: proc_macro2::TokenStream,
+    },
 }
 
 /// `Halo` / `Interior` padding from the const arguments after the element type:
 /// `RX`, then `RY` (default `RX`), then `RZ` (default 0) — the aliases' defaults.
-/// Each as a braced const argument, so a const expression works too.
+/// (A const expression arrives already braced, as Rust requires.)
 fn halo_pad(consts: &[&syn::GenericArgument]) -> Option<[proc_macro2::TokenStream; 3]> {
-    let tok = |a: &syn::GenericArgument| quote::quote!({ #a });
+    let tok = |a: &syn::GenericArgument| quote::quote!(#a);
     let rx = tok(consts.first()?);
     let ry = consts.get(1).map(|a| tok(a)).unwrap_or_else(|| rx.clone());
     let rz = consts
         .get(2)
         .map(|a| tok(a))
-        .unwrap_or_else(|| quote::quote!({ 0 }));
+        .unwrap_or_else(|| quote::quote!(0));
     (consts.len() <= 3).then_some([rx, ry, rz])
 }
 
 /// The element type `T` and access, if `ty` is a per-item kernel parameter
 /// (last path segment): `PerItem<T>` / `PerItemIn<T>` / `PerItemOut<T>`,
-/// `PerRow<T>` / `PerRowIn<T>`, a
+/// `PerRow<T>` / `PerRowIn<T>`, `Tensor<T, R>` / `TensorMut<T, R>`, a
 /// stencil — `Stencil<T, Padded<..> | Wrap | Clamp>` or its aliases `Halo<T, R..>`
 /// / `Periodic<T>` / `Clamped<T>` — or `Interior<T, R..>`. Recognised by name,
 /// so user aliases of these types are not (keep in sync with `claspr-macros`).
@@ -1075,6 +1081,10 @@ fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, PerItemAccess)> {
         ("PerItemOut", []) => PerItemAccess::Write,
         ("PerRow", []) => PerItemAccess::Row { mutable: true },
         ("PerRowIn", []) => PerItemAccess::Row { mutable: false },
+        ("Tensor" | "TensorMut", [rank]) => PerItemAccess::Tensor {
+            mutable: seg.ident == "TensorMut",
+            rank: quote::quote!(#rank),
+        },
         ("Periodic", []) => PerItemAccess::Stencil(quote::quote!(crate::__claspr::Wrap)),
         ("Clamped", []) => PerItemAccess::Stencil(quote::quote!(crate::__claspr::Clamp)),
         ("Halo", consts) => {
@@ -1168,16 +1178,46 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn, checked: bool) -> Result<Option<
         *pt.ty = match access {
             PerItemAccess::ReadWrite
             | PerItemAccess::Interior(_)
-            | PerItemAccess::Row { mutable: true } => syn::parse_quote!(&mut [#elem]),
+            | PerItemAccess::Row { mutable: true }
+            | PerItemAccess::Tensor { mutable: true, .. } => syn::parse_quote!(&mut [#elem]),
             PerItemAccess::Read
             | PerItemAccess::Stencil(_)
-            | PerItemAccess::Row { mutable: false } => syn::parse_quote!(&[#elem]),
+            | PerItemAccess::Row { mutable: false }
+            | PerItemAccess::Tensor { mutable: false, .. } => syn::parse_quote!(&[#elem]),
             PerItemAccess::Write => syn::parse_quote!(&mut [core::mem::MaybeUninit<#elem>]),
         };
         lowered.push((name, raw, access));
     }
     if lowered.is_empty() {
         return Ok(None);
+    }
+    // A tensor's `Shape<R>` is its own by-value kernel arg, right after the
+    // buffer: on the wire `T *buf, size_t len, Shape<R> shape`.
+    let shape_params: Vec<(usize, syn::FnArg)> = f
+        .sig
+        .inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, input)| {
+            let syn::FnArg::Typed(pt) = input else {
+                return None;
+            };
+            let syn::Pat::Ident(pi) = &*pt.pat else {
+                return None;
+            };
+            let (name, _, access) = lowered.iter().find(|(_, raw, _)| *raw == pi.ident)?;
+            let PerItemAccess::Tensor { rank, .. } = access else {
+                return None;
+            };
+            let shape = quote::format_ident!("{}_shape", name);
+            Some((
+                i + 1,
+                syn::parse_quote!(#shape: crate::__claspr::Shape<#rank>),
+            ))
+        })
+        .collect();
+    for (at, param) in shape_params.into_iter().rev() {
+        f.sig.inputs.insert(at, param);
     }
     let gid = gid.unwrap_or_else(|| {
         let id = quote::format_ident!("__claspr_gid");
@@ -1223,6 +1263,15 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn, checked: bool) -> Result<Option<
                 let unchecked = !checked;
                 syn::parse_quote! {
                     let #name = crate::__claspr::Stencil::<_, #boundary>::__claspr_new(#raw, #gid, #gsize, #unchecked);
+                }
+            }
+            PerItemAccess::Tensor { mutable, rank } => {
+                let unchecked = !checked;
+                let shape = quote::format_ident!("{}_shape", name);
+                let view = if *mutable { quote::quote!(TensorMut) } else { quote::quote!(Tensor) };
+                syn::parse_quote! {
+                    #[allow(unused_mut)]
+                    let mut #name = crate::__claspr::#view::<_, #rank>::__claspr_new(#raw, #shape, #unchecked);
                 }
             }
             PerItemAccess::Row { mutable } => {
@@ -1649,6 +1698,254 @@ pub mod __claspr {
             self.row
         }
     }
+
+    /// The strided layout of a tensor argument, passed BY VALUE right after its
+    /// buffer — field for field the host's `claspr::Shape`: element
+    /// `[i0, ..]` is buffer element `offset + Σ i_d * stride[d]`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Shape<const R: usize> {
+        pub offset: usize,
+        pub ext: [usize; R],
+        pub stride: [usize; R],
+    }
+
+    /// Buffer index of a multi-index, per rank — unrolled with constant array
+    /// indices (a runtime-indexed `ext[d]` / `stride[d]` crashes PoCL's
+    /// `llvm-spirv`, though the SPIR-V is valid).
+    pub trait ShapeIndex<const R: usize> {
+        /// Buffer index of `idx`, after checking each `idx[d] < ext[d]` (the
+        /// launch checked the whole view is inside the buffer, so this is too).
+        fn index_of(&self, idx: [usize; R]) -> usize;
+        /// Extent of axis `d` (`d < R`).
+        fn extent(&self, d: usize) -> usize;
+    }
+
+    macro_rules! shape_index {
+        ($($r:literal: [$($d:literal),*]),*) => {$(
+            impl ShapeIndex<$r> for Shape<$r> {
+                #[inline(always)]
+                fn index_of(&self, idx: [usize; $r]) -> usize {
+                    let mut o = self.offset;
+                    $(
+                        assert!(idx[$d] < self.ext[$d], "tensor index past its extent");
+                        o += idx[$d] * self.stride[$d];
+                    )*
+                    o
+                }
+                #[inline(always)]
+                fn extent(&self, d: usize) -> usize {
+                    match d {
+                        $($d => self.ext[$d],)*
+                        _ => panic!("tensor axis past its rank"),
+                    }
+                }
+            }
+        )*};
+    }
+    shape_index!(1: [0], 2: [0, 1], 3: [0, 1, 2], 4: [0, 1, 2, 3]);
+
+    /// A read-only rank-`R` view of a buffer (`Shape<R>` layout): `t[[i, j]]`,
+    /// `t.sub(i)` (rank `R - 1`), `t.extent(d)`; rank 1 also `t[j]`, `t.len()`.
+    /// Shared by all work-items — any element may be read.
+    pub struct Tensor<'a, T, const R: usize> {
+        buf: &'a [T],
+        shape: Shape<R>,
+        unchecked: bool,
+    }
+
+    /// A read-write rank-`R` view of a buffer — like `&mut [T]`, shared by all
+    /// work-items (each must write distinct elements).
+    pub struct TensorMut<'a, T, const R: usize> {
+        buf: &'a mut [T],
+        shape: Shape<R>,
+        unchecked: bool,
+    }
+
+    impl<'a, T, const R: usize> Tensor<'a, T, R> {
+        #[doc(hidden)]
+        #[inline(always)]
+        pub fn __claspr_new(buf: &'a [T], shape: Shape<R>, unchecked: bool) -> Self {
+            Tensor { buf, shape, unchecked }
+        }
+
+        /// Extent of axis `d`.
+        #[inline(always)]
+        pub fn extent(&self, d: usize) -> usize
+        where
+            Shape<R>: ShapeIndex<R>,
+        {
+            self.shape.extent(d)
+        }
+
+        /// The view's layout.
+        #[inline(always)]
+        pub fn shape(&self) -> Shape<R> {
+            self.shape
+        }
+
+        #[inline(always)]
+        fn load(&self, o: usize) -> &T {
+            if self.unchecked {
+                // SAFETY: only the unchecked twin sets `unchecked`, dispatched by
+                // the typed launcher after its host check that the shape stays
+                // inside the buffer; `index_of` keeps the index within the shape.
+                unsafe { self.buf.get_unchecked(o) }
+            } else {
+                &self.buf[o]
+            }
+        }
+    }
+
+    impl<'a, T, const R: usize> TensorMut<'a, T, R> {
+        #[doc(hidden)]
+        #[inline(always)]
+        pub fn __claspr_new(buf: &'a mut [T], shape: Shape<R>, unchecked: bool) -> Self {
+            TensorMut { buf, shape, unchecked }
+        }
+
+        /// Extent of axis `d`.
+        #[inline(always)]
+        pub fn extent(&self, d: usize) -> usize
+        where
+            Shape<R>: ShapeIndex<R>,
+        {
+            self.shape.extent(d)
+        }
+
+        /// The view's layout.
+        #[inline(always)]
+        pub fn shape(&self) -> Shape<R> {
+            self.shape
+        }
+
+        #[inline(always)]
+        fn load(&self, o: usize) -> &T {
+            if self.unchecked {
+                // SAFETY: as for `Tensor::load`.
+                unsafe { self.buf.get_unchecked(o) }
+            } else {
+                &self.buf[o]
+            }
+        }
+
+        #[inline(always)]
+        fn load_mut(&mut self, o: usize) -> &mut T {
+            if self.unchecked {
+                // SAFETY: as for `Tensor::load`.
+                unsafe { self.buf.get_unchecked_mut(o) }
+            } else {
+                &mut self.buf[o]
+            }
+        }
+    }
+
+    impl<T, const R: usize> core::ops::Index<[usize; R]> for Tensor<'_, T, R>
+    where
+        Shape<R>: ShapeIndex<R>,
+    {
+        type Output = T;
+        #[inline(always)]
+        fn index(&self, idx: [usize; R]) -> &T {
+            self.load(self.shape.index_of(idx))
+        }
+    }
+
+    impl<T, const R: usize> core::ops::Index<[usize; R]> for TensorMut<'_, T, R>
+    where
+        Shape<R>: ShapeIndex<R>,
+    {
+        type Output = T;
+        #[inline(always)]
+        fn index(&self, idx: [usize; R]) -> &T {
+            self.load(self.shape.index_of(idx))
+        }
+    }
+
+    impl<T, const R: usize> core::ops::IndexMut<[usize; R]> for TensorMut<'_, T, R>
+    where
+        Shape<R>: ShapeIndex<R>,
+    {
+        #[inline(always)]
+        fn index_mut(&mut self, idx: [usize; R]) -> &mut T {
+            let o = self.shape.index_of(idx);
+            self.load_mut(o)
+        }
+    }
+
+    impl<T> core::ops::Index<usize> for Tensor<'_, T, 1> {
+        type Output = T;
+        #[inline(always)]
+        fn index(&self, i: usize) -> &T {
+            self.load(self.shape.index_of([i]))
+        }
+    }
+
+    impl<T> core::ops::Index<usize> for TensorMut<'_, T, 1> {
+        type Output = T;
+        #[inline(always)]
+        fn index(&self, i: usize) -> &T {
+            self.load(self.shape.index_of([i]))
+        }
+    }
+
+    impl<T> core::ops::IndexMut<usize> for TensorMut<'_, T, 1> {
+        #[inline(always)]
+        fn index_mut(&mut self, i: usize) -> &mut T {
+            let o = self.shape.index_of([i]);
+            self.load_mut(o)
+        }
+    }
+
+    impl<T> Tensor<'_, T, 1> {
+        /// Number of elements.
+        #[inline(always)]
+        pub fn len(&self) -> usize {
+            self.shape.ext[0]
+        }
+    }
+
+    impl<T> TensorMut<'_, T, 1> {
+        /// Number of elements.
+        #[inline(always)]
+        pub fn len(&self) -> usize {
+            self.shape.ext[0]
+        }
+    }
+
+    // `sub(i)`: the rank `R - 1` view at index `i` of the first axis (spelled
+    // out per rank — `R - 1` in a const generic needs an unstable feature).
+    macro_rules! tensor_sub {
+        ($($r:literal => $s:literal: [$($d:literal),*]),*) => {$(
+            impl Shape<$r> {
+                #[inline(always)]
+                fn sub(&self, i: usize) -> Shape<$s> {
+                    assert!(i < self.ext[0], "tensor index past its extent");
+                    Shape {
+                        offset: self.offset + i * self.stride[0],
+                        ext: [$(self.ext[$d]),*],
+                        stride: [$(self.stride[$d]),*],
+                    }
+                }
+            }
+            impl<'a, T> Tensor<'a, T, $r> {
+                /// The rank-`R - 1` view at index `i` of the first axis.
+                #[inline(always)]
+                pub fn sub(&self, i: usize) -> Tensor<'a, T, $s> {
+                    Tensor { buf: self.buf, shape: self.shape.sub(i), unchecked: self.unchecked }
+                }
+            }
+            impl<T> TensorMut<'_, T, $r> {
+                /// The rank-`R - 1` view at index `i` of the first axis.
+                #[inline(always)]
+                pub fn sub(&mut self, i: usize) -> TensorMut<'_, T, $s> {
+                    let shape = self.shape.sub(i);
+                    TensorMut { buf: &mut *self.buf, shape, unchecked: self.unchecked }
+                }
+            }
+        )*};
+    }
+    tensor_sub!(2 => 1: [1], 3 => 2: [1, 2], 4 => 3: [1, 2, 3]);
 
     /// A stencil offset: `[dx]`, `[dx, dy]` or `[dx, dy, dz]` (missing axes are 0).
     pub trait Offset {

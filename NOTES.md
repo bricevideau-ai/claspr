@@ -101,6 +101,19 @@ scalar arg vs tuple vs shaped buffer type), strided vs contiguous layout. SETTLE
 arg. Gap found: `scalar_arg!` gives a user struct `KernelArg` but not
 `From<T> for ScalarInput<T>` / `SlotValue`, so typed launchers need
 `ScalarInput::Concrete(v)` — extend `scalar_arg!` (or B's descriptor type) first.
+**Tensor views (family B) — branch `tensor-views` (2026-10-30):** `Tensor<T, R>` /
+`TensorMut<T, R>` = buffer + by-value `Shape<R>` (offset, extents, strides; host
+`claspr::Shape`, `contiguous` / `slice`); on the wire `T *buf, size_t len, Shape s`
+(user's call: keep the slice splatted so any buffer still works). The macro inserts
+a non-piped `<name>_shape` scalar after the buffer (so tiles = re-bound shapes);
+host `check_tensor_shape` / `Error::TensorShapeMismatch`. Device: `t[[i, j]]`,
+`sub(i)` (ranks 2–4), `extent(d)`, rank-1 `t[j]` / `len()`; extent asserts stay,
+buffer access unchecked in the twin. Indexing is unrolled per rank with constant
+array indices — a runtime `ext[d]` crashes PoCL's `llvm-spirv-20` (valid SPIR-V,
+rusticl fine). llama2 `att_scores` / `att_mix` use it (drop `seq_len` / `head_size` /
+`kv_dim` / `kv_mul`; 2-D grids): output identical, perf neutral. `Shape` has its own
+`ScalarInput` / slot impls; the general `scalar_arg!` gap remains. Not yet: Halo as
+sugar over Tensor (reach), staggered/asymmetric reach, component axes for miniweather.
 **Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
 inside the kernel, so the positional handle is no worse than before; and the real
 user difficulty is telling which params are PIPED (every buffer-like param —

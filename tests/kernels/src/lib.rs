@@ -248,6 +248,60 @@ pub mod kernels {
         }
     }
 
+    /// Transpose: on the `[n0, n1]` grid, work-item `(i, j)` writes element
+    /// `j * n0 + i` of `out` (row-major `[n1, n0]`) from `src[[i, j]]` — a
+    /// `Tensor<u32, 2>` read at any multi-index.
+    #[claspr::kernel]
+    pub fn transpose_u32(
+        #[spirv(cross_workgroup)] src: Tensor<u32, 2>,
+        #[spirv(cross_workgroup)] out: PerItemOut<u32>,
+    ) -> Written {
+        let c = out.coord();
+        Written {
+            out: out.write(src[[c.x, c.y]]),
+        }
+    }
+
+    /// `out[i] = sum of src.sub(i)` — rank-1 rows of a (possibly strided) view.
+    #[claspr::kernel]
+    pub fn tensor_row_sums_u32(
+        #[spirv(cross_workgroup)] src: Tensor<u32, 2>,
+        #[spirv(cross_workgroup)] out: PerItemOut<u32>,
+    ) -> Written {
+        let row = src.sub(out.index());
+        let mut sum = 0u32;
+        let mut j = 0usize;
+        while j < row.len() {
+            sum += row[j];
+            j += 1;
+        }
+        Written {
+            out: out.write(sum),
+        }
+    }
+
+    /// `out[i] = t[[i, 1, 2]]` via `sub(i).sub(1)[2]` — rank 3 down to rank 1.
+    #[claspr::kernel]
+    pub fn tensor3_pick_u32(
+        #[spirv(cross_workgroup)] t: Tensor<u32, 3>,
+        #[spirv(cross_workgroup)] out: PerItemOut<u32>,
+    ) -> Written {
+        let i = out.index();
+        Written {
+            out: out.write(t.sub(i).sub(1)[2]),
+        }
+    }
+
+    /// `m[[i, i]] = d[i]` — a `TensorMut` written at work-item-distinct elements.
+    #[claspr::kernel]
+    pub fn set_diagonal_u32(
+        #[spirv(cross_workgroup)] m: TensorMut<u32, 2>,
+        #[spirv(cross_workgroup)] d: PerItemIn<u32>,
+    ) {
+        let i = d.index();
+        m[[i, i]] = *d;
+    }
+
     /// `out[i] = sum of row i` — `PerRowIn`: the buffer is one equal row per
     /// work-item, and this work-item reads its own.
     #[claspr::kernel]

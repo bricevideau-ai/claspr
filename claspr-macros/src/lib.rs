@@ -115,6 +115,15 @@ use syn::{
 ///   exactly (`Error::RowGridMismatch`). `PerRowIn<T>` is the read-only form.
 ///   Loop to `row.len()` rather than a separate length argument: the bounds
 ///   check then matches the loop condition and the driver can drop it.
+/// - `Tensor<T, R>` is a read-only rank-`R` strided view of a buffer, shared
+///   by all work-items: `t[[i, j]]`, `t.sub(i)` (rank `R - 1`, for `R` up to 4),
+///   `t.extent(d)`; rank 1 also `t[j]` / `t.len()`. On the wire it is the buffer
+///   then a by-value `claspr::Shape<R>` (offset, extents, strides), so the
+///   launcher takes the buffer (piped) followed by a `<name>_shape: Shape<R>`
+///   scalar (not piped; a literal or a `slot!`, e.g. to walk tiles of one
+///   buffer with `Shape::slice`). Each launch checks the shape stays inside
+///   the buffer (`Error::TensorShapeMismatch`). `TensorMut<T, R>` is the
+///   read-write form (like `&mut [T]`: work-items must write distinct elements).
 /// - Stencils read this work-item's cell AND its neighbours, read-only (a
 ///   neighbour is another work-item's cell): `*name` is the cell,
 ///   `name.at([dx, dy])` (`[dx]` / `[dx, dy, dz]` too) a neighbour.
@@ -691,6 +700,7 @@ fn validate_kernel_sig(sig: &Signature) -> syn::Result<()> {
 }
 
 fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
+    let func = &with_tensor_shapes(func);
     validate_kernel_sig(&func.sig)?;
     let name = &func.sig.ident;
 
@@ -975,6 +985,12 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         GridCheck::Rows => quote! {
                             ::claspr::check_row_grid(&__claspr_spec, #len, #name_lit)?;
                         },
+                        GridCheck::Tensor => {
+                            let shape = quote::format_ident!("{}_shape", pname.to_string());
+                            quote! {
+                                ::claspr::check_tensor_shape(&#shape, #len, #name_lit)?;
+                            }
+                        }
                     });
                 }
                 if write_only {
@@ -2821,6 +2837,52 @@ fn cross_workgroup_element_ty(ty: &Type) -> syn::Result<CrossWorkgroupTy> {
     }
 }
 
+/// `func` with a `<name>_shape: ::claspr::Shape<R>` scalar param inserted right
+/// after each `Tensor<T, R>` / `TensorMut<T, R>` param — what claspr-build adds
+/// on the device (a tensor is its buffer then its shape, by value, on the
+/// wire), so every signature walker sees the launcher's real parameters.
+fn with_tensor_shapes(func: &ItemFn) -> ItemFn {
+    let mut func = func.clone();
+    let mut inputs = syn::punctuated::Punctuated::<syn::FnArg, syn::Token![,]>::new();
+    for input in std::mem::take(&mut func.sig.inputs) {
+        let shape = match &input {
+            syn::FnArg::Typed(pt) => tensor_rank(&pt.ty).and_then(|rank| match &*pt.pat {
+                syn::Pat::Ident(pi) => {
+                    Some((quote::format_ident!("{}_shape", pi.ident), rank.clone()))
+                }
+                _ => None,
+            }),
+            syn::FnArg::Receiver(_) => None,
+        };
+        inputs.push(input);
+        if let Some((name, rank)) = shape {
+            inputs.push(syn::parse_quote!(#name: ::claspr::Shape<#rank>));
+        }
+    }
+    func.sig.inputs = inputs;
+    func
+}
+
+/// The rank argument of a `Tensor<T, R>` / `TensorMut<T, R>` param type.
+fn tensor_rank(ty: &Type) -> Option<&syn::GenericArgument> {
+    let Type::Path(tp) = ty else { return None };
+    let seg = tp.path.segments.last()?;
+    if seg.ident != "Tensor" && seg.ident != "TensorMut" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    let mut args = args
+        .args
+        .iter()
+        .filter(|a| !matches!(a, syn::GenericArgument::Lifetime(_)));
+    let (_, rank, None) = (args.next()?, args.next()?, args.next()) else {
+        return None;
+    };
+    Some(rank)
+}
+
 /// How the launch checks a per-item view param's buffer against the grid.
 enum GridCheck {
     /// One element per work-item (`check_per_item_grid`).
@@ -2830,11 +2892,15 @@ enum GridCheck {
     Halo(TokenStream2),
     /// One equal row per work-item (`check_row_grid`).
     Rows,
+    /// A `Tensor` / `TensorMut`: its `<name>_shape` (the scalar param that
+    /// follows it) stays inside the buffer (`check_tensor_shape`).
+    Tensor,
 }
 
 /// A per-item view parameter type, by name (last path segment) — the same
 /// spellings claspr-build's `per_item_elem` lowers (keep the two in sync):
 /// `PerItem` / `PerItemIn` / `PerItemOut<T>`, `PerRow` / `PerRowIn<T>`,
+/// `Tensor` / `TensorMut<T, R>`,
 /// `Periodic` / `Clamped<T>`,
 /// `Halo<T, RX[, RY[, RZ]]>` / `Interior<T, ..>` (defaults `RY = RX`, `RZ = 0`),
 /// and `Stencil<T, Wrap | Clamp | Padded<RX, RY, RZ>>`.
@@ -2873,13 +2939,15 @@ fn per_item_view(ty: &Type) -> Option<CrossWorkgroupTy> {
         write_only,
         grid_check,
     };
-    use GridCheck::{Exact, Halo, Rows};
+    use GridCheck::{Exact, Halo, Rows, Tensor};
     match (seg.ident.to_string().as_str(), rest) {
         ("PerItem", []) => Some(view(true, false, Exact)),
         ("PerItemIn", []) => Some(view(false, false, Exact)),
         ("PerItemOut", []) => Some(view(true, true, Exact)),
         ("PerRow", []) => Some(view(true, false, Rows)),
         ("PerRowIn", []) => Some(view(false, false, Rows)),
+        ("Tensor", [_rank]) => Some(view(false, false, Tensor)),
+        ("TensorMut", [_rank]) => Some(view(true, false, Tensor)),
         ("Periodic" | "Clamped", []) => Some(view(false, false, Exact)),
         ("Halo", consts) => Some(view(false, false, Halo(pad(consts)?))),
         ("Interior", consts) => Some(view(true, false, Halo(pad(consts)?))),
@@ -3163,6 +3231,7 @@ fn instantiate_trait_methods(
     let mut impls = Vec::new();
     let mut skipped = Vec::new();
     'fns: for func in kernel_fns {
+        let func = &with_tensor_shapes(func);
         let name = &func.sig.ident;
         let mut gens: Vec<TokenStream2> = Vec::new();
         let mut params: Vec<TokenStream2> = Vec::new();

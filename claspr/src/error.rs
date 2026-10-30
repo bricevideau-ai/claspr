@@ -49,6 +49,14 @@ pub enum Error {
         grid: Vec<usize>,
         len: usize,
     },
+    /// A tensor kernel argument's `Shape` reaches past its buffer.
+    TensorShapeMismatch {
+        arg: &'static str,
+        offset: usize,
+        ext: Vec<usize>,
+        stride: Vec<usize>,
+        len: usize,
+    },
     /// A halo-padded stencil kernel argument (`Halo` / `Interior`) is not exactly
     /// the launch grid plus `pad` halo cells on each side of each axis.
     HaloGridMismatch {
@@ -154,6 +162,17 @@ impl fmt::Display for Error {
                 "kernel launch: per-row argument `{arg}` has {len} elements, which the grid \
                  {grid:?} ({} work-items) does not split into equal rows",
                 grid.iter().product::<usize>()
+            ),
+            Error::TensorShapeMismatch {
+                arg,
+                offset,
+                ext,
+                stride,
+                len,
+            } => write!(
+                f,
+                "kernel launch: tensor argument `{arg}`'s shape (offset {offset}, extents \
+                 {ext:?}, strides {stride:?}) reaches past its buffer of {len} elements"
             ),
             Error::HaloGridMismatch {
                 arg,

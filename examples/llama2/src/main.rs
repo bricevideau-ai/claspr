@@ -38,7 +38,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use claspr::eager::{DeviceDynOp, DeviceOpExt, Pipe, bundle2, forward};
-use claspr::{Context, DeviceScalar, DeviceSlice, Single, graph};
+use claspr::{Context, DeviceScalar, DeviceSlice, Shape, Single, graph};
 
 #[claspr::device]
 mod gpu {
@@ -175,36 +175,33 @@ mod gpu {
 
     /// Attention scores `att[h, t] = q_h . k_t / sqrt(head_size)` for every head
     /// `h` and every past position `t <= pos` (one work-item per `(h, t)`).
+    /// Attention scores on the `[seq_len, n_heads]` grid: work-item `(t, h)` is
+    /// `q[h] · k_cache[t][h / kv_mul]` (scaled), for `t <= pos`. `q` is
+    /// `[n_heads, head_size]` and `k_cache` `[seq_len, n_kv_heads, head_size]`
+    /// (their `Shape`s come with the launch), so `kv_mul` is
+    /// `n_heads / n_kv_heads`.
     #[claspr::kernel]
-    #[allow(clippy::too_many_arguments)]
     pub fn att_scores(
-        #[spirv(global_invocation_id)] id: USizeVec3,
-        #[spirv(cross_workgroup)] q: &[f32],
-        #[spirv(cross_workgroup)] k_cache: &[f32],
+        #[spirv(cross_workgroup)] q: Tensor<f32, 2>,
+        #[spirv(cross_workgroup)] k_cache: Tensor<f32, 3>,
         #[spirv(cross_workgroup)] att: PerItem<f32>,
         #[spirv(cross_workgroup)] step: &Step,
-        seq_len: u32,
-        head_size: u32,
-        kv_dim: u32,
-        kv_mul: u32,
     ) {
-        let (h, t) = (id.x / seq_len as usize, id.x % seq_len as usize);
+        let (t, h) = (att.coord().x, att.coord().y);
         if t > step.pos as usize {
             return;
         }
-        let hs = head_size as usize;
-        let qo = h * hs;
-        let ko = t * kv_dim as usize + (h / kv_mul as usize) * hs;
+        let kv_mul = q.extent(0) / k_cache.extent(1);
+        let (qh, kh) = (q.sub(h), k_cache.sub(t).sub(h / kv_mul));
         let mut score = 0.0f32;
         let mut i = 0usize;
-        while i < hs {
-            score += q[qo + i] * k_cache[ko + i];
+        while i < qh.len() {
+            score += qh[i] * kh[i];
             i += 1;
         }
-        *att = score / ocl::sqrt(head_size as f32);
+        *att = score / ocl::sqrt(qh.len() as f32);
     }
 
-    /// Softmax of each head's scores over `t <= pos` (one work-item per head).
     #[claspr::kernel]
     pub fn softmax(
         #[spirv(global_invocation_id)] id: USizeVec3,
@@ -236,26 +233,23 @@ mod gpu {
     }
 
     /// Each head's attention-weighted sum of the cached values, for `t <= pos`.
+    /// Attention-weighted values on the `[head_size, n_heads]` grid: work-item
+    /// `(j, h)` is `Σ_{t <= pos} att[h][t] * v_cache[t][h / kv_mul][j]`. `att` is
+    /// `[n_heads, seq_len]`, `v_cache` `[seq_len, n_kv_heads, head_size]`.
     #[claspr::kernel]
-    #[allow(clippy::too_many_arguments)]
     pub fn att_mix(
-        #[spirv(global_invocation_id)] id: USizeVec3,
-        #[spirv(cross_workgroup)] att: &[f32],
-        #[spirv(cross_workgroup)] v_cache: &[f32],
+        #[spirv(cross_workgroup)] att: Tensor<f32, 2>,
+        #[spirv(cross_workgroup)] v_cache: Tensor<f32, 3>,
         #[spirv(cross_workgroup)] out: PerItemOut<f32>,
         #[spirv(cross_workgroup)] step: &Step,
-        seq_len: u32,
-        head_size: u32,
-        kv_dim: u32,
-        kv_mul: u32,
     ) -> Written {
-        let hs = head_size as usize;
-        let (h, j) = (id.x / hs, id.x % hs);
-        let vo = (h / kv_mul as usize) * hs + j;
+        let (j, h) = (out.coord().x, out.coord().y);
+        let kvh = h / (att.extent(0) / v_cache.extent(1));
+        let a = att.sub(h);
         let mut acc = 0.0f32;
         let mut t = 0usize;
         while t <= step.pos as usize {
-            acc += att[h * seq_len as usize + t] * v_cache[t * kv_dim as usize + vo];
+            acc += a[t] * v_cache[[t, kvh, j]];
             t += 1;
         }
         Written {
@@ -263,7 +257,6 @@ mod gpu {
         }
     }
 
-    /// `x += y`: the residual connection.
     #[claspr::kernel]
     pub fn add(
         #[spirv(global_invocation_id)] id: USizeVec3,
@@ -336,6 +329,7 @@ impl Config {
     fn kv_dim(&self) -> usize {
         self.dim * self.n_kv_heads / self.n_heads
     }
+    #[cfg(test)] // the kernels derive it from the cache shapes
     fn kv_mul(&self) -> usize {
         self.n_heads / self.n_kv_heads
     }
@@ -722,7 +716,9 @@ impl Builder<'_> {
         let att = self.zeros(c.n_heads * c.seq_len)?;
         let ks = self.ks;
         let (d, kvd, hs) = (c.dim as u32, c.kv_dim() as u32, c.head_size() as u32);
-        let (seq, kv_mul) = (c.seq_len as u32, c.kv_mul() as u32);
+        let q_shape = Shape::contiguous([c.n_heads, c.head_size()]);
+        let att_shape = Shape::contiguous([c.n_heads, c.seq_len]);
+        let cache_shape = Shape::contiguous([c.seq_len, c.n_kv_heads, c.head_size()]);
         Ok(g.and_then(|(x, step)| {
             graph! {
                 let (x, _rms, xb) = ks.rmsnorm([c.dim], x, rms, xb, d);
@@ -731,11 +727,12 @@ impl Builder<'_> {
                     ks.kv([c.kv_dim()], wk, wv, xb, k_cache, v_cache, step, kvd);
                 let (q, k_cache, step) = ks.rope([c.dim / 2], q, k_cache, step, kvd, hs);
                 let (_q, _k_cache, att, step) = ks.att_scores(
-                    [c.n_heads * c.seq_len], q, k_cache, att, step, seq, hs, kvd, kv_mul,
+                    [c.seq_len, c.n_heads], q, q_shape, k_cache, cache_shape, att, step,
                 );
                 let (att, step) = ks.softmax([c.n_heads], att, step);
-                let (_att, _v_cache, xb2, step) =
-                    ks.att_mix([c.dim], att, v_cache, xb2, step, seq, hs, kvd, kv_mul);
+                let (_att, _v_cache, xb2, step) = ks.att_mix(
+                    [c.head_size(), c.n_heads], att, att_shape, v_cache, cache_shape, xb2, step,
+                );
                 let (_wo, _xb2, xo) = ks.matmul([c.dim], wo, xb2, xo);
                 let (x, _xo) = ks.add([c.dim], x, xo);
                 bundle2(forward(x), forward(step))

@@ -93,6 +93,7 @@ pub mod exec_ctx;
 pub mod host_view;
 pub mod mappable;
 pub mod record;
+pub mod tensor;
 mod tier2_macros;
 pub mod transfer;
 
@@ -135,6 +136,7 @@ pub use op::{
 };
 pub use ppm::write_ppm_rgba8;
 pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
+pub use tensor::{Shape, check_tensor_shape};
 
 #[cfg(feature = "async-events")]
 pub use future::{EventFuture, EventFutureExt, LaunchFuture};
