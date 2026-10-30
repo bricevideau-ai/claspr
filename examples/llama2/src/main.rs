@@ -727,11 +727,11 @@ impl Builder<'_> {
                     ks.kv([c.kv_dim()], wk, wv, xb, k_cache, v_cache, step, kvd);
                 let (q, k_cache, step) = ks.rope([c.dim / 2], q, k_cache, step, kvd, hs);
                 let (_q, _k_cache, att, step) = ks.att_scores(
-                    [c.seq_len, c.n_heads], q, q_shape, k_cache, cache_shape, att, step,
+                    [c.seq_len, c.n_heads], (q, q_shape), (k_cache, cache_shape), att, step,
                 );
                 let (att, step) = ks.softmax([c.n_heads], att, step);
                 let (_att, _v_cache, xb2, step) = ks.att_mix(
-                    [c.head_size(), c.n_heads], att, att_shape, v_cache, cache_shape, xb2, step,
+                    [c.head_size(), c.n_heads], (att, att_shape), (v_cache, cache_shape), xb2, step,
                 );
                 let (_wo, _xb2, xo) = ks.matmul([c.dim], wo, xb2, xo);
                 let (x, _xo) = ks.add([c.dim], x, xo);

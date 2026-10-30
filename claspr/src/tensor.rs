@@ -2,10 +2,11 @@
 //! argument.
 //!
 //! A tensor parameter is two kernel args on the wire — its buffer (pointer +
-//! length, like any slice) and its `Shape` by value — so the launcher takes the
-//! buffer (piped, as usual) followed by a `<name>_shape` scalar (not piped; a
-//! literal or a `slot!`, so a replay can re-bind it, e.g. to walk tiles). Every
-//! launch first checks the shape stays inside the buffer
+//! length, like any slice) and its `Shape` by value — but ONE launcher argument:
+//! a `(buffer, shape)` pair. The buffer is piped as usual (it is what the
+//! handle holds); the shape is not — a `Shape`, bare extents (`[rows, cols]`,
+//! contiguous) or a `slot!`, so a replay can re-bind it, e.g. to walk tiles.
+//! Every launch first checks the shape stays inside the buffer
 //! ([`check_tensor_shape`]).
 
 use crate::eager::{ScalarInput, SlotEq, SlotValue};
@@ -140,6 +141,14 @@ impl<const R: usize> SlotEq for Shape<R> {
 impl<const R: usize> From<Shape<R>> for ScalarInput<Shape<R>> {
     fn from(shape: Shape<R>) -> Self {
         ScalarInput::Concrete(shape)
+    }
+}
+
+/// Bare extents in a shape position: the [`contiguous`](Shape::contiguous) shape
+/// — `(buf, [rows, cols])`.
+impl<const R: usize> From<[usize; R]> for ScalarInput<Shape<R>> {
+    fn from(ext: [usize; R]) -> Self {
+        ScalarInput::Concrete(Shape::contiguous(ext))
     }
 }
 

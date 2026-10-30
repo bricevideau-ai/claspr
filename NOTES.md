@@ -104,9 +104,12 @@ arg. Gap found: `scalar_arg!` gives a user struct `KernelArg` but not
 **Tensor views (family B) — branch `tensor-views` (2026-10-30):** `Tensor<T, R>` /
 `TensorMut<T, R>` = buffer + by-value `Shape<R>` (offset, extents, strides; host
 `claspr::Shape`, `contiguous` / `slice`); on the wire `T *buf, size_t len, Shape s`
-(user's call: keep the slice splatted so any buffer still works). The macro inserts
-a non-piped `<name>_shape` scalar after the buffer (so tiles = re-bound shapes);
-host `check_tensor_shape` / `Error::TensorShapeMismatch`. Device: `t[[i, j]]`,
+(user's call: keep the slice splatted so any buffer still works). On the host it
+is ONE launcher argument, a `(buffer, shape)` pair (user: host and kernel params
+must map one to one) — the buffer piped (the handle holds it), the shape a `Shape`,
+bare contiguous extents `[r, c]`, or a `slot!` (tiles = re-bound shapes; tested).
+Internally the macro still inserts a marked `<name>_shape` scalar and folds it
+into the buffer's param. Host `check_tensor_shape` / `Error::TensorShapeMismatch`. Device: `t[[i, j]]`,
 `sub(i)` (ranks 2–4), `extent(d)`, rank-1 `t[j]` / `len()`; extent asserts stay,
 buffer access unchecked in the twin. Indexing is unrolled per rank with constant
 array indices — a runtime `ext[d]` crashes PoCL's `llvm-spirv-20` (valid SPIR-V,
