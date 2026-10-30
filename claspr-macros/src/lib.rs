@@ -123,8 +123,10 @@ use syn::{
 ///   decomposes (on the wire: the buffer, then the shape by value) and the
 ///   handle hands back, so it pipes into the next kernel unchanged. A `Tensor`
 ///   also fills a plain slice / `PerItem*` param (its buffer; the shape is
-///   ignored). Each launch checks the shape stays inside the buffer
-///   (`Error::TensorShapeMismatch`). `TensorMut<T, R>` is the
+///   ignored). A `claspr::Tile` — a disjoint part of a split `Tensor`, for
+///   concurrent writes — fits ONLY tensor params (never a plain slice, which
+///   would see the whole shared buffer). Each launch checks the shape stays
+///   inside the buffer (`Error::TensorShapeMismatch`). `TensorMut<T, R>` is the
 ///   read-write form (like `&mut [T]`: work-items must write distinct elements).
 /// - Stencils read this work-item's cell AND its neighbours, read-only (a
 ///   neighbour is another work-item's cell): `*name` is the cell,
@@ -943,16 +945,22 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     GridCheck::Tensor(rank) => Some(rank.clone()),
                     _ => None,
                 };
-                let tensor_bound = tensor_rank
-                    .as_ref()
-                    .map(|rank| quote! { + ::claspr::KernelTensorArg<#rank> });
-                let dbound: TokenStream2 = if write_only {
-                    quote! { #gid: ::claspr::KernelSliceWriteArg<#elem> }
-                } else if mutable {
-                    quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> #tensor_bound }
-                } else {
-                    quote! { #gid: ::claspr::KernelSliceReadArg<#elem> #tensor_bound }
+                // A tensor param takes its own traits — a `Tensor` or a `Tile` —
+                // NOT the slice traits: a `Tile` (part of a shared buffer) must
+                // never reach a plain slice param, which would see all of it.
+                let dbound: TokenStream2 = match &tensor_rank {
+                    Some(rank) if mutable => {
+                        quote! { #gid: ::claspr::KernelTensorWriteArg<#elem, #rank> }
+                    }
+                    Some(rank) => quote! { #gid: ::claspr::KernelTensorReadArg<#elem, #rank> },
+                    None if write_only => quote! { #gid: ::claspr::KernelSliceWriteArg<#elem> },
+                    None if mutable => quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> },
+                    None => quote! { #gid: ::claspr::KernelSliceReadArg<#elem> },
                 };
+                // The tensor trait's view of the buffer, for a tensor param.
+                let tensor_trait = tensor_rank
+                    .as_ref()
+                    .map(|rank| quote! { ::claspr::KernelTensorReadArg::<#elem, #rank> });
                 let ibound: TokenStream2 = quote! { #sid: ::claspr::ToInput<#elem, Buf = #gid> };
                 generics.push((gid_tt.clone(), dbound));
                 method_only_generics.push((iid_tt.clone(), ibound));
@@ -979,7 +987,9 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 });
                 if per_item {
                     let name_lit = pname.to_string();
-                    let len = if write_only {
+                    let len = if let Some(tt) = &tensor_trait {
+                        quote! { #tt::element_count(&#pname) }
+                    } else if write_only {
                         quote! { ::claspr::KernelSliceWriteArg::<#elem>::element_count(&#pname) }
                     } else {
                         quote! { ::claspr::KernelSliceReadArg::<#elem>::element_count(&#pname) }
@@ -995,9 +1005,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                             ::claspr::check_row_grid(&__claspr_spec, #len, #name_lit)?;
                         },
                         GridCheck::Tensor(_) => quote! {
-                            ::claspr::check_tensor_shape(
-                                &::claspr::KernelTensorArg::shape(&#pname), #len, #name_lit,
-                            )?;
+                            ::claspr::check_tensor_shape(&#tensor_trait::shape(&#pname), #len, #name_lit)?;
                         },
                     });
                 }
@@ -1020,7 +1028,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 op_arg_pass.push(quote! { &#pname });
                 if tensor_rank.is_some() {
                     // On the wire a tensor is its buffer then its shape, by value.
-                    op_arg_pass.push(quote! { ::claspr::KernelTensorArg::shape(&#pname) });
+                    op_arg_pass.push(quote! { #tensor_trait::shape(&#pname) });
                 }
                 output_names.push(pname.clone());
                 output_types.push(if write_only {
@@ -1036,10 +1044,14 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // CB-mode: set this slice's (cl_mem, len) arg pair from the LENT
                 // local's handle, gather its upstream producer's sync points, and
                 // remember the handle for the output-pipe registration.
+                let record_handle = match &tensor_trait {
+                    Some(tt) => quote! { #tt::record_handle(&#pname) },
+                    None => quote! { ::claspr::KernelSliceReadArg::record_handle(&#pname) },
+                };
                 let cb_shape = tensor_rank.as_ref().map(|rank| {
                     quote! {
                         let __claspr_shape: ::claspr::Shape<#rank> =
-                            ::claspr::KernelTensorArg::shape(&#pname);
+                            #tensor_trait::shape(&#pname);
                         let __claspr_bytes = unsafe {
                             ::core::slice::from_raw_parts(
                                 (&__claspr_shape as *const ::claspr::Shape<#rank>) as *const u8,
@@ -1058,7 +1070,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 let note_origins_tt = note_origins(&origin_ident);
                 cb_arg_stmts.push(quote! {
                     {
-                        let __claspr_h = ::claspr::KernelSliceReadArg::record_handle(&#pname)?;
+                        let __claspr_h = #record_handle?;
                         __claspr_cb_waits.extend(__claspr_cb_ec.sp_lookup(#cbcell_ident));
                         #note_origins_tt
                         unsafe {
@@ -2879,8 +2891,9 @@ enum GridCheck {
     /// One equal row per work-item (`check_row_grid`).
     Rows,
     /// A `Tensor<T, R>` / `TensorMut<T, R>` (carries `R`): the host value is a
-    /// `claspr::Tensor` (`KernelTensorArg<R>`) whose shape — passed as the
-    /// kernel arg after the buffer — stays inside it (`check_tensor_shape`).
+    /// `claspr::Tensor` or `claspr::Tile` (`KernelTensor{Read,Write}Arg`) whose
+    /// shape — passed as the kernel arg after the buffer — stays inside it
+    /// (`check_tensor_shape`).
     Tensor(TokenStream2),
 }
 
@@ -3235,15 +3248,15 @@ fn instantiate_trait_methods(
                     grid_check: GridCheck::Tensor(rank),
                     ..
                 } => {
-                    // A tensor param: its value also carries its shape.
+                    // A tensor param: a `Tensor` or `Tile` (its own traits).
                     let d = quote::format_ident!("__claspr_TD{idx}");
                     let s = quote::format_ident!("__claspr_TS{idx}");
                     let bound = if mutable {
-                        quote! { ::claspr::KernelSliceReadWriteArg<#elem> }
+                        quote! { ::claspr::KernelTensorWriteArg<#elem, #rank> }
                     } else {
-                        quote! { ::claspr::KernelSliceReadArg<#elem> }
+                        quote! { ::claspr::KernelTensorReadArg<#elem, #rank> }
                     };
-                    gens.push(quote! { #d: #bound + ::claspr::KernelTensorArg<#rank> });
+                    gens.push(quote! { #d: #bound });
                     gens.push(quote! { #s: ::claspr::ToInput<#elem, Buf = #d> });
                     params.push(quote! { #pname: #s });
                     arg_names.push(pname);

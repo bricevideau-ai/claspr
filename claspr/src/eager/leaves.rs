@@ -561,9 +561,44 @@ where
     }
 }
 
-/// A tensor's view: one `clEnqueueReadBufferRect` when it has a rect copy (rank
-/// 1–3, contiguous innermost axis — a tile is a 2-D copy), else the span it
-/// covers, read whole (blocking) and gathered on the host.
+/// Read the view `shape` of `buf` into a dense row-major host `Vec`: one
+/// `clEnqueueReadBufferRect` when the view has a rect copy (rank 1–3,
+/// contiguous innermost axis — a tile is a 2-D copy), else the span it covers,
+/// read whole (blocking) and gathered on the host.
+fn read_view<T, M, L, const R: usize>(
+    buf: &DeviceSlice<T, M>,
+    shape: crate::Shape<R>,
+    launcher: &L,
+    blocking: bool,
+    deps: &[crate::cl_event],
+) -> Result<(Vec<T>, Option<crate::Event>)>
+where
+    T: Copy + Default,
+    M: MemMode,
+    L: crate::Launcher + ?Sized,
+{
+    use crate::Buffer;
+    crate::check_tensor_shape(&shape, buf.len(), "download")?;
+    if shape.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    if let Some(rect) = shape.rect(std::mem::size_of::<T>()) {
+        let mut host = vec![T::default(); shape.len()];
+        let event = crate::buffer::read_buffer_rect_enqueue(
+            buf, launcher, &rect, &mut host, blocking, deps,
+        )?;
+        return Ok((host, (!blocking).then_some(event)));
+    }
+    let last = shape
+        .max_index()
+        .expect("a non-empty view inside its buffer");
+    let mut span = vec![T::default(); last - shape.offset + 1];
+    crate::buffer::read_buffer_range_enqueue(buf, launcher, shape.offset, &mut span, true, deps)?;
+    Ok((shape.gather(&span), None))
+}
+
+/// A tensor's view: one rect copy when it has one (rank 1–3, contiguous
+/// innermost axis — a tile is a 2-D copy), else the covered span, gathered.
 impl<T, M, const R: usize> HostRead for crate::Tensor<DeviceSlice<T, M>, R>
 where
     T: Copy + Default + Send + 'static,
@@ -576,37 +611,28 @@ where
         blocking: bool,
         deps: &[crate::cl_event],
     ) -> Result<(Vec<T>, Option<crate::Event>)> {
+        read_view(self.buffer(), self.shape(), launcher, blocking, deps)
+    }
+    fn __claspr_ctx(&self) -> Context {
         use crate::Buffer;
-        let shape = self.shape();
-        crate::check_tensor_shape(&shape, self.buffer().len(), "download")?;
-        if shape.is_empty() {
-            return Ok((Vec::new(), None));
-        }
-        if let Some(rect) = shape.rect(std::mem::size_of::<T>()) {
-            let mut host = vec![T::default(); shape.len()];
-            let event = crate::buffer::read_buffer_rect_enqueue(
-                self.buffer(),
-                launcher,
-                &rect,
-                &mut host,
-                blocking,
-                deps,
-            )?;
-            return Ok((host, (!blocking).then_some(event)));
-        }
-        let last = shape
-            .max_index()
-            .expect("a non-empty view inside its buffer");
-        let mut span = vec![T::default(); last - shape.offset + 1];
-        crate::buffer::read_buffer_range_enqueue(
-            self.buffer(),
-            launcher,
-            shape.offset,
-            &mut span,
-            true,
-            deps,
-        )?;
-        Ok((shape.gather(&span), None))
+        self.buffer().ctx().clone()
+    }
+}
+
+/// A tile's view (as a tensor's).
+impl<T, M, const R: usize> HostRead for crate::Tile<T, M, R>
+where
+    T: Copy + Default + Send + Sync + 'static,
+    M: MemMode + HostReadable + Send + Sync + 'static,
+{
+    type Elem = T;
+    fn __claspr_read<L: crate::Launcher + ?Sized>(
+        &self,
+        launcher: &L,
+        blocking: bool,
+        deps: &[crate::cl_event],
+    ) -> Result<(Vec<T>, Option<crate::Event>)> {
+        read_view(self.buffer(), self.shape(), launcher, blocking, deps)
     }
     fn __claspr_ctx(&self) -> Context {
         use crate::Buffer;

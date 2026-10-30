@@ -302,6 +302,17 @@ pub mod kernels {
         m[[i, i]] = *d;
     }
 
+    /// `t[[row, col]] = v` for the work-item at `(col, row)` — writes its own
+    /// element of a `TensorMut` (a whole tensor, or one tile of a split).
+    #[claspr::kernel]
+    pub fn fill_view_u32(
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
+        #[spirv(cross_workgroup)] t: TensorMut<u32, 2>,
+        v: u32,
+    ) {
+        t[[id.y, id.x]] = v;
+    }
+
     /// `out[i] = sum of row i` — `PerRowIn`: the buffer is one equal row per
     /// work-item, and this work-item reads its own.
     #[claspr::kernel]

@@ -172,6 +172,27 @@ impl<const R: usize> Shape<R> {
     }
 }
 
+impl<const R: usize> Shape<R> {
+    /// Whether no two indices of the view reach the same element: sorted by
+    /// stride, each axis (of extent > 1) steps past everything the faster axes
+    /// span. A view `split` can hand out disjoint, writable tiles of.
+    pub fn is_injective(&self) -> bool {
+        let mut axes: Vec<usize> = (0..R).filter(|&d| self.ext[d] > 1).collect();
+        axes.sort_by_key(|&d| self.stride[d]);
+        let mut span = 1usize; // elements the faster axes reach, from the first
+        for d in axes {
+            if self.stride[d] < span {
+                return false;
+            }
+            span = match self.stride[d].checked_mul(self.ext[d] - 1) {
+                Some(reach) => reach.saturating_add(1).max(span),
+                None => return false,
+            };
+        }
+        true
+    }
+}
+
 /// Check that `shape` stays inside a tensor argument's buffer of `len`
 /// elements: every element it reaches is a buffer element. Called by the code
 /// the `#[kernel]` macro emits, before the enqueue. Not API.
@@ -267,18 +288,42 @@ impl<B, const R: usize> Tensor<B, R> {
     }
 }
 
-/// A host value that carries a rank-`R` [`Shape`] for a tensor kernel param.
-/// The `#[kernel]` macro bounds `Tensor<T, R>` params by it (with the slice
-/// trait) and passes `shape()` as the arg after the buffer.
-pub trait KernelTensorArg<const R: usize> {
+/// A host value a `Tensor<T, R>` kernel param takes: a buffer (set as the
+/// kernel's pointer + length args) and the rank-`R` [`Shape`] passed after it.
+/// Implemented by [`Tensor`] (over any kernel-readable buffer) and [`Tile`].
+/// The methods are the launch's plumbing, not API.
+pub trait KernelTensorReadArg<T, const R: usize>: crate::KernelArg + Send + 'static {
     /// The layout passed to the kernel.
     fn shape(&self) -> Shape<R>;
+    /// Number of elements in the underlying buffer (the shape must stay inside).
+    #[doc(hidden)]
+    fn element_count(&self) -> usize;
+    /// The recording handle of the underlying buffer (command buffers).
+    #[doc(hidden)]
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle>;
 }
 
-impl<B, const R: usize> KernelTensorArg<R> for Tensor<B, R> {
+/// A host value a `TensorMut<T, R>` kernel param takes — [`Tensor`] over a
+/// kernel-writable buffer, or a [`Tile`] (a disjoint part of one).
+pub trait KernelTensorWriteArg<T, const R: usize>: KernelTensorReadArg<T, R> {}
+
+impl<T, B: crate::KernelSliceReadArg<T>, const R: usize> KernelTensorReadArg<T, R>
+    for Tensor<B, R>
+{
     fn shape(&self) -> Shape<R> {
         self.shape
     }
+    fn element_count(&self) -> usize {
+        self.buf.element_count()
+    }
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
+        self.buf.record_handle()
+    }
+}
+
+impl<T, B: crate::KernelSliceReadWriteArg<T>, const R: usize> KernelTensorWriteArg<T, R>
+    for Tensor<B, R>
+{
 }
 
 // The buffer traits delegate to the buffer: the shape is a separate kernel arg
@@ -407,10 +452,207 @@ mod tests {
     }
 
     #[test]
+    fn injectivity() {
+        assert!(Shape::contiguous([3, 4]).is_injective());
+        assert!(Shape::contiguous([6, 8]).slice(1, 2..5).is_injective());
+        assert!(
+            Shape {
+                offset: 0,
+                ext: [3, 2],
+                stride: [1, 3]
+            }
+            .is_injective()
+        ); // transposed
+        assert!(
+            !Shape {
+                offset: 0,
+                ext: [3, 2],
+                stride: [0, 1]
+            }
+            .is_injective()
+        ); // broadcast
+        assert!(
+            !Shape {
+                offset: 0,
+                ext: [3, 2],
+                stride: [1, 2]
+            }
+            .is_injective()
+        ); // overlapping
+        assert!(
+            Shape {
+                offset: 0,
+                ext: [1, 4],
+                stride: [0, 1]
+            }
+            .is_injective()
+        ); // extent-1 axis
+    }
+
+    #[test]
     fn check_rejects_a_shape_past_the_buffer() {
         let s = Shape::contiguous([4, 4]);
         assert!(check_tensor_shape(&s, 16, "t").is_ok());
         assert!(check_tensor_shape(&s, 15, "t").is_err());
         assert!(check_tensor_shape(&Shape::contiguous([0, 4]), 0, "t").is_ok());
+    }
+}
+
+// ── Tiles: disjoint writable parts of one buffer ───────────────────────────
+
+/// The buffer a [`Tensor::split`] shares between its [`Tile`]s, with the
+/// parent view [`Tile::join`] restores.
+#[derive(Debug)]
+struct TileSet<T, M: crate::access::MemMode, const R: usize> {
+    buf: crate::DeviceSlice<T, M>,
+    shape: Shape<R>,
+}
+
+/// One part of a [`Tensor`] split along an axis ([`Tensor::split`]). The tiles
+/// of a split share the buffer but cover disjoint elements, so each can be
+/// WRITTEN concurrently — by kernels in different graphs / queues on the
+/// buffer's device. Correct by construction:
+///
+/// - a `Tile` fits only `Tensor` / `TensorMut` kernel params (never a plain
+///   slice or `PerItem*` param, which would see the whole buffer), and the
+///   kernel's tensor view can only reach the tile's elements;
+/// - `split` refuses a parent view whose indices alias ([`Shape::is_injective`]).
+///
+/// [`Tile::join`] takes every tile of the split back and returns the `Tensor`.
+#[derive(Debug)]
+pub struct Tile<T, M: crate::access::MemMode, const R: usize> {
+    set: std::sync::Arc<TileSet<T, M, R>>,
+    shape: Shape<R>,
+}
+
+impl<T, M: crate::access::MemMode, const R: usize> Tensor<crate::DeviceSlice<T, M>, R> {
+    /// Split the view into `parts` tiles along `axis` (equal extents, the last
+    /// taking the remainder; empty tiles are not made). Errors if `axis >= R`,
+    /// `parts == 0`, the view leaves its buffer, or the view's indices alias.
+    pub fn split(self, axis: usize, parts: usize) -> crate::Result<Vec<Tile<T, M, R>>> {
+        use crate::Buffer;
+        if axis >= R || parts == 0 {
+            return Err(crate::Error::NotSupported(
+                "Tensor::split: the axis must be below the rank, and parts at least 1",
+            ));
+        }
+        check_tensor_shape(&self.shape, self.buf.len(), "split")?;
+        if !self.shape.is_injective() {
+            return Err(crate::Error::NotSupported(
+                "Tensor::split: the view's indices alias (a zero or overlapping stride), \
+                 so its tiles would not be disjoint",
+            ));
+        }
+        let ext = self.shape.ext[axis];
+        let step = ext.div_ceil(parts).max(1);
+        let shape = self.shape;
+        let set = std::sync::Arc::new(TileSet {
+            buf: self.buf,
+            shape,
+        });
+        Ok((0..ext)
+            .step_by(step)
+            .map(|start| Tile {
+                set: std::sync::Arc::clone(&set),
+                shape: shape.slice(axis, start..(start + step).min(ext)),
+            })
+            .collect())
+    }
+}
+
+impl<T, M: crate::access::MemMode, const R: usize> Tile<T, M, R> {
+    /// The tile's view of the shared buffer.
+    pub fn shape(&self) -> Shape<R> {
+        self.shape
+    }
+
+    /// Reassemble the `Tensor` from EVERY tile of its split (any order); `Err`
+    /// hands the tiles back if some are missing (still held elsewhere — e.g. in
+    /// a graph: `sync` it and take its checkout first) or not from one split.
+    pub fn join(
+        tiles: Vec<Tile<T, M, R>>,
+    ) -> Result<Tensor<crate::DeviceSlice<T, M>, R>, Vec<Self>> {
+        let Some(first) = tiles.first() else {
+            return Err(tiles);
+        };
+        let set = std::sync::Arc::clone(&first.set);
+        let all = tiles.iter().all(|t| std::sync::Arc::ptr_eq(&t.set, &set));
+        // Every tile of the split is here: the set's other owners are exactly
+        // these tiles (plus our clone).
+        if !all || std::sync::Arc::strong_count(&set) != tiles.len() + 1 {
+            return Err(tiles);
+        }
+        drop(tiles);
+        let Ok(set) = std::sync::Arc::try_unwrap(set) else {
+            unreachable!("every other owner of the tile set was just dropped");
+        };
+        Ok(Tensor::new(set.buf, set.shape))
+    }
+
+    pub(crate) fn buffer(&self) -> &crate::DeviceSlice<T, M> {
+        &self.set.buf
+    }
+}
+
+impl<T, M: crate::access::MemMode, const R: usize> crate::KernelArg for Tile<T, M, R> {
+    fn set(&self, exec: &mut crate::launch::__macro_support::ExecuteKernel<'_>) {
+        // The buffer's pointer + length; the shape is the next arg (the macro).
+        self.set.buf.set(exec);
+    }
+}
+
+impl<T, M, const R: usize> KernelTensorReadArg<T, R> for Tile<T, M, R>
+where
+    T: Send + Sync + 'static,
+    M: crate::access::MemMode + crate::access::KernelReadable + Send + Sync + 'static,
+{
+    fn shape(&self) -> Shape<R> {
+        self.shape
+    }
+    fn element_count(&self) -> usize {
+        use crate::Buffer;
+        self.set.buf.len()
+    }
+    fn record_handle(&self) -> crate::Result<crate::record::BufHandle> {
+        crate::KernelSliceReadArg::<T>::record_handle(&self.set.buf)
+    }
+}
+
+impl<T, M, const R: usize> KernelTensorWriteArg<T, R> for Tile<T, M, R>
+where
+    T: Send + Sync + 'static,
+    M: crate::access::MemMode
+        + crate::access::KernelReadable
+        + crate::access::KernelWritable
+        + Send
+        + Sync
+        + 'static,
+{
+}
+
+impl<T: Send + Sync + 'static, M: crate::access::MemMode + Send + Sync + 'static, const R: usize>
+    SlotEq for Tile<T, M, R>
+{
+    fn slot_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.set, &other.set) && self.shape == other.shape
+    }
+
+    fn slot_digest(&self) -> u64 {
+        crate::eager::slot_digest_of((std::sync::Arc::as_ptr(&self.set) as usize, self.shape))
+    }
+}
+
+impl<T: Send + Sync + 'static, M: crate::access::MemMode + Send + Sync + 'static, const R: usize>
+    SlotValue for Tile<T, M, R>
+{
+    fn fill_clone(&self) -> Option<Box<dyn Any + Send>> {
+        None // a tile is a writable part: one owner, like a buffer
+    }
+}
+
+impl<E, T, M: crate::access::MemMode, const R: usize> ToInput<E> for Tile<T, M, R> {
+    type Buf = Tile<T, M, R>;
+    fn to_input(self) -> Input<Tile<T, M, R>> {
+        Input::from(self)
     }
 }

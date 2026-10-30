@@ -120,7 +120,15 @@ concrete / pipe / `Checkout` / `slot!` all work), and `upload(src).shaped(shape)
 makes a `Tensor`. Rank 1–3 with a contiguous
 innermost axis = one `clEnqueue{Read,Write}BufferRect` (`Shape::rect`); otherwise
 download reads the covered span + gathers on the host, write is `NotSupported`.
-Gap: tile walking is `with_shape` between runs, not a re-bindable shape slot. Device: `t[[i, j]]`,
+Concurrent tiles (user: tiling = one CB/graph per tile, so the
+real need is disjoint WRITABLE tiles of one buffer at once, same device):
+`Tensor::split(axis, parts)` → `Tile`s sharing the buffer (Arc), `Tile::join` takes
+ALL back. Correct by construction: tensor params now bound by
+`KernelTensor{Read,Write}Arg` (impl'd by `Tensor` and `Tile`), a `Tile` implements no
+slice trait (compile-fail fixture `tile_to_slice_arg`), device `TensorMut` extent
+asserts confine writes to the view, and `split` refuses non-injective views
+(`Shape::is_injective`). Tiles download their view; no host `write` into a tile
+(OpenCL write needs `&mut` of the shared buffer — write the parent before split). Device: `t[[i, j]]`,
 `sub(i)` (ranks 2–4), `extent(d)`, rank-1 `t[j]` / `len()`; extent asserts stay,
 buffer access unchecked in the twin. Indexing is unrolled per rank with constant
 array indices — a runtime `ext[d]` crashes PoCL's `llvm-spirv-20` (valid SPIR-V,
