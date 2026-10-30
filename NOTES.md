@@ -46,7 +46,21 @@ on PoCL CPU (4x work-items; local size not the cause), GPU unmeasured. `state`
 (halo-padded), `flux` (partial coverage per direction) and the halo kernels don't
 fit a per-item partition; `tend` can't be `alloc_uninit` (halo kernels read it first
 in the caravan).
-**Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
+**Unchecked per-item views — prototype on branch `unchecked-per-item` (2026-10-30):**
+rust-gpu bounds-checks every slice index (compare + OpenCL `printf` + return); the
+per-work-item early exit stops PoCL vectorising (miniweather built with the UB panic
+strategy: 0 → 16 vectorised loops, −5%). Per-item kernels now get TWO entry points:
+`<name>` with a UNIFORM in-kernel guard (grid covers every view's buffer, by division
+— rust-gpu has no `checked_mul`; a per-item `index < len` guard still blocked
+vectorisation), handed out by `Kernels::kernel` for raw `LaunchOp`s; and
+`<name>__claspr_unchecked`, no guard, `get_unchecked` views, dispatched only by the
+typed launcher after its host check (runs every execute, incl. CB replays — the CB
+cache keys on bound buffers). `Kernels::kernel` refuses the twin; `Context::kernel`
+on the raw SPV bytes can still reach it (same trust model as any external SPIR-V).
+Gray-scott (views-only `combine`): PoCL 4.03 → 3.72 s; rusticl 11.6 → 11.0 s, where
+the guard alone was 14.2 s. llama2 ±noise, miniweather unchanged (plain slices).
+Next: halo/stencil views, so the stencil kernels' plain-slice reads become views too.
+ `Written` already matches OUTPUTS by name
 inside the kernel, so the positional handle is no worse than before; and the real
 user difficulty is telling which params are PIPED (every buffer-like param —
 slice, `PerItem*` view, scalar-by-ref, image — in signature order; by-value

@@ -562,7 +562,23 @@ fn generate_module_source(
     /// Used internally by proc-macro-emitted launch methods; exposed
     /// for the rare case where you need a raw kernel by name
     /// (e.g. `ctx.launch(&kernels.kernel("foo"), ...)`).
+    ///
+    /// Panics on a per-item kernel's `<name>__claspr_unchecked` twin: it has no
+    /// in-kernel grid check and is only sound behind its typed launcher.
     pub fn kernel(&self, name: &str) -> ::claspr::Kernel {
+        assert!(
+            !name.ends_with("__claspr_unchecked"),
+            "{name:?} is the unchecked twin of a per-item kernel; launch it through its \
+             typed launcher, or use the checked entry point {:?}",
+            name.trim_end_matches("__claspr_unchecked"),
+        );
+        self.__claspr_kernel(name)
+    }
+
+    /// `kernel` without the unchecked-twin refusal — for typed launchers only,
+    /// which run the host-side grid check the twin relies on.
+    #[doc(hidden)]
+    pub fn __claspr_kernel(&self, name: &str) -> ::claspr::Kernel {
         ::claspr::Kernel::create(&self.__claspr_program, name).unwrap_or_else(|e| {
             panic!(
                 "clCreateKernel({name:?}) failed: {e:?} (entry points in this program: \
@@ -860,17 +876,32 @@ impl HostBuilder {
 /// Function items get their `#[claspr::kernel]` attrs translated to
 /// `#[spirv(kernel)]`; everything else (use, const, static, struct,
 /// type def, …) passes through verbatim.
+/// Entry-point name suffix of a per-item kernel's unguarded twin: no in-kernel
+/// grid check, so it's only sound behind the typed launcher's host check.
+/// Must match `claspr-macros`.
+const UNCHECKED_SUFFIX: &str = "__claspr_unchecked";
+
 fn translate_and_inline(items: Vec<syn::Item>, dir: &Path) -> Result<Vec<syn::Item>> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         match item {
             syn::Item::Fn(mut f) => {
-                let mut extra = Vec::new();
                 if f.attrs.iter().any(is_claspr_kernel_attr) {
-                    extra = rewrite_per_item_params(&mut f)?;
+                    // A kernel with per-item params gets an unguarded twin
+                    // (`<name>__claspr_unchecked`) for the typed launcher.
+                    let mut twin = f.clone();
+                    if let Some(extra) = rewrite_per_item_params(&mut f, true)? {
+                        twin.sig.ident =
+                            quote::format_ident!("{}{}", twin.sig.ident, UNCHECKED_SUFFIX);
+                        let twin_extra = rewrite_per_item_params(&mut twin, false)?
+                            .expect("the twin has the same per-item params");
+                        translate_fn_attrs(&mut twin.attrs);
+                        out.extend(extra);
+                        out.extend(twin_extra);
+                        out.push(syn::Item::Fn(twin));
+                    }
                 }
                 translate_fn_attrs(&mut f.attrs);
-                out.extend(extra);
                 out.push(syn::Item::Fn(f));
             }
             syn::Item::Mod(mut m) => {
@@ -1032,7 +1063,7 @@ fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, PerItemAccess)> {
 /// every path that completes has written every output (a missing field, a
 /// second write, another output's proof or a forged one are compile errors).
 /// Returns the generated items (the per-output marker types and `Written`).
-fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
+fn rewrite_per_item_params(f: &mut syn::ItemFn, guarded: bool) -> Result<Option<Vec<syn::Item>>> {
     let is_gid = |pt: &syn::PatType| {
         pt.attrs.iter().any(|a| {
             a.path().is_ident("spirv")
@@ -1081,7 +1112,7 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
         lowered.push((name, raw, access));
     }
     if lowered.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let gid = gid.unwrap_or_else(|| {
         let id = quote::format_ident!("__claspr_gid");
@@ -1108,7 +1139,8 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
             PerItemAccess::Write => {
                 let m = marker(name);
                 syn::parse_quote! {
-                    // SAFETY: the guard above checked the grid covers every buffer.
+                    // SAFETY: the grid covers every buffer — checked by the guard above, or
+                    // for the unchecked twin by the typed launcher's host check.
                     let #name = unsafe {
                         crate::__claspr::PerItemOut::<_, #m>::__claspr_new(#raw, __claspr_index, #gid)
                     };
@@ -1122,21 +1154,29 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
                 };
                 syn::parse_quote! {
                     #[allow(unused_mut)]
-                    // SAFETY: the guard above checked the grid covers every buffer.
+                    // SAFETY: the grid covers every buffer — checked by the guard above, or
+                    // for the unchecked twin by the typed launcher's host check.
                     let mut #name = unsafe { crate::__claspr::#view::__claspr_new(#raw, __claspr_index, #gid) };
                 }
             }
         })
         .collect();
     // One UNIFORM guard for all views: a grid that doesn't cover every per-item
-    // buffer exactly ends every work-item before any view exists.
+    // buffer exactly ends every work-item before any view exists. Omitted from
+    // the `__claspr_unchecked` twin, which only the typed launcher (after its
+    // host-side grid check) dispatches.
     let raws = lowered.iter().map(|(_, raw, _)| raw);
-    let guard: Vec<syn::Stmt> = syn::parse_quote! {
-        if !(true #( && crate::__claspr::covers(#raws.len(), #gsize) )*) {
-            return;
-        }
+    let mut guard: Vec<syn::Stmt> = Vec::new();
+    if guarded {
+        guard.push(syn::parse_quote! {
+            if !(true #( && crate::__claspr::covers(#raws.len(), #gsize) )*) {
+                return;
+            }
+        });
+    }
+    guard.push(syn::parse_quote! {
         let __claspr_index = crate::__claspr::linear(#gid, #gsize);
-    };
+    });
     let prologue: Vec<syn::Stmt> = guard.into_iter().chain(prologue).collect();
     let outs: Vec<&syn::Ident> = lowered
         .iter()
@@ -1145,7 +1185,7 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
         .collect();
     if outs.is_empty() {
         f.block.stmts.splice(0..0, prologue);
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     // Write-only outputs: the body must yield `Written`, proof that each one was
     // written on every path that completes.
@@ -1190,7 +1230,7 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
         let _: #written = (|| -> #written { #(#body)* })();
     };
     f.sig.output = syn::ReturnType::Default;
-    Ok(items)
+    Ok(Some(items))
 }
 
 fn translate_fn_attrs(attrs: &mut Vec<syn::Attribute>) {

@@ -3,13 +3,17 @@
 //!
 //! claspr-build lowers the parameter to the raw `&mut [T]` plus a per-item view
 //! (adding a global-id parameter if the kernel has none); the host side checks
-//! at launch that the grid is 1-D and exactly as long as the buffer, so every
-//! element is owned by exactly one work-item. A mismatch is `GridMismatch`
-//! before anything is enqueued, and leaves a graph retryable.
+//! at launch that the grid has exactly as many work-items as the buffer has
+//! elements, so every element is owned by exactly one work-item. A mismatch is
+//! `GridMismatch` before anything is enqueued, and leaves a graph retryable.
+//! The typed launcher then dispatches an unguarded device twin that indexes
+//! without bounds checks; the kernel's own entry point (what a raw launch gets)
+//! re-checks the grid uniformly and does nothing on a mismatch.
 
 use claspr::eager::{DeviceOpExt, download};
 use claspr::{
-    DeviceScratch, DeviceSlice, Error, LaunchSpec, MappedSlice, SvmLevel, USMSlice, slot, slots,
+    DeviceScratch, DeviceSlice, Error, LaunchOp, LaunchSpec, MappedSlice, SvmLevel, USMSlice, slot,
+    slots,
 };
 use claspr_test_kernels::kernels;
 use claspr_test_support::ctx;
@@ -331,4 +335,50 @@ fn per_item_out_initialises_an_uninitialised_usm_slice() {
         .wait()
         .expect("launch");
     assert!(out.iter().all(|&v| v == 45), "got {:?}", &out[..4]);
+}
+
+/// A raw launch of a per-item kernel's own entry point (which skips the host
+/// grid check) runs its in-kernel guard: a matching grid computes as usual, and
+/// a grid that doesn't cover every per-item buffer does nothing — no work-item
+/// reads past the short input.
+#[test]
+fn raw_launch_runs_the_in_kernel_grid_guard() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let kernel = ks.kernel("add_per_item_in_u32");
+    let (a, b, out) = (buf(&ctx, 3), buf(&ctx, 4), buf(&ctx, 0));
+    LaunchOp::new(&ctx, &kernel, [N], (&a, &b, &out))
+        .wait()
+        .expect("launch");
+    let mut host = vec![0u32; N];
+    out.read(&mut host).wait().expect("read");
+    assert!(host.iter().all(|&v| v == 7), "got {:?}", &host[..4]);
+
+    let short = DeviceSlice::<u32>::from_slice(&ctx, &[3; N / 2]).expect("alloc");
+    let out = buf(&ctx, 0);
+    LaunchOp::new(&ctx, &kernel, [N], (&short, &b, &out))
+        .wait()
+        .expect("launch");
+    out.read(&mut host).wait().expect("read");
+    assert!(
+        host.iter().all(|&v| v == 0),
+        "guard let a work-item through: {:?}",
+        &host[..4]
+    );
+}
+
+/// The unguarded twin the typed launcher dispatches is not handed out raw.
+#[test]
+fn raw_lookup_of_the_unchecked_twin_panics() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ks.kernel("add_per_item_u32__claspr_unchecked")
+    }))
+    .expect_err("the unchecked twin must be refused");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .unwrap_or("");
+    assert!(msg.contains("unchecked twin"), "unexpected panic: {msg}");
 }

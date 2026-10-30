@@ -534,6 +534,11 @@ fn expand_kernels(input: KernelsMacroInput) -> syn::Result<TokenStream2> {
                     )
                 }
 
+                #[doc(hidden)]
+                pub fn __claspr_kernel(&self, name: &str) -> ::claspr::Kernel {
+                    self.kernel(name)
+                }
+
                 /// The kernel entry-point names this `Kernels` view
                 /// expects to find in the program. Built from the
                 /// `fn` idents in the `kernels!` invocation.
@@ -1453,6 +1458,17 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
     //   `(empty)`                   — when there are no slice params.
     // `PerItem` grid checks, run after the inputs resolve (a pipe-fed buffer's
     // length is only known then); on a mismatch every lent input goes back.
+    // A kernel with per-item params launches its unguarded device twin (no
+    // in-kernel grid check — claspr-build's `UNCHECKED_SUFFIX`): every execute
+    // runs the host-side `per_item_guard` below first, so the twin's unchecked
+    // indexing is in bounds. Raw `Kernels::kernel` callers get the guarded one.
+    let kernel_lookup: TokenStream2 = if per_item_checks.is_empty() {
+        let lit = name.to_string();
+        quote! { self.kernel(#lit) }
+    } else {
+        let lit = format!("{name}__claspr_unchecked");
+        quote! { self.__claspr_kernel(#lit) }
+    };
     let per_item_guard: TokenStream2 = if per_item_checks.is_empty() {
         quote! {}
     } else {
@@ -2413,7 +2429,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                 #(#method_params),*
             ) -> #op_mod_ident::Op #gen_use {
                 #op_mod_ident::Op {
-                    kernel: self.kernel(#kernel_name_lit),
+                    kernel: #kernel_lookup,
                     spec: ::core::convert::Into::into(grid),
                     args: #op_args_tuple_init,
                     deps: ::std::vec::Vec::new(),
