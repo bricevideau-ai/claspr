@@ -65,9 +65,10 @@ Gray-scott (views-only `combine`): PoCL 4.03 → 3.72 s, rusticl 11.6 → 11.0 s
 bounds and unique, not exact coverage: `PerItem`/`PerItemIn` are sound for any grid
 whose largest `linear` index is `< len` (incl. a future 1-D global offset — gid
 includes it), only `PerItemOut` needs offset 0 + exact coverage. The host check is
-stricter today (exact for all three) — relaxing it is an open question. N-D offsets
-shift rows (stride = grid width) rather than pick a sub-rectangle — that needs the
-buffer's own extents, i.e. the halo/padded-view design. Before merging: measure the
+stricter today (exact for all three) and STAYS so for now (2026-10-30): partial
+coverage is tied to tiling, global offsets and tensor views with leading dimensions
+(buffer extents ≠ grid extents; N-D offsets today would shift rows, stride = grid
+width, not pick a sub-rectangle) — design them together, with the halo/padded views. Before merging: measure the
 extra `clBuildProgram` time. Next: halo/stencil views.
 **Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
 inside the kernel, so the positional handle is no worse than before; and the real
