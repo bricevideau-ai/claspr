@@ -1019,12 +1019,12 @@ fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, PerItemAccess)> {
 
 /// Lower a kernel's `PerItem<T>` parameters for the device crate: each becomes the
 /// raw `&mut [T]` buffer it is on the wire, and a prologue rebinds the user's name
-/// to this work-item's element (`PerItem::__claspr_new(raw, gid, gsize)`: the row-major
-/// linear id over the grid, so 1-, 2- and 3-D grids all work; defined in the
-/// generated preamble). A global-invocation-id parameter is added if the kernel
-/// has none. The host side treats the parameter as a written slice and checks at
-/// launch that the 1-D grid matches the buffer's length, so `gid.x` indexes every
-/// element exactly once.
+/// to this work-item's element (the row-major linear id over the grid, so 1-, 2-
+/// and 3-D grids all work; helpers in the generated preamble). Global-id and
+/// global-size parameters are added if the kernel has none. The host checks at
+/// launch that the grid has exactly as many work-items as each buffer has
+/// elements; the prologue re-checks it UNIFORMLY (`covers`, an early return for
+/// all work-items) and then indexes without per-work-item bounds checks.
 ///
 /// A kernel with `PerItemOut<T>` params must return `Written`: a per-kernel struct
 /// with one field per write-only param, each of a type only that param's
@@ -1108,7 +1108,10 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
             PerItemAccess::Write => {
                 let m = marker(name);
                 syn::parse_quote! {
-                    let #name = crate::__claspr::PerItemOut::<_, #m>::__claspr_new(#raw, #gid, #gsize);
+                    // SAFETY: the guard above checked the grid covers every buffer.
+                    let #name = unsafe {
+                        crate::__claspr::PerItemOut::<_, #m>::__claspr_new(#raw, __claspr_index, #gid)
+                    };
                 }
             }
             PerItemAccess::ReadWrite | PerItemAccess::Read => {
@@ -1119,11 +1122,22 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn) -> Result<Vec<syn::Item>> {
                 };
                 syn::parse_quote! {
                     #[allow(unused_mut)]
-                    let mut #name = crate::__claspr::#view::__claspr_new(#raw, #gid, #gsize);
+                    // SAFETY: the guard above checked the grid covers every buffer.
+                    let mut #name = unsafe { crate::__claspr::#view::__claspr_new(#raw, __claspr_index, #gid) };
                 }
             }
         })
         .collect();
+    // One UNIFORM guard for all views: a grid that doesn't cover every per-item
+    // buffer exactly ends every work-item before any view exists.
+    let raws = lowered.iter().map(|(_, raw, _)| raw);
+    let guard: Vec<syn::Stmt> = syn::parse_quote! {
+        if !(true #( && crate::__claspr::covers(#raws.len(), #gsize) )*) {
+            return;
+        }
+        let __claspr_index = crate::__claspr::linear(#gid, #gsize);
+    };
+    let prologue: Vec<syn::Stmt> = guard.into_iter().chain(prologue).collect();
     let outs: Vec<&syn::Ident> = lowered
         .iter()
         .filter(|(_, _, a)| *a == PerItemAccess::Write)
@@ -1284,9 +1298,28 @@ pub mod __claspr {
     /// This work-item's element of a `PerItem<T>` kernel argument.
     use spirv_std::glam::USizeVec3;
 
-    /// Row-major linear id of work-item `gid` in a grid of extent `gsize`.
+    /// Whether a grid of extent `gsize` has exactly `len` work-items. The kernel
+    /// prologue requires it of every per-item buffer before building the views,
+    /// which then index UNCHECKED: `gid < gsize` component-wise (claspr never
+    /// sets a global offset; a dimension beyond the launch's has id 0, size 1),
+    /// so every `linear(gid, gsize)` is below `len`. The check is UNIFORM — the
+    /// same answer on every work-item — so unlike a per-work-item bounds check
+    /// (whose panic path is a `printf`) it doesn't keep the driver from
+    /// vectorising across work-items. The host's launch check reports a
+    /// mismatched grid first; this keeps a raw launch sound too.
+    #[doc(hidden)]
     #[inline(always)]
-    fn linear(gid: USizeVec3, gsize: USizeVec3) -> usize {
+    pub fn covers(len: usize, gsize: USizeVec3) -> bool {
+        // `gsize.x * gsize.y * gsize.z == len`, by division so it can't
+        // overflow (rust-gpu has no `checked_mul` yet).
+        let (x, y) = (gsize.x, gsize.y);
+        x != 0 && y != 0 && len % x == 0 && (len / x) % y == 0 && len / x / y == gsize.z
+    }
+
+    /// Row-major linear id of work-item `gid` in a grid of extent `gsize`.
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn linear(gid: USizeVec3, gsize: USizeVec3) -> usize {
         gid.x + gsize.x * (gid.y + gsize.y * gid.z)
     }
 
@@ -1299,9 +1332,12 @@ pub mod __claspr {
     impl<'a, T> PerItem<'a, T> {
         #[doc(hidden)]
         #[inline(always)]
-        pub fn __claspr_new(buf: &'a mut [T], gid: USizeVec3, gsize: USizeVec3) -> Self {
-            let index = linear(gid, gsize);
-            PerItem { slot: &mut buf[index], index, coord: gid }
+        /// # Safety
+        /// `index < buf.len()` (`covers(buf.len(), gsize)` with `index = linear(gid, gsize)`).
+        pub unsafe fn __claspr_new(buf: &'a mut [T], index: usize, gid: USizeVec3) -> Self {
+            // SAFETY: the caller guarantees `index < buf.len()`.
+            let slot = unsafe { buf.get_unchecked_mut(index) };
+            PerItem { slot, index, coord: gid }
         }
 
         /// The element's index in the buffer: the work-item's row-major linear
@@ -1343,9 +1379,12 @@ pub mod __claspr {
     impl<'a, T> PerItemIn<'a, T> {
         #[doc(hidden)]
         #[inline(always)]
-        pub fn __claspr_new(buf: &'a [T], gid: USizeVec3, gsize: USizeVec3) -> Self {
-            let index = linear(gid, gsize);
-            PerItemIn { slot: &buf[index], index, coord: gid }
+        /// # Safety
+        /// `index < buf.len()` (`covers(buf.len(), gsize)` with `index = linear(gid, gsize)`).
+        pub unsafe fn __claspr_new(buf: &'a [T], index: usize, gid: USizeVec3) -> Self {
+            // SAFETY: the caller guarantees `index < buf.len()`.
+            let slot = unsafe { buf.get_unchecked(index) };
+            PerItemIn { slot, index, coord: gid }
         }
 
         /// The element's index in the buffer (see `PerItem::index`).
@@ -1386,14 +1425,17 @@ pub mod __claspr {
     impl<'a, T, M> PerItemOut<'a, T, M> {
         #[doc(hidden)]
         #[inline(always)]
-        pub fn __claspr_new(
+        /// # Safety
+        /// `index < buf.len()` (`covers(buf.len(), gsize)` with `index = linear(gid, gsize)`).
+        pub unsafe fn __claspr_new(
             buf: &'a mut [core::mem::MaybeUninit<T>],
+            index: usize,
             gid: USizeVec3,
-            gsize: USizeVec3,
         ) -> Self {
-            let index = linear(gid, gsize);
+            // SAFETY: the caller guarantees `index < buf.len()`.
+            let slot = unsafe { buf.get_unchecked_mut(index) };
             PerItemOut {
-                slot: &mut buf[index],
+                slot,
                 index,
                 coord: gid,
                 _output: core::marker::PhantomData,
