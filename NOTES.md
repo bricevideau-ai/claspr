@@ -72,7 +72,7 @@ width, not pick a sub-rectangle) — design them together, with the halo/padded 
 Build cost of the twins: SPIR-V +19–110%, `clBuildProgram` +0–5 ms (PoCL) / +3–6 ms
 (rusticl), no cold-start cost (both runtimes codegen a kernel lazily at first launch, and
 typed code never launches the checked entry). Next: halo/stencil views.
-**Stencil views — prototype on branch `stencil-views` (2026-10-30):** read-only
+**Stencil views — landed on main (2026-10-30):** read-only
 `Stencil<T, B>` (`*s` cell, `s.at([dx, dy])` neighbour; `B = Wrap | Clamp |
 Padded<RX, RY, RZ>`) with aliases `Periodic<T>` / `Clamped<T>` (unpadded, grid =
 buffer) and `Halo<T, RX, RY = RX, RZ = 0>` (buffer = grid + 2R per axis, host check
