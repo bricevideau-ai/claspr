@@ -95,8 +95,12 @@ their `n` / `seq_len` args: output identical, PoCL ±noise, **rusticl 11.6 → 2
 condition so llvmpipe's LLVM drops it (unverified). Next: family B, `Tensor<T, R>`
 with explicit extents/strides/offset (gathers: `att_scores` / `att_mix`, KV cache;
 tiling as host-side sub-views). Open: how a shape reaches the launch (separate
-scalar arg vs tuple vs shaped buffer type), strided vs contiguous wire format, and
-whether rust-gpu takes a `#[repr(C)]` struct by value as a kernel arg.
+scalar arg vs tuple vs shaped buffer type), strided vs contiguous layout. SETTLED
+(probe, 2026-10-30): rust-gpu emits a `#[repr(C)]` struct param as a true by-value
+`OpTypeStruct` and PoCL + rusticl pass it intact, so a descriptor can be ONE kernel
+arg. Gap found: `scalar_arg!` gives a user struct `KernelArg` but not
+`From<T> for ScalarInput<T>` / `SlotValue`, so typed launchers need
+`ScalarInput::Concrete(v)` — extend `scalar_arg!` (or B's descriptor type) first.
 **Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
 inside the kernel, so the positional handle is no worse than before; and the real
 user difficulty is telling which params are PIPED (every buffer-like param —
