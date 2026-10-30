@@ -85,7 +85,7 @@ refusals 105 → 6). Gray-scott `laplacian` → `Periodic`: frames byte-identica
 3.77 → 3.67 s, rusticl 10.8 → 9.5 s; miniweather `update_a/b` → `Halo` + `Interior`
 (nx/nz args gone), bit-identical. Not covered: staggered grids, SoA component axes,
 halo fills — the tensor-view/tiling design.
-**Per-row views (family A of the tensor-view design) — branch `per-row` (2026-10-30):**
+**Per-row views (family A of the tensor-view design) — landed on main (2026-10-30):**
 `PerRow<T>` (exclusive `&mut` row) / `PerRowIn<T>` (read-only), deref to `[T]`: one
 equal row per work-item (row = linear id), row length `len / work-items`, host
 `check_row_grid` / `Error::RowGridMismatch`; the twin skips the row-slice check only
