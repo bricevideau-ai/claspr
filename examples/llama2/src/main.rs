@@ -38,7 +38,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use claspr::eager::{DeviceDynOp, DeviceOpExt, Pipe, bundle2, forward};
-use claspr::{Context, DeviceScalar, DeviceSlice, Shape, Single, graph};
+use claspr::{Context, DeviceScalar, DeviceSlice, Single, Tensor, graph};
 
 #[claspr::device]
 mod gpu {
@@ -711,14 +711,19 @@ impl Builder<'_> {
     ) -> Result<Stream, String> {
         let c = self.cfg;
         let [rms, wq, wk, wv, wo] = self.weights(w, layer)?;
-        let [xb, q, xb2, xo] = self.uninit_n(c.dim)?;
-        let [k_cache, v_cache] = self.zeros_n(c.seq_len * c.kv_dim())?;
-        let att = self.zeros(c.n_heads * c.seq_len)?;
+        let [xb, xb2, xo] = self.uninit_n(c.dim)?;
+        // The attention buffers are `Tensor`s from the start — the kernels that
+        // gather from them read their shapes; the others just see the buffer.
+        // (`q` is zeroed: a `Tensor` over an uninitialised buffer can't be a
+        // `PerItemOut` target yet.)
+        let head = c.head_size();
+        let q = Tensor::new(self.zeros(c.dim)?, [c.n_heads, head]);
+        let [k_cache, v_cache] = self
+            .zeros_n(c.seq_len * c.kv_dim())?
+            .map(|b| Tensor::new(b, [c.seq_len, c.n_kv_heads, head]));
+        let att = Tensor::new(self.zeros(c.n_heads * c.seq_len)?, [c.n_heads, c.seq_len]);
         let ks = self.ks;
         let (d, kvd, hs) = (c.dim as u32, c.kv_dim() as u32, c.head_size() as u32);
-        let q_shape = Shape::contiguous([c.n_heads, c.head_size()]);
-        let att_shape = Shape::contiguous([c.n_heads, c.seq_len]);
-        let cache_shape = Shape::contiguous([c.seq_len, c.n_kv_heads, c.head_size()]);
         Ok(g.and_then(|(x, step)| {
             graph! {
                 let (x, _rms, xb) = ks.rmsnorm([c.dim], x, rms, xb, d);
@@ -726,13 +731,9 @@ impl Builder<'_> {
                 let (_wk, _wv, _xb, k_cache, v_cache, step) =
                     ks.kv([c.kv_dim()], wk, wv, xb, k_cache, v_cache, step, kvd);
                 let (q, k_cache, step) = ks.rope([c.dim / 2], q, k_cache, step, kvd, hs);
-                let (_q, _k_cache, att, step) = ks.att_scores(
-                    [c.seq_len, c.n_heads], (q, q_shape), (k_cache, cache_shape), att, step,
-                );
+                let (_q, _k_cache, att, step) = ks.att_scores([c.seq_len, c.n_heads], q, k_cache, att, step);
                 let (att, step) = ks.softmax([c.n_heads], att, step);
-                let (_att, _v_cache, xb2, step) = ks.att_mix(
-                    [c.head_size(), c.n_heads], (att, att_shape), (v_cache, cache_shape), xb2, step,
-                );
+                let (_att, _v_cache, xb2, step) = ks.att_mix([c.head_size(), c.n_heads], att, v_cache, xb2, step);
                 let (_wo, _xb2, xo) = ks.matmul([c.dim], wo, xb2, xo);
                 let (x, _xo) = ks.add([c.dim], x, xo);
                 bundle2(forward(x), forward(step))

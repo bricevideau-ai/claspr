@@ -117,13 +117,14 @@ use syn::{
 ///   check then matches the loop condition and the driver can drop it.
 /// - `Tensor<T, R>` is a read-only rank-`R` strided view of a buffer, shared
 ///   by all work-items: `t[[i, j]]`, `t.sub(i)` (rank `R - 1`, for `R` up to 4),
-///   `t.extent(d)`; rank 1 also `t[j]` / `t.len()`. On the wire it is the buffer
-///   then a by-value `claspr::Shape<R>` (offset, extents, strides); on the host
-///   it is ONE launcher argument, a `(buffer, shape)` pair: the buffer piped as
-///   usual (the handle holds it), the shape a `Shape`, bare extents
-///   (`[rows, cols]`, contiguous) or a `slot!` — e.g. to walk tiles of one
-///   buffer with `Shape::slice`. Each launch checks the shape stays inside the
-///   buffer (`Error::TensorShapeMismatch`). `TensorMut<T, R>` is the
+///   `t.extent(d)`; rank 1 also `t[j]` / `t.len()`. On the host it takes ONE
+///   value, a `claspr::Tensor` (a buffer plus its `claspr::Shape<R>`: offset,
+///   extents, strides — `Tensor::new(buf, [rows, cols])`), which the launcher
+///   decomposes (on the wire: the buffer, then the shape by value) and the
+///   handle hands back, so it pipes into the next kernel unchanged. A `Tensor`
+///   also fills a plain slice / `PerItem*` param (its buffer; the shape is
+///   ignored). Each launch checks the shape stays inside the buffer
+///   (`Error::TensorShapeMismatch`). `TensorMut<T, R>` is the
 ///   read-write form (like `&mut [T]`: work-items must write distinct elements).
 /// - Stencils read this work-item's cell AND its neighbours, read-only (a
 ///   neighbour is another work-item's cell): `*name` is the cell,
@@ -701,7 +702,6 @@ fn validate_kernel_sig(sig: &Signature) -> syn::Result<()> {
 }
 
 fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
-    let func = &with_tensor_shapes(func);
     validate_kernel_sig(&func.sig)?;
     let name = &func.sig.ident;
 
@@ -737,9 +737,6 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
     // and the wrapper flows the user's concrete type through to
     // Output without coercion.
     let mut host_names: Vec<TokenStream2> = Vec::new();
-    // The last slice param's (name, method type) — a tensor's shape param, which
-    // follows it, folds into it as one `(buffer, shape)` argument.
-    let mut last_slice_param: Option<(TokenStream2, TokenStream2)> = None;
     // How each arg is stored into the Op's `args` field at construction:
     // slices wrap via `ToInput::to_input()` (→ `Input<__D>`), scalars verbatim.
     // Distinct from `host_names` (the destructure pattern at enqueue).
@@ -941,12 +938,20 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // Buffer bound by mutability: `&[T]` → KernelSliceReadArg<T>;
                 // `&mut [T]` → KernelSliceReadWriteArg<T> (also KernelWritable,
                 // excluding ReadOnly / Frozen at the type level).
+                // A tensor param's host value also carries its shape.
+                let tensor_rank = match &grid_check {
+                    GridCheck::Tensor(rank) => Some(rank.clone()),
+                    _ => None,
+                };
+                let tensor_bound = tensor_rank
+                    .as_ref()
+                    .map(|rank| quote! { + ::claspr::KernelTensorArg<#rank> });
                 let dbound: TokenStream2 = if write_only {
                     quote! { #gid: ::claspr::KernelSliceWriteArg<#elem> }
                 } else if mutable {
-                    quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> }
+                    quote! { #gid: ::claspr::KernelSliceReadWriteArg<#elem> #tensor_bound }
                 } else {
-                    quote! { #gid: ::claspr::KernelSliceReadArg<#elem> }
+                    quote! { #gid: ::claspr::KernelSliceReadArg<#elem> #tensor_bound }
                 };
                 let ibound: TokenStream2 = quote! { #sid: ::claspr::ToInput<#elem, Buf = #gid> };
                 generics.push((gid_tt.clone(), dbound));
@@ -955,7 +960,6 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 host_names.push(pname.clone());
                 // Method takes the `ToInput` arg; the Op stores `Input<__D>`.
                 method_params.push(quote! { #pname: #iid_tt });
-                last_slice_param = Some((pname.clone(), iid_tt.clone()));
                 arg_types.push(quote! { ::claspr::Input<#gid_tt> });
                 op_field_init.push(quote! { ::claspr::ToInput::to_input(#pname) });
                 // Eager path: resolve to (buffer, deps, home); collect the deps +
@@ -990,12 +994,11 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                         GridCheck::Rows => quote! {
                             ::claspr::check_row_grid(&__claspr_spec, #len, #name_lit)?;
                         },
-                        GridCheck::Tensor => {
-                            let shape = quote::format_ident!("{}_shape", pname.to_string());
-                            quote! {
-                                ::claspr::check_tensor_shape(&#shape, #len, #name_lit)?;
-                            }
-                        }
+                        GridCheck::Tensor(_) => quote! {
+                            ::claspr::check_tensor_shape(
+                                &::claspr::KernelTensorArg::shape(&#pname), #len, #name_lit,
+                            )?;
+                        },
                     });
                 }
                 if write_only {
@@ -1015,6 +1018,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 input_check_ready.push(res_check_ready(&pname));
                 bind_slot_pat_names.push(quote! { #pname });
                 op_arg_pass.push(quote! { &#pname });
+                if tensor_rank.is_some() {
+                    // On the wire a tensor is its buffer then its shape, by value.
+                    op_arg_pass.push(quote! { ::claspr::KernelTensorArg::shape(&#pname) });
+                }
                 output_names.push(pname.clone());
                 output_types.push(if write_only {
                     quote! { <#gid_tt as ::claspr::KernelSliceWriteArg<#elem>>::Init }
@@ -1029,6 +1036,25 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // CB-mode: set this slice's (cl_mem, len) arg pair from the LENT
                 // local's handle, gather its upstream producer's sync points, and
                 // remember the handle for the output-pipe registration.
+                let cb_shape = tensor_rank.as_ref().map(|rank| {
+                    quote! {
+                        let __claspr_shape: ::claspr::Shape<#rank> =
+                            ::claspr::KernelTensorArg::shape(&#pname);
+                        let __claspr_bytes = unsafe {
+                            ::core::slice::from_raw_parts(
+                                (&__claspr_shape as *const ::claspr::Shape<#rank>) as *const u8,
+                                ::core::mem::size_of::<::claspr::Shape<#rank>>(),
+                            )
+                        };
+                        unsafe {
+                            __claspr_cb_builder.set_scalar_arg(
+                                __claspr_cb_kernel,
+                                &mut __claspr_cb_argi,
+                                __claspr_bytes,
+                            )?;
+                        }
+                    }
+                });
                 let note_origins_tt = note_origins(&origin_ident);
                 cb_arg_stmts.push(quote! {
                     {
@@ -1043,6 +1069,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                                 __claspr_h.byte_len / ::core::mem::size_of::<#elem>(),
                             )?;
                         }
+                        #cb_shape
                         __claspr_cb_out_handles.push(__claspr_h);
                     }
                 });
@@ -1271,17 +1298,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 // Read-only dump: a plain scalar carries NO `Input` (no pipe edge),
                 // so bind `_` in the dump destructure and emit no in-cell stmt.
                 dump_pat_names.push(quote! { _ });
-                if is_tensor_shape(pt) {
-                    // A tensor's shape rides with its buffer: one `(buffer,
-                    // shape)` host argument per kernel parameter.
-                    let (buf, buf_ty) = last_slice_param
-                        .take()
-                        .expect("a tensor's shape param follows its buffer param");
-                    method_params.pop();
-                    method_params.push(quote! { (#buf, #pname): (#buf_ty, #ssid) });
-                } else {
-                    method_params.push(quote! { #pname: #ssid });
-                }
+                method_params.push(quote! { #pname: #ssid });
                 arg_types.push(quote! { ::claspr::ScalarInput<#ty> });
                 op_field_init.push(quote! { ::core::convert::Into::into(#pname) });
                 // Eager path: READ the scalar value (clone) for this run, rebinding
@@ -1416,9 +1433,6 @@ fn handle_doc(func: &ItemFn) -> syn::Result<String> {
     let mut scalars = Vec::new();
     for arg in &func.sig.inputs {
         let syn::FnArg::Typed(pt) = arg else { continue };
-        if is_tensor_shape(pt) {
-            continue; // part of its tensor's `(buffer, shape)` argument
-        }
         match classify_param(pt)? {
             ParamRole::Builtin => {}
             ParamRole::Slice { name, .. }
@@ -2855,61 +2869,6 @@ fn cross_workgroup_element_ty(ty: &Type) -> syn::Result<CrossWorkgroupTy> {
     }
 }
 
-/// `func` with a `<name>_shape: ::claspr::Shape<R>` scalar param inserted right
-/// after each `Tensor<T, R>` / `TensorMut<T, R>` param — what claspr-build adds
-/// on the device (a tensor is its buffer then its shape, by value, on the
-/// wire). Marked `#[claspr_tensor_shape]` ([`is_tensor_shape`]): the host
-/// launcher folds it into its tensor's parameter, a `(buffer, shape)` pair, so
-/// host and kernel parameters stay one to one.
-fn with_tensor_shapes(func: &ItemFn) -> ItemFn {
-    let mut func = func.clone();
-    let mut inputs = syn::punctuated::Punctuated::<syn::FnArg, syn::Token![,]>::new();
-    for input in std::mem::take(&mut func.sig.inputs) {
-        let shape = match &input {
-            syn::FnArg::Typed(pt) => tensor_rank(&pt.ty).and_then(|rank| match &*pt.pat {
-                syn::Pat::Ident(pi) => {
-                    Some((quote::format_ident!("{}_shape", pi.ident), rank.clone()))
-                }
-                _ => None,
-            }),
-            syn::FnArg::Receiver(_) => None,
-        };
-        inputs.push(input);
-        if let Some((name, rank)) = shape {
-            inputs.push(syn::parse_quote!(#[claspr_tensor_shape] #name: ::claspr::Shape<#rank>));
-        }
-    }
-    func.sig.inputs = inputs;
-    func
-}
-
-/// Whether `pt` is a tensor's synthetic shape param (see [`with_tensor_shapes`]).
-fn is_tensor_shape(pt: &syn::PatType) -> bool {
-    pt.attrs
-        .iter()
-        .any(|a| a.path().is_ident("claspr_tensor_shape"))
-}
-
-/// The rank argument of a `Tensor<T, R>` / `TensorMut<T, R>` param type.
-fn tensor_rank(ty: &Type) -> Option<&syn::GenericArgument> {
-    let Type::Path(tp) = ty else { return None };
-    let seg = tp.path.segments.last()?;
-    if seg.ident != "Tensor" && seg.ident != "TensorMut" {
-        return None;
-    }
-    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
-        return None;
-    };
-    let mut args = args
-        .args
-        .iter()
-        .filter(|a| !matches!(a, syn::GenericArgument::Lifetime(_)));
-    let (_, rank, None) = (args.next()?, args.next()?, args.next()) else {
-        return None;
-    };
-    Some(rank)
-}
-
 /// How the launch checks a per-item view param's buffer against the grid.
 enum GridCheck {
     /// One element per work-item (`check_per_item_grid`).
@@ -2919,9 +2878,10 @@ enum GridCheck {
     Halo(TokenStream2),
     /// One equal row per work-item (`check_row_grid`).
     Rows,
-    /// A `Tensor` / `TensorMut`: its `<name>_shape` (the scalar param that
-    /// follows it) stays inside the buffer (`check_tensor_shape`).
-    Tensor,
+    /// A `Tensor<T, R>` / `TensorMut<T, R>` (carries `R`): the host value is a
+    /// `claspr::Tensor` (`KernelTensorArg<R>`) whose shape — passed as the
+    /// kernel arg after the buffer — stays inside it (`check_tensor_shape`).
+    Tensor(TokenStream2),
 }
 
 /// A per-item view parameter type, by name (last path segment) — the same
@@ -2973,8 +2933,8 @@ fn per_item_view(ty: &Type) -> Option<CrossWorkgroupTy> {
         ("PerItemOut", []) => Some(view(true, true, Exact)),
         ("PerRow", []) => Some(view(true, false, Rows)),
         ("PerRowIn", []) => Some(view(false, false, Rows)),
-        ("Tensor", [_rank]) => Some(view(false, false, Tensor)),
-        ("TensorMut", [_rank]) => Some(view(true, false, Tensor)),
+        ("Tensor", [rank]) => Some(view(false, false, Tensor(quote! { #rank }))),
+        ("TensorMut", [rank]) => Some(view(true, false, Tensor(quote! { #rank }))),
         ("Periodic" | "Clamped", []) => Some(view(false, false, Exact)),
         ("Halo", consts) => Some(view(false, false, Halo(pad(consts)?))),
         ("Interior", consts) => Some(view(true, false, Halo(pad(consts)?))),
@@ -3258,7 +3218,6 @@ fn instantiate_trait_methods(
     let mut impls = Vec::new();
     let mut skipped = Vec::new();
     'fns: for func in kernel_fns {
-        let func = &with_tensor_shapes(func);
         let name = &func.sig.ident;
         let mut gens: Vec<TokenStream2> = Vec::new();
         let mut params: Vec<TokenStream2> = Vec::new();
@@ -3269,6 +3228,28 @@ fn instantiate_trait_methods(
             let syn::FnArg::Typed(pt) = arg else { continue };
             match classify_param(pt)? {
                 ParamRole::Builtin => {}
+                ParamRole::Slice {
+                    name: pname,
+                    elem,
+                    mutable,
+                    grid_check: GridCheck::Tensor(rank),
+                    ..
+                } => {
+                    // A tensor param: its value also carries its shape.
+                    let d = quote::format_ident!("__claspr_TD{idx}");
+                    let s = quote::format_ident!("__claspr_TS{idx}");
+                    let bound = if mutable {
+                        quote! { ::claspr::KernelSliceReadWriteArg<#elem> }
+                    } else {
+                        quote! { ::claspr::KernelSliceReadArg<#elem> }
+                    };
+                    gens.push(quote! { #d: #bound + ::claspr::KernelTensorArg<#rank> });
+                    gens.push(quote! { #s: ::claspr::ToInput<#elem, Buf = #d> });
+                    params.push(quote! { #pname: #s });
+                    arg_names.push(pname);
+                    outs.push(quote! { #d });
+                    idx += 1;
+                }
                 ParamRole::Slice {
                     name: pname,
                     elem,
@@ -3297,19 +3278,8 @@ fn instantiate_trait_methods(
                 ParamRole::Scalar { name: pname, ty } => {
                     let ss = quote::format_ident!("__claspr_TSS{idx}");
                     gens.push(quote! { #ss: ::core::convert::Into<::claspr::ScalarInput<#ty>> });
-                    if is_tensor_shape(pt) {
-                        // Folded into its tensor's `(buffer, shape)` argument.
-                        let buf = arg_names
-                            .pop()
-                            .expect("a tensor's buffer precedes its shape");
-                        let buf_ty = quote::format_ident!("__claspr_TS{}", idx - 1);
-                        params.pop();
-                        params.push(quote! { (#buf, #pname): (#buf_ty, #ss) });
-                        arg_names.push(quote! { (#buf, #pname) });
-                    } else {
-                        params.push(quote! { #pname: #ss });
-                        arg_names.push(pname);
-                    }
+                    params.push(quote! { #pname: #ss });
+                    arg_names.push(pname);
                     idx += 1;
                 }
                 ParamRole::Image { .. } => {

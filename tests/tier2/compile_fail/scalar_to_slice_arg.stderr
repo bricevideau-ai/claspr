@@ -15,6 +15,10 @@ help: the following other types implement trait `KernelSliceReadWriteArg<T>`
   ::: claspr/src/launch.rs:LL:CC
    |
    = note: `USMSlice<T, M>`
+  --> claspr/src/tensor.rs:LL:CC
+  ::: claspr/src/tensor.rs:LL:CC
+   |
+   = note: `Tensor<B, R>`
 note: required by a bound in `claspr_test_kernels::kernels::Kernels::scale_u32`
   --> tests/kernels/src/lib.rs:59:4
    = note: this error originates in the attribute macro `claspr::kernel` (in Nightly builds, run with -Z macro-backtrace for more info)

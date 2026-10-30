@@ -136,7 +136,7 @@ pub use op::{
 };
 pub use ppm::write_ppm_rgba8;
 pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
-pub use tensor::{Shape, check_tensor_shape};
+pub use tensor::{KernelTensorArg, Shape, Tensor, check_tensor_shape};
 
 #[cfg(feature = "async-events")]
 pub use future::{EventFuture, EventFutureExt, LaunchFuture};

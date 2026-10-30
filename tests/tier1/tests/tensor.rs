@@ -1,17 +1,14 @@
-//! `Tensor<T, R>` / `TensorMut<T, R>` kernel arguments: a buffer plus a
-//! `Shape<R>` (offset, extents, strides) passed by value right after it on the
-//! wire, one `(buffer, shape)` argument on the host — the buffer piped, the shape
-//! a `Shape`, bare (contiguous) extents or a slot. The launch checks the shape
-//! stays inside the buffer (`TensorShapeMismatch` otherwise).
+//! `Tensor<T, R>` / `TensorMut<T, R>` kernel arguments. On the host the value is
+//! one `claspr::Tensor` — a buffer plus its `Shape<R>` (offset, extents,
+//! strides) — which the launcher decomposes (on the wire: the buffer, then the
+//! shape by value) and the handle hands back, so it pipes into the next kernel
+//! as is. A `Tensor` also fills a plain slice / `PerItem*` param (its buffer).
+//! The launch checks the shape stays inside the buffer (`TensorShapeMismatch`).
 
-use claspr::eager::{DeviceOpExt, download};
-use claspr::{Buffer, DeviceSlice, Error, Shape, slot, slots};
+use claspr::eager::DeviceOpExt;
+use claspr::{Buffer, DeviceSlice, Error, Shape, Tensor};
 use claspr_test_kernels::kernels;
 use claspr_test_support::ctx;
-
-slots! {
-    Tile: Shape<2>,
-}
 
 fn upload(ctx: &claspr::Context, v: &[u32]) -> DeviceSlice<u32> {
     DeviceSlice::<u32>::from_slice(ctx, v).expect("alloc")
@@ -27,26 +24,35 @@ fn iota(n: usize) -> Vec<u32> {
     (0..n as u32).map(|i| i * 3 + 1).collect()
 }
 
+/// Transpose twice through a pipe: the first launch's output `Tensor` (written
+/// as a `PerItemOut` — a tensor fills it with its buffer) is the second's
+/// `Tensor` input, unchanged, and the round trip restores the matrix.
 #[test]
-fn transpose_reads_any_multi_index() {
+fn a_tensor_pipes_into_the_next_kernel() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
     let (n0, n1) = (5, 7);
     let v = iota(n0 * n1);
-    let out = DeviceSlice::<u32>::alloc_uninit(&ctx, n0 * n1).expect("alloc");
-    let (_, out) = ks
-        .transpose_u32([n0, n1], (upload(&ctx, &v), [n0, n1]), out)
-        .wait()
+    let a = Tensor::new(upload(&ctx, &v), [n0, n1]);
+    let b = Tensor::new(upload(&ctx, &vec![0; n0 * n1]), [n1, n0]);
+    let c = upload(&ctx, &vec![0; n0 * n1]);
+    let (b, c) = ks
+        .transpose_u32([n0, n1], a, b)
+        .and_then(|(_a, b)| ks.transpose_u32([n1, n0], b, c))
+        .sync(&ctx)
         .expect("launch");
+    let (b, c) = (b.into_inner(), c.into_inner());
+    assert_eq!(b.shape(), Shape::contiguous([n1, n0]));
     let expected: Vec<u32> = (0..n1)
         .flat_map(|j| (0..n0).map(move |i| (i, j)))
         .map(|(i, j)| v[i * n1 + j])
         .collect();
-    assert_eq!(read(out), expected);
+    assert_eq!(read(b.into_buffer()), expected);
+    assert_eq!(read(c), v);
 }
 
-/// The same kernel over the whole matrix and over a tile of it (`Shape::slice`):
-/// a tile is just another shape of the same buffer.
+/// The same kernel over the whole matrix and over a tile of it: a tile is the
+/// same buffer viewed with another shape (`with_shape` + `Shape::slice`).
 #[test]
 fn rows_of_a_matrix_and_of_a_tile() {
     let Some(ctx) = ctx() else { return };
@@ -55,10 +61,10 @@ fn rows_of_a_matrix_and_of_a_tile() {
     let v = iota(rows * cols);
     let sum = |r: usize, c: std::ops::Range<usize>| -> u32 { c.map(|j| v[r * cols + j]).sum() };
 
-    let whole = Shape::contiguous([rows, cols]);
+    let m = Tensor::new(upload(&ctx, &v), [rows, cols]);
     let out = DeviceSlice::<u32>::alloc_uninit(&ctx, rows).expect("alloc");
     let (m, out) = ks
-        .tensor_row_sums_u32([rows], (upload(&ctx, &v), whole), out)
+        .tensor_row_sums_u32([rows], m, out)
         .wait()
         .expect("launch");
     assert_eq!(
@@ -66,10 +72,10 @@ fn rows_of_a_matrix_and_of_a_tile() {
         (0..rows).map(|r| sum(r, 0..cols)).collect::<Vec<_>>()
     );
 
-    let tile = whole.slice(0, 2..5).slice(1, 3..7);
+    let tile = m.shape().slice(0, 2..5).slice(1, 3..7);
     let out = DeviceSlice::<u32>::alloc_uninit(&ctx, 3).expect("alloc");
     let (_, out) = ks
-        .tensor_row_sums_u32([3], (m, tile), out)
+        .tensor_row_sums_u32([3], m.with_shape(tile), out)
         .wait()
         .expect("launch");
     assert_eq!(read(out), (2..5).map(|r| sum(r, 3..7)).collect::<Vec<_>>());
@@ -79,13 +85,10 @@ fn rows_of_a_matrix_and_of_a_tile() {
 fn rank_three_sub_views() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
-    let ext = [4, 3, 5];
     let v = iota(60);
     let out = DeviceSlice::<u32>::alloc_uninit(&ctx, 4).expect("alloc");
-    let (_, out) = ks
-        .tensor3_pick_u32([4], (upload(&ctx, &v), ext), out)
-        .wait()
-        .expect("launch");
+    let t = Tensor::new(upload(&ctx, &v), [4, 3, 5]);
+    let (_, out) = ks.tensor3_pick_u32([4], t, out).wait().expect("launch");
     let expected: Vec<u32> = (0..4).map(|i| v[i * 15 + 5 + 2]).collect();
     assert_eq!(read(out), expected);
 }
@@ -96,15 +99,12 @@ fn tensor_mut_writes_distinct_elements() {
     let ks = kernels::kernels(&ctx).expect("load kernels");
     let n = 6;
     let d: Vec<u32> = (0..n as u32).map(|i| 100 + i).collect();
+    let m = Tensor::new(upload(&ctx, &vec![0; n * n]), [n, n]);
     let (m, _) = ks
-        .set_diagonal_u32(
-            [n],
-            (upload(&ctx, &vec![0; n * n]), [n, n]),
-            upload(&ctx, &d),
-        )
+        .set_diagonal_u32([n], m, upload(&ctx, &d))
         .wait()
         .expect("launch");
-    let got = read(m);
+    let got = read(m.into_buffer());
     for i in 0..n {
         for j in 0..n {
             assert_eq!(got[i * n + j], if i == j { d[i] } else { 0 }, "({i}, {j})");
@@ -118,39 +118,9 @@ fn shape_must_stay_inside_the_buffer() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
     let out = DeviceSlice::<u32>::alloc_uninit(&ctx, 4).expect("alloc");
-    let shape = Shape::contiguous([4, 5]); // 20 elements over a 19-element buffer
-    match ks
-        .tensor_row_sums_u32([4], (upload(&ctx, &iota(19)), shape), out)
-        .wait()
-    {
+    let t = Tensor::new(upload(&ctx, &iota(19)), [4, 5]); // 20 elements, 19 in the buffer
+    match ks.tensor_row_sums_u32([4], t, out).wait() {
         Err(Error::TensorShapeMismatch { arg, len, .. }) => assert_eq!((arg, len), ("src", 19)),
         other => panic!("expected TensorShapeMismatch, got {:?}", other.map(|_| ())),
-    }
-}
-
-/// A reusable graph walks the tiles of one buffer by re-binding the shape slot
-/// (the recorded command buffer bakes the shape, so the re-bind re-records it).
-#[test]
-fn a_shape_slot_walks_tiles_across_replays() {
-    let Some(ctx) = ctx() else { return };
-    let ks = kernels::kernels(&ctx).expect("load kernels");
-    let (rows, cols) = (6, 8);
-    let v = iota(rows * cols);
-    let sum = |r: usize| -> u32 { (2..6).map(|j| v[r * cols + j]).sum() };
-    let whole = Shape::contiguous([rows, cols]);
-    let out = DeviceSlice::<u32>::alloc_uninit(&ctx, 3).expect("alloc");
-    let g = ks
-        .tensor_row_sums_u32([3], (upload(&ctx, &v), slot!(Tile)), out)
-        .and_then(|(_m, out)| download(out))
-        .bind(Tile(whole.slice(1, 2..6).slice(0, 0..3)));
-    assert_eq!(
-        g.sync(&ctx).expect("tile 0"),
-        (0..3).map(sum).collect::<Vec<_>>()
-    );
-    g.mutate_bind(Tile(whole.slice(1, 2..6).slice(0, 3..6)))
-        .expect("rebind tile");
-    for run in 1..=2 {
-        let got = g.sync(&ctx).expect("tile 1");
-        assert_eq!(got, (3..6).map(sum).collect::<Vec<_>>(), "run {run}");
     }
 }

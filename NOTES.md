@@ -104,18 +104,22 @@ arg. Gap found: `scalar_arg!` gives a user struct `KernelArg` but not
 **Tensor views (family B) — branch `tensor-views` (2026-10-30):** `Tensor<T, R>` /
 `TensorMut<T, R>` = buffer + by-value `Shape<R>` (offset, extents, strides; host
 `claspr::Shape`, `contiguous` / `slice`); on the wire `T *buf, size_t len, Shape s`
-(user's call: keep the slice splatted so any buffer still works). On the host it
-is ONE launcher argument, a `(buffer, shape)` pair (user: host and kernel params
-must map one to one) — the buffer piped (the handle holds it), the shape a `Shape`,
-bare contiguous extents `[r, c]`, or a `slot!` (tiles = re-bound shapes; tested).
-Internally the macro still inserts a marked `<name>_shape` scalar and folds it
-into the buffer's param. Host `check_tensor_shape` / `Error::TensorShapeMismatch`. Device: `t[[i, j]]`,
+(user's call: keep the slice splatted so any buffer still works). On the host a
+tensor is ONE object, `claspr::Tensor<B, R>` (buffer + `Shape`; user: host and
+kernel params map one to one, and no repacking at every call): the launcher
+decomposes it (`KernelTensorArg::shape()` passed as the arg after the buffer, also
+baked into CBs) and the handle hands it back, so it pipes on unchanged. It
+delegates the buffer traits to `B`, so it also fills slice / `PerItem*` params.
+Host `check_tensor_shape` / `Error::TensorShapeMismatch`. Gaps: a `Tensor` over an
+UNINIT buffer can't be a `PerItemOut` target (needs explicit `KernelSliceWriteArg`
+impls per uninit type — coherent, not done; llama2 zeroes `q`); tile walking is
+`with_shape` between runs, not a re-bindable shape slot. Device: `t[[i, j]]`,
 `sub(i)` (ranks 2–4), `extent(d)`, rank-1 `t[j]` / `len()`; extent asserts stay,
 buffer access unchecked in the twin. Indexing is unrolled per rank with constant
 array indices — a runtime `ext[d]` crashes PoCL's `llvm-spirv-20` (valid SPIR-V,
 rusticl fine). llama2 `att_scores` / `att_mix` use it (drop `seq_len` / `head_size` /
-`kv_dim` / `kv_mul`; 2-D grids): output identical, perf neutral. `Shape` has its own
-`ScalarInput` / slot impls; the general `scalar_arg!` gap remains. Not yet: Halo as
+`kv_dim` / `kv_mul`; 2-D grids; `q` / caches / `att` allocated as `Tensor`s): output
+identical, perf neutral. The general `scalar_arg!` gap remains. Not yet: Halo as
 sugar over Tensor (reach), staggered/asymmetric reach, component axes for miniweather.
 **Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
 inside the kernel, so the positional handle is no worse than before; and the real

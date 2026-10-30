@@ -89,7 +89,7 @@ impl<T: KernelArg + ?Sized> KernelArg for &mut T {
 
 /// Sealing module — keeps the `KernelSlice{Read,ReadWrite}Arg` impls in-crate so we
 /// can change the traits or their bounds without breaking external callers.
-mod kernel_slice_arg_sealed {
+pub(crate) mod kernel_slice_arg_sealed {
     pub trait Sealed {}
 }
 
