@@ -186,9 +186,7 @@ pub use eager::{
     image_download, image_upload, lift, read_into, scalar_value, scalar_value_as, scalar_zero,
     scalar_zero_as, transfer_to_device, transfer_to_device_at, upload, value, write, write_mapped,
 };
-pub use eager::{
-    DownloadTensor, UploadTensor, WriteTensor, download_tensor, upload_tensor, write_tensor,
-};
+pub use eager::{HostRead, HostWrite, UploadTensor};
 
 // Stage-3 proc-macro frontend.
 pub use claspr_macros::{device, kernel, kernels};
@@ -239,8 +237,8 @@ pub mod prelude {
     pub use crate::eager::{
         alloc_zero, arc_split, arced, bundle2, bundle3, bundle4, bundle5, bundle6, bundle7,
         bundle8, bundle9, bundle10, bundle11, bundle12, bundle13, bundle14, bundle15, bundle16,
-        download, download_tensor, fan_out, fill, forward, lift, transfer_to_device,
-        transfer_to_device_at, upload, upload_as, upload_tensor, value, write, write_tensor,
+        download, fan_out, fill, forward, lift, transfer_to_device, transfer_to_device_at, upload,
+        upload_as, value, write,
     };
 
     // ── Chain-entry macros (re-exported from the crate root, where

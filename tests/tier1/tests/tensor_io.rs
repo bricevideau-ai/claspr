@@ -1,11 +1,11 @@
-//! Tensor views to and from the host: `download_tensor` (a view → a dense
-//! row-major `Vec`), `upload_tensor` (a host array → a contiguous `Tensor`) and
-//! `write_tensor` (a host array → a view of an existing buffer, e.g. a tile).
-//! A rank-1–3 view with a contiguous innermost axis is one rect copy
-//! (`clEnqueue{Read,Write}BufferRect`); `download_tensor` gathers any other
-//! view on the host, `write_tensor` refuses it.
+//! Tensor views to and from the host, through the same leaves as buffers:
+//! `download` (a view → a dense row-major `Vec`), `upload(src).shaped(shape)`
+//! (a host array → a contiguous `Tensor`) and `write` (a host array → a view of
+//! an existing buffer, e.g. a tile). A rank-1–3 view with a contiguous
+//! innermost axis is one rect copy (`clEnqueue{Read,Write}BufferRect`);
+//! `download` gathers any other view on the host, `write` refuses it.
 
-use claspr::eager::{DeviceOpExt, download, download_tensor, upload_tensor, write_tensor};
+use claspr::eager::{DeviceOpExt, download, upload, write};
 use claspr::{DeviceSlice, Error, Shape, Tensor};
 use claspr_test_kernels::kernels;
 use claspr_test_support::ctx;
@@ -29,7 +29,7 @@ fn tensor<const R: usize>(
 fn download_a_whole_tensor() {
     let Some(ctx) = ctx() else { return };
     let v = iota(24);
-    let got = download_tensor(tensor(&ctx, &v, Shape::contiguous([4, 6])))
+    let got = download(tensor(&ctx, &v, Shape::contiguous([4, 6])))
         .wait()
         .expect("download");
     assert_eq!(got, v);
@@ -41,9 +41,7 @@ fn download_a_tile_and_a_sub_box() {
     let Some(ctx) = ctx() else { return };
     let v = iota(48);
     let tile = Shape::contiguous([6, 8]).slice(0, 1..4).slice(1, 2..7);
-    let got = download_tensor(tensor(&ctx, &v, tile))
-        .wait()
-        .expect("tile");
+    let got = download(tensor(&ctx, &v, tile)).wait().expect("tile");
     let expected: Vec<u32> = (1..4)
         .flat_map(|r| (2..7).map(move |c| (r, c)))
         .map(|(r, c)| v[r * 8 + c])
@@ -54,9 +52,7 @@ fn download_a_tile_and_a_sub_box() {
         .slice(0, 1..3)
         .slice(1, 1..3)
         .slice(2, 0..3);
-    let got = download_tensor(tensor(&ctx, &v, sub))
-        .wait()
-        .expect("sub-box");
+    let got = download(tensor(&ctx, &v, sub)).wait().expect("sub-box");
     let expected: Vec<u32> = (1..3)
         .flat_map(|z| (1..3).flat_map(move |y| (0..3).map(move |x| (z, y, x))))
         .map(|(z, y, x)| v[z * 16 + y * 4 + x])
@@ -75,7 +71,7 @@ fn download_views_without_a_rect() {
         ext: [6, 4],
         stride: [1, 6],
     };
-    let got = download_tensor(tensor(&ctx, &v, transposed))
+    let got = download(tensor(&ctx, &v, transposed))
         .wait()
         .expect("transposed");
     let expected: Vec<u32> = (0..6)
@@ -85,9 +81,7 @@ fn download_views_without_a_rect() {
     assert_eq!(got, expected);
 
     let rank4 = Shape::contiguous([2, 2, 3, 2]).slice(2, 1..3);
-    let got = download_tensor(tensor(&ctx, &v, rank4))
-        .wait()
-        .expect("rank 4");
+    let got = download(tensor(&ctx, &v, rank4)).wait().expect("rank 4");
     let expected: Vec<u32> = (0..2)
         .flat_map(|a| {
             (0..2).flat_map(move |b| (1..3).flat_map(move |c| (0..2).map(move |d| (a, b, c, d))))
@@ -98,7 +92,7 @@ fn download_views_without_a_rect() {
 }
 
 /// A kernel's output `Tensor` downloads straight from its pipe; the chain starts
-/// from `upload_tensor` and replays (the uploaded tensor reseeds each run).
+/// from a shaped `upload` and replays (the uploaded tensor reseeds each run).
 #[test]
 fn upload_transpose_download_replays() {
     let Some(ctx) = ctx() else { return };
@@ -109,9 +103,10 @@ fn upload_transpose_download_replays() {
         DeviceSlice::<u32>::alloc_uninit(&ctx, n0 * n1).expect("alloc"),
         [n1, n0],
     );
-    let g = upload_tensor(v.clone(), [n0, n1])
+    let g = upload(v.clone())
+        .shaped([n0, n1])
         .and_then(|a| ks.transpose_u32([n0, n1], a, out))
-        .and_then(|(_a, t)| download_tensor(t));
+        .and_then(|(_a, t)| download(t));
     let expected: Vec<u32> = (0..n1)
         .flat_map(|j| (0..n0).map(move |i| (i, j)))
         .map(|(i, j)| v[i * n1 + j])
@@ -125,7 +120,7 @@ fn upload_transpose_download_replays() {
     }
 }
 
-/// `write_tensor` fills one tile of a buffer and leaves the rest untouched.
+/// `write` fills one tile of a buffer and leaves the rest untouched.
 #[test]
 fn write_a_tile() {
     let Some(ctx) = ctx() else { return };
@@ -135,7 +130,7 @@ fn write_a_tile() {
         .slice(1, 2..6);
     let t = tensor(&ctx, &vec![0; rows * cols], tile);
     let data: Vec<u32> = (1..=8).collect();
-    let t = write_tensor(t, data.clone())
+    let t = write(t, data.clone())
         .sync(&ctx)
         .expect("write")
         .into_inner();
@@ -162,9 +157,23 @@ fn write_refuses_a_view_without_a_rect() {
         stride: [1, 3],
     };
     let t = tensor(&ctx, &[0; 6], transposed);
-    let err = write_tensor(t, vec![1u32; 6])
+    let err = write(t, vec![1u32; 6])
         .sync(&ctx)
         .map(|_| ())
         .expect_err("no rect");
     assert!(matches!(err, Error::NotSupported(_)), "got {err:?}");
+}
+
+/// A `Checkout` of a tensor lends into the next graph: write a tile, then
+/// download that same view from the checkout.
+#[test]
+fn a_tensor_checkout_downloads_its_view() {
+    let Some(ctx) = ctx() else { return };
+    let tile = Shape::contiguous([4, 6]).slice(0, 1..3).slice(1, 1..4);
+    let data: Vec<u32> = (10..16).collect();
+    let co = write(tensor(&ctx, &[0; 24], tile), data.clone())
+        .sync(&ctx)
+        .expect("write");
+    let got = download(co).sync(&ctx).expect("download").into_inner();
+    assert_eq!(got, data);
 }

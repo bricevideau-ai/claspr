@@ -1445,6 +1445,30 @@ impl<E, D> ToInput<E> for Pipe<D> {
     }
 }
 
+/// An already-built `Input` (e.g. `slot!(Tag).into_slot_input()`) is its own input.
+impl<E, D> ToInput<E> for Input<D> {
+    type Buf = D;
+    fn to_input(self) -> Input<D> {
+        self
+    }
+}
+
+/// A `Checkout` of a [`Tensor`](crate::Tensor) LENDS forward like a buffer
+/// checkout: the tensor and its home ride into the consuming graph.
+impl<E, B: Send, const R: usize> ToInput<E> for Checkout<crate::Tensor<B, R>> {
+    type Buf = crate::Tensor<B, R>;
+    fn to_input(self) -> Input<crate::Tensor<B, R>> {
+        let (value, home) = self.into_value_and_home();
+        Input::lent(value, home)
+    }
+}
+impl<B: Send, const R: usize> From<Checkout<crate::Tensor<B, R>>> for Input<crate::Tensor<B, R>> {
+    fn from(co: Checkout<crate::Tensor<B, R>>) -> Self {
+        let (value, home) = co.into_value_and_home();
+        Input::lent(value, home)
+    }
+}
+
 /// Implement [`ToInput`] for a concrete buffer family. Per-family (not a
 /// blanket) so it stays disjoint from the `Pipe<D>` impl.
 macro_rules! impl_to_input_concrete {

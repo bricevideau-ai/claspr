@@ -548,7 +548,7 @@ where
     /// `ReadOnly`. Markers that mark the buffer host-read-only (`HostReadOnly`,
     /// `Frozen`) or host-no-access (`DeviceScratch`) intentionally don't allow
     /// `write`.
-    pub fn write<S>(self, src: S) -> crate::eager::WriteDevice<T, M>
+    pub fn write<S>(self, src: S) -> crate::eager::WriteDevice<DeviceSlice<T, M>>
     where
         S: Into<crate::transfer::UploadSource<T>>,
     {
