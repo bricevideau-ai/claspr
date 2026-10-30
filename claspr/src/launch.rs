@@ -782,6 +782,32 @@ pub fn check_per_item_grid(spec: &LaunchSpec, len: usize, arg: &'static str) -> 
     }
 }
 
+/// Check that a halo-padded stencil argument (`Halo` / `Interior`) of `len`
+/// elements is exactly `spec`'s grid plus `pad[i]` halo cells on each side of
+/// each axis `i` (an axis beyond the grid's dimensions has extent 1): work-item
+/// `(x, y, z)` owns cell `(x + pad[0], y + pad[1], z + pad[2])`. Called by the code
+/// the `#[kernel]` macro emits, before the enqueue. Not API.
+#[doc(hidden)]
+pub fn check_halo_grid(
+    spec: &LaunchSpec,
+    len: usize,
+    pad: [usize; 3],
+    arg: &'static str,
+) -> crate::Result<()> {
+    let grid = spec.global();
+    let extent = |i: usize| grid.get(i).copied().unwrap_or(1) + 2 * pad[i];
+    if extent(0) * extent(1) * extent(2) == len {
+        Ok(())
+    } else {
+        Err(crate::Error::HaloGridMismatch {
+            arg,
+            grid: grid.to_vec(),
+            pad,
+            len,
+        })
+    }
+}
+
 impl LaunchSpec {
     /// Number of dimensions (1, 2, or 3).
     pub fn dims(&self) -> u8 {

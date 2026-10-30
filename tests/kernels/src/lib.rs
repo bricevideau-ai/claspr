@@ -248,6 +248,61 @@ pub mod kernels {
         }
     }
 
+    /// Sum of the 4 neighbours on a periodic `[W, H]` grid (`Periodic`: the
+    /// buffer is the grid; offsets past an edge wrap).
+    #[claspr::kernel]
+    pub fn neighbours_periodic_u32(
+        #[spirv(cross_workgroup)] f: Periodic<u32>,
+        #[spirv(cross_workgroup)] out: PerItemOut<u32>,
+    ) -> Written {
+        let s = f.at([-1, 0]) + f.at([1, 0]) + f.at([0, -1]) + f.at([0, 1]);
+        Written { out: out.write(s) }
+    }
+
+    /// The same with clamped edges (`Clamped`: past an edge reads the edge).
+    #[claspr::kernel]
+    pub fn neighbours_clamped_u32(
+        #[spirv(cross_workgroup)] f: Clamped<u32>,
+        #[spirv(cross_workgroup)] out: PerItemOut<u32>,
+    ) -> Written {
+        let s = f.at([-1, 0]) + f.at([1, 0]) + f.at([0, -1]) + f.at([0, 1]);
+        Written { out: out.write(s) }
+    }
+
+    /// The same over a buffer padded with one halo cell per side (`Halo<u32, 1>`:
+    /// the buffer is `[W + 2, H + 2]`, the grid is the `[W, H]` interior), plus
+    /// 1000 x the centre.
+    #[claspr::kernel]
+    pub fn neighbours_halo_u32(
+        #[spirv(cross_workgroup)] f: Halo<u32, 1>,
+        #[spirv(cross_workgroup)] out: PerItemOut<u32>,
+    ) -> Written {
+        let s = f.at([-1, 0]) + f.at([1, 0]) + f.at([0, -1]) + f.at([0, 1]) + 1000 * *f;
+        Written { out: out.write(s) }
+    }
+
+    /// 3-D halo, spelled out as `Stencil<_, Padded<..>>`: the z neighbours
+    /// (`Padded<0, 0, 1>`: padded along z only).
+    #[claspr::kernel]
+    pub fn z_neighbours_u32(
+        #[spirv(cross_workgroup)] f: Stencil<u32, Padded<0, 0, 1>>,
+        #[spirv(cross_workgroup)] out: PerItemOut<u32>,
+    ) -> Written {
+        Written {
+            out: out.write(f.at([0, 0, -1]) + f.at([0, 0, 1])),
+        }
+    }
+
+    /// `dst = src + 1` on the interior of two halo-padded buffers (`Interior`
+    /// writes this work-item's cell; the halo is left as it is).
+    #[claspr::kernel]
+    pub fn interior_add_one_u32(
+        #[spirv(cross_workgroup)] src: Halo<u32, 1>,
+        #[spirv(cross_workgroup)] dst: Interior<u32, 1>,
+    ) {
+        *dst = *src + 1;
+    }
+
     /// A user struct passed BY REFERENCE to kernels, held on the host side in
     /// a `DeviceScalar<Counter>` — e.g. per-step state a graph advances itself.
     #[derive(Clone, Copy, Debug, PartialEq)]

@@ -92,7 +92,7 @@
 //! 3. **Pipe threading between dispatches** — the field BUFFERS are move-only
 //!    (`DeviceSlice`, not `Clone`), so a single buffer slot can't fan out to two
 //!    sites. Instead each `laplacian` dispatch is multi-output
-//!    `(field_in, lap_out)`, and `combine` reads BOTH of its outputs **threaded
+//!    `(field, lap_out)`, and `combine` reads BOTH of its outputs **threaded
 //!    as pipes** via `and_then`: the field itself (passed through unchanged) and
 //!    its Laplacian. So `slot!(UIn)`/`slot!(VIn)` sit at ONE site each (their lap
 //!    dispatch), and the Laplacian scratch buffers need no slot tags at all —
@@ -127,11 +127,10 @@
 //!
 //! `combine` passes the eight things that genuinely VARY per step or per regime:
 //! the six buffers (`u_in, v_in, lap_u, lap_v, u_out, v_out`) plus the two reaction
-//! scalars `F`, `k`. The run-fixed diffusion constants `Du`/`Dv` (and `Dt`, grid
-//! size) are baked in as `gpu::DU`/`gpu::DV`/`gpu::DT`/`gpu::W`/`gpu::H`
-//! compile-time consts — not because of an arg-count ceiling (`KernelArgs` goes to
+//! scalars `F`, `k`. The run-fixed diffusion constants `Du`/`Dv` (and `Dt`) are
+//! baked in as `gpu::DU`/`gpu::DV`/`gpu::DT` compile-time consts — not because of an arg-count ceiling (`KernelArgs` goes to
 //! 16), but because they never change, so spending kernel args on them would be
-//! waste. `laplacian`'s args are just `field_in` + `lap_out` (the grid rides the
+//! waste. `laplacian`'s args are just `field` + `lap_out` (the grid rides the
 //! launch slot).
 //!
 //! ## Output
@@ -156,62 +155,32 @@ use claspr::{graph, slot, slots};
 
 #[claspr::device]
 mod gpu {
-    /// Grid dimensions, time step, and diffusion rates are compile-time
-    /// constants of the meta-kernel — `combine`'s eight kernel args carry only what
-    /// VARIES at runtime (the six field/scratch buffers plus the two scalar slots
-    /// `F`, `k`). So the rest is baked in: `dt = 1.0` is the standard Gray-Scott step,
-    /// `DU`/`DV` are the (fixed) diffusion rates, and `W`/`H` the grid extent.
-    /// Host code mirrors `W`/`H` with its own constants.
-    pub const W: u32 = 256;
-    pub const H: u32 = 256;
+    /// The time step and diffusion rates are compile-time constants of the
+    /// meta-kernel — `combine`'s eight kernel args carry only what VARIES at
+    /// runtime (the six field/scratch buffers plus the two scalar slots `F`, `k`).
+    /// So the rest is baked in: `dt = 1.0` is the standard Gray-Scott step and
+    /// `DU`/`DV` are the (fixed) diffusion rates. The grid extent rides the launch.
     pub const DT: f32 = 1.0;
     pub const DU: f32 = 0.16;
     pub const DV: f32 = 0.08;
-
-    /// Periodic (wrap-around) neighbor index along one axis: `coord ± 1`
-    /// modulo `extent`, computed without signed arithmetic so it lowers
-    /// cleanly to the kernel target. Used by the Laplacian for both axes.
-    /// Pure — host and kernel both call it.
-    pub fn wrap(coord: u32, delta_is_plus: bool, extent: u32) -> u32 {
-        if delta_is_plus {
-            let c = coord + 1;
-            if c == extent { 0 } else { c }
-        } else if coord == 0 {
-            extent - 1
-        } else {
-            coord - 1
-        }
-    }
-
-    /// 5-point Laplacian of a flat `W*H` field at cell `(x, y)` with periodic
-    /// boundaries: `left + right + up + down - 4*center`. Pure helper called by
-    /// the `laplacian` kernel.
-    pub fn laplacian_at(field: &[f32], x: u32, y: u32, w: u32, h: u32) -> f32 {
-        let idx = |xx: u32, yy: u32| (yy * w + xx) as usize;
-        let center = field[idx(x, y)];
-        let left = field[idx(wrap(x, false, w), y)];
-        let right = field[idx(wrap(x, true, w), y)];
-        let up = field[idx(x, wrap(y, false, h))];
-        let down = field[idx(x, wrap(y, true, h))];
-        left + right + up + down - 4.0 * center
-    }
 
     /// SHARED Laplacian pass. Reads one field, writes its 5-point periodic
     /// Laplacian into a scratch buffer — one value per cell. Dispatched TWICE per
     /// step (once for `U` → `lap_u`, once for `V` → `lap_v`): **same kernel, two
     /// sites**, sharing one `slot!(Grid)` launch slot.
     ///
-    /// Kernel args are just `(field_in, lap_out)` — well under the arity-8
+    /// Kernel args are just `(field, lap_out)` — well under the arity-8
     /// ceiling — because the grid extent rides the launch slot, not an arg.
     #[claspr::kernel]
     pub fn laplacian(
-        #[spirv(cross_workgroup)] field_in: &[f32],
+        #[spirv(cross_workgroup)] field: Periodic<f32>,
         #[spirv(cross_workgroup)] lap_out: PerItemOut<f32>,
     ) -> Written {
-        // `lap_out` is this work-item's cell of the `[W, H]` grid (the launch
-        // checks the grid covers the field exactly); the field is read around it.
-        let c = lap_out.coord();
-        let lap = laplacian_at(field_in, c.x as u32, c.y as u32, W, H);
+        // 5-point periodic Laplacian: `field` is this work-item's cell of the
+        // `[W, H]` grid, its neighbours wrapping at the edges; `lap_out` is the
+        // same cell of the output (the launch checks both buffers are the grid).
+        let lap = field.at([-1, 0]) + field.at([1, 0]) + field.at([0, -1]) + field.at([0, 1])
+            - 4.0 * *field;
         Written {
             lap_out: lap_out.write(lap),
         }
@@ -399,8 +368,8 @@ fn run_swap(
     // value is a `Copy` `LaunchSpec`, so it clones into every cell). The field
     // BUFFERS are move-only (`DeviceSlice`, not `Clone`), so they cannot fan out
     // to two sites; instead each `laplacian` dispatch is multi-output
-    // `(field_in, lap_out)` and we thread BOTH its outputs forward as PIPES — the
-    // field buffer (`field_in`, passed through unchanged) AND its Laplacian
+    // `(field, lap_out)` and we thread BOTH its outputs forward as PIPES — the
+    // field buffer (`field`, passed through unchanged) AND its Laplacian
     // (`lap_out`) flow into `combine`. So `slot!(UIn)`/`slot!(VIn)` live at ONE
     // site each (their lap dispatch), and the Laplacian scratch buffers need no
     // slot tags at all — both are carried by `and_then`'s pipe threading.
@@ -804,6 +773,32 @@ fn main() -> claspr::Result<()> {
 mod tests {
     use super::*;
 
+    /// Periodic (wrap-around) neighbor index along one axis: `coord ± 1`
+    /// modulo `extent`. Used by the reference Laplacian for both axes.
+    fn wrap(coord: u32, delta_is_plus: bool, extent: u32) -> u32 {
+        if delta_is_plus {
+            let c = coord + 1;
+            if c == extent { 0 } else { c }
+        } else if coord == 0 {
+            extent - 1
+        } else {
+            coord - 1
+        }
+    }
+
+    /// 5-point Laplacian of a flat `W*H` field at cell `(x, y)` with periodic
+    /// boundaries: `left + right + up + down - 4*center` — the host reference for
+    /// the `laplacian` kernel (same evaluation order).
+    fn laplacian_at(field: &[f32], x: u32, y: u32, w: u32, h: u32) -> f32 {
+        let idx = |xx: u32, yy: u32| (yy * w + xx) as usize;
+        let center = field[idx(x, y)];
+        let left = field[idx(wrap(x, false, w), y)];
+        let right = field[idx(wrap(x, true, w), y)];
+        let up = field[idx(x, wrap(y, false, h))];
+        let down = field[idx(x, wrap(y, true, h))];
+        left + right + up + down - 4.0 * center
+    }
+
     /// Smoke test: a SHORT sim must stay bounded, NaN-free, and actually evolve
     /// away from the initial condition (V grows from ~0). Skips silently with no
     /// device.
@@ -857,7 +852,7 @@ mod tests {
     /// one drifts from this golden by more than ordinary CPU/GPU f32 error is the
     /// incorrect one.
     fn cpu_reference(steps: usize, feed: f32, kill: f32) -> Vec<f32> {
-        use super::gpu::{DT, DU, DV, laplacian_at};
+        use super::gpu::{DT, DU, DV};
         let (mut u, mut v) = initial_fields();
         let mut u_next = vec![0.0f32; N];
         let mut v_next = vec![0.0f32; N];

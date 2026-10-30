@@ -72,6 +72,19 @@ width, not pick a sub-rectangle) — design them together, with the halo/padded 
 Build cost of the twins: SPIR-V +19–110%, `clBuildProgram` +0–5 ms (PoCL) / +3–6 ms
 (rusticl), no cold-start cost (both runtimes codegen a kernel lazily at first launch, and
 typed code never launches the checked entry). Next: halo/stencil views.
+**Stencil views — prototype on branch `stencil-views` (2026-10-30):** read-only
+`Stencil<T, B>` (`*s` cell, `s.at([dx, dy])` neighbour; `B = Wrap | Clamp |
+Padded<RX, RY, RZ>`) with aliases `Periodic<T>` / `Clamped<T>` (unpadded, grid =
+buffer) and `Halo<T, RX, RY = RX, RZ = 0>` (buffer = grid + 2R per axis, host check
+`check_halo_grid` / `Error::HaloGridMismatch`); `Interior<T, R..>` is the read-write
+centre of a padded buffer. Names matched syntactically in claspr-build AND
+claspr-macros (user aliases / custom boundaries unsupported; a shared no_std
+view crate would lift that). Offsets are runtime; the per-offset radius `assert!`
+stays in both entry points but the driver folds it for literal offsets (PoCL
+refusals 105 → 6). Gray-scott `laplacian` → `Periodic`: frames byte-identical, PoCL
+3.77 → 3.67 s, rusticl 10.8 → 9.5 s; miniweather `update_a/b` → `Halo` + `Interior`
+(nx/nz args gone), bit-identical. Not covered: staggered grids, SoA component axes,
+halo fills — the tensor-view/tiling design.
 **Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
 inside the kernel, so the positional handle is no worse than before; and the real
 user difficulty is telling which params are PIPED (every buffer-like param —

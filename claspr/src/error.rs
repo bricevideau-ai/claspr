@@ -42,6 +42,14 @@ pub enum Error {
         grid: Vec<usize>,
         len: usize,
     },
+    /// A halo-padded stencil kernel argument (`Halo` / `Interior`) is not exactly
+    /// the launch grid plus `pad` halo cells on each side of each axis.
+    HaloGridMismatch {
+        arg: &'static str,
+        grid: Vec<usize>,
+        pad: [usize; 3],
+        len: usize,
+    },
     /// No OpenCL device was found on any platform — usually an
     /// environment problem (no ICD installed, or `OCL_ICD_VENDORS`
     /// pointing at the wrong directory), not a claspr one. The most
@@ -134,6 +142,22 @@ impl fmt::Display for Error {
                  has {} work-items; a per-item argument needs exactly one work-item per element",
                 grid.iter().product::<usize>()
             ),
+            Error::HaloGridMismatch {
+                arg,
+                grid,
+                pad,
+                len,
+            } => {
+                let ext: Vec<usize> = (0..3)
+                    .map(|i| grid.get(i).copied().unwrap_or(1) + 2 * pad[i])
+                    .collect();
+                write!(
+                    f,
+                    "kernel launch: stencil argument `{arg}` has {len} elements but the grid \
+                     {grid:?} padded by {pad:?} halo cells per side needs {ext:?} = {}",
+                    ext.iter().product::<usize>()
+                )
+            }
             Error::PipeDrained(which) => write!(
                 f,
                 "eager graph: {which} was already drained — a pipe was consumed twice, \

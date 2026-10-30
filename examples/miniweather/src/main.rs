@@ -288,13 +288,6 @@ pub mod gpu {
         }
     }
 
-    /// Index into a halo-padded state array of the interior cell a
-    /// `[nx, nz, 4]` work-item `c` owns (`c.z` is the variable plane).
-    fn interior(c: USizeVec3, nx: usize, nz: usize) -> usize {
-        let nxp = nx + 2 * HS;
-        c.z * (nz + 2 * HS) * nxp + (c.y + HS) * nxp + (c.x + HS)
-    }
-
     // ── entry points: caravan order is fixed across all kernels ─────────────
 
     #[claspr::kernel]
@@ -488,37 +481,33 @@ pub mod gpu {
         }
     }
 
+    // The state arrays are halo-padded by HS in x and z (not across the 4
+    // variable planes), so on the `[nx, nz, 4]` grid `Halo<Real, HS>` /
+    // `Interior<Real, HS>` (RY = RX, RZ = 0) are this work-item's state cell.
+
     /// stages 1 & 2: state_tmp = state + dt * tend, one work-item per `tend`
     /// element on the `[nx, nz, 4]` grid.
     #[claspr::kernel]
-    #[allow(clippy::too_many_arguments)]
     pub fn update_a(
-        #[spirv(cross_workgroup)] state: &[Real],
-        #[spirv(cross_workgroup)] state_tmp: &mut [Real],
+        #[spirv(cross_workgroup)] state: Halo<Real, HS>,
+        #[spirv(cross_workgroup)] state_tmp: Interior<Real, HS>,
         #[spirv(cross_workgroup)] _flux: &[Real],
         #[spirv(cross_workgroup)] tend: PerItemIn<Real>,
-        nx: u32,
-        nz: u32,
         dt: Real,
     ) {
-        let c = interior(tend.coord(), nx as usize, nz as usize);
-        state_tmp[c] = state[c] + dt * *tend;
+        *state_tmp = *state + dt * *tend;
     }
 
     /// stage 3: state = state + dt * tend (in place)
     #[claspr::kernel]
-    #[allow(clippy::too_many_arguments)]
     pub fn update_b(
-        #[spirv(cross_workgroup)] state: &mut [Real],
+        #[spirv(cross_workgroup)] state: Interior<Real, HS>,
         #[spirv(cross_workgroup)] _state_tmp: &[Real],
         #[spirv(cross_workgroup)] _flux: &[Real],
         #[spirv(cross_workgroup)] tend: PerItemIn<Real>,
-        nx: u32,
-        nz: u32,
         dt: Real,
     ) {
-        let c = interior(tend.coord(), nx as usize, nz as usize);
-        state[c] = state[c] + dt * *tend;
+        *state = *state + dt * *tend;
     }
 }
 
@@ -908,7 +897,7 @@ where
                     ks.tend_s(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
                 })
                 .and_then(move |(s, t, fx, td)| {
-                    ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dta<Real>))
+                    ks.update_a(gt, s, t, fx, td, slot!($dta<Real>))
                 })
                 .and_then(move |(s, t, fx, td)| {
                     ks.halo_t(
@@ -948,7 +937,7 @@ where
                     ks.tend_t(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
                 })
                 .and_then(move |(s, t, fx, td)| {
-                    ks.update_a(gt, s, t, fx, td, nxu, nzu, slot!($dtb<Real>))
+                    ks.update_a(gt, s, t, fx, td, slot!($dtb<Real>))
                 })
                 .and_then(move |(s, t, fx, td)| {
                     ks.halo_t(
@@ -988,7 +977,7 @@ where
                     ks.tend_t(gt, s, t, fx, td, nxu, nzu, $d, dx_t, dz_t)
                 })
                 .and_then(move |(s, t, fx, td)| {
-                    ks.update_b(gt, s, t, fx, td, nxu, nzu, slot!($dtc<Real>))
+                    ks.update_b(gt, s, t, fx, td, slot!($dtc<Real>))
                 })
             };
         }

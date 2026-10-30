@@ -1016,7 +1016,7 @@ fn has_any_claspr_device_attr(attrs: &[syn::Attribute]) -> bool {
 }
 
 /// How a per-item kernel parameter may touch its element.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone)]
 enum PerItemAccess {
     /// `PerItem<T>`: read and write.
     ReadWrite,
@@ -1024,29 +1024,82 @@ enum PerItemAccess {
     Read,
     /// `PerItemOut<T>`: write only (the buffer may be uninitialised).
     Write,
+    /// `Stencil<T, B>` (`Halo` / `Periodic` / `Clamped`): read-only neighbourhood;
+    /// carries the canonical boundary type (`crate::__claspr::Padded<..>`, ...).
+    Stencil(proc_macro2::TokenStream),
+    /// `Interior<T, RX, RY, RZ>`: read-write centre of a halo-padded buffer;
+    /// carries the canonical view type.
+    Interior(proc_macro2::TokenStream),
 }
 
-/// The element type `T` and access, if `ty` is a `PerItem<T>` /
-/// `PerItemIn<T>` / `PerItemOut<T>` kernel parameter (last path segment, one
-/// type argument).
+/// `Halo` / `Interior` padding from the const arguments after the element type:
+/// `RX`, then `RY` (default `RX`), then `RZ` (default 0) — the aliases' defaults.
+/// Each as a braced const argument, so a const expression works too.
+fn halo_pad(consts: &[&syn::GenericArgument]) -> Option<[proc_macro2::TokenStream; 3]> {
+    let tok = |a: &syn::GenericArgument| quote::quote!({ #a });
+    let rx = tok(consts.first()?);
+    let ry = consts.get(1).map(|a| tok(a)).unwrap_or_else(|| rx.clone());
+    let rz = consts
+        .get(2)
+        .map(|a| tok(a))
+        .unwrap_or_else(|| quote::quote!({ 0 }));
+    (consts.len() <= 3).then_some([rx, ry, rz])
+}
+
+/// The element type `T` and access, if `ty` is a per-item kernel parameter
+/// (last path segment): `PerItem<T>` / `PerItemIn<T>` / `PerItemOut<T>`, a
+/// stencil — `Stencil<T, Padded<..> | Wrap | Clamp>` or its aliases `Halo<T, R..>`
+/// / `Periodic<T>` / `Clamped<T>` — or `Interior<T, R..>`. Recognised by name,
+/// so user aliases of these types are not (keep in sync with `claspr-macros`).
 fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, PerItemAccess)> {
     let syn::Type::Path(tp) = ty else { return None };
     let seg = tp.path.segments.last()?;
-    let access = match seg.ident.to_string().as_str() {
-        "PerItem" => PerItemAccess::ReadWrite,
-        "PerItemIn" => PerItemAccess::Read,
-        "PerItemOut" => PerItemAccess::Write,
-        _ => return None,
-    };
     let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
         return None;
     };
-    let mut types = args.args.iter().filter_map(|a| match a {
-        syn::GenericArgument::Type(t) => Some(t.clone()),
-        _ => None,
-    });
-    let elem = types.next()?;
-    types.next().is_none().then_some((elem, access))
+    let args: Vec<&syn::GenericArgument> = args
+        .args
+        .iter()
+        .filter(|a| !matches!(a, syn::GenericArgument::Lifetime(_)))
+        .collect();
+    let (first, rest) = args.split_first()?;
+    let syn::GenericArgument::Type(elem) = first else {
+        return None;
+    };
+    let access = match (seg.ident.to_string().as_str(), rest) {
+        ("PerItem", []) => PerItemAccess::ReadWrite,
+        ("PerItemIn", []) => PerItemAccess::Read,
+        ("PerItemOut", []) => PerItemAccess::Write,
+        ("Periodic", []) => PerItemAccess::Stencil(quote::quote!(crate::__claspr::Wrap)),
+        ("Clamped", []) => PerItemAccess::Stencil(quote::quote!(crate::__claspr::Clamp)),
+        ("Halo", consts) => {
+            let [rx, ry, rz] = halo_pad(consts)?;
+            PerItemAccess::Stencil(quote::quote!(crate::__claspr::Padded<#rx, #ry, #rz>))
+        }
+        ("Interior", consts) => {
+            let [rx, ry, rz] = halo_pad(consts)?;
+            PerItemAccess::Interior(quote::quote!(crate::__claspr::Interior::<_, #rx, #ry, #rz>))
+        }
+        ("Stencil", [syn::GenericArgument::Type(syn::Type::Path(b))]) => {
+            let bseg = b.path.segments.last()?;
+            match (bseg.ident.to_string().as_str(), &bseg.arguments) {
+                ("Wrap", syn::PathArguments::None) => {
+                    PerItemAccess::Stencil(quote::quote!(crate::__claspr::Wrap))
+                }
+                ("Clamp", syn::PathArguments::None) => {
+                    PerItemAccess::Stencil(quote::quote!(crate::__claspr::Clamp))
+                }
+                ("Padded", syn::PathArguments::AngleBracketed(pa)) if pa.args.len() == 3 => {
+                    let consts: Vec<&syn::GenericArgument> = pa.args.iter().collect();
+                    let [rx, ry, rz] = halo_pad(&consts)?;
+                    PerItemAccess::Stencil(quote::quote!(crate::__claspr::Padded<#rx, #ry, #rz>))
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some((elem.clone(), access))
 }
 
 /// Lower a kernel's `PerItem<T>` parameters for the device crate: each becomes the
@@ -1108,8 +1161,10 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn, checked: bool) -> Result<Option<
         // A write-only view may cover uninitialised memory: `MaybeUninit`, so
         // no `&mut T` to it ever exists.
         *pt.ty = match access {
-            PerItemAccess::ReadWrite => syn::parse_quote!(&mut [#elem]),
-            PerItemAccess::Read => syn::parse_quote!(&[#elem]),
+            PerItemAccess::ReadWrite | PerItemAccess::Interior(_) => {
+                syn::parse_quote!(&mut [#elem])
+            }
+            PerItemAccess::Read | PerItemAccess::Stencil(_) => syn::parse_quote!(&[#elem]),
             PerItemAccess::Write => syn::parse_quote!(&mut [core::mem::MaybeUninit<#elem>]),
         };
         lowered.push((name, raw, access));
@@ -1155,8 +1210,23 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn, checked: bool) -> Result<Option<
                     }
                 }
             }
+            // Stencil / Interior views compute their own (padded) cell; the
+            // twin flag selects unchecked indexing inside the view.
+            PerItemAccess::Stencil(boundary) => {
+                let unchecked = !checked;
+                syn::parse_quote! {
+                    let #name = crate::__claspr::Stencil::<_, #boundary>::__claspr_new(#raw, #gid, #gsize, #unchecked);
+                }
+            }
+            PerItemAccess::Interior(view) => {
+                let unchecked = !checked;
+                syn::parse_quote! {
+                    #[allow(unused_mut)]
+                    let mut #name = #view::__claspr_new(#raw, #gid, #gsize, #unchecked);
+                }
+            }
             PerItemAccess::ReadWrite | PerItemAccess::Read => {
-                let view = if *access == PerItemAccess::Read {
+                let view = if matches!(access, PerItemAccess::Read) {
                     quote::quote!(PerItemIn)
                 } else {
                     quote::quote!(PerItem)
@@ -1180,12 +1250,13 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn, checked: bool) -> Result<Option<
         })
         .collect();
     let index: syn::Stmt = syn::parse_quote! {
+        #[allow(unused_variables)]
         let __claspr_index = crate::__claspr::linear(#gid, #gsize);
     };
     let prologue: Vec<syn::Stmt> = std::iter::once(index).chain(prologue).collect();
     let outs: Vec<&syn::Ident> = lowered
         .iter()
-        .filter(|(_, _, a)| *a == PerItemAccess::Write)
+        .filter(|(_, _, a)| matches!(a, PerItemAccess::Write))
         .map(|(name, _, _)| name)
         .collect();
     if outs.is_empty() {
@@ -1443,6 +1514,204 @@ pub mod __claspr {
         type Target = T;
         #[inline(always)]
         fn deref(&self) -> &T {
+            self.slot
+        }
+    }
+
+    /// A stencil offset: `[dx]`, `[dx, dy]` or `[dx, dy, dz]` (missing axes are 0).
+    pub trait Offset {
+        fn xyz(self) -> (isize, isize, isize);
+    }
+    impl Offset for [isize; 1] {
+        #[inline(always)]
+        fn xyz(self) -> (isize, isize, isize) {
+            (self[0], 0, 0)
+        }
+    }
+    impl Offset for [isize; 2] {
+        #[inline(always)]
+        fn xyz(self) -> (isize, isize, isize) {
+            (self[0], self[1], 0)
+        }
+    }
+    impl Offset for [isize; 3] {
+        #[inline(always)]
+        fn xyz(self) -> (isize, isize, isize) {
+            (self[0], self[1], self[2])
+        }
+    }
+
+    /// How a `Stencil` resolves a neighbour along one axis.
+    pub trait Boundary {
+        /// Halo cells stored on each side of each axis (0 = unpadded buffer).
+        const PAD: [usize; 3];
+        /// Buffer coordinate of the neighbour at offset `d` from grid coordinate
+        /// `c`, on an axis with `pad` halo cells and buffer extent `ext`.
+        fn axis(c: usize, d: isize, pad: usize, ext: usize) -> usize;
+    }
+
+    /// Halo cells in memory: `R` on each side, filled by the caller. Offsets
+    /// may reach at most `R` cells (checked; folds away for literal offsets).
+    pub struct Padded<const RX: usize, const RY: usize, const RZ: usize>;
+    impl<const RX: usize, const RY: usize, const RZ: usize> Boundary for Padded<RX, RY, RZ> {
+        const PAD: [usize; 3] = [RX, RY, RZ];
+        #[inline(always)]
+        fn axis(c: usize, d: isize, pad: usize, _ext: usize) -> usize {
+            assert!(d.unsigned_abs() <= pad, "stencil offset beyond the halo");
+            ((c + pad) as isize + d) as usize
+        }
+    }
+
+    /// Periodic: an offset past an edge wraps to the other side (at most one
+    /// extent away; checked).
+    pub struct Wrap;
+    impl Boundary for Wrap {
+        const PAD: [usize; 3] = [0; 3];
+        #[inline(always)]
+        fn axis(c: usize, d: isize, _pad: usize, ext: usize) -> usize {
+            assert!(d.unsigned_abs() <= ext, "periodic stencil offset beyond one extent");
+            let i = c as isize + d;
+            if i < 0 {
+                (i + ext as isize) as usize
+            } else if i as usize >= ext {
+                i as usize - ext
+            } else {
+                i as usize
+            }
+        }
+    }
+
+    /// Clamped: an offset past an edge reads the edge cell.
+    pub struct Clamp;
+    impl Boundary for Clamp {
+        const PAD: [usize; 3] = [0; 3];
+        #[inline(always)]
+        fn axis(c: usize, d: isize, _pad: usize, ext: usize) -> usize {
+            let i = c as isize + d;
+            if i < 0 {
+                0
+            } else if i as usize >= ext {
+                ext - 1
+            } else {
+                i as usize
+            }
+        }
+    }
+
+    /// Read-only neighbourhood of this work-item's cell — `*s` is the cell,
+    /// `s.at([dx, dy])` a neighbour. The buffer is the grid plus `B::PAD` halo
+    /// cells on each side of each axis (row-major); `B` resolves the edges.
+    pub struct Stencil<'a, T, B> {
+        buf: &'a [T],
+        coord: USizeVec3,
+        ext: USizeVec3,
+        centre: usize,
+        unchecked: bool,
+        _boundary: core::marker::PhantomData<B>,
+    }
+
+    impl<'a, T, B: Boundary> Stencil<'a, T, B> {
+        #[doc(hidden)]
+        #[inline(always)]
+        pub fn __claspr_new(buf: &'a [T], gid: USizeVec3, gsize: USizeVec3, unchecked: bool) -> Self {
+            let p = B::PAD;
+            let ext = USizeVec3::new(gsize.x + 2 * p[0], gsize.y + 2 * p[1], gsize.z + 2 * p[2]);
+            let centre = linear(USizeVec3::new(gid.x + p[0], gid.y + p[1], gid.z + p[2]), ext);
+            Stencil { buf, coord: gid, ext, centre, unchecked, _boundary: core::marker::PhantomData }
+        }
+
+        #[inline(always)]
+        fn load(&self, i: usize) -> &T {
+            if self.unchecked {
+                // SAFETY: only the unchecked twin sets `unchecked`, dispatched by
+                // the typed launcher after its host check that the buffer is
+                // exactly the padded grid; `Boundary::axis` keeps every
+                // neighbour inside it.
+                unsafe { self.buf.get_unchecked(i) }
+            } else {
+                &self.buf[i]
+            }
+        }
+
+        /// The neighbour at offset `[dx]`, `[dx, dy]` or `[dx, dy, dz]`.
+        #[inline(always)]
+        pub fn at(&self, d: impl Offset) -> T
+        where
+            T: Copy,
+        {
+            let (dx, dy, dz) = d.xyz();
+            let p = B::PAD;
+            let x = B::axis(self.coord.x, dx, p[0], self.ext.x);
+            let y = B::axis(self.coord.y, dy, p[1], self.ext.y);
+            let z = B::axis(self.coord.z, dz, p[2], self.ext.z);
+            *self.load(x + self.ext.x * (y + self.ext.y * z))
+        }
+
+        /// The work-item's coordinates in the grid (not counting the halo).
+        #[inline(always)]
+        pub fn coord(&self) -> USizeVec3 {
+            self.coord
+        }
+    }
+
+    impl<T, B: Boundary> core::ops::Deref for Stencil<'_, T, B> {
+        type Target = T;
+        #[inline(always)]
+        fn deref(&self) -> &T {
+            self.load(self.centre)
+        }
+    }
+
+    /// A stencil over a buffer padded with `R` halo cells per side.
+    pub type Halo<'a, T, const RX: usize, const RY: usize = RX, const RZ: usize = 0> =
+        Stencil<'a, T, Padded<RX, RY, RZ>>;
+    /// A stencil with periodic edges over an unpadded buffer.
+    pub type Periodic<'a, T> = Stencil<'a, T, Wrap>;
+    /// A stencil with clamped edges over an unpadded buffer.
+    pub type Clamped<'a, T> = Stencil<'a, T, Clamp>;
+
+    /// This work-item's cell of a halo-padded buffer, read and write — no
+    /// neighbour access (neighbours belong to other work-items). The halo is
+    /// left as it is.
+    pub struct Interior<'a, T, const RX: usize, const RY: usize = RX, const RZ: usize = 0> {
+        slot: &'a mut T,
+        coord: USizeVec3,
+    }
+
+    impl<'a, T, const RX: usize, const RY: usize, const RZ: usize> Interior<'a, T, RX, RY, RZ> {
+        #[doc(hidden)]
+        #[inline(always)]
+        pub fn __claspr_new(buf: &'a mut [T], gid: USizeVec3, gsize: USizeVec3, unchecked: bool) -> Self {
+            let ext = USizeVec3::new(gsize.x + 2 * RX, gsize.y + 2 * RY, gsize.z + 2 * RZ);
+            let centre = linear(USizeVec3::new(gid.x + RX, gid.y + RY, gid.z + RZ), ext);
+            let slot = if unchecked {
+                // SAFETY: as for `Stencil::load` — the typed launcher checked the
+                // buffer is exactly the padded grid.
+                unsafe { buf.get_unchecked_mut(centre) }
+            } else {
+                &mut buf[centre]
+            };
+            Interior { slot, coord: gid }
+        }
+
+        /// The work-item's coordinates in the grid (not counting the halo).
+        #[inline(always)]
+        pub fn coord(&self) -> USizeVec3 {
+            self.coord
+        }
+    }
+
+    impl<T, const RX: usize, const RY: usize, const RZ: usize> core::ops::Deref for Interior<'_, T, RX, RY, RZ> {
+        type Target = T;
+        #[inline(always)]
+        fn deref(&self) -> &T {
+            self.slot
+        }
+    }
+
+    impl<T, const RX: usize, const RY: usize, const RZ: usize> core::ops::DerefMut for Interior<'_, T, RX, RY, RZ> {
+        #[inline(always)]
+        fn deref_mut(&mut self) -> &mut T {
             self.slot
         }
     }
