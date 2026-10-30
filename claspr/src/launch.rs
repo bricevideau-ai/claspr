@@ -782,6 +782,25 @@ pub fn check_per_item_grid(spec: &LaunchSpec, len: usize, arg: &'static str) -> 
     }
 }
 
+/// Check that a `PerRow` / `PerRowIn` argument of `len` elements splits into as
+/// many equal rows as `spec` has work-items (any 1-, 2- or 3-D grid): work-item
+/// `i` (row-major linear id) owns row `i` of `len / work-items` elements. Called
+/// by the code the `#[kernel]` macro emits, before the enqueue. Not API.
+#[doc(hidden)]
+pub fn check_row_grid(spec: &LaunchSpec, len: usize, arg: &'static str) -> crate::Result<()> {
+    let grid = spec.global();
+    let items: usize = grid.iter().product();
+    if items != 0 && len.is_multiple_of(items) {
+        Ok(())
+    } else {
+        Err(crate::Error::RowGridMismatch {
+            arg,
+            grid: grid.to_vec(),
+            len,
+        })
+    }
+}
+
 /// Check that a halo-padded stencil argument (`Halo` / `Interior`) of `len`
 /// elements is exactly `spec`'s grid plus `pad[i]` halo cells on each side of
 /// each axis `i` (an axis beyond the grid's dimensions has extent 1): work-item

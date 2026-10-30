@@ -127,7 +127,7 @@ pub use launch::{
     IntoLaunchSpec, KernelArg, KernelArgs, KernelPointerArg, KernelScalarRefArg,
     KernelScalarRefMutArg, KernelSliceReadArg, KernelSliceReadWriteArg, KernelSliceWriteArg,
     LaunchSpec, LocalBuffer, ScalarArg, ScalarRefArg, check_halo_grid, check_per_item_grid,
-    profiling_duration,
+    check_row_grid, profiling_duration,
 };
 pub use op::{
     LaunchOp, ProfileCb, ProfilingInfo, assert_same_context, complete_user_event,

@@ -248,6 +248,43 @@ pub mod kernels {
         }
     }
 
+    /// `out[i] = sum of row i` — `PerRowIn`: the buffer is one equal row per
+    /// work-item, and this work-item reads its own.
+    #[claspr::kernel]
+    pub fn row_sums_u32(
+        #[spirv(cross_workgroup)] m: PerRowIn<u32>,
+        #[spirv(cross_workgroup)] out: PerItemOut<u32>,
+    ) -> Written {
+        let mut sum = 0u32;
+        let mut j = 0usize;
+        while j < m.len() {
+            sum += m[j];
+            j += 1;
+        }
+        Written {
+            out: out.write(sum),
+        }
+    }
+
+    /// Subtract each row's minimum from it, in place — `PerRow`: this
+    /// work-item's row, exclusively.
+    #[claspr::kernel]
+    pub fn subtract_row_min_u32(#[spirv(cross_workgroup)] m: PerRow<u32>) {
+        let mut min = m[0];
+        let mut j = 1usize;
+        while j < m.len() {
+            if m[j] < min {
+                min = m[j];
+            }
+            j += 1;
+        }
+        j = 0;
+        while j < m.len() {
+            m[j] -= min;
+            j += 1;
+        }
+    }
+
     /// Sum of the 4 neighbours on a periodic `[W, H]` grid (`Periodic`: the
     /// buffer is the grid; offsets past an edge wrap).
     #[claspr::kernel]

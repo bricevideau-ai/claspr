@@ -102,16 +102,14 @@ mod gpu {
     #[claspr::kernel]
     pub fn matmul(
         #[spirv(global_invocation_id)] id: USizeVec3,
-        #[spirv(cross_workgroup)] w: &[f32],
+        #[spirv(cross_workgroup)] w: PerRowIn<f32>,
         #[spirv(cross_workgroup)] x: &[f32],
         #[spirv(cross_workgroup)] out: PerItemOut<f32>,
-        n: u32,
     ) -> Written {
-        let row = out.index() * n as usize;
         let mut acc = 0.0f32;
         let mut j = 0usize;
-        while j < n as usize {
-            acc += w[row + j] * x[j];
+        while j < w.len() {
+            acc += w[j] * x[j];
             j += 1;
         }
         Written {
@@ -125,23 +123,21 @@ mod gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn kv(
         #[spirv(global_invocation_id)] id: USizeVec3,
-        #[spirv(cross_workgroup)] wk: &[f32],
-        #[spirv(cross_workgroup)] wv: &[f32],
+        #[spirv(cross_workgroup)] wk: PerRowIn<f32>,
+        #[spirv(cross_workgroup)] wv: PerRowIn<f32>,
         #[spirv(cross_workgroup)] x: &[f32],
         #[spirv(cross_workgroup)] k_cache: &mut [f32],
         #[spirv(cross_workgroup)] v_cache: &mut [f32],
         #[spirv(cross_workgroup)] step: &Step,
-        n: u32,
         kv_dim: u32,
     ) {
-        let i = id.x;
-        let row = i * n as usize;
+        let i = wk.index();
         let mut k = 0.0f32;
         let mut v = 0.0f32;
         let mut j = 0usize;
-        while j < n as usize {
-            k += wk[row + j] * x[j];
-            v += wv[row + j] * x[j];
+        while j < wk.len() {
+            k += wk[j] * x[j];
+            v += wv[j] * x[j];
             j += 1;
         }
         let at = step.pos as usize * kv_dim as usize + i;
@@ -212,31 +208,29 @@ mod gpu {
     #[claspr::kernel]
     pub fn softmax(
         #[spirv(global_invocation_id)] id: USizeVec3,
-        #[spirv(cross_workgroup)] att: &mut [f32],
+        #[spirv(cross_workgroup)] att: PerRow<f32>,
         #[spirv(cross_workgroup)] step: &Step,
-        seq_len: u32,
     ) {
-        let row = id.x * seq_len as usize;
         let n = step.pos as usize + 1;
-        let mut max = att[row];
+        let mut max = att[0];
         let mut t = 1usize;
         while t < n {
-            if att[row + t] > max {
-                max = att[row + t];
+            if att[t] > max {
+                max = att[t];
             }
             t += 1;
         }
         let mut sum = 0.0f32;
         t = 0;
         while t < n {
-            let e = ocl::exp(att[row + t] - max);
-            att[row + t] = e;
+            let e = ocl::exp(att[t] - max);
+            att[t] = e;
             sum += e;
             t += 1;
         }
         t = 0;
         while t < n {
-            att[row + t] /= sum;
+            att[t] /= sum;
             t += 1;
         }
     }
@@ -695,9 +689,9 @@ impl Builder<'_> {
 
     fn classifier(&self, g: Stream, w: &str) -> Result<Stream, String> {
         let (w, logits) = (self.shared_weight(w)?, self.uninit(self.cfg.vocab_size)?);
-        let (ks, d, v) = (self.ks, self.cfg.dim, self.cfg.vocab_size);
+        let (ks, v) = (self.ks, self.cfg.vocab_size);
         Ok(map_x(g, move |x| {
-            ks.matmul([v], w, x, logits, d as u32)
+            ks.matmul([v], w, x, logits)
                 .and_then(|(_w, _x, logits)| forward(logits))
                 .erase()
         }))
@@ -732,17 +726,17 @@ impl Builder<'_> {
         Ok(g.and_then(|(x, step)| {
             graph! {
                 let (x, _rms, xb) = ks.rmsnorm([c.dim], x, rms, xb, d);
-                let (_wq, xb, q) = ks.matmul([c.dim], wq, xb, q, d);
+                let (_wq, xb, q) = ks.matmul([c.dim], wq, xb, q);
                 let (_wk, _wv, _xb, k_cache, v_cache, step) =
-                    ks.kv([c.kv_dim()], wk, wv, xb, k_cache, v_cache, step, d, kvd);
+                    ks.kv([c.kv_dim()], wk, wv, xb, k_cache, v_cache, step, kvd);
                 let (q, k_cache, step) = ks.rope([c.dim / 2], q, k_cache, step, kvd, hs);
                 let (_q, _k_cache, att, step) = ks.att_scores(
                     [c.n_heads * c.seq_len], q, k_cache, att, step, seq, hs, kvd, kv_mul,
                 );
-                let (att, step) = ks.softmax([c.n_heads], att, step, seq);
+                let (att, step) = ks.softmax([c.n_heads], att, step);
                 let (_att, _v_cache, xb2, step) =
                     ks.att_mix([c.dim], att, v_cache, xb2, step, seq, hs, kvd, kv_mul);
-                let (_wo, _xb2, xo) = ks.matmul([c.dim], wo, xb2, xo, d);
+                let (_wo, _xb2, xo) = ks.matmul([c.dim], wo, xb2, xo);
                 let (x, _xo) = ks.add([c.dim], x, xo);
                 bundle2(forward(x), forward(step))
             }
@@ -757,14 +751,14 @@ impl Builder<'_> {
         let [xb, xo] = self.uninit_n(c.dim)?;
         let [h1, h3] = self.uninit_n(c.hidden_dim)?;
         let ks = self.ks;
-        let (d, h) = (c.dim as u32, c.hidden_dim as u32);
+        let d = c.dim as u32;
         Ok(map_x(g, |x| {
             graph! {
                 let (x, _rms, xb) = ks.rmsnorm([c.dim], x, rms, xb, d);
-                let (_w1, xb, h1) = ks.matmul([c.hidden_dim], w1, xb, h1, d);
-                let (_w3, _xb, h3) = ks.matmul([c.hidden_dim], w3, xb, h3, d);
+                let (_w1, xb, h1) = ks.matmul([c.hidden_dim], w1, xb, h1);
+                let (_w3, _xb, h3) = ks.matmul([c.hidden_dim], w3, xb, h3);
                 let (h1, _h3) = ks.swiglu([c.hidden_dim], h1, h3);
-                let (_w2, _h1, xo) = ks.matmul([c.dim], w2, h1, xo, h);
+                let (_w2, _h1, xo) = ks.matmul([c.dim], w2, h1, xo);
                 let (x, _xo) = ks.add([c.dim], x, xo);
                 forward(x)
             }

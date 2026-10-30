@@ -109,6 +109,12 @@ use syn::{
 ///   an output left unwritten on any completing path is a compile error. It
 ///   accepts an UNINITIALISED buffer (`DeviceSliceUninit`) and outputs the
 ///   initialised one.
+/// - `PerRow<T>` is this work-item's ROW, exclusively (read and write; derefs
+///   to `[T]`): the buffer is split into one equal row per work-item, row `i`
+///   for the row-major linear id `i`, and the launch checks the length divides
+///   exactly (`Error::RowGridMismatch`). `PerRowIn<T>` is the read-only form.
+///   Loop to `row.len()` rather than a separate length argument: the bounds
+///   check then matches the loop condition and the driver can drop it.
 /// - Stencils read this work-item's cell AND its neighbours, read-only (a
 ///   neighbour is another work-item's cell): `*name` is the cell,
 ///   `name.at([dx, dy])` (`[dx]` / `[dx, dy, dz]` too) a neighbour.
@@ -903,7 +909,7 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                 mutable,
                 per_item,
                 write_only,
-                pad,
+                grid_check,
             } => {
                 // Two generics per slice:
                 //   __claspr_D{n} — the concrete BUFFER type (flows to Output,
@@ -959,12 +965,15 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     } else {
                         quote! { ::claspr::KernelSliceReadArg::<#elem>::element_count(&#pname) }
                     };
-                    per_item_checks.push(match &pad {
-                        None => quote! {
+                    per_item_checks.push(match &grid_check {
+                        GridCheck::Exact => quote! {
                             ::claspr::check_per_item_grid(&__claspr_spec, #len, #name_lit)?;
                         },
-                        Some(pad) => quote! {
+                        GridCheck::Halo(pad) => quote! {
                             ::claspr::check_halo_grid(&__claspr_spec, #len, #pad, #name_lit)?;
+                        },
+                        GridCheck::Rows => quote! {
+                            ::claspr::check_row_grid(&__claspr_spec, #len, #name_lit)?;
                         },
                     });
                 }
@@ -2609,10 +2618,8 @@ enum ParamRole {
         /// A `PerItemOut<T>` param: `per_item`, write-only — it accepts an
         /// uninitialised buffer (`KernelSliceWriteArg`) and outputs its `Init`.
         write_only: bool,
-        /// A `Halo` / `Interior` (padded `Stencil`) param: `per_item`, and the
-        /// buffer is the grid plus this many halo cells per side of each axis
-        /// (a `[usize; 3]` expression); `None` for an unpadded buffer.
-        pad: Option<TokenStream2>,
+        /// How the launch checks a `per_item` param's buffer against the grid.
+        grid_check: GridCheck,
     },
     /// Image param (`&Image!(...)` / `&mut Image!(...)`). Becomes a
     /// pair of generic type parameters on the emitted method:
@@ -2706,14 +2713,14 @@ fn classify_param(pt: &PatType) -> syn::Result<ParamRole> {
                 mutable,
                 per_item,
                 write_only,
-                pad,
+                grid_check,
             } => Ok(ParamRole::Slice {
                 name: pname,
                 elem,
                 mutable,
                 per_item,
                 write_only,
-                pad,
+                grid_check,
             }),
             CrossWorkgroupTy::ScalarRef { elem, mutable } => Ok(ParamRole::ScalarRef {
                 name: pname,
@@ -2761,7 +2768,7 @@ enum CrossWorkgroupTy {
         mutable: bool,
         per_item: bool,
         write_only: bool,
-        pad: Option<TokenStream2>,
+        grid_check: GridCheck,
     },
     ScalarRef {
         elem: TokenStream2,
@@ -2802,7 +2809,7 @@ fn cross_workgroup_element_ty(ty: &Type) -> syn::Result<CrossWorkgroupTy> {
             mutable,
             per_item: false,
             write_only: false,
-            pad: None,
+            grid_check: GridCheck::Exact,
         }),
         // Anything else the reference wraps (a `Type::Path` like `f32`,
         // or another concrete non-slice type) is a scalar-by-reference:
@@ -2814,9 +2821,21 @@ fn cross_workgroup_element_ty(ty: &Type) -> syn::Result<CrossWorkgroupTy> {
     }
 }
 
+/// How the launch checks a per-item view param's buffer against the grid.
+enum GridCheck {
+    /// One element per work-item (`check_per_item_grid`).
+    Exact,
+    /// The grid plus halo cells per side of each axis — a `[usize; 3]`
+    /// expression (`check_halo_grid`).
+    Halo(TokenStream2),
+    /// One equal row per work-item (`check_row_grid`).
+    Rows,
+}
+
 /// A per-item view parameter type, by name (last path segment) — the same
 /// spellings claspr-build's `per_item_elem` lowers (keep the two in sync):
-/// `PerItem` / `PerItemIn` / `PerItemOut<T>`, `Periodic` / `Clamped<T>`,
+/// `PerItem` / `PerItemIn` / `PerItemOut<T>`, `PerRow` / `PerRowIn<T>`,
+/// `Periodic` / `Clamped<T>`,
 /// `Halo<T, RX[, RY[, RZ]]>` / `Interior<T, ..>` (defaults `RY = RX`, `RZ = 0`),
 /// and `Stencil<T, Wrap | Clamp | Padded<RX, RY, RZ>>`.
 fn per_item_view(ty: &Type) -> Option<CrossWorkgroupTy> {
@@ -2847,28 +2866,30 @@ fn per_item_view(ty: &Type) -> Option<CrossWorkgroupTy> {
             .unwrap_or_else(|| quote! { 0 });
         (consts.len() <= 3).then(|| quote! { [(#rx) as usize, (#ry) as usize, (#rz) as usize] })
     };
-    let view =
-        |mutable: bool, write_only: bool, pad: Option<TokenStream2>| CrossWorkgroupTy::Slice {
-            elem: quote! { #inner },
-            mutable,
-            per_item: true,
-            write_only,
-            pad,
-        };
+    let view = |mutable: bool, write_only: bool, grid_check: GridCheck| CrossWorkgroupTy::Slice {
+        elem: quote! { #inner },
+        mutable,
+        per_item: true,
+        write_only,
+        grid_check,
+    };
+    use GridCheck::{Exact, Halo, Rows};
     match (seg.ident.to_string().as_str(), rest) {
-        ("PerItem", []) => Some(view(true, false, None)),
-        ("PerItemIn", []) => Some(view(false, false, None)),
-        ("PerItemOut", []) => Some(view(true, true, None)),
-        ("Periodic" | "Clamped", []) => Some(view(false, false, None)),
-        ("Halo", consts) => Some(view(false, false, Some(pad(consts)?))),
-        ("Interior", consts) => Some(view(true, false, Some(pad(consts)?))),
+        ("PerItem", []) => Some(view(true, false, Exact)),
+        ("PerItemIn", []) => Some(view(false, false, Exact)),
+        ("PerItemOut", []) => Some(view(true, true, Exact)),
+        ("PerRow", []) => Some(view(true, false, Rows)),
+        ("PerRowIn", []) => Some(view(false, false, Rows)),
+        ("Periodic" | "Clamped", []) => Some(view(false, false, Exact)),
+        ("Halo", consts) => Some(view(false, false, Halo(pad(consts)?))),
+        ("Interior", consts) => Some(view(true, false, Halo(pad(consts)?))),
         ("Stencil", [syn::GenericArgument::Type(Type::Path(b))]) => {
             let bseg = b.path.segments.last()?;
             match (bseg.ident.to_string().as_str(), &bseg.arguments) {
-                ("Wrap" | "Clamp", syn::PathArguments::None) => Some(view(false, false, None)),
+                ("Wrap" | "Clamp", syn::PathArguments::None) => Some(view(false, false, Exact)),
                 ("Padded", syn::PathArguments::AngleBracketed(pa)) if pa.args.len() == 3 => {
                     let consts: Vec<&syn::GenericArgument> = pa.args.iter().collect();
-                    Some(view(false, false, Some(pad(&consts)?)))
+                    Some(view(false, false, Halo(pad(&consts)?)))
                 }
                 _ => None,
             }

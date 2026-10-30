@@ -85,6 +85,18 @@ refusals 105 → 6). Gray-scott `laplacian` → `Periodic`: frames byte-identica
 3.77 → 3.67 s, rusticl 10.8 → 9.5 s; miniweather `update_a/b` → `Halo` + `Interior`
 (nx/nz args gone), bit-identical. Not covered: staggered grids, SoA component axes,
 halo fills — the tensor-view/tiling design.
+**Per-row views (family A of the tensor-view design) — branch `per-row` (2026-10-30):**
+`PerRow<T>` (exclusive `&mut` row) / `PerRowIn<T>` (read-only), deref to `[T]`: one
+equal row per work-item (row = linear id), row length `len / work-items`, host
+`check_row_grid` / `Error::RowGridMismatch`; the twin skips the row-slice check only
+(the user's `j` stays checked). llama2 `matmul` / `kv` / `softmax` use them and drop
+their `n` / `seq_len` args: output identical, PoCL ±noise, **rusticl 11.6 → 25 tok/s**
+— likely because `while j < row.len()` makes the per-element check match the loop
+condition so llvmpipe's LLVM drops it (unverified). Next: family B, `Tensor<T, R>`
+with explicit extents/strides/offset (gathers: `att_scores` / `att_mix`, KV cache;
+tiling as host-side sub-views). Open: how a shape reaches the launch (separate
+scalar arg vs tuple vs shaped buffer type), strided vs contiguous wire format, and
+whether rust-gpu takes a `#[repr(C)]` struct by value as a kernel arg.
 **Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
 inside the kernel, so the positional handle is no worse than before; and the real
 user difficulty is telling which params are PIPED (every buffer-like param —

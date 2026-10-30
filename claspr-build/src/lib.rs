@@ -1030,6 +1030,8 @@ enum PerItemAccess {
     /// `Interior<T, RX, RY, RZ>`: read-write centre of a halo-padded buffer;
     /// carries the canonical view type.
     Interior(proc_macro2::TokenStream),
+    /// `PerRow<T>` (`mutable`) / `PerRowIn<T>`: this work-item's row.
+    Row { mutable: bool },
 }
 
 /// `Halo` / `Interior` padding from the const arguments after the element type:
@@ -1047,7 +1049,8 @@ fn halo_pad(consts: &[&syn::GenericArgument]) -> Option<[proc_macro2::TokenStrea
 }
 
 /// The element type `T` and access, if `ty` is a per-item kernel parameter
-/// (last path segment): `PerItem<T>` / `PerItemIn<T>` / `PerItemOut<T>`, a
+/// (last path segment): `PerItem<T>` / `PerItemIn<T>` / `PerItemOut<T>`,
+/// `PerRow<T>` / `PerRowIn<T>`, a
 /// stencil — `Stencil<T, Padded<..> | Wrap | Clamp>` or its aliases `Halo<T, R..>`
 /// / `Periodic<T>` / `Clamped<T>` — or `Interior<T, R..>`. Recognised by name,
 /// so user aliases of these types are not (keep in sync with `claspr-macros`).
@@ -1070,6 +1073,8 @@ fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, PerItemAccess)> {
         ("PerItem", []) => PerItemAccess::ReadWrite,
         ("PerItemIn", []) => PerItemAccess::Read,
         ("PerItemOut", []) => PerItemAccess::Write,
+        ("PerRow", []) => PerItemAccess::Row { mutable: true },
+        ("PerRowIn", []) => PerItemAccess::Row { mutable: false },
         ("Periodic", []) => PerItemAccess::Stencil(quote::quote!(crate::__claspr::Wrap)),
         ("Clamped", []) => PerItemAccess::Stencil(quote::quote!(crate::__claspr::Clamp)),
         ("Halo", consts) => {
@@ -1161,10 +1166,12 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn, checked: bool) -> Result<Option<
         // A write-only view may cover uninitialised memory: `MaybeUninit`, so
         // no `&mut T` to it ever exists.
         *pt.ty = match access {
-            PerItemAccess::ReadWrite | PerItemAccess::Interior(_) => {
-                syn::parse_quote!(&mut [#elem])
-            }
-            PerItemAccess::Read | PerItemAccess::Stencil(_) => syn::parse_quote!(&[#elem]),
+            PerItemAccess::ReadWrite
+            | PerItemAccess::Interior(_)
+            | PerItemAccess::Row { mutable: true } => syn::parse_quote!(&mut [#elem]),
+            PerItemAccess::Read
+            | PerItemAccess::Stencil(_)
+            | PerItemAccess::Row { mutable: false } => syn::parse_quote!(&[#elem]),
             PerItemAccess::Write => syn::parse_quote!(&mut [core::mem::MaybeUninit<#elem>]),
         };
         lowered.push((name, raw, access));
@@ -1216,6 +1223,14 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn, checked: bool) -> Result<Option<
                 let unchecked = !checked;
                 syn::parse_quote! {
                     let #name = crate::__claspr::Stencil::<_, #boundary>::__claspr_new(#raw, #gid, #gsize, #unchecked);
+                }
+            }
+            PerItemAccess::Row { mutable } => {
+                let unchecked = !checked;
+                let view = if *mutable { quote::quote!(PerRow) } else { quote::quote!(PerRowIn) };
+                syn::parse_quote! {
+                    #[allow(unused_mut)]
+                    let mut #name = crate::__claspr::#view::__claspr_new(#raw, __claspr_index, #gid, #gsize, #unchecked);
                 }
             }
             PerItemAccess::Interior(view) => {
@@ -1515,6 +1530,123 @@ pub mod __claspr {
         #[inline(always)]
         fn deref(&self) -> &T {
             self.slot
+        }
+    }
+
+    /// Grid work-items in all.
+    #[inline(always)]
+    fn total(gsize: USizeVec3) -> usize {
+        gsize.x * gsize.y * gsize.z
+    }
+
+    /// This work-item's ROW of a `PerRow<T>` kernel argument — exclusive, read
+    /// and write: the buffer is split into as many equal rows as the grid has
+    /// work-items (the launch checks the length divides exactly), and
+    /// work-item `i` (row-major linear id) owns row `i`. Derefs to `[T]`.
+    pub struct PerRow<'a, T> {
+        row: &'a mut [T],
+        index: usize,
+        coord: USizeVec3,
+    }
+
+    impl<'a, T> PerRow<'a, T> {
+        #[doc(hidden)]
+        #[inline(always)]
+        pub fn __claspr_new(
+            buf: &'a mut [T],
+            index: usize,
+            gid: USizeVec3,
+            gsize: USizeVec3,
+            unchecked: bool,
+        ) -> Self {
+            let n = buf.len() / total(gsize);
+            let rows = index * n..(index + 1) * n;
+            let row = if unchecked {
+                // SAFETY: only the unchecked twin sets `unchecked`, dispatched by
+                // the typed launcher after its host check that the buffer is
+                // exactly `total(gsize)` rows, so row `index` is inside it.
+                unsafe { buf.get_unchecked_mut(rows) }
+            } else {
+                &mut buf[rows]
+            };
+            PerRow { row, index, coord: gid }
+        }
+
+        /// The row's index: the work-item's row-major linear id over the grid.
+        #[inline(always)]
+        pub fn index(&self) -> usize {
+            self.index
+        }
+
+        /// The work-item's coordinates in the grid.
+        #[inline(always)]
+        pub fn coord(&self) -> USizeVec3 {
+            self.coord
+        }
+    }
+
+    impl<T> core::ops::Deref for PerRow<'_, T> {
+        type Target = [T];
+        #[inline(always)]
+        fn deref(&self) -> &[T] {
+            self.row
+        }
+    }
+
+    impl<T> core::ops::DerefMut for PerRow<'_, T> {
+        #[inline(always)]
+        fn deref_mut(&mut self) -> &mut [T] {
+            self.row
+        }
+    }
+
+    /// This work-item's row of a `PerRowIn<T>` kernel argument — read-only (see
+    /// `PerRow`). Derefs to `[T]`.
+    pub struct PerRowIn<'a, T> {
+        row: &'a [T],
+        index: usize,
+        coord: USizeVec3,
+    }
+
+    impl<'a, T> PerRowIn<'a, T> {
+        #[doc(hidden)]
+        #[inline(always)]
+        pub fn __claspr_new(
+            buf: &'a [T],
+            index: usize,
+            gid: USizeVec3,
+            gsize: USizeVec3,
+            unchecked: bool,
+        ) -> Self {
+            let n = buf.len() / total(gsize);
+            let rows = index * n..(index + 1) * n;
+            let row = if unchecked {
+                // SAFETY: as for `PerRow::__claspr_new`.
+                unsafe { buf.get_unchecked(rows) }
+            } else {
+                &buf[rows]
+            };
+            PerRowIn { row, index, coord: gid }
+        }
+
+        /// The row's index (see `PerRow::index`).
+        #[inline(always)]
+        pub fn index(&self) -> usize {
+            self.index
+        }
+
+        /// The work-item's coordinates in the grid.
+        #[inline(always)]
+        pub fn coord(&self) -> USizeVec3 {
+            self.coord
+        }
+    }
+
+    impl<T> core::ops::Deref for PerRowIn<'_, T> {
+        type Target = [T];
+        #[inline(always)]
+        fn deref(&self) -> &[T] {
+            self.row
         }
     }
 

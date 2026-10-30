@@ -42,6 +42,13 @@ pub enum Error {
         grid: Vec<usize>,
         len: usize,
     },
+    /// A per-row kernel argument (`PerRow` / `PerRowIn`) does not split into one
+    /// equal row per work-item of the launch grid.
+    RowGridMismatch {
+        arg: &'static str,
+        grid: Vec<usize>,
+        len: usize,
+    },
     /// A halo-padded stencil kernel argument (`Halo` / `Interior`) is not exactly
     /// the launch grid plus `pad` halo cells on each side of each axis.
     HaloGridMismatch {
@@ -140,6 +147,12 @@ impl fmt::Display for Error {
                 f,
                 "kernel launch: per-item argument `{arg}` has {len} elements but the grid {grid:?} \
                  has {} work-items; a per-item argument needs exactly one work-item per element",
+                grid.iter().product::<usize>()
+            ),
+            Error::RowGridMismatch { arg, grid, len } => write!(
+                f,
+                "kernel launch: per-row argument `{arg}` has {len} elements, which the grid \
+                 {grid:?} ({} work-items) does not split into equal rows",
                 grid.iter().product::<usize>()
             ),
             Error::HaloGridMismatch {
