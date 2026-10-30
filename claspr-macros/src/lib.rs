@@ -1458,10 +1458,10 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
     //   `(empty)`                   — when there are no slice params.
     // `PerItem` grid checks, run after the inputs resolve (a pipe-fed buffer's
     // length is only known then); on a mismatch every lent input goes back.
-    // A kernel with per-item params launches its unguarded device twin (no
-    // in-kernel grid check — claspr-build's `UNCHECKED_SUFFIX`): every execute
-    // runs the host-side `per_item_guard` below first, so the twin's unchecked
-    // indexing is in bounds. Raw `Kernels::kernel` callers get the guarded one.
+    // A kernel with per-item params launches its unchecked device twin (views
+    // index without bounds checks — claspr-build's `UNCHECKED_SUFFIX`): every
+    // execute runs the host-side `per_item_guard` below first, so the twin's
+    // indexing is in bounds. Raw `Kernels::kernel` callers get the checked one.
     let kernel_lookup: TokenStream2 = if per_item_checks.is_empty() {
         let lit = name.to_string();
         quote! { self.kernel(#lit) }

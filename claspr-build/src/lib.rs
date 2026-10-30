@@ -563,8 +563,8 @@ fn generate_module_source(
     /// for the rare case where you need a raw kernel by name
     /// (e.g. `ctx.launch(&kernels.kernel("foo"), ...)`).
     ///
-    /// Panics on a per-item kernel's `<name>__claspr_unchecked` twin: it has no
-    /// in-kernel grid check and is only sound behind its typed launcher.
+    /// Panics on a per-item kernel's `<name>__claspr_unchecked` twin: its views
+    /// index without bounds checks, so it is only sound behind its typed launcher.
     pub fn kernel(&self, name: &str) -> ::claspr::Kernel {
         assert!(
             !name.ends_with("__claspr_unchecked"),
@@ -876,8 +876,9 @@ impl HostBuilder {
 /// Function items get their `#[claspr::kernel]` attrs translated to
 /// `#[spirv(kernel)]`; everything else (use, const, static, struct,
 /// type def, …) passes through verbatim.
-/// Entry-point name suffix of a per-item kernel's unguarded twin: no in-kernel
-/// grid check, so it's only sound behind the typed launcher's host check.
+/// Entry-point name suffix of a per-item kernel's unchecked twin: its views
+/// index without bounds checks, so it's only sound behind the typed launcher's
+/// host-side grid check.
 /// Must match `claspr-macros`.
 const UNCHECKED_SUFFIX: &str = "__claspr_unchecked";
 
@@ -887,7 +888,7 @@ fn translate_and_inline(items: Vec<syn::Item>, dir: &Path) -> Result<Vec<syn::It
         match item {
             syn::Item::Fn(mut f) => {
                 if f.attrs.iter().any(is_claspr_kernel_attr) {
-                    // A kernel with per-item params gets an unguarded twin
+                    // A kernel with per-item params gets an unchecked twin
                     // (`<name>__claspr_unchecked`) for the typed launcher.
                     let mut twin = f.clone();
                     if let Some(extra) = rewrite_per_item_params(&mut f, true)? {
@@ -1054,8 +1055,10 @@ fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, PerItemAccess)> {
 /// and 3-D grids all work; helpers in the generated preamble). Global-id and
 /// global-size parameters are added if the kernel has none. The host checks at
 /// launch that the grid has exactly as many work-items as each buffer has
-/// elements; the prologue re-checks it UNIFORMLY (`covers`, an early return for
-/// all work-items) and then indexes without per-work-item bounds checks.
+/// elements. The views index the buffer with ordinary checked slice access (what
+/// an out-of-bounds index does is the build's panic strategy) — except in the
+/// `checked == false` twin, which indexes unchecked and is only dispatched by
+/// the typed launcher, after that host check.
 ///
 /// A kernel with `PerItemOut<T>` params must return `Written`: a per-kernel struct
 /// with one field per write-only param, each of a type only that param's
@@ -1063,7 +1066,7 @@ fn per_item_elem(ty: &syn::Type) -> Option<(syn::Type, PerItemAccess)> {
 /// every path that completes has written every output (a missing field, a
 /// second write, another output's proof or a forged one are compile errors).
 /// Returns the generated items (the per-output marker types and `Written`).
-fn rewrite_per_item_params(f: &mut syn::ItemFn, guarded: bool) -> Result<Option<Vec<syn::Item>>> {
+fn rewrite_per_item_params(f: &mut syn::ItemFn, checked: bool) -> Result<Option<Vec<syn::Item>>> {
     let is_gid = |pt: &syn::PatType| {
         pt.attrs.iter().any(|a| {
             a.path().is_ident("spirv")
@@ -1138,12 +1141,18 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn, guarded: bool) -> Result<Option<
         .map(|(name, raw, access)| match access {
             PerItemAccess::Write => {
                 let m = marker(name);
-                syn::parse_quote! {
-                    // SAFETY: the grid covers every buffer — checked by the guard above, or
-                    // for the unchecked twin by the typed launcher's host check.
-                    let #name = unsafe {
-                        crate::__claspr::PerItemOut::<_, #m>::__claspr_new(#raw, __claspr_index, #gid)
-                    };
+                if checked {
+                    syn::parse_quote! {
+                        let #name = crate::__claspr::PerItemOut::<_, #m>::__claspr_new(#raw, __claspr_index, #gid);
+                    }
+                } else {
+                    syn::parse_quote! {
+                        // SAFETY: only the typed launcher dispatches the unchecked
+                        // twin, after its host check that the grid covers the buffer.
+                        let #name = unsafe {
+                            crate::__claspr::PerItemOut::<_, #m>::__claspr_new_unchecked(#raw, __claspr_index, #gid)
+                        };
+                    }
                 }
             }
             PerItemAccess::ReadWrite | PerItemAccess::Read => {
@@ -1152,32 +1161,28 @@ fn rewrite_per_item_params(f: &mut syn::ItemFn, guarded: bool) -> Result<Option<
                 } else {
                     quote::quote!(PerItem)
                 };
-                syn::parse_quote! {
-                    #[allow(unused_mut)]
-                    // SAFETY: the grid covers every buffer — checked by the guard above, or
-                    // for the unchecked twin by the typed launcher's host check.
-                    let mut #name = unsafe { crate::__claspr::#view::__claspr_new(#raw, __claspr_index, #gid) };
+                if checked {
+                    syn::parse_quote! {
+                        #[allow(unused_mut)]
+                        let mut #name = crate::__claspr::#view::__claspr_new(#raw, __claspr_index, #gid);
+                    }
+                } else {
+                    syn::parse_quote! {
+                        #[allow(unused_mut)]
+                        // SAFETY: only the typed launcher dispatches the unchecked
+                        // twin, after its host check that the grid covers the buffer.
+                        let mut #name = unsafe {
+                            crate::__claspr::#view::__claspr_new_unchecked(#raw, __claspr_index, #gid)
+                        };
+                    }
                 }
             }
         })
         .collect();
-    // One UNIFORM guard for all views: a grid that doesn't cover every per-item
-    // buffer exactly ends every work-item before any view exists. Omitted from
-    // the `__claspr_unchecked` twin, which only the typed launcher (after its
-    // host-side grid check) dispatches.
-    let raws = lowered.iter().map(|(_, raw, _)| raw);
-    let mut guard: Vec<syn::Stmt> = Vec::new();
-    if guarded {
-        guard.push(syn::parse_quote! {
-            if !(true #( && crate::__claspr::covers(#raws.len(), #gsize) )*) {
-                return;
-            }
-        });
-    }
-    guard.push(syn::parse_quote! {
+    let index: syn::Stmt = syn::parse_quote! {
         let __claspr_index = crate::__claspr::linear(#gid, #gsize);
-    });
-    let prologue: Vec<syn::Stmt> = guard.into_iter().chain(prologue).collect();
+    };
+    let prologue: Vec<syn::Stmt> = std::iter::once(index).chain(prologue).collect();
     let outs: Vec<&syn::Ident> = lowered
         .iter()
         .filter(|(_, _, a)| *a == PerItemAccess::Write)
@@ -1338,24 +1343,6 @@ pub mod __claspr {
     /// This work-item's element of a `PerItem<T>` kernel argument.
     use spirv_std::glam::USizeVec3;
 
-    /// Whether a grid of extent `gsize` has exactly `len` work-items. The kernel
-    /// prologue requires it of every per-item buffer before building the views,
-    /// which then index UNCHECKED: `gid < gsize` component-wise (claspr never
-    /// sets a global offset; a dimension beyond the launch's has id 0, size 1),
-    /// so every `linear(gid, gsize)` is below `len`. The check is UNIFORM — the
-    /// same answer on every work-item — so unlike a per-work-item bounds check
-    /// (whose panic path is a `printf`) it doesn't keep the driver from
-    /// vectorising across work-items. The host's launch check reports a
-    /// mismatched grid first; this keeps a raw launch sound too.
-    #[doc(hidden)]
-    #[inline(always)]
-    pub fn covers(len: usize, gsize: USizeVec3) -> bool {
-        // `gsize.x * gsize.y * gsize.z == len`, by division so it can't
-        // overflow (rust-gpu has no `checked_mul` yet).
-        let (x, y) = (gsize.x, gsize.y);
-        x != 0 && y != 0 && len % x == 0 && (len / x) % y == 0 && len / x / y == gsize.z
-    }
-
     /// Row-major linear id of work-item `gid` in a grid of extent `gsize`.
     #[doc(hidden)]
     #[inline(always)]
@@ -1372,9 +1359,15 @@ pub mod __claspr {
     impl<'a, T> PerItem<'a, T> {
         #[doc(hidden)]
         #[inline(always)]
+        pub fn __claspr_new(buf: &'a mut [T], index: usize, gid: USizeVec3) -> Self {
+            PerItem { slot: &mut buf[index], index, coord: gid }
+        }
+
         /// # Safety
-        /// `index < buf.len()` (`covers(buf.len(), gsize)` with `index = linear(gid, gsize)`).
-        pub unsafe fn __claspr_new(buf: &'a mut [T], index: usize, gid: USizeVec3) -> Self {
+        /// `index < buf.len()`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn __claspr_new_unchecked(buf: &'a mut [T], index: usize, gid: USizeVec3) -> Self {
             // SAFETY: the caller guarantees `index < buf.len()`.
             let slot = unsafe { buf.get_unchecked_mut(index) };
             PerItem { slot, index, coord: gid }
@@ -1419,9 +1412,15 @@ pub mod __claspr {
     impl<'a, T> PerItemIn<'a, T> {
         #[doc(hidden)]
         #[inline(always)]
+        pub fn __claspr_new(buf: &'a [T], index: usize, gid: USizeVec3) -> Self {
+            PerItemIn { slot: &buf[index], index, coord: gid }
+        }
+
         /// # Safety
-        /// `index < buf.len()` (`covers(buf.len(), gsize)` with `index = linear(gid, gsize)`).
-        pub unsafe fn __claspr_new(buf: &'a [T], index: usize, gid: USizeVec3) -> Self {
+        /// `index < buf.len()`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn __claspr_new_unchecked(buf: &'a [T], index: usize, gid: USizeVec3) -> Self {
             // SAFETY: the caller guarantees `index < buf.len()`.
             let slot = unsafe { buf.get_unchecked(index) };
             PerItemIn { slot, index, coord: gid }
@@ -1465,9 +1464,24 @@ pub mod __claspr {
     impl<'a, T, M> PerItemOut<'a, T, M> {
         #[doc(hidden)]
         #[inline(always)]
+        pub fn __claspr_new(
+            buf: &'a mut [core::mem::MaybeUninit<T>],
+            index: usize,
+            gid: USizeVec3,
+        ) -> Self {
+            PerItemOut {
+                slot: &mut buf[index],
+                index,
+                coord: gid,
+                _output: core::marker::PhantomData,
+            }
+        }
+
         /// # Safety
-        /// `index < buf.len()` (`covers(buf.len(), gsize)` with `index = linear(gid, gsize)`).
-        pub unsafe fn __claspr_new(
+        /// `index < buf.len()`.
+        #[doc(hidden)]
+        #[inline(always)]
+        pub unsafe fn __claspr_new_unchecked(
             buf: &'a mut [core::mem::MaybeUninit<T>],
             index: usize,
             gid: USizeVec3,

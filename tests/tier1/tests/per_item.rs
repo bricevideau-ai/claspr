@@ -6,9 +6,9 @@
 //! at launch that the grid has exactly as many work-items as the buffer has
 //! elements, so every element is owned by exactly one work-item. A mismatch is
 //! `GridMismatch` before anything is enqueued, and leaves a graph retryable.
-//! The typed launcher then dispatches an unguarded device twin that indexes
+//! The typed launcher then dispatches an unchecked device twin whose views index
 //! without bounds checks; the kernel's own entry point (what a raw launch gets)
-//! re-checks the grid uniformly and does nothing on a mismatch.
+//! uses ordinary checked slice access.
 
 use claspr::eager::{DeviceOpExt, download};
 use claspr::{
@@ -338,36 +338,31 @@ fn per_item_out_initialises_an_uninitialised_usm_slice() {
 }
 
 /// A raw launch of a per-item kernel's own entry point (which skips the host
-/// grid check) runs its in-kernel guard: a matching grid computes as usual, and
-/// a grid that doesn't cover every per-item buffer does nothing — no work-item
-/// reads past the short input.
+/// grid check) indexes its views with ordinary checked slice access: with an
+/// input one element short of the grid, every in-bounds work-item computes and
+/// the last one stops at its bounds check (the build's panic strategy) instead
+/// of reading past the buffer.
 #[test]
-fn raw_launch_runs_the_in_kernel_grid_guard() {
+fn raw_launch_uses_checked_slice_access() {
     let Some(ctx) = ctx() else { return };
     let ks = kernels::kernels(&ctx).expect("load kernels");
     let kernel = ks.kernel("add_per_item_in_u32");
-    let (a, b, out) = (buf(&ctx, 3), buf(&ctx, 4), buf(&ctx, 0));
-    LaunchOp::new(&ctx, &kernel, [N], (&a, &b, &out))
+    let short = DeviceSlice::<u32>::from_slice(&ctx, &[3; N - 1]).expect("alloc");
+    let (b, out) = (buf(&ctx, 4), buf(&ctx, 0));
+    LaunchOp::new(&ctx, &kernel, [N], (&short, &b, &out))
         .wait()
         .expect("launch");
     let mut host = vec![0u32; N];
     out.read(&mut host).wait().expect("read");
-    assert!(host.iter().all(|&v| v == 7), "got {:?}", &host[..4]);
-
-    let short = DeviceSlice::<u32>::from_slice(&ctx, &[3; N / 2]).expect("alloc");
-    let out = buf(&ctx, 0);
-    LaunchOp::new(&ctx, &kernel, [N], (&short, &b, &out))
-        .wait()
-        .expect("launch");
-    out.read(&mut host).wait().expect("read");
     assert!(
-        host.iter().all(|&v| v == 0),
-        "guard let a work-item through: {:?}",
+        host[..N - 1].iter().all(|&v| v == 7),
+        "got {:?}",
         &host[..4]
     );
+    assert_eq!(host[N - 1], 0, "the out-of-bounds work-item must not write");
 }
 
-/// The unguarded twin the typed launcher dispatches is not handed out raw.
+/// The unchecked twin the typed launcher dispatches is not handed out raw.
 #[test]
 fn raw_lookup_of_the_unchecked_twin_panics() {
     let Some(ctx) = ctx() else { return };
