@@ -112,9 +112,12 @@ baked into CBs) and the handle hands it back, so it pipes on unchanged. It
 delegates the buffer traits to `B`, so it also fills slice / `PerItem*` params.
 Host `check_tensor_shape` / `Error::TensorShapeMismatch`. A `Tensor` over an
 UNINIT buffer is a `PerItemOut` target too (explicit `KernelSliceWriteArg` per uninit
-family, `Init` = `Tensor` over the init type; replays forget init again). Gaps:
-`download` takes only a `DeviceSlice` pipe (not a `Tensor` one); tile walking is
-`with_shape` between runs, not a re-bindable shape slot. Device: `t[[i, j]]`,
+family, `Init` = `Tensor` over the init type; replays forget init again). Host IO:
+`download_tensor` (view → dense row-major `Vec`), `upload_tensor` (host → contiguous
+`Tensor`), `write_tensor` (host → a view, e.g. a tile). Rank 1–3 with a contiguous
+innermost axis = one `clEnqueue{Read,Write}BufferRect` (`Shape::rect`); otherwise
+download reads the covered span + gathers on the host, write is `NotSupported`.
+Gap: tile walking is `with_shape` between runs, not a re-bindable shape slot. Device: `t[[i, j]]`,
 `sub(i)` (ranks 2–4), `extent(d)`, rank-1 `t[j]` / `len()`; extent asserts stay,
 buffer access unchecked in the twin. Indexing is unrolled per rank with constant
 array indices — a runtime `ext[d]` crashes PoCL's `llvm-spirv-20` (valid SPIR-V,

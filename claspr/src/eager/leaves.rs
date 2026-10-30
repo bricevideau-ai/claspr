@@ -748,6 +748,334 @@ where
     }
 }
 
+// ── Leaves: tensor views to / from the host (rect copies) ──────────────────
+
+/// The context of a concrete (not pipe-fed) tensor input — for the concrete-head
+/// terminals.
+fn concrete_tensor_ctx<T, M: MemMode, const R: usize>(
+    t: &Input<crate::Tensor<DeviceSlice<T, M>, R>>,
+) -> Result<Context> {
+    use crate::Buffer;
+    t.with_concrete(|t| t.buffer().ctx().clone())
+        .ok_or(Error::NotSupported(
+            "concrete-head terminal (wait) on a pipe-fed tensor op — use sync(&ctx) for \
+             piped (graph) inputs",
+        ))
+}
+
+/// Read a tensor's view into a dense row-major host `Vec`: one rect copy when
+/// the view has one, else the covered span read whole and gathered (blocking).
+/// Returns the event of a non-blocking rect read.
+fn read_tensor<T, M, L, const R: usize>(
+    t: &crate::Tensor<DeviceSlice<T, M>, R>,
+    launcher: &L,
+    blocking: bool,
+    deps: &[crate::cl_event],
+) -> Result<(Vec<T>, Option<crate::Event>)>
+where
+    T: Copy + Default,
+    M: MemMode,
+    L: crate::Launcher + ?Sized,
+{
+    use crate::Buffer;
+    let shape = t.shape();
+    crate::check_tensor_shape(&shape, t.buffer().len(), "download_tensor")?;
+    if shape.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    if let Some(rect) = shape.rect(std::mem::size_of::<T>()) {
+        let mut host = vec![T::default(); shape.len()];
+        let event = crate::buffer::read_buffer_rect_enqueue(
+            t.buffer(),
+            launcher,
+            &rect,
+            &mut host,
+            blocking,
+            deps,
+        )?;
+        return Ok((host, (!blocking).then_some(event)));
+    }
+    // No rect (rank 4, a strided innermost axis): read the covered span, gather.
+    let last = shape
+        .max_index()
+        .expect("a non-empty view inside its buffer");
+    let mut span = vec![T::default(); last - shape.offset + 1];
+    crate::buffer::read_buffer_range_enqueue(
+        t.buffer(),
+        launcher,
+        shape.offset,
+        &mut span,
+        true,
+        deps,
+    )?;
+    Ok((shape.gather(&span), None))
+}
+
+/// Read a [`Tensor`](crate::Tensor)'s view into a fresh host `Vec<T>` — its
+/// elements, row-major and dense — and return the tensor to its home, as
+/// [`download`] does for a buffer. A rank-1–3 view with a contiguous innermost
+/// axis is one `clEnqueueReadBufferRect` (a tile of a matrix is a 2-D copy);
+/// any other view (rank 4, a strided innermost axis) reads the span it covers
+/// and gathers on the host.
+pub struct DownloadTensor<T, const R: usize, M: MemMode = ReadWrite> {
+    t: Input<crate::Tensor<DeviceSlice<T, M>, R>>,
+    out: Pipe<Vec<T>>,
+}
+
+/// Build a download leaf over an upstream tensor. See [`DownloadTensor`].
+pub fn download_tensor<T, M, const R: usize>(
+    t: impl Into<Input<crate::Tensor<DeviceSlice<T, M>, R>>>,
+) -> DownloadTensor<T, R, M>
+where
+    T: Copy + Default + Send + 'static,
+    M: MemMode + HostReadable + Send + 'static,
+{
+    DownloadTensor {
+        t: t.into(),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M, const R: usize> DeviceOp for DownloadTensor<T, R, M>
+where
+    T: Copy + Default + Send + 'static,
+    M: MemMode + HostReadable + Send + 'static,
+{
+    type Output = Vec<T>;
+
+    fn output_pipe(&self) -> Option<Pipe<Vec<T>>> {
+        Some(self.out.share())
+    }
+
+    fn handle(&self) -> HandleOf<Self> {
+        self.out.share()
+    }
+
+    fn execute(&self, ec: &ExecutionContext<'_>, mode: ExecMode) -> Result<()> {
+        // As `Download`: the tensor returns to its home; the `Vec` is the
+        // homeless result. Guarded so a failed read rehomes it.
+        let (t, deps, home) = self.t.resolve_home(ec)?;
+        let raw = deps_to_wait_list(&deps);
+        let guard = crate::eager::LentGuard::new(t, home);
+        let (host, event) = read_tensor(guard.value(), ec, mode == ExecMode::Blocking, &raw)?;
+        let (t, home) = guard.disarm();
+        rehome_consumed(t, home);
+        self.out
+            .put(host, event.map(single_dep).unwrap_or_default());
+        Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.t.check_ready()
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        self.t.try_bind_slot(binder);
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("download_tensor".into());
+    }
+}
+
+impl<T, M, const R: usize> DownloadTensor<T, R, M>
+where
+    T: Copy + Default + Send + 'static,
+    M: MemMode + HostReadable + Send + 'static,
+{
+    /// Concrete-head blocking terminal: read on the tensor's own context and
+    /// return the host `Vec<T>`.
+    pub fn wait(self) -> Result<Vec<T>> {
+        let ctx = concrete_tensor_ctx(&self.t)?;
+        self.sync(&ctx).map(Checkout::into_inner)
+    }
+}
+
+/// Upload a host array as a contiguous [`Tensor`](crate::Tensor) — [`upload`]
+/// plus a shape, with the same stable-handle / reseed-on-replay contract. The
+/// shape must stay inside the uploaded data (checked at execute).
+pub struct UploadTensor<T: Copy, const R: usize, M: MemMode = ReadWrite> {
+    src: UploadSource<T>,
+    shape: crate::Shape<R>,
+    buf: Cell<crate::Tensor<DeviceSlice<T, M>, R>>,
+    seeded: Arc<Mutex<bool>>,
+    out: Pipe<crate::Tensor<DeviceSlice<T, M>, R>>,
+}
+
+/// Build a tensor upload leaf: `upload_tensor(vec, [rows, cols])` (default
+/// [`ReadWrite`] marker). See [`UploadTensor`].
+pub fn upload_tensor<T, S, const R: usize>(
+    src: S,
+    shape: impl Into<crate::Shape<R>>,
+) -> UploadTensor<T, R, ReadWrite>
+where
+    T: Copy + Send + Sync + 'static,
+    S: Into<UploadSource<T>>,
+{
+    UploadTensor {
+        src: src.into(),
+        shape: shape.into(),
+        buf: Arc::new(Mutex::new(None)),
+        seeded: Arc::new(Mutex::new(false)),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M, const R: usize> DeviceOp for UploadTensor<T, R, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: crate::UploadReseed + Send + 'static,
+{
+    type Output = crate::Tensor<DeviceSlice<T, M>, R>;
+
+    fn output_pipe(&self) -> Option<Pipe<crate::Tensor<DeviceSlice<T, M>, R>>> {
+        Some(self.out.share())
+    }
+
+    fn handle(&self) -> HandleOf<Self> {
+        self.out.share()
+    }
+
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        // `Upload`'s three cases (first run / replay / lent-out), over a tensor.
+        crate::check_tensor_shape(&self.shape, self.src.as_slice().len(), "upload_tensor")?;
+        let mut seeded = lock_unpoisoned(&self.seeded);
+        let lent = lock_unpoisoned(&self.buf).take();
+        let t = match (lent, *seeded) {
+            (None, false) => {
+                let buf = DeviceSlice::<T, M>::from_slice(ec.context(), self.src.as_slice())?;
+                *seeded = true;
+                crate::Tensor::new(buf, self.shape)
+            }
+            (Some(mut t), _) => {
+                if M::RESEED_ON_REPLAY
+                    && let Err(e) = crate::buffer::write_buffer_enqueue(
+                        t.buffer_mut(),
+                        ec,
+                        self.src.as_slice(),
+                        true,
+                        &[],
+                    )
+                {
+                    // Rehome before surfacing (see `Upload`).
+                    *lock_unpoisoned(&self.buf) = Some(t);
+                    return Err(e);
+                }
+                t
+            }
+            (None, true) => {
+                return Err(Error::NotSupported(
+                    "eager graph: an upload_tensor buffer was already lent and not returned \
+                     — a graph is `sync`'d while a previous `Checkout` is still alive \
+                     (the graph is busy)",
+                ));
+            }
+        };
+        let home: Option<BoxedHome<crate::Tensor<DeviceSlice<T, M>, R>>> =
+            Some(Box::new(Arc::clone(&self.buf)));
+        self.out.put_home(t, Deps::new(), home);
+        Ok(())
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("upload_tensor".into());
+    }
+}
+
+/// Write a host array (row-major, dense, the view's length) into a
+/// [`Tensor`](crate::Tensor)'s view — e.g. one tile of a larger buffer — with
+/// one `clEnqueueWriteBufferRect`, and pass the tensor on. The view must have a
+/// rect copy (rank 1–3, contiguous innermost axis); another is
+/// [`Error::NotSupported`].
+pub struct WriteTensor<T: Copy, const R: usize, M: MemMode = ReadWrite> {
+    t: Input<crate::Tensor<DeviceSlice<T, M>, R>>,
+    src: UploadSource<T>,
+    out: Pipe<crate::Tensor<DeviceSlice<T, M>, R>>,
+}
+
+/// Build a tensor-view write leaf: `write_tensor(tensor, vec)`. See
+/// [`WriteTensor`].
+pub fn write_tensor<T, M, S, const R: usize>(
+    t: impl Into<Input<crate::Tensor<DeviceSlice<T, M>, R>>>,
+    src: S,
+) -> WriteTensor<T, R, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + crate::access::HostWritable + Send + 'static,
+    S: Into<UploadSource<T>>,
+{
+    WriteTensor {
+        t: t.into(),
+        src: src.into(),
+        out: Pipe::new(),
+    }
+}
+
+impl<T, M, const R: usize> DeviceOp for WriteTensor<T, R, M>
+where
+    T: Copy + Send + Sync + 'static,
+    M: MemMode + crate::access::HostWritable + Send + 'static,
+{
+    type Output = crate::Tensor<DeviceSlice<T, M>, R>;
+
+    fn output_pipe(&self) -> Option<Pipe<crate::Tensor<DeviceSlice<T, M>, R>>> {
+        Some(self.out.share())
+    }
+
+    fn handle(&self) -> HandleOf<Self> {
+        self.out.share()
+    }
+
+    fn execute(&self, ec: &ExecutionContext<'_>, _mode: ExecMode) -> Result<()> {
+        use crate::Buffer;
+        let (t, deps, home) = self.t.resolve_home(ec)?;
+        let raw = deps_to_wait_list(&deps);
+        // In place: the tensor is written and handed on → its home threads.
+        let mut guard = crate::eager::LentGuard::new(t, home);
+        let shape = guard.value().shape();
+        crate::check_tensor_shape(&shape, guard.value().buffer().len(), "write_tensor")?;
+        let src = self.src.as_slice();
+        if src.len() != shape.len() {
+            return Err(Error::LengthMismatch {
+                src: src.len(),
+                dst: shape.len(),
+            });
+        }
+        if !shape.is_empty() {
+            let rect = shape
+                .rect(std::mem::size_of::<T>())
+                .ok_or(Error::NotSupported(
+                    "write_tensor: the view has no rect copy (rank 4, or a strided innermost \
+                 axis) — write a contiguous-innermost view",
+                ))?;
+            // Blocking, as `Upload`'s writes: `src` outlives it trivially.
+            crate::buffer::write_buffer_rect_enqueue(
+                guard.value_mut().buffer_mut(),
+                ec,
+                &rect,
+                src,
+                true,
+                &raw,
+            )?;
+        }
+        let (t, home) = guard.disarm();
+        self.out.put_home(t, Deps::new(), home);
+        Ok(())
+    }
+
+    fn check_ready(&self) -> Result<()> {
+        self.t.check_ready()
+    }
+
+    fn bind_slots(&self, binder: &mut SlotBinder) {
+        self.t.try_bind_slot(binder);
+    }
+
+    fn describe(&self, out: &mut Vec<String>) {
+        out.push("write_tensor".into());
+    }
+}
+
 // ── Leaf: migrate a DeviceSlice to another device (eager TransferToDevice) ──
 
 /// Eager port of the closure-layer `transfer_to_device(buf, &dev)`. Enqueues a

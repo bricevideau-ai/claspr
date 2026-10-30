@@ -904,6 +904,124 @@ where
     Ok(event)
 }
 
+/// Raw `clEnqueueReadBufferRect`: the strided region `rect` of `buf` into the
+/// dense `dst` (a tensor view's elements, row-major).
+pub(crate) fn read_buffer_rect_enqueue<T, M, L>(
+    buf: &DeviceSlice<T, M>,
+    launcher: &L,
+    rect: &crate::tensor::Rect,
+    dst: &mut [T],
+    blocking: bool,
+    deps: &[cl_event],
+) -> Result<Event>
+where
+    M: MemMode,
+    L: Launcher + ?Sized,
+{
+    let cl_blocking = if blocking {
+        CL_BLOCKING
+    } else {
+        CL_NON_BLOCKING
+    };
+    // SAFETY: `rect` comes from `Shape::rect` of a view the caller checked lies
+    // inside `buf`, and `dst` holds exactly the region (`region[0] / size_of::<T>()
+    // * region[1] * region[2]` elements, the view's length); same context and
+    // blocking contract as `read_buffer_enqueue`.
+    let event = unsafe {
+        launcher.cl_queue().enqueue_read_buffer_rect(
+            &buf.buffer,
+            cl_blocking,
+            rect.buffer_origin.as_ptr(),
+            [0usize; 3].as_ptr(),
+            rect.region.as_ptr(),
+            rect.buffer_row_pitch,
+            rect.buffer_slice_pitch,
+            rect.host_row_pitch,
+            rect.host_slice_pitch,
+            dst.as_mut_ptr().cast(),
+            deps,
+        )?
+    };
+    Ok(event)
+}
+
+/// Raw `clEnqueueWriteBufferRect`: the dense `src` into the strided region
+/// `rect` of `buf`.
+pub(crate) fn write_buffer_rect_enqueue<T, M, L>(
+    buf: &mut DeviceSlice<T, M>,
+    launcher: &L,
+    rect: &crate::tensor::Rect,
+    src: &[T],
+    blocking: bool,
+    deps: &[cl_event],
+) -> Result<Event>
+where
+    M: MemMode,
+    L: Launcher + ?Sized,
+{
+    let cl_blocking = if blocking {
+        CL_BLOCKING
+    } else {
+        CL_NON_BLOCKING
+    };
+    // SAFETY: as for `read_buffer_rect_enqueue`, with `src` the view's length.
+    let event = unsafe {
+        launcher.cl_queue().enqueue_write_buffer_rect(
+            &mut buf.buffer,
+            cl_blocking,
+            rect.buffer_origin.as_ptr(),
+            [0usize; 3].as_ptr(),
+            rect.region.as_ptr(),
+            rect.buffer_row_pitch,
+            rect.buffer_slice_pitch,
+            rect.host_row_pitch,
+            rect.host_slice_pitch,
+            src.as_ptr().cast_mut().cast(),
+            deps,
+        )?
+    };
+    Ok(event)
+}
+
+/// Raw `clEnqueueReadBuffer` of `dst.len()` elements of `buf` from element
+/// `offset` (the span a non-rect tensor view covers).
+pub(crate) fn read_buffer_range_enqueue<T, M, L>(
+    buf: &DeviceSlice<T, M>,
+    launcher: &L,
+    offset: usize,
+    dst: &mut [T],
+    blocking: bool,
+    deps: &[cl_event],
+) -> Result<Event>
+where
+    M: MemMode,
+    L: Launcher + ?Sized,
+{
+    if offset + dst.len() > buf.len {
+        return Err(Error::LengthMismatch {
+            src: buf.len,
+            dst: offset + dst.len(),
+        });
+    }
+    let cl_blocking = if blocking {
+        CL_BLOCKING
+    } else {
+        CL_NON_BLOCKING
+    };
+    // SAFETY: the range is inside `buf` (checked above); same contract as
+    // `read_buffer_enqueue`.
+    let event = unsafe {
+        launcher.cl_queue().enqueue_read_buffer(
+            &buf.buffer,
+            cl_blocking,
+            offset * std::mem::size_of::<T>(),
+            dst,
+            deps,
+        )?
+    };
+    Ok(event)
+}
+
 /// Raw `clEnqueueFillBuffer` (or kernel fill) over `buf` — body of the former
 /// `FillOp::into_event`. Always non-blocking enqueue: the eager `Fill` op's
 /// `Blocking` terminal waits on the returned event (fill has no `CL_BLOCKING`
