@@ -508,7 +508,7 @@ struct TileSet<T, M: crate::access::MemMode, const R: usize> {
     shape: Shape<R>,
 }
 
-/// One part of a [`Tensor`] split along an axis ([`Tensor::split`]). The tiles
+/// One part of a split [`Tensor`] ([`Tensor::split`] / [`Tensor::tiles`]). The tiles
 /// of a split share the buffer but cover disjoint elements, so each can be
 /// WRITTEN concurrently — by kernels in different graphs / queues on the
 /// buffer's device. Correct by construction:
@@ -523,17 +523,36 @@ struct TileSet<T, M: crate::access::MemMode, const R: usize> {
 pub struct Tile<T, M: crate::access::MemMode, const R: usize> {
     set: std::sync::Arc<TileSet<T, M, R>>,
     shape: Shape<R>,
+    index: [usize; R],
 }
 
 impl<T, M: crate::access::MemMode, const R: usize> Tensor<crate::DeviceSlice<T, M>, R> {
-    /// Split the view into `parts` tiles along `axis` (equal extents, the last
-    /// taking the remainder; empty tiles are not made). Errors if `axis >= R`,
-    /// `parts == 0`, the view leaves its buffer, or the view's indices alias.
-    pub fn split(self, axis: usize, parts: usize) -> crate::Result<Vec<Tile<T, M, R>>> {
-        use crate::Buffer;
-        if axis >= R || parts == 0 {
+    /// Split the view into `parts[d]` tiles along each axis `d` (extents as
+    /// equal as possible), in row-major tile order — `split([4, 1])` is four
+    /// row bands, `split([2, 3])` a 2 x 3 grid of tiles. Errors if a part count
+    /// is 0, the view leaves its buffer, or the view's indices alias.
+    pub fn split(self, parts: [usize; R]) -> crate::Result<Vec<Tile<T, M, R>>> {
+        if parts.contains(&0) {
             return Err(crate::Error::NotSupported(
-                "Tensor::split: the axis must be below the rank, and parts at least 1",
+                "Tensor::split: every axis needs at least one part",
+            ));
+        }
+        let mut tile = [0usize; R];
+        for d in 0..R {
+            tile[d] = self.shape.ext[d].div_ceil(parts[d]).max(1);
+        }
+        self.tiles(tile)
+    }
+
+    /// Split the view into tiles of `tile[d]` elements along each axis `d` (the
+    /// last tile on an axis takes the remainder), in row-major tile order.
+    /// Errors if a tile size is 0, the view leaves its buffer, or the view's
+    /// indices alias (its tiles would not be disjoint).
+    pub fn tiles(self, tile: [usize; R]) -> crate::Result<Vec<Tile<T, M, R>>> {
+        use crate::Buffer;
+        if tile.contains(&0) {
+            return Err(crate::Error::NotSupported(
+                "Tensor::tiles: every tile size must be at least 1",
             ));
         }
         check_tensor_shape(&self.shape, self.buf.len(), "split")?;
@@ -543,20 +562,42 @@ impl<T, M: crate::access::MemMode, const R: usize> Tensor<crate::DeviceSlice<T, 
                  so its tiles would not be disjoint",
             ));
         }
-        let ext = self.shape.ext[axis];
-        let step = ext.div_ceil(parts).max(1);
         let shape = self.shape;
+        let counts: [usize; R] = std::array::from_fn(|d| shape.ext[d].div_ceil(tile[d]));
         let set = std::sync::Arc::new(TileSet {
             buf: self.buf,
             shape,
         });
-        Ok((0..ext)
-            .step_by(step)
-            .map(|start| Tile {
+        let mut tiles = Vec::with_capacity(counts.iter().product());
+        if shape.is_empty() {
+            return Ok(tiles);
+        }
+        let mut index = [0usize; R];
+        loop {
+            let mut view = shape;
+            for d in 0..R {
+                let start = index[d] * tile[d];
+                view = view.slice(d, start..(start + tile[d]).min(shape.ext[d]));
+            }
+            tiles.push(Tile {
                 set: std::sync::Arc::clone(&set),
-                shape: shape.slice(axis, start..(start + step).min(ext)),
-            })
-            .collect())
+                shape: view,
+                index,
+            });
+            // Next tile, row-major (last axis fastest).
+            let mut d = R;
+            loop {
+                if d == 0 {
+                    return Ok(tiles);
+                }
+                d -= 1;
+                index[d] += 1;
+                if index[d] < counts[d] {
+                    break;
+                }
+                index[d] = 0;
+            }
+        }
     }
 }
 
@@ -564,6 +605,11 @@ impl<T, M: crate::access::MemMode, const R: usize> Tile<T, M, R> {
     /// The tile's view of the shared buffer.
     pub fn shape(&self) -> Shape<R> {
         self.shape
+    }
+
+    /// The tile's position in the split's grid of tiles (per axis).
+    pub fn index(&self) -> [usize; R] {
+        self.index
     }
 
     /// Reassemble the `Tensor` from EVERY tile of its split (any order); `Err`

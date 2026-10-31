@@ -122,8 +122,9 @@ innermost axis = one `clEnqueue{Read,Write}BufferRect` (`Shape::rect`); otherwis
 download reads the covered span + gathers on the host, write is `NotSupported`.
 Concurrent tiles (user: tiling = one CB/graph per tile, so the
 real need is disjoint WRITABLE tiles of one buffer at once, same device):
-`Tensor::split(axis, parts)` → `Tile`s sharing the buffer (Arc), `Tile::join` takes
-ALL back. Correct by construction: tensor params now bound by
+`Tensor::split([parts per axis])` / `Tensor::tiles([tile size per axis])` → a
+row-major grid of `Tile`s (each with its grid `index()`) sharing the buffer (Arc),
+`Tile::join` takes ALL back. Correct by construction: tensor params now bound by
 `KernelTensor{Read,Write}Arg` (impl'd by `Tensor` and `Tile`), a `Tile` implements no
 slice trait (compile-fail fixture `tile_to_slice_arg`), device `TensorMut` extent
 asserts confine writes to the view, and `split` refuses non-injective views

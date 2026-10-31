@@ -11,7 +11,7 @@ fn main() {
     let ctx = Context::any().unwrap();
     let kernels = kernels::kernels(&ctx).unwrap();
     let buf = DeviceSlice::<u32>::alloc_zero(&ctx, 8).unwrap();
-    let mut tiles = Tensor::new(buf, [2, 4]).split(0, 2).unwrap();
+    let mut tiles = Tensor::new(buf, [2, 4]).split([2, 1]).unwrap();
     let tile = tiles.pop().unwrap();
     let _ = kernels.scale_u32([4usize], tile, 2u32);
 }
