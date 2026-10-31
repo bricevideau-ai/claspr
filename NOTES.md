@@ -101,7 +101,7 @@ scalar arg vs tuple vs shaped buffer type), strided vs contiguous layout. SETTLE
 arg. Gap found: `scalar_arg!` gives a user struct `KernelArg` but not
 `From<T> for ScalarInput<T>` / `SlotValue`, so typed launchers need
 `ScalarInput::Concrete(v)` — extend `scalar_arg!` (or B's descriptor type) first.
-**Tensor views (family B) — branch `tensor-views` (2026-10-30):** `Tensor<T, R>` /
+**Tensor views (family B) — landed on main (2026-10-30), feature still in progress:** `Tensor<T, R>` /
 `TensorMut<T, R>` = buffer + by-value `Shape<R>` (offset, extents, strides; host
 `claspr::Shape`, `contiguous` / `slice`); on the wire `T *buf, size_t len, Shape s`
 (user's call: keep the slice splatted so any buffer still works). On the host a
