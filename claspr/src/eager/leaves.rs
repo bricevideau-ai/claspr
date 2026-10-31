@@ -644,25 +644,29 @@ where
 /// the upstream events) and return the device value to its home. Output is the
 /// `Vec`: a buffer's elements, or a [`Tensor`](crate::Tensor)'s view (see
 /// [`HostRead`]).
-pub struct Download<D: HostRead> {
+pub struct DownloadOp<D: HostRead> {
     buf: Input<D>,
     out: Pipe<Vec<D::Elem>>,
 }
 
+/// The download of a whole [`DeviceSlice`] — the spelling from before
+/// `download` also took tensors.
+pub type Download<T, M = ReadWrite> = DownloadOp<DeviceSlice<T, M>>;
+
 /// Build a download leaf over an upstream buffer or tensor — concrete, piped,
 /// a `Checkout` or a `slot!`.
-pub fn download<E, S>(src: S) -> Download<S::Buf>
+pub fn download<E, S>(src: S) -> DownloadOp<S::Buf>
 where
     S: ToInput<E>,
     S::Buf: HostRead<Elem = E>,
 {
-    Download {
+    DownloadOp {
         buf: src.to_input(),
         out: Pipe::new(),
     }
 }
 
-impl<D: HostRead> DeviceOp for Download<D> {
+impl<D: HostRead> DeviceOp for DownloadOp<D> {
     type Output = Vec<D::Elem>;
 
     fn output_pipe(&self) -> Option<Pipe<Vec<D::Elem>>> {
@@ -713,7 +717,7 @@ impl<D: HostRead> DeviceOp for Download<D> {
     }
 }
 
-impl<D: HostRead> Download<D> {
+impl<D: HostRead> DownloadOp<D> {
     /// Concrete-head blocking terminal: read on the value's own context default
     /// queue and return the host `Vec`.
     pub fn wait(self) -> Result<Vec<D::Elem>> {
@@ -1558,7 +1562,7 @@ where
 /// Write host data into an existing device value in place — a buffer, or a
 /// [`Tensor`](crate::Tensor)'s view (e.g. one tile of a larger buffer; see
 /// [`HostWrite`]) — and pass it on.
-pub struct WriteDevice<D: HostWrite> {
+pub struct WriteDeviceOp<D: HostWrite> {
     buf: Input<D>,
     // Retained by value (not `Option`): the host source is read BY REFERENCE each
     // run (re-seed). `&self` outlives the whole `sync` (the terminal waits before
@@ -1567,23 +1571,27 @@ pub struct WriteDevice<D: HostWrite> {
     out: Pipe<D>,
 }
 
+/// The write of a whole [`DeviceSlice`] — the spelling from before `write`
+/// also took tensors.
+pub type WriteDevice<T, M = ReadWrite> = WriteDeviceOp<DeviceSlice<T, M>>;
+
 /// Build an eager in-place write leaf over an existing buffer or tensor —
 /// concrete, piped, a `Checkout` or a `slot!`. `M: HostWritable` — same gate as
 /// the closure layer's `device_slice_write`.
-pub fn write<E, S, Src>(dst: S, src: Src) -> WriteDevice<S::Buf>
+pub fn write<E, S, Src>(dst: S, src: Src) -> WriteDeviceOp<S::Buf>
 where
     S: ToInput<E>,
     S::Buf: HostWrite<Elem = E>,
     Src: Into<UploadSource<E>>,
 {
-    WriteDevice {
+    WriteDeviceOp {
         buf: dst.to_input(),
         src: src.into(),
         out: Pipe::new(),
     }
 }
 
-impl<D: HostWrite> DeviceOp for WriteDevice<D> {
+impl<D: HostWrite> DeviceOp for WriteDeviceOp<D> {
     type Output = D;
 
     fn output_pipe(&self) -> Option<Pipe<D>> {
@@ -1626,7 +1634,7 @@ impl<D: HostWrite> DeviceOp for WriteDevice<D> {
     }
 }
 
-impl<D: HostWrite> WriteDevice<D> {
+impl<D: HostWrite> WriteDeviceOp<D> {
     /// Concrete-head blocking terminal: write on the value's own context default
     /// queue and return it for reuse (`let buf = buf.write(d).wait()?;`).
     pub fn wait(self) -> Result<D> {

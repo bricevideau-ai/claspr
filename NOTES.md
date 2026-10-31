@@ -117,7 +117,10 @@ through the SAME leaves as buffers (user: no parallel `*_tensor` API): `download
 and `write` are generic over `HostRead` / `HostWrite` (impl'd for `DeviceSlice` =
 whole buffer and `Tensor<DeviceSlice>` = its view; sources via `ToInput`, so
 concrete / pipe / `Checkout` / `slot!` all work), and `upload(src).shaped(shape)`
-makes a `Tensor`. Rank 1–3 with a contiguous
+makes a `Tensor`. The generic ops are `DownloadOp<D>` / `WriteDeviceOp<D>`;
+`Download<T, M>` / `WriteDevice<T, M>` stay as aliases over `DeviceSlice<T, M>` so
+existing spellings compile (only a `download::<T, M>` turbofish naming the marker
+breaks: the fn's params are now `<E, S>`). Rank 1–3 with a contiguous
 innermost axis = one `clEnqueue{Read,Write}BufferRect` (`Shape::rect`); otherwise
 download reads the covered span + gathers on the host, write is `NotSupported`.
 Concurrent tiles (user: tiling = one CB/graph per tile, so the

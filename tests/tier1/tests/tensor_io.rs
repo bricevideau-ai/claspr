@@ -177,3 +177,16 @@ fn a_tensor_checkout_downloads_its_view() {
     let got = download(co).sync(&ctx).expect("download").into_inner();
     assert_eq!(got, data);
 }
+
+/// The buffer ops keep their pre-tensor type spellings (`Download<T, M>` /
+/// `WriteDevice<T, M>` — aliases of the generic `DownloadOp` / `WriteDeviceOp`
+/// over a `DeviceSlice`), so code naming them is unaffected.
+#[test]
+fn buffer_op_type_spellings_still_work() {
+    let Some(ctx) = ctx() else { return };
+    let buf = DeviceSlice::<u32>::from_slice(&ctx, &[0; 4]).expect("alloc");
+    let w: claspr::WriteDevice<u32> = write(buf, vec![7u32; 4]);
+    let buf = w.wait().expect("write");
+    let d: claspr::Download<u32> = download(buf);
+    assert_eq!(d.wait().expect("download"), [7; 4]);
+}

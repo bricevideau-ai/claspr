@@ -188,7 +188,7 @@ pub use eager::{
     image_download, image_upload, lift, read_into, scalar_value, scalar_value_as, scalar_zero,
     scalar_zero_as, transfer_to_device, transfer_to_device_at, upload, value, write, write_mapped,
 };
-pub use eager::{HostRead, HostWrite, UploadTensor};
+pub use eager::{DownloadOp, HostRead, HostWrite, UploadTensor, WriteDeviceOp};
 
 // Stage-3 proc-macro frontend.
 pub use claspr_macros::{device, kernel, kernels};

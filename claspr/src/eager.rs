@@ -3944,7 +3944,7 @@ pub use leaves::*;
 impl<T, M: MemMode> Pipe<DeviceSlice<T, M>> {
     /// Write `src` into this piped buffer — delegates to [`write`](fn@write). Same
     /// `M: HostWritable` bound as [`DeviceSlice::write`](crate::DeviceSlice::write).
-    pub fn write<S>(self, src: S) -> WriteDevice<DeviceSlice<T, M>>
+    pub fn write<S>(self, src: S) -> WriteDevice<T, M>
     where
         T: Send + Sync + 'static,
         M: HostWritable + Send + 'static,
@@ -3955,7 +3955,7 @@ impl<T, M: MemMode> Pipe<DeviceSlice<T, M>> {
 
     /// Read this piped buffer into a fresh `Vec<T>` — delegates to [`download`].
     /// Same `M: HostReadable` bound as [`download`].
-    pub fn read(self) -> Download<DeviceSlice<T, M>>
+    pub fn read(self) -> Download<T, M>
     where
         T: Clone + Default + Send + 'static,
         M: HostReadable + Send + 'static,
