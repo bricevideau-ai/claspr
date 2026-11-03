@@ -409,7 +409,15 @@ fn reaper() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Box<dyn Send>>>
         let (tx, rx) = std::sync::mpsc::channel::<Box<dyn Send>>();
         std::thread::Builder::new()
             .name("claspr-reaper".into())
-            .spawn(move || rx.into_iter().for_each(drop))
+            .spawn(move || {
+                // A drop racing process teardown can hit a runtime already
+                // shutting down (opencl3 panics on a failed release); keep the
+                // reaper alive for the rest.
+                for payload in rx {
+                    let _ =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)));
+                }
+            })
             .expect("spawn the claspr reaper thread");
         std::sync::Mutex::new(tx)
     })
