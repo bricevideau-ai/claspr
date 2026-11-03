@@ -9,50 +9,6 @@ use super::*;
 
 // ── AndThen: source then next; next eagerly built over source's pipe ───
 
-/// If `src_pipe` still holds a value (the `and_then` closure discarded the
-/// source's handle), merge its stranded events into `out_pipe`'s deps so the
-/// whole chain's events still gate the terminal. See `AndThen::collect`. No-op
-/// when the source pipe was consumed by `next` (the normal case). The discarded
-/// source value drops.
-///
-/// Both pipes are `Option` (the [`output_pipe`](DeviceOp::output_pipe) shape): a
-/// **multi-output** source or `next` has NO single storage pipe (`None`), so its
-/// storage is per-branch element pipes and there is nothing to thread through
-/// here — the multi-output source's completion events ride its own per-branch
-/// gather (`collect`/`gather_checkouts`), and a multi-output `next`'s deps are
-/// threaded by its own override. A `None` on either side is therefore a no-op —
-/// byte-identical to the pre-Option behaviour, where a multi-output op returned a
-/// fresh never-filled `Pipe::new()` that `take()` always drained as empty.
-/// Merge a discarded `AndThen` source's leftover deps into the `deps` a
-/// value-returning walk (`collect`/`collect_home`/`gather_checkouts`) hands back.
-/// The source pipe was run for effect (its buffer threaded onward via `and_then`);
-/// if it still holds undrained events, they must gate downstream. The
-/// [`execute`](AndThen) twin instead stamps them onto its OUTPUT pipe (no return
-/// value) — see [`thread_orphaned_source_deps`].
-fn merge_orphaned_source_deps<A>(src_pipe: &Option<Pipe<A>>, deps: &mut Deps) {
-    if let Some((_discarded, src_deps)) = src_pipe.as_ref().and_then(|p| p.take()) {
-        deps.extend(src_deps);
-    }
-}
-
-fn thread_orphaned_source_deps<A, B>(src_pipe: &Option<Pipe<A>>, out_pipe: &Option<Pipe<B>>) {
-    // Multi-output source (`None`) → no single pipe to thread; or the source pipe
-    // was consumed by `next` (the normal case) → nothing to thread.
-    let Some((_discarded, src_deps)) = src_pipe.as_ref().and_then(|p| p.take()) else {
-        return;
-    };
-    // Merge the stranded source events into the out pipe's deps. If `out_pipe` is
-    // absent/empty (a multi-output `next` whose storage is its element pipes, not
-    // `output_pipe`), `execute` isn't the gather path — `collect` handles
-    // orphaned deps for that case directly, so this is a no-op here.
-    if let Some(out_pipe) = out_pipe.as_ref()
-        && let Some((v, mut deps)) = out_pipe.take()
-    {
-        deps.extend(src_deps);
-        out_pipe.put(v, deps);
-    }
-}
-
 /// Sequential composition node. Holds the source op and the **already-built**
 /// downstream op (which reads the source's output via a [`Pipe`]). No `FnOnce`.
 pub struct AndThen<S, U> {
@@ -105,8 +61,6 @@ where
             return cb_boundary_execute(self, ec, mode);
         }
         // Source is always upstream → must pipeline (its output feeds `next`).
-        let src_pipe = self.source.output_pipe();
-        let out_pipe = self.next.output_pipe();
         cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
         // CLOSE the span at the seam (Build/LendOnly + next can't continue): seal +
         // enqueue the CB and restamp `source`'s pipes with its completion event, then
@@ -117,7 +71,6 @@ where
         } else {
             cb_exec_child(&self.next, ec, mode)?;
         }
-        thread_orphaned_source_deps(&src_pipe, &out_pipe);
         Ok(())
     }
 
@@ -127,25 +80,18 @@ where
         // (scatter-then-reconstruct over its per-element pipes) rather than the
         // default single-pipe drain — whose `output_pipe` it never fills. The
         // source pipelines; only the tail observes the terminal `mode`.
-        let src_pipe = self.source.output_pipe();
         cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
         // CLOSE the span at the seam: seal + enqueue + restamp `source`, then collect
         // `next` in `Off`. Otherwise collect `next` normally (continue in Build).
-        let (value, mut deps) = if cb_close_before_seam(&self.source, &self.next, ec)? {
+        let (value, deps) = if cb_close_before_seam(&self.source, &self.next, ec)? {
             self.next.collect(&ec.with_cb(CbWalk::Off), mode)?
         } else {
             self.next.collect(ec, mode)?
         };
-        // ORPHANED DEPS: if the `and_then` closure discarded the source's handle
-        // (e.g. `.and_then(|_buf| value(0))`), the source's value + events are
-        // still sitting un-taken in its output pipe. Those events MUST still gate
-        // the terminal — most critically when the source is an `and_then_host`
-        // whose worker thread signals completion via a user event; without this,
-        // `sync` would return before the worker ran. Thread them in. (The old
-        // closure layer got this for free by passing `prior_evts` into
-        // `next.execute`.) The discarded value drops here — the closure didn't
-        // want it; its `cl_mem` is retained by any in-flight unmap until done.
-        merge_orphaned_source_deps(&src_pipe, &mut deps);
+        // A source whose handle the closure discarded (`.and_then(|_b| ..)`) stays
+        // in its pipe: the terminal waits on it (`reclaim_undelivered` /
+        // `undelivered_deps`) and returns it home — so it gates only the terminal,
+        // not `next` (no extra edge in a left-nested chain).
         Ok((value, deps))
     }
 
@@ -161,17 +107,14 @@ where
         // Mirror `collect`, but preserve the tail's return home so an
         // `and_then`-terminated chain nested as a bundle branch (e.g.
         // `upload(buf).and_then(|b| fill(b, v))`) re-arms its caller buffer. The
-        // home is the tail's — the source pipelines and its orphaned deps thread
-        // in exactly as in `collect`.
-        let src_pipe = self.source.output_pipe();
+        // home is the tail's — the source pipelines; a discarded source is left to
+        // the terminal, as in `collect`.
         cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
-        let (value, mut deps, home) = if cb_close_before_seam(&self.source, &self.next, ec)? {
-            self.next.collect_home(&ec.with_cb(CbWalk::Off), mode)?
+        if cb_close_before_seam(&self.source, &self.next, ec)? {
+            self.next.collect_home(&ec.with_cb(CbWalk::Off), mode)
         } else {
-            self.next.collect_home(ec, mode)?
-        };
-        merge_orphaned_source_deps(&src_pipe, &mut deps);
-        Ok((value, deps, home))
+            self.next.collect_home(ec, mode)
+        }
     }
 
     fn gather_checkouts(
@@ -194,19 +137,17 @@ where
         // its per-element `Checkout` tuple via its OWN `gather_checkouts` override
         // (the default single-pipe drain reads `output_pipe`, which a multi-output
         // op never fills → "op produced no output"). Source pipelines; tail takes
-        // the terminal `mode`. Same orphaned-source-deps threading as `collect`.
-        let src_pipe = self.source.output_pipe();
+        // the terminal `mode`. A discarded source is left to the terminal, as in
+        // `collect`.
         cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
         // CLOSE the span at the seam: seal + enqueue + restamp `source`, then gather
         // `next` in `Off`. Otherwise gather `next` normally (continue in Build, or
         // open a fresh boundary in Off).
-        let (checkouts, mut deps) = if cb_close_before_seam(&self.source, &self.next, ec)? {
-            self.next.gather_checkouts(&ec.with_cb(CbWalk::Off), mode)?
+        if cb_close_before_seam(&self.source, &self.next, ec)? {
+            self.next.gather_checkouts(&ec.with_cb(CbWalk::Off), mode)
         } else {
-            cb_gather_child(&self.next, ec, mode)?
-        };
-        merge_orphaned_source_deps(&src_pipe, &mut deps);
-        Ok((checkouts, deps))
+            cb_gather_child(&self.next, ec, mode)
+        }
     }
 
     fn describe(&self, out: &mut Vec<String>) {
@@ -270,6 +211,11 @@ where
         // `gather_checkouts` before this runs → its `reclaim` is also a no-op.
         self.source.reclaim_undelivered();
         self.next.reclaim_undelivered();
+    }
+
+    fn undelivered_deps(&self, out: &mut Deps) {
+        self.source.undelivered_deps(out);
+        self.next.undelivered_deps(out);
     }
 
     fn contains_host_seam(&self) -> bool {
@@ -753,6 +699,10 @@ where
         self.inner.reclaim_undelivered();
     }
 
+    fn undelivered_deps(&self, out: &mut Deps) {
+        self.inner.undelivered_deps(out);
+    }
+
     fn contains_host_seam(&self) -> bool {
         self.inner.contains_host_seam()
     }
@@ -946,6 +896,10 @@ where
 
     fn reclaim_undelivered(&self) {
         self.inner.reclaim_undelivered();
+    }
+
+    fn undelivered_deps(&self, out: &mut Deps) {
+        self.inner.undelivered_deps(out);
     }
 
     fn contains_host_seam(&self) -> bool {
@@ -1524,6 +1478,10 @@ macro_rules! impl_eager_bundle {
                 Ok((checkouts, joined))
             }
 
+            fn undelivered_deps(&self, out: &mut Deps) {
+                $( self.$field.undelivered_deps(out); )+
+            }
+
             fn reclaim_undelivered(&self) {
                 // Mid-graph mop-up: a downstream `and_then` closure may discard some
                 // branch handles (e.g. keep only one branch's output). Each branch
@@ -1936,6 +1894,12 @@ where
         // (already-drained pipes are no-ops).
         for op in &self.ops {
             op.reclaim_undelivered();
+        }
+    }
+
+    fn undelivered_deps(&self, out: &mut Deps) {
+        for op in &self.ops {
+            op.undelivered_deps(out);
         }
     }
 
@@ -2611,6 +2575,11 @@ where
         self.source.reclaim_undelivered();
     }
 
+    fn undelivered_deps(&self, out: &mut Deps) {
+        <CheckoutsOf<S> as SeamScatter>::undelivered_deps(&self.handle, out);
+        self.source.undelivered_deps(out);
+    }
+
     fn check_ready(&self) -> Result<()> {
         self.source.check_ready()
     }
@@ -2880,7 +2849,7 @@ impl<T: Unpin> std::future::Future for DeviceChainFuture<T> {
 #[cfg(feature = "async-events")]
 pub(crate) fn run_eager_chain<Op>(chain: Op, context: &Context) -> DeviceChainFuture<Op::Output>
 where
-    Op: DeviceOp,
+    Op: DeviceOp + 'static,
     Op::Output: Unpin,
 {
     use crate::EventFutureExt;
@@ -2943,7 +2912,7 @@ where
         }
     };
 
-    let (output, deps) = match collected {
+    let (output, mut deps) = match collected {
         Ok(pair) => pair,
         Err(e) => {
             // Setup failed before/while enqueueing — release the gate so any
@@ -2971,6 +2940,8 @@ where
     //    whole point is that the *entire* graph is committed before anything
     //    runs). The marker enqueue is non-blocking, so wiring it while `start`
     //    is still held does not deadlock.
+    // Work whose output nothing consumed still gates completion.
+    chain.undelivered_deps(&mut deps);
     let wait_list = deps_to_wait_list(&deps);
     let marker = match unsafe { queue.raw().enqueue_marker_with_wait_list(&wait_list) } {
         Ok(ev) => ev,
@@ -3016,6 +2987,13 @@ where
     // `start` (if any) has been completed; its retained dep refs keep the cl_event
     // alive in the wait-lists until those commands run. Safe to drop here.
     drop(start);
+
+    // Keep the chain (its undelivered values, any caller memory it holds) alive
+    // until the marker completes — its drop could otherwise return a buffer home
+    // or free host memory the device is still using.
+    if let Err(e) = crate::op::drop_after(&marker, chain) {
+        return DeviceChainFuture::Errored(Some(e));
+    }
 
     // 5. Wrap the marker in the EventFuture machinery (clSetEventCallback).
     //    The future joins `workers` when the marker resolves.

@@ -151,8 +151,14 @@ callback); `submit_value_on` (and kernel `submit`) require a sealed `DeviceResid
 output; host-memory / borrowing ops return `Pending<'a, T>` (`wait`, drop waits;
 `'a` keeps caller slices borrowed); new `submit_pending_on` for any graph. Open:
 `USMSlice` is in `DeviceResident` (its drop waits) but host deref while a kernel runs
-is still a race; discarded-output deps + orphan threading (step 2); left-nesting CB
-segmentation (step 3).
+is still a race; left-nesting CB segmentation (step 3).
+Step 2 done: the non-blocking terminals (`submit*`, async `run`) add every
+undelivered output's events to their completion (`DeviceOp::undelivered_deps`,
+mirroring `reclaim_undelivered`), and `AndThen` no longer threads a discarded
+source's events into `next`'s output (they gate only the terminal → no extra edge
+in left-nested chains; the value is reclaimed home like a discarded multi-output).
+`run` now needs `'static` and keeps the chain alive until completion. Can't be
+shown failing on PoCL/rusticl (CB batching / in-order execution mask it).
 **Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
 inside the kernel, so the positional handle is no worse than before; and the real
 user difficulty is telling which params are PIPED (every buffer-like param —

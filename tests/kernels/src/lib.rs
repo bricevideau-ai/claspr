@@ -313,6 +313,25 @@ pub mod kernels {
         t[[id.y, id.x]] = v;
     }
 
+    /// Deliberately slow: `iters` steps of an LCG per work-item, the final state
+    /// written to both `a[i]` and `b[i]` — two outputs, so the handle is a tuple.
+    #[claspr::kernel]
+    pub fn slow_pair_u32(
+        #[spirv(global_invocation_id)] id: spirv_std::glam::USizeVec3,
+        #[spirv(cross_workgroup)] a: &mut [u32],
+        #[spirv(cross_workgroup)] b: &mut [u32],
+        iters: u32,
+    ) {
+        let mut x = id.x as u32;
+        let mut k = 0u32;
+        while k < iters {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            k += 1;
+        }
+        a[id.x] = x;
+        b[id.x] = x;
+    }
+
     /// `out[i] = sum of row i` — `PerRowIn`: the buffer is one equal row per
     /// work-item, and this work-item reads its own.
     #[claspr::kernel]

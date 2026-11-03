@@ -2270,6 +2270,10 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
                     #( self.#op_pipe_fields.reclaim(); )*
                 }
 
+                fn undelivered_deps(&self, out: &mut ::claspr::eager::Deps) {
+                    #( self.#op_pipe_fields.undelivered_deps(out); )*
+                }
+
                 fn cb_cache(&self) -> ::core::option::Option<&::claspr::eager::CbCache> {
                     ::core::option::Option::Some(&self.__claspr_cb_cache)
                 }

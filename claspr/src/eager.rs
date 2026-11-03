@@ -996,6 +996,15 @@ impl<T> Pipe<T> {
         }
     }
 
+    /// Add the events of a value still sitting in this pipe (nothing consumed
+    /// it) to `out`, leaving it in place for [`reclaim`](Self::reclaim) — so a
+    /// non-blocking terminal's completion covers work whose output was dropped.
+    pub fn undelivered_deps(&self, out: &mut Deps) {
+        if let Some(p) = lock_unpoisoned(&self.cell).as_ref() {
+            out.extend(p.deps.clone());
+        }
+    }
+
     /// Stable identity of this pipe's storage cell — the graph-edge key. Handles
     /// to the same cell share it; independently-built pipes differ. Used
     /// by the record walk to thread a producer's output handle to the consumer
@@ -2008,6 +2017,19 @@ pub trait DeviceOp: Send {
         // defensive `None` is simply a no-op rather than a panic.
         if let Some(pipe) = self.output_pipe() {
             pipe.reclaim();
+        }
+    }
+
+    /// Add the events of every value this op (transitively) produced that
+    /// nothing consumed — the outputs an `and_then` closure discarded — to
+    /// `out`, without taking them (the mirror of
+    /// [`reclaim_undelivered`](Self::reclaim_undelivered), which runs later and
+    /// returns them home). The non-blocking terminals add these to their
+    /// completion event, so it never fires before such work has finished.
+    /// Default: this op's own output pipe; combinators override to recurse.
+    fn undelivered_deps(&self, out: &mut Deps) {
+        if let Some(pipe) = self.output_pipe() {
+            pipe.undelivered_deps(out);
         }
     }
 
@@ -3042,6 +3064,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     #[cfg(feature = "async-events")]
     fn run(self, context: &Context) -> DeviceChainFuture<Self::Output>
     where
+        Self: 'static,
         Self::Output: Unpin,
     {
         run_eager_chain(self, context)
@@ -3078,7 +3101,9 @@ fn submit_collect<O: DeviceOp + ?Sized, L: crate::Launcher + ?Sized>(
     let device = launcher.context().device().clone();
     let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
     // Gather non-blocking (Pipelined); a host-seam setup error surfaces here.
-    let (output, deps) = op.collect(&ec, ExecMode::Pipelined)?;
+    let (output, mut deps) = op.collect(&ec, ExecMode::Pipelined)?;
+    // Work whose output nothing consumed still gates completion.
+    op.undelivered_deps(&mut deps);
     let event = deps_into_single_event(&ec, deps)?;
     Ok((output, event))
 }
@@ -3744,6 +3769,9 @@ pub trait SeamScatter: CheckoutSplit {
     /// undelivered branch to its origin cell (the mid-graph half of the home
     /// invariant — see [`reclaim_undelivered`](DeviceOp::reclaim_undelivered)).
     fn reclaim(handle: &Self::Handle);
+    /// Add the events of every undelivered branch to `out`, leaving them in
+    /// place (see [`DeviceOp::undelivered_deps`]).
+    fn undelivered_deps(handle: &Self::Handle, out: &mut Deps);
     /// Reconstruct the assembled value + joined deps by draining every element
     /// pipe — the by-value (`collect` / async `run`) path for a multi-output seam.
     fn reconstruct(handle: &Self::Handle) -> Result<(Self::Value, Deps)>;
@@ -3776,6 +3804,9 @@ impl<O: Send + 'static> SeamScatter for Checkout<O> {
     }
     fn reclaim(handle: &Pipe<O>) {
         handle.reclaim();
+    }
+    fn undelivered_deps(handle: &Pipe<O>, out: &mut Deps) {
+        handle.undelivered_deps(out);
     }
     fn reconstruct(handle: &Pipe<O>) -> Result<(O, Deps)> {
         handle
@@ -3812,6 +3843,9 @@ macro_rules! impl_seam_scatter_tuple {
             }
             fn reclaim(handle: &Self::Handle) {
                 $( <$ck as SeamScatter>::reclaim(&handle.$idx); )+
+            }
+            fn undelivered_deps(handle: &Self::Handle, out: &mut Deps) {
+                $( <$ck as SeamScatter>::undelivered_deps(&handle.$idx, out); )+
             }
             fn reconstruct(handle: &Self::Handle) -> Result<(Self::Value, Deps)> {
                 let mut deps = Deps::new();

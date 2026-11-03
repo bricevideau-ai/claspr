@@ -3164,4 +3164,9 @@ where
         self.src_pipe.reclaim();
         self.dst_pipe.reclaim();
     }
+
+    fn undelivered_deps(&self, out: &mut Deps) {
+        self.src_pipe.undelivered_deps(out);
+        self.dst_pipe.undelivered_deps(out);
+    }
 }
