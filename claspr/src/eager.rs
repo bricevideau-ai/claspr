@@ -2200,6 +2200,24 @@ pub trait DeviceOp: Send {
         self.cb_addable()
     }
 
+    /// How many recordable commands END this op's chain after its last blocker
+    /// (a host seam, a transfer, a non-recordable head like `upload`): a
+    /// left-nested `upload(v).and_then(k1).and_then(k2)` has suffix 2 — `k1, k2`
+    /// sit in the `next` of two nested `AndThen`s, so no single subtree holds
+    /// them. A span may open at an `AndThen` whose suffix weighs >= 2; inside it,
+    /// the source part with no suffix runs outside the command buffer and the
+    /// suffix records into it. Default: the whole weight if this op is wholly
+    /// addable, else 0; [`AndThen`] overrides, wrappers forward. Static under
+    /// mutate, like [`cbable_weight`](Self::cbable_weight).
+    #[doc(hidden)]
+    fn cb_suffix_weight(&self) -> usize {
+        if self.cb_addable() {
+            self.cbable_weight()
+        } else {
+            0
+        }
+    }
+
     // ── Conversion — by value, so the one member deliberately NOT dispatchable ─
 
     /// Box this op into a [`DeviceDynOp`] of its own shape: the conversion behind
@@ -2383,6 +2401,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             cb_addable_memo: PredMemo::new(),
             seam_memo: PredMemo::new(),
             spine_head_memo: PredMemo::new(),
+            suffix_memo: std::sync::OnceLock::new(),
         }
     }
 

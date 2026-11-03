@@ -151,7 +151,7 @@ callback); `submit_value_on` (and kernel `submit`) require a sealed `DeviceResid
 output; host-memory / borrowing ops return `Pending<'a, T>` (`wait`, drop waits;
 `'a` keeps caller slices borrowed); new `submit_pending_on` for any graph. Open:
 `USMSlice` is in `DeviceResident` (its drop waits) but host deref while a kernel runs
-is still a race; left-nesting CB segmentation (step 3).
+is still a race.
 Step 2 done: the non-blocking terminals (`submit*`, async `run`) add every
 undelivered output's events to their completion (`DeviceOp::undelivered_deps`,
 mirroring `reclaim_undelivered`), and `AndThen` no longer threads a discarded
@@ -159,6 +159,13 @@ source's events into `next`'s output (they gate only the terminal → no extra e
 in left-nested chains; the value is reclaimed home like a discarded multi-output).
 `run` now needs `'static` and keeps the chain alive until completion. Can't be
 shown failing on PoCL/rusticl (CB batching / in-order execution mask it).
+Step 3 done: nesting shape no longer changes CB batching. Spans used to open only
+where an addable run formed a subtree, so a left-nested chain after a blocker (a host
+seam, or a non-recordable head like `upload`) ran per-op — `upload(v).and_then(k)
+.and_then(k).and_then(k)` recorded 0 CBs (right-nested: 1). Now
+`DeviceOp::cb_suffix_weight` (the recordable steps after the last blocker, down the
+left spine) also opens a span (>= 2), and inside a span `AndThen` runs a source with no
+part in it OUTSIDE the CB (`source_walk`). `graph_shapes.rs` pins left == right.
 **Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
 inside the kernel, so the positional handle is no worse than before; and the real
 user difficulty is telling which params are PIPED (every buffer-like param —

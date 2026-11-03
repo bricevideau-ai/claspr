@@ -763,12 +763,15 @@ fn drain_ext(ext: &Mutex<Deps>) -> Vec<crate::cl_event> {
 /// PARENT's `cb_exec_child`/`cb_gather_child` handles; only the interior-seam
 /// spine-head opens its span from inside its own `execute`/`gather`.
 pub(crate) fn cb_should_open_span<O: DeviceOp>(op: &O, ec: &ExecutionContext<'_>) -> bool {
+    // Two span shapes: an addable PREFIX closing at a seam down `next` (the
+    // spine-head case), or an addable SUFFIX after a blocker down the left
+    // spine (`cb_suffix_weight`; the blocked part then runs outside the CB).
     matches!(ec.cb(), CbWalk::Off)
         // Not inside this op's own boundary fallback (else: unbounded recursion).
         && op.cb_cache().is_some_and(|c| ec.may_open_boundary_at(c))
         && ec.context().has_cl_khr_command_buffer()
-        && op.cb_spine_head_addable()
         && !op.cb_addable()
+        && (op.cb_spine_head_addable() || op.cb_suffix_weight() >= 2)
         // >= 2: don't open a span CB that would record a single command (per-op is
         // cheaper). NOTE: unlike the other boundary sites, here the recorded span is
         // the maximal seam-free PREFIX of `op`, not its whole subtree — so

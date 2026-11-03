@@ -30,6 +30,29 @@ pub struct AndThen<S, U> {
     /// Memo for [`cb_spine_head_addable`](DeviceOp::cb_spine_head_addable) — see
     /// [`PredMemo`].
     pub(crate) spine_head_memo: PredMemo,
+    /// Memo for [`cb_suffix_weight`](DeviceOp::cb_suffix_weight) (static under
+    /// mutate; the recursion descends the whole left spine).
+    pub(crate) suffix_memo: std::sync::OnceLock<usize>,
+}
+
+/// The walk position for an [`AndThen`]'s source. Inside a command-buffer span
+/// (`Build` / `LendOnly`), a source that can take no part in it — neither
+/// continuing the span (`cb_spine_head_addable`) nor holding the span's suffix
+/// (`cb_suffix_weight`) — runs OUTSIDE it, enqueued normally: the span was
+/// opened at a left-nested chain's suffix (see [`DeviceOp::cb_suffix_weight`])
+/// and records only the trailing steps, which wait on this source's events as
+/// external deps. Everywhere else the source shares the walk position.
+fn source_walk<'e, S: DeviceOp>(
+    source: &S,
+    ec: &'e ExecutionContext<'e>,
+    off: &'e mut Option<ExecutionContext<'e>>,
+) -> &'e ExecutionContext<'e> {
+    let in_span = !matches!(ec.cb(), CbWalk::Off);
+    if in_span && !source.cb_spine_head_addable() && source.cb_suffix_weight() == 0 {
+        off.insert(ec.with_cb(CbWalk::Off))
+    } else {
+        ec
+    }
 }
 
 impl<S, U> DeviceOp for AndThen<S, U>
@@ -61,7 +84,12 @@ where
             return cb_boundary_execute(self, ec, mode);
         }
         // Source is always upstream → must pipeline (its output feeds `next`).
-        cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
+        let mut off = None;
+        cb_exec_child(
+            &self.source,
+            source_walk(&self.source, ec, &mut off),
+            ExecMode::Pipelined,
+        )?;
         // CLOSE the span at the seam (Build/LendOnly + next can't continue): seal +
         // enqueue the CB and restamp `source`'s pipes with its completion event, then
         // run `next` in `Off`. Otherwise forward normally (continue the span in Build,
@@ -80,7 +108,12 @@ where
         // (scatter-then-reconstruct over its per-element pipes) rather than the
         // default single-pipe drain — whose `output_pipe` it never fills. The
         // source pipelines; only the tail observes the terminal `mode`.
-        cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
+        let mut off = None;
+        cb_exec_child(
+            &self.source,
+            source_walk(&self.source, ec, &mut off),
+            ExecMode::Pipelined,
+        )?;
         // CLOSE the span at the seam: seal + enqueue + restamp `source`, then collect
         // `next` in `Off`. Otherwise collect `next` normally (continue in Build).
         let (value, deps) = if cb_close_before_seam(&self.source, &self.next, ec)? {
@@ -109,7 +142,12 @@ where
         // `upload(buf).and_then(|b| fill(b, v))`) re-arms its caller buffer. The
         // home is the tail's — the source pipelines; a discarded source is left to
         // the terminal, as in `collect`.
-        cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
+        let mut off = None;
+        cb_exec_child(
+            &self.source,
+            source_walk(&self.source, ec, &mut off),
+            ExecMode::Pipelined,
+        )?;
         if cb_close_before_seam(&self.source, &self.next, ec)? {
             self.next.collect_home(&ec.with_cb(CbWalk::Off), mode)
         } else {
@@ -139,7 +177,12 @@ where
         // op never fills → "op produced no output"). Source pipelines; tail takes
         // the terminal `mode`. A discarded source is left to the terminal, as in
         // `collect`.
-        cb_exec_child(&self.source, ec, ExecMode::Pipelined)?;
+        let mut off = None;
+        cb_exec_child(
+            &self.source,
+            source_walk(&self.source, ec, &mut off),
+            ExecMode::Pipelined,
+        )?;
         // CLOSE the span at the seam: seal + enqueue + restamp `source`, then gather
         // `next` in `Off`. Otherwise gather `next` normally (continue in Build, or
         // open a fresh boundary in Off).
@@ -263,6 +306,21 @@ where
         // erased `DeviceDynOp` source it is n real calls per node.
         pred_memo(&self.spine_head_memo, || {
             self.source.cb_spine_head_addable()
+        })
+    }
+
+    fn cb_suffix_weight(&self) -> usize {
+        // The recordable steps after the chain's last blocker: the whole chain if
+        // it is wholly addable; else, while `next` is addable, `next` plus
+        // whatever suffix the source ends with (down the left spine).
+        *self.suffix_memo.get_or_init(|| {
+            if self.cb_addable() {
+                self.cbable_weight
+            } else if self.next.cb_addable() {
+                self.next.cbable_weight() + self.source.cb_suffix_weight()
+            } else {
+                0
+            }
         })
     }
 
@@ -735,6 +793,10 @@ where
         self.inner.cb_spine_head_addable()
     }
 
+    fn cb_suffix_weight(&self) -> usize {
+        self.inner.cb_suffix_weight()
+    }
+
     fn into_dyn<'b>(self) -> DeviceDynOp<'b, S>
     where
         Self: 'b,
@@ -932,6 +994,10 @@ where
 
     fn cb_spine_head_addable(&self) -> bool {
         self.inner.cb_spine_head_addable()
+    }
+
+    fn cb_suffix_weight(&self) -> usize {
+        self.inner.cb_suffix_weight()
     }
 
     fn into_dyn<'op>(self) -> DeviceDynOp<'op, O::Shape>
