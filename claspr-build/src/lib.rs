@@ -897,6 +897,9 @@ fn translate_and_inline(items: Vec<syn::Item>, dir: &Path) -> Result<Vec<syn::It
                         let twin_extra = rewrite_per_item_params(&mut twin, false)?
                             .expect("the twin has the same per-item params");
                         translate_fn_attrs(&mut twin.attrs);
+                        // The double underscore keeps the twin's name clear of
+                        // user names; it isn't snake case.
+                        twin.attrs.push(syn::parse_quote!(#[allow(non_snake_case)]));
                         out.extend(extra);
                         out.extend(twin_extra);
                         out.push(syn::Item::Fn(twin));
@@ -1733,12 +1736,15 @@ pub mod __claspr {
                     )*
                     o
                 }
+                // Branch-free select: a `match d` (or an `if d == k` chain, which
+                // MIR folds back into one) emits an `OpSwitch` on a 64-bit
+                // selector, whose two-word case literals trip an assertion in the
+                // bundled spirv-opt's constant propagation (aborting the build
+                // when no newer system `spirv-opt` is on PATH).
                 #[inline(always)]
                 fn extent(&self, d: usize) -> usize {
-                    match d {
-                        $($d => self.ext[$d],)*
-                        _ => panic!("tensor axis past its rank"),
-                    }
+                    assert!(d < $r, "tensor axis past its rank");
+                    0 $(| (self.ext[$d] & 0usize.wrapping_sub((d == $d) as usize)))*
                 }
             }
         )*};
