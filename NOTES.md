@@ -493,6 +493,15 @@ CI job stays deferred until a suitable pocl is easy to install.
   skips became loud (`CLASPR_REQUIRE_DEVICE`): the two access_frozen victims had
   been silently "passing" as skips.
 
+- **Second CB implementation: rusticl + cmdbufemu (local only, 2026-11-03)** — Ben
+  Ashbaugh's command-buffer emulation layer (`~/scratch/cmdbufemu`) loads only
+  through the Khronos ICD loader it builds (`LD_LIBRARY_PATH=<build>/external/opencl-icd-loader
+  OPENCL_LAYERS=<build>/layers/10_cmdbufemu/libCmdBufEmu.so` + the rusticl env);
+  the system ocl-icd 2.3.4 ignored `OPENCL_LAYERS` (the user is updating ocl-icd —
+  re-check). The layer is not thread-safe: gray-scott's concurrent tests crash
+  intermittently under it, `--test-threads=1` is clean. Its first run found the
+  non-NULL recording queue (we leaned on a pocl leniency) and the broken re-run
+  fallback (now software replay, see ARCHITECTURE.md). Not in CI.
 - **Image dispatch is family-level, not format-level** — the macro derives
   dim/arrayed/family/access from `Image!(...)` and bounds the launcher generic, but the
   concrete channel format isn't part of the bound (Kernel-target SPIR-V carries only the

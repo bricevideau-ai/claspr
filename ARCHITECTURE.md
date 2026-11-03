@@ -100,6 +100,10 @@ subtree opens ONE command buffer at a boundary and re-enters `execute` in `Build
   (`Context::disable_command_buffers`). Failures are injectable for tests
   (`record::__inject_cb_failure`, `tests/tier2/tests/cb_replay.rs`);
   `CLASPR_CB_TRACE=1` logs every failed CB call.
+- Recording calls pass a NULL `command_queue`: without
+  `cl_khr_command_buffer_multi_device` the spec requires it (with it, NULL means the
+  buffer's one queue). pocl accepted our queue; Ben Ashbaugh's cmdbufemu layer
+  rejects it with `CL_INVALID_COMMAND_QUEUE`.
 
 ## To change X, read Y
 

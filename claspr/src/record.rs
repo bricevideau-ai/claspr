@@ -497,7 +497,10 @@ impl CbBuilder {
                 cb_call(|| unsafe {
                     fill(
                         self.cb,
-                        self.queue,
+                        // The recording queue must be NULL: claspr creates every command
+                        // buffer with ONE queue, and without `cl_khr_command_buffer_multi_device`
+                        // the spec requires NULL (with it, NULL means that one queue).
+                        ptr::null_mut(),
                         ptr::null(),
                         m as opencl_sys::cl_mem,
                         pattern.as_ptr() as *const c_void,
@@ -522,7 +525,7 @@ impl CbBuilder {
                 cb_call(|| unsafe {
                     svm_fill(
                         self.cb,
-                        self.queue,
+                        ptr::null_mut(),
                         ptr::null(),
                         base,
                         pattern.as_ptr() as *const c_void,
@@ -580,7 +583,7 @@ impl CbBuilder {
                 cb_call(|| unsafe {
                     copy(
                         self.cb,
-                        self.queue,
+                        ptr::null_mut(),
                         ptr::null(),
                         s as opencl_sys::cl_mem,
                         d as opencl_sys::cl_mem,
@@ -606,7 +609,7 @@ impl CbBuilder {
                 cb_call(|| unsafe {
                     svm_copy(
                         self.cb,
-                        self.queue,
+                        ptr::null_mut(),
                         ptr::null(),
                         dst_ptr,
                         src_ptr,
@@ -670,7 +673,7 @@ impl CbBuilder {
         let st = cb_call(|| unsafe {
             fill(
                 self.cb,
-                self.queue,
+                ptr::null_mut(),
                 ptr::null(),
                 m as opencl_sys::cl_mem,
                 fill_color.as_ptr() as *const c_void,
@@ -728,7 +731,7 @@ impl CbBuilder {
         let st = cb_call(|| unsafe {
             copy(
                 self.cb,
-                self.queue,
+                ptr::null_mut(),
                 ptr::null(),
                 s as opencl_sys::cl_mem,
                 d as opencl_sys::cl_mem,
@@ -886,7 +889,10 @@ impl CbBuilder {
         let st = cb_call(|| unsafe {
             ndr(
                 self.cb,
-                self.queue,
+                // The recording queue must be NULL: claspr creates every command
+                // buffer with ONE queue, and without `cl_khr_command_buffer_multi_device`
+                // the spec requires NULL (with it, NULL means that one queue).
+                ptr::null_mut(),
                 ptr::null(),
                 kernel as opencl_sys::cl_kernel,
                 global.len() as cl_uint,
