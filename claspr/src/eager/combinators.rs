@@ -1473,7 +1473,7 @@ macro_rules! impl_eager_bundle {
                 // Not when this IS the boundary's per-op fallback (its build was
                 // discarded): reopening here would fail the same way and recurse.
                 if matches!(ec.cb(), CbWalk::Off)
-                    && ec.context().has_cl_khr_command_buffer()
+                    && ec.context().command_buffers_enabled()
                     && ec.may_open_boundary_at(&self.cb_cache)
                     && self.cbable_weight() >= 2
                     && self.cb_addable()

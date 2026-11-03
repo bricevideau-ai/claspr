@@ -25,12 +25,119 @@
 //! lacking an SVM/image command PFN) resolves the entry point null, and the graph
 //! falls back to the per-op `execute` path — same results, no CB acceleration.
 use crate::error::{Error, Result};
-use crate::exec_ctx::{SyncPoints, sync_points_to_wait_list};
+use crate::exec_ctx::SyncPoints;
 use crate::util::lock_unpoisoned;
 use opencl3::types::{cl_command_queue, cl_event, cl_kernel, cl_mem, cl_uint};
 use std::ffi::{CStr, c_void};
 use std::ptr;
 use std::sync::Mutex;
+
+/// One command the recording walk issued, kept in software so a build that can't
+/// become a real command buffer (a rejected command, a missing optional entry
+/// point, a failed finalize) still runs EXACTLY what was recorded — enqueued
+/// directly by [`CbBuilder::replay`] — instead of re-running the graph, which
+/// can't re-supply inputs that already flowed into the build through pipes.
+enum SwCmd {
+    Fill {
+        mem: MemRef,
+        pattern: Vec<u8>,
+        offset: usize,
+        size: usize,
+    },
+    Copy {
+        src: MemRef,
+        dst: MemRef,
+        src_offset: usize,
+        dst_offset: usize,
+        size: usize,
+    },
+    FillImage {
+        image: cl_mem,
+        color: Vec<u8>,
+        origin: [usize; 3],
+        region: [usize; 3],
+    },
+    CopyImage {
+        src: cl_mem,
+        dst: cl_mem,
+        src_origin: [usize; 3],
+        dst_origin: [usize; 3],
+        region: [usize; 3],
+    },
+    NdRange {
+        kernel: cl_kernel,
+        global: Vec<usize>,
+        local: Vec<usize>,
+    },
+    /// A command claspr declines to record (a copy whose sizes differ): replaying
+    /// it is this error — what the per-op path reports.
+    Fail(Option<Error>),
+}
+
+/// A logged command and the commands (indices into the log) it waits on.
+struct SwEntry {
+    cmd: SwCmd,
+    waits: Vec<usize>,
+}
+
+thread_local! {
+    static INJECT_CB_FAILURE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test hook: make a `cl_khr_command_buffer` recording or finalize call on THIS
+/// thread fail as if the driver rejected it — `Some(0)` the next call, `Some(n)`
+/// the one after `n` more, `None` to cancel. Forces the replay fallback on any
+/// device (a graph records on the thread that runs its terminal). Not API.
+#[doc(hidden)]
+pub fn __inject_cb_failure(after: Option<u32>) {
+    INJECT_CB_FAILURE.with(|c| c.set(after));
+}
+
+/// Whether the injection hook fails this call (consuming it).
+fn cb_injected_failure() -> bool {
+    INJECT_CB_FAILURE.with(|c| match c.get() {
+        Some(0) => {
+            c.set(None);
+            true
+        }
+        Some(n) => {
+            c.set(Some(n - 1));
+            false
+        }
+        None => false,
+    })
+}
+
+/// A command-buffer call's status, or a driver-style failure when the injection
+/// hook fires — so an injected failure takes exactly the real failure path.
+fn cb_call(call: impl FnOnce() -> opencl_sys::cl_int) -> opencl_sys::cl_int {
+    if cb_injected_failure() {
+        opencl_sys::CL_OUT_OF_RESOURCES
+    } else {
+        call()
+    }
+}
+
+/// `CLASPR_CB_TRACE=1`: log every failed `cl_khr_command_buffer` call and every
+/// build marked ineligible to stderr — to diagnose an implementation (or an
+/// emulation layer) that rejects what claspr records. Read once.
+fn cb_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CLASPR_CB_TRACE").is_some_and(|v| v != "0"))
+}
+
+/// Trace a `cl_khr_command_buffer` call's status when it failed.
+fn cb_trace(call: &str, status: opencl_sys::cl_int) {
+    if status != opencl_sys::CL_SUCCESS && cb_trace_enabled() {
+        eprintln!("[claspr cb] {call} -> {status}");
+    }
+}
+
+fn cb_trace_ineligible(at: &std::panic::Location<'_>) {
+    if cb_trace_enabled() {
+        eprintln!("[claspr cb] build marked ineligible at {at}");
+    }
+}
 
 // ── cl_khr_command_buffer FFI (layer 2) ─────────────────────────────────────
 //
@@ -170,13 +277,6 @@ pub struct CbBuilder {
     /// or image command PFN). A non-eligible builder is discarded and the caller
     /// falls back to per-op execute.
     eligible: Mutex<bool>,
-    /// Count of `clCommand*KHR` commands successfully recorded. Used by the boundary
-    /// to DISCARD an EMPTY command buffer — a span of pure structural passthroughs
-    /// (a bare `Pipe` aliasing an upstream, a `lift` of a device-resident cell) adds
-    /// zero commands, and finalizing + enqueuing such a CB is pure event-sync
-    /// overhead (an empty CB masquerading as work). `recorded() == 0` → the boundary
-    /// skips the CB and just forwards the events the pipes already carry.
-    recorded: Mutex<usize>,
     /// Set true once [`finalize`](Self::finalize) has sealed this builder into a
     /// [`FinalizedCb`] and handed off the CB handle + retained kernels. Makes
     /// finalize idempotent (finalize-at-close: the close point seals the CB, and the
@@ -195,6 +295,19 @@ pub struct CbBuilder {
     /// ([`set_slot_digests`](Self::set_slot_digests)). Moved into the
     /// [`FinalizedCb`]; `CbLru::install` keys the CB from it.
     slot_digests: Mutex<std::collections::BTreeMap<usize, Option<u64>>>,
+    /// Every command the walk issued, in order (see [`SwCmd`]). The sync point a
+    /// recording method returns is a VIRTUAL one — its 1-based index here — so a
+    /// consumer's waits stay meaningful even past a command the driver rejected.
+    sw: Mutex<Vec<SwEntry>>,
+    /// The REAL `cl_sync_point_khr` of each logged command that made it into the
+    /// command buffer (`None` once the build stopped recording).
+    real_sp: Mutex<Vec<Option<cl_sync_point_khr>>>,
+    /// Set when a command-buffer call failed in the DRIVER (not a command claspr
+    /// declined): the boundary then disables command buffers on the context.
+    driver_failed: std::sync::atomic::AtomicBool,
+    /// Set once [`replay`](Self::replay) ran the log: the build is settled (like a
+    /// finalize) — a later boundary-return frame must not run it again.
+    replayed: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: the CB / queue / kernel handles are opaque handles into the
@@ -237,6 +350,7 @@ impl CbBuilder {
         // SAFETY: `create` is the resolved clCreateCommandBufferKHR for `platform`;
         // one queue, default properties.
         let cb = unsafe { create(1, &mut q as *mut _, ptr::null(), &mut err) };
+        cb_trace("clCreateCommandBufferKHR", err);
         if err != opencl_sys::CL_SUCCESS || cb.is_null() {
             return None;
         }
@@ -247,11 +361,66 @@ impl CbBuilder {
             ext,
             kernels: Mutex::new(Vec::new()),
             eligible: Mutex::new(true),
-            recorded: Mutex::new(0),
             finalized: Mutex::new(false),
             slots: Mutex::new(std::collections::BTreeSet::new()),
             slot_digests: Mutex::new(std::collections::BTreeMap::new()),
+            sw: Mutex::new(Vec::new()),
+            real_sp: Mutex::new(Vec::new()),
+            driver_failed: std::sync::atomic::AtomicBool::new(false),
+            replayed: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Log `cmd`; return its virtual sync point and — while the build can still
+    /// record — the real sync points of the commands it waits on (`None` once a
+    /// command was rejected: nothing more goes into the real command buffer).
+    fn log(
+        &self,
+        cmd: SwCmd,
+        waits: &SyncPoints,
+    ) -> (cl_sync_point_khr, Option<Vec<cl_sync_point_khr>>) {
+        let idx: Vec<usize> = waits.iter().map(|&w| w as usize - 1).collect();
+        let mut real_sp = lock_unpoisoned(&self.real_sp);
+        let real = if self.is_eligible() {
+            idx.iter()
+                .map(|&i| real_sp.get(i).copied().flatten())
+                .collect()
+        } else {
+            None
+        };
+        let mut sw = lock_unpoisoned(&self.sw);
+        sw.push(SwEntry { cmd, waits: idx });
+        real_sp.push(None);
+        (sw.len() as cl_sync_point_khr, real)
+    }
+
+    /// Note that virtual command `v` made it into the command buffer as `sp`.
+    fn recorded_as(&self, v: cl_sync_point_khr, sp: cl_sync_point_khr) {
+        lock_unpoisoned(&self.real_sp)[v as usize - 1] = Some(sp);
+    }
+
+    /// A command-buffer call failed in the driver: stop recording (the build will
+    /// replay) and remember it was the driver.
+    #[track_caller]
+    fn driver_failure(&self, call: &str, status: opencl_sys::cl_int) {
+        cb_trace(call, status);
+        self.driver_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.mark_ineligible();
+    }
+
+    /// Whether a command-buffer call failed in the driver during this build.
+    pub(crate) fn driver_failed(&self) -> bool {
+        self.driver_failed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Log a command claspr declines to record: replaying it returns `err` (the
+    /// error its per-op path would report). Returns its virtual sync point.
+    #[track_caller]
+    pub(crate) fn fail(&self, err: Error, waits: &SyncPoints) -> cl_sync_point_khr {
+        self.mark_ineligible();
+        self.log(SwCmd::Fail(Some(err)), waits).0
     }
 
     /// Mark the build as ineligible (an SVM command or a failed add) so the homing
@@ -259,13 +428,10 @@ impl CbBuilder {
     /// ops (`copy.rs`) can force the per-op fallback on a size mismatch — routing
     /// the error through the per-op path that already returns `LengthMismatch`,
     /// instead of the CB path silently truncating.
+    #[track_caller]
     pub(crate) fn mark_ineligible(&self) {
+        cb_trace_ineligible(std::panic::Location::caller());
         *lock_unpoisoned(&self.eligible) = false;
-    }
-
-    /// Bump the recorded-command counter (called on each successful `clCommand*KHR`).
-    fn count(&self) {
-        *lock_unpoisoned(&self.recorded) += 1;
     }
 
     /// Note that this CB baked in a buffer/scalar traceable to slot cell `id`
@@ -282,10 +448,10 @@ impl CbBuilder {
         *lock_unpoisoned(&self.slot_digests) = digests;
     }
 
-    /// How many `clCommand*KHR` commands have been recorded. Zero → the boundary
-    /// discards the CB (empty-CB guard).
+    /// How many commands the walk issued (logged, recorded or not). Zero → the
+    /// boundary discards the CB (empty-CB guard).
     pub fn recorded(&self) -> usize {
-        *lock_unpoisoned(&self.recorded)
+        lock_unpoisoned(&self.sw).len()
     }
 
     /// Whether [`finalize`](Self::finalize) has already sealed this builder. The
@@ -294,14 +460,14 @@ impl CbBuilder {
     /// eligible → the close never fired (a span with no interior seam) → the opener
     /// finalizes + enqueues at return itself.
     pub fn is_finalized(&self) -> bool {
-        *lock_unpoisoned(&self.finalized)
+        *lock_unpoisoned(&self.finalized) || self.replayed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Add a buffer fill to the CB. A `cl_mem` buffer records via
-    /// `clCommandFillBufferKHR`; an SVM buffer records via `clCommandSVMMemFillKHR`
-    /// (extension >= 0.9.4 — if that PFN is absent, the build is marked ineligible so
-    /// the boundary falls back to software). Returns the command's sync point, or
-    /// `None` on any shortfall.
+    /// Add a buffer fill. A `cl_mem` buffer records via `clCommandFillBufferKHR`;
+    /// an SVM buffer via `clCommandSVMMemFillKHR` (extension >= 0.9.4). Always
+    /// logged (see [`SwCmd`]): if the command can't be recorded — absent entry
+    /// point, a driver rejection — the build stops recording and the boundary
+    /// replays the log instead. Returns the command's (virtual) sync point.
     pub(crate) fn fill_buffer(
         &self,
         mem: MemRef,
@@ -310,15 +476,25 @@ impl CbBuilder {
         size: usize,
         waits: &SyncPoints,
     ) -> Option<cl_sync_point_khr> {
-        let waits = sync_points_to_wait_list(waits);
-        let (wptr, n) = wait_ptr(&waits);
+        let cmd = SwCmd::Fill {
+            mem,
+            pattern: pattern.to_vec(),
+            offset,
+            size,
+        };
+        let (v, real) = self.log(cmd, waits);
+        let Some(real) = real else { return Some(v) };
+        let (wptr, n) = wait_ptr(&real);
         let mut sp: cl_sync_point_khr = 0;
         let st = match mem {
             MemRef::Buffer(m) => {
-                let fill = self.ext.fill_buffer?;
-                // SAFETY: live CB + queue; `m` a valid cl_mem kept alive by the
-                // graph; `pattern` outlives the call; `waits` are markers from this CB.
-                unsafe {
+                let Some(fill) = self.ext.fill_buffer else {
+                    self.mark_ineligible();
+                    return Some(v);
+                };
+                // SAFETY: live CB; `m` a valid cl_mem kept alive by the graph;
+                // `pattern` outlives the call; `real` are this CB's sync points.
+                cb_call(|| unsafe {
                     fill(
                         self.cb,
                         self.queue,
@@ -333,17 +509,17 @@ impl CbBuilder {
                         &mut sp,
                         ptr::null_mut(),
                     )
-                }
+                })
             }
             MemRef::Svm(p) => {
-                // `?`: an SVM fill on a driver without the extension-0.9.4 command
-                // falls back (None → boundary discards → software), never a null call.
-                let svm_fill = self.ext.svm_memfill?;
+                let Some(svm_fill) = self.ext.svm_memfill else {
+                    self.mark_ineligible();
+                    return Some(v);
+                };
                 // SVM fill has no offset param — offset the pointer directly.
                 let base = unsafe { (p as *mut u8).add(offset) } as *mut c_void;
-                // SAFETY: `p` a valid SVM pointer kept alive by the graph; `pattern`
-                // outlives the call; `waits` are markers from this CB.
-                unsafe {
+                // SAFETY: `p` a valid SVM pointer kept alive by the graph; as above.
+                cb_call(|| unsafe {
                     svm_fill(
                         self.cb,
                         self.queue,
@@ -357,22 +533,22 @@ impl CbBuilder {
                         &mut sp,
                         ptr::null_mut(),
                     )
-                }
+                })
             }
         };
         if st != opencl_sys::CL_SUCCESS {
-            self.mark_ineligible();
-            return None;
+            self.driver_failure("clCommandFillBufferKHR", st);
+        } else {
+            self.recorded_as(v, sp);
         }
-        self.count();
-        Some(sp)
+        Some(v)
     }
 
-    /// Add a device-to-device copy to the CB. Buffer↔buffer records via
+    /// Add a device-to-device copy. Buffer↔buffer records via
     /// `clCommandCopyBufferKHR`; SVM↔SVM via `clCommandSVMMemcpyKHR` (extension
-    /// version 0.9.4+ — absent PFN falls back: ineligible → software). A MIXED
-    /// cl_mem/SVM pair has no single CB command and marks the build ineligible.
-    /// Returns its sync point, or `None` on any shortfall.
+    /// 0.9.4 or later). A mixed cl_mem/SVM pair has no command-buffer command (and no
+    /// per-op copy either): it replays as an error. Always logged; returns the
+    /// command's (virtual) sync point.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn copy_buffer(
         &self,
@@ -383,15 +559,25 @@ impl CbBuilder {
         size: usize,
         waits: &SyncPoints,
     ) -> Option<cl_sync_point_khr> {
-        let waits = sync_points_to_wait_list(waits);
-        let (wptr, n) = wait_ptr(&waits);
+        let cmd = SwCmd::Copy {
+            src,
+            dst,
+            src_offset,
+            dst_offset,
+            size,
+        };
+        let (v, real) = self.log(cmd, waits);
+        let Some(real) = real else { return Some(v) };
+        let (wptr, n) = wait_ptr(&real);
         let mut sp: cl_sync_point_khr = 0;
         let st = match (src, dst) {
             (MemRef::Buffer(s), MemRef::Buffer(d)) => {
-                let copy = self.ext.copy_buffer?;
-                // SAFETY: live CB + queue; `s`/`d` valid cl_mem kept alive by the
-                // graph; `waits` are markers from this CB.
-                unsafe {
+                let Some(copy) = self.ext.copy_buffer else {
+                    self.mark_ineligible();
+                    return Some(v);
+                };
+                // SAFETY: live CB; `s`/`d` valid cl_mem kept alive by the graph.
+                cb_call(|| unsafe {
                     copy(
                         self.cb,
                         self.queue,
@@ -406,17 +592,18 @@ impl CbBuilder {
                         &mut sp,
                         ptr::null_mut(),
                     )
-                }
+                })
             }
             (MemRef::Svm(s), MemRef::Svm(d)) => {
-                // `?`: SVM copy on a driver without the 0.9.4 command falls back.
-                let svm_copy = self.ext.svm_memcpy?;
+                let Some(svm_copy) = self.ext.svm_memcpy else {
+                    self.mark_ineligible();
+                    return Some(v);
+                };
                 // SVM copy has no offset params — offset the pointers directly.
                 let src_ptr = unsafe { (s as *const u8).add(src_offset) } as *const c_void;
                 let dst_ptr = unsafe { (d as *mut u8).add(dst_offset) } as *mut c_void;
-                // SAFETY: `s`/`d` valid SVM pointers kept alive by the graph; `waits`
-                // are markers from this CB.
-                unsafe {
+                // SAFETY: `s`/`d` valid SVM pointers kept alive by the graph.
+                cb_call(|| unsafe {
                     svm_copy(
                         self.cb,
                         self.queue,
@@ -429,27 +616,25 @@ impl CbBuilder {
                         &mut sp,
                         ptr::null_mut(),
                     )
-                }
+                })
             }
-            // A mixed cl_mem/SVM copy has no single CB command → software fallback.
             _ => {
                 self.mark_ineligible();
-                return None;
+                return Some(v);
             }
         };
         if st != opencl_sys::CL_SUCCESS {
-            self.mark_ineligible();
-            return None;
+            self.driver_failure("clCommandCopyBufferKHR", st);
+        } else {
+            self.recorded_as(v, sp);
         }
-        self.count();
-        Some(sp)
+        Some(v)
     }
 
-    /// Add an image fill to the CB via `clCommandFillImageKHR` (extension present →
-    /// records; absent → ineligible → software). `image` is the image's `cl_mem`;
-    /// `fill_color` is the format-appropriate fill value (4×component); `origin` and
-    /// `region` are 3-element arrays (`clEnqueueFillImage` shape). Returns its sync
-    /// point, or `None` on any shortfall.
+    /// Add an image fill via `clCommandFillImageKHR`. `fill_color` is the
+    /// format-appropriate fill value (4×component); `origin` and `region` are
+    /// 3-element arrays (`clEnqueueFillImage` shape). Always logged; returns the
+    /// command's (virtual) sync point.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn fill_image(
         &self,
@@ -460,20 +645,29 @@ impl CbBuilder {
         waits: &SyncPoints,
     ) -> Option<cl_sync_point_khr> {
         // An image is always a `cl_mem` (never SVM).
-        let m = match image {
-            MemRef::Buffer(m) => m,
-            MemRef::Svm(_) => {
-                self.mark_ineligible();
-                return None;
-            }
+        let MemRef::Buffer(m) = image else {
+            return Some(self.fail(
+                Error::NotSupported("an image fill on an SVM pointer"),
+                waits,
+            ));
         };
-        let fill = self.ext.fill_image?;
-        let waits = sync_points_to_wait_list(waits);
-        let (wptr, n) = wait_ptr(&waits);
+        let cmd = SwCmd::FillImage {
+            image: m,
+            color: fill_color.to_vec(),
+            origin,
+            region,
+        };
+        let (v, real) = self.log(cmd, waits);
+        let Some(real) = real else { return Some(v) };
+        let Some(fill) = self.ext.fill_image else {
+            self.mark_ineligible();
+            return Some(v);
+        };
+        let (wptr, n) = wait_ptr(&real);
         let mut sp: cl_sync_point_khr = 0;
-        // SAFETY: live CB + queue; `m` a valid image cl_mem kept alive by the graph;
-        // `fill_color`/`origin`/`region` outlive the call; `waits` are this CB's markers.
-        let st = unsafe {
+        // SAFETY: live CB; `m` a valid image cl_mem kept alive by the graph;
+        // `fill_color`/`origin`/`region` outlive the call.
+        let st = cb_call(|| unsafe {
             fill(
                 self.cb,
                 self.queue,
@@ -487,18 +681,18 @@ impl CbBuilder {
                 &mut sp,
                 ptr::null_mut(),
             )
-        };
+        });
         if st != opencl_sys::CL_SUCCESS {
-            self.mark_ineligible();
-            return None;
+            self.driver_failure("clCommandFillImageKHR", st);
+        } else {
+            self.recorded_as(v, sp);
         }
-        self.count();
-        Some(sp)
+        Some(v)
     }
 
-    /// Add an image→image copy to the CB via `clCommandCopyImageKHR`. `src`/`dst` are
-    /// image `cl_mem`s; `src_origin`/`dst_origin`/`region` are 3-element arrays.
-    /// Returns its sync point, or `None` on any shortfall.
+    /// Add an image→image copy via `clCommandCopyImageKHR`. `src`/`dst` are image
+    /// `cl_mem`s; `src_origin`/`dst_origin`/`region` are 3-element arrays. Always
+    /// logged; returns the command's (virtual) sync point.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn copy_image(
         &self,
@@ -509,19 +703,29 @@ impl CbBuilder {
         region: [usize; 3],
         waits: &SyncPoints,
     ) -> Option<cl_sync_point_khr> {
-        let (s, d) = match (src, dst) {
-            (MemRef::Buffer(s), MemRef::Buffer(d)) => (s, d),
-            _ => {
-                self.mark_ineligible();
-                return None;
-            }
+        let (MemRef::Buffer(s), MemRef::Buffer(d)) = (src, dst) else {
+            return Some(self.fail(
+                Error::NotSupported("an image copy on an SVM pointer"),
+                waits,
+            ));
         };
-        let copy = self.ext.copy_image?;
-        let waits = sync_points_to_wait_list(waits);
-        let (wptr, n) = wait_ptr(&waits);
+        let cmd = SwCmd::CopyImage {
+            src: s,
+            dst: d,
+            src_origin,
+            dst_origin,
+            region,
+        };
+        let (v, real) = self.log(cmd, waits);
+        let Some(real) = real else { return Some(v) };
+        let Some(copy) = self.ext.copy_image else {
+            self.mark_ineligible();
+            return Some(v);
+        };
+        let (wptr, n) = wait_ptr(&real);
         let mut sp: cl_sync_point_khr = 0;
         // SAFETY: as `fill_image`; both images valid cl_mem kept alive by the graph.
-        let st = unsafe {
+        let st = cb_call(|| unsafe {
             copy(
                 self.cb,
                 self.queue,
@@ -536,13 +740,13 @@ impl CbBuilder {
                 &mut sp,
                 ptr::null_mut(),
             )
-        };
+        });
         if st != opencl_sys::CL_SUCCESS {
-            self.mark_ineligible();
-            return None;
+            self.driver_failure("clCommandCopyImageKHR", st);
+        } else {
+            self.recorded_as(v, sp);
         }
-        self.count();
-        Some(sp)
+        Some(v)
     }
 
     /// Set one buffer `(pointer, len)` argument pair on `kernel` for CB-mode
@@ -644,13 +848,14 @@ impl CbBuilder {
         Ok(())
     }
 
-    /// Add an ND-range kernel launch to the CB. The kernel's args must already be
-    /// set (the caller sets them at build time, exactly like the software record
-    /// path). The kernel is retained for the CB's lifetime. Returns its sync point.
+    /// Add an ND-range kernel launch. The kernel's args must already be set (the
+    /// caller sets them at build time); the kernel is retained for the build's
+    /// lifetime (and the command buffer's, once finalized). Always logged; returns
+    /// the command's (virtual) sync point.
     ///
     /// # Safety
     /// `kernel` must be a valid `cl_kernel` whose args are set to the buffers this
-    /// launch uses; `waits` must be sync points from this same CB.
+    /// launch uses; `waits` must be sync points from this same builder.
     pub unsafe fn ndrange_kernel(
         &self,
         kernel: cl_kernel,
@@ -658,23 +863,27 @@ impl CbBuilder {
         local: &[usize],
         waits: &SyncPoints,
     ) -> Option<cl_sync_point_khr> {
-        let ndr = self.ext.ndrange_kernel?;
-        // Own a refcount for the CB's lifetime.
-        if unsafe { cl3::kernel::retain_kernel(kernel) }.is_err() {
-            self.mark_ineligible();
-            return None;
+        // Own a refcount for as long as the build (a replay) or the CB needs it.
+        if let Err(code) = unsafe { cl3::kernel::retain_kernel(kernel) } {
+            return Some(self.fail(Error::OpenCl(opencl3::error_codes::ClError(code)), waits));
         }
         lock_unpoisoned(&self.kernels).push(kernel);
-        // Materialize the set into the contiguous slice the C call needs. The
-        // wait-list is a SET (wait for all markers; order irrelevant) — carrying it
-        // as a `BTreeSet` up to here means a consumer reading two pipes of one
-        // producer can't submit that marker twice.
-        let waits = sync_points_to_wait_list(waits);
-        let (wptr, n) = wait_ptr(&waits);
+        let cmd = SwCmd::NdRange {
+            kernel,
+            global: global.to_vec(),
+            local: local.to_vec(),
+        };
+        let (v, real) = self.log(cmd, waits);
+        let Some(real) = real else { return Some(v) };
+        let Some(ndr) = self.ext.ndrange_kernel else {
+            self.mark_ineligible();
+            return Some(v);
+        };
+        let (wptr, n) = wait_ptr(&real);
         let mut sp: cl_sync_point_khr = 0;
-        // SAFETY: live CB + queue; kernel valid + args set + retained; `waits` are
-        // markers from this same CB.
-        let st = unsafe {
+        // SAFETY: live CB; kernel valid + args set + retained; `real` are this
+        // CB's sync points.
+        let st = cb_call(|| unsafe {
             ndr(
                 self.cb,
                 self.queue,
@@ -693,13 +902,13 @@ impl CbBuilder {
                 &mut sp,
                 ptr::null_mut(),
             )
-        };
+        });
         if st != opencl_sys::CL_SUCCESS {
-            self.mark_ineligible();
-            return None;
+            self.driver_failure("clCommandNDRangeKernelKHR", st);
+        } else {
+            self.recorded_as(v, sp);
         }
-        self.count();
-        Some(sp)
+        Some(v)
     }
 
     /// Whether every command added so far is CB-eligible (all `cl_mem`, no failed
@@ -733,7 +942,9 @@ impl CbBuilder {
         }
         let finalize = self.ext.finalize?;
         // SAFETY: sealing the live CB built above.
-        if unsafe { finalize(self.cb) } != opencl_sys::CL_SUCCESS {
+        let st = cb_call(|| unsafe { finalize(self.cb) });
+        if st != opencl_sys::CL_SUCCESS {
+            self.driver_failure("clFinalizeCommandBufferKHR", st);
             return None;
         }
         let enqueue = self.ext.enqueue?;
@@ -756,6 +967,163 @@ impl CbBuilder {
             // Stamped by `CbLru::install` from `slot_digests` + its own bindings.
             key: Mutex::new(None),
         })
+    }
+}
+
+impl CbBuilder {
+    /// Run every logged command directly on the build's queue — the fallback
+    /// when the build couldn't become a command buffer (a rejected command, an
+    /// absent entry point, a failed finalize). Commands run in recorded order,
+    /// each waiting on `wait` (the build's external deps) and on the commands
+    /// it depended on; returns one completion event over all of them, standing
+    /// in for the command buffer's. A command claspr declined to record returns
+    /// its error here.
+    pub fn replay(&self, wait: &[cl_event]) -> Result<crate::Event> {
+        let mut sw = lock_unpoisoned(&self.sw);
+        self.replayed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut events: Vec<crate::Event> = Vec::with_capacity(sw.len());
+        let to_err = |code| Error::OpenCl(opencl3::error_codes::ClError(code));
+        for entry in sw.iter_mut() {
+            let mut deps: Vec<cl_event> = wait.to_vec();
+            deps.extend(entry.waits.iter().map(|&i| events[i].get()));
+            let (dptr, n) = wait_ptr_ev(&deps);
+            let q = self.queue;
+            // SAFETY: every handle was valid when logged and is kept alive by the
+            // graph (buffers, images) or by this builder (kernels, retained); `deps`
+            // are live events; pointer arguments outlive each call.
+            let raw = unsafe {
+                match &mut entry.cmd {
+                    SwCmd::Fill {
+                        mem: MemRef::Buffer(m),
+                        pattern,
+                        offset,
+                        size,
+                    } => cl3::command_queue::enqueue_fill_buffer(
+                        q,
+                        *m,
+                        pattern.as_ptr() as *const c_void,
+                        pattern.len(),
+                        *offset,
+                        *size,
+                        n,
+                        dptr,
+                    ),
+                    SwCmd::Fill {
+                        mem: MemRef::Svm(p),
+                        pattern,
+                        offset,
+                        size,
+                    } => cl3::command_queue::enqueue_svm_mem_fill(
+                        q,
+                        (*p as *mut u8).add(*offset) as *mut c_void,
+                        pattern.as_ptr() as *const c_void,
+                        pattern.len(),
+                        *size,
+                        n,
+                        dptr,
+                    ),
+                    SwCmd::Copy {
+                        src: MemRef::Buffer(s),
+                        dst: MemRef::Buffer(d),
+                        src_offset,
+                        dst_offset,
+                        size,
+                    } => cl3::command_queue::enqueue_copy_buffer(
+                        q,
+                        *s,
+                        *d,
+                        *src_offset,
+                        *dst_offset,
+                        *size,
+                        n,
+                        dptr,
+                    ),
+                    SwCmd::Copy {
+                        src: MemRef::Svm(s),
+                        dst: MemRef::Svm(d),
+                        src_offset,
+                        dst_offset,
+                        size,
+                    } => cl3::command_queue::enqueue_svm_mem_cpy(
+                        q,
+                        opencl3::types::CL_NON_BLOCKING,
+                        (*d as *mut u8).add(*dst_offset) as *mut c_void,
+                        (*s as *const u8).add(*src_offset) as *const c_void,
+                        *size,
+                        n,
+                        dptr,
+                    ),
+                    SwCmd::Copy { .. } => {
+                        return Err(Error::NotSupported(
+                            "a copy between a cl_mem buffer and an SVM pointer",
+                        ));
+                    }
+                    SwCmd::FillImage {
+                        image,
+                        color,
+                        origin,
+                        region,
+                    } => cl3::command_queue::enqueue_fill_image(
+                        q,
+                        *image,
+                        color.as_ptr() as *const c_void,
+                        origin.as_ptr(),
+                        region.as_ptr(),
+                        n,
+                        dptr,
+                    ),
+                    SwCmd::CopyImage {
+                        src,
+                        dst,
+                        src_origin,
+                        dst_origin,
+                        region,
+                    } => cl3::command_queue::enqueue_copy_image(
+                        q,
+                        *src,
+                        *dst,
+                        src_origin.as_ptr(),
+                        dst_origin.as_ptr(),
+                        region.as_ptr(),
+                        n,
+                        dptr,
+                    ),
+                    SwCmd::NdRange {
+                        kernel,
+                        global,
+                        local,
+                    } => cl3::command_queue::enqueue_nd_range_kernel(
+                        q,
+                        *kernel,
+                        global.len() as cl_uint,
+                        ptr::null(),
+                        global.as_ptr(),
+                        if local.is_empty() {
+                            ptr::null()
+                        } else {
+                            local.as_ptr()
+                        },
+                        n,
+                        dptr,
+                    ),
+                    SwCmd::Fail(err) => {
+                        return Err(err
+                            .take()
+                            .unwrap_or(Error::NotSupported("a declined command replayed twice")));
+                    }
+                }
+            };
+            events.push(crate::Event::new(raw.map_err(to_err)?));
+        }
+        let all: Vec<cl_event> = events.iter().map(|e| e.get()).collect();
+        let all = if all.is_empty() { wait.to_vec() } else { all };
+        let (aptr, n) = wait_ptr_ev(&all);
+        // SAFETY: live queue; `all` are live events (held by `events` / the caller).
+        let done =
+            unsafe { cl3::command_queue::enqueue_marker_with_wait_list(self.queue, n, aptr) }
+                .map_err(to_err)?;
+        Ok(crate::Event::new(done))
     }
 }
 
@@ -872,6 +1240,7 @@ impl FinalizedCb {
                 &mut event,
             )
         };
+        cb_trace("clEnqueueCommandBufferKHR", status);
         if status != opencl_sys::CL_SUCCESS {
             return Err(Error::OpenCl(opencl3::error_codes::ClError(status)));
         }

@@ -66,9 +66,14 @@ fn record_copy_cmd<S: RecordableBuffer, D: RecordableBuffer>(
     let sh = src.record_handle();
     let dh = dst.record_handle();
     if sh.byte_len != dh.byte_len {
-        // Defer to the per-op path (which errors) instead of truncating.
-        builder.mark_ineligible();
-        return None;
+        // Never truncate: replaying this command reports the per-op path's error.
+        return Some(builder.fail(
+            crate::Error::LengthMismatch {
+                src: sh.byte_len,
+                dst: dh.byte_len,
+            },
+            waits,
+        ));
     }
     builder.copy_buffer(sh.mem, dh.mem, 0, 0, sh.byte_len, waits)
 }

@@ -89,6 +89,17 @@ subtree opens ONE command buffer at a boundary and re-enters `execute` in `Build
   `tests/tier2/tests/cb_precise_invalidation.rs`.
 - CB acceleration engages only where the driver advertises `cl_khr_command_buffer`
   (locally: pocl). rusticl/intel fall back to per-op `execute` — same results.
+- **Fallback = software replay, never re-run.** `CbBuilder` logs every command it is
+  handed (`SwCmd`) and hands out VIRTUAL sync points (log index), mapped to real ones
+  only while the real recording succeeds. When a build can't become a command buffer
+  (ineligible, a rejected call, a failed finalize) the boundary/span close calls
+  `CbBuilder::replay`, which enqueues the logged commands directly with event deps.
+  Re-running the subtree instead is unsound: inputs that already flowed in through
+  pipes can't be re-supplied (`PipeDrained`, or a hang at a host seam). A driver
+  rejection also turns command buffers off for the whole context
+  (`Context::disable_command_buffers`). Failures are injectable for tests
+  (`record::__inject_cb_failure`, `tests/tier2/tests/cb_replay.rs`);
+  `CLASPR_CB_TRACE=1` logs every failed CB call.
 
 ## To change X, read Y
 

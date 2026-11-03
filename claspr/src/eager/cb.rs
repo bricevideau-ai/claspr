@@ -417,7 +417,7 @@ pub(crate) fn cb_forward_passthrough(
 /// ineligible via [`CbBuilder`], and the boundary discards it — so SVM graphs
 /// transparently fall back to per-op execute without a static type gate here.)
 pub(crate) fn cb_graph_eligible<O: DeviceOp + ?Sized>(op: &O, ec: &ExecutionContext<'_>) -> bool {
-    ec.context().has_cl_khr_command_buffer() && op.cb_addable()
+    ec.context().command_buffers_enabled() && op.cb_addable()
 }
 
 /// What every slot cell under `op` holds now (`cell id → digest`), read from the
@@ -531,12 +531,11 @@ where
     }
 
     if !builder.is_eligible() {
-        // An SVM (or otherwise un-addable) command: the build pass enqueued NOTHING
-        // real, so drop the lent Checkouts (rehome every buffer to its cell),
-        // reclaim mid-graph intermediates, and re-run the normal per-op path.
-        drop(checkouts);
-        op.reclaim_undelivered();
-        return op.gather_checkouts(&fallback, mode);
+        // The build couldn't become a command buffer (a command the driver or
+        // claspr rejected): run exactly what it recorded instead. Re-running the
+        // graph can't work — inputs that flowed in through pipes are consumed.
+        let event = cb_replay(&builder, ec, &ext)?;
+        return Ok((checkouts, single_dep(event)));
     }
 
     if builder.recorded() == 0 {
@@ -553,10 +552,9 @@ where
     }
 
     let Some(finalized) = builder.finalize() else {
-        // Finalize failed: same clean fallback as ineligible.
-        drop(checkouts);
-        op.reclaim_undelivered();
-        return op.gather_checkouts(&fallback, mode);
+        // Finalize failed: replay, as for an ineligible build.
+        let event = cb_replay(&builder, ec, &ext)?;
+        return Ok((checkouts, single_dep(event)));
     };
     let finalized = Arc::new(finalized);
     // HOME the CB in the boundary node's OWN cache (drops with the graph).
@@ -736,16 +734,33 @@ pub(crate) fn cb_close_span(ec: &ExecutionContext<'_>) -> Result<Option<Dep>> {
         return Ok(None);
     }
     let Some(finalized) = builder.finalize() else {
-        // Ineligible / finalize failure: no CB. The span's leaves added to a builder
-        // that will be discarded → the caller must fall back. Signalled as `None`;
-        // the AndThen close handles the reclaim + Off re-run.
-        return Ok(None);
+        // Ineligible / finalize failure: no CB — run what the span recorded
+        // directly; its completion event stands in for the CB's (the caller
+        // restamps the span's outputs with it, so the seam waits on the work).
+        let event = cb_replay(builder, ec, ext)?;
+        return Ok(Some(wrap_event(event)));
     };
     let finalized = Arc::new(finalized);
     lock_unpoisoned(cache).install(Arc::clone(&finalized));
     let waits = drain_ext(ext);
     let event = finalized.enqueue(&waits)?;
     Ok(Some(wrap_event(event)))
+}
+
+/// A build that couldn't become a command buffer: run what it recorded directly
+/// ([`CbBuilder::replay`](crate::record::CbBuilder::replay), waiting on the
+/// build's external deps) and return the completion event. If the DRIVER
+/// rejected a call, later graphs on this context stop recording.
+fn cb_replay(
+    builder: &crate::record::CbBuilder,
+    ec: &ExecutionContext<'_>,
+    ext: &Mutex<Deps>,
+) -> Result<crate::Event> {
+    if builder.driver_failed() {
+        ec.context().disable_command_buffers();
+    }
+    let waits = drain_ext(ext);
+    builder.replay(&waits)
 }
 
 /// Drain a CB's external dep accumulator into a raw `cl_event` wait-list for
@@ -769,7 +784,7 @@ pub(crate) fn cb_should_open_span<O: DeviceOp>(op: &O, ec: &ExecutionContext<'_>
     matches!(ec.cb(), CbWalk::Off)
         // Not inside this op's own boundary fallback (else: unbounded recursion).
         && op.cb_cache().is_some_and(|c| ec.may_open_boundary_at(c))
-        && ec.context().has_cl_khr_command_buffer()
+        && ec.context().command_buffers_enabled()
         && !op.cb_addable()
         && (op.cb_spine_head_addable() || op.cb_suffix_weight() >= 2)
         // >= 2: don't open a span CB that would record a single command (per-op is
@@ -912,11 +927,11 @@ where
     }
 
     if !builder.is_eligible() {
-        // The build enqueued nothing; the pipes hold the lent buffers with empty
-        // deps. Reclaim (rehome) them and re-run the normal per-op path so the
-        // buffers are re-lent + real device work runs.
-        op.reclaim_undelivered();
-        return op.execute(&fallback, mode);
+        // The build couldn't become a command buffer: run what it recorded and
+        // stamp its completion on the outputs (see `cb_boundary_gather`).
+        let event = cb_replay(&builder, ec, &ext)?;
+        op.cb_restamp(&single_dep(event));
+        return Ok(());
     }
 
     if builder.recorded() == 0 {
@@ -935,8 +950,9 @@ where
     }
 
     let Some(finalized) = builder.finalize() else {
-        op.reclaim_undelivered();
-        return op.execute(&fallback, mode);
+        let event = cb_replay(&builder, ec, &ext)?;
+        op.cb_restamp(&single_dep(event));
+        return Ok(());
     };
     let finalized = Arc::new(finalized);
     lock_unpoisoned(cache).install(Arc::clone(&finalized));

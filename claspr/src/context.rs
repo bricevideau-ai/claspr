@@ -87,6 +87,10 @@ struct ContextInner {
     /// replay loop was paying it on every iteration; an API trace of a steady-state
     /// replay shows two `clGetDeviceInfo` calls per enqueue. Cached here instead.
     device_extensions: OnceLock<std::collections::HashSet<String>>,
+    /// Set when a command-buffer build failed in the DRIVER (a `clCommand*KHR`,
+    /// finalize or create call returned an error): later graphs on this context
+    /// run per-op from the start instead of re-trying a recording that fails.
+    cb_disabled: std::sync::atomic::AtomicBool,
     /// Lazily-built program holding the built-in fill kernels (see
     /// [`crate::fill_kernel`]). Built on first device-fill use via
     /// [`Context::fill_program`]; cached for the context's lifetime.
@@ -516,6 +520,25 @@ impl Context {
     /// `cl_khr_command_buffer_mutable_dispatch` — record once, then rebind
     /// buffers/args per replay via `clUpdateMutableCommandsKHR` (the reusable
     /// command-buffer path; a later layer on top of the immutable recording).
+    /// Whether the graph engine may record command buffers on this context: the
+    /// device advertises `cl_khr_command_buffer` and no build has failed in the
+    /// driver (see [`disable_command_buffers`](Self::disable_command_buffers)).
+    pub(crate) fn command_buffers_enabled(&self) -> bool {
+        !self
+            .inner
+            .cb_disabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.has_cl_khr_command_buffer()
+    }
+
+    /// Stop recording command buffers on this context (a build failed in the
+    /// driver): later graphs run per-op. Not reversible.
+    pub(crate) fn disable_command_buffers(&self) {
+        self.inner
+            .cb_disabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn has_cl_khr_command_buffer_mutable_dispatch(&self) -> bool {
         self.device_has_extension("cl_khr_command_buffer_mutable_dispatch")
     }
@@ -698,6 +721,7 @@ impl ContextBuilder {
                 queues,
                 error_state: AtomicU32::new(0),
                 device_extensions: OnceLock::new(),
+                cb_disabled: std::sync::atomic::AtomicBool::new(false),
                 fill_program: OnceLock::new(),
             }),
         };
