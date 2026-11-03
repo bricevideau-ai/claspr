@@ -463,8 +463,9 @@ CI job stays deferred until a suitable pocl is easy to install.
 ### rusticl (Mesa 26.2.5, still in 26.2.6) driver bugs that show up in CI — reported, do not gate
 
 - **mesa#16714** — llvmpipe SIGSEGVs JIT-compiling any kernel that calls `fma()` on
-  `double` (miniweather's f64 kernels). CI runs miniweather with fp64 hidden on that
-  Mesa (`6c2b322`); locally `RUSTICL_FEATURES=fp64` reproduces it.
+  `double` (miniweather's f64 kernels). CI runs miniweather with fp64 hidden on
+  Mesa 26.2.5/26.2.6 (`6c2b322`; 26.2.6 added after kisak shipped it on 2026-10-30
+  and turned CI red); locally `RUSTICL_FEATURES=fp64` reproduces it.
 - **mesa#16723** — heap corruption (`llvmpipe_set_global_binding` SIGSEGV or glibc
   `malloc(): corrupted top size`) when kernels in flight on two queues are joined by
   one cross-queue sync. Surfaces as a ~15% flake of `tier1 cross_queue::
