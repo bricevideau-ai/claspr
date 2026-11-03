@@ -140,7 +140,7 @@ rusticl fine). llama2 `att_scores` / `att_mix` use it (drop `seq_len` / `head_si
 `kv_dim` / `kv_mul`; 2-D grids; `q` / caches / `att` allocated as `Tensor`s): output
 identical, perf neutral. The general `scalar_arg!` gap remains. Not yet: Halo as
 sugar over Tensor (reach), staggered/asymmetric reach, component axes for miniweather.
-**Non-blocking terminals — use-after-free fixed (2026-11-03, branch `graph-terminals`):**
+**Non-blocking terminals — use-after-free fixed (landed on main 2026-11-03):**
 `DeviceOpExt::submit_on` dropped the graph's output on return — a downloaded `Vec`
 a held/slow read was still filling → device wrote freed heap (reproduced: fresh heap
 blocks overwritten + abort). Same class by design: `submit_value_on` / `Download::submit`
@@ -519,6 +519,8 @@ CI job stays deferred until a suitable pocl is easy to install.
 
 | Commit | What |
 |---|---|
+| `1ad3202` `d967980` `d907c2b` | CB fallback replays the recorded commands (no re-run → no `PipeDrained`/hang); a driver rejection disables CBs per context; NULL recording queue (spec; found via rusticl+cmdbufemu). |
+| `7b2f386` `3a4c6fe` `04c8968` | Non-blocking terminals: `Pending`/`DeviceResident` (no use-after-free), undelivered outputs gate completion, left-nested chains batch into CBs. |
 | `02777ad` `b94809c` | `Pipe` is not `Clone` (a handle pipe moves into the one op that drains it; duplicating it is a compile error); dedicated `Error::PipeDrained`. |
 | `94e37b3` `fbe385d` | `graph!`: sequential composition as straight-line `let` bindings; llama2 attention/ffn and gray-scott meta-kernels rewritten with it. |
 | `9eac837` | `examples/llama2`: a llama2.c model built at run time from a text spec, replayed once per token, greedy output byte-identical to `run.c`. |
