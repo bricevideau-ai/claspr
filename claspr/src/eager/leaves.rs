@@ -2969,14 +2969,12 @@ where
                     self.dst.pipe_cell_id(),
                     self.dst_pipe.cell_id(),
                 ));
-                // `record_cb(Some)` ALWAYS returns the type-converted output; the sync
-                // point is `Some` when the command recorded, `None` when the copy was
-                // ineligible (mixed cl_mem/SVM, or absent PFN) — in which case it has
-                // already called `builder.mark_ineligible()`, so the boundary will
-                // DISCARD this CB and re-run the whole span in Off. Either way we
-                // deposit the (lent) buffers with empty deps: on the eligible path the
-                // CB does the copy; on the discard path this deposit is thrown away and
-                // recomputed by the Off re-run. Ordering inside the CB is sync points.
+                // `record_cb(Some)` ALWAYS returns the type-converted output and the
+                // command's (virtual) sync point: the builder logs every command, and
+                // if the build can't become a command buffer (mixed cl_mem/SVM, absent
+                // PFN, a driver rejection) the boundary replays the log directly.
+                // Either way we deposit the (lent) buffers with empty deps — the CB or
+                // its replay does the copy, ordered inside by sync points.
                 let (out, sp) = src
                     .copy_to(dst)
                     .record_cb(Some(builder), &waits)
