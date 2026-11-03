@@ -502,6 +502,15 @@ CI job stays deferred until a suitable pocl is easy to install.
   intermittently under it, `--test-threads=1` is clean. Its first run found the
   non-NULL recording queue (we leaned on a pocl leniency) and the broken re-run
   fallback (now software replay, see ARCHITECTURE.md). Not in CI.
+- **rust-gpu fork: spirv-opt fallback is not crash-proof (2026-11-03)** — the
+  fork forks the full optimizer, then tries a system `spirv-opt`, then runs "safe
+  passes" IN-PROCESS. Those include CCP, which asserts on a 64-bit `OpSwitch`
+  (bundled spirv-tools v0.13), so a user `match` on `usize` aborts rustc on any
+  machine without a recent system `spirv-opt` (CI's ubuntu runner). claspr's own
+  trigger (`Shape::extent`) is branch-free now (`afcc053`). Root fix belongs in the
+  fork: fork the safe passes too and pass through unoptimized on a crash (the
+  doc comment already promises that step), and/or lower 64-bit switches. To
+  reproduce CI locally, put a failing `spirv-opt` stub first on PATH.
 - **Image dispatch is family-level, not format-level** — the macro derives
   dim/arrayed/family/access from `Image!(...)` and bounds the launcher generic, but the
   concrete channel format isn't part of the bound (Kernel-target SPIR-V carries only the
