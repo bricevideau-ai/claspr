@@ -382,6 +382,39 @@ pub fn complete_user_event(event: &Event, status: cl_int) -> Result<()> {
 
 // ── Keep-alive callback FFI shim ────────────────────────────────────
 
+/// Keep `value` alive until `event` completes, then drop it — on a reaper
+/// thread, not the OpenCL callback thread: a drop may wait on events or call
+/// OpenCL (rehome a buffer, free SVM), which a callback must not.
+pub(crate) fn drop_after<T: Send + 'static>(event: &Event, value: T) -> Result<()> {
+    register_drop_callback(event, Box::new(ToReaper(Some(Box::new(value)))))
+}
+
+/// Hands its payload to the reaper thread when dropped (from the callback).
+struct ToReaper(Option<Box<dyn Send>>);
+
+impl Drop for ToReaper {
+    fn drop(&mut self) {
+        if let Some(payload) = self.0.take() {
+            // If the reaper is gone (process teardown), the payload drops here.
+            let _ = reaper().lock().map(|tx| tx.send(payload));
+        }
+    }
+}
+
+/// The lazily started reaper: drops whatever it is sent, in order.
+fn reaper() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Box<dyn Send>>> {
+    static REAPER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Box<dyn Send>>>> =
+        std::sync::OnceLock::new();
+    REAPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn Send>>();
+        std::thread::Builder::new()
+            .name("claspr-reaper".into())
+            .spawn(move || rx.into_iter().for_each(drop))
+            .expect("spawn the claspr reaper thread");
+        std::sync::Mutex::new(tx)
+    })
+}
+
 /// Register a `CL_COMPLETE` callback on `event` whose sole job is to
 /// drop `holder` when the event fires.
 ///

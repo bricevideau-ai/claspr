@@ -725,13 +725,14 @@ impl<D: HostRead> DownloadOp<D> {
         self.sync(&ctx).map(Checkout::into_inner)
     }
 
-    /// Concrete-head non-blocking terminal returning the (not-yet-valid) host
-    /// `Vec` plus a completion [`Event`](crate::Event) — mirrors the Tier-1
-    /// `(Output, Event)` submit contract.
-    pub fn submit(self) -> Result<(Vec<D::Elem>, crate::Event)> {
+    /// Concrete-head non-blocking terminal: the host `Vec` as a
+    /// [`Pending`](crate::Pending) — [`wait`](crate::Pending::wait) yields it
+    /// once the read completes (dropping the guard waits too), so the `Vec` is
+    /// never read, grown or freed while the device is still filling it.
+    pub fn submit(self) -> Result<crate::Pending<'static, Vec<D::Elem>>> {
         let ctx = concrete_value_ctx(&self.buf, D::__claspr_ctx)?;
         let queue = ctx.default_outoforder_queue(ctx.device())?;
-        self.submit_value_on(&*queue)
+        self.submit_pending_on(&*queue)
     }
 }
 
@@ -835,7 +836,7 @@ where
     }
 }
 
-impl<T, M> ReadInto<'_, T, M>
+impl<'d, T, M> ReadInto<'d, T, M>
 where
     T: Send + 'static,
     M: MemMode + HostReadable + Send + 'static,
@@ -848,12 +849,14 @@ where
     }
 
     /// Concrete-head non-blocking terminal: enqueue the read on the buffer's own
-    /// context default queue and return a completion [`Event`](crate::Event).
-    /// (The `dst` slice must outlive the event.)
-    pub fn submit(self) -> Result<crate::Event> {
+    /// context default queue; the buffer comes back as a
+    /// [`Pending`](crate::Pending) that keeps `dst` borrowed until the read
+    /// completes ([`wait`](crate::Pending::wait), or drop, waits) — so `dst` can't
+    /// be read or freed while the device is still writing it.
+    pub fn submit(self) -> Result<crate::Pending<'d, DeviceSlice<T, M>>> {
         let ctx = concrete_buf_ctx(&self.buf)?;
         let queue = ctx.default_outoforder_queue(ctx.device())?;
-        self.submit_on(&*queue)
+        self.submit_pending_on(&*queue)
     }
 }
 
@@ -1475,7 +1478,7 @@ where
 /// one (its view, from row-major dense data of the view's length — one
 /// `clEnqueueWriteBufferRect`; a view with no rect copy is
 /// [`Error::NotSupported`]). The methods are the leaf's plumbing, not API.
-pub trait HostWrite: Send + 'static {
+pub trait HostWrite: crate::DeviceResident + Send + 'static {
     /// The element type of the host data.
     type Elem: Send + Sync + 'static;
     #[doc(hidden)]

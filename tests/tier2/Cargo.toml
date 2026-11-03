@@ -23,6 +23,9 @@ claspr-test-support = { path = "../support", features = ["ui-test"] }
 futures = { version = "0.3", default-features = false, features = ["executor", "std"] }
 # Write-only IMAGE kernel for the home-invariant no-seed scenario (scenario 4).
 claspr-test-image-kernels = { path = "../image-kernels" }
+# Raw event plumbing (retain a user event, CL_COMPLETE) for the
+# discarded-outputs terminal test.
+opencl3 = { workspace = true }
 
 # `ui_test` requires harness = false so its `fn main()` runs instead of cargo
 # looking for `#[test]`s. Mirrors `tests/tier1`'s `image_compile_fail`.

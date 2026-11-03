@@ -92,6 +92,7 @@ pub mod eager;
 pub mod exec_ctx;
 pub mod host_view;
 pub mod mappable;
+pub mod pending;
 pub mod record;
 pub mod tensor;
 mod tier2_macros;
@@ -134,6 +135,7 @@ pub use op::{
     LaunchOp, ProfileCb, ProfilingInfo, assert_same_context, complete_user_event,
     create_user_event, register_drop_callback, register_profiling_callback,
 };
+pub use pending::{DeviceResident, Pending};
 pub use ppm::write_ppm_rgba8;
 pub use queue::{InOrder, Launcher, OutOfOrder, Queue, QueueOrder};
 pub use tensor::{

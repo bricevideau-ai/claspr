@@ -127,7 +127,7 @@ fn image2d_read_length_mismatch_errors() {
 /// `image.write(...).submit()?` enqueues the write
 /// non-blocking and returns an `Event`. Waiting on the event
 /// surfaces completion; the data must be live until then (here,
-/// `pixels` outlives the event).
+/// `pixels` stays borrowed until the write completes).
 #[test]
 fn image2d_write_submit_returns_event() {
     let Some(ctx) = ctx_with_images() else { return };
@@ -136,9 +136,14 @@ fn image2d_write_submit_returns_event() {
 
     let img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
     let pixels: Vec<u32> = (1..=(W * H)).collect();
-    // Non-blocking submit returns the (rebindable) image plus the write event.
-    let (img, event) = img.write(&pixels).submit().expect("submit write");
-    event.wait().expect("wait write");
+    // Non-blocking submit returns the image as a `Pending` that keeps `pixels`
+    // borrowed until the write has read it; `wait` hands the image back.
+    let img = img
+        .write(&pixels)
+        .submit()
+        .expect("submit write")
+        .wait()
+        .expect("wait write");
 
     let got: Vec<u32> = img.read_alloc().wait().expect("read");
     assert_eq!(got, pixels);
@@ -159,9 +164,10 @@ fn image2d_read_submit_returns_event() {
     let mut got = vec![0u32; (W as usize) * (H as usize)];
     {
         let op = img.read(&mut got);
-        // Non-blocking submit returns the (rebindable) image plus the read event.
-        let (_img, event) = op.submit().expect("submit read");
-        event.wait().expect("wait read");
+        // Non-blocking submit returns the image as a `Pending` that keeps `got`
+        // borrowed until the read has filled it.
+        let pending = op.submit().expect("submit read");
+        let _img = pending.wait().expect("wait read");
     }
     assert_eq!(got, pixels);
 }
@@ -198,10 +204,14 @@ fn image2d_write_after_event() {
     let img = Image2D::<ReadWrite, R32Uint>::alloc(&ctx, W, H).expect("alloc");
 
     let first: Vec<u32> = vec![1u32; (W as usize) * (H as usize)];
-    // Non-blocking first write; wait on its event before the second so the
-    // ordering is explicit (mirrors the former `.after(&ev)`).
-    let (img, ev) = img.write(&first).submit().expect("first write");
-    ev.wait().expect("wait first write");
+    // Non-blocking first write; wait for it before the second so the ordering is
+    // explicit (mirrors the former `.after(&ev)`).
+    let img = img
+        .write(&first)
+        .submit()
+        .expect("first write")
+        .wait()
+        .expect("wait first write");
 
     let second: Vec<u32> = vec![2u32; (W as usize) * (H as usize)];
     let img = img.write(&second).wait().expect("second write after first");

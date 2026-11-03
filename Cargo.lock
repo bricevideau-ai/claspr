@@ -387,6 +387,7 @@ dependencies = [
  "claspr-test-kernels",
  "claspr-test-support",
  "futures",
+ "opencl3",
 ]
 
 [[package]]

@@ -643,7 +643,7 @@ pub(crate) fn fill_image_enqueue<L: Launcher + ?Sized>(
 /// signatures only as a bound (the methods consume an image whose concrete type
 /// already implements it). It is not part of the stable API and should not be
 /// implemented for foreign types.
-pub trait ImageEnqueue: Send + 'static {
+pub trait ImageEnqueue: crate::DeviceResident + Send + 'static {
     /// Shared borrow of the underlying image (read / copy-src).
     fn image_ref(&self) -> &Image;
     /// Exclusive borrow of the underlying image (write / fill / copy-dst).
@@ -837,7 +837,7 @@ impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
     }
 }
 
-impl<I: ImageEnqueue, E: Send + Sync> ImageWrite<'_, I, E> {
+impl<'a, I: ImageEnqueue, E: Send + Sync> ImageWrite<'a, I, E> {
     /// Concrete-head blocking terminal: write on the image's own context default
     /// queue and return the image for reuse.
     pub fn wait(self) -> Result<I> {
@@ -845,12 +845,13 @@ impl<I: ImageEnqueue, E: Send + Sync> ImageWrite<'_, I, E> {
         self.sync(&ctx).map(Checkout::into_inner)
     }
 
-    /// Concrete-head non-blocking terminal returning the image plus a completion
-    /// [`Event`]. (The host slice must outlive the event.)
-    pub fn submit(self) -> Result<(I, crate::Event)> {
+    /// Concrete-head non-blocking terminal: the image as a [`crate::Pending`]
+    /// that keeps the host slice borrowed until the write has read it
+    /// ([`wait`](crate::Pending::wait), or drop, waits).
+    pub fn submit(self) -> Result<crate::Pending<'a, I>> {
         let ctx = concrete_image_ctx(&self.img)?;
         let queue = ctx.default_outoforder_queue(ctx.device())?;
-        self.submit_value_on(&*queue)
+        self.submit_pending_on(&*queue)
     }
 }
 
@@ -959,7 +960,7 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
     }
 }
 
-impl<I: ImageEnqueue, E: Send> ImageRead<'_, I, E> {
+impl<'a, I: ImageEnqueue, E: Send> ImageRead<'a, I, E> {
     /// Concrete-head blocking terminal: read into the caller slice on the image's
     /// own context default queue; return the image for reuse.
     pub fn wait(self) -> Result<I> {
@@ -967,12 +968,13 @@ impl<I: ImageEnqueue, E: Send> ImageRead<'_, I, E> {
         self.sync(&ctx).map(Checkout::into_inner)
     }
 
-    /// Concrete-head non-blocking terminal returning the image plus a completion
-    /// [`Event`]. (The `dst` slice must outlive the event.)
-    pub fn submit(self) -> Result<(I, crate::Event)> {
+    /// Concrete-head non-blocking terminal: the image as a [`crate::Pending`]
+    /// that keeps `dst` borrowed until the read has filled it
+    /// ([`wait`](crate::Pending::wait), or drop, waits).
+    pub fn submit(self) -> Result<crate::Pending<'a, I>> {
         let ctx = concrete_image_ctx(&self.img)?;
         let queue = ctx.default_outoforder_queue(ctx.device())?;
-        self.submit_value_on(&*queue)
+        self.submit_pending_on(&*queue)
     }
 }
 

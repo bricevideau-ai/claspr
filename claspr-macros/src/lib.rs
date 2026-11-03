@@ -2453,7 +2453,10 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
             /// return `(Output, Event)`.
             pub fn submit(
                 self,
-            ) -> ::claspr::Result<(#output_ty, ::claspr::Event)> {
+            ) -> ::claspr::Result<(#output_ty, ::claspr::Event)>
+            where
+                #output_ty: ::claspr::DeviceResident,
+            {
                 let ctx = ::core::clone::Clone::clone(&self.ctx);
                 self.submit_on(&ctx)
             }
@@ -2474,6 +2477,7 @@ fn emit_kernel_launch(func: &ItemFn, args: &AttrArgs, parts: KernelParts) -> Tok
             ) -> ::claspr::Result<(#output_ty, ::claspr::Event)>
             where
                 L: ::claspr::Launcher,
+                #output_ty: ::claspr::DeviceResident,
             {
                 // The kernel Op is a `DeviceOp`; `submit_value_on` runs its
                 // single enqueue on the launcher's queue and returns the

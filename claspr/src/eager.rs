@@ -2950,45 +2950,59 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// Non-blocking terminal — enqueue the whole graph on `launcher`'s queue and
     /// return a single completion [`Event`](crate::Event) (a marker over every
     /// command the graph produced) WITHOUT waiting. The caller can `.wait()` the
-    /// event or thread it into other Tier-1 ordering. The graph's `Output` value
-    /// is materialised here (handles/Vecs); the event just gates *when* the
-    /// device work is done. Tier-1 heritage spelling; `submit` is the
-    /// concrete-head no-launcher form (see the buffer ops).
+    /// event or thread it into other Tier-1 ordering. The graph and its output
+    /// are kept alive until the event completes (then dropped on claspr's
+    /// reaper thread) — a downloaded `Vec` the device is still filling is never
+    /// freed under it. Tier-1 heritage spelling; `submit` is the concrete-head
+    /// no-launcher form (see the buffer ops). To get the output back, use
+    /// [`submit_pending_on`](Self::submit_pending_on).
     ///
     /// ≈ cuda-oxide's `unsafe async_on`, but safe here and event-returning
     /// (you get a completion [`Event`](crate::Event) to chain, not a raw stream).
-    fn submit_on<L: crate::Launcher + ?Sized>(self, launcher: &L) -> Result<crate::Event> {
-        use crate::Launcher;
-        // Atomicity pre-pass: validate all inputs before any enqueue, mirroring wait_on.
-        self.check_ready()?;
-        let device = launcher.context().device().clone();
-        let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
-        // Gather non-blocking (Pipelined); a host-seam setup error surfaces here.
-        let (_output, deps) = self.collect(&ec, ExecMode::Pipelined)?;
-        let wait_list = deps_to_wait_list(&deps);
-        // SAFETY: the cl_events are held alive by `deps` across this call.
-        let marker = unsafe { ec.cl_queue().enqueue_marker_with_wait_list(&wait_list) }
-            .map_err(Error::OpenCl)?;
+    fn submit_on<L: crate::Launcher + ?Sized>(self, launcher: &L) -> Result<crate::Event>
+    where
+        Self: 'static,
+    {
+        let (output, marker) = submit_collect(&self, launcher)?;
+        crate::op::drop_after(&marker, (self, output))?;
         Ok(marker)
     }
 
     /// Non-blocking terminal returning BOTH the output value AND a single
     /// completion event — the Tier-1 `(Output, Event)` contract used by the
-    /// kernel-op `submit`/`submit_on`. Runs `collect(Pipelined)` on `launcher`'s
-    /// queue, then reduces the op's deps to one chainable marker event. (The
-    /// plain [`submit_on`](Self::submit_on) drops the value; this keeps it so the
-    /// caller can keep using the buffers and chain via `.after(event)`.)
+    /// kernel-op `submit`/`submit_on`. Only for a [`DeviceResident`](crate::DeviceResident)
+    /// output (buffers, images, device scalars, tensors — the host can't touch
+    /// their storage directly), which the caller keeps using and orders after
+    /// the event (`.after(event)`). A host value the device is still filling (a
+    /// downloaded `Vec`) comes back through [`submit_pending_on`](Self::submit_pending_on)
+    /// instead. The graph itself is kept alive until the event completes.
     fn submit_value_on<L: crate::Launcher + ?Sized>(
         self,
         launcher: &L,
-    ) -> Result<(Self::Output, crate::Event)> {
-        // Atomicity pre-pass: validate all inputs before any enqueue, mirroring wait_on.
-        self.check_ready()?;
-        let device = launcher.context().device().clone();
-        let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
-        let (output, deps) = self.collect(&ec, ExecMode::Pipelined)?;
-        let event = deps_into_single_event(&ec, deps)?;
+    ) -> Result<(Self::Output, crate::Event)>
+    where
+        Self: 'static,
+        Self::Output: crate::DeviceResident,
+    {
+        let (output, event) = submit_collect(&self, launcher)?;
+        crate::op::drop_after(&event, self)?;
         Ok((output, event))
+    }
+
+    /// Non-blocking terminal returning the output as a [`Pending`](crate::Pending):
+    /// [`wait`](crate::Pending::wait) yields it once the work completes, and
+    /// dropping it waits too — sound for ANY output, including host memory the
+    /// device is still writing (`download(..).submit_pending_on(&queue)`) and
+    /// graphs that borrow caller memory (the guard keeps it borrowed).
+    fn submit_pending_on<'a, L: crate::Launcher + ?Sized>(
+        self,
+        launcher: &L,
+    ) -> Result<crate::Pending<'a, Self::Output>>
+    where
+        Self: 'a,
+    {
+        let (output, event) = submit_collect(&self, launcher)?;
+        Ok(crate::Pending::new(output, event, Some(Box::new(self))))
     }
 
     /// Async terminal — run `self` on `context` and return a future that
@@ -3052,6 +3066,22 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     }
 }
 impl<T: DeviceOp> DeviceOpExt for T {}
+
+/// The non-blocking terminals' shared gather: validate, `collect` pipelined on
+/// `launcher`'s queue, and reduce the deps to one completion event.
+fn submit_collect<O: DeviceOp + ?Sized, L: crate::Launcher + ?Sized>(
+    op: &O,
+    launcher: &L,
+) -> Result<(O::Output, crate::Event)> {
+    // Atomicity pre-pass: validate all inputs before any enqueue, mirroring wait_on.
+    op.check_ready()?;
+    let device = launcher.context().device().clone();
+    let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
+    // Gather non-blocking (Pipelined); a host-seam setup error surfaces here.
+    let (output, deps) = op.collect(&ec, ExecMode::Pipelined)?;
+    let event = deps_into_single_event(&ec, deps)?;
+    Ok((output, event))
+}
 
 // ── BindAll: fill a tuple of slots in one call (`g.call((A(a), B(b)))`) ──────
 

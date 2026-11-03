@@ -140,6 +140,19 @@ rusticl fine). llama2 `att_scores` / `att_mix` use it (drop `seq_len` / `head_si
 `kv_dim` / `kv_mul`; 2-D grids; `q` / caches / `att` allocated as `Tensor`s): output
 identical, perf neutral. The general `scalar_arg!` gap remains. Not yet: Halo as
 sugar over Tensor (reach), staggered/asymmetric reach, component axes for miniweather.
+**Non-blocking terminals — use-after-free fixed (2026-11-03, branch `graph-terminals`):**
+`DeviceOpExt::submit_on` dropped the graph's output on return — a downloaded `Vec`
+a held/slow read was still filling → device wrote freed heap (reproduced: fresh heap
+blocks overwritten + abort). Same class by design: `submit_value_on` / `Download::submit`
+returned a not-yet-valid `Vec`; `ReadInto` / `ImageRead` / `ImageWrite::submit`
+released the borrowed slice early. Fix: `submit_on` / `submit_value_on` keep the graph
+(and output) alive until the event (`op::drop_after` → reaper thread, not the CL
+callback); `submit_value_on` (and kernel `submit`) require a sealed `DeviceResident`
+output; host-memory / borrowing ops return `Pending<'a, T>` (`wait`, drop waits;
+`'a` keeps caller slices borrowed); new `submit_pending_on` for any graph. Open:
+`USMSlice` is in `DeviceResident` (its drop waits) but host deref while a kernel runs
+is still a race; discarded-output deps + orphan threading (step 2); left-nesting CB
+segmentation (step 3).
 **Named handles — DECLINED (2026-10-29):** `Written` already matches OUTPUTS by name
 inside the kernel, so the positional handle is no worse than before; and the real
 user difficulty is telling which params are PIPED (every buffer-like param —
