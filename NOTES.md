@@ -460,7 +460,7 @@ maintainer would rather move the implementation to the v1.0 command-buffer spec
 pocl/pocl#2314 (open). So stock pocl still has the race — one more reason the pocl
 CI job stays deferred until a suitable pocl is easy to install.
 
-### rusticl (Mesa 26.2.5) driver bugs that show up in CI — reported, do not gate
+### rusticl (Mesa 26.2.5, still in 26.2.6) driver bugs that show up in CI — reported, do not gate
 
 - **mesa#16714** — llvmpipe SIGSEGVs JIT-compiling any kernel that calls `fma()` on
   `double` (miniweather's f64 kernels). CI runs miniweather with fp64 hidden on that
@@ -470,6 +470,10 @@ CI job stays deferred until a suitable pocl is easy to install.
   one cross-queue sync. Surfaces as a ~15% flake of `tier1 cross_queue::
   after_all_orders_launch_after_multiple_cross_queue_events`; reproduced on x86-64 and
   aarch64.
+- Re-checked on kisak Mesa 26.2.6 (2026-11-03): both still reproduce with the
+  standalone C repros (`~/scratch/rusticl-fp64-repro`, 3/3 runs crash;
+  `~/scratch/rusticl-two-queue-repro`, 11/30 runs crash with the shader cache off,
+  5/30 with it on).
 
 ### Other driver quirks and coverage gaps
 
@@ -494,14 +498,13 @@ CI job stays deferred until a suitable pocl is easy to install.
   been silently "passing" as skips.
 
 - **Second CB implementation: rusticl + cmdbufemu (local only, 2026-11-03)** — Ben
-  Ashbaugh's command-buffer emulation layer (`~/scratch/cmdbufemu`) loads only
-  through the Khronos ICD loader it builds (`LD_LIBRARY_PATH=<build>/external/opencl-icd-loader
-  OPENCL_LAYERS=<build>/layers/10_cmdbufemu/libCmdBufEmu.so` + the rusticl env);
-  the system ocl-icd 2.3.4 ignored `OPENCL_LAYERS` (the user is updating ocl-icd —
-  re-check). The layer is not thread-safe: gray-scott's concurrent tests crash
-  intermittently under it, `--test-threads=1` is clean. Its first run found the
-  non-NULL recording queue (we leaned on a pocl leniency) and the broken re-run
-  fallback (now software replay, see ARCHITECTURE.md). Not in CI.
+  Ashbaugh's command-buffer emulation layer (`~/scratch/cmdbufemu`). With ocl-icd
+  2.3.5 just add `OPENCL_LAYERS=<build>/layers/10_cmdbufemu/libCmdBufEmu.so` to the
+  rusticl env (2.3.4 ignored it; the Khronos loader the layer builds also works).
+  The layer is not thread-safe: gray-scott's concurrent tests crash intermittently
+  under it, `--test-threads=1` is clean. Its first run found the non-NULL recording
+  queue (we leaned on a pocl leniency) and the broken re-run fallback (now software
+  replay, see ARCHITECTURE.md). Not in CI.
 - **rust-gpu fork: spirv-opt fallback is not crash-proof (2026-11-03)** — the
   fork forks the full optimizer, then tries a system `spirv-opt`, then runs "safe
   passes" IN-PROCESS. Those include CCP, which asserts on a 64-bit `OpSwitch`
