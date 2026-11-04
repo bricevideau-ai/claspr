@@ -467,7 +467,11 @@ replays clean), 0.9.7 queue semantics, implicit in-order deps at record time (ne
 `test_command_buffer_in_order`). OpenCL-CTS command-buffer suite 95/102 (rest
 pre-existing: DEVICE_SIDE_SYNC, completion event type, mutable_handle checks);
 pocl ctest clean except 2 pre-existing remote failures; claspr 606/606 on it.
-Next: PR upstream (awaiting approval), then a pocl CI job once it's installable.
+Opened as **pocl/pocl#2427** (2026-11-04). Follow-ups pushed to the fork, stacked
+on it, PRs to open after it lands: `cmdbuf-mutable-handle-only-ndrange`,
+`cmdbuf-event-command-type`, `cmdbuf-device-side-sync` (CTS 102/102 combined).
+Filed along the way: KhronosGroup/OpenCL-CTS#2872, KhronosGroup/OpenCL-Docs#1643.
+Then: a pocl CI job for claspr once a release ships it (conda-forge?).
 
 ### rusticl (Mesa 26.2.5, still in 26.2.6) driver bugs that show up in CI — reported, do not gate
 
