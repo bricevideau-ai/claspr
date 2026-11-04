@@ -460,6 +460,15 @@ maintainer would rather move the implementation to the v1.0 command-buffer spec
 pocl/pocl#2314 (open). So stock pocl still has the race — one more reason the pocl
 CI job stays deferred until a suitable pocl is easy to install.
 
+**1.0 update in progress (2026-11-04):** pocl branch `cmdbuf-v1.0` (commit
+`ce3460c7c`, local, not pushed) implements base 1.0.0 / multi_device 0.9.2 /
+mutable_dispatch 0.9.4 per #2314: no pending state (race gone: old repro 5×20000
+replays clean), 0.9.7 queue semantics, implicit in-order deps at record time (new
+`test_command_buffer_in_order`). OpenCL-CTS command-buffer suite 95/102 (rest
+pre-existing: DEVICE_SIDE_SYNC, completion event type, mutable_handle checks);
+pocl ctest clean except 2 pre-existing remote failures; claspr 606/606 on it.
+Next: PR upstream (awaiting approval), then a pocl CI job once it's installable.
+
 ### rusticl (Mesa 26.2.5, still in 26.2.6) driver bugs that show up in CI — reported, do not gate
 
 - **mesa#16714** — llvmpipe SIGSEGVs JIT-compiling any kernel that calls `fma()` on
