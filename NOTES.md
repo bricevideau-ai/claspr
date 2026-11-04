@@ -475,6 +475,12 @@ CI job stays deferred until a suitable pocl is easy to install.
   standalone C repros (`~/scratch/rusticl-fp64-repro`, 3/3 runs crash;
   `~/scratch/rusticl-two-queue-repro`, 11/30 runs crash with the shader cache off,
   5/30 with it on).
+- **mesa#16723 fix candidate validated locally (2026-11-04):** MR 45919 ("llvmpipe:
+  Track global bindings per context", Cc mesa-stable) rebuilt into the kisak 26.2.6
+  debs (`26.2.6~kisak1~r+mesa16723`, source + patch in `~/scratch/mesa-deb`). Repro
+  0/160 runs (was 16/60), tier1 `cross_queue` 0/50, workspace suite otherwise
+  unchanged (602 pass; miniweather = mesa#16714). Once it ships in kisak, CI's
+  `cross_queue` flake should stop by itself.
 
 ### Other driver quirks and coverage gaps
 
