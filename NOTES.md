@@ -408,6 +408,46 @@ trigger:** a user wants one of those.
 
 ## Concerns
 
+### OpenCode review (2026-11-05): safety hardening before API expansion
+
+Assessment: compelling experimental compute framework, with genuine substance in
+single-source Rust kernels, typed launches and reusable device graphs, but not yet
+production-ready. Strengths: separate runtime/build/macro crates (runtime consumers
+avoid the compiler backend), realistic examples (gray-scott, CG, miniweather,
+llama2), explicit ownership/access/dependency models, compile-fail coverage,
+deterministic user-event tests, atomicity tests and CB failure injection.
+
+Open findings below are from source review, NOT reproduced corruption exploits:
+
+1. **Async download cancellation can free the DMA destination early.**
+   `eager/combinators.rs:2821,3057`: `DeviceChainFuture::Running` owns the output,
+   but `drop_after` keeps only the graph alive. Dropping the future frees the Vec;
+   public variant fields also allow early extraction. Keep output alive until
+   completion independently of polling; make state private; test gated cancellation.
+2. **Borrowed async transfers rely on Drop for safety.** `eager/leaves.rs:851`
+   and `pending.rs:65`: safe `mem::forget(Pending)` ends the borrow without waiting,
+   permitting destination access/free while OpenCL writes. Use owned destinations,
+   genuinely scoped completion, or an unsafe borrowing contract; cover forgetting.
+3. **Safe public initialization bypass.** `launch.rs:343,388`:
+   `KernelSliceWriteArg::__claspr_into_init()` calls `assume_init()` without a
+   launch/proof, including mapped/USM allocations. `#[doc(hidden)]` is not privacy.
+   Require an unsafe contract or unforgeable internal proof; add compile-fail tests.
+4. **Image fill accepts undersized/wrong-family colors.** `image.rs:362,1302`:
+   generic `[T; 4]` permits `[u8; 4]`, but OpenCL reads four 32-bit components.
+   Derive `[f32; 4]`, `[i32; 4]` or `[u32; 4]` from the format; reject others.
+5. **Tensor injectivity check accepts overlapping writable layouts.**
+   `tensor.rs:179`: extents `[2,2,2]`, strides `[2,3,5]` pass, yet `[1,1,0]` and
+   `[0,0,1]` both address 5. Accumulate the full span instead of replacing it;
+   add this regression and enumerate accepted layouts in property tests.
+
+Priority: consolidate safe/unsafe contracts before more features. Graph ownership,
+slots, checkouts, host seams and CB replay form a substantial invariant surface.
+A driver matrix would strengthen confidence beyond rusticl/llvmpipe CI (existing
+PoCL/driver blockers below still apply). Verification:
+`cargo test -p claspr --lib --locked` passed 14/14; no full workspace integration
+run or performance benchmarks. Review itself changed no source code.
+Prune these findings as fixes land.
+
 ### Where per-sync time actually goes (profiled 2026-09-08) — NOT the walk
 
 Closes the deferred "should we skip the LendOnly walk on a cache hit?" question
