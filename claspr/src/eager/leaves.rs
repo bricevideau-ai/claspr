@@ -811,10 +811,12 @@ where
                 let (buf, home) = guard.disarm();
                 self.out.put_home(buf, Deps::new(), home);
             }
-            // Pipelined: non-blocking; the event gates `dst` being valid.
+            // Pipelined: non-blocking; the event gates `dst` being valid, and
+            // the terminal waits on it before the borrow of `dst` can end.
             ExecMode::Pipelined => {
                 let event =
                     crate::buffer::read_buffer_enqueue(guard.value(), ec, &mut dst, false, &raw)?;
+                ec.note_host_transfer(&event)?;
                 let (buf, home) = guard.disarm();
                 self.out.put_home(buf, single_dep(event), home);
             }
@@ -848,11 +850,9 @@ where
         self.sync(&ctx).map(Checkout::into_inner)
     }
 
-    /// Concrete-head non-blocking terminal: enqueue the read on the buffer's own
-    /// context default queue; the buffer comes back as a
-    /// [`Pending`](crate::Pending) that keeps `dst` borrowed until the read
-    /// completes ([`wait`](crate::Pending::wait), or drop, waits) — so `dst` can't
-    /// be read or freed while the device is still writing it.
+    /// Concrete-head terminal on the buffer's own context default queue: returns
+    /// once the read into `dst` is complete (it borrows caller memory), with the
+    /// buffer as a [`Pending`](crate::Pending).
     pub fn submit(self) -> Result<crate::Pending<'d, DeviceSlice<T, M>>> {
         let ctx = concrete_buf_ctx(&self.buf)?;
         let queue = ctx.default_outoforder_queue(ctx.device())?;

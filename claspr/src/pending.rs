@@ -2,13 +2,15 @@
 //! them.
 //!
 //! A non-blocking terminal (`submit` / `submit_on` / `submit_value_on`) returns
-//! as soon as the work is enqueued. Whatever host memory that work still reads
-//! or writes — a downloaded `Vec`, a caller's slice — must stay alive and
-//! untouched until it completes. Two ways keep that sound:
+//! as soon as the work is enqueued — except for transfers that read or write a
+//! caller's slice (`read_into`, image `read`/`write`), which are complete when
+//! it returns, so the slice is free to use (or drop) as soon as the borrow ends,
+//! even if the returned guard is leaked. Host memory the work owns (a downloaded
+//! `Vec`) must stay alive until the work completes. Two ways keep that sound:
 //!
-//! - [`Pending`]: the value (and anything the transfer borrows) comes back only
-//!   through [`wait`](Pending::wait); dropping the guard waits too, so the memory
-//!   can never be freed or read while the device still uses it.
+//! - [`Pending`]: the value comes back only through [`wait`](Pending::wait);
+//!   dropping the guard waits too, so it can never be read or freed while the
+//!   device still writes it. Leaking the guard leaks the value, nothing worse.
 //! - [`DeviceResident`]: values whose storage the host can't touch directly
 //!   (buffers, images, device scalars, tensors, tiles — and tuples of them) may
 //!   be handed back right away with the completion event, Tier-1 style: the
@@ -16,12 +18,12 @@
 
 use std::marker::PhantomData;
 
-/// A value the device may still be writing (or a transfer still reading the
-/// host memory it borrows): [`wait`](Self::wait) for it. Dropping the guard
-/// without waiting blocks until the work completes, so no host memory the work
-/// uses is ever freed early. `'a` is the borrow of any caller memory involved
-/// (a slice read into / written from), which stays borrowed while the guard
-/// lives.
+/// A value the device may still be writing: [`wait`](Self::wait) for it.
+/// Dropping the guard without waiting blocks until the work completes, so no
+/// host memory the work owns is ever freed early. `'a` is the borrow of any
+/// caller memory the graph involved (a slice read into / written from); the
+/// transfers on it are already complete when the terminal returns, so safety
+/// never depends on the guard being dropped.
 #[must_use = "dropping a `Pending` blocks until the device work completes; call `wait`"]
 pub struct Pending<'a, T> {
     value: Option<T>,

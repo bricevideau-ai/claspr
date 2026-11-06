@@ -2184,6 +2184,7 @@ where
             parent.host_error_slot(),
             parent.start_dep(),
             parent.workers_handle(),
+            parent.host_transfers_handle(),
             parent.sp_edges_handle(),
             parent.cb_reach_handle(),
         );

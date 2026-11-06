@@ -821,6 +821,8 @@ impl<I: ImageEnqueue, E: Send + Sync> DeviceOp for ImageWrite<'_, I, E> {
                     false,
                     &raw,
                 )?;
+                // The terminal waits on it before the borrow of `data` can end.
+                ec.note_host_transfer(&event)?;
                 let (img, home) = guard.disarm();
                 self.out.put_home(img, single_dep(event), home);
             }
@@ -858,9 +860,8 @@ impl<'a, I: ImageEnqueue, E: Send + Sync> ImageWrite<'a, I, E> {
         self.sync(&ctx).map(Checkout::into_inner)
     }
 
-    /// Concrete-head non-blocking terminal: the image as a [`crate::Pending`]
-    /// that keeps the host slice borrowed until the write has read it
-    /// ([`wait`](crate::Pending::wait), or drop, waits).
+    /// Concrete-head terminal: returns once the write has read the host slice
+    /// (it borrows caller memory), with the image as a [`crate::Pending`].
     pub fn submit(self) -> Result<crate::Pending<'a, I>> {
         let ctx = concrete_image_ctx(&self.img)?;
         let queue = ctx.default_outoforder_queue(ctx.device())?;
@@ -944,6 +945,8 @@ impl<I: ImageEnqueue, E: Send> DeviceOp for ImageRead<'_, I, E> {
                     false,
                     &raw,
                 )?;
+                // The terminal waits on it before the borrow of `dst` can end.
+                ec.note_host_transfer(&event)?;
                 let (img, home) = img_guard.disarm();
                 self.out.put_home(img, single_dep(event), home);
             }
@@ -981,9 +984,8 @@ impl<'a, I: ImageEnqueue, E: Send> ImageRead<'a, I, E> {
         self.sync(&ctx).map(Checkout::into_inner)
     }
 
-    /// Concrete-head non-blocking terminal: the image as a [`crate::Pending`]
-    /// that keeps `dst` borrowed until the read has filled it
-    /// ([`wait`](crate::Pending::wait), or drop, waits).
+    /// Concrete-head terminal: returns once the read has filled `dst` (it
+    /// borrows caller memory), with the image as a [`crate::Pending`].
     pub fn submit(self) -> Result<crate::Pending<'a, I>> {
         let ctx = concrete_image_ctx(&self.img)?;
         let queue = ctx.default_outoforder_queue(ctx.device())?;

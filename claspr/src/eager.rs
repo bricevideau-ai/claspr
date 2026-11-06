@@ -2887,6 +2887,9 @@ pub trait DeviceOpExt: DeviceOp + Sized {
                 // signalled its user event negative; the blocking wait may return
                 // the cl_event cascade (`Error::OpenCl(-1)`). Prefer the stash.
                 Err(cascade) => {
+                    // Transfers on borrowed host memory enqueued before the
+                    // failure must finish before the caller gets the memory back.
+                    let _ = ec.wait_host_transfers();
                     // A FAILED run still deposited whatever ran before the failure
                     // (a bundle's other branch, an upstream stage) into pipes the
                     // aborted walk never drained; rehome it (after its device work)
@@ -2901,7 +2904,10 @@ pub trait DeviceOpExt: DeviceOp + Sized {
                     // re-lend finds it. The terminal's OWN output was already drained
                     // into `checkouts`, so this only touches intermediates.
                     self.reclaim_undelivered();
-                    wait_deps_reconcile(&deps, &ec, checkouts)
+                    let result = wait_deps_reconcile(&deps, &ec, checkouts);
+                    // Also covers a borrowed transfer whose output nothing consumed.
+                    let _ = ec.wait_host_transfers();
+                    result
                 }
             };
         }
@@ -2936,6 +2942,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
                 // the rich error if the seam stashed one. Reclaim AFTER the join (a
                 // worker may still deposit into a pipe), as on the fast path's
                 // error arm: what ran before the failure must not strand.
+                let _ = ec.wait_host_transfers();
                 ec.join_workers();
                 self.reclaim_undelivered();
                 return Err(ec.take_host_error().unwrap_or(setup_err));
@@ -2956,6 +2963,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
             }
         }
         drop(deps);
+        let _ = ec.wait_host_transfers();
         ec.join_workers();
         // Mop up undelivered intermediates (see the fast-path note) so a reused
         // graph re-arms its upstream cells — AFTER the join, so a host seam whose
@@ -3033,8 +3041,10 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// Non-blocking terminal returning the output as a [`Pending`](crate::Pending):
     /// [`wait`](crate::Pending::wait) yields it once the work completes, and
     /// dropping it waits too — sound for ANY output, including host memory the
-    /// device is still writing (`download(..).submit_pending_on(&queue)`) and
-    /// graphs that borrow caller memory (the guard keeps it borrowed).
+    /// device is still writing (`download(..).submit_pending_on(&queue)`). In a
+    /// graph that borrows caller memory, the transfers on it are waited on
+    /// before this returns (everything else stays asynchronous), so even a
+    /// leaked `Pending` can't let the device touch that memory afterwards.
     fn submit_pending_on<'a, L: crate::Launcher + ?Sized>(
         self,
         launcher: &L,
@@ -3120,7 +3130,12 @@ fn submit_collect<O: DeviceOp + ?Sized, L: crate::Launcher + ?Sized>(
     let device = launcher.context().device().clone();
     let ec = ExecutionContext::new(launcher.context(), device, launcher.cl_queue());
     // Gather non-blocking (Pipelined); a host-seam setup error surfaces here.
-    let (output, mut deps) = op.collect(&ec, ExecMode::Pipelined)?;
+    let collected = op.collect(&ec, ExecMode::Pipelined);
+    // Transfers on caller-borrowed host memory are done before we return,
+    // success or not: the borrow may end here, whatever happens to the result.
+    let host = ec.wait_host_transfers();
+    let (output, mut deps) = collected?;
+    host?;
     // Work whose output nothing consumed still gates completion.
     op.undelivered_deps(&mut deps);
     let event = deps_into_single_event(&ec, deps)?;

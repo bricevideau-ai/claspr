@@ -27,6 +27,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+/// See [`ExecutionContext`]'s `host_transfers`.
+type HostTransfers = Arc<Mutex<Vec<crate::Event>>>;
+
 /// The CB-internal marker edge-map (design v2): a producer inside a command
 /// buffer registers its output command's [`cl_sync_point_khr`]s under its output
 /// pipe's [`cell_id`](crate::Pipe::cell_id); a consumer inside the SAME CB looks
@@ -184,6 +187,12 @@ pub struct ExecutionContext<'ctx> {
     /// workers (via [`with_host_error_slot`](Self::with_host_error_slot)) are
     /// joined by the same terminal.
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// Events of the transfers that read or write caller-borrowed host memory
+    /// (`read_into`, image `read`/`write` from a slice), recorded when they are
+    /// enqueued non-blocking. A non-blocking terminal waits on them before
+    /// returning, so the borrow can end when it returns: no guard has to be
+    /// dropped (or not leaked) to keep the memory valid. Shared like `workers`.
+    host_transfers: HostTransfers,
     /// The **forwarded command buffer** for this walk position (design v2,
     /// CB-as-execution-mode). `Some` iff this op is currently INSIDE a command
     /// buffer being built — set by a CB-creating node for its children's
@@ -236,6 +245,7 @@ impl<'ctx> ExecutionContext<'ctx> {
             host_error: Arc::new(Mutex::new(None)),
             start: None,
             workers: Arc::new(Mutex::new(Vec::new())),
+            host_transfers: Arc::new(Mutex::new(Vec::new())),
             cb: CbWalk::Off,
             sp_edges: Arc::new(Mutex::new(HashMap::new())),
             cb_reach: Arc::new(Mutex::new(HashMap::new())),
@@ -261,6 +271,7 @@ impl<'ctx> ExecutionContext<'ctx> {
         host_error: Arc<Mutex<Option<Error>>>,
         start: Option<crate::cl_event>,
         workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+        host_transfers: HostTransfers,
         sp_edges: SyncPointEdges,
         cb_reach: CbReach,
     ) -> ExecutionContext<'a> {
@@ -271,6 +282,7 @@ impl<'ctx> ExecutionContext<'ctx> {
             host_error,
             start,
             workers,
+            host_transfers,
             // A routed sub-chain runs on a DIFFERENT queue, so it cannot share the
             // parent's command buffer (a CB is single-queue). It opens its own CB
             // if eligible; here it starts outside any CB.
@@ -313,6 +325,7 @@ impl<'ctx> ExecutionContext<'ctx> {
             host_error: Arc::clone(&self.host_error),
             start: self.start,
             workers: Arc::clone(&self.workers),
+            host_transfers: Arc::clone(&self.host_transfers),
             cb,
             sp_edges: Arc::new(Mutex::new(HashMap::new())),
             // SHARED across the CB boundary (unlike sp_edges): a slot threaded across
@@ -337,6 +350,7 @@ impl<'ctx> ExecutionContext<'ctx> {
             host_error: Arc::clone(&self.host_error),
             start: self.start,
             workers: Arc::clone(&self.workers),
+            host_transfers: Arc::clone(&self.host_transfers),
             cb: self.cb,
             sp_edges: Arc::clone(&self.sp_edges),
             cb_reach: Arc::clone(&self.cb_reach),
@@ -418,6 +432,41 @@ impl<'ctx> ExecutionContext<'ctx> {
     /// same terminal that owns the parent EC.
     pub(crate) fn workers_handle(&self) -> Arc<Mutex<Vec<JoinHandle<()>>>> {
         Arc::clone(&self.workers)
+    }
+
+    /// Cheap `Arc` clone of the borrowed-host-transfer list, for a routed
+    /// sub-chain's [`with_host_error_slot`](Self::with_host_error_slot).
+    pub(crate) fn host_transfers_handle(&self) -> HostTransfers {
+        Arc::clone(&self.host_transfers)
+    }
+
+    /// Record the event of a non-blocking transfer that reads or writes
+    /// caller-borrowed host memory (see `host_transfers`). If the event can't
+    /// be retained, wait for the transfer before returning the error.
+    pub(crate) fn note_host_transfer(&self, event: &crate::Event) -> Result<(), Error> {
+        // SAFETY: `event` is a live cl_event; the retained handle is released
+        // by the `Event` pushed below.
+        if let Err(code) = unsafe { opencl3::event::retain_event(event.get()) } {
+            let _ = event.wait();
+            return Err(Error::OpenCl(opencl3::error_codes::ClError(code)));
+        }
+        lock_unpoisoned(&self.host_transfers).push(crate::Event::new(event.get()));
+        Ok(())
+    }
+
+    /// Wait on every recorded borrowed-host transfer (all of them, even after
+    /// a failure) and return the first error.
+    pub(crate) fn wait_host_transfers(&self) -> Result<(), Error> {
+        let events = std::mem::take(&mut *lock_unpoisoned(&self.host_transfers));
+        let mut first = Ok(());
+        for event in &events {
+            if let Err(code) = event.wait()
+                && first.is_ok()
+            {
+                first = Err(Error::OpenCl(code));
+            }
+        }
+        first
     }
 
     /// Cheap `Arc` clone of the host-error slot for an `and_then_host`
