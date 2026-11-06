@@ -446,16 +446,15 @@ PoCL/driver blockers below still apply). Verification:
 run or performance benchmarks. Review itself changed no source code.
 Prune these findings as fixes land.
 
-### PoCL assertion in `eager_run_await` under load (2026-11-06, investigating)
+### PoCL assertion in `eager_run_await` under load — stale local PoCL, NOT claspr (2026-11-06)
 
-`await_propagates_chain_error` (host-seam closure `Err` cascading through a user
-event) aborts ~0.3% of runs with 8 parallel copies on the local PoCL debug build:
-`pocl_update_event_finished: Assertion '(event)->prev != NULL'` (once
-`cq->command_count > 0`) — an event finished twice. Never sequentially; rusticl
-clean. Stress bisect inconclusive (pre-`safety-hardening` 0/1680, `05e16b7` 2/720,
-`c08d0a4` 0/720, main 2/360). Either a PoCL error-cascade race or a claspr event
-over-release. Next: reproduce on the pocl `cmdbuf-v1.0` build (current PoCL main),
-then audit event refcounts on that path with the intercept layer.
+`await_propagates_chain_error` aborted ~0.3% of runs (8 parallel copies) with
+`pocl_update_event_finished: Assertion '(event)->prev != NULL'` — on the installed
+`~/.local` PoCL (Sep 4 build of `fix/cmdbuf-pending-race`, base 2026-09-02). Against
+current PoCL (`cmdbuf-v1.0` build = upstream main + the 1.0 change): **0/2880**
+(expected ~9). Likely fixed upstream by the Oct pthread scheduler changes
+(`f0e65a197`, `492b908ee`); not pinned further. Fix the env, not claspr: replace the
+installed PoCL with a current build.
 
 ### Where per-sync time actually goes (profiled 2026-09-08) — NOT the walk
 
