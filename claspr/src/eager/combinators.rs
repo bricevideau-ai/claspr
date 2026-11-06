@@ -2911,7 +2911,9 @@ impl<T: Send + Unpin + 'static> std::future::Future for DeviceChainFuture<T> {
                 // cl_event cascade, mirroring `sync`.
                 Poll::Ready(Err(e)) => {
                     // Marker done → all device work (and the seam's signals) are
-                    // settled; join workers before returning.
+                    // settled; join workers before returning. The output is
+                    // released now, so `Drop` never touches the resolved marker.
+                    drop(output.take());
                     join_chain_workers(workers);
                     Poll::Ready(Err(lock_unpoisoned(host_error).take().unwrap_or(e)))
                 }
@@ -2922,13 +2924,14 @@ impl<T: Send + Unpin + 'static> std::future::Future for DeviceChainFuture<T> {
                 // the chain genuinely failed). A non-empty slot is itself the
                 // failure signal. (Same handling as the old `ChainFuture`.)
                 Poll::Ready(Ok(())) => {
+                    let output = output
+                        .take()
+                        .expect("DeviceChainFuture polled after Ready (Running)");
                     join_chain_workers(workers);
                     if let Some(rust_err) = lock_unpoisoned(host_error).take() {
                         return Poll::Ready(Err(rust_err));
                     }
-                    Poll::Ready(Ok(output
-                        .take()
-                        .expect("DeviceChainFuture polled after Ready (Running)")))
+                    Poll::Ready(Ok(output))
                 }
             },
         }
