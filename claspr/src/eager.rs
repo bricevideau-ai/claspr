@@ -3012,7 +3012,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     where
         Self: 'static,
     {
-        let (output, marker) = submit_collect(&self, launcher)?;
+        let (output, marker) = submit_collect(&self, launcher, true)?;
         crate::op::drop_after(&marker, (self, output))?;
         Ok(marker)
     }
@@ -3033,7 +3033,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
         Self: 'static,
         Self::Output: crate::DeviceResident,
     {
-        let (output, event) = submit_collect(&self, launcher)?;
+        let (output, event) = submit_collect(&self, launcher, true)?;
         crate::op::drop_after(&event, self)?;
         Ok((output, event))
     }
@@ -3044,7 +3044,11 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// device is still writing (`download(..).submit_pending_on(&queue)`). In a
     /// graph that borrows caller memory, the transfers on it are waited on
     /// before this returns (everything else stays asynchronous), so even a
-    /// leaked `Pending` can't let the device touch that memory afterwards.
+    /// leaked `Pending` can't let the device touch that memory afterwards. It
+    /// therefore also waits for whatever gates those transfers, like
+    /// [`wait_on`](Self::wait_on) would: a user event gating them must be
+    /// completed by another thread. To keep borrowed transfers asynchronous,
+    /// see [`submit_pending_on_unchecked`](Self::submit_pending_on_unchecked).
     fn submit_pending_on<'a, L: crate::Launcher + ?Sized>(
         self,
         launcher: &L,
@@ -3052,7 +3056,28 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     where
         Self: 'a,
     {
-        let (output, event) = submit_collect(&self, launcher)?;
+        let (output, event) = submit_collect(&self, launcher, true)?;
+        Ok(crate::Pending::new(output, event, Some(Box::new(self))))
+    }
+
+    /// [`submit_pending_on`](Self::submit_pending_on) without waiting for the
+    /// transfers on caller-borrowed memory: it returns as soon as everything is
+    /// enqueued, and the returned [`Pending`](crate::Pending) alone keeps that
+    /// memory borrowed until the work completes.
+    ///
+    /// # Safety
+    ///
+    /// The returned `Pending` must be waited on or dropped, never leaked
+    /// (`mem::forget`, `Box::leak`, a reference cycle, ...): leaking it ends the
+    /// borrow while the device may still read or write the memory.
+    unsafe fn submit_pending_on_unchecked<'a, L: crate::Launcher + ?Sized>(
+        self,
+        launcher: &L,
+    ) -> Result<crate::Pending<'a, Self::Output>>
+    where
+        Self: 'a,
+    {
+        let (output, event) = submit_collect(&self, launcher, false)?;
         Ok(crate::Pending::new(output, event, Some(Box::new(self))))
     }
 
@@ -3121,9 +3146,12 @@ impl<T: DeviceOp> DeviceOpExt for T {}
 
 /// The non-blocking terminals' shared gather: validate, `collect` pipelined on
 /// `launcher`'s queue, and reduce the deps to one completion event.
+/// `wait_borrowed`: wait for the transfers on caller-borrowed host memory
+/// before returning (see `ExecutionContext::host_transfers`).
 fn submit_collect<O: DeviceOp + ?Sized, L: crate::Launcher + ?Sized>(
     op: &O,
     launcher: &L,
+    wait_borrowed: bool,
 ) -> Result<(O::Output, crate::Event)> {
     // Atomicity pre-pass: validate all inputs before any enqueue, mirroring wait_on.
     op.check_ready()?;
@@ -3133,7 +3161,13 @@ fn submit_collect<O: DeviceOp + ?Sized, L: crate::Launcher + ?Sized>(
     let collected = op.collect(&ec, ExecMode::Pipelined);
     // Transfers on caller-borrowed host memory are done before we return,
     // success or not: the borrow may end here, whatever happens to the result.
-    let host = ec.wait_host_transfers();
+    // A failed walk waits even when unchecked: there is no Pending to keep the
+    // borrow alive.
+    let host = if wait_borrowed || collected.is_err() {
+        ec.wait_host_transfers()
+    } else {
+        Ok(())
+    };
     let (output, mut deps) = collected?;
     host?;
     // Work whose output nothing consumed still gates completion.

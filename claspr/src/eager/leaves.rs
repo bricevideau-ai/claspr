@@ -858,6 +858,21 @@ where
         let queue = ctx.default_outoforder_queue(ctx.device())?;
         self.submit_pending_on(&*queue)
     }
+
+    /// [`submit`](Self::submit) returning as soon as the read is enqueued.
+    ///
+    /// # Safety
+    ///
+    /// The returned [`Pending`](crate::Pending) must be waited on or dropped,
+    /// never leaked: leaking it ends the borrow of `dst` while the device may
+    /// still write it. See
+    /// [`submit_pending_on_unchecked`](DeviceOpExt::submit_pending_on_unchecked).
+    pub unsafe fn submit_unchecked(self) -> Result<crate::Pending<'d, DeviceSlice<T, M>>> {
+        let ctx = concrete_buf_ctx(&self.buf)?;
+        let queue = ctx.default_outoforder_queue(ctx.device())?;
+        // SAFETY: forwarded to the caller.
+        unsafe { self.submit_pending_on_unchecked(&*queue) }
+    }
 }
 
 // ── Leaf: shaped upload (host array → Tensor) ──────────────────────────────

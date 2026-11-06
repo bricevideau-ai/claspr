@@ -867,6 +867,21 @@ impl<'a, I: ImageEnqueue, E: Send + Sync> ImageWrite<'a, I, E> {
         let queue = ctx.default_outoforder_queue(ctx.device())?;
         self.submit_pending_on(&*queue)
     }
+
+    /// [`submit`](Self::submit) returning as soon as the write is enqueued.
+    ///
+    /// # Safety
+    ///
+    /// The returned [`Pending`](crate::Pending) must be waited on or dropped,
+    /// never leaked: leaking it ends the borrow of the host slice while the
+    /// device may still use it. See
+    /// [`submit_pending_on_unchecked`](crate::eager::DeviceOpExt::submit_pending_on_unchecked).
+    pub unsafe fn submit_unchecked(self) -> Result<crate::Pending<'a, I>> {
+        let ctx = concrete_image_ctx(&self.img)?;
+        let queue = ctx.default_outoforder_queue(ctx.device())?;
+        // SAFETY: forwarded to the caller.
+        unsafe { self.submit_pending_on_unchecked(&*queue) }
+    }
 }
 
 // ── Leaf: image read (image → caller host slice) ────────────────────
@@ -990,6 +1005,21 @@ impl<'a, I: ImageEnqueue, E: Send> ImageRead<'a, I, E> {
         let ctx = concrete_image_ctx(&self.img)?;
         let queue = ctx.default_outoforder_queue(ctx.device())?;
         self.submit_pending_on(&*queue)
+    }
+
+    /// [`submit`](Self::submit) returning as soon as the read is enqueued.
+    ///
+    /// # Safety
+    ///
+    /// The returned [`Pending`](crate::Pending) must be waited on or dropped,
+    /// never leaked: leaking it ends the borrow of the host slice while the
+    /// device may still use it. See
+    /// [`submit_pending_on_unchecked`](crate::eager::DeviceOpExt::submit_pending_on_unchecked).
+    pub unsafe fn submit_unchecked(self) -> Result<crate::Pending<'a, I>> {
+        let ctx = concrete_image_ctx(&self.img)?;
+        let queue = ctx.default_outoforder_queue(ctx.device())?;
+        // SAFETY: forwarded to the caller.
+        unsafe { self.submit_pending_on_unchecked(&*queue) }
     }
 }
 

@@ -250,3 +250,31 @@ fn a_leaked_pending_cannot_outlive_a_borrowed_image_write() {
         "the write read the overwritten src"
     );
 }
+
+/// The unchecked form keeps a borrowed read asynchronous: it returns before
+/// the gate opens, and the `Pending` (waited on, as its contract requires)
+/// delivers the data.
+#[test]
+fn unchecked_submit_leaves_a_borrowed_read_in_flight() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let queue = ctx.default_outoforder_queue(ctx.device()).expect("queue");
+    let (gate, dep) = gate(&ctx);
+    let release = release_later(gate, 200);
+    let buf = DeviceSlice::<u32>::alloc_zero(&ctx, LEN).expect("alloc");
+    let mut dst = vec![0u32; LEN];
+    let start = Instant::now();
+    let graph = ks
+        .fill_u32([LEN], buf, 9)
+        .after(dep)
+        .and_then(|b| read_into(b, &mut dst));
+    // SAFETY: the `Pending` is waited on below, never leaked.
+    let pending = unsafe { graph.submit_pending_on_unchecked(&*queue) }.expect("submit");
+    assert!(
+        start.elapsed() < Duration::from_millis(100),
+        "the unchecked submit waited for the gated read"
+    );
+    pending.wait().expect("wait");
+    assert!(dst.iter().all(|&v| v == 9));
+    release.join().expect("release thread");
+}
