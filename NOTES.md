@@ -424,7 +424,7 @@ run) + `register_drop_callback` waits before dropping on failure (`05e16b7`);
 (`48a67de`); `is_injective` sums the faster axes' reach (`567797a`). Each has a
 regression test (compile-fail fixture or exhaustive/gated runtime test).
 
-Finding 2 implemented on branch `borrowed-transfer-wait` (2026-11-06, `6b0ab60`):
+Finding 2 FIXED (2026-11-06, `e9f081c`; unchecked opt-out `7fe3039`):
 leaves on caller-borrowed host memory (`read_into`, image `read`/`write`) record
 their transfer event in the `ExecutionContext`; non-blocking terminals wait on just
 those before returning (also on error paths, and in `wait_on`'s error arms), so a
@@ -445,6 +445,17 @@ PoCL/driver blockers below still apply). Verification:
 `cargo test -p claspr --lib --locked` passed 14/14; no full workspace integration
 run or performance benchmarks. Review itself changed no source code.
 Prune these findings as fixes land.
+
+### PoCL assertion in `eager_run_await` under load (2026-11-06, investigating)
+
+`await_propagates_chain_error` (host-seam closure `Err` cascading through a user
+event) aborts ~0.3% of runs with 8 parallel copies on the local PoCL debug build:
+`pocl_update_event_finished: Assertion '(event)->prev != NULL'` (once
+`cq->command_count > 0`) — an event finished twice. Never sequentially; rusticl
+clean. Stress bisect inconclusive (pre-`safety-hardening` 0/1680, `05e16b7` 2/720,
+`c08d0a4` 0/720, main 2/360). Either a PoCL error-cascade race or a claspr event
+over-release. Next: reproduce on the pocl `cmdbuf-v1.0` build (current PoCL main),
+then audit event refcounts on that path with the intercept layer.
 
 ### Where per-sync time actually goes (profiled 2026-09-08) — NOT the walk
 
