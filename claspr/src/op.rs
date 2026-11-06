@@ -437,6 +437,10 @@ fn reaper() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Box<dyn Send>>>
 /// via `Box::from_raw` with the same `T` it was allocated as.
 ///
 /// Panics inside the drop are caught via `catch_unwind` (FFI safety).
+///
+/// If the callback can't be registered, this waits for `event` before
+/// dropping `holder` and returning the error, so `holder` is never dropped
+/// before the event completes.
 pub fn register_drop_callback<T>(event: &Event, holder: Box<T>) -> Result<()>
 where
     T: Send + 'static,
@@ -445,10 +449,11 @@ where
     // every other Event handle for this cl_event has been released.
     // SAFETY: `event.get()` is a live cl_event; retain matches the
     // release in `drop_callback_thunk` when it reclaims the box.
-    unsafe {
-        opencl3::event::retain_event(event.get())
-            .map_err(|code| Error::OpenCl(opencl3::error_codes::ClError(code)))?
-    };
+    if let Err(code) = unsafe { opencl3::event::retain_event(event.get()) } {
+        let _ = event.wait();
+        drop(holder);
+        return Err(Error::OpenCl(opencl3::error_codes::ClError(code)));
+    }
     let owned_event = Event::new(event.get());
     let data = Box::new(KeepAlive {
         event: owned_event,
@@ -462,8 +467,9 @@ where
         user_data,
     );
     if let Err(code) = res {
+        let _ = event.wait();
         // SAFETY: registration failed, OpenCL never took ownership;
-        // reclaim and drop.
+        // reclaim and drop (after the wait above).
         unsafe {
             drop(Box::from_raw(user_data as *mut KeepAlive<T>));
         }
