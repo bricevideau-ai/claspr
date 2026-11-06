@@ -453,8 +453,8 @@ Prune these findings as fixes land.
 `~/.local` PoCL (Sep 4 build of `fix/cmdbuf-pending-race`, base 2026-09-02). Against
 current PoCL (`cmdbuf-v1.0` build = upstream main + the 1.0 change): **0/2880**
 (expected ~9). Likely fixed upstream by the Oct pthread scheduler changes
-(`f0e65a197`, `492b908ee`); not pinned further. Fix the env, not claspr: replace the
-installed PoCL with a current build.
+(`f0e65a197`, `492b908ee`); not pinned further. Fixed in the env: the installed PoCL is
+now the `cmdbuf-v1.0` build — claspr workspace 614/614, stress 0/480.
 
 ### Where per-sync time actually goes (profiled 2026-09-08) — NOT the walk
 
@@ -500,9 +500,11 @@ Replaying one finalized command buffer in a `sync` loop returned `-59` from
 `pending` count, so a waiter arriving in that window re-enqueues while `pending != 0`.
 claspr is conformant (waiting on the completion event before re-enqueueing).
 
-The fix (branch `fix/cmdbuf-pending-race`, repro `scratch/pocl_cmdbuf_replay_race.c`)
-is installed in the local pocl 8.0-pre (`~/.local`), so `cb_bench` and the suites run
-clean here. **Upstream it was NOT merged**: pocl/pocl#2306 was closed 2026-09-09 — the
+The local pocl (`~/.local`) is now the `cmdbuf-v1.0` build (2026-11-06: upstream
+main + the 1.0 update, which removes the pending state and with it this race; repro
+`scratch/pocl_cmdbuf_replay_race.c` runs clean), replacing the old
+`fix/cmdbuf-pending-race` install. Backup of the old install:
+`~/scratch/pocl-backup-2026-11-06/`. **Upstream it was NOT merged**: pocl/pocl#2306 was closed 2026-09-09 — the
 maintainer would rather move the implementation to the v1.0 command-buffer spec
 (0.9.8 drops simultaneous-use and the `pending` bookkeeping entirely), tracked as
 pocl/pocl#2314 (open). So stock pocl still has the race — one more reason the pocl
