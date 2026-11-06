@@ -175,17 +175,21 @@ impl<const R: usize> Shape<R> {
 impl<const R: usize> Shape<R> {
     /// Whether no two indices of the view reach the same element: sorted by
     /// stride, each axis (of extent > 1) steps past everything the faster axes
-    /// span. A view `split` can hand out disjoint, writable tiles of.
+    /// reach together. A view `split` can hand out disjoint, writable tiles of.
+    /// Conservative: an interleaved but injective view may be refused.
     pub fn is_injective(&self) -> bool {
         let mut axes: Vec<usize> = (0..R).filter(|&d| self.ext[d] > 1).collect();
         axes.sort_by_key(|&d| self.stride[d]);
-        let mut span = 1usize; // elements the faster axes reach, from the first
+        let mut span = 1usize; // the faster axes reach offsets 0..span
         for d in axes {
             if self.stride[d] < span {
                 return false;
             }
-            span = match self.stride[d].checked_mul(self.ext[d] - 1) {
-                Some(reach) => reach.saturating_add(1).max(span),
+            span = match self.stride[d]
+                .checked_mul(self.ext[d] - 1)
+                .and_then(|reach| reach.checked_add(span))
+            {
+                Some(span) => span,
                 None => return false,
             };
         }
@@ -487,6 +491,41 @@ mod tests {
             }
             .is_injective()
         ); // extent-1 axis
+        assert!(
+            !Shape {
+                offset: 0,
+                ext: [2, 2, 2],
+                stride: [2, 3, 5]
+            }
+            .is_injective()
+        ); // [1, 1, 0] and [0, 0, 1] both reach 5
+    }
+
+    /// Every small rank-3 view `is_injective` accepts really is injective.
+    #[test]
+    fn injectivity_never_accepts_aliasing() {
+        let range = |n: usize| 0..n;
+        for e in range(27).map(|i| [i / 9 + 1, i / 3 % 3 + 1, i % 3 + 1]) {
+            for s in range(343).map(|i| [i / 49, i / 7 % 7, i % 7]) {
+                let shape = Shape {
+                    offset: 0,
+                    ext: e,
+                    stride: s,
+                };
+                if !shape.is_injective() {
+                    continue;
+                }
+                let mut seen = std::collections::HashSet::new();
+                for i in 0..e[0] {
+                    for j in 0..e[1] {
+                        for k in 0..e[2] {
+                            let at = i * s[0] + j * s[1] + k * s[2];
+                            assert!(seen.insert(at), "{e:?} / {s:?} aliases {at}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
