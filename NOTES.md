@@ -417,28 +417,23 @@ avoid the compiler backend), realistic examples (gray-scott, CG, miniweather,
 llama2), explicit ownership/access/dependency models, compile-fail coverage,
 deterministic user-event tests, atomicity tests and CB failure injection.
 
-Open findings below are from source review, NOT reproduced corruption exploits:
+Findings 1, 3, 4, 5 FIXED on branch `safety-hardening` (2026-11-06): dropped async
+`run` future keeps its output alive (`c08d0a4`; reproduced: heap corruption every
+run) + `register_drop_callback` waits before dropping on failure (`05e16b7`);
+`__claspr_into_init` is `unsafe` (`2f56016`); image fill color typed by the format
+(`48a67de`); `is_injective` sums the faster axes' reach (`567797a`). Each has a
+regression test (compile-fail fixture or exhaustive/gated runtime test).
 
-1. **Async download cancellation can free the DMA destination early.**
-   `eager/combinators.rs:2821,3057`: `DeviceChainFuture::Running` owns the output,
-   but `drop_after` keeps only the graph alive. Dropping the future frees the Vec;
-   public variant fields also allow early extraction. Keep output alive until
-   completion independently of polling; make state private; test gated cancellation.
-2. **Borrowed async transfers rely on Drop for safety.** `eager/leaves.rs:851`
-   and `pending.rs:65`: safe `mem::forget(Pending)` ends the borrow without waiting,
-   permitting destination access/free while OpenCL writes. Use owned destinations,
-   genuinely scoped completion, or an unsafe borrowing contract; cover forgetting.
-3. **Safe public initialization bypass.** `launch.rs:343,388`:
-   `KernelSliceWriteArg::__claspr_into_init()` calls `assume_init()` without a
-   launch/proof, including mapped/USM allocations. `#[doc(hidden)]` is not privacy.
-   Require an unsafe contract or unforgeable internal proof; add compile-fail tests.
-4. **Image fill accepts undersized/wrong-family colors.** `image.rs:362,1302`:
-   generic `[T; 4]` permits `[u8; 4]`, but OpenCL reads four 32-bit components.
-   Derive `[f32; 4]`, `[i32; 4]` or `[u32; 4]` from the format; reject others.
-5. **Tensor injectivity check accepts overlapping writable layouts.**
-   `tensor.rs:179`: extents `[2,2,2]`, strides `[2,3,5]` pass, yet `[1,1,0]` and
-   `[0,0,1]` both address 5. Accumulate the full span instead of replacing it;
-   add this regression and enumerate accepted layouts in property tests.
+Still open:
+
+2. **Borrowed async transfers rely on Drop for safety.** `ReadInto::submit`,
+   `ImageRead`/`ImageWrite::submit` (and `submit_pending_on` over them) return a
+   `Pending` borrowing the caller's slice; safe `mem::forget` ends the borrow
+   without waiting (the pre-1.0 `thread::scoped` hole). Event-scheduled release
+   only protects memory claspr owns, not a borrow. Options: (a) owned staging
+   (copy at `wait`/`submit`; leak → `dst` never written, safe), (b) `unsafe`
+   submit, (c) a+b, (d) scoped `ctx.scope(|s| ..)` API that waits on return.
+   Recommended (a) now, (d) later. **Awaiting the user's decision.**
 
 Priority: consolidate safe/unsafe contracts before more features. Graph ownership,
 slots, checkouts, host seams and CB replay form a substantial invariant surface.
