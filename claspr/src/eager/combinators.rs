@@ -2814,11 +2814,17 @@ where
 /// seam (`run_host_seam`) runs its closure on a worker thread and stashes any
 /// failure into the chain's host-error slot before signalling its user event with a
 /// negative status. That status cascades into the trailing marker, so the
-/// future's marker poll resolves with `Err`; [`Running`](Self::Running) then
-/// prefers the stashed rich variant (closure `Err`, `HostPanic`) over the
-/// `Error::OpenCl(-1)` cascade — mirroring the `sync` terminal.
+/// future's marker poll resolves with `Err`; it then prefers the stashed rich
+/// variant (closure `Err`, `HostPanic`) over the `Error::OpenCl(-1)` cascade —
+/// mirroring the `sync` terminal.
+///
+/// Dropping the future before it resolves is safe: the output (a downloaded
+/// `Vec` the device may still be writing) is released once the chain completes.
 #[cfg(feature = "async-events")]
-pub enum DeviceChainFuture<T> {
+pub struct DeviceChainFuture<T: Send + 'static>(ChainState<T>);
+
+#[cfg(feature = "async-events")]
+enum ChainState<T> {
     /// Chain failed during setup, `execute`, or marker enqueue. The error
     /// surfaces on the first `poll`.
     Errored(Option<Error>),
@@ -2852,11 +2858,35 @@ fn join_chain_workers(
     }
 }
 
+#[cfg(feature = "async-events")]
+impl<T: Send + 'static> DeviceChainFuture<T> {
+    fn errored(e: Error) -> Self {
+        DeviceChainFuture(ChainState::Errored(Some(e)))
+    }
+}
+
+/// Dropped before resolving: the device may still be writing the output, so
+/// release it once the chain's marker completes instead of now.
+#[cfg(feature = "async-events")]
+impl<T: Send + 'static> Drop for DeviceChainFuture<T> {
+    fn drop(&mut self) {
+        if let ChainState::Running {
+            output: output @ Some(_),
+            event_future,
+            ..
+        } = &mut self.0
+        {
+            // On error `drop_after` has already waited for the marker.
+            let _ = crate::op::drop_after(event_future.event(), output.take());
+        }
+    }
+}
+
 // `T: Unpin` covers every realistic chain output (`Vec<u8>`, `DeviceSlice<T>`,
 // `Arc<T>`, tuples of those, ...) and lets us pin-project via the cheap
 // `Pin::get_mut`. Mirrors `ChainFuture`'s bound.
 #[cfg(feature = "async-events")]
-impl<T: Unpin> std::future::Future for DeviceChainFuture<T> {
+impl<T: Send + Unpin + 'static> std::future::Future for DeviceChainFuture<T> {
     type Output = Result<T>;
 
     fn poll(
@@ -2865,11 +2895,11 @@ impl<T: Unpin> std::future::Future for DeviceChainFuture<T> {
     ) -> std::task::Poll<Self::Output> {
         use std::task::Poll;
         let this = self.as_mut().get_mut();
-        match this {
-            DeviceChainFuture::Errored(slot) => Poll::Ready(Err(slot
+        match &mut this.0 {
+            ChainState::Errored(slot) => Poll::Ready(Err(slot
                 .take()
                 .expect("DeviceChainFuture polled after Ready (Errored)"))),
-            DeviceChainFuture::Running {
+            ChainState::Running {
                 output,
                 event_future,
                 host_error,
@@ -2916,7 +2946,7 @@ impl<T: Unpin> std::future::Future for DeviceChainFuture<T> {
 pub(crate) fn run_eager_chain<Op>(chain: Op, context: &Context) -> DeviceChainFuture<Op::Output>
 where
     Op: DeviceOp + 'static,
-    Op::Output: Unpin,
+    Op::Output: Unpin + 'static,
 {
     use crate::EventFutureExt;
 
@@ -2925,14 +2955,14 @@ where
     // enqueued), returned as an eager `Errored` future so the caller sees an
     // unsatisfiable-input error at `run()` time, not at poll/await.
     if let Err(e) = chain.check_ready() {
-        return DeviceChainFuture::Errored(Some(e));
+        return DeviceChainFuture::errored(e);
     }
 
     // 1. Pick the per-device default OOO queue (same as `sync`).
     let device = context.device().clone();
     let queue = match context.default_outoforder_queue(&device) {
         Ok(q) => q,
-        Err(e) => return DeviceChainFuture::Errored(Some(e)),
+        Err(e) => return DeviceChainFuture::errored(e),
     };
     let mut ec = ExecutionContext::new(context, device.clone(), queue.raw());
     // Clone the chain's host-error slot + worker-join list out before `ec` drops
@@ -2954,7 +2984,7 @@ where
             Err(e) => {
                 drop(queue);
                 context.invalidate_default_outoforder_queue(&device);
-                return DeviceChainFuture::Errored(Some(e));
+                return DeviceChainFuture::errored(e);
             }
         }
     } else {
@@ -2988,9 +3018,7 @@ where
             join_chain_workers(&workers);
             drop(queue);
             context.invalidate_default_outoforder_queue(&device);
-            return DeviceChainFuture::Errored(Some(
-                lock_unpoisoned(&host_error).take().unwrap_or(e),
-            ));
+            return DeviceChainFuture::errored(lock_unpoisoned(&host_error).take().unwrap_or(e));
         }
     };
 
@@ -3024,11 +3052,11 @@ where
             join_chain_workers(&workers);
             drop(queue);
             context.invalidate_default_outoforder_queue(&device);
-            return DeviceChainFuture::Errored(Some(
+            return DeviceChainFuture::errored(
                 lock_unpoisoned(&host_error)
                     .take()
                     .unwrap_or(Error::OpenCl(code)),
-            ));
+            );
         }
     };
     drop(deps);
@@ -3048,7 +3076,7 @@ where
         drop(queue);
         context.invalidate_default_outoforder_queue(&device);
         // Same precedence as the marker path above: a seam's stash beats the code.
-        return DeviceChainFuture::Errored(Some(lock_unpoisoned(&host_error).take().unwrap_or(e)));
+        return DeviceChainFuture::errored(lock_unpoisoned(&host_error).take().unwrap_or(e));
     }
     // `start` (if any) has been completed; its retained dep refs keep the cl_event
     // alive in the wait-lists until those commands run. Safe to drop here.
@@ -3058,15 +3086,15 @@ where
     // until the marker completes — its drop could otherwise return a buffer home
     // or free host memory the device is still using.
     if let Err(e) = crate::op::drop_after(&marker, chain) {
-        return DeviceChainFuture::Errored(Some(e));
+        return DeviceChainFuture::errored(e);
     }
 
     // 5. Wrap the marker in the EventFuture machinery (clSetEventCallback).
     //    The future joins `workers` when the marker resolves.
-    DeviceChainFuture::Running {
+    DeviceChainFuture(ChainState::Running {
         output: Some(output),
         event_future: marker.into_future(),
         host_error,
         workers,
-    }
+    })
 }

@@ -3084,7 +3084,7 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     fn run(self, context: &Context) -> DeviceChainFuture<Self::Output>
     where
         Self: 'static,
-        Self::Output: Unpin,
+        Self::Output: Unpin + 'static,
     {
         run_eager_chain(self, context)
     }

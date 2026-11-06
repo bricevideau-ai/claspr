@@ -104,6 +104,11 @@ pub struct EventFuture {
 }
 
 impl EventFuture {
+    /// The event this future waits on.
+    pub(crate) fn event(&self) -> &Event {
+        &self._event
+    }
+
     pub(crate) fn new(event: Event) -> Self {
         EventFuture {
             _event: event,

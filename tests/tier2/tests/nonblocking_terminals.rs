@@ -1,6 +1,7 @@
 //! The non-blocking terminals never let the device touch host memory that has
 //! been freed (or is being read) under it: `submit_on` keeps the graph and its
-//! output alive until its event completes, and `submit_pending_on` (and the
+//! output alive until its event completes, a dropped `run` future releases its
+//! output only once the chain completes, and `submit_pending_on` (and the
 //! `submit` of host-memory ops) hands the value back as a `Pending`, which only
 //! yields it after the work completes — and waits if dropped.
 //!
@@ -47,6 +48,34 @@ fn submit_on_keeps_a_downloaded_vec_alive() {
         let junk: Vec<Vec<u8>> = (0..64).map(|i| vec![i as u8; 4096]).collect();
         complete_user_event(&gate, CL_COMPLETE).expect("release");
         done.wait().expect("wait");
+        for (i, block) in junk.iter().enumerate() {
+            assert!(
+                block.iter().all(|&b| b == i as u8),
+                "round {round}: heap block {i} overwritten"
+            );
+        }
+    }
+}
+
+/// Dropping the async `run` future before it resolves (a cancelled `select!`,
+/// a timeout) does not free the download's `Vec` under the held read.
+#[test]
+fn dropping_a_run_future_keeps_the_download_alive() {
+    let Some(ctx) = ctx() else { return };
+    let ks = kernels::kernels(&ctx).expect("load kernels");
+    let queue = ctx.default_outoforder_queue(ctx.device()).expect("queue");
+    for round in 0..20 {
+        let (gate, dep) = gate(&ctx);
+        let buf = DeviceSlice::<u32>::alloc_zero(&ctx, LEN).expect("alloc");
+        let future = ks
+            .fill_u32([LEN], buf, 0xdead_beef)
+            .after(dep)
+            .and_then(download)
+            .run(&ctx);
+        drop(future);
+        let junk: Vec<Vec<u8>> = (0..64).map(|i| vec![i as u8; 4096]).collect();
+        complete_user_event(&gate, CL_COMPLETE).expect("release");
+        queue.finish().expect("finish");
         for (i, block) in junk.iter().enumerate() {
             assert!(
                 block.iter().all(|&b| b == i as u8),
