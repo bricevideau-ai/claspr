@@ -3068,13 +3068,13 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// user event with a negative status to abort downstream device work (the
     /// unmap is gated by a separate, always-`CL_COMPLETE` `fire` event, never by
     /// a negative status). That status cascades into the trailing marker, so the
-    /// future's marker poll resolves `Err`; the `Running` variant's `poll` then
-    /// prefers the stashed rich error over the `Error::OpenCl(-1)` cascade. The
-    /// slot is also drained on a *successful* marker, because some drivers (pocl)
-    /// don't propagate a user-event's negative status through
-    /// `clEnqueueMarkerWithWaitList` — a non-empty slot is itself the failure
-    /// signal. Only an error *submitting* the chain (before any worker spawns)
-    /// returns [`DeviceChainFuture::Errored`] eagerly here.
+    /// future's marker poll resolves `Err`; its `poll` then prefers the stashed
+    /// rich error over the `Error::OpenCl(-1)` cascade. The slot is also drained
+    /// on a *successful* marker, because some drivers (pocl) don't propagate a
+    /// user-event's negative status through `clEnqueueMarkerWithWaitList` — a
+    /// non-empty slot is itself the failure signal. Only an error *submitting*
+    /// the chain (before any worker spawns) makes the future resolve to that
+    /// error on its first poll, without waiting on the device.
     ///
     /// Arity-agnostic: like [`sync`](Self::sync), `run` gathers via
     /// [`collect`](DeviceOp::collect), so multi-output terminals (`arc_split`,

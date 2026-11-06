@@ -64,7 +64,7 @@ fn await_pure_value_chain() {
 ///
 /// The eager host seam runs its closure synchronously inside `execute` and
 /// returns the closure's exact `Error` variant; `run` turns that synchronous
-/// `Err` into `DeviceChainFuture::Errored`, which surfaces on the first poll.
+/// `Err` into a future that resolves to it on the first poll.
 #[test]
 fn await_propagates_chain_error() {
     let Some(ctx) = ctx() else { return };
