@@ -149,9 +149,13 @@ released the borrowed slice early. Fix: `submit_on` / `submit_value_on` keep the
 (and output) alive until the event (`op::drop_after` → reaper thread, not the CL
 callback); `submit_value_on` (and kernel `submit`) require a sealed `DeviceResident`
 output; host-memory / borrowing ops return `Pending<'a, T>` (`wait`, drop waits;
-`'a` keeps caller slices borrowed); new `submit_pending_on` for any graph. Open:
-`USMSlice` is in `DeviceResident` (its drop waits) but host deref while a kernel runs
-is still a race.
+`'a` keeps caller slices borrowed); new `submit_pending_on` for any graph.
+`USMSlice` host deref while a kernel runs: fixed 2026-11-06 — `Deref`/`DerefMut` wait
+on the slice's recorded kernel events (fast path: one atomic load when nothing
+is in flight), so it stays `DeviceResident` and keeps the `(buffer, event)` API.
+(Alternative kept on branch `usm-not-resident-alt`: drop it from `DeviceResident`.)
+Same gap remains for the map views of `MappedSlice`/`DeviceSlice` (maps enqueue with
+an empty wait list; `DeviceSlice` records no kernel uses) — awaiting a decision.
 Step 2 done: the non-blocking terminals (`submit*`, async `run`) add every
 undelivered output's events to their completion (`DeviceOp::undelivered_deps`,
 mirroring `reclaim_undelivered`), and `AndThen` no longer threads a discarded

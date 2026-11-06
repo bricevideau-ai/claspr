@@ -41,6 +41,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A host `Vec<T>` wrapped as a fine-grain-system SVM slice. The
@@ -51,9 +52,10 @@ use std::sync::{Arc, Mutex};
 /// [`SvmLevel::FineSystem`] — errors
 /// with [`Error::NotSupported`] on
 /// devices without fine-grain system SVM. Host access goes through
-/// `Deref<Target=[T]>` / `DerefMut` directly on the wrapped Vec;
-/// kernel access goes through `clSetKernelArgSVMPointer` (driven by
-/// the `KernelArg` impl).
+/// `Deref<Target=[T]>` / `DerefMut` directly on the wrapped Vec, and
+/// first waits for any kernel still using the slice (a non-blocking
+/// launch hands it back while the kernel may run); kernel access goes
+/// through `clSetKernelArgSVMPointer` (driven by the `KernelArg` impl).
 ///
 /// ## Drop semantics
 ///
@@ -72,6 +74,10 @@ pub struct USMSlice<T, M: MemMode = ReadWrite> {
     /// [`register_use`](Self::register_use). Drop waits on each
     /// before letting the host Vec drop.
     in_flight: Mutex<Vec<Arc<Event>>>,
+    /// Set by [`register_use`](Self::register_use), cleared when
+    /// `in_flight` is drained: lets `Deref` skip the lock when no kernel
+    /// has used the slice since the last drain.
+    used: AtomicBool,
     /// Type-level access-mode tag. USMSlice's backing memory is just
     /// a Rust `Vec<T>` — no `cl_mem_flags` at construction time. The
     /// marker exists purely to enable type-level method gating
@@ -101,6 +107,7 @@ impl<T, M: MemMode> USMSlice<T, M> {
     /// context's sticky error flag, like `Drop`).
     pub(crate) fn wait_in_flight(&self) {
         let events = std::mem::take(&mut *lock_unpoisoned(&self.in_flight));
+        self.used.store(false, Ordering::Release);
         for ev in &events {
             if ev.wait().is_err() {
                 self.ctx.record_err();
@@ -125,6 +132,7 @@ impl<T, M: MemMode> USMSlice<T, M> {
             data,
             ctx: ctx.clone(),
             in_flight: Mutex::new(Vec::new()),
+            used: AtomicBool::new(false),
             _mode: PhantomData,
         })
     }
@@ -138,6 +146,7 @@ impl<T, M: MemMode> USMSlice<T, M> {
     /// (manual `clSetKernelArgSVMPointer`) can stay Drop-safe.
     pub fn register_use(&self, event: Arc<Event>) {
         lock_unpoisoned(&self.in_flight).push(event);
+        self.used.store(true, Ordering::Release);
     }
 
     /// Raw SVM pointer (the wrapped Vec's allocation). Same escape
@@ -171,6 +180,7 @@ impl<T: Copy, M: MemMode> USMSlice<T, M> {
         // the same host-side wait `Drop` performs, but here we KEEP the
         // buffer alive and re-arm it. Errors bump the sticky context flag.
         let events = std::mem::take(&mut *lock_unpoisoned(&self.in_flight));
+        self.used.store(false, Ordering::Release);
         for ev in &events {
             ev.wait().map_err(Error::OpenCl)?;
         }
@@ -354,6 +364,7 @@ impl<T, M: MemMode> USMSliceUninit<T, M> {
             data: data_t,
             ctx: self.ctx,
             in_flight: Mutex::new(Vec::new()),
+            used: AtomicBool::new(false),
             _mode: PhantomData,
         }
     }
@@ -466,6 +477,7 @@ impl<T: Copy, M: MemMode> USMSliceUninit<T, M> {
             data: data_t,
             ctx: self.ctx,
             in_flight: Mutex::new(Vec::new()),
+            used: AtomicBool::new(false),
             _mode: PhantomData,
         }
     }
@@ -497,6 +509,7 @@ impl<T: Copy, M: MemMode> USMSliceUninit<T, M> {
             data: data_t,
             ctx: self.ctx,
             in_flight: Mutex::new(Vec::new()),
+            used: AtomicBool::new(false),
             _mode: PhantomData,
         })
     }
@@ -512,15 +525,25 @@ impl<T, M: MemMode> Buffer<T> for USMSlice<T, M> {
     }
 }
 
+/// Host access waits for every kernel still using the slice: the host reads
+/// and writes the very memory those kernels do. With nothing in flight the
+/// check is one atomic load per deref; in a hot loop, take a slice once
+/// (`let s = &buf[..];`) rather than indexing `buf[i]` each iteration.
 impl<T, M: MemMode + HostReadable> Deref for USMSlice<T, M> {
     type Target = [T];
     fn deref(&self) -> &[T] {
+        if self.used.load(Ordering::Acquire) {
+            self.wait_in_flight();
+        }
         &self.data
     }
 }
 
 impl<T, M: MemMode + HostWritable + HostReadable> DerefMut for USMSlice<T, M> {
     fn deref_mut(&mut self) -> &mut [T] {
+        if self.used.load(Ordering::Acquire) {
+            self.wait_in_flight();
+        }
         &mut self.data
     }
 }

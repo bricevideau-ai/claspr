@@ -331,3 +331,72 @@ fn usm_slice_as_bundle_branch_replays() {
     assert!(b2.iter().all(|&v| v == 18), "run2 b got {}", b2[0]);
     drop((a2, b2));
 }
+
+/// A user event `(gate, dep)` (`dep` gates a kernel), completed from another
+/// thread after `ms` milliseconds.
+fn gate_released_after(
+    ctx: &claspr::Context,
+    ms: u64,
+) -> (claspr::Event, std::thread::JoinHandle<()>) {
+    let gate = claspr::create_user_event(ctx).expect("user event");
+    // SAFETY: a second owned handle on the same event (retained for it).
+    let dep = unsafe {
+        opencl3::event::retain_event(gate.get()).expect("retain");
+        claspr::Event::new(gate.get())
+    };
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        claspr::complete_user_event(&gate, opencl3::event::CL_COMPLETE).expect("release");
+    });
+    (dep, release)
+}
+
+/// A non-blocking launch hands the USMSlice back while the kernel may still
+/// run; reading it waits for the kernel and sees its writes.
+#[test]
+fn usm_slice_deref_waits_for_its_kernel() {
+    let Some(ctx) = ctx_with_fine_system() else {
+        return;
+    };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+    let (dep, release) = gate_released_after(&ctx, 200);
+    let buf = claspr::USMSlice::<u32>::new(&ctx, vec![3u32; N]).expect("USM new");
+    let (buf, _event) = kernels
+        .scale_u32([N], buf, 4)
+        .after(dep)
+        .submit()
+        .expect("submit");
+    let start = std::time::Instant::now();
+    let first = buf[0];
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(150),
+        "deref returned while the kernel was held back"
+    );
+    assert_eq!(first, 12);
+    assert!(buf.iter().all(|&v| v == 12));
+    release.join().expect("release thread");
+}
+
+/// Writing through `DerefMut` waits too: the write lands after the kernel's.
+#[test]
+fn usm_slice_deref_mut_waits_for_its_kernel() {
+    let Some(ctx) = ctx_with_fine_system() else {
+        return;
+    };
+    let kernels = kernels::kernels(&ctx).expect("load kernels");
+    let (dep, release) = gate_released_after(&ctx, 200);
+    let buf = claspr::USMSlice::<u32>::new(&ctx, vec![3u32; N]).expect("USM new");
+    let (mut buf, event) = kernels
+        .scale_u32([N], buf, 4)
+        .after(dep)
+        .submit()
+        .expect("submit");
+    buf[0] = 99;
+    event.wait().expect("kernel");
+    assert_eq!(
+        buf[0], 99,
+        "the kernel overwrote a host write made after submit"
+    );
+    assert!(buf[1..].iter().all(|&v| v == 12));
+    release.join().expect("release thread");
+}
