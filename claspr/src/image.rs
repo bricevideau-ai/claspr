@@ -119,7 +119,11 @@ pub mod format {
     /// `Image<dim>D<A, F>` arguments to kernels that declare a
     /// matching `type=` keyword (`type=u32` → `Uint`, `type=i32` →
     /// `Sint`, `type=f32` → `Float`).
-    pub trait SampledTypeFamily: sealed::FamilySealed {}
+    pub trait SampledTypeFamily: sealed::FamilySealed {
+        /// The component type of a `clEnqueueFillImage` color: four of
+        /// these, 32-bit each (`u32`, `i32` or `f32`).
+        type FillElem: Copy + Send + 'static;
+    }
 
     /// Unsigned-integer sampled-type family. Kernel sees `uint`
     /// values via `read_imageui`/`write_imageui`. Implemented for
@@ -128,7 +132,9 @@ pub mod format {
     #[derive(Clone, Copy, Debug)]
     pub struct Uint;
     impl sealed::FamilySealed for Uint {}
-    impl SampledTypeFamily for Uint {}
+    impl SampledTypeFamily for Uint {
+        type FillElem = u32;
+    }
 
     /// Signed-integer sampled-type family. Kernel sees `int`
     /// values via `read_imagei`/`write_imagei`. Implemented for
@@ -136,7 +142,9 @@ pub mod format {
     #[derive(Clone, Copy, Debug)]
     pub struct Sint;
     impl sealed::FamilySealed for Sint {}
-    impl SampledTypeFamily for Sint {}
+    impl SampledTypeFamily for Sint {
+        type FillElem = i32;
+    }
 
     /// Floating-point sampled-type family. Kernel sees `float`
     /// values via `read_imagef`/`write_imagef`. Implemented by both
@@ -146,7 +154,9 @@ pub mod format {
     #[derive(Clone, Copy, Debug)]
     pub struct Float;
     impl sealed::FamilySealed for Float {}
-    impl SampledTypeFamily for Float {}
+    impl SampledTypeFamily for Float {
+        type FillElem = f32;
+    }
 
     /// Sealed trait for image storage formats. See the module
     /// docs for the format-naming convention (`*Uint`/`*Unorm`/
@@ -354,12 +364,15 @@ macro_rules! impl_image_verbs {
                 image_copy_op(self, dst, region)
             }
 
-            /// Begin filling every pixel with `pattern`. The 4-component
-            /// pattern follows OpenCL's `clEnqueueFillImage` shape —
-            /// match `T` to the format's `SampledTypeFamily` (`u32` for
-            /// `Uint`, `i32` for `Sint`, `f32` for `Float` / `Unorm` /
-            /// `Snorm`).
-            pub fn fill<T: Copy + Send + 'static>(self, pattern: [T; 4]) -> ImageFill<Self, T>
+            /// Begin filling every pixel with `pattern`, OpenCL's
+            /// `clEnqueueFillImage` color: four components of the format's
+            /// [`SampledTypeFamily::FillElem`](format::SampledTypeFamily::FillElem)
+            /// (`u32` for `Uint`, `i32` for `Sint`, `f32` for `Float` /
+            /// `Unorm` / `Snorm`).
+            pub fn fill(
+                self,
+                pattern: [<F::SampledFamily as format::SampledTypeFamily>::FillElem; 4],
+            ) -> ImageFill<Self, <F::SampledFamily as format::SampledTypeFamily>::FillElem>
             where
                 Self: ImageEnqueue,
             {

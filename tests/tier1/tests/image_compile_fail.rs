@@ -21,6 +21,8 @@
 //! - `dim_mismatch_*` — host's `Image<N>D<…>` doesn't match the
 //!   dim the kernel declared. Wrong trait family entirely.
 //! - `view_*` — `Image1DBufferView` access/lifetime checks.
+//! - `fill_color_wrong_type` — a fill color must be four of the format's
+//!   `FillElem` (`[u32; 4]` for `Uint`), not any `[T; 4]`.
 //!
 //! `compile_fail/macro` + `compile_pass/macro` cover macro-level
 //! diagnostics (no kernel crate needed — a `claspr::kernels!`
