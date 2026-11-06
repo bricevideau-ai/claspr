@@ -1014,7 +1014,10 @@ fn expand_kernel(func: &ItemFn, args: &AttrArgs) -> syn::Result<TokenStream2> {
                     // the buffer (and its home) become its initialised form; from
                     // here on it is an ordinary read-write slice.
                     write_only_init.push(quote! {
-                        let #pname = ::claspr::KernelSliceWriteArg::<#elem>::__claspr_into_init(#pname);
+                        // SAFETY: the grid check above passed for this argument.
+                        let #pname = unsafe {
+                            ::claspr::KernelSliceWriteArg::<#elem>::__claspr_into_init(#pname)
+                        };
                         let #home_ident = ::core::option::Option::map(
                             #home_ident,
                             ::claspr::eager::__claspr_init_home::<#gid, #elem>,

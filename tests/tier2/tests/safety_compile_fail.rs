@@ -40,6 +40,9 @@
 //!   may read (`&[T]`) is rejected.
 //! - `per_item_out_without_written` — a kernel with write-only `PerItemOut`
 //!   outputs must return `Written` (proof every output is written).
+//! - `into_init_is_unsafe` — `KernelSliceWriteArg::__claspr_into_init`, which
+//!   marks an uninitialised buffer initialised, is `unsafe`: safe code can't
+//!   skip the launch to read uninitialised memory.
 //! - `pipe_not_clone` — `Pipe` is not `Clone`: a handle pipe can't be
 //!   duplicated to feed one value to two consumers (share it with
 //!   `.arc()` / `arc_split`).

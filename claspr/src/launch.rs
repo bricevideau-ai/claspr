@@ -350,8 +350,13 @@ pub trait KernelSliceWriteArg<T>:
     /// Number of elements (what the grid must cover).
     fn element_count(&self) -> usize;
     /// After the launch's grid check: every element will be written. Not API.
+    ///
+    /// # Safety
+    ///
+    /// Every element must be written before the result is read: only a launch
+    /// whose grid check passed for this argument may call it.
     #[doc(hidden)]
-    fn __claspr_into_init(self) -> Self::Init;
+    unsafe fn __claspr_into_init(self) -> Self::Init;
     /// Back to `Self` to return a value to its origin cell (forgetting
     /// initialisation is always safe: a replay rewrites every element). Not API.
     #[doc(hidden)]
@@ -364,7 +369,7 @@ impl<T, B: KernelSliceReadWriteArg<T>> KernelSliceWriteArg<T> for B {
     fn element_count(&self) -> usize {
         KernelSliceReadArg::element_count(self)
     }
-    fn __claspr_into_init(self) -> B {
+    unsafe fn __claspr_into_init(self) -> B {
         self
     }
     fn __claspr_forget_init(init: B) -> B {
@@ -385,10 +390,10 @@ impl<
     fn element_count(&self) -> usize {
         crate::Buffer::len(self.as_raw())
     }
-    fn __claspr_into_init(self) -> DeviceSlice<T, M> {
-        // SAFETY: the launch completed, its grid was checked to give every
-        // element one `PerItemOut` writer, and the kernel's `Written` return
-        // proves each writer wrote (see the trait docs).
+    unsafe fn __claspr_into_init(self) -> DeviceSlice<T, M> {
+        // SAFETY: the caller's contract — the launch's grid gives every element
+        // one `PerItemOut` writer, and the kernel's `Written` return proves each
+        // writer wrote (see the trait docs).
         unsafe { self.assume_init() }
     }
     fn __claspr_forget_init(init: DeviceSlice<T, M>) -> Self {
@@ -411,10 +416,8 @@ macro_rules! impl_write_arg_svm_uninit {
             fn element_count(&self) -> usize {
                 self.len()
             }
-            fn __claspr_into_init(self) -> crate::$init<T, M> {
-                // SAFETY: as for `DeviceSliceUninit` — the launch's grid gives
-                // every element one `PerItemOut` writer and `Written` proves
-                // each one writes.
+            unsafe fn __claspr_into_init(self) -> crate::$init<T, M> {
+                // SAFETY: as for `DeviceSliceUninit` — the caller's contract.
                 unsafe { self.assume_init() }
             }
             fn __claspr_forget_init(init: crate::$init<T, M>) -> Self {
@@ -446,9 +449,10 @@ macro_rules! impl_write_arg_tensor_uninit {
             fn element_count(&self) -> usize {
                 KernelSliceWriteArg::<T>::element_count(self.buffer())
             }
-            fn __claspr_into_init(self) -> Self::Init {
+            unsafe fn __claspr_into_init(self) -> Self::Init {
                 let (buf, shape) = self.into_parts();
-                crate::Tensor::new(buf.__claspr_into_init(), shape)
+                // SAFETY: the caller's contract covers the tensor's buffer.
+                crate::Tensor::new(unsafe { buf.__claspr_into_init() }, shape)
             }
             fn __claspr_forget_init(init: Self::Init) -> Self {
                 let (buf, shape) = init.into_parts();
