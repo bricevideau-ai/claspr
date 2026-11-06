@@ -149,6 +149,14 @@ impl<T, M: MemMode> USMSlice<T, M> {
         self.used.store(true, Ordering::Release);
     }
 
+    /// See [`DeviceResident`](crate::DeviceResident): host access waits
+    /// for the work behind `event`.
+    pub(crate) fn record_in_use(&self, event: &Event) -> Result<()> {
+        crate::util::record_use(&self.in_flight, event)?;
+        self.used.store(true, Ordering::Release);
+        Ok(())
+    }
+
     /// Raw SVM pointer (the wrapped Vec's allocation). Same escape
     /// hatch as [`MappedSlice::ptr`](crate::MappedSlice::ptr).
     pub fn ptr(&self) -> *mut T {

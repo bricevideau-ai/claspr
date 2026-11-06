@@ -181,10 +181,14 @@ where
         // defensive Drop-time unmap if anything between this map
         // and `enqueue_unmap` errors out.
         let map_queue = RetainedQueue::from_queue(queue)?;
+        // Plus work a non-blocking terminal left running on the buffer.
+        let uses = crate::util::pending_uses(&self.in_use);
+        let mut wait: Vec<cl_event> = deps.to_vec();
+        wait.extend(uses.iter().map(|e| e.get()));
         // SAFETY: cl_mem is a live buffer (we just borrowed `&self`);
         // the size matches the allocation's element-count × element
-        // size; deps points to live cl_events for the duration of
-        // this call.
+        // size; `wait` points to live cl_events (held by the caller's
+        // deps and `uses`) for the duration of this call.
         let (host_ptr_raw, map_event) = unsafe {
             map_primitive::map_buffer(
                 map_queue.raw(),
@@ -193,7 +197,7 @@ where
                 CL_MAP_READ | CL_MAP_WRITE,
                 0,
                 size,
-                deps,
+                &wait,
             )?
         };
         let handle = DeviceSliceMapHandle {

@@ -198,10 +198,13 @@ where
         let cl_mem = buf.buffer().get();
         let len = Buffer::len(&buf);
         let size = len * std::mem::size_of::<T>();
-        let wait_list = deps_to_wait_list(&deps);
+        let mut wait_list = deps_to_wait_list(&deps);
+        // Plus work a non-blocking terminal left running on the buffer.
+        let uses = crate::util::pending_uses(&buf.in_use);
+        wait_list.extend(uses.iter().map(|e| e.get()));
         // SAFETY: cl_mem is live (we hold the DeviceSlice); the
         // map size matches the allocation's byte length; wait_list
-        // stays alive for the call.
+        // stays alive for the call (its events held by `deps` / `uses`).
         let (host_ptr_raw, map_event) = unsafe {
             map_primitive::map_buffer(
                 map_queue.raw(),
@@ -525,11 +528,14 @@ where
         let ptr = buf.ptr();
         // Retain the queue for the view's defensive Drop-time unmap.
         let queue = RetainedQueue::from_queue(ctx.cl_queue())?;
-        let wait_list = deps_to_wait_list(&deps);
+        let mut wait_list = deps_to_wait_list(&deps);
+        // Plus work a non-blocking terminal left running on the buffer.
+        let uses = buf.pending_uses();
+        wait_list.extend(uses.iter().map(|e| e.get()));
         // SAFETY: non-blocking SVM map. `ptr` came from clSVMAlloc on
         // the same context; `size` is the allocation's exact byte
         // length. Wait-list events stay alive across the call via the
-        // `deps` Vec.
+        // `deps` Vec and `uses`.
         let map_event = unsafe {
             map_primitive::svm_map(
                 queue.raw(),

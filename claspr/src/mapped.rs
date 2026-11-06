@@ -404,6 +404,17 @@ impl<T, M: MemMode> MappedSlice<T, M> {
         lock_unpoisoned(&self.last_use).push(event);
     }
 
+    /// See [`DeviceResident`](crate::DeviceResident): host maps wait for
+    /// the work behind `event`.
+    pub(crate) fn record_in_use(&self, event: &Event) -> Result<()> {
+        crate::util::record_use(&self.last_use, event)
+    }
+
+    /// The recorded uses still running, for a map's wait list.
+    pub(crate) fn pending_uses(&self) -> Vec<Arc<Event>> {
+        crate::util::pending_uses(&self.last_use)
+    }
+
     /// Begin a host read map of this buffer. Returns a lazy [`MapOp`]
     /// builder — call [`wait`](MapOp::wait) on it with a launcher to
     /// actually issue the `clEnqueueSVMMap(CL_BLOCKING, CL_MAP_READ)`
@@ -988,8 +999,12 @@ impl<'a, T, M: MemMode> MappedReadGuard<'a, T, M> {
         blocking: bool,
     ) -> Result<(Self, Event)> {
         let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
+        // Work a non-blocking terminal left running on the buffer.
+        let uses = crate::util::pending_uses(&buf.last_use);
+        let wait: Vec<cl_event> = uses.iter().map(|e| e.get()).collect();
         // SAFETY: queue is alive (RetainedQueue); buf.ptr is the live
-        // SVM allocation; map_size matches the allocation's byte length.
+        // SVM allocation; map_size matches the allocation's byte length;
+        // `wait`'s events are kept alive by `uses`.
         let event = unsafe {
             map_primitive::svm_map(
                 queue.raw(),
@@ -997,7 +1012,7 @@ impl<'a, T, M: MemMode> MappedReadGuard<'a, T, M> {
                 CL_MAP_READ,
                 buf.ptr.cast(),
                 buf.len * std::mem::size_of::<T>(),
-                &[],
+                &wait,
             )?
         };
         Ok((MappedReadGuard { buf, queue }, event))
@@ -1046,6 +1061,8 @@ impl<'a, T, M: MemMode> MappedWriteGuard<'a, T, M> {
         let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
         let ptr = buf.ptr;
         let len = buf.len;
+        let uses = crate::util::pending_uses(&buf.last_use);
+        let wait: Vec<cl_event> = uses.iter().map(|e| e.get()).collect();
         // SAFETY: see MappedReadGuard::enqueue_map.
         let event = unsafe {
             map_primitive::svm_map(
@@ -1054,7 +1071,7 @@ impl<'a, T, M: MemMode> MappedWriteGuard<'a, T, M> {
                 CL_MAP_READ | CL_MAP_WRITE,
                 ptr.cast(),
                 len * std::mem::size_of::<T>(),
-                &[],
+                &wait,
             )?
         };
         Ok((MappedWriteGuard { buf, queue }, event))

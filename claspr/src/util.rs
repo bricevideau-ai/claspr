@@ -124,3 +124,32 @@ pub unsafe fn mapped_slice_mut<'a, T>(ptr: *mut T, len: usize) -> &'a mut [T] {
 pub fn lock_unpoisoned<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+/// Events of work that may still use a buffer the host can reach through a
+/// view (a map, a `USMSlice` deref): recorded by the non-blocking terminals
+/// that hand the buffer back early, waited on by those views.
+pub(crate) type InUse = std::sync::Mutex<Vec<std::sync::Arc<opencl3::event::Event>>>;
+
+/// Record that the work behind `event` may still use the buffer. If the event
+/// can't be retained, wait for the work instead.
+pub(crate) fn record_use(uses: &InUse, event: &opencl3::event::Event) -> Result<()> {
+    // SAFETY: `event` is live; the retained handle is released by the
+    // `Event` pushed below.
+    if let Err(code) = unsafe { opencl3::event::retain_event(event.get()) } {
+        let _ = event.wait();
+        return Err(Error::OpenCl(ClError(code)));
+    }
+    let mut uses = lock_unpoisoned(uses);
+    // Keep only the work still running, so the list stays short.
+    uses.retain(|e| e.command_execution_status().is_ok_and(|s| s.0 > 0));
+    uses.push(std::sync::Arc::new(opencl3::event::Event::new(event.get())));
+    Ok(())
+}
+
+/// The recorded uses still running, for a view's wait list; completed ones
+/// are dropped from `uses`.
+pub(crate) fn pending_uses(uses: &InUse) -> Vec<std::sync::Arc<opencl3::event::Event>> {
+    let mut uses = lock_unpoisoned(uses);
+    uses.retain(|e| e.command_execution_status().is_ok_and(|s| s.0 > 0));
+    uses.clone()
+}

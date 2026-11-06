@@ -154,8 +154,15 @@ output; host-memory / borrowing ops return `Pending<'a, T>` (`wait`, drop waits;
 on the slice's recorded kernel events (fast path: one atomic load when nothing
 is in flight), so it stays `DeviceResident` and keeps the `(buffer, event)` API.
 (Alternative kept on branch `usm-not-resident-alt`: drop it from `DeviceResident`.)
-Same gap remains for the map views of `MappedSlice`/`DeviceSlice` (maps enqueue with
-an empty wait list; `DeviceSlice` records no kernel uses) — awaiting a decision.
+Generalized the same day: `submit_value_on` (every value-returning non-blocking
+terminal: kernel `submit`, leaf/image `submit`s) records its completion event on
+the returned `DeviceResident` value (`__claspr_in_use_until`; `DeviceSlice` gained an
+`in_use` list, `MappedSlice`/`USMSlice` reuse theirs), and every host view waits for
+it: `DeviceSlice`/`MappedSlice` maps (Tier-1 guards, graph host views, `Mappable`) and
+`USMSlice` deref. Covers multi-op graphs / CB replays, where no per-launch hook runs.
+Lists drop completed events on record and on map. Tests: `resident_host_views.rs`
+(kernel on the OOO queue, view on the default in-order queue — same-queue order
+would hide it).
 Step 2 done: the non-blocking terminals (`submit*`, async `run`) add every
 undelivered output's events to their completion (`DeviceOp::undelivered_deps`,
 mirroring `reclaim_undelivered`), and `AndThen` no longer threads a discarded

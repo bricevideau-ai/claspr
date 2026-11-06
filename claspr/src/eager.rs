@@ -3022,9 +3022,11 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     /// kernel-op `submit`/`submit_on`. Only for a [`DeviceResident`](crate::DeviceResident)
     /// output (buffers, images, device scalars, tensors — the host can't touch
     /// their storage directly), which the caller keeps using and orders after
-    /// the event (`.after(event)`). A host value the device is still filling (a
-    /// downloaded `Vec`) comes back through [`submit_pending_on`](Self::submit_pending_on)
-    /// instead. The graph itself is kept alive until the event completes.
+    /// the event (`.after(event)`); host views of it (maps, a `USMSlice`
+    /// deref) wait for the event on their own. A host value the device is still
+    /// filling (a downloaded `Vec`) comes back through
+    /// [`submit_pending_on`](Self::submit_pending_on) instead. The graph itself
+    /// is kept alive until the event completes.
     fn submit_value_on<L: crate::Launcher + ?Sized>(
         self,
         launcher: &L,
@@ -3035,6 +3037,8 @@ pub trait DeviceOpExt: DeviceOp + Sized {
     {
         let (output, event) = submit_collect(&self, launcher, true)?;
         crate::op::drop_after(&event, self)?;
+        // The work may still use the output: its host views wait for `event`.
+        crate::DeviceResident::__claspr_in_use_until(&output, &event)?;
         Ok((output, event))
     }
 

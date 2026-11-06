@@ -122,6 +122,17 @@ pub struct DeviceSlice<T, M: MemMode = ReadWrite> {
     /// to gate method availability and the `clCreateBuffer` flags
     /// chosen at alloc time. See [`crate::access`].
     pub(crate) _mode: PhantomData<fn() -> M>,
+    /// Work that may still use the buffer after a non-blocking terminal
+    /// handed it back; host maps wait for it.
+    pub(crate) in_use: crate::util::InUse,
+}
+
+impl<T, M: MemMode> DeviceSlice<T, M> {
+    /// See [`DeviceResident`](crate::DeviceResident): host maps wait for
+    /// the work behind `event`.
+    pub(crate) fn record_in_use(&self, event: &Event) -> Result<()> {
+        crate::util::record_use(&self.in_use, event)
+    }
 }
 
 impl<T, M: MemMode> Drop for DeviceSlice<T, M> {
@@ -211,6 +222,7 @@ impl<T, M: MemMode> DeviceSlice<T, M> {
                 len,
                 ctx: ctx.clone(),
                 _mode: PhantomData,
+                in_use: Default::default(),
             },
         })
     }
@@ -777,6 +789,7 @@ impl<T: Copy, M: MemMode> DeviceSlice<T, M> {
             len: data.len(),
             ctx: ctx.clone(),
             _mode: PhantomData,
+            in_use: Default::default(),
         })
     }
 
@@ -1272,8 +1285,12 @@ impl<'a, T, M: MemMode> DeviceMappedReadGuard<'a, T, M> {
     ) -> Result<(Self, Event)> {
         let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
         let size = buf.len * std::mem::size_of::<T>();
+        // Work a non-blocking terminal left running on the buffer.
+        let uses = crate::util::pending_uses(&buf.in_use);
+        let wait: Vec<cl_event> = uses.iter().map(|e| e.get()).collect();
         // SAFETY: buf.buffer is live (we hold the borrow); queue is
-        // live (RetainedQueue); size matches the allocation.
+        // live (RetainedQueue); size matches the allocation; `wait`'s
+        // events are kept alive by `uses`.
         let (host_ptr_raw, event) = unsafe {
             map_primitive::map_buffer(
                 queue.raw(),
@@ -1282,7 +1299,7 @@ impl<'a, T, M: MemMode> DeviceMappedReadGuard<'a, T, M> {
                 CL_MAP_READ,
                 0,
                 size,
-                &[],
+                &wait,
             )?
         };
         Ok((
@@ -1370,6 +1387,8 @@ impl<'a, T, M: MemMode> DeviceMappedWriteGuard<'a, T, M> {
         let queue = crate::util::RetainedQueue::from_queue(launcher.cl_queue())?;
         let size = buf.len * std::mem::size_of::<T>();
         let cl_mem = buf.buffer.get();
+        let uses = crate::util::pending_uses(&buf.in_use);
+        let wait: Vec<cl_event> = uses.iter().map(|e| e.get()).collect();
         // SAFETY: see DeviceMappedReadGuard::enqueue_map.
         let (host_ptr_raw, event) = unsafe {
             map_primitive::map_buffer(
@@ -1379,7 +1398,7 @@ impl<'a, T, M: MemMode> DeviceMappedWriteGuard<'a, T, M> {
                 CL_MAP_READ | CL_MAP_WRITE,
                 0,
                 size,
-                &[],
+                &wait,
             )?
         };
         Ok((

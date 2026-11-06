@@ -84,8 +84,43 @@ mod sealed {
 /// directly (or, for a fine-grain `USMSlice`, whose drop waits for in-flight
 /// kernels). Sealed — host memory (a `Vec`) is not, and comes back as a
 /// [`Pending`] instead.
-pub trait DeviceResident: sealed::Sealed + Send {}
+///
+/// The terminal records its completion event on the value, and every host
+/// view of it (a map, a [`USMSlice`](crate::USMSlice) deref) waits for that
+/// event: the device may still be using the storage when it comes back.
+pub trait DeviceResident: sealed::Sealed + Send {
+    /// Record that the work behind `event` may still use the value. Not API.
+    #[doc(hidden)]
+    fn __claspr_in_use_until(&self, event: &crate::Event) -> crate::Result<()> {
+        let _ = event;
+        Ok(())
+    }
+}
 
+/// Resident types with storage the host can view: record the event on it.
+macro_rules! device_resident_viewed {
+    ($([$($g:tt)*] $t:ty => |$v:ident, $e:ident| $record:expr),* $(,)?) => {$(
+        impl<$($g)*> sealed::Sealed for $t {}
+        impl<$($g)*> DeviceResident for $t where $t: Send {
+            fn __claspr_in_use_until(&self, $e: &crate::Event) -> crate::Result<()> {
+                let $v = self;
+                $record
+            }
+        }
+    )*};
+}
+
+device_resident_viewed! {
+    [T, M: crate::access::MemMode] crate::DeviceSlice<T, M> => |v, e| v.record_in_use(e),
+    [T, M: crate::access::MemMode] std::sync::Arc<crate::DeviceSlice<T, M>> => |v, e| v.record_in_use(e),
+    [T, M: crate::access::MemMode] crate::MappedSlice<T, M> => |v, e| v.record_in_use(e),
+    [T, M: crate::access::MemMode] crate::USMSlice<T, M> => |v, e| v.record_in_use(e),
+    [B: DeviceResident] crate::Scalar<B> => |v, e| v.inner.__claspr_in_use_until(e),
+    [B: DeviceResident, const R: usize] crate::Tensor<B, R> => |v, e| v.buffer().__claspr_in_use_until(e),
+    [T, M: crate::access::MemMode, const R: usize] crate::Tile<T, M, R> => |v, e| v.buffer().record_in_use(e),
+}
+
+/// Resident types the host can't view (images go through copies).
 macro_rules! device_resident {
     ($([$($g:tt)*] $t:ty),* $(,)?) => {$(
         impl<$($g)*> sealed::Sealed for $t {}
@@ -94,13 +129,6 @@ macro_rules! device_resident {
 }
 
 device_resident! {
-    [T, M: crate::access::MemMode] crate::DeviceSlice<T, M>,
-    [T, M: crate::access::MemMode] std::sync::Arc<crate::DeviceSlice<T, M>>,
-    [T, M: crate::access::MemMode] crate::MappedSlice<T, M>,
-    [T, M: crate::access::MemMode] crate::USMSlice<T, M>,
-    [B: DeviceResident] crate::Scalar<B>,
-    [B: DeviceResident, const R: usize] crate::Tensor<B, R>,
-    [T, M: crate::access::MemMode, const R: usize] crate::Tile<T, M, R>,
     [A: crate::access::KernelAccess, F: crate::format::Format] crate::Image1D<A, F>,
     [A: crate::access::KernelAccess, F: crate::format::Format] crate::Image2D<A, F>,
     [A: crate::access::KernelAccess, F: crate::format::Format] crate::Image3D<A, F>,
@@ -115,7 +143,14 @@ impl DeviceResident for () {}
 macro_rules! device_resident_tuples {
     ($($name:ident)+) => {
         impl<$($name: DeviceResident),+> sealed::Sealed for ($($name,)+) {}
-        impl<$($name: DeviceResident),+> DeviceResident for ($($name,)+) {}
+        impl<$($name: DeviceResident),+> DeviceResident for ($($name,)+) {
+            #[allow(non_snake_case)]
+            fn __claspr_in_use_until(&self, event: &crate::Event) -> crate::Result<()> {
+                let ($($name,)+) = self;
+                $($name.__claspr_in_use_until(event)?;)+
+                Ok(())
+            }
+        }
     };
 }
 device_resident_tuples!(A);
