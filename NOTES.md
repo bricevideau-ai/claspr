@@ -430,11 +430,13 @@ their transfer event in the `ExecutionContext`; non-blocking terminals wait on j
 those before returning (also on error paths, and in `wait_on`'s error arms), so a
 leaked `Pending` can't outlive them; the rest of the graph stays async. Deterministic
 leak tests (gated / in-order-queue), each 10/10 against the mutation.
-**Open decision:** fail fast instead of blocking when a borrowed transfer is gated
-on an incomplete user event? Avoids a same-thread deadlock (complete-after-submit)
-but would refuse a valid program where another thread completes it. Current
-behavior: block (documented). Later, optional: owned `read_into` variant and a
-`ctx.scope` API for host-side overlap with borrowed reads.
+**Decided:** no fail-fast on user-event gates — `wait_on` on the same graph can
+only return if another thread completes the gate too, so blocking there is the
+same rule, and a check would refuse valid cross-thread programs. Opt-out for
+overlap: `unsafe` `submit_pending_on_unchecked` / `submit_unchecked` (contract: the
+`Pending` is never leaked). A/B vs main (cb_bench 8 interleaved runs, gray-scott 6):
+all within -1.4%..+2.5% per-sync median, mixed signs (noise); gray-scott wall -0.2%.
+Later, optional: owned `read_into` variant, `ctx.scope` API.
 
 Priority: consolidate safe/unsafe contracts before more features. Graph ownership,
 slots, checkouts, host seams and CB replay form a substantial invariant surface.
