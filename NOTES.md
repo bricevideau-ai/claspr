@@ -511,11 +511,9 @@ Replaying one finalized command buffer in a `sync` loop returned `-59` from
 `pending` count, so a waiter arriving in that window re-enqueues while `pending != 0`.
 claspr is conformant (waiting on the completion event before re-enqueueing).
 
-The local pocl (`~/.local`) is now the `cmdbuf-v1.0` build (2026-11-06: upstream
-main + the 1.0 update, which removes the pending state and with it this race; repro
-`scratch/pocl_cmdbuf_replay_race.c` runs clean), replacing the old
-`fix/cmdbuf-pending-race` install. Backup of the old install:
-`~/scratch/pocl-backup-2026-11-06/`. **Upstream it was NOT merged**: pocl/pocl#2306 was closed 2026-09-09 — the
+The local pocl (`~/.local`) is upstream main (`187ee1fd7`, 2026-11-24), which includes
+the 1.0 update (#2427): no pending state, so no race. Backups of earlier installs:
+`~/scratch/pocl-backup-2026-11-06/`, `~/scratch/pocl-backup-2026-11-24/`. **Upstream it was NOT merged**: pocl/pocl#2306 was closed 2026-09-09 — the
 maintainer would rather move the implementation to the v1.0 command-buffer spec
 (0.9.8 drops simultaneous-use and the `pending` bookkeeping entirely), tracked as
 pocl/pocl#2314 (open). So stock pocl still has the race — one more reason the pocl
@@ -528,11 +526,14 @@ replays clean), 0.9.7 queue semantics, implicit in-order deps at record time (ne
 `test_command_buffer_in_order`). OpenCL-CTS command-buffer suite 95/102 (rest
 pre-existing: DEVICE_SIDE_SYNC, completion event type, mutable_handle checks);
 pocl ctest clean except 2 pre-existing remote failures; claspr 606/606 on it.
-Opened as **pocl/pocl#2427** (2026-11-04). Follow-ups pushed to the fork, stacked
-on it, PRs to open after it lands: `cmdbuf-mutable-handle-only-ndrange`,
-`cmdbuf-event-command-type`, `cmdbuf-device-side-sync` (CTS 102/102 combined).
+**Merged upstream as pocl/pocl#2427 (2026-11-16).** Follow-ups rebased on upstream main
+and opened 2026-11-24: #2450 (mutable handles only for NDRange), #2451 (completion
+event type), #2452 (DEVICE_SIDE_SYNC; its 2nd commit, CPU self-sync, is an
+interpretation). OpenCL-CTS command-buffer suite 102/102 on main + the three.
 Filed along the way: KhronosGroup/OpenCL-CTS#2872, KhronosGroup/OpenCL-Docs#1643.
-Then: a pocl CI job for claspr once a release ships it (conda-forge?).
+**pocl CI job for claspr: the deferral trigger has fired** (stock pocl main no longer
+has the replay race). Remaining blocker: an easy install — wait for the next pocl
+release / conda-forge package, or build pocl main in CI with caching.
 
 ### rusticl (Mesa 26.2.5, still in 26.2.6) driver bugs that show up in CI — reported, do not gate
 
