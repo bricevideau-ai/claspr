@@ -532,8 +532,8 @@ event type), #2452 (DEVICE_SIDE_SYNC; its 2nd commit, CPU self-sync, is an
 interpretation). OpenCL-CTS command-buffer suite 102/102 on main + the three.
 Filed along the way: KhronosGroup/OpenCL-CTS#2872, KhronosGroup/OpenCL-Docs#1643.
 **pocl CI job for claspr: the deferral trigger has fired** (stock pocl main no longer
-has the replay race). Remaining blocker: an easy install — wait for the next pocl
-release / conda-forge package, or build pocl main in CI with caching.
+has the replay race). Decided (2026-11-24): wait for the next pocl release (or a
+conda-forge package) that includes #2427; don't build pocl main in CI.
 
 ### rusticl (Mesa 26.2.5, still in 26.2.6) driver bugs that show up in CI — reported, do not gate
 
