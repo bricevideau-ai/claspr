@@ -531,7 +531,12 @@ and opened 2026-11-24: #2450 (mutable handles only for NDRange) and #2451 (compl
 event type) MERGED 2026-11-25; #2452 (DEVICE_SIDE_SYNC; its 2nd commit, CPU
 self-sync, is an interpretation) open, extended on request with enabling
 cl_khr_command_buffer + multi_device in ENABLE_CONFORMANCE builds (mutable_dispatch
-stays out: 0.9.4 vs the CTS's 0.9.5). OpenCL-CTS command-buffer suite 102/102 on main + the three.
+stays out: 0.9.4 vs the CTS's 0.9.5). #2454 (2026-11-25): Level Zero advertises
+cl_khr_command_buffer in conformance builds too (its CI conformance job runs the CB
+CTS; untested locally). Next pocl PR, once KhronosGroup/OpenCL-CTS#2904 is settled:
+mutable_dispatch 0.9.5 — the bump is ~free (no ARGUMENTS cap); fix the global-size
+update (re-pick an implementation-chosen local size) and the unsupported-field error
+code (INVALID_VALUE → INVALID_OPERATION); then enable it in conformance builds. OpenCL-CTS command-buffer suite 102/102 on main + the three.
 Filed along the way: KhronosGroup/OpenCL-CTS#2872, KhronosGroup/OpenCL-Docs#1643.
 **pocl CI job for claspr: the deferral trigger has fired** (stock pocl main no longer
 has the replay race). Decided (2026-11-24): wait for the next pocl release (or a
