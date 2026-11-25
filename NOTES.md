@@ -527,9 +527,11 @@ replays clean), 0.9.7 queue semantics, implicit in-order deps at record time (ne
 pre-existing: DEVICE_SIDE_SYNC, completion event type, mutable_handle checks);
 pocl ctest clean except 2 pre-existing remote failures; claspr 606/606 on it.
 **Merged upstream as pocl/pocl#2427 (2026-11-16).** Follow-ups rebased on upstream main
-and opened 2026-11-24: #2450 (mutable handles only for NDRange), #2451 (completion
-event type), #2452 (DEVICE_SIDE_SYNC; its 2nd commit, CPU self-sync, is an
-interpretation). OpenCL-CTS command-buffer suite 102/102 on main + the three.
+and opened 2026-11-24: #2450 (mutable handles only for NDRange) and #2451 (completion
+event type) MERGED 2026-11-25; #2452 (DEVICE_SIDE_SYNC; its 2nd commit, CPU
+self-sync, is an interpretation) open, extended on request with enabling
+cl_khr_command_buffer + multi_device in ENABLE_CONFORMANCE builds (mutable_dispatch
+stays out: 0.9.4 vs the CTS's 0.9.5). OpenCL-CTS command-buffer suite 102/102 on main + the three.
 Filed along the way: KhronosGroup/OpenCL-CTS#2872, KhronosGroup/OpenCL-Docs#1643.
 **pocl CI job for claspr: the deferral trigger has fired** (stock pocl main no longer
 has the replay race). Decided (2026-11-24): wait for the next pocl release (or a
